@@ -21,7 +21,7 @@
       {#if item.kind === 'message'}
         <TextMessage message={item.message} {collapsed} {onMediaClick} />
       {:else}
-        <QuietMessageGroup messages={item.messages} />
+        <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} />
       {/if}
     {/each}
   </div>

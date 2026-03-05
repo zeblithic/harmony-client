@@ -2,8 +2,10 @@
   import type { Message } from '../types';
   import TextMessage from './TextMessage.svelte';
 
-  let { messages }: {
+  let { messages, collapsed = false, onMediaClick }: {
     messages: Message[];
+    collapsed?: boolean;
+    onMediaClick?: (mediaId: string) => void;
   } = $props();
 
   let expanded = $state(false);
@@ -25,7 +27,7 @@
   {#if expanded}
     <div class="quiet-expanded">
       {#each messages as message (message.id)}
-        <TextMessage {message} />
+        <TextMessage {message} {collapsed} {onMediaClick} />
       {/each}
     </div>
   {/if}

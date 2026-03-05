@@ -52,6 +52,18 @@
     version++;
   }
 
+  function clearPeerLevel(address: string, level: 'quiet' | 'standard' | 'loud') {
+    const current = service.settings.perPeer.get(address);
+    if (!current) return;
+    const { [level]: _, ...rest } = current;
+    if (Object.keys(rest).length === 0) {
+      service.clearPeerPolicy(address);
+    } else {
+      service.setPeerPolicy(address, rest);
+    }
+    version++;
+  }
+
   function clearPeer(address: string) {
     service.clearPeerPolicy(address);
     version++;
@@ -65,6 +77,18 @@
   function setCommunityLevel(id: string, level: 'quiet' | 'standard' | 'loud', action: NotificationAction) {
     const current = service.settings.perCommunity.get(id) ?? {};
     service.setCommunityPolicy(id, { ...current, [level]: action });
+    version++;
+  }
+
+  function clearCommunityLevel(id: string, level: 'quiet' | 'standard' | 'loud') {
+    const current = service.settings.perCommunity.get(id);
+    if (!current) return;
+    const { [level]: _, ...rest } = current;
+    if (Object.keys(rest).length === 0) {
+      service.clearCommunityPolicy(id);
+    } else {
+      service.setCommunityPolicy(id, rest);
+    }
     version++;
   }
 
@@ -121,7 +145,11 @@
                   value={getCommunityPolicy(comm.id)?.[level] ?? ''}
                   onchange={(e) => {
                     const val = (e.target as HTMLSelectElement).value;
-                    if (val) setCommunityLevel(comm.id, level, val as NotificationAction);
+                    if (val) {
+                      setCommunityLevel(comm.id, level, val as NotificationAction);
+                    } else {
+                      clearCommunityLevel(comm.id, level);
+                    }
                   }}
                 >
                   <option value="">Using global default</option>
@@ -152,7 +180,11 @@
                   value={getPeerPolicy(peer.address)?.[level] ?? ''}
                   onchange={(e) => {
                     const val = (e.target as HTMLSelectElement).value;
-                    if (val) setPeerLevel(peer.address, level, val as NotificationAction);
+                    if (val) {
+                      setPeerLevel(peer.address, level, val as NotificationAction);
+                    } else {
+                      clearPeerLevel(peer.address, level);
+                    }
                   }}
                 >
                   <option value="">Using community/global default</option>
