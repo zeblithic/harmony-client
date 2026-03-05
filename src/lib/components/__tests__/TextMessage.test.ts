@@ -63,4 +63,21 @@ describe('TextMessage', () => {
     pill?.click();
     expect(onClick).toHaveBeenCalledWith('media-1');
   });
+
+  it('renders loud message with accent border class', () => {
+    const loudMsg: Message = {
+      ...mockMessage,
+      id: 'loud-1',
+      priority: 'loud',
+    };
+    const { container } = render(TextMessage, { props: { message: loudMsg } });
+    const el = container.querySelector('.text-message');
+    expect(el?.classList.contains('loud')).toBe(true);
+  });
+
+  it('does not add loud class to standard messages', () => {
+    const { container } = render(TextMessage, { props: { message: mockMessage } });
+    const el = container.querySelector('.text-message');
+    expect(el?.classList.contains('loud')).toBe(false);
+  });
 });
