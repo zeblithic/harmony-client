@@ -46,21 +46,29 @@
     pinnedThreadIds?: Set<string>;
   } = $props();
 
-  let observersReady = $state(false);
+  let reportedThreadIds = $state(new Set<string>());
   let visibleThreadIds = $state(new Set<string>());
 
   function handleThreadVisibility(rootId: string, visible: boolean) {
-    observersReady = true;
+    if (!reportedThreadIds.has(rootId)) {
+      const nextReported = new Set(reportedThreadIds);
+      nextReported.add(rootId);
+      reportedThreadIds = nextReported;
+    }
     const next = new Set(visibleThreadIds);
     if (visible) next.add(rootId);
     else next.delete(rootId);
     visibleThreadIds = next;
   }
 
-  // Before observers initialize, treat all threads as visible (no auto-float)
-  let effectiveVisibleIds = $derived(
-    observersReady ? visibleThreadIds : new Set(threadMeta.keys())
-  );
+  // Threads whose observers haven't reported yet are treated as visible (no flash)
+  let effectiveVisibleIds = $derived.by(() => {
+    const result = new Set(visibleThreadIds);
+    for (const id of threadMeta.keys()) {
+      if (!reportedThreadIds.has(id)) result.add(id);
+    }
+    return result;
+  });
 
   let feedItems = $derived(groupMessages(messages));
 
