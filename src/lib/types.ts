@@ -4,6 +4,19 @@ export interface Peer {
   avatarUrl?: string;
 }
 
+export interface SoundOverrides {
+  quiet?: string;
+  standard?: string;
+  loud?: string;
+}
+
+export interface Profile extends Peer {
+  statusText?: string;
+  avatarCid?: string;
+  avatarMiniCid?: string;
+  notificationSounds?: SoundOverrides;
+}
+
 export interface MediaAttachment {
   id: string;
   type: 'image' | 'link' | 'code';
