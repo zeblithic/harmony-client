@@ -1,17 +1,13 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  let { nav, textFeed, mediaFeed }: {
+  let { nav, textFeed, mediaFeed, collapsed = false }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
+    collapsed?: boolean;
   } = $props();
-
-  let innerWidth = $state(window.innerWidth);
-  let collapsed = $derived(innerWidth <= 768);
 </script>
-
-<svelte:window bind:innerWidth />
 
 <div class="layout" class:collapsed>
   <aside class="nav-area">

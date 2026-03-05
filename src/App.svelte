@@ -28,7 +28,7 @@
 
 <svelte:window bind:innerWidth />
 
-<Layout>
+<Layout {collapsed}>
   {#snippet nav()}
     <NavPanel {channels} {collapsed} />
   {/snippet}
@@ -41,8 +41,11 @@
 </Layout>
 
 <style>
+  :global(.text-message) {
+    transition: background 0.3s ease;
+  }
+
   :global(.text-message.highlight) {
     background: rgba(88, 101, 242, 0.15) !important;
-    transition: background 0.3s ease;
   }
 </style>
