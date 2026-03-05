@@ -39,7 +39,7 @@
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
 
-  function handleClick(e: MouseEvent) {
+  function handleClick(e: MouseEvent | KeyboardEvent) {
     e.stopPropagation();
     if (node.type === 'folder') {
       onToggle?.(node.id);
@@ -81,7 +81,7 @@
   tabindex="0"
   data-testid="nav-row-{node.id}"
   onclick={handleClick}
-  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(e as unknown as MouseEvent); }}
+  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(e); }}
 >
   <!-- Color bands -->
   {#each colorAncestry as colorIdx, i}
