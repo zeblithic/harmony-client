@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { Message, MediaAttachment } from '../types';
   import Avatar from './Avatar.svelte';
 
@@ -40,6 +41,12 @@
       cooldownTimer = null;
     }
   }
+
+  onDestroy(() => {
+    if (cooldownTimer) {
+      clearTimeout(cooldownTimer);
+    }
+  });
 
   const TYPE_LABELS: Record<string, string> = {
     image: 'image',

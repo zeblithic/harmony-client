@@ -112,6 +112,16 @@ describe('UntrustedMediaCard', () => {
     expect(onLoad).not.toHaveBeenCalled();
   });
 
+  it('returns to blocked state when Cancel is clicked during cooldown', async () => {
+    render(UntrustedMediaCard, {
+      props: { message: mockMessage, attachment: mockImageAttachment },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^show$/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(screen.getByRole('button', { name: /^show$/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /confirm load/i })).toBeNull();
+  });
+
   it('has correct aria-label for screen readers', () => {
     render(UntrustedMediaCard, {
       props: { message: mockMessage, attachment: mockImageAttachment },
