@@ -6,6 +6,9 @@ import {
   sortNodes,
   getInheritedDisplayMode,
   getInheritedSortOrder,
+  findNode,
+  getNodeDepth,
+  getColorAncestry,
 } from './nav-utils';
 
 /** Helper to build a minimal NavNode. */
@@ -115,5 +118,55 @@ describe('getInheritedSortOrder', () => {
 
   it('falls back to activity when nothing set', () => {
     expect(getInheritedSortOrder(TREE, 'c1')).toBe('activity');
+  });
+});
+
+describe('findNode', () => {
+  it('returns the node when found', () => {
+    const result = findNode(TREE, 'f1');
+    expect(result).toBeDefined();
+    expect(result?.id).toBe('f1');
+    expect(result?.name).toBe('General');
+  });
+
+  it('returns undefined when not found', () => {
+    const result = findNode(TREE, 'nonexistent');
+    expect(result).toBeUndefined();
+  });
+});
+
+describe('getNodeDepth', () => {
+  it('returns 0 for top-level nodes', () => {
+    expect(getNodeDepth(TREE, 'f1')).toBe(0);
+    expect(getNodeDepth(TREE, 'c3')).toBe(0);
+  });
+
+  it('returns 1 for one level deep', () => {
+    expect(getNodeDepth(TREE, 'c1')).toBe(1);
+    expect(getNodeDepth(TREE, 'f3')).toBe(1);
+  });
+
+  it('returns 2 for two levels deep', () => {
+    expect(getNodeDepth(TREE, 'c2')).toBe(2);
+  });
+});
+
+describe('getColorAncestry', () => {
+  it('returns empty array for top-level nodes', () => {
+    expect(getColorAncestry(TREE, 'f1')).toEqual([]);
+    expect(getColorAncestry(TREE, 'c3')).toEqual([]);
+  });
+
+  it('returns [parentColor] for depth-1 nodes', () => {
+    const ancestry = getColorAncestry(TREE, 'c1');
+    expect(ancestry.length).toBe(1);
+    expect(ancestry[0]).toBe(getNodeColor(TREE, 'f1'));
+  });
+
+  it('returns [grandparentColor, parentColor] for depth-2 nodes', () => {
+    const ancestry = getColorAncestry(TREE, 'c2');
+    expect(ancestry.length).toBe(2);
+    expect(ancestry[0]).toBe(getNodeColor(TREE, 'f1'));
+    expect(ancestry[1]).toBe(getNodeColor(TREE, 'f3'));
   });
 });
