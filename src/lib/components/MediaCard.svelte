@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message, MediaAttachment } from '../types';
+  import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
   let { message, attachment, onLinkBack, onAvatarClick }: {
@@ -18,7 +19,7 @@
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
-  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !(e.target as HTMLElement).closest('.avatar')) { e.preventDefault(); onLinkBack?.(message.id); } }}>
+  <button class="card-header" onclick={() => onLinkBack?.(message.id)}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
@@ -29,7 +30,7 @@
     <span class="card-sender">{message.sender.displayName}</span>
     <span class="card-time">{timeStr}</span>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
-  </div>
+  </button>
 
   <div class="card-content">
     {#if attachment.type === 'image'}
@@ -38,19 +39,30 @@
         alt={attachment.title ?? 'image'}
         class="card-image"
         loading="lazy"
+        referrerpolicy="no-referrer"
       />
       {#if attachment.title}
         <p class="card-caption">{attachment.title}</p>
       {/if}
     {:else if attachment.type === 'link'}
-      <a href={attachment.url} class="card-link" target="_blank" rel="noopener">
+      {@const href = sanitizeHref(attachment.url)}
+      {#if href}
+        <a {href} class="card-link" target="_blank" rel="noopener noreferrer">
+          <div class="link-preview">
+            <div class="link-title">{attachment.title ?? attachment.url}</div>
+            {#if attachment.domain}
+              <div class="link-domain">{attachment.domain}</div>
+            {/if}
+          </div>
+        </a>
+      {:else}
         <div class="link-preview">
           <div class="link-title">{attachment.title ?? attachment.url}</div>
           {#if attachment.domain}
             <div class="link-domain">{attachment.domain}</div>
           {/if}
         </div>
-      </a>
+      {/if}
     {:else if attachment.type === 'code'}
       <div class="code-block">
         {#if attachment.title}

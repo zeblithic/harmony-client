@@ -1,12 +1,15 @@
 <script lang="ts">
-  import type { NotificationAction, NavNode, Peer } from '../types';
+  import type { NotificationAction, NavNode, Peer, TrustLevel } from '../types';
   import { NotificationService } from '../notification-service';
+  import type { TrustService } from '../trust-service';
 
-  let { service, peers, communities, onClose }: {
+  let { service, trustService, peers, communities, onClose, onTrustChange }: {
     service: NotificationService;
+    trustService?: TrustService;
     peers: Peer[];
     communities: NavNode[];
     onClose?: () => void;
+    onTrustChange?: () => void;
   } = $props();
 
   type Tab = 'global' | 'communities' | 'peers';
@@ -96,6 +99,59 @@
     service.clearCommunityPolicy(id);
     version++;
   }
+
+  const TRUST_LABELS: Record<TrustLevel, string> = {
+    untrusted: 'Untrusted',
+    preview: 'Preview (coming soon)',
+    trusted: 'Trusted',
+  };
+
+  // preview excluded until the feature is implemented — avoids persisting a value
+  // that silently falls through to blocked behavior
+  const TRUST_LEVELS: TrustLevel[] = ['untrusted', 'trusted'];
+
+  function getGlobalTrust(): TrustLevel {
+    void version;
+    return trustService?.settings.global ?? 'untrusted';
+  }
+
+  function setGlobalTrust(level: TrustLevel) {
+    trustService?.setGlobalTrust(level);
+    version++;
+    onTrustChange?.();
+  }
+
+  function getPeerTrust(address: string): TrustLevel | undefined {
+    void version;
+    return trustService?.settings.perPeer.get(address);
+  }
+
+  function setPeerTrust(address: string, level: TrustLevel | '') {
+    if (!trustService) return;
+    if (level === '') {
+      trustService.clearPeerTrust(address);
+    } else {
+      trustService.setPeerTrust(address, level);
+    }
+    version++;
+    onTrustChange?.();
+  }
+
+  function getCommunityTrust(id: string): TrustLevel | undefined {
+    void version;
+    return trustService?.settings.perCommunity.get(id);
+  }
+
+  function setCommunityTrust(id: string, level: TrustLevel | '') {
+    if (!trustService) return;
+    if (level === '') {
+      trustService.clearCommunityTrust(id);
+    } else {
+      trustService.setCommunityTrust(id, level);
+    }
+    version++;
+    onTrustChange?.();
+  }
 </script>
 
 <div class="settings-panel">
@@ -127,6 +183,23 @@
           </div>
         {/each}
       </div>
+
+      {#if trustService}
+        <div class="trust-section">
+          <div class="section-label">Media Trust</div>
+          <div class="policy-row">
+            <span class="policy-label">Default trust level</span>
+            <select
+              value={getGlobalTrust()}
+              onchange={(e) => setGlobalTrust((e.target as HTMLSelectElement).value as TrustLevel)}
+            >
+              {#each TRUST_LEVELS as level}
+                <option value={level}>{TRUST_LABELS[level]}</option>
+              {/each}
+            </select>
+          </div>
+        </div>
+      {/if}
 
     {:else if activeTab === 'communities'}
       {#each communities as comm (comm.id)}
@@ -169,6 +242,23 @@
               </div>
             {/each}
           </div>
+          {#if trustService}
+            <div class="trust-section">
+              <div class="section-label">Media Trust</div>
+              <div class="policy-row">
+                <span class="policy-label">Trust level</span>
+                <select
+                  value={getCommunityTrust(comm.id) ?? ''}
+                  onchange={(e) => setCommunityTrust(comm.id, (e.target as HTMLSelectElement).value as TrustLevel | '')}
+                >
+                  <option value="">Use default</option>
+                  {#each TRUST_LEVELS as level}
+                    <option value={level}>{TRUST_LABELS[level]}</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+          {/if}
         </div>
       {/each}
 
@@ -213,6 +303,23 @@
               </div>
             {/each}
           </div>
+          {#if trustService}
+            <div class="trust-section">
+              <div class="section-label">Media Trust</div>
+              <div class="policy-row">
+                <span class="policy-label">Trust level</span>
+                <select
+                  value={getPeerTrust(peer.address) ?? ''}
+                  onchange={(e) => setPeerTrust(peer.address, (e.target as HTMLSelectElement).value as TrustLevel | '')}
+                >
+                  <option value="">Use default</option>
+                  {#each TRUST_LEVELS as level}
+                    <option value={level}>{TRUST_LABELS[level]}</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -376,5 +483,20 @@
     font-size: 12px;
     color: var(--text-muted);
     font-style: italic;
+  }
+
+  .trust-section {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
   }
 </style>

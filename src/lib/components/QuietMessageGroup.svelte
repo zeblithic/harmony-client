@@ -1,12 +1,15 @@
 <script lang="ts">
   import type { Message } from '../types';
+  import type { TrustService } from '../trust-service';
   import TextMessage from './TextMessage.svelte';
 
-  let { messages, collapsed = false, onMediaClick, onAvatarClick }: {
+  let { messages, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0 }: {
     messages: Message[];
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
+    trustService?: TrustService;
+    trustVersion?: number;
   } = $props();
 
   let expanded = $state(false);
@@ -39,7 +42,7 @@
   {#if expanded}
     <div class="quiet-expanded">
       {#each messages as message (message.id)}
-        <TextMessage {message} {collapsed} {onMediaClick} {onAvatarClick} />
+        <TextMessage {message} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} />
       {/each}
     </div>
   {/if}
