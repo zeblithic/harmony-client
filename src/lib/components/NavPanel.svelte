@@ -8,11 +8,13 @@
     collapsed = false,
     onNodeClick,
     onSettingsClick,
+    profileLookup,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
     onNodeClick?: (id: string) => void;
     onSettingsClick?: () => void;
+    profileLookup?: (address: string) => string | undefined;
   } = $props();
 
   let navNodes = $state<NavNode[]>(nodes);
@@ -101,6 +103,7 @@
         onClick={onNodeClick}
         onDisplayModeChange={changeDisplayMode}
         onSortOrderChange={changeSortOrder}
+        {profileLookup}
       />
     </nav>
   {:else}

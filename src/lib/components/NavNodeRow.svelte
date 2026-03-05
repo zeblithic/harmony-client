@@ -2,7 +2,6 @@
   import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { NAV_PALETTE } from '../nav-utils';
   import Avatar from './Avatar.svelte';
-  import { profileStore } from '../mock-data';
 
   const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
   const DISPLAY_MODE_ICON: Record<DisplayMode, string> = {
@@ -26,6 +25,7 @@
     onClick,
     onDisplayModeChange,
     onSortOrderChange,
+    statusText,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -35,13 +35,10 @@
     onClick?: (id: string) => void;
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
     onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
+    statusText?: string;
   } = $props();
 
   let showSortMenu = $state(false);
-
-  let statusText = $derived(
-    node.peer ? profileStore.get(node.peer.address)?.statusText : undefined
-  );
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
 

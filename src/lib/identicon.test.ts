@@ -33,10 +33,11 @@ describe('generateIdenticon', () => {
     const rectMatches = [...svg.matchAll(/x="(\d+)" y="(\d+)"/g)];
     const cells = rectMatches.map((m) => ({ x: Number(m[1]), y: Number(m[2]) }));
 
+    // Use grid width (5 columns: 0-4) for mirror axis, not maxX of actual cells
+    const GRID_MAX = 4;
     if (cells.length > 0) {
-      const maxX = Math.max(...cells.map((c) => c.x));
       for (const cell of cells) {
-        const mirrorX = maxX - cell.x;
+        const mirrorX = GRID_MAX - cell.x;
         const hasMirror = cells.some((c) => c.x === mirrorX && c.y === cell.y);
         expect(hasMirror).toBe(true);
       }
@@ -53,5 +54,16 @@ describe('generateIdenticon', () => {
     const svg = generateIdenticon('a1b2c3d4');
     expect(svg).toContain('width="64"');
     expect(svg).toContain('height="64"');
+  });
+
+  it('sanitizes address input — strips non-alphanumeric characters', () => {
+    const safe = generateIdenticon('a1b2<script>alert(1)</script>');
+    expect(safe).not.toContain('<script>');
+    expect(safe).toContain('<svg');
+  });
+
+  it('handles empty address after sanitization', () => {
+    const svg = generateIdenticon('<<<>>>');
+    expect(svg).toContain('<svg');
   });
 });

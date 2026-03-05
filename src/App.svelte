@@ -107,7 +107,7 @@
 
 <Layout {collapsed} {showSettings}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} />
+    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} onAvatarClick={handleAvatarClick} />

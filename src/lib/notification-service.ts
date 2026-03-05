@@ -77,14 +77,14 @@ export class NotificationService {
     communityId?: string,
   ): string | undefined {
     const peerSounds = this.settings.perPeerSounds.get(peerAddress);
-    if (peerSounds?.[priority]) return peerSounds[priority];
+    if (peerSounds?.[priority] !== undefined) return peerSounds[priority];
 
     if (communityId) {
       const commSounds = this.settings.perCommunitySounds.get(communityId);
-      if (commSounds?.[priority]) return commSounds[priority];
+      if (commSounds?.[priority] !== undefined) return commSounds[priority];
     }
 
-    if (senderProfile.notificationSounds?.[priority]) {
+    if (senderProfile.notificationSounds?.[priority] !== undefined) {
       return senderProfile.notificationSounds[priority];
     }
 

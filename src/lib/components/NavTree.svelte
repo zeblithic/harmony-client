@@ -11,6 +11,7 @@
     onClick,
     onDisplayModeChange,
     onSortOrderChange,
+    profileLookup,
   }: {
     nodes: NavNode[];
     parentId: string | null;
@@ -18,6 +19,7 @@
     onClick?: (id: string) => void;
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
     onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
+    profileLookup?: (address: string) => string | undefined;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
@@ -37,6 +39,7 @@
     colorAncestry={ancestry}
     displayMode={dm}
     isLastChild={isLast}
+    statusText={child.peer && profileLookup ? profileLookup(child.peer.address) : undefined}
     {onToggle}
     {onClick}
     {onDisplayModeChange}
@@ -44,6 +47,6 @@
   />
 
   {#if child.type === 'folder' && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} />
+    <NavTree nodes={nodes} parentId={child.id} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} />
   {/if}
 {/each}
