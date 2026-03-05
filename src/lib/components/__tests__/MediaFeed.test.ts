@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import { describe, it, expect } from 'vitest';
 import MediaFeed from '../MediaFeed.svelte';
+import { TrustService } from '../../trust-service';
 import type { Message } from '../../types';
 
 const messagesWithMedia: Message[] = [
@@ -32,7 +33,9 @@ const messagesWithMedia: Message[] = [
 
 describe('MediaFeed', () => {
   it('renders only messages that have media', () => {
-    render(MediaFeed, { props: { messages: messagesWithMedia } });
+    const trustService = new TrustService();
+    trustService.setGlobalTrust('trusted');
+    render(MediaFeed, { props: { messages: messagesWithMedia, trustService } });
     expect(screen.getByText('Alice')).toBeTruthy();
     expect(screen.getByText('Carol')).toBeTruthy();
     expect(screen.queryByText('Bob')).toBeNull();
@@ -42,7 +45,7 @@ describe('MediaFeed', () => {
     const noMedia: Message[] = [
       { id: 'm1', sender: { address: 'x', displayName: 'X' }, text: 'hi', timestamp: Date.now(), media: [], priority: 'standard' },
     ];
-    render(MediaFeed, { props: { messages: noMedia } });
+    render(MediaFeed, { props: { messages: noMedia, trustService: new TrustService() } });
     expect(screen.getByText('No media yet')).toBeTruthy();
   });
 });
