@@ -21,9 +21,13 @@
   function handleAvatarClick(address: string, event: MouseEvent) {
     const profile = profileStore.get(address);
     if (!profile) return;
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    popoverX = rect.right + 8;
-    popoverY = rect.top;
+    const el = (event.target as HTMLElement).closest('.avatar') as HTMLElement | null;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const POPOVER_WIDTH = 300;
+    const POPOVER_HEIGHT = 220;
+    popoverX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
+    popoverY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
     popoverProfile = profile;
   }
 

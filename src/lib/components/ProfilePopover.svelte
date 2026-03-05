@@ -19,7 +19,7 @@
     }
     function onClickOutside(e: MouseEvent) {
       const target = e.target as HTMLElement;
-      if (!target.closest('.profile-popover')) {
+      if (!target.closest('.profile-popover') && !target.closest('.avatar.interactive')) {
         close();
       }
     }
@@ -103,6 +103,7 @@
     margin-top: 4px;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .popover-sounds {

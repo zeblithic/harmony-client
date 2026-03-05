@@ -18,7 +18,8 @@
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
-  <button class="card-header" onclick={() => onLinkBack?.(message.id)}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="card-header" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if (e.key === 'Enter') onLinkBack?.(message.id); }}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
@@ -28,7 +29,7 @@
     <span class="card-sender">{message.sender.displayName}</span>
     <span class="card-time">{timeStr}</span>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
-  </button>
+  </div>
 
   <div class="card-content">
     {#if attachment.type === 'image'}
