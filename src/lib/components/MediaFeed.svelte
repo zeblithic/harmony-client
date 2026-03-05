@@ -30,6 +30,7 @@
     <div class="empty-state">No media yet</div>
   {:else}
     {#each mediaItems as { message, attachment } (attachment.id)}
+      <!-- communityId not yet available on Message; per-community trust will apply once content transport provides context -->
       {#if TrustService.isGated(attachment) && trustService.resolve(message.sender.address) !== 'trusted' && !trustService.isLoaded(attachment.id)}
         <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} />
       {:else}
