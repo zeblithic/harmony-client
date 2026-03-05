@@ -4,13 +4,15 @@
   import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
-  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0 }: {
+  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage }: {
     message: Message;
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     trustService?: TrustService;
     trustVersion?: number;
+    allMessages?: Message[];
+    onScrollToMessage?: (messageId: string) => void;
   } = $props();
 
   let timeStr = $derived(
@@ -18,6 +20,14 @@
       hour: '2-digit',
       minute: '2-digit',
     })
+  );
+
+  let parentMessage = $derived(
+    message.replyTo ? allMessages.find(m => m.id === message.replyTo) : undefined
+  );
+
+  let parentPreview = $derived(
+    parentMessage ? parentMessage.text.slice(0, 50) + (parentMessage.text.length > 50 ? '...' : '') : ''
   );
 
   function isBlocked(attachment: import('../types').MediaAttachment): boolean {
@@ -43,6 +53,17 @@
       <span class="sender-name">{message.sender.displayName}</span>
       <span class="timestamp">{timeStr}</span>
     </div>
+    {#if parentMessage}
+      <button
+        class="reply-to-header"
+        onclick={() => onScrollToMessage?.(parentMessage.id)}
+        aria-label="In reply to {parentMessage.sender.displayName}: {parentPreview}"
+      >
+        <span class="reply-to-icon">↩</span>
+        <span class="reply-to-sender">{parentMessage.sender.displayName}</span>
+        <span class="reply-to-text">{parentPreview}</span>
+      </button>
+    {/if}
     <div class="message-text">{message.text}</div>
     {#if message.media.length > 0}
       <div class="media-indicators">
@@ -225,6 +246,39 @@
     font-size: 13px;
     overflow-x: auto;
     color: var(--text-secondary);
+  }
+
+  .reply-to-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 0;
+    margin-bottom: 2px;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .reply-to-header:hover {
+    color: var(--accent);
+  }
+
+  .reply-to-icon {
+    font-size: 12px;
+  }
+
+  .reply-to-sender {
+    font-weight: 600;
+  }
+
+  .reply-to-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
   }
 
   .text-message.loud {

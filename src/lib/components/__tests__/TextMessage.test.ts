@@ -88,4 +88,33 @@ describe('TextMessage', () => {
     const el = container.querySelector('.text-message');
     expect(el?.classList.contains('loud')).toBe(false);
   });
+
+  it('shows reply-to header when replyTo is set', () => {
+    const replyMsg: Message = {
+      ...mockMessage,
+      id: 'reply-1',
+      replyTo: 'parent-1',
+    };
+    const parentMsg: Message = {
+      ...mockMessage,
+      id: 'parent-1',
+      text: 'This is the parent message with some long text that should be truncated',
+    };
+    render(TextMessage, {
+      props: {
+        message: replyMsg,
+        allMessages: [parentMsg, replyMsg],
+        trustService: trustedService(),
+      },
+    });
+    expect(screen.getByText(/↩/)).toBeTruthy();
+    expect(screen.getAllByText(/Alice/).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not show reply-to header when replyTo is not set', () => {
+    render(TextMessage, {
+      props: { message: mockMessage, trustService: trustedService() },
+    });
+    expect(screen.queryByText(/↩/)).toBeNull();
+  });
 });
