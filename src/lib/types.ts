@@ -38,7 +38,6 @@ export interface NavNode {
   type: NavNodeType;
   name: string;
   icon?: string;
-  colorIndex?: number;
   expanded: boolean;
   displayMode?: DisplayMode;
   sortOrder?: SortOrder;

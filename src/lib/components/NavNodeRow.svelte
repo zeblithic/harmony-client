@@ -139,7 +139,7 @@
   {#if node.type === 'folder' && node.expanded}
     <span class="bracket bracket-open">{'\u250C'}</span>
   {/if}
-  {#if isLastChild && colorAncestry.length > 0 && !(node.type === 'folder' && node.expanded)}
+  {#if isLastChild && colorAncestry.length > 0}
     <span class="bracket bracket-close">{'\u2518'}</span>
   {/if}
 </div>

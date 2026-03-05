@@ -49,8 +49,9 @@
     const q = searchQuery.trim().toLowerCase();
     if (!q) return navNodes;
 
-    // Find nodes whose names match
+    // Find nodes whose names match and their ancestor folders
     const matchIds = new Set<string>();
+    const ancestorIds = new Set<string>();
     for (const node of navNodes) {
       if (node.name.toLowerCase().includes(q)) {
         matchIds.add(node.id);
@@ -58,6 +59,7 @@
         let current = node;
         while (current.parentId !== null) {
           matchIds.add(current.parentId);
+          ancestorIds.add(current.parentId);
           const parent = findNode(navNodes, current.parentId);
           if (!parent) break;
           current = parent;
@@ -69,7 +71,7 @@
     return navNodes
       .filter((n) => matchIds.has(n.id))
       .map((n) =>
-        n.type === 'folder'
+        n.type === 'folder' && ancestorIds.has(n.id)
           ? { ...n, expanded: true }
           : n
       );
