@@ -71,6 +71,24 @@
     border-left: 3px solid var(--accent);
     border-radius: 0 8px 8px 0;
     position: relative;
+    transition: opacity 0.2s ease, max-height 0.3s ease;
+    overflow: hidden;
+  }
+
+  .thread-card.exiting {
+    opacity: 0;
+    max-height: 0 !important;
+    padding: 0;
+    margin: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .thread-card {
+      transition: none;
+    }
+    .thread-card.exiting {
+      display: none;
+    }
   }
 
   .thread-tag {
