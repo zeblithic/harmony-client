@@ -93,7 +93,16 @@
   });
 
   let showThreadPanel = $derived(threadRoot !== null && openThreadId !== null);
+
+  function handleGlobalKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && showThreadPanel) {
+      e.preventDefault();
+      onThreadClose?.();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeyDown} />
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
