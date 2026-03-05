@@ -4,10 +4,11 @@
   import MediaCard from './MediaCard.svelte';
   import UntrustedMediaCard from './UntrustedMediaCard.svelte';
 
-  let { messages, trustService, trustVersion = 0, onLinkBack, onAvatarClick, onTrustChange }: {
+  let { messages, trustService, trustVersion = 0, threadMessageIds = new Set<string>(), onLinkBack, onAvatarClick, onTrustChange }: {
     messages: Message[];
     trustService: TrustService;
     trustVersion?: number;
+    threadMessageIds?: Set<string>;
     onLinkBack?: (messageId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     onTrustChange?: () => void;
@@ -37,12 +38,17 @@
     <div class="empty-state">No media yet</div>
   {:else}
     {#each mediaItems as { message, attachment } (attachment.id)}
-      <!-- communityId not yet available on Message; per-community trust will apply once content transport provides context -->
-      {#if isTrustGated(attachment, message.sender.address)}
-        <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} />
-      {:else}
-        <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} />
-      {/if}
+      <div class={threadMessageIds.has(message.id) ? 'thread-card' : ''}>
+        <!-- communityId not yet available on Message; per-community trust will apply once content transport provides context -->
+        {#if isTrustGated(attachment, message.sender.address)}
+          <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} />
+        {:else}
+          <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} />
+        {/if}
+        {#if threadMessageIds.has(message.id)}
+          <span class="thread-tag">in thread</span>
+        {/if}
+      </div>
     {/each}
   {/if}
 </div>
@@ -59,5 +65,20 @@
     text-align: center;
     padding: 40px 20px;
     font-size: 14px;
+  }
+
+  .thread-card {
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    position: relative;
+  }
+
+  .thread-tag {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-size: 11px;
+    color: var(--accent);
+    opacity: 0.7;
   }
 </style>
