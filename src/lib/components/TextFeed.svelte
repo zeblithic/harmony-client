@@ -27,7 +27,6 @@
     onThreadSend,
     onScrollToMessage,
     pinnedThreadIds = new Set(),
-    visibleThreadIds = new Set(),
   }: {
     messages: Message[];
     collapsed?: boolean;
@@ -45,8 +44,16 @@
     onThreadSend?: (text: string, priority: MessagePriority) => void;
     onScrollToMessage?: (messageId: string) => void;
     pinnedThreadIds?: Set<string>;
-    visibleThreadIds?: Set<string>;
   } = $props();
+
+  let visibleThreadIds = $state(new Set<string>());
+
+  function handleThreadVisibility(rootId: string, visible: boolean) {
+    const next = new Set(visibleThreadIds);
+    if (visible) next.add(rootId);
+    else next.delete(rootId);
+    visibleThreadIds = next;
+  }
 
   let feedItems = $derived(groupMessages(messages));
 
@@ -143,6 +150,7 @@
               rootId={item.message.id}
               isOpen={openThreadId === item.message.id}
               onOpen={onThreadOpen}
+              onVisibilityChange={handleThreadVisibility}
             />
           {/if}
         {:else}

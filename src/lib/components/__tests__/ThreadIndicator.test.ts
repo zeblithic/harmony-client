@@ -1,7 +1,28 @@
 import { render, screen } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import ThreadIndicator from '../ThreadIndicator.svelte';
 import type { Peer } from '../../types';
+
+// IntersectionObserver mock
+let observerCallback: IntersectionObserverCallback;
+let observedElements: Element[] = [];
+const mockDisconnect = vi.fn();
+
+class MockIntersectionObserver {
+  constructor(callback: IntersectionObserverCallback) {
+    observerCallback = callback;
+  }
+  observe(el: Element) { observedElements.push(el); }
+  unobserve(el: Element) { observedElements = observedElements.filter(e => e !== el); }
+  disconnect() { mockDisconnect(); observedElements = []; }
+}
+
+function simulateIntersection(el: Element, isIntersecting: boolean) {
+  observerCallback(
+    [{ target: el, isIntersecting } as IntersectionObserverEntry],
+    {} as IntersectionObserver,
+  );
+}
 
 const participants: Peer[] = [
   { address: 'a', displayName: 'Alice' },
@@ -9,6 +30,16 @@ const participants: Peer[] = [
 ];
 
 describe('ThreadIndicator', () => {
+  beforeEach(() => {
+    observedElements = [];
+    mockDisconnect.mockClear();
+    vi.stubGlobal('IntersectionObserver', MockIntersectionObserver);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('shows reply count and participant names', () => {
     render(ThreadIndicator, {
       props: { count: 3, participants, rootId: 'root-1' },
@@ -53,5 +84,30 @@ describe('ThreadIndicator', () => {
     const btn = screen.getByRole('button');
     expect(btn.getAttribute('aria-label')).toContain('3 replies');
     expect(btn.getAttribute('aria-label')).toContain('Alice');
+  });
+
+  it('calls onVisibilityChange when intersection changes', async () => {
+    const onVisibilityChange = vi.fn();
+    render(ThreadIndicator, {
+      props: { count: 2, participants, rootId: 'root-1', onVisibilityChange },
+    });
+    await vi.waitFor(() => expect(observedElements.length).toBe(1));
+    const el = observedElements[0];
+
+    simulateIntersection(el, true);
+    expect(onVisibilityChange).toHaveBeenCalledWith('root-1', true);
+
+    simulateIntersection(el, false);
+    expect(onVisibilityChange).toHaveBeenCalledWith('root-1', false);
+  });
+
+  it('disconnects observer on unmount', async () => {
+    const onVisibilityChange = vi.fn();
+    const { unmount } = render(ThreadIndicator, {
+      props: { count: 1, participants: [participants[0]], rootId: 'root-1', onVisibilityChange },
+    });
+    await vi.waitFor(() => expect(observedElements.length).toBe(1));
+    unmount();
+    expect(mockDisconnect).toHaveBeenCalled();
   });
 });

@@ -1,13 +1,26 @@
 <script lang="ts">
   import type { Peer } from '../types';
 
-  let { count, participants, rootId, isOpen = false, onOpen }: {
+  let { count, participants, rootId, isOpen = false, onOpen, onVisibilityChange }: {
     count: number;
     participants: Peer[];
     rootId: string;
     isOpen?: boolean;
     onOpen?: (rootId: string) => void;
+    onVisibilityChange?: (rootId: string, visible: boolean) => void;
   } = $props();
+
+  let el: HTMLButtonElement | undefined = $state();
+
+  $effect(() => {
+    if (!el || !onVisibilityChange) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => onVisibilityChange(rootId, entry.isIntersecting),
+      { threshold: 0 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
 
   let nameList = $derived.by(() => {
     const names = participants.slice(0, 3).map(p => p.displayName);
@@ -24,6 +37,7 @@
 </script>
 
 <button
+  bind:this={el}
   class="thread-indicator"
   class:open={isOpen}
   onclick={() => onOpen?.(rootId)}
