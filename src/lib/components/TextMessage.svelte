@@ -21,6 +21,7 @@
   <Avatar
     address={message.sender.address}
     displayName={message.sender.displayName}
+    avatarUrl={message.sender.avatarUrl}
     size={24}
     onclick={onAvatarClick ? (e) => onAvatarClick(message.sender.address, e) : undefined}
   />

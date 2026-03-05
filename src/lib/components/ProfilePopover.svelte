@@ -37,7 +37,7 @@
 
 <div class="profile-popover" style="left: {x}px; top: {y}px;">
   <div class="popover-header">
-    <Avatar address={profile.address} displayName={profile.displayName} size={64} />
+    <Avatar address={profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
     <div class="popover-identity">
       <div class="popover-name">{profile.displayName}</div>
       {#if profile.statusText}
@@ -52,7 +52,7 @@
       <div class="sound-row">
         <span class="sound-slot">{SOUND_LABELS[slot]}</span>
         <span class="sound-value">
-          {profile.notificationSounds?.[slot] ?? 'System default'}
+          {profile.notificationSounds?.[slot] || 'System default'}
         </span>
       </div>
     {/each}

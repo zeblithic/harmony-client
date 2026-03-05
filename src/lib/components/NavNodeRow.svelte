@@ -97,7 +97,7 @@
   <span class="row-content" style="padding-left: {paddingLeft}px">
     {#if displayMode === 'icon'}
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
-        <Avatar address={node.peer.address} displayName={node.peer.displayName} size={32} />
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={32} />
       {:else}
         <span class="icon-cell">
           {node.name.charAt(0).toUpperCase()}
@@ -107,10 +107,10 @@
       <!-- Text or both mode -->
       <span class="type-icon">{typeIcon(node)}</span>
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
-        <Avatar address={node.peer.address} displayName={node.peer.displayName} size={20} />
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
       <span class="node-name">
-        {node.name}
+        <span class="name-text">{node.name}</span>
         {#if statusText}
           <span class="status-text">{statusText}</span>
         {/if}
@@ -200,6 +200,12 @@
 
   .node-name {
     flex: 1;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .name-text {
+    display: block;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

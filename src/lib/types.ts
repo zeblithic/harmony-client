@@ -12,7 +12,9 @@ export interface SoundOverrides {
 
 export interface Profile extends Peer {
   statusText?: string;
+  /** CID for full-size avatar — resolved via content transport (future) */
   avatarCid?: string;
+  /** CID for thumbnail avatar — resolved via content transport (future) */
   avatarMiniCid?: string;
   notificationSounds?: SoundOverrides;
 }

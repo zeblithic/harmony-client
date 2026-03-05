@@ -7,6 +7,7 @@
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
+  // TODO: Replace mock-data imports with real data sources once content transport is wired up
   import { messages, navNodes, profileStore } from './lib/mock-data';
   import type { MessagePriority, Profile } from './lib/types';
 

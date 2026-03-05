@@ -22,6 +22,7 @@
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
+      avatarUrl={message.sender.avatarUrl}
       size={20}
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
