@@ -2,10 +2,11 @@
   import type { Message } from '../types';
   import Avatar from './Avatar.svelte';
 
-  let { message, collapsed = false, onMediaClick }: {
+  let { message, collapsed = false, onMediaClick, onAvatarClick }: {
     message: Message;
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
+    onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
   let timeStr = $derived(
@@ -21,6 +22,7 @@
     address={message.sender.address}
     displayName={message.sender.displayName}
     size={24}
+    onclick={(e) => onAvatarClick?.(message.sender.address, e)}
   />
   <div class="message-content">
     <div class="message-header">

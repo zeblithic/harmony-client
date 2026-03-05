@@ -5,11 +5,12 @@
   import QuietMessageGroup from './QuietMessageGroup.svelte';
   import ComposeBar from './ComposeBar.svelte';
 
-  let { messages, collapsed = false, onMediaClick, onSend }: {
+  let { messages, collapsed = false, onMediaClick, onSend, onAvatarClick }: {
     messages: Message[];
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
     onSend?: (text: string, priority: MessagePriority) => void;
+    onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
   let feedItems = $derived(groupMessages(messages));
@@ -19,9 +20,9 @@
   <div class="messages-scroll">
     {#each feedItems as item (item.kind === 'message' ? item.message.id : `quiet-${item.messages[0].id}`)}
       {#if item.kind === 'message'}
-        <TextMessage message={item.message} {collapsed} {onMediaClick} />
+        <TextMessage message={item.message} {collapsed} {onMediaClick} {onAvatarClick} />
       {:else}
-        <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} />
+        <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} {onAvatarClick} />
       {/if}
     {/each}
   </div>

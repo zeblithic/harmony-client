@@ -2,10 +2,11 @@
   import type { Message, MediaAttachment } from '../types';
   import Avatar from './Avatar.svelte';
 
-  let { message, attachment, onLinkBack }: {
+  let { message, attachment, onLinkBack, onAvatarClick }: {
     message: Message;
     attachment: MediaAttachment;
     onLinkBack?: (messageId: string) => void;
+    onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
   let timeStr = $derived(
@@ -22,6 +23,7 @@
       address={message.sender.address}
       displayName={message.sender.displayName}
       size={20}
+      onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
     <span class="card-sender">{message.sender.displayName}</span>
     <span class="card-time">{timeStr}</span>

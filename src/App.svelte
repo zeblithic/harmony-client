@@ -5,13 +5,31 @@
   import TextFeed from './lib/components/TextFeed.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
+  import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
-  import { messages, navNodes } from './lib/mock-data';
-  import type { MessagePriority } from './lib/types';
+  import { messages, navNodes, profileStore } from './lib/mock-data';
+  import type { MessagePriority, Profile } from './lib/types';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
+
+  let popoverProfile = $state<Profile | null>(null);
+  let popoverX = $state(0);
+  let popoverY = $state(0);
+
+  function handleAvatarClick(address: string, event: MouseEvent) {
+    const profile = profileStore.get(address);
+    if (!profile) return;
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    popoverX = rect.right + 8;
+    popoverY = rect.top;
+    popoverProfile = profile;
+  }
+
+  function closePopover() {
+    popoverProfile = null;
+  }
 
   const notificationService = new NotificationService();
 
@@ -84,10 +102,10 @@
     <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} />
   {/snippet}
   {#snippet textFeed()}
-    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} />
+    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} onAvatarClick={handleAvatarClick} />
   {/snippet}
   {#snippet mediaFeed()}
-    <MediaFeed messages={allMessages} onLinkBack={scrollToMessage} />
+    <MediaFeed messages={allMessages} onLinkBack={scrollToMessage} onAvatarClick={handleAvatarClick} />
   {/snippet}
   {#snippet settingsPanel()}
     <NotificationSettingsPanel
@@ -98,6 +116,15 @@
     />
   {/snippet}
 </Layout>
+
+{#if popoverProfile}
+  <ProfilePopover
+    profile={popoverProfile}
+    x={popoverX}
+    y={popoverY}
+    onClose={closePopover}
+  />
+{/if}
 
 <style>
   :global(.text-message) {
