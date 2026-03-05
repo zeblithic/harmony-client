@@ -27,12 +27,6 @@ export interface Message {
   media: MediaAttachment[];
 }
 
-export interface Channel {
-  id: string;
-  name: string;
-  unreadCount: number;
-}
-
 export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat';
 export type DisplayMode = 'text' | 'icon' | 'both';
 export type SortOrder = 'activity' | 'pinned' | 'alphabetical';

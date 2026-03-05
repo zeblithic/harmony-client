@@ -4,7 +4,7 @@
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
-  import { messages, channels } from './lib/mock-data';
+  import { messages, navNodes } from './lib/mock-data';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -30,7 +30,7 @@
 
 <Layout {collapsed}>
   {#snippet nav()}
-    <NavPanel {channels} {collapsed} />
+    <NavPanel nodes={navNodes} {collapsed} />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed {messages} {collapsed} onMediaClick={scrollToMedia} />
