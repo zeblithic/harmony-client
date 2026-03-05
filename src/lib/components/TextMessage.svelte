@@ -22,8 +22,8 @@
 
   function isBlocked(attachment: import('../types').MediaAttachment): boolean {
     void trustVersion;
-    if (!trustService) return false;
     if (!TrustService.isGated(attachment)) return false;
+    if (!trustService) return true;  // fail-closed: no trust service means block
     const level = trustService.resolve(message.sender.address);
     if (level === 'trusted') return false;
     return !trustService.isLoaded(attachment.id);

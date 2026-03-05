@@ -2,6 +2,9 @@ import type { MediaAttachment, TrustLevel, TrustSettings } from './types';
 
 export class TrustService {
   readonly settings: TrustSettings;
+  // Session-scoped: tracks which attachments the user has manually confirmed.
+  // Intentionally never pruned — entries are small strings and the set resets
+  // when the app restarts. clearLoaded() exists for testing.
   private loadedAttachments = new Set<string>();
 
   constructor() {

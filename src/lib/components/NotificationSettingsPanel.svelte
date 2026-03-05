@@ -106,7 +106,9 @@
     trusted: 'Trusted',
   };
 
-  const TRUST_LEVELS: TrustLevel[] = ['untrusted', 'preview', 'trusted'];
+  // preview excluded until the feature is implemented — avoids persisting a value
+  // that silently falls through to blocked behavior
+  const TRUST_LEVELS: TrustLevel[] = ['untrusted', 'trusted'];
 
   function getGlobalTrust(): TrustLevel {
     void version;
@@ -192,7 +194,7 @@
               onchange={(e) => setGlobalTrust((e.target as HTMLSelectElement).value as TrustLevel)}
             >
               {#each TRUST_LEVELS as level}
-                <option value={level} disabled={level === 'preview'}>{TRUST_LABELS[level]}</option>
+                <option value={level}>{TRUST_LABELS[level]}</option>
               {/each}
             </select>
           </div>
@@ -251,7 +253,7 @@
                 >
                   <option value="">Use default</option>
                   {#each TRUST_LEVELS as level}
-                    <option value={level} disabled={level === 'preview'}>{TRUST_LABELS[level]}</option>
+                    <option value={level}>{TRUST_LABELS[level]}</option>
                   {/each}
                 </select>
               </div>
@@ -312,7 +314,7 @@
                 >
                   <option value="">Use default</option>
                   {#each TRUST_LEVELS as level}
-                    <option value={level} disabled={level === 'preview'}>{TRUST_LABELS[level]}</option>
+                    <option value={level}>{TRUST_LABELS[level]}</option>
                   {/each}
                 </select>
               </div>

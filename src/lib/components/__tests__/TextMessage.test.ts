@@ -1,7 +1,14 @@
 import { render, screen } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import TextMessage from '../TextMessage.svelte';
+import { TrustService } from '../../trust-service';
 import type { Message } from '../../types';
+
+function trustedService(): TrustService {
+  const ts = new TrustService();
+  ts.setGlobalTrust('trusted');
+  return ts;
+}
 
 const mockMessage: Message = {
   id: 'test-1',
@@ -38,14 +45,14 @@ describe('TextMessage', () => {
 
   it('shows media indicator pill when not collapsed', () => {
     render(TextMessage, {
-      props: { message: mockMessageWithMedia, collapsed: false },
+      props: { message: mockMessageWithMedia, collapsed: false, trustService: trustedService() },
     });
     expect(screen.getByText('example.com')).toBeTruthy();
   });
 
   it('shows inline embed when collapsed', () => {
     render(TextMessage, {
-      props: { message: mockMessageWithMedia, collapsed: true },
+      props: { message: mockMessageWithMedia, collapsed: true, trustService: trustedService() },
     });
     expect(screen.getByText('Example Site')).toBeTruthy();
   });
@@ -57,6 +64,7 @@ describe('TextMessage', () => {
         message: mockMessageWithMedia,
         collapsed: false,
         onMediaClick: onClick,
+        trustService: trustedService(),
       },
     });
     const pill = screen.getByText('example.com').closest('button');

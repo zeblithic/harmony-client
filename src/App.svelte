@@ -52,9 +52,6 @@
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
 
-  // Demo: trust one peer to show the difference
-  trustService.setPeerTrust('a1b2c3d4', 'trusted');
-
   let allMessages = $state([...messages]);
 
   function scrollToMedia(mediaId: string) {
