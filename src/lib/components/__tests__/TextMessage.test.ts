@@ -9,6 +9,7 @@ const mockMessage: Message = {
   text: 'Hello world',
   timestamp: new Date('2026-03-04T12:00:00Z').getTime(),
   media: [],
+  priority: 'standard',
 };
 
 const mockMessageWithMedia: Message = {
@@ -25,6 +26,7 @@ const mockMessageWithMedia: Message = {
       domain: 'example.com',
     },
   ],
+  priority: 'standard',
 };
 
 describe('TextMessage', () => {
