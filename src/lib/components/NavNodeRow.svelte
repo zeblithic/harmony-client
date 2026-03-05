@@ -57,8 +57,7 @@
 
   function cycleDisplayMode(e: MouseEvent) {
     e.stopPropagation();
-    const current = node.displayMode ?? 'text';
-    const idx = DISPLAY_MODE_CYCLE.indexOf(current);
+    const idx = DISPLAY_MODE_CYCLE.indexOf(displayMode);
     const next = DISPLAY_MODE_CYCLE[(idx + 1) % DISPLAY_MODE_CYCLE.length];
     onDisplayModeChange?.(node.id, next);
   }
@@ -123,7 +122,7 @@
   <!-- Folder controls -->
   {#if node.type === 'folder'}
     <button class="sort-trigger" onclick={toggleSortMenu}>{'\u2195'}</button>
-    <button class="mode-toggle" onclick={cycleDisplayMode}>{DISPLAY_MODE_ICON[node.displayMode ?? 'text']}</button>
+    <button class="mode-toggle" onclick={cycleDisplayMode}>{DISPLAY_MODE_ICON[displayMode]}</button>
     {#if showSortMenu}
       <div class="sort-menu">
         {#each SORT_OPTIONS as opt}
@@ -140,7 +139,7 @@
   {#if node.type === 'folder' && node.expanded}
     <span class="bracket bracket-open">{'\u250C'}</span>
   {/if}
-  {#if isLastChild && colorAncestry.length > 0}
+  {#if isLastChild && colorAncestry.length > 0 && !(node.type === 'folder' && node.expanded)}
     <span class="bracket bracket-close">{'\u2518'}</span>
   {/if}
 </div>

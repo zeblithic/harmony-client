@@ -13,7 +13,7 @@
     onNodeClick?: (id: string) => void;
   } = $props();
 
-  let navNodes = $state<NavNode[]>([]);
+  let navNodes = $state<NavNode[]>(nodes);
   let searchQuery = $state('');
 
   $effect(() => {
@@ -69,7 +69,7 @@
     return navNodes
       .filter((n) => matchIds.has(n.id))
       .map((n) =>
-        n.type === 'folder' && matchIds.has(n.id)
+        n.type === 'folder'
           ? { ...n, expanded: true }
           : n
       );
