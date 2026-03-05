@@ -1,4 +1,4 @@
-import type { Peer, Message, Channel } from './types';
+import type { Peer, Message, NavNode } from './types';
 
 export const peers: Peer[] = [
   { address: 'a1b2c3d4', displayName: 'Alice', avatarUrl: undefined },
@@ -184,10 +184,158 @@ let address: [u8; 16] = hash[..16]
   },
 ];
 
-export const channels: Channel[] = [
-  { id: 'ch-general', name: 'general', unreadCount: 3 },
-  { id: 'ch-crypto', name: 'crypto', unreadCount: 0 },
-  { id: 'ch-transport', name: 'transport', unreadCount: 1 },
-  { id: 'ch-voice', name: 'voice', unreadCount: 0 },
-  { id: 'ch-testing', name: 'testing', unreadCount: 5 },
+const now = Date.now();
+
+export const navNodes: NavNode[] = [
+  // Top-level: Work folder
+  {
+    id: 'work',
+    parentId: null,
+    type: 'folder',
+    name: 'Work',
+    expanded: true,
+    sortOrder: 'activity',
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 10 * 60_000,
+  },
+  // Work > Harmony Dev folder
+  {
+    id: 'harmony-dev',
+    parentId: 'work',
+    type: 'folder',
+    name: 'Harmony Dev',
+    expanded: true,
+    sortOrder: 'activity',
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 10 * 60_000,
+  },
+  // Work > Harmony Dev > #general
+  {
+    id: 'general',
+    parentId: 'harmony-dev',
+    type: 'channel',
+    name: 'general',
+    expanded: false,
+    unreadCount: 3,
+    unreadLevel: 'standard',
+    lastActivity: now - 5 * 60_000,
+  },
+  // Work > Harmony Dev > #crypto
+  {
+    id: 'crypto',
+    parentId: 'harmony-dev',
+    type: 'channel',
+    name: 'crypto',
+    expanded: false,
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 2 * hour,
+  },
+  // Work > Harmony Dev > #transport
+  {
+    id: 'transport',
+    parentId: 'harmony-dev',
+    type: 'channel',
+    name: 'transport',
+    expanded: false,
+    unreadCount: 1,
+    unreadLevel: 'quiet',
+    lastActivity: now - 30 * 60_000,
+  },
+  // Work > IPFS Crew folder
+  {
+    id: 'ipfs-crew',
+    parentId: 'work',
+    type: 'folder',
+    name: 'IPFS Crew',
+    expanded: true,
+    sortOrder: 'alphabetical',
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 45 * 60_000,
+  },
+  // Work > IPFS Crew > #mesh
+  {
+    id: 'mesh',
+    parentId: 'ipfs-crew',
+    type: 'channel',
+    name: 'mesh',
+    expanded: false,
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 3 * hour,
+  },
+  // Work > IPFS Crew > #routing
+  {
+    id: 'routing',
+    parentId: 'ipfs-crew',
+    type: 'channel',
+    name: 'routing',
+    expanded: false,
+    unreadCount: 2,
+    unreadLevel: 'loud',
+    lastActivity: now - 15 * 60_000,
+  },
+  // Work > Alice (DM)
+  {
+    id: 'alice-dm',
+    parentId: 'work',
+    type: 'dm',
+    name: 'Alice',
+    expanded: false,
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - hour,
+    peer: peers[0],
+  },
+  // Top-level: Friends folder
+  {
+    id: 'friends',
+    parentId: null,
+    type: 'folder',
+    name: 'Friends',
+    expanded: true,
+    sortOrder: 'pinned',
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 20 * 60_000,
+  },
+  // Friends > Bob (DM)
+  {
+    id: 'bob-dm',
+    parentId: 'friends',
+    type: 'dm',
+    name: 'Bob',
+    expanded: false,
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 2 * hour,
+    peer: peers[1],
+  },
+  // Friends > Carol (DM)
+  {
+    id: 'carol-dm',
+    parentId: 'friends',
+    type: 'dm',
+    name: 'Carol',
+    expanded: false,
+    unreadCount: 1,
+    unreadLevel: 'standard',
+    lastActivity: now - 10 * 60_000,
+    peer: peers[2],
+  },
+  // Top-level: Eve (DM)
+  {
+    id: 'eve-dm',
+    parentId: null,
+    type: 'dm',
+    name: 'Eve',
+    expanded: false,
+    unreadCount: 0,
+    unreadLevel: 'none',
+    lastActivity: now - 3 * hour,
+    peer: { address: 'q7r8s9t0', displayName: 'Eve' },
+  },
 ];
