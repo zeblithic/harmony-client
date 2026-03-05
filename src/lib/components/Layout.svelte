@@ -1,11 +1,13 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  let { nav, textFeed, mediaFeed, collapsed = false }: {
+  let { nav, textFeed, mediaFeed, settingsPanel, collapsed = false, showSettings = false }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
+    settingsPanel?: Snippet;
     collapsed?: boolean;
+    showSettings?: boolean;
   } = $props();
 </script>
 
@@ -18,7 +20,11 @@
   </main>
   {#if !collapsed}
     <section class="media-area">
-      {@render mediaFeed()}
+      {#if showSettings && settingsPanel}
+        {@render settingsPanel()}
+      {:else}
+        {@render mediaFeed()}
+      {/if}
     </section>
   {/if}
 </div>

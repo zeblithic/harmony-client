@@ -17,6 +17,22 @@ export interface MediaAttachment {
   content?: string;
 }
 
+export type MessagePriority = 'quiet' | 'standard' | 'loud';
+
+export type NotificationAction = 'silent' | 'dot_only' | 'notify' | 'sound' | 'break_dnd';
+
+export interface NotificationPolicy {
+  quiet: NotificationAction;
+  standard: NotificationAction;
+  loud: NotificationAction;
+}
+
+export interface NotificationSettings {
+  global: NotificationPolicy;
+  perCommunity: Map<string, Partial<NotificationPolicy>>;
+  perPeer: Map<string, Partial<NotificationPolicy>>;
+}
+
 export interface Message {
   id: string;
   sender: Peer;
@@ -25,6 +41,8 @@ export interface Message {
   timestamp: number;
   /** Empty array for text-only messages */
   media: MediaAttachment[];
+  /** Message priority level, defaults to 'standard' */
+  priority: MessagePriority;
 }
 
 export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat';

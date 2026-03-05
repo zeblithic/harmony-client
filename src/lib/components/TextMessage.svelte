@@ -16,7 +16,7 @@
   );
 </script>
 
-<div class="text-message" id="msg-{message.id}">
+<div class="text-message" class:loud={message.priority === 'loud'} id="msg-{message.id}">
   <Avatar
     address={message.sender.address}
     displayName={message.sender.displayName}
@@ -158,5 +158,14 @@
     font-size: 13px;
     overflow-x: auto;
     color: var(--text-secondary);
+  }
+
+  .text-message.loud {
+    border-left: 2px solid var(--accent);
+    padding-left: 14px;
+  }
+
+  .text-message.loud .sender-name {
+    font-weight: 700;
   }
 </style>

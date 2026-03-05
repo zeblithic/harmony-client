@@ -7,10 +7,12 @@
     nodes,
     collapsed = false,
     onNodeClick,
+    onSettingsClick,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
     onNodeClick?: (id: string) => void;
+    onSettingsClick?: () => void;
   } = $props();
 
   let navNodes = $state<NavNode[]>(nodes);
@@ -89,6 +91,7 @@
         placeholder="Search"
         bind:value={searchQuery}
       />
+      <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>
     </div>
     <nav class="nav-tree-container">
       <NavTree
@@ -124,6 +127,23 @@
   .nav-header {
     padding: 8px 12px;
     border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .settings-btn {
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 4px;
+    flex-shrink: 0;
+  }
+
+  .settings-btn:hover {
+    color: var(--text-primary);
   }
 
   .search-input {

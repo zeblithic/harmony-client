@@ -17,6 +17,7 @@ export const messages: Message[] = [
     text: 'Hey everyone, just pushed the new transport layer changes.',
     timestamp: base,
     media: [],
+    priority: 'standard',
   },
   {
     id: 'msg-02',
@@ -32,6 +33,7 @@ export const messages: Message[] = [
         domain: 'github.com',
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-03',
@@ -46,6 +48,7 @@ export const messages: Message[] = [
         title: 'Routing throughput comparison',
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-04',
@@ -53,6 +56,7 @@ export const messages: Message[] = [
     text: 'That looks great. The adaptive fuel scaling really helped.',
     timestamp: base + 15 * 60_000,
     media: [],
+    priority: 'quiet',
   },
   {
     id: 'msg-05',
@@ -74,6 +78,7 @@ high_water = 50
 floor_fraction = 0.1`,
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-06',
@@ -81,6 +86,7 @@ floor_fraction = 0.1`,
     text: 'I ran the same test with the W-TinyLFU cache enabled.',
     timestamp: base + 30 * 60_000,
     media: [],
+    priority: 'quiet',
   },
   {
     id: 'msg-07',
@@ -95,6 +101,7 @@ floor_fraction = 0.1`,
         title: 'W-TinyLFU cache hit rate over time',
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-08',
@@ -102,6 +109,7 @@ floor_fraction = 0.1`,
     text: 'Has anyone tested the Reticulum interop with the latest packet format changes?',
     timestamp: base + hour,
     media: [],
+    priority: 'loud',
   },
   {
     id: 'msg-09',
@@ -117,6 +125,7 @@ floor_fraction = 0.1`,
         domain: 'github.com',
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-10',
@@ -124,6 +133,7 @@ floor_fraction = 0.1`,
     text: 'Perfect. The identity derivation path is byte-identical to Python Reticulum now.',
     timestamp: base + hour + 10 * 60_000,
     media: [],
+    priority: 'quiet',
   },
   {
     id: 'msg-11',
@@ -145,6 +155,7 @@ let address: [u8; 16] = hash[..16]
     .expect("SHA256 output is 32 bytes");`,
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-12',
@@ -152,6 +163,7 @@ let address: [u8; 16] = hash[..16]
     text: 'Clean. Next up is the Zenoh pub/sub integration for presence.',
     timestamp: base + 2 * hour,
     media: [],
+    priority: 'standard',
   },
   {
     id: 'msg-13',
@@ -167,6 +179,7 @@ let address: [u8; 16] = hash[..16]
         domain: 'github.com',
       },
     ],
+    priority: 'standard',
   },
   {
     id: 'msg-14',
@@ -174,6 +187,7 @@ let address: [u8; 16] = hash[..16]
     text: 'Looks solid. The key expression hierarchy makes sense for our namespace.',
     timestamp: base + 2 * hour + 25 * 60_000,
     media: [],
+    priority: 'quiet',
   },
   {
     id: 'msg-15',
@@ -181,6 +195,7 @@ let address: [u8; 16] = hash[..16]
     text: 'Agreed. Let us get this merged and start on the voice engine next.',
     timestamp: base + 3 * hour,
     media: [],
+    priority: 'standard',
   },
 ];
 

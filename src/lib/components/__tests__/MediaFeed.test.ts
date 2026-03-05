@@ -10,6 +10,7 @@ const messagesWithMedia: Message[] = [
     text: 'Image here',
     timestamp: Date.now(),
     media: [{ id: 'img-1', type: 'image', url: 'https://example.com/img.png', title: 'Screenshot' }],
+    priority: 'standard',
   },
   {
     id: 'msg-2',
@@ -17,6 +18,7 @@ const messagesWithMedia: Message[] = [
     text: 'No media',
     timestamp: Date.now(),
     media: [],
+    priority: 'standard',
   },
   {
     id: 'msg-3',
@@ -24,6 +26,7 @@ const messagesWithMedia: Message[] = [
     text: 'Link share',
     timestamp: Date.now(),
     media: [{ id: 'link-1', type: 'link', url: 'https://example.com', title: 'Example', domain: 'example.com' }],
+    priority: 'standard',
   },
 ];
 
@@ -37,7 +40,7 @@ describe('MediaFeed', () => {
 
   it('shows empty state when no media exists', () => {
     const noMedia: Message[] = [
-      { id: 'm1', sender: { address: 'x', displayName: 'X' }, text: 'hi', timestamp: Date.now(), media: [] },
+      { id: 'm1', sender: { address: 'x', displayName: 'X' }, text: 'hi', timestamp: Date.now(), media: [], priority: 'standard' },
     ];
     render(MediaFeed, { props: { messages: noMedia } });
     expect(screen.getByText('No media yet')).toBeTruthy();

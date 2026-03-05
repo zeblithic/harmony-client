@@ -9,6 +9,7 @@ const mockMessage: Message = {
   text: 'Hello world',
   timestamp: new Date('2026-03-04T12:00:00Z').getTime(),
   media: [],
+  priority: 'standard',
 };
 
 const mockMessageWithMedia: Message = {
@@ -25,6 +26,7 @@ const mockMessageWithMedia: Message = {
       domain: 'example.com',
     },
   ],
+  priority: 'standard',
 };
 
 describe('TextMessage', () => {
@@ -60,5 +62,22 @@ describe('TextMessage', () => {
     const pill = screen.getByText('example.com').closest('button');
     pill?.click();
     expect(onClick).toHaveBeenCalledWith('media-1');
+  });
+
+  it('renders loud message with accent border class', () => {
+    const loudMsg: Message = {
+      ...mockMessage,
+      id: 'loud-1',
+      priority: 'loud',
+    };
+    const { container } = render(TextMessage, { props: { message: loudMsg } });
+    const el = container.querySelector('.text-message');
+    expect(el?.classList.contains('loud')).toBe(true);
+  });
+
+  it('does not add loud class to standard messages', () => {
+    const { container } = render(TextMessage, { props: { message: mockMessage } });
+    const el = container.querySelector('.text-message');
+    expect(el?.classList.contains('loud')).toBe(false);
   });
 });
