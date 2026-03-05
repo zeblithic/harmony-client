@@ -32,3 +32,24 @@ export interface Channel {
   name: string;
   unreadCount: number;
 }
+
+export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat';
+export type DisplayMode = 'text' | 'icon' | 'both';
+export type SortOrder = 'activity' | 'pinned' | 'alphabetical';
+export type UnreadLevel = 'none' | 'quiet' | 'standard' | 'loud';
+
+export interface NavNode {
+  id: string;
+  parentId: string | null;
+  type: NavNodeType;
+  name: string;
+  icon?: string;
+  colorIndex?: number;
+  expanded: boolean;
+  displayMode?: DisplayMode;
+  sortOrder?: SortOrder;
+  unreadCount: number;
+  unreadLevel: UnreadLevel;
+  lastActivity?: number;
+  peer?: Peer;
+}
