@@ -1,33 +1,99 @@
 <script lang="ts">
-  import type { Channel } from '../types';
+  import type { NavNode } from '../types';
+  import { getChildNodes, findNode } from '../nav-utils';
+  import NavTree from './NavTree.svelte';
 
-  let { channels, collapsed = false }: {
-    channels: Channel[];
+  let {
+    nodes,
+    collapsed = false,
+    onNodeClick,
+  }: {
+    nodes: NavNode[];
     collapsed: boolean;
+    onNodeClick?: (id: string) => void;
   } = $props();
+
+  let navNodes = $state<NavNode[]>([]);
+  let searchQuery = $state('');
+
+  $effect(() => {
+    navNodes = [...nodes];
+  });
+
+  /** Toggle a folder's expanded state. */
+  function toggleFolder(id: string) {
+    navNodes = navNodes.map((n) =>
+      n.id === id ? { ...n, expanded: !n.expanded } : n
+    );
+  }
+
+  /**
+   * Filter nodes by search query. Shows matching nodes and all their
+   * ancestor folders (auto-expanded so matches are visible).
+   */
+  let filteredNodes = $derived.by(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return navNodes;
+
+    // Find nodes whose names match
+    const matchIds = new Set<string>();
+    for (const node of navNodes) {
+      if (node.name.toLowerCase().includes(q)) {
+        matchIds.add(node.id);
+        // Walk up to include all ancestors
+        let current = node;
+        while (current.parentId !== null) {
+          matchIds.add(current.parentId);
+          const parent = findNode(navNodes, current.parentId);
+          if (!parent) break;
+          current = parent;
+        }
+      }
+    }
+
+    // Return matching nodes, with ancestor folders expanded
+    return navNodes
+      .filter((n) => matchIds.has(n.id))
+      .map((n) =>
+        n.type === 'folder' && matchIds.has(n.id)
+          ? { ...n, expanded: true }
+          : n
+      );
+  });
+
+  let topLevelNodes = $derived(getChildNodes(navNodes, null));
 </script>
 
 <div class="nav-panel">
-  <div class="nav-header">
-    {#if !collapsed}
-      <h2>Harmony Dev</h2>
-    {:else}
-      <span class="nav-icon">H</span>
-    {/if}
-  </div>
-  <nav class="channel-list">
-    {#each channels as channel (channel.id)}
-      <button class="channel-item" class:has-unread={channel.unreadCount > 0}>
-        <span class="channel-hash">#</span>
-        {#if !collapsed}
-          <span class="channel-name">{channel.name}</span>
-          {#if channel.unreadCount > 0}
-            <span class="unread-badge">{channel.unreadCount}</span>
-          {/if}
-        {/if}
-      </button>
-    {/each}
-  </nav>
+  {#if !collapsed}
+    <div class="nav-header">
+      <input
+        class="search-input"
+        type="text"
+        placeholder="Search"
+        bind:value={searchQuery}
+      />
+    </div>
+    <nav class="nav-tree-container">
+      <NavTree
+        nodes={filteredNodes}
+        parentId={null}
+        onToggle={toggleFolder}
+        onClick={onNodeClick}
+      />
+    </nav>
+  {:else}
+    <nav class="collapsed-icons">
+      {#each topLevelNodes as node (node.id)}
+        <button
+          class="icon-button"
+          onclick={() => onNodeClick?.(node.id)}
+        >
+          {node.name.charAt(0).toUpperCase()}
+        </button>
+      {/each}
+    </nav>
+  {/if}
 </div>
 
 <style>
@@ -38,80 +104,55 @@
   }
 
   .nav-header {
-    padding: 12px 16px;
+    padding: 8px 12px;
     border-bottom: 1px solid var(--border);
-    min-height: 48px;
-    display: flex;
-    align-items: center;
   }
 
-  .nav-header h2 {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .nav-icon {
-    font-size: 18px;
-    font-weight: 700;
-    color: var(--text-primary);
+  .search-input {
     width: 100%;
-    text-align: center;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
   }
 
-  .channel-list {
+  .search-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  .nav-tree-container {
     flex: 1;
-    padding: 8px 0;
+    padding: 4px 0;
     overflow-y: auto;
   }
 
-  .channel-item {
+  .collapsed-icons {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 6px 16px;
-    border: none;
-    background: none;
-    color: var(--text-muted);
-    font-size: 14px;
-    cursor: pointer;
-    text-align: left;
+    gap: 4px;
+    padding: 8px 0;
   }
 
-  .channel-item:hover {
+  .icon-button {
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 8px;
     background: var(--bg-tertiary);
     color: var(--text-primary);
-  }
-
-  .channel-item.has-unread {
-    color: var(--text-primary);
-    font-weight: 600;
-  }
-
-  .channel-hash {
-    color: var(--text-muted);
     font-size: 16px;
-    flex-shrink: 0;
-  }
-
-  .channel-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .unread-badge {
-    background: var(--accent);
-    color: white;
-    font-size: 11px;
     font-weight: 700;
-    padding: 1px 6px;
-    border-radius: 8px;
-    flex-shrink: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .icon-button:hover {
+    background: var(--accent);
   }
 </style>
