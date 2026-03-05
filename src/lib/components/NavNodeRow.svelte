@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { NAV_PALETTE } from '../nav-utils';
+  import Avatar from './Avatar.svelte';
+  import { profileStore } from '../mock-data';
 
   const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
   const DISPLAY_MODE_ICON: Record<DisplayMode, string> = {
@@ -36,6 +38,10 @@
   } = $props();
 
   let showSortMenu = $state(false);
+
+  let statusText = $derived(
+    node.peer ? profileStore.get(node.peer.address)?.statusText : undefined
+  );
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
 
@@ -93,20 +99,25 @@
   <!-- Row content -->
   <span class="row-content" style="padding-left: {paddingLeft}px">
     {#if displayMode === 'icon'}
-      <!-- Icon grid cell -->
-      <span class="icon-cell">
-        {node.name.charAt(0).toUpperCase()}
-      </span>
-      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer?.avatarUrl}
-        <img class="dm-avatar" src={node.peer.avatarUrl} alt={node.name} />
+      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} size={32} />
+      {:else}
+        <span class="icon-cell">
+          {node.name.charAt(0).toUpperCase()}
+        </span>
       {/if}
     {:else}
       <!-- Text or both mode -->
       <span class="type-icon">{typeIcon(node)}</span>
-      <span class="node-name">{node.name}</span>
-      {#if displayMode === 'both' && (node.type === 'dm' || node.type === 'group-chat') && node.peer?.avatarUrl}
-        <img class="dm-avatar" src={node.peer.avatarUrl} alt={node.name} />
+      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} size={20} />
       {/if}
+      <span class="node-name">
+        {node.name}
+        {#if statusText}
+          <span class="status-text">{statusText}</span>
+        {/if}
+      </span>
     {/if}
 
     <!-- Unread indicators -->
@@ -211,11 +222,14 @@
     flex-shrink: 0;
   }
 
-  .dm-avatar {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    flex-shrink: 0;
+  .status-text {
+    display: block;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .unread-badge {
