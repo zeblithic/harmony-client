@@ -18,7 +18,7 @@
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
-  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if (e.key === 'Enter' && !(e.target as HTMLElement).closest('.avatar')) onLinkBack?.(message.id); }}>
+  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !(e.target as HTMLElement).closest('.avatar')) { e.preventDefault(); onLinkBack?.(message.id); } }}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
