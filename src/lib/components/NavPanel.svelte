@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NavNode } from '../types';
+  import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
 
@@ -24,6 +24,20 @@
   function toggleFolder(id: string) {
     navNodes = navNodes.map((n) =>
       n.id === id ? { ...n, expanded: !n.expanded } : n
+    );
+  }
+
+  /** Change a folder's display mode. */
+  function changeDisplayMode(nodeId: string, mode: DisplayMode) {
+    navNodes = navNodes.map((n) =>
+      n.id === nodeId ? { ...n, displayMode: mode } : n
+    );
+  }
+
+  /** Change a folder's sort order. */
+  function changeSortOrder(nodeId: string, order: SortOrder) {
+    navNodes = navNodes.map((n) =>
+      n.id === nodeId ? { ...n, sortOrder: order } : n
     );
   }
 
@@ -80,6 +94,8 @@
         parentId={null}
         onToggle={toggleFolder}
         onClick={onNodeClick}
+        onDisplayModeChange={changeDisplayMode}
+        onSortOrderChange={changeSortOrder}
       />
     </nav>
   {:else}

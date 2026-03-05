@@ -1,6 +1,19 @@
 <script lang="ts">
-  import type { NavNode, DisplayMode } from '../types';
+  import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { NAV_PALETTE } from '../nav-utils';
+
+  const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
+  const DISPLAY_MODE_ICON: Record<DisplayMode, string> = {
+    text: '\u2630',
+    icon: '\u229E',
+    both: '\u2630\u229E',
+  };
+
+  const SORT_OPTIONS: { value: SortOrder; label: string }[] = [
+    { value: 'activity', label: '\uD83D\uDD50 Activity' },
+    { value: 'pinned', label: '\uD83D\uDCCC Pinned' },
+    { value: 'alphabetical', label: '\uD83D\uDD24 A-Z' },
+  ];
 
   let {
     node,
@@ -9,6 +22,8 @@
     isLastChild,
     onToggle,
     onClick,
+    onDisplayModeChange,
+    onSortOrderChange,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -16,7 +31,11 @@
     isLastChild: boolean;
     onToggle?: (id: string) => void;
     onClick?: (id: string) => void;
+    onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
+    onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
   } = $props();
+
+  let showSortMenu = $state(false);
 
   let paddingLeft = $derived(colorAncestry.length * 4 + 8);
 
@@ -35,12 +54,34 @@
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
     return '';
   }
+
+  function cycleDisplayMode(e: MouseEvent) {
+    e.stopPropagation();
+    const current = node.displayMode ?? 'text';
+    const idx = DISPLAY_MODE_CYCLE.indexOf(current);
+    const next = DISPLAY_MODE_CYCLE[(idx + 1) % DISPLAY_MODE_CYCLE.length];
+    onDisplayModeChange?.(node.id, next);
+  }
+
+  function toggleSortMenu(e: MouseEvent) {
+    e.stopPropagation();
+    showSortMenu = !showSortMenu;
+  }
+
+  function selectSortOrder(e: MouseEvent, order: SortOrder) {
+    e.stopPropagation();
+    onSortOrderChange?.(node.id, order);
+    showSortMenu = false;
+  }
 </script>
 
-<button
+<div
   class="nav-row"
+  role="button"
+  tabindex="0"
   data-testid="nav-row-{node.id}"
   onclick={handleClick}
+  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(e as unknown as MouseEvent); }}
 >
   <!-- Color bands -->
   {#each colorAncestry as colorIdx, i}
@@ -79,6 +120,22 @@
     {/if}
   </span>
 
+  <!-- Folder controls -->
+  {#if node.type === 'folder'}
+    <button class="sort-trigger" onclick={toggleSortMenu}>{'\u2195'}</button>
+    <button class="mode-toggle" onclick={cycleDisplayMode}>{DISPLAY_MODE_ICON[node.displayMode ?? 'text']}</button>
+    {#if showSortMenu}
+      <div class="sort-menu">
+        {#each SORT_OPTIONS as opt}
+          <button
+            class="sort-option {(node.sortOrder ?? 'activity') === opt.value ? 'active' : ''}"
+            onclick={(e: MouseEvent) => selectSortOrder(e, opt.value)}
+          >{opt.label}</button>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+
   <!-- Bracket markers -->
   {#if node.type === 'folder' && node.expanded}
     <span class="bracket bracket-open">{'\u250C'}</span>
@@ -86,7 +143,7 @@
   {#if isLastChild && colorAncestry.length > 0}
     <span class="bracket bracket-close">{'\u2518'}</span>
   {/if}
-</button>
+</div>
 
 <style>
   .nav-row {
@@ -205,5 +262,78 @@
 
   .bracket-close {
     bottom: 2px;
+  }
+
+  .mode-toggle {
+    position: absolute;
+    right: 24px;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    padding: 2px 4px;
+  }
+
+  .nav-row:hover .mode-toggle {
+    opacity: 1;
+  }
+
+  .mode-toggle:hover {
+    color: var(--text-primary);
+  }
+
+  .sort-trigger {
+    position: absolute;
+    right: 36px;
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    padding: 2px 4px;
+  }
+
+  .nav-row:hover .sort-trigger {
+    opacity: 1;
+  }
+
+  .sort-menu {
+    position: absolute;
+    right: 8px;
+    top: 28px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 120px;
+  }
+
+  .sort-option {
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: left;
+  }
+
+  .sort-option:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .sort-option.active {
+    color: var(--accent);
   }
 </style>

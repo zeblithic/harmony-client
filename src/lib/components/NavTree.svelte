@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NavNode } from '../types';
+  import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { getChildNodes, sortNodes, getColorAncestry, getInheritedDisplayMode, getInheritedSortOrder } from '../nav-utils';
   import NavNodeRow from './NavNodeRow.svelte';
   import NavTree from './NavTree.svelte';
@@ -9,11 +9,15 @@
     parentId,
     onToggle,
     onClick,
+    onDisplayModeChange,
+    onSortOrderChange,
   }: {
     nodes: NavNode[];
     parentId: string | null;
     onToggle?: (id: string) => void;
     onClick?: (id: string) => void;
+    onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
+    onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
   } = $props();
 
   let sortedChildren = $derived.by(() => {
@@ -35,9 +39,11 @@
     isLastChild={isLast}
     {onToggle}
     {onClick}
+    {onDisplayModeChange}
+    {onSortOrderChange}
   />
 
   {#if child.type === 'folder' && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {onToggle} {onClick} />
+    <NavTree nodes={nodes} parentId={child.id} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} />
   {/if}
 {/each}
