@@ -10,6 +10,17 @@
 
   let expanded = $state(false);
 
+  let messageIds = $derived(new Set(messages.map((m) => m.id)));
+
+  $effect(() => {
+    function onReveal(e: Event) {
+      const id = (e as CustomEvent<string>).detail;
+      if (messageIds.has(id)) expanded = true;
+    }
+    document.addEventListener('reveal-message', onReveal);
+    return () => document.removeEventListener('reveal-message', onReveal);
+  });
+
   let senderNames = $derived(
     [...new Set(messages.map((m) => m.sender.displayName))].join(', ')
   );

@@ -28,12 +28,22 @@
   }
 
   function scrollToMessage(messageId: string) {
-    const el = document.getElementById(`msg-${messageId}`);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      el.classList.add('highlight');
-      setTimeout(() => el.classList.remove('highlight'), 1500);
+    let el = document.getElementById(`msg-${messageId}`);
+    if (!el) {
+      document.dispatchEvent(new CustomEvent('reveal-message', { detail: messageId }));
+      requestAnimationFrame(() => {
+        el = document.getElementById(`msg-${messageId}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('highlight');
+          setTimeout(() => el.classList.remove('highlight'), 1500);
+        }
+      });
+      return;
     }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('highlight');
+    setTimeout(() => el.classList.remove('highlight'), 1500);
   }
 
   function handleSend(text: string, priority: MessagePriority) {
@@ -53,7 +63,11 @@
 
   // Collect known peers from messages and nav nodes (DMs)
   let knownPeers = $derived.by(() => {
-    const peerMap = new Map(allMessages.map((m) => [m.sender.address, m.sender]));
+    const peerMap = new Map(
+      allMessages
+        .filter((m) => m.sender.address !== 'self')
+        .map((m) => [m.sender.address, m.sender])
+    );
     for (const node of navNodes) {
       if (node.peer && !peerMap.has(node.peer.address)) {
         peerMap.set(node.peer.address, node.peer);
