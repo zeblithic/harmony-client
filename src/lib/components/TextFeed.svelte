@@ -113,7 +113,7 @@
   onmouseup={handleDragEnd}
   onmouseleave={handleDragEnd}
 >
-  <div class="main-section" style={showThreadPanel ? `flex-basis: ${splitPercent}%` : ''}>
+  <div class="main-section" style={showThreadPanel ? `flex: 0 0 ${splitPercent}%` : ''}>
     <FloatingThreadBar
       {threadMeta}
       {pinnedThreadIds}

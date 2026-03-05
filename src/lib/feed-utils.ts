@@ -23,18 +23,17 @@ export interface ThreadMetaEntry {
 
 export function getThreadMeta(messages: Message[]): Map<string, ThreadMetaEntry> {
   const meta = new Map<string, ThreadMetaEntry>();
-  const roots = getThreadRoots(messages);
-  for (const rootId of roots) {
-    const replies = getThreadReplies(messages, rootId);
-    const seen = new Set<string>();
-    const participants: Peer[] = [];
-    for (const r of replies) {
-      if (!seen.has(r.sender.address)) {
-        seen.add(r.sender.address);
-        participants.push(r.sender);
-      }
+  for (const m of messages) {
+    if (!m.replyTo) continue;
+    let entry = meta.get(m.replyTo);
+    if (!entry) {
+      entry = { count: 0, participants: [] };
+      meta.set(m.replyTo, entry);
     }
-    meta.set(rootId, { count: replies.length, participants });
+    entry.count++;
+    if (!entry.participants.some(p => p.address === m.sender.address)) {
+      entry.participants.push(m.sender);
+    }
   }
   return meta;
 }
