@@ -8,6 +8,7 @@
   import ComposeBar from './ComposeBar.svelte';
   import ThreadView from './ThreadView.svelte';
   import ThreadIndicator from './ThreadIndicator.svelte';
+  import FloatingThreadBar from './FloatingThreadBar.svelte';
 
   let {
     messages,
@@ -80,6 +81,17 @@
     }
   }
 
+  let rootMessages = $derived.by(() => {
+    const map = new Map<string, { sender: string; text: string }>();
+    for (const [id, _meta] of threadMeta) {
+      const rootMsg = messages.find(m => m.id === id);
+      if (rootMsg) {
+        map.set(id, { sender: rootMsg.sender.displayName, text: rootMsg.text });
+      }
+    }
+    return map;
+  });
+
   let showThreadPanel = $derived(threadRoot !== null && openThreadId !== null);
 </script>
 
@@ -93,6 +105,14 @@
   onmouseleave={handleDragEnd}
 >
   <div class="main-section" style={showThreadPanel ? `flex-basis: ${splitPercent}%` : ''}>
+    <FloatingThreadBar
+      {threadMeta}
+      {pinnedThreadIds}
+      {visibleThreadIds}
+      {rootMessages}
+      {openThreadId}
+      onThreadOpen={onThreadOpen}
+    />
     <div class="messages-scroll">
       {#each feedItems as item (item.kind === 'message' ? item.message.id : `quiet-${item.messages[0].id}`)}
         {#if item.kind === 'message'}
