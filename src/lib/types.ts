@@ -60,7 +60,11 @@ export interface Message {
   media: MediaAttachment[];
   /** Message priority level, defaults to 'standard' */
   priority: MessagePriority;
+  /** ID of the thread root message this is a reply to */
+  replyTo?: string;
 }
+
+export type ThreadDisplayMode = 'panel' | 'inline' | 'muted';
 
 export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat';
 export type DisplayMode = 'text' | 'icon' | 'both';
