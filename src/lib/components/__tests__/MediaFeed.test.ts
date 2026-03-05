@@ -41,6 +41,34 @@ describe('MediaFeed', () => {
     expect(screen.queryByText('Bob')).toBeNull();
   });
 
+  it('applies thread-card class to messages in threadMessageIds', () => {
+    const trustService = new TrustService();
+    trustService.setGlobalTrust('trusted');
+    const threadIds = new Set(['msg-1']);
+    const { container } = render(MediaFeed, {
+      props: {
+        messages: messagesWithMedia,
+        trustService,
+        threadMessageIds: threadIds,
+      },
+    });
+    const threadCards = container.querySelectorAll('.thread-card');
+    expect(threadCards.length).toBeGreaterThan(0);
+  });
+
+  it('does not apply thread-card class when threadMessageIds is empty', () => {
+    const trustService = new TrustService();
+    trustService.setGlobalTrust('trusted');
+    const { container } = render(MediaFeed, {
+      props: {
+        messages: messagesWithMedia,
+        trustService,
+      },
+    });
+    const threadCards = container.querySelectorAll('.thread-card');
+    expect(threadCards.length).toBe(0);
+  });
+
   it('shows empty state when no media exists', () => {
     const noMedia: Message[] = [
       { id: 'm1', sender: { address: 'x', displayName: 'X' }, text: 'hi', timestamp: Date.now(), media: [], priority: 'standard' },
