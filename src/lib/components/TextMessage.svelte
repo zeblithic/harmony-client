@@ -56,11 +56,16 @@
             {:else}
               <div class="inline-embed">
                 {#if attachment.type === 'image'}
-                  <img src={attachment.url} alt={attachment.title ?? 'image'} class="inline-image" referrerpolicy="no-referrer" crossorigin="anonymous" />
+                  <img src={attachment.url} alt={attachment.title ?? 'image'} class="inline-image" referrerpolicy="no-referrer" />
                 {:else if attachment.type === 'link'}
-                  <a href={sanitizeHref(attachment.url)} class="inline-link" target="_blank" rel="noopener noreferrer">
-                    {attachment.title ?? attachment.url}
-                  </a>
+                  {@const href = sanitizeHref(attachment.url)}
+                  {#if href}
+                    <a {href} class="inline-link" target="_blank" rel="noopener noreferrer">
+                      {attachment.title ?? attachment.url}
+                    </a>
+                  {:else}
+                    <span class="inline-link-blocked">{attachment.title ?? attachment.url}</span>
+                  {/if}
                 {:else if attachment.type === 'code'}
                   <pre class="inline-code"><code>{attachment.content}</code></pre>
                 {/if}
@@ -206,6 +211,11 @@
 
   .inline-link:hover {
     text-decoration: underline;
+  }
+
+  .inline-link-blocked {
+    color: var(--text-muted);
+    font-size: 12px;
   }
 
   .inline-code {

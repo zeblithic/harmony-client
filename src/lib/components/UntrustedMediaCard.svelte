@@ -59,7 +59,7 @@
   id="media-{attachment.id}"
   aria-label="Blocked media, {TYPE_LABELS[attachment.type] ?? attachment.type}, from {message.sender.displayName}"
 >
-  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !(e.target as HTMLElement).closest('.avatar')) { e.preventDefault(); onLinkBack?.(message.id); } }}>
+  <button class="card-header" onclick={() => onLinkBack?.(message.id)}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
@@ -70,7 +70,7 @@
     <span class="card-sender">{message.sender.displayName}</span>
     <span class="card-time">{timeStr}</span>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
-  </div>
+  </button>
 
   <div class="card-body">
     <span class="lock-icon">&#128274;</span>
