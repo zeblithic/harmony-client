@@ -80,7 +80,7 @@ describe('ThreadView', () => {
     render(ThreadView, {
       props: { rootMessage: rootMsg, replies: [], trustService: trustedService() },
     });
-    const textarea = screen.getByPlaceholderText(/Reply in thread/);
+    const textarea = screen.getByPlaceholderText(/Message #thread/);
     expect(textarea).toBeTruthy();
   });
 });

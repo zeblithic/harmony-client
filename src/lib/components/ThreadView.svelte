@@ -42,7 +42,7 @@
     {/each}
   </div>
 
-  <ComposeBar {onSend} channelName="Reply in thread" />
+  <ComposeBar {onSend} channelName="thread" />
 </div>
 
 <style>
