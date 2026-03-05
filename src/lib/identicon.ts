@@ -32,7 +32,7 @@ export function generateIdenticon(address: string, size = 64): string {
     }
   }
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${safeSize}" height="${safeSize}" viewBox="0 0 5 5">${rects.join('')}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${safeSize}" height="${safeSize}" viewBox="0 0 5 5" shape-rendering="crispEdges">${rects.join('')}</svg>`;
 }
 
 /** Simple hash function — returns an array of pseudo-random bytes from an address string. */
