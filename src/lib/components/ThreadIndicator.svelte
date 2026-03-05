@@ -14,12 +14,18 @@
 
   $effect(() => {
     if (!el || !onVisibilityChange) return;
+    // Read rootId synchronously so Svelte tracks it as a dependency
+    const id = rootId;
+    const cb = onVisibilityChange;
     const observer = new IntersectionObserver(
-      ([entry]) => onVisibilityChange(rootId, entry.isIntersecting),
+      ([entry]) => cb(id, entry.isIntersecting),
       { threshold: 0 }
     );
     observer.observe(el);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      cb(id, false);
+    };
   });
 
   let nameList = $derived.by(() => {

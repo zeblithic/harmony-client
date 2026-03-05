@@ -46,14 +46,21 @@
     pinnedThreadIds?: Set<string>;
   } = $props();
 
+  let observersReady = $state(false);
   let visibleThreadIds = $state(new Set<string>());
 
   function handleThreadVisibility(rootId: string, visible: boolean) {
+    observersReady = true;
     const next = new Set(visibleThreadIds);
     if (visible) next.add(rootId);
     else next.delete(rootId);
     visibleThreadIds = next;
   }
+
+  // Before observers initialize, treat all threads as visible (no auto-float)
+  let effectiveVisibleIds = $derived(
+    observersReady ? visibleThreadIds : new Set(threadMeta.keys())
+  );
 
   let feedItems = $derived(groupMessages(messages));
 
@@ -124,7 +131,7 @@
     <FloatingThreadBar
       {threadMeta}
       {pinnedThreadIds}
-      {visibleThreadIds}
+      visibleThreadIds={effectiveVisibleIds}
       {rootMessages}
       {openThreadId}
       onThreadOpen={onThreadOpen}

@@ -3,22 +3,26 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import ThreadIndicator from '../ThreadIndicator.svelte';
 import type { Peer } from '../../types';
 
-// IntersectionObserver mock
-let observerCallback: IntersectionObserverCallback;
-let observedElements: Element[] = [];
-const mockDisconnect = vi.fn();
+// Per-instance IntersectionObserver mock
+let observers: { callback: IntersectionObserverCallback; elements: Element[]; disconnect: ReturnType<typeof vi.fn> }[] = [];
 
-class MockIntersectionObserver {
-  constructor(callback: IntersectionObserverCallback) {
-    observerCallback = callback;
-  }
-  observe(el: Element) { observedElements.push(el); }
-  unobserve(el: Element) { observedElements = observedElements.filter(e => e !== el); }
-  disconnect() { mockDisconnect(); observedElements = []; }
+function latestObserver() {
+  return observers[observers.length - 1];
 }
 
-function simulateIntersection(el: Element, isIntersecting: boolean) {
-  observerCallback(
+class MockIntersectionObserver {
+  private _entry: typeof observers[number];
+  constructor(callback: IntersectionObserverCallback) {
+    this._entry = { callback, elements: [], disconnect: vi.fn() };
+    observers.push(this._entry);
+  }
+  observe(el: Element) { this._entry.elements.push(el); }
+  unobserve(el: Element) { this._entry.elements = this._entry.elements.filter(e => e !== el); }
+  disconnect() { this._entry.disconnect(); this._entry.elements = []; }
+}
+
+function simulateIntersection(obs: typeof observers[number], el: Element, isIntersecting: boolean) {
+  obs.callback(
     [{ target: el, isIntersecting } as IntersectionObserverEntry],
     {} as IntersectionObserver,
   );
@@ -31,8 +35,7 @@ const participants: Peer[] = [
 
 describe('ThreadIndicator', () => {
   beforeEach(() => {
-    observedElements = [];
-    mockDisconnect.mockClear();
+    observers = [];
     vi.stubGlobal('IntersectionObserver', MockIntersectionObserver);
   });
 
@@ -91,23 +94,31 @@ describe('ThreadIndicator', () => {
     render(ThreadIndicator, {
       props: { count: 2, participants, rootId: 'root-1', onVisibilityChange },
     });
-    await vi.waitFor(() => expect(observedElements.length).toBe(1));
-    const el = observedElements[0];
+    await vi.waitFor(() => expect(latestObserver().elements.length).toBe(1));
+    const obs = latestObserver();
+    const el = obs.elements[0];
 
-    simulateIntersection(el, true);
+    simulateIntersection(obs, el, true);
     expect(onVisibilityChange).toHaveBeenCalledWith('root-1', true);
 
-    simulateIntersection(el, false);
+    simulateIntersection(obs, el, false);
     expect(onVisibilityChange).toHaveBeenCalledWith('root-1', false);
   });
 
-  it('disconnects observer on unmount', async () => {
+  it('calls onVisibilityChange(false) and disconnects on unmount', async () => {
     const onVisibilityChange = vi.fn();
     const { unmount } = render(ThreadIndicator, {
       props: { count: 1, participants: [participants[0]], rootId: 'root-1', onVisibilityChange },
     });
-    await vi.waitFor(() => expect(observedElements.length).toBe(1));
+    await vi.waitFor(() => expect(latestObserver().elements.length).toBe(1));
+    const obs = latestObserver();
+
+    // Simulate visible first
+    simulateIntersection(obs, obs.elements[0], true);
+    onVisibilityChange.mockClear();
+
     unmount();
-    expect(mockDisconnect).toHaveBeenCalled();
+    expect(obs.disconnect).toHaveBeenCalled();
+    expect(onVisibilityChange).toHaveBeenCalledWith('root-1', false);
   });
 });
