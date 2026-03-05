@@ -20,13 +20,13 @@
     })
   );
 
-  function isBlocked(attachmentId: string, attachmentType: string): boolean {
+  function isBlocked(attachment: import('../types').MediaAttachment): boolean {
     void trustVersion;
     if (!trustService) return false;
-    if (attachmentType === 'code') return false;
+    if (!TrustService.isGated(attachment)) return false;
     const level = trustService.resolve(message.sender.address);
     if (level === 'trusted') return false;
-    return !trustService.isLoaded(attachmentId);
+    return !trustService.isLoaded(attachment.id);
   }
 </script>
 
@@ -48,7 +48,7 @@
       <div class="media-indicators">
         {#each message.media as attachment (attachment.id)}
           {#if collapsed}
-            {#if isBlocked(attachment.id, attachment.type)}
+            {#if isBlocked(attachment)}
               <div class="inline-embed inline-blocked">
                 <span class="blocked-inline-icon">&#128274;</span>
                 <span class="blocked-inline-label">Blocked {attachment.type}</span>
@@ -67,7 +67,7 @@
               </div>
             {/if}
           {:else}
-            {#if isBlocked(attachment.id, attachment.type)}
+            {#if isBlocked(attachment)}
               <button
                 class="media-pill blocked"
                 onclick={() => onMediaClick?.(attachment.id)}

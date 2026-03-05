@@ -1,7 +1,7 @@
 import type { MediaAttachment, TrustLevel, TrustSettings } from './types';
 
 export class TrustService {
-  settings: TrustSettings;
+  readonly settings: TrustSettings;
   private loadedAttachments = new Set<string>();
 
   constructor() {

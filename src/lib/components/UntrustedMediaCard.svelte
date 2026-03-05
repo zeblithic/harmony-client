@@ -84,9 +84,10 @@
       <button class="action-btn confirming" disabled aria-disabled="true">Confirm load</button>
       <button class="cancel-btn" onclick={handleCancel}>Cancel</button>
     {:else if loadState === 'confirming'}
-      <button class="action-btn confirming" onclick={handleConfirm} aria-live="polite">Confirm load</button>
+      <button class="action-btn confirming" onclick={handleConfirm}>Confirm load</button>
       <button class="cancel-btn" onclick={handleCancel}>Cancel</button>
     {/if}
+    <span class="sr-only" aria-live="polite">{loadState === 'confirming' ? 'Confirm load is now available' : ''}</span>
   </div>
 </div>
 
@@ -198,5 +199,17 @@
 
   .cancel-btn:hover {
     color: var(--text-primary);
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 </style>

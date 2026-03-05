@@ -19,6 +19,13 @@
       .flatMap((m) => m.media.map((a) => ({ message: m, attachment: a })))
   );
 
+  function isTrustGated(attachment: import('../types').MediaAttachment, senderAddress: string): boolean {
+    void trustVersion;
+    return TrustService.isGated(attachment)
+      && trustService.resolve(senderAddress) !== 'trusted'
+      && !trustService.isLoaded(attachment.id);
+  }
+
   function handleLoad(attachmentId: string) {
     trustService.markLoaded(attachmentId);
     onTrustChange?.();
@@ -31,7 +38,7 @@
   {:else}
     {#each mediaItems as { message, attachment } (attachment.id)}
       <!-- communityId not yet available on Message; per-community trust will apply once content transport provides context -->
-      {#if TrustService.isGated(attachment) && trustService.resolve(message.sender.address) !== 'trusted' && !trustService.isLoaded(attachment.id)}
+      {#if isTrustGated(attachment, message.sender.address)}
         <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} />
       {:else}
         <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} />
