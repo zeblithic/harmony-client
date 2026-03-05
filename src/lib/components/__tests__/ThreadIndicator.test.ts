@@ -96,8 +96,8 @@ describe('ThreadIndicator', () => {
     });
     await vi.waitFor(() => expect(latestObserver().elements.length).toBe(1));
 
-    // Optimistic true on mount
-    expect(onVisibilityChange).toHaveBeenCalledWith('root-1', true);
+    // Optimistic true fires via microtask
+    await vi.waitFor(() => expect(onVisibilityChange).toHaveBeenCalledWith('root-1', true));
     onVisibilityChange.mockClear();
 
     // Observer corrects if off-screen
