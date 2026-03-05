@@ -7,6 +7,7 @@
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
+  import { TrustService } from './lib/trust-service';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
   import { messages, navNodes, profileStore } from './lib/mock-data';
   import type { MessagePriority, Profile } from './lib/types';
@@ -41,9 +42,18 @@
   }
 
   const notificationService = new NotificationService();
+  const trustService = new TrustService();
+  let trustVersion = $state(0);
+
+  function handleTrustChange() {
+    trustVersion++;
+  }
 
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
+
+  // Demo: trust one peer to show the difference
+  trustService.setPeerTrust('a1b2c3d4', 'trusted');
 
   let allMessages = $state([...messages]);
 
@@ -111,17 +121,19 @@
     <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} />
   {/snippet}
   {#snippet textFeed()}
-    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} onAvatarClick={handleAvatarClick} />
+    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} onAvatarClick={handleAvatarClick} {trustService} {trustVersion} />
   {/snippet}
   {#snippet mediaFeed()}
-    <MediaFeed messages={allMessages} onLinkBack={scrollToMessage} onAvatarClick={handleAvatarClick} />
+    <MediaFeed messages={allMessages} {trustService} {trustVersion} onLinkBack={scrollToMessage} onAvatarClick={handleAvatarClick} onTrustChange={handleTrustChange} />
   {/snippet}
   {#snippet settingsPanel()}
     <NotificationSettingsPanel
       service={notificationService}
+      {trustService}
       peers={knownPeers}
       {communities}
       onClose={() => { showSettings = false; }}
+      onTrustChange={handleTrustChange}
     />
   {/snippet}
 </Layout>
