@@ -44,6 +44,8 @@ export interface NotificationSettings {
   global: NotificationPolicy;
   perCommunity: Map<string, Partial<NotificationPolicy>>;
   perPeer: Map<string, Partial<NotificationPolicy>>;
+  perPeerSounds: Map<string, SoundOverrides>;
+  perCommunitySounds: Map<string, SoundOverrides>;
 }
 
 export interface Message {

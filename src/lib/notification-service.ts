@@ -3,6 +3,8 @@ import type {
   NotificationAction,
   NotificationPolicy,
   NotificationSettings,
+  Profile,
+  SoundOverrides,
 } from './types';
 
 const DEFAULT_POLICY: NotificationPolicy = {
@@ -19,6 +21,8 @@ export class NotificationService {
       global: { ...DEFAULT_POLICY },
       perCommunity: new Map(),
       perPeer: new Map(),
+      perPeerSounds: new Map(),
+      perCommunitySounds: new Map(),
     };
   }
 
@@ -64,5 +68,42 @@ export class NotificationService {
 
   shouldPlaySound(action: NotificationAction): boolean {
     return action === 'sound' || action === 'break_dnd';
+  }
+
+  resolveSoundCid(
+    priority: MessagePriority,
+    peerAddress: string,
+    senderProfile: Profile,
+    communityId?: string,
+  ): string | undefined {
+    const peerSounds = this.settings.perPeerSounds.get(peerAddress);
+    if (peerSounds?.[priority]) return peerSounds[priority];
+
+    if (communityId) {
+      const commSounds = this.settings.perCommunitySounds.get(communityId);
+      if (commSounds?.[priority]) return commSounds[priority];
+    }
+
+    if (senderProfile.notificationSounds?.[priority]) {
+      return senderProfile.notificationSounds[priority];
+    }
+
+    return undefined;
+  }
+
+  setPeerSoundOverrides(peerAddress: string, sounds: SoundOverrides): void {
+    this.settings.perPeerSounds.set(peerAddress, { ...sounds });
+  }
+
+  clearPeerSoundOverrides(peerAddress: string): void {
+    this.settings.perPeerSounds.delete(peerAddress);
+  }
+
+  setCommunitySoundOverrides(communityId: string, sounds: SoundOverrides): void {
+    this.settings.perCommunitySounds.set(communityId, { ...sounds });
+  }
+
+  clearCommunitySoundOverrides(communityId: string): void {
+    this.settings.perCommunitySounds.delete(communityId);
   }
 }
