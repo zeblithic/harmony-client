@@ -86,7 +86,7 @@ describe('NavNodeRow', () => {
   it('shows quiet unread dot', () => {
     const { container } = render(NavNodeRow, {
       props: {
-        node: makeNode({ unreadLevel: 'quiet' }),
+        node: makeNode({ unreadLevel: 'quiet', unreadCount: 1 }),
         colorAncestry: [],
         displayMode: 'text',
         isLastChild: false,

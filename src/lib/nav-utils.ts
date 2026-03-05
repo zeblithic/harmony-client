@@ -36,8 +36,8 @@ export function getNodeColor(nodes: NavNode[], nodeId: string): number {
   const depth = getNodeDepth(nodes, nodeId);
 
   if (depth === 0) {
-    // Top-level: position among top-level siblings
-    const siblings = getChildNodes(nodes, null);
+    // Top-level: position among top-level folder siblings only
+    const siblings = getChildNodes(nodes, null).filter((n) => n.type === 'folder');
     const index = siblings.findIndex((n) => n.id === nodeId);
     return index % NAV_PALETTE.length;
   }

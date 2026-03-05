@@ -115,7 +115,7 @@
       <span class="unread-badge">{node.unreadCount}</span>
     {:else if node.unreadLevel === 'loud' && node.unreadCount > 0}
       <span class="unread-badge loud">{node.unreadCount}</span>
-    {:else if node.unreadLevel === 'quiet'}
+    {:else if node.unreadLevel === 'quiet' && node.unreadCount > 0}
       <span class="unread-dot"></span>
     {/if}
   </span>
