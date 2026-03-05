@@ -89,19 +89,20 @@ describe('ThreadIndicator', () => {
     expect(btn.getAttribute('aria-label')).toContain('Alice');
   });
 
-  it('calls onVisibilityChange when intersection changes', async () => {
+  it('optimistically reports visible on mount, then tracks intersection', async () => {
     const onVisibilityChange = vi.fn();
     render(ThreadIndicator, {
       props: { count: 2, participants, rootId: 'root-1', onVisibilityChange },
     });
     await vi.waitFor(() => expect(latestObserver().elements.length).toBe(1));
-    const obs = latestObserver();
-    const el = obs.elements[0];
 
-    simulateIntersection(obs, el, true);
+    // Optimistic true on mount
     expect(onVisibilityChange).toHaveBeenCalledWith('root-1', true);
+    onVisibilityChange.mockClear();
 
-    simulateIntersection(obs, el, false);
+    // Observer corrects if off-screen
+    const obs = latestObserver();
+    simulateIntersection(obs, obs.elements[0], false);
     expect(onVisibilityChange).toHaveBeenCalledWith('root-1', false);
   });
 

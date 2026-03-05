@@ -17,6 +17,9 @@
     // Read rootId synchronously so Svelte tracks it as a dependency
     const id = rootId;
     const cb = onVisibilityChange;
+    // Optimistically report visible on mount to prevent flash;
+    // the observer will correct if actually off-screen
+    cb(id, true);
     const observer = new IntersectionObserver(
       ([entry]) => cb(id, entry.isIntersecting),
       { threshold: 0 }
