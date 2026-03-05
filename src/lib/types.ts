@@ -67,6 +67,14 @@ export type DisplayMode = 'text' | 'icon' | 'both';
 export type SortOrder = 'activity' | 'pinned' | 'alphabetical';
 export type UnreadLevel = 'none' | 'quiet' | 'standard' | 'loud';
 
+export type TrustLevel = 'untrusted' | 'preview' | 'trusted';
+
+export interface TrustSettings {
+  global: TrustLevel;
+  perPeer: Map<string, TrustLevel>;
+  perCommunity: Map<string, TrustLevel>;
+}
+
 export interface NavNode {
   id: string;
   parentId: string | null;
