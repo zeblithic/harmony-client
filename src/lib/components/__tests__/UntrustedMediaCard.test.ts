@@ -111,4 +111,12 @@ describe('UntrustedMediaCard', () => {
     await fireEvent.click(confirmBtn);
     expect(onLoad).not.toHaveBeenCalled();
   });
+
+  it('has correct aria-label for screen readers', () => {
+    render(UntrustedMediaCard, {
+      props: { message: mockMessage, attachment: mockImageAttachment },
+    });
+    const region = screen.getByLabelText(/blocked media.*image.*alice/i);
+    expect(region).toBeTruthy();
+  });
 });
