@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message } from '../types';
+  import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
   let { message, collapsed = false, onMediaClick, onAvatarClick }: {
@@ -37,9 +38,9 @@
           {#if collapsed}
             <div class="inline-embed">
               {#if attachment.type === 'image'}
-                <img src={attachment.url} alt={attachment.title ?? 'image'} class="inline-image" />
+                <img src={attachment.url} alt={attachment.title ?? 'image'} class="inline-image" referrerpolicy="no-referrer" crossorigin="anonymous" />
               {:else if attachment.type === 'link'}
-                <a href={attachment.url} class="inline-link" target="_blank" rel="noopener">
+                <a href={sanitizeHref(attachment.url)} class="inline-link" target="_blank" rel="noopener noreferrer">
                   {attachment.title ?? attachment.url}
                 </a>
               {:else if attachment.type === 'code'}
