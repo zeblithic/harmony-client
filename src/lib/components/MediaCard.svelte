@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message, MediaAttachment } from '../types';
+  import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
   let { message, attachment, onLinkBack, onAvatarClick }: {
@@ -38,12 +39,14 @@
         alt={attachment.title ?? 'image'}
         class="card-image"
         loading="lazy"
+        referrerpolicy="no-referrer"
+        crossorigin="anonymous"
       />
       {#if attachment.title}
         <p class="card-caption">{attachment.title}</p>
       {/if}
     {:else if attachment.type === 'link'}
-      <a href={attachment.url} class="card-link" target="_blank" rel="noopener">
+      <a href={sanitizeHref(attachment.url)} class="card-link" target="_blank" rel="noopener noreferrer">
         <div class="link-preview">
           <div class="link-title">{attachment.title ?? attachment.url}</div>
           {#if attachment.domain}
