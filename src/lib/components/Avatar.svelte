@@ -12,26 +12,32 @@
   let identiconSvg = $derived(generateIdenticon(address, size));
 </script>
 
-{#if avatarUrl}
+{#snippet avatarContent()}
+  {#if avatarUrl}
+    <img src={avatarUrl} alt={displayName} width={size} height={size} />
+  {:else}
+    {@html identiconSvg}
+  {/if}
+{/snippet}
+
+{#if onclick}
   <button
-    class="avatar"
+    class="avatar interactive"
     style="width: {size}px; height: {size}px;"
     title={displayName}
     onclick={(e) => onclick?.(e)}
     type="button"
   >
-    <img src={avatarUrl} alt={displayName} width={size} height={size} />
+    {@render avatarContent()}
   </button>
 {:else}
-  <button
+  <span
     class="avatar"
     style="width: {size}px; height: {size}px;"
     title={displayName}
-    onclick={(e) => onclick?.(e)}
-    type="button"
   >
-    {@html identiconSvg}
-  </button>
+    {@render avatarContent()}
+  </span>
 {/if}
 
 <style>
@@ -46,6 +52,10 @@
     border: none;
     background: none;
     padding: 0;
+    cursor: default;
+  }
+
+  .avatar.interactive {
     cursor: pointer;
   }
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { Profile } from '../types';
   import Avatar from './Avatar.svelte';
 
@@ -12,13 +13,14 @@
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
 
   $effect(() => {
+    const close = untrack(() => onClose);
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') close();
     }
     function onClickOutside(e: MouseEvent) {
       const target = e.target as HTMLElement;
       if (!target.closest('.profile-popover')) {
-        onClose();
+        close();
       }
     }
     window.addEventListener('keydown', onKeyDown);
