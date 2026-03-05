@@ -17,7 +17,7 @@
 
 <div class="text-feed">
   <div class="messages-scroll">
-    {#each feedItems as item, i (item.kind === 'message' ? item.message.id : `quiet-${i}`)}
+    {#each feedItems as item (item.kind === 'message' ? item.message.id : `quiet-${item.messages[0].id}`)}
       {#if item.kind === 'message'}
         <TextMessage message={item.message} {collapsed} {onMediaClick} />
       {:else}

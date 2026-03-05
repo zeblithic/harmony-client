@@ -50,6 +50,17 @@
 
   // Extract community nodes (folders) for settings panel
   let communities = $derived(navNodes.filter((n) => n.type === 'folder'));
+
+  // Collect known peers from messages and nav nodes (DMs)
+  let knownPeers = $derived.by(() => {
+    const peerMap = new Map(allMessages.map((m) => [m.sender.address, m.sender]));
+    for (const node of navNodes) {
+      if (node.peer && !peerMap.has(node.peer.address)) {
+        peerMap.set(node.peer.address, node.peer);
+      }
+    }
+    return [...peerMap.values()];
+  });
 </script>
 
 <svelte:window bind:innerWidth />
@@ -67,7 +78,7 @@
   {#snippet settingsPanel()}
     <NotificationSettingsPanel
       service={notificationService}
-      peers={[...new Map(allMessages.map((m) => [m.sender.address, m.sender])).values()]}
+      peers={knownPeers}
       {communities}
       onClose={() => { showSettings = false; }}
     />

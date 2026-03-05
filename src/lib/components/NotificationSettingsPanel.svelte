@@ -155,7 +155,7 @@
                     if (val) setPeerLevel(peer.address, level, val as NotificationAction);
                   }}
                 >
-                  <option value="">Using default</option>
+                  <option value="">Using community/global default</option>
                   {#each ACTIONS as action}
                     <option value={action}>{ACTION_LABELS[action]}</option>
                   {/each}
