@@ -18,8 +18,7 @@
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="card-header" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if (e.key === 'Enter') onLinkBack?.(message.id); }}>
+  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if (e.key === 'Enter' && !(e.target as HTMLElement).closest('.avatar')) onLinkBack?.(message.id); }}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}

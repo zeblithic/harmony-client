@@ -22,7 +22,7 @@
     address={message.sender.address}
     displayName={message.sender.displayName}
     size={24}
-    onclick={(e) => onAvatarClick?.(message.sender.address, e)}
+    onclick={onAvatarClick ? (e) => onAvatarClick(message.sender.address, e) : undefined}
   />
   <div class="message-content">
     <div class="message-header">

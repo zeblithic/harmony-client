@@ -19,6 +19,10 @@
   let popoverY = $state(0);
 
   function handleAvatarClick(address: string, event: MouseEvent) {
+    if (popoverProfile?.address === address) {
+      popoverProfile = null;
+      return;
+    }
     const profile = profileStore.get(address);
     if (!profile) return;
     const el = (event.target as HTMLElement).closest('.avatar') as HTMLElement | null;
