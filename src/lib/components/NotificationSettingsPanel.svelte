@@ -160,6 +160,15 @@
               </div>
             {/each}
           </div>
+          <div class="sound-slots">
+            <div class="slots-label">Custom sounds</div>
+            {#each (['quiet', 'standard', 'loud'] as const) as slot}
+              <div class="sound-slot-row">
+                <span class="slot-name">{PRIORITY_LABELS[slot]}</span>
+                <span class="slot-value">System default</span>
+              </div>
+            {/each}
+          </div>
         </div>
       {/each}
 
@@ -192,6 +201,15 @@
                     <option value={action}>{ACTION_LABELS[action]}</option>
                   {/each}
                 </select>
+              </div>
+            {/each}
+          </div>
+          <div class="sound-slots">
+            <div class="slots-label">Custom sounds</div>
+            {#each (['quiet', 'standard', 'loud'] as const) as slot}
+              <div class="sound-slot-row">
+                <span class="slot-name">{PRIORITY_LABELS[slot]}</span>
+                <span class="slot-value">System default</span>
               </div>
             {/each}
           </div>
@@ -325,5 +343,38 @@
 
   .reset-btn:hover {
     color: var(--accent);
+  }
+
+  .sound-slots {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .slots-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+
+  .sound-slot-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 0;
+  }
+
+  .slot-name {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .slot-value {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
   }
 </style>
