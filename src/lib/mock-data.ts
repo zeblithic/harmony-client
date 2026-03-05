@@ -35,6 +35,25 @@ export const messages: Message[] = [
     ],
     priority: 'standard',
   },
+  // Thread reply to msg-02 (Bob's PR)
+  {
+    id: 'msg-02-r1',
+    sender: peers[2], // Carol
+    text: 'Reviewed — looks good, left a few comments on the error handling.',
+    timestamp: base + 8 * 60_000,
+    media: [],
+    priority: 'standard',
+    replyTo: 'msg-02',
+  },
+  {
+    id: 'msg-02-r2',
+    sender: peers[0], // Alice
+    text: 'Thanks Carol, I will address those today.',
+    timestamp: base + 10 * 60_000,
+    media: [],
+    priority: 'standard',
+    replyTo: 'msg-02',
+  },
   {
     id: 'msg-03',
     sender: peers[2],
@@ -110,6 +129,41 @@ floor_fraction = 0.1`,
     timestamp: base + hour,
     media: [],
     priority: 'loud',
+  },
+  // Thread reply to msg-08 (interop question)
+  {
+    id: 'msg-08-r1',
+    sender: peers[3], // Dave
+    text: 'Running the full suite now, will post results shortly.',
+    timestamp: base + hour + 2 * 60_000,
+    media: [],
+    priority: 'standard',
+    replyTo: 'msg-08',
+  },
+  {
+    id: 'msg-08-r2',
+    sender: peers[2], // Carol
+    text: 'I tested the identity path — byte-identical to Python.',
+    timestamp: base + hour + 3 * 60_000,
+    media: [
+      {
+        id: 'media-08',
+        type: 'image',
+        url: 'https://placehold.co/600x300/313338/f2f3f5?text=Interop+Test+Results',
+        title: 'Identity derivation interop results',
+      },
+    ],
+    priority: 'standard',
+    replyTo: 'msg-08',
+  },
+  {
+    id: 'msg-08-r3',
+    sender: peers[0], // Alice
+    text: 'Excellent — that confirms the HKDF path is correct too.',
+    timestamp: base + hour + 4 * 60_000,
+    media: [],
+    priority: 'quiet',
+    replyTo: 'msg-08',
   },
   {
     id: 'msg-09',
