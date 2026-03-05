@@ -4,7 +4,7 @@
   import TextMessage from './TextMessage.svelte';
   import ComposeBar from './ComposeBar.svelte';
 
-  let { rootMessage, replies, onClose, onSend, onAvatarClick, trustService, trustVersion = 0 }: {
+  let { rootMessage, replies, onClose, onSend, onAvatarClick, trustService, trustVersion = 0, onScrollToMessage }: {
     rootMessage: Message;
     replies: Message[];
     onClose?: () => void;
@@ -12,6 +12,7 @@
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     trustService?: TrustService;
     trustVersion?: number;
+    onScrollToMessage?: (messageId: string) => void;
   } = $props();
 
   let allThreadMessages = $derived([rootMessage, ...replies]);
@@ -37,7 +38,7 @@
     </div>
 
     {#each replies as reply (reply.id)}
-      <TextMessage message={reply} {onAvatarClick} {trustService} {trustVersion} allMessages={allThreadMessages} />
+      <TextMessage message={reply} {onAvatarClick} {trustService} {trustVersion} allMessages={allThreadMessages} {onScrollToMessage} />
     {/each}
   </div>
 

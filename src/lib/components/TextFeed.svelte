@@ -160,6 +160,8 @@
       class="drag-handle"
       role="separator"
       aria-orientation="horizontal"
+      aria-valuemin={20}
+      aria-valuemax={80}
       aria-valuenow={Math.round(splitPercent)}
       aria-label="Resize thread panel"
       tabindex="0"
@@ -175,6 +177,7 @@
         {onAvatarClick}
         {trustService}
         {trustVersion}
+        {onScrollToMessage}
       />
     </div>
   {/if}

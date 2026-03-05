@@ -49,6 +49,7 @@
         class="thread-entry"
         class:active={openThreadId === entry.id}
         onclick={() => onThreadOpen?.(entry.id)}
+        aria-label="{entry.pinned ? 'Pinned thread' : 'Thread'} by {entry.sender}: {entry.text.slice(0, 30)}, {entry.count} {entry.count === 1 ? 'reply' : 'replies'}"
       >
         {#if entry.pinned}<span class="pin-icon">📌</span>{/if}
         <span class="entry-sender">{entry.sender}</span>
