@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { NAV_PALETTE } from '../nav-utils';
+  import Avatar from './Avatar.svelte';
 
   const DISPLAY_MODE_CYCLE: DisplayMode[] = ['text', 'icon', 'both'];
   const DISPLAY_MODE_ICON: Record<DisplayMode, string> = {
@@ -24,6 +25,7 @@
     onClick,
     onDisplayModeChange,
     onSortOrderChange,
+    statusText,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -33,6 +35,7 @@
     onClick?: (id: string) => void;
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
     onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
+    statusText?: string;
   } = $props();
 
   let showSortMenu = $state(false);
@@ -93,20 +96,25 @@
   <!-- Row content -->
   <span class="row-content" style="padding-left: {paddingLeft}px">
     {#if displayMode === 'icon'}
-      <!-- Icon grid cell -->
-      <span class="icon-cell">
-        {node.name.charAt(0).toUpperCase()}
-      </span>
-      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer?.avatarUrl}
-        <img class="dm-avatar" src={node.peer.avatarUrl} alt={node.name} />
+      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={32} />
+      {:else}
+        <span class="icon-cell">
+          {node.name.charAt(0).toUpperCase()}
+        </span>
       {/if}
     {:else}
       <!-- Text or both mode -->
       <span class="type-icon">{typeIcon(node)}</span>
-      <span class="node-name">{node.name}</span>
-      {#if displayMode === 'both' && (node.type === 'dm' || node.type === 'group-chat') && node.peer?.avatarUrl}
-        <img class="dm-avatar" src={node.peer.avatarUrl} alt={node.name} />
+      {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
+        <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
+      <span class="node-name">
+        <span class="name-text">{node.name}</span>
+        {#if statusText}
+          <span class="status-text">{statusText}</span>
+        {/if}
+      </span>
     {/if}
 
     <!-- Unread indicators -->
@@ -193,6 +201,12 @@
   .node-name {
     flex: 1;
     overflow: hidden;
+    min-width: 0;
+  }
+
+  .name-text {
+    display: block;
+    overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -211,11 +225,14 @@
     flex-shrink: 0;
   }
 
-  .dm-avatar {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    flex-shrink: 0;
+  .status-text {
+    display: block;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .unread-badge {

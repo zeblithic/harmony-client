@@ -1,10 +1,10 @@
-import type { Peer, Message, NavNode } from './types';
+import type { Peer, Profile, Message, NavNode } from './types';
 
-export const peers: Peer[] = [
-  { address: 'a1b2c3d4', displayName: 'Alice', avatarUrl: undefined },
-  { address: 'e5f6g7h8', displayName: 'Bob', avatarUrl: undefined },
-  { address: 'i9j0k1l2', displayName: 'Carol', avatarUrl: undefined },
-  { address: 'm3n4o5p6', displayName: 'Dave', avatarUrl: undefined },
+export const peers: Profile[] = [
+  { address: 'a1b2c3d4', displayName: 'Alice', statusText: 'Working on transport layer' },
+  { address: 'e5f6g7h8', displayName: 'Bob' },
+  { address: 'i9j0k1l2', displayName: 'Carol', statusText: 'AFK until tomorrow' },
+  { address: 'm3n4o5p6', displayName: 'Dave', statusText: 'Reviewing PRs' },
 ];
 
 const hour = 3600_000;
@@ -354,3 +354,8 @@ export const navNodes: NavNode[] = [
     peer: { address: 'q7r8s9t0', displayName: 'Eve' },
   },
 ];
+
+export const profileStore = new Map<string, Profile>(
+  [...peers, { address: 'q7r8s9t0', displayName: 'Eve', statusText: 'Lurking' } as Profile]
+    .map((p) => [p.address, p])
+);

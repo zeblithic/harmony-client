@@ -2,9 +2,10 @@
   import type { Message } from '../types';
   import MediaCard from './MediaCard.svelte';
 
-  let { messages, onLinkBack }: {
+  let { messages, onLinkBack, onAvatarClick }: {
     messages: Message[];
     onLinkBack?: (messageId: string) => void;
+    onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
   let mediaItems = $derived(
@@ -19,7 +20,7 @@
     <div class="empty-state">No media yet</div>
   {:else}
     {#each mediaItems as { message, attachment } (attachment.id)}
-      <MediaCard {message} {attachment} {onLinkBack} />
+      <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} />
     {/each}
   {/if}
 </div>

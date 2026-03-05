@@ -4,6 +4,21 @@ export interface Peer {
   avatarUrl?: string;
 }
 
+export interface SoundOverrides {
+  quiet?: string;
+  standard?: string;
+  loud?: string;
+}
+
+export interface Profile extends Peer {
+  statusText?: string;
+  /** CID for full-size avatar — resolved via content transport (future) */
+  avatarCid?: string;
+  /** CID for thumbnail avatar — resolved via content transport (future) */
+  avatarMiniCid?: string;
+  notificationSounds?: SoundOverrides;
+}
+
 export interface MediaAttachment {
   id: string;
   type: 'image' | 'link' | 'code';
@@ -31,6 +46,8 @@ export interface NotificationSettings {
   global: NotificationPolicy;
   perCommunity: Map<string, Partial<NotificationPolicy>>;
   perPeer: Map<string, Partial<NotificationPolicy>>;
+  perPeerSounds: Map<string, SoundOverrides>;
+  perCommunitySounds: Map<string, SoundOverrides>;
 }
 
 export interface Message {

@@ -2,10 +2,11 @@
   import type { Message, MediaAttachment } from '../types';
   import Avatar from './Avatar.svelte';
 
-  let { message, attachment, onLinkBack }: {
+  let { message, attachment, onLinkBack, onAvatarClick }: {
     message: Message;
     attachment: MediaAttachment;
     onLinkBack?: (messageId: string) => void;
+    onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
   let timeStr = $derived(
@@ -17,16 +18,18 @@
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
-  <button class="card-header" onclick={() => onLinkBack?.(message.id)}>
+  <div class="card-header" role="button" tabindex="0" onclick={() => onLinkBack?.(message.id)} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !(e.target as HTMLElement).closest('.avatar')) { e.preventDefault(); onLinkBack?.(message.id); } }}>
     <Avatar
       address={message.sender.address}
       displayName={message.sender.displayName}
+      avatarUrl={message.sender.avatarUrl}
       size={20}
+      onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
     <span class="card-sender">{message.sender.displayName}</span>
     <span class="card-time">{timeStr}</span>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
-  </button>
+  </div>
 
   <div class="card-content">
     {#if attachment.type === 'image'}

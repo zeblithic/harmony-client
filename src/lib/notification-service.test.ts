@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { NotificationService } from './notification-service';
-import type { NotificationPolicy } from './types';
+import type { NotificationPolicy, Profile } from './types';
 
 const DEFAULT_POLICY: NotificationPolicy = {
   quiet: 'dot_only',
@@ -73,5 +73,62 @@ describe('NotificationService', () => {
     expect(svc.shouldPlaySound('notify')).toBe(false);
     expect(svc.shouldPlaySound('dot_only')).toBe(false);
     expect(svc.shouldPlaySound('silent')).toBe(false);
+  });
+});
+
+describe('NotificationService.resolveSoundCid', () => {
+  const senderProfile: Profile = {
+    address: 'sender-1',
+    displayName: 'Alice',
+    notificationSounds: {
+      quiet: 'cid-whisper',
+      standard: 'cid-chime',
+      loud: 'cid-siren',
+    },
+  };
+
+  const noSoundsProfile: Profile = {
+    address: 'sender-2',
+    displayName: 'Bob',
+  };
+
+  it('returns undefined when no sounds configured anywhere', () => {
+    const svc = new NotificationService();
+    expect(svc.resolveSoundCid('standard', 'peer-1', noSoundsProfile)).toBeUndefined();
+  });
+
+  it('returns sender profile sound as fallback (tier 3)', () => {
+    const svc = new NotificationService();
+    expect(svc.resolveSoundCid('standard', 'peer-1', senderProfile)).toBe('cid-chime');
+    expect(svc.resolveSoundCid('quiet', 'peer-1', senderProfile)).toBe('cid-whisper');
+    expect(svc.resolveSoundCid('loud', 'peer-1', senderProfile)).toBe('cid-siren');
+  });
+
+  it('per-community sound override beats sender profile (tier 2)', () => {
+    const svc = new NotificationService();
+    svc.setCommunitySoundOverrides('comm-1', { standard: 'cid-community-chime' });
+    expect(svc.resolveSoundCid('standard', 'peer-1', senderProfile, 'comm-1')).toBe('cid-community-chime');
+    expect(svc.resolveSoundCid('loud', 'peer-1', senderProfile, 'comm-1')).toBe('cid-siren');
+  });
+
+  it('per-peer sound override beats per-community (tier 1)', () => {
+    const svc = new NotificationService();
+    svc.setCommunitySoundOverrides('comm-1', { standard: 'cid-community-chime' });
+    svc.setPeerSoundOverrides('peer-1', { standard: 'cid-peer-chime' });
+    expect(svc.resolveSoundCid('standard', 'peer-1', senderProfile, 'comm-1')).toBe('cid-peer-chime');
+  });
+
+  it('clears peer sound overrides', () => {
+    const svc = new NotificationService();
+    svc.setPeerSoundOverrides('peer-1', { standard: 'cid-custom' });
+    svc.clearPeerSoundOverrides('peer-1');
+    expect(svc.resolveSoundCid('standard', 'peer-1', senderProfile)).toBe('cid-chime');
+  });
+
+  it('clears community sound overrides', () => {
+    const svc = new NotificationService();
+    svc.setCommunitySoundOverrides('comm-1', { standard: 'cid-custom' });
+    svc.clearCommunitySoundOverrides('comm-1');
+    expect(svc.resolveSoundCid('standard', 'peer-1', senderProfile, 'comm-1')).toBe('cid-chime');
   });
 });

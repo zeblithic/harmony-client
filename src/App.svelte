@@ -5,13 +5,40 @@
   import TextFeed from './lib/components/TextFeed.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
+  import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
-  import { messages, navNodes } from './lib/mock-data';
-  import type { MessagePriority } from './lib/types';
+  // TODO: Replace mock-data imports with real data sources once content transport is wired up
+  import { messages, navNodes, profileStore } from './lib/mock-data';
+  import type { MessagePriority, Profile } from './lib/types';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
+
+  let popoverProfile = $state<Profile | null>(null);
+  let popoverX = $state(0);
+  let popoverY = $state(0);
+
+  function handleAvatarClick(address: string, event: MouseEvent) {
+    if (popoverProfile?.address === address) {
+      popoverProfile = null;
+      return;
+    }
+    const profile = profileStore.get(address);
+    if (!profile) return;
+    const el = (event.target as HTMLElement).closest('.avatar') as HTMLElement | null;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const POPOVER_WIDTH = 300;
+    const POPOVER_HEIGHT = 220;
+    popoverX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
+    popoverY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
+    popoverProfile = profile;
+  }
+
+  function closePopover() {
+    popoverProfile = null;
+  }
 
   const notificationService = new NotificationService();
 
@@ -81,13 +108,13 @@
 
 <Layout {collapsed} {showSettings}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} />
+    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} />
   {/snippet}
   {#snippet textFeed()}
-    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} />
+    <TextFeed messages={allMessages} {collapsed} onMediaClick={scrollToMedia} onSend={handleSend} onAvatarClick={handleAvatarClick} />
   {/snippet}
   {#snippet mediaFeed()}
-    <MediaFeed messages={allMessages} onLinkBack={scrollToMessage} />
+    <MediaFeed messages={allMessages} onLinkBack={scrollToMessage} onAvatarClick={handleAvatarClick} />
   {/snippet}
   {#snippet settingsPanel()}
     <NotificationSettingsPanel
@@ -98,6 +125,15 @@
     />
   {/snippet}
 </Layout>
+
+{#if popoverProfile}
+  <ProfilePopover
+    profile={popoverProfile}
+    x={popoverX}
+    y={popoverY}
+    onClose={closePopover}
+  />
+{/if}
 
 <style>
   :global(.text-message) {
