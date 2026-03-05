@@ -17,15 +17,17 @@
     // Read rootId synchronously so Svelte tracks it as a dependency
     const id = rootId;
     const cb = onVisibilityChange;
+    let cancelled = false;
     // Optimistically report visible via microtask to prevent flash
     // without risking effect re-trigger from synchronous state writes
-    queueMicrotask(() => cb(id, true));
+    queueMicrotask(() => { if (!cancelled) cb(id, true); });
     const observer = new IntersectionObserver(
-      ([entry]) => cb(id, entry.isIntersecting),
+      ([entry]) => { if (!cancelled) cb(id, entry.isIntersecting); },
       { threshold: 0 }
     );
     observer.observe(el);
     return () => {
+      cancelled = true;
       observer.disconnect();
       cb(id, false);
     };
