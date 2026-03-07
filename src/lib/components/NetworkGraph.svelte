@@ -285,7 +285,7 @@
     const h = canvas.height / dpr;
 
     // Clear and draw background (not transformed)
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, w, h);
     drawBackground(ctx, w, h);
 
     // Apply zoom transform

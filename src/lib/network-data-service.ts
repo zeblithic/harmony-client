@@ -243,7 +243,14 @@ export class MockNetworkDataService implements NetworkDataService {
         node.status = 'online';
       }
 
+      if (node.status !== prevStatus) {
+        this.onAlert?.(
+          `Node ${node.displayName} (${node.address.slice(0, 8)}) changed from ${prevStatus} to ${node.status}`,
+        );
+      }
+
       // Occasional offline/recovery for non-local nodes (~15% chance every 60 ticks)
+      const preOfflineStatus = node.status;
       if (!node.isLocal && this.tickCount % 60 === 0) {
         if (Math.random() < 0.15) {
           if (node.status === 'online' || node.status === 'degraded') {
@@ -254,10 +261,9 @@ export class MockNetworkDataService implements NetworkDataService {
         }
       }
 
-      // Emit alerts on status transitions
-      if (node.status !== prevStatus) {
+      if (node.status !== preOfflineStatus) {
         this.onAlert?.(
-          `Node ${node.displayName} (${node.address.slice(0, 8)}) changed from ${prevStatus} to ${node.status}`,
+          `Node ${node.displayName} (${node.address.slice(0, 8)}) changed from ${preOfflineStatus} to ${node.status}`,
         );
       }
     }

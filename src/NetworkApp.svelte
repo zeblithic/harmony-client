@@ -46,8 +46,8 @@
   };
 
   service.onTick = () => {
-    nodes = [...service.nodes];
-    links = [...service.links];
+    nodes = service.nodes.map((n) => ({ ...n }));
+    links = service.links.map((l) => ({ ...l }));
   };
 
   function handleNodeClick(address: string) {

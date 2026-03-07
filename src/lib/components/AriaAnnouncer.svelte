@@ -4,19 +4,30 @@
   let { message }: { message: string } = $props();
   let displayedMessage = $state('');
   let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastDropped: string | null = null;
+
+  function startCooldown() {
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      if (lastDropped) {
+        displayedMessage = lastDropped;
+        lastDropped = null;
+        startCooldown();
+      }
+    }, 3000);
+  }
 
   $effect(() => {
     const msg = message;
     if (!msg) return;
 
     if (!throttleTimer) {
-      // Not in cooldown — announce immediately, start 3s cooldown
       displayedMessage = msg;
-      throttleTimer = setTimeout(() => {
-        throttleTimer = null;
-      }, 3000);
+      lastDropped = null;
+      startCooldown();
+    } else {
+      lastDropped = msg;
     }
-    // In cooldown — drop the message (throttle behavior)
   });
 
   onDestroy(() => {
