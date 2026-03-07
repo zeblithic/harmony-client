@@ -13,7 +13,7 @@ describe('nodeHealthColor', () => {
     expect(nodeHealthColor('online', false)).toBe('#43b581');
   });
 
-  it('returns accent blue for local node', () => {
+  it('returns accent blue for local node when online', () => {
     expect(nodeHealthColor('online', true)).toBe('#5865f2');
   });
 
@@ -21,8 +21,16 @@ describe('nodeHealthColor', () => {
     expect(nodeHealthColor('degraded', false)).toBe('#faa61a');
   });
 
+  it('returns amber for degraded local node', () => {
+    expect(nodeHealthColor('degraded', true)).toBe('#faa61a');
+  });
+
   it('returns gray for offline', () => {
     expect(nodeHealthColor('offline', false)).toBe('#72767d');
+  });
+
+  it('returns gray for offline local node', () => {
+    expect(nodeHealthColor('offline', true)).toBe('#72767d');
   });
 });
 

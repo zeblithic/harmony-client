@@ -49,4 +49,5 @@ export interface NetworkDataService {
   stop(): void;
   requestPeerData(address: string): void;
   onAlert?: (message: string) => void;
+  onTick?: () => void;
 }

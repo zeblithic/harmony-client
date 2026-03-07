@@ -78,7 +78,7 @@
     <div class="metric">
       <div class="metric-header">
         <span class="metric-label">Latency</span>
-        <span class="metric-value">{link.latencyMs} ms</span>
+        <span class="metric-value">{Math.round(link.latencyMs)} ms</span>
       </div>
       <Sparkline data={latencyData} label="Link latency history" color="#5865f2" />
     </div>

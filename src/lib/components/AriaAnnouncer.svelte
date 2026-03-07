@@ -1,9 +1,23 @@
 <script lang="ts">
   let { message }: { message: string } = $props();
+  let debouncedMessage = $state('');
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    const msg = message;
+    if (!msg) return;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debouncedMessage = msg;
+    }, 3000);
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  });
 </script>
 
 <div role="status" aria-live="polite" aria-atomic="true" class="sr-only">
-  {message}
+  {debouncedMessage}
 </div>
 
 <style>

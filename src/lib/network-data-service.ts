@@ -110,6 +110,7 @@ export class MockNetworkDataService implements NetworkDataService {
   nodes: NetworkNode[];
   links: NetworkLink[];
   onAlert?: (message: string) => void;
+  onTick?: () => void;
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private tickCount = 0;
@@ -282,6 +283,8 @@ export class MockNetworkDataService implements NetworkDataService {
     for (const discovery of ready) {
       this.addDiscoveredNodes(discovery.address);
     }
+
+    this.onTick?.();
   }
 
   private addDiscoveredNodes(parentAddress: string): void {

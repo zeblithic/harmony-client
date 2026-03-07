@@ -24,7 +24,7 @@
   let statusColor = $derived(nodeHealthColor(node.status, node.isLocal));
 
   let hopLabel = $derived(
-    node.hopDistance === 1 ? '1 hop' : `${node.hopDistance} hops`,
+    node.hopDistance === 0 ? 'local' : node.hopDistance === 1 ? '1 hop' : `${node.hopDistance} hops`,
   );
 
   let lastSeenSeconds = $derived(
@@ -179,7 +179,7 @@
             <span class="link-type">{link.interfaceType.toUpperCase()}</span>
             <span class="link-stats">
               <span style="color: {linkUtilizationColor(link.utilizationPercent)}">{formatPercent(link.utilizationPercent)}</span>
-              · {link.latencyMs}ms
+              · {Math.round(link.latencyMs)}ms
             </span>
           </button>
         </li>

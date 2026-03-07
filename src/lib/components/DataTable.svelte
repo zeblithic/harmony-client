@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { NetworkNode } from '../network-types';
+  import { nodeHealthColor } from '../graph-utils';
 
   type SortKey = 'displayName' | 'status' | 'hopDistance' | 'cpuPercent' | 'memory' | 'disk';
 
@@ -66,18 +67,10 @@
   }
 
   function formatBytes(used: number, total: number): string {
-    const usedGb = used / 1e9;
-    const totalGb = total / 1e9;
+    const GiB = 1024 * 1024 * 1024;
+    const usedGb = used / GiB;
+    const totalGb = total / GiB;
     return `${usedGb.toFixed(1)}/${totalGb.toFixed(0)} GB`;
-  }
-
-  function statusColor(status: string): string {
-    switch (status) {
-      case 'online': return '#43b581';
-      case 'degraded': return '#faa61a';
-      case 'offline': return '#72767d';
-      default: return '#72767d';
-    }
   }
 
   function handleRowClick(address: string) {
@@ -129,7 +122,7 @@
       >
         <td class="name-cell">{node.displayName}</td>
         <td>
-          <span class="status-dot" style="background: {statusColor(node.status)}"></span>
+          <span class="status-dot" style="background: {nodeHealthColor(node.status, node.isLocal)}"></span>
           {node.status}
         </td>
         <td>{node.hopDistance}</td>

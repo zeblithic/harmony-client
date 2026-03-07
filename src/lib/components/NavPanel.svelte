@@ -48,17 +48,16 @@
 
   /** Open the network visualization in a second Tauri window. */
   async function openNetworkWindow() {
-    try {
-      const existing = await WebviewWindow.getByLabel('network-viz');
-      if (existing) {
-        await existing.setFocus();
-        return;
-      }
-    } catch {
-      // Window doesn't exist yet, create it
+    const existing = await WebviewWindow.getByLabel('network-viz');
+    if (existing) {
+      await existing.setFocus();
+      return;
     }
+    const url = import.meta.env.DEV
+      ? 'src/network.html'
+      : 'network.html';
     new WebviewWindow('network-viz', {
-      url: 'src/network.html',
+      url,
       title: 'Harmony — Network',
       width: 1200,
       height: 800,

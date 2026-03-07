@@ -1,10 +1,9 @@
 import type { NodeStatus } from './network-types';
 
 export function nodeHealthColor(status: NodeStatus, isLocal: boolean): string {
-  if (isLocal) return '#5865f2';
   switch (status) {
     case 'online':
-      return '#43b581';
+      return isLocal ? '#5865f2' : '#43b581';
     case 'degraded':
       return '#faa61a';
     case 'offline':

@@ -1,6 +1,7 @@
 <script lang="ts">
   import './app.css';
   import { MockNetworkDataService } from './lib/network-data-service';
+  import type { NetworkNode, NetworkLink } from './lib/network-types';
   import NetworkToolbar from './lib/components/NetworkToolbar.svelte';
   import NetworkGraph from './lib/components/NetworkGraph.svelte';
   import DetailPanel from './lib/components/DetailPanel.svelte';
@@ -9,6 +10,8 @@
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
 
   let service = new MockNetworkDataService();
+  let nodes = $state<NetworkNode[]>([...service.nodes]);
+  let links = $state<NetworkLink[]>([...service.links]);
   let selectedAddress = $state<string | null>(null);
   let selectedLinkId = $state<string | null>(null);
   let showTable = $state(false);
@@ -21,16 +24,16 @@
   }
 
   let selectedNode = $derived(
-    selectedAddress ? service.nodes.find((n) => n.address === selectedAddress) ?? null : null,
+    selectedAddress ? nodes.find((n) => n.address === selectedAddress) ?? null : null,
   );
 
   let selectedLink = $derived(
-    selectedLinkId ? service.links.find((l) => l.id === selectedLinkId) ?? null : null,
+    selectedLinkId ? links.find((l) => l.id === selectedLinkId) ?? null : null,
   );
 
   let healthySummary = $derived.by(() => {
     const counts = { online: 0, degraded: 0, offline: 0 };
-    for (const n of service.nodes) counts[n.status]++;
+    for (const n of nodes) counts[n.status]++;
     const parts: string[] = [];
     if (counts.online > 0) parts.push(`${counts.online} healthy`);
     if (counts.degraded > 0) parts.push(`${counts.degraded} degraded`);
@@ -40,6 +43,11 @@
 
   service.onAlert = (msg) => {
     announcement = msg;
+  };
+
+  service.onTick = () => {
+    nodes = [...service.nodes];
+    links = [...service.links];
   };
 
   function handleNodeClick(address: string) {
@@ -77,7 +85,7 @@
     {#if showTable}
       <div class="table-area">
         <DataTable
-          nodes={service.nodes}
+          {nodes}
           {selectedAddress}
           onNodeSelect={handleNodeClick}
         />
@@ -85,8 +93,8 @@
     {:else}
       <NetworkGraph
         bind:this={graphComponent}
-        nodes={service.nodes}
-        links={service.links}
+        {nodes}
+        {links}
         {selectedAddress}
         onNodeClick={handleNodeClick}
         onLinkClick={handleLinkClick}
@@ -96,15 +104,15 @@
     <DetailPanel
       {selectedNode}
       {selectedLink}
-      nodes={service.nodes}
-      links={service.links}
+      {nodes}
+      {links}
       onLinkClick={handleLinkClick}
     />
   </div>
 
   <NetworkStatusBar
-    nodeCount={service.nodes.length}
-    linkCount={service.links.length}
+    nodeCount={nodes.length}
+    linkCount={links.length}
     {healthySummary}
   />
 

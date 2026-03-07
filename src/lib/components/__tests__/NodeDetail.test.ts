@@ -48,6 +48,12 @@ describe('NodeDetail', () => {
     expect(screen.getByText(/2 hops/)).toBeTruthy();
   });
 
+  it('shows "local" for hop distance 0', () => {
+    const localNode = { ...makeTestNode(), hopDistance: 0, isLocal: true };
+    render(NodeDetail, { props: { node: localNode, links: testLinks } });
+    expect(screen.getByText(/local/)).toBeTruthy();
+  });
+
   it('displays CPU metric', () => {
     render(NodeDetail, { props: { node: makeTestNode(), links: testLinks } });
     expect(screen.getByText(/47%/)).toBeTruthy();
