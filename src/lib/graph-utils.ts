@@ -59,6 +59,48 @@ export function findNodeAtPoint<T extends PointNode>(
   return closest;
 }
 
+interface PointLink {
+  id: string;
+  source: { x: number; y: number };
+  target: { x: number; y: number };
+  utilizationPercent: number;
+}
+
+export function findLinkAtPoint<T extends PointLink>(
+  px: number,
+  py: number,
+  links: T[],
+): T | null {
+  let closest: T | null = null;
+  let closestDist = Infinity;
+
+  for (const link of links) {
+    const sx = link.source.x;
+    const sy = link.source.y;
+    const tx = link.target.x;
+    const ty = link.target.y;
+
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) continue;
+
+    // Project point onto line segment, clamped to [0,1]
+    const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / lenSq));
+    const projX = sx + t * dx;
+    const projY = sy + t * dy;
+    const dist = Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+
+    const threshold = linkWidth(link.utilizationPercent) / 2 + 4;
+    if (dist <= threshold && dist < closestDist) {
+      closest = link;
+      closestDist = dist;
+    }
+  }
+
+  return closest;
+}
+
 export function advanceParticle(position: number, speed: number, dt: number): number {
   const advancement = 2 * speed * dt;
   return (position + advancement) % 1;

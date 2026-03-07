@@ -200,41 +200,46 @@ export class MockNetworkDataService implements NetworkDataService {
 
     // Update node metrics
     for (const node of this.nodes) {
-      const prevCpu = node.metrics.cpuPercent;
+      // Status transitions and alerts happen for all nodes, but
+      // metrics only update for non-offline nodes
+      if (node.status === 'offline') {
+        // Skip metrics update — preserve last-known values
+      } else {
+        const prevCpu = node.metrics.cpuPercent;
 
-      // Sine-wave drift + random noise for CPU
-      const sineComponent = Math.sin(this.tickCount * 0.05) * 10;
-      const noise = (Math.random() - 0.5) * 8;
-      const newCpu = clamp(prevCpu + sineComponent * 0.1 + noise, 2, 98);
+        // Sine-wave drift + random noise for CPU
+        const sineComponent = Math.sin(this.tickCount * 0.05) * 10;
+        const noise = (Math.random() - 0.5) * 8;
+        const newCpu = clamp(prevCpu + sineComponent * 0.1 + noise, 2, 98);
 
-      // Memory drifts slightly
-      const memDrift = (Math.random() - 0.5) * 0.01 * node.metrics.memoryTotalBytes;
-      const newMemUsed = clamp(
-        node.metrics.memoryUsedBytes + memDrift,
-        0,
-        node.metrics.memoryTotalBytes,
-      );
+        // Memory drifts slightly
+        const memDrift = (Math.random() - 0.5) * 0.01 * node.metrics.memoryTotalBytes;
+        const newMemUsed = clamp(
+          node.metrics.memoryUsedBytes + memDrift,
+          0,
+          node.metrics.memoryTotalBytes,
+        );
 
-      const newMetrics: NodeMetrics = {
-        timestamp: now,
-        cpuPercent: newCpu,
-        memoryUsedBytes: Math.floor(newMemUsed),
-        memoryTotalBytes: node.metrics.memoryTotalBytes,
-        diskUsedBytes: node.metrics.diskUsedBytes,
-        diskTotalBytes: node.metrics.diskTotalBytes,
-      };
+        const newMetrics: NodeMetrics = {
+          timestamp: now,
+          cpuPercent: newCpu,
+          memoryUsedBytes: Math.floor(newMemUsed),
+          memoryTotalBytes: node.metrics.memoryTotalBytes,
+          diskUsedBytes: node.metrics.diskUsedBytes,
+          diskTotalBytes: node.metrics.diskTotalBytes,
+        };
 
-      node.metrics = newMetrics;
-      node.metricsHistory.push(newMetrics);
-      if (node.status !== 'offline') {
+        node.metrics = newMetrics;
+        node.metricsHistory.push(newMetrics);
         node.lastSeen = now;
       }
 
       // Status transitions based on CPU
       const prevStatus = node.status;
-      if (node.status === 'online' && newCpu > 85) {
+      const currentCpu = node.metrics.cpuPercent;
+      if (node.status === 'online' && currentCpu > 85) {
         node.status = 'degraded';
-      } else if (node.status === 'degraded' && newCpu < 70) {
+      } else if (node.status === 'degraded' && currentCpu < 70) {
         node.status = 'online';
       }
 

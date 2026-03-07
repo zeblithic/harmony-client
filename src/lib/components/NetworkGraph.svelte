@@ -19,6 +19,7 @@
     linkWidth,
     nodeRadius,
     findNodeAtPoint,
+    findLinkAtPoint,
     advanceParticle,
   } from '../graph-utils';
 
@@ -285,6 +286,7 @@
     ctx.restore();
 
     animationFrameId = requestAnimationFrame(render);
+    if (document.hidden) return;
   }
 
   function screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
@@ -296,21 +298,27 @@
 
   function handleClick(event: MouseEvent) {
     const { x, y } = screenToWorld(event.clientX, event.clientY);
-    const hit = findNodeAtPoint(x, y, simNodes);
-    if (hit) {
-      onNodeClick?.(hit.address);
+    const hitNode = findNodeAtPoint(x, y, simNodes);
+    if (hitNode) {
+      onNodeClick?.(hitNode.address);
+      return;
+    }
+    const hitLink = findLinkAtPoint(x, y, simLinks);
+    if (hitLink) {
+      onLinkClick?.(hitLink.id);
     }
   }
 
   function handleMouseMove(event: MouseEvent) {
     const { x, y } = screenToWorld(event.clientX, event.clientY);
     const hit = findNodeAtPoint(x, y, simNodes);
+    const hitLink = !hit ? findLinkAtPoint(x, y, simLinks) : null;
     const newHovered = hit ? hit.address : null;
     if (newHovered !== hoveredAddress) {
       hoveredAddress = newHovered;
       onNodeHover?.(newHovered);
-      canvas.style.cursor = newHovered ? 'pointer' : 'default';
     }
+    canvas.style.cursor = (hit || hitLink) ? 'pointer' : 'default';
   }
 
   function resizeCanvas() {

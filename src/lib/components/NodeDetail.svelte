@@ -150,31 +150,35 @@
     {hopLabel} · last seen: {lastSeenSeconds}s
   </p>
 
-  <div class="metrics-section">
-    <div class="metric">
-      <div class="metric-header">
-        <span class="metric-label">CPU</span>
-        <span class="metric-value">{formatPercent(node.metrics.cpuPercent)}</span>
+  {#if node.status === 'offline'}
+    <p class="meta-line" style="color: var(--text-muted, #72767d)">No metrics available — node is offline</p>
+  {:else}
+    <div class="metrics-section">
+      <div class="metric">
+        <div class="metric-header">
+          <span class="metric-label">CPU</span>
+          <span class="metric-value">{formatPercent(node.metrics.cpuPercent)}</span>
+        </div>
+        <Sparkline data={cpuData} label="CPU usage history" color={cpuColor} />
       </div>
-      <Sparkline data={cpuData} label="CPU usage history" color={cpuColor} />
-    </div>
 
-    <div class="metric">
-      <div class="metric-header">
-        <span class="metric-label">Memory</span>
-        <span class="metric-value">{formatBytes(node.metrics.memoryUsedBytes)} / {formatBytes(node.metrics.memoryTotalBytes)}</span>
+      <div class="metric">
+        <div class="metric-header">
+          <span class="metric-label">Memory</span>
+          <span class="metric-value">{formatBytes(node.metrics.memoryUsedBytes)} / {formatBytes(node.metrics.memoryTotalBytes)}</span>
+        </div>
+        <Sparkline data={memData} label="Memory usage history" color={memColor} />
       </div>
-      <Sparkline data={memData} label="Memory usage history" color={memColor} />
-    </div>
 
-    <div class="metric">
-      <div class="metric-header">
-        <span class="metric-label">Disk</span>
-        <span class="metric-value">{formatBytes(node.metrics.diskUsedBytes)} / {formatBytes(node.metrics.diskTotalBytes)}</span>
+      <div class="metric">
+        <div class="metric-header">
+          <span class="metric-label">Disk</span>
+          <span class="metric-value">{formatBytes(node.metrics.diskUsedBytes)} / {formatBytes(node.metrics.diskTotalBytes)}</span>
+        </div>
+        <Sparkline data={diskData} label="Disk usage history" color={diskColor} />
       </div>
-      <Sparkline data={diskData} label="Disk usage history" color={diskColor} />
     </div>
-  </div>
+  {/if}
 
   <div class="links-section">
     <h3 class="links-heading">Links ({connectedLinks.length})</h3>
