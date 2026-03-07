@@ -60,7 +60,7 @@
               name="trust-{dim}"
               value={level}
               checked={dimensions[i] === level}
-              onclick={() => handleChange(i, level)}
+              onchange={() => handleChange(i, level)}
             />
             <span class="level-value">{level}</span>
           </label>
