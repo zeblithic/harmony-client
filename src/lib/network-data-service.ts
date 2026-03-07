@@ -184,6 +184,8 @@ export class MockNetworkDataService implements NetworkDataService {
   }
 
   requestPeerData(address: string): void {
+    // Stub for future backend integration — not called by the mock UI,
+    // but required by the NetworkDataService interface.
     // Queue a discovery that resolves 1-2 seconds later
     const delayTicks = randomInt(1, 2);
     this.pendingDiscoveries.push({

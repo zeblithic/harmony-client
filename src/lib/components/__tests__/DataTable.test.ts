@@ -31,9 +31,9 @@ const testNodes: NetworkNode[] = [
 ];
 
 describe('DataTable', () => {
-  it('renders a table element', () => {
+  it('renders a grid element', () => {
     render(DataTable, { props: { nodes: testNodes } });
-    const table = screen.getByRole('table');
+    const table = screen.getByRole('grid');
     expect(table).toBeTruthy();
   });
 

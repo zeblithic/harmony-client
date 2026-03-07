@@ -98,7 +98,7 @@
   ];
 </script>
 
-<table class="data-table">
+<table class="data-table" role="grid">
   <thead>
     <tr>
       {#each columns as col}
@@ -115,7 +115,7 @@
     </tr>
   </thead>
   <tbody>
-    {#each sortedNodes as node}
+    {#each sortedNodes as node (node.address)}
       <tr
         class="data-row"
         class:selected={selectedAddress === node.address}
