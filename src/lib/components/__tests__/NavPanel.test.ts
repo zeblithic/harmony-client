@@ -1,5 +1,13 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+vi.mock('@tauri-apps/api/webviewWindow', () => ({
+  WebviewWindow: class {
+    static getByLabel = vi.fn().mockResolvedValue(null);
+    constructor() { /* no-op in tests */ }
+  },
+}));
+
 import NavPanel from '../NavPanel.svelte';
 import type { NavNode } from '../../types';
 
