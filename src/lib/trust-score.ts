@@ -1,4 +1,4 @@
-export type TrustScore = number; // 0-255, uint8
+export type TrustScore = number & { readonly __brand: 'TrustScore' };
 
 export interface TrustEdge {
   /** SHA-256 address of the scorer */
@@ -30,7 +30,11 @@ export function buildScore(
     ((clampDimension(compliance) & 0x3) << 2) |
     ((clampDimension(association) & 0x3) << 4) |
     ((clampDimension(endorsement) & 0x3) << 6)
-  );
+  ) as TrustScore;
+}
+
+export function isValidScore(value: number): value is TrustScore {
+  return Number.isInteger(value) && value >= 0 && value <= 255;
 }
 
 export function getIdentity(score: TrustScore): number {

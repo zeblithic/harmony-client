@@ -1,6 +1,6 @@
 import type { TrustLevel } from './types';
 import type { TrustScore, TrustEdge } from './trust-score';
-import { getIdentity } from './trust-score';
+import { getIdentity, isValidScore } from './trust-score';
 import { randomInt } from './random-utils';
 
 export interface TrustGraphService {
@@ -49,19 +49,20 @@ export class MockTrustGraphService implements TrustGraphService {
   }
 
   setScore(target: string, score: TrustScore): void {
-    const existing = this.edges.find(
+    const idx = this.edges.findIndex(
       (e) => e.source === this.localAddress && e.target === target,
     );
-    if (existing) {
-      existing.score = score;
-      existing.timestamp = Date.now();
+    if (idx !== -1) {
+      this.edges = this.edges.map((e, i) =>
+        i === idx ? { ...e, score, timestamp: Date.now() } : e,
+      );
     } else {
-      this.edges.push({
+      this.edges = [...this.edges, {
         source: this.localAddress,
         target,
         score,
         timestamp: Date.now(),
-      });
+      }];
     }
   }
 
@@ -99,7 +100,7 @@ export class MockTrustGraphService implements TrustGraphService {
    */
   resolveMediaTrust(peerAddress: string): TrustLevel | null {
     const score = this.directScore(this.localAddress, peerAddress);
-    if (score === null) return null;
+    if (score === null || !isValidScore(score)) return null;
     const identity = getIdentity(score);
     if (identity <= 1) return 'untrusted';
     if (identity === 2) return 'preview';
