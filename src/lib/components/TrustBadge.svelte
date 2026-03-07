@@ -3,9 +3,9 @@
   import type { TrustScore } from '../trust-score';
 
   let {
-    score,
+    score = null,
   }: {
-    score: TrustScore | null;
+    score?: TrustScore | null;
   } = $props();
 
   let color = $derived(trustScoreColor(score));
