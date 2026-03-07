@@ -19,10 +19,24 @@ export class MockTrustGraphService {
     const allAddresses = [this.localAddress, ...peers];
 
     for (const source of allAddresses) {
+      let hasEdge = false;
       for (const target of allAddresses) {
         if (source === target) continue;
         // ~60% chance of having a score for any given peer
-        if (Math.random() < 0.4) continue;
+        if (Math.random() < 0.4) {
+          continue;
+        }
+        hasEdge = true;
+        this.edges.push({
+          source,
+          target,
+          score: randomInt(0, 255) as TrustScore,
+          timestamp: Date.now() - randomInt(0, 7 * 24 * 60 * 60 * 1000),
+        });
+      }
+      // Guarantee at least one edge per source to avoid flaky tests
+      if (!hasEdge && allAddresses.length > 1) {
+        const target = allAddresses.find((a) => a !== source)!;
         this.edges.push({
           source,
           target,

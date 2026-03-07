@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { MockTrustGraphService } from './trust-graph-service';
-import { getIdentity, buildScore } from './trust-score';
+import { buildScore } from './trust-score';
 
 describe('MockTrustGraphService', () => {
   it('initializes with edges between mock peers', () => {
