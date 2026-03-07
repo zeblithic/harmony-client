@@ -81,7 +81,7 @@
     {#if onClear}
       <button
         class="clear-button"
-        onclick={() => onClear?.()}
+        onclick={() => onClear()}
         aria-label="Clear trust score"
       >
         Clear

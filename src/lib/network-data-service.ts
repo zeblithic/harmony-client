@@ -1,4 +1,5 @@
 import { RingBuffer } from './ring-buffer';
+import { randomInt } from './random-utils';
 import type {
   NetworkNode,
   NetworkLink,
@@ -33,9 +34,6 @@ function randomBetween(min: number, max: number): number {
   return min + Math.random() * (max - min);
 }
 
-function randomInt(min: number, max: number): number {
-  return Math.floor(randomBetween(min, max + 1));
-}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));

@@ -1,13 +1,10 @@
 import type { TrustLevel } from './types';
 import type { TrustScore, TrustEdge } from './trust-score';
 import { getIdentity } from './trust-score';
+import { randomInt } from './random-utils';
 
 export interface TrustGraphService {
   resolveMediaTrust(peerAddress: string): TrustLevel | null;
-}
-
-function randomInt(min: number, max: number): number {
-  return Math.floor(min + Math.random() * (max - min + 1));
 }
 
 export class MockTrustGraphService implements TrustGraphService {
@@ -80,15 +77,15 @@ export class MockTrustGraphService implements TrustGraphService {
   }
 
   getEdges(): TrustEdge[] {
-    return [...this.edges];
+    return this.edges.map((e) => ({ ...e }));
   }
 
   edgesFrom(address: string): TrustEdge[] {
-    return this.edges.filter((e) => e.source === address);
+    return this.edges.filter((e) => e.source === address).map((e) => ({ ...e }));
   }
 
   edgesTo(address: string): TrustEdge[] {
-    return this.edges.filter((e) => e.target === address);
+    return this.edges.filter((e) => e.target === address).map((e) => ({ ...e }));
   }
 
   directScore(source: string, target: string): TrustScore | null {
