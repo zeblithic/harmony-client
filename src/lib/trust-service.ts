@@ -1,5 +1,5 @@
 import type { MediaAttachment, TrustLevel, TrustSettings } from './types';
-import type { MockTrustGraphService } from './trust-graph-service';
+import type { TrustGraphService } from './trust-graph-service';
 
 export class TrustService {
   readonly settings: TrustSettings;
@@ -7,9 +7,9 @@ export class TrustService {
   // Intentionally never pruned — entries are small strings and the set resets
   // when the app restarts. clearLoaded() exists for testing.
   private loadedAttachments = new Set<string>();
-  private trustGraph: MockTrustGraphService | null;
+  private trustGraph: TrustGraphService | null;
 
-  constructor(trustGraph?: MockTrustGraphService) {
+  constructor(trustGraph?: TrustGraphService) {
     this.settings = {
       global: 'untrusted',
       perPeer: new Map(),

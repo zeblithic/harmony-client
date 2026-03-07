@@ -2,11 +2,15 @@ import type { TrustLevel } from './types';
 import type { TrustScore, TrustEdge } from './trust-score';
 import { getIdentity } from './trust-score';
 
+export interface TrustGraphService {
+  resolveMediaTrust(peerAddress: string): TrustLevel | null;
+}
+
 function randomInt(min: number, max: number): number {
   return Math.floor(min + Math.random() * (max - min + 1));
 }
 
-export class MockTrustGraphService {
+export class MockTrustGraphService implements TrustGraphService {
   readonly localAddress: string;
   private edges: TrustEdge[] = [];
 
