@@ -15,7 +15,7 @@ export interface TrustEdge {
 export const DIMENSIONS = ['Identity', 'Compliance', 'Association', 'Endorsement'] as const;
 export type TrustDimension = (typeof DIMENSIONS)[number];
 
-function clamp02(v: number): number {
+function clampDimension(v: number): number {
   return Math.max(0, Math.min(3, Math.floor(v)));
 }
 
@@ -26,10 +26,10 @@ export function buildScore(
   endorsement: number,
 ): TrustScore {
   return (
-    (clamp02(identity) & 0x3) |
-    ((clamp02(compliance) & 0x3) << 2) |
-    ((clamp02(association) & 0x3) << 4) |
-    ((clamp02(endorsement) & 0x3) << 6)
+    (clampDimension(identity) & 0x3) |
+    ((clampDimension(compliance) & 0x3) << 2) |
+    ((clampDimension(association) & 0x3) << 4) |
+    ((clampDimension(endorsement) & 0x3) << 6)
   );
 }
 
@@ -49,18 +49,24 @@ export function getEndorsement(score: TrustScore): number {
   return (score >> 6) & 0x3;
 }
 
+function dimensionAverage(score: TrustScore): number {
+  return (getIdentity(score) + getCompliance(score) + getAssociation(score) + getEndorsement(score)) / 4;
+}
+
 export function trustScoreColor(score: TrustScore | null): string {
   if (score === null) return '#72767d';
-  if (score < 64) return '#ed4245';
-  if (score < 128) return '#faa61a';
-  if (score < 192) return '#43b581';
+  const avg = dimensionAverage(score);
+  if (avg < 1) return '#ed4245';
+  if (avg < 2) return '#faa61a';
+  if (avg < 2.5) return '#43b581';
   return '#5865f2';
 }
 
 export function trustScoreLabel(score: TrustScore | null): string {
   if (score === null) return 'unscored';
-  if (score < 64) return 'low trust';
-  if (score < 128) return 'cautious';
-  if (score < 192) return 'trusted';
+  const avg = dimensionAverage(score);
+  if (avg < 1) return 'low trust';
+  if (avg < 2) return 'cautious';
+  if (avg < 2.5) return 'trusted';
   return 'highly trusted';
 }

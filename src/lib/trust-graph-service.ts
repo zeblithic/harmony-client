@@ -80,7 +80,7 @@ export class MockTrustGraphService implements TrustGraphService {
   }
 
   getEdges(): TrustEdge[] {
-    return this.edges;
+    return [...this.edges];
   }
 
   edgesFrom(address: string): TrustEdge[] {

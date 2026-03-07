@@ -38,7 +38,9 @@
   );
 
   let fractionDisplay = $derived(
-    score !== null ? `${score}/255` : '',
+    score !== null
+      ? `${getIdentity(score) + getCompliance(score) + getAssociation(score) + getEndorsement(score)}/12`
+      : '',
   );
 </script>
 

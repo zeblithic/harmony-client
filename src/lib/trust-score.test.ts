@@ -92,24 +92,24 @@ describe('trustScoreColor', () => {
     expect(trustScoreColor(null)).toBe('#72767d');
   });
 
-  it('returns red for low trust (0-63)', () => {
-    expect(trustScoreColor(0)).toBe('#ed4245');
-    expect(trustScoreColor(63)).toBe('#ed4245');
+  it('returns red for low trust (avg < 1)', () => {
+    expect(trustScoreColor(buildScore(0, 0, 0, 0))).toBe('#ed4245');
+    expect(trustScoreColor(buildScore(0, 1, 1, 1))).toBe('#ed4245'); // avg 0.75
   });
 
-  it('returns amber for cautious (64-127)', () => {
-    expect(trustScoreColor(64)).toBe('#faa61a');
-    expect(trustScoreColor(127)).toBe('#faa61a');
+  it('returns amber for cautious (avg >= 1, < 2)', () => {
+    expect(trustScoreColor(buildScore(1, 1, 1, 1))).toBe('#faa61a'); // avg 1.0
+    expect(trustScoreColor(buildScore(1, 2, 2, 2))).toBe('#faa61a'); // avg 1.75
   });
 
-  it('returns green for trusted (128-191)', () => {
-    expect(trustScoreColor(128)).toBe('#43b581');
-    expect(trustScoreColor(191)).toBe('#43b581');
+  it('returns green for trusted (avg >= 2, < 2.5)', () => {
+    expect(trustScoreColor(buildScore(2, 2, 2, 2))).toBe('#43b581'); // avg 2.0
+    expect(trustScoreColor(buildScore(2, 2, 3, 2))).toBe('#43b581'); // avg 2.25
   });
 
-  it('returns accent blue for highly trusted (192-255)', () => {
-    expect(trustScoreColor(192)).toBe('#5865f2');
-    expect(trustScoreColor(255)).toBe('#5865f2');
+  it('returns accent blue for highly trusted (avg >= 2.5)', () => {
+    expect(trustScoreColor(buildScore(3, 3, 2, 2))).toBe('#5865f2'); // avg 2.5
+    expect(trustScoreColor(buildScore(3, 3, 3, 3))).toBe('#5865f2'); // avg 3.0
   });
 });
 
@@ -118,19 +118,19 @@ describe('trustScoreLabel', () => {
     expect(trustScoreLabel(null)).toBe('unscored');
   });
 
-  it('returns "low trust" for 0-63', () => {
-    expect(trustScoreLabel(32)).toBe('low trust');
+  it('returns "low trust" for avg < 1', () => {
+    expect(trustScoreLabel(buildScore(0, 0, 0, 0))).toBe('low trust');
   });
 
-  it('returns "cautious" for 64-127', () => {
-    expect(trustScoreLabel(100)).toBe('cautious');
+  it('returns "cautious" for avg >= 1, < 2', () => {
+    expect(trustScoreLabel(buildScore(1, 1, 1, 1))).toBe('cautious');
   });
 
-  it('returns "trusted" for 128-191', () => {
-    expect(trustScoreLabel(150)).toBe('trusted');
+  it('returns "trusted" for avg >= 2, < 2.5', () => {
+    expect(trustScoreLabel(buildScore(2, 2, 2, 2))).toBe('trusted');
   });
 
-  it('returns "highly trusted" for 192-255', () => {
-    expect(trustScoreLabel(255)).toBe('highly trusted');
+  it('returns "highly trusted" for avg >= 2.5', () => {
+    expect(trustScoreLabel(buildScore(3, 3, 3, 3))).toBe('highly trusted');
   });
 });
