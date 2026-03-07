@@ -1,23 +1,34 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
+
   let { message }: { message: string } = $props();
-  let debouncedMessage = $state('');
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let displayedMessage = $state('');
+  let throttleTimer: ReturnType<typeof setTimeout> | null = null;
 
   $effect(() => {
     const msg = message;
     if (!msg) return;
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      debouncedMessage = msg;
-    }, 3000);
-    return () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-    };
+
+    if (!throttleTimer) {
+      // Not in cooldown — announce immediately, start 3s cooldown
+      displayedMessage = msg;
+      throttleTimer = setTimeout(() => {
+        throttleTimer = null;
+      }, 3000);
+    }
+    // In cooldown — drop the message (throttle behavior)
+  });
+
+  onDestroy(() => {
+    if (throttleTimer) {
+      clearTimeout(throttleTimer);
+      throttleTimer = null;
+    }
   });
 </script>
 
 <div role="status" aria-live="polite" aria-atomic="true" class="sr-only">
-  {debouncedMessage}
+  {displayedMessage}
 </div>
 
 <style>

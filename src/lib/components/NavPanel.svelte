@@ -53,9 +53,7 @@
       await existing.setFocus();
       return;
     }
-    const url = import.meta.env.DEV
-      ? 'src/network.html'
-      : 'network.html';
+    const url = 'src/network.html';
     new WebviewWindow('network-viz', {
       url,
       title: 'Harmony — Network',

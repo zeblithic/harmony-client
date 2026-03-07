@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { NetworkNode, NetworkLink } from '../network-types';
   import { generateIdenticon } from '../identicon';
   import { nodeHealthColor, linkUtilizationColor } from '../graph-utils';
@@ -15,6 +16,15 @@
     onLinkClick?: (linkId: string) => void;
   } = $props();
 
+  let now = $state(Date.now());
+
+  onMount(() => {
+    const interval = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(interval);
+  });
+
   let truncatedAddress = $derived(
     node.address.length > 8
       ? `${node.address.slice(0, 4)}...${node.address.slice(-4)}`
@@ -28,7 +38,7 @@
   );
 
   let lastSeenSeconds = $derived(
-    Math.round((Date.now() - node.lastSeen) / 1000),
+    Math.round((now - node.lastSeen) / 1000),
   );
 
   let identiconSvg = $derived(generateIdenticon(node.address, 36));

@@ -17,16 +17,10 @@ describe('AriaAnnouncer', () => {
     expect(el).toBeTruthy();
   });
 
-  it('does not display message immediately (debounced)', () => {
+  it('announces first message immediately (leading-edge throttle)', async () => {
     render(AriaAnnouncer, { props: { message: 'Node bravo went offline' } });
     const el = screen.getByRole('status');
-    expect(el.textContent?.trim()).toBe('');
-  });
-
-  it('displays the message text after 3-second debounce', async () => {
-    render(AriaAnnouncer, { props: { message: 'Node bravo went offline' } });
-    const el = screen.getByRole('status');
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(0);
     expect(el.textContent?.trim()).toBe('Node bravo went offline');
   });
 
