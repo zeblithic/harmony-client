@@ -92,7 +92,7 @@
       sortAsc = !sortAsc;
     } else {
       sortKey = key;
-      sortAsc = false;
+      sortAsc = true;
     }
   }
 

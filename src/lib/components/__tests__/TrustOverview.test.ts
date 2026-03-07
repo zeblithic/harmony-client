@@ -86,7 +86,7 @@ describe('TrustOverview', () => {
     const btn = screen.getByRole('button', { name: /sort by my score/i });
     await fireEvent.click(btn);
     const rows = screen.getAllByRole('row');
-    // After sorting ascending by my score, Bravo (lower) should be first
-    expect(rows[1].textContent).toContain('Bravo');
+    // After sorting ascending by my score, Alpha (score 27) comes before Bravo (score 228)
+    expect(rows[1].textContent).toContain('Alpha');
   });
 });
