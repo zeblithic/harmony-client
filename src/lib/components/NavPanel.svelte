@@ -2,6 +2,7 @@
   import type { NavNode, DisplayMode, SortOrder } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
+  import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let {
     nodes,
@@ -43,6 +44,24 @@
     navNodes = navNodes.map((n) =>
       n.id === nodeId ? { ...n, sortOrder: order } : n
     );
+  }
+
+  /** Open the network visualization in a second Tauri window. */
+  async function openNetworkWindow() {
+    const existing = await WebviewWindow.getByLabel('network-viz');
+    if (existing) {
+      await existing.setFocus();
+      return;
+    }
+    const url = 'src/network.html';
+    new WebviewWindow('network-viz', {
+      url,
+      title: 'Harmony — Network',
+      width: 1200,
+      height: 800,
+      minWidth: 800,
+      minHeight: 600,
+    });
   }
 
   /**
@@ -106,6 +125,16 @@
         {profileLookup}
       />
     </nav>
+    <div class="nav-footer">
+      <button
+        type="button"
+        class="nav-action-btn"
+        aria-label="Open network visualization"
+        onclick={openNetworkWindow}
+      >
+        Network
+      </button>
+    </div>
   {:else}
     <nav class="collapsed-icons">
       {#each topLevelNodes as node (node.id)}
@@ -195,5 +224,27 @@
 
   .icon-button:hover {
     background: var(--accent);
+  }
+
+  .nav-footer {
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+  }
+
+  .nav-action-btn {
+    width: 100%;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: 13px;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .nav-action-btn:hover {
+    background: var(--accent);
+    color: var(--text-primary);
   }
 </style>
