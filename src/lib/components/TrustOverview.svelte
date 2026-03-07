@@ -29,13 +29,6 @@
   let sortKey: SortKey = $state('name');
   let sortAsc: boolean = $state(true);
 
-  interface PeerRow {
-    address: string;
-    displayName: string;
-    myScore: TrustScore | null;
-    theirScore: TrustScore | null;
-  }
-
   let rows = $derived.by(() => {
     const myEdges = new Map(
       edges.filter((e) => e.source === localAddress).map((e) => [e.target, e.score]),
