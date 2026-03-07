@@ -102,7 +102,7 @@
   <thead>
     <tr>
       {#each columns as col}
-        <th scope="col">
+        <th scope="col" aria-sort={sortKey === col.key ? (sortAsc ? 'ascending' : 'descending') : 'none'}>
           <button
             class="sort-button"
             onclick={() => toggleSort(col.key)}

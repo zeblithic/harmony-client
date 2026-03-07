@@ -137,9 +137,20 @@
       }
     }
 
-    // Detect new nodes
+    // Detect new nodes — preserve existing positions for smooth expansion
     if (nodes.length > simNodes.length) {
-      simNodes = createSimNodes(nodes);
+      const existingMap = new Map(simNodes.map((n) => [n.address, n]));
+      simNodes = nodes.map((n) => {
+        const existing = existingMap.get(n.address);
+        if (existing) return existing;
+        return {
+          address: n.address,
+          displayName: n.displayName,
+          hopDistance: n.hopDistance,
+          status: n.status,
+          isLocal: n.isLocal,
+        };
+      });
       simLinks = createSimLinks(links, simNodes);
       particles = initParticles();
       if (simulation) {
@@ -252,6 +263,9 @@
 
   function render(timestamp: number) {
     if (!canvas) return;
+    animationFrameId = requestAnimationFrame(render);
+    if (document.hidden) return;
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
@@ -285,8 +299,6 @@
 
     ctx.restore();
 
-    animationFrameId = requestAnimationFrame(render);
-    if (document.hidden) return;
   }
 
   function screenToWorld(clientX: number, clientY: number): { x: number; y: number } {

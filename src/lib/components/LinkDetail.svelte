@@ -72,7 +72,7 @@
         <span class="metric-label">Utilization</span>
         <span class="metric-value" style="color: {utilizationColor}">{Math.round(link.utilizationPercent)}%</span>
       </div>
-      <Sparkline data={utilizationData} label="Link utilization history" color={utilizationColor} />
+      <Sparkline data={utilizationData} label="Link utilization history" color={utilizationColor} fixedMin={0} fixedMax={100} />
     </div>
 
     <div class="metric">

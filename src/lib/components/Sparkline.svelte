@@ -6,20 +6,26 @@
     label,
     color = '#43b581',
     height = 32,
+    fixedMin = null as number | null,
+    fixedMax = null as number | null,
   }: {
     data: RingBuffer<number>;
     label: string;
     color?: string;
     height?: number;
+    fixedMin?: number | null;
+    fixedMax?: number | null;
   } = $props();
 
   let points = $derived.by(() => {
     const values = data.toArray();
     if (values.length < 2) return '';
-    const max = Math.max(...values, 1);
+    const lo = fixedMin ?? Math.min(...values);
+    const hi = fixedMax ?? Math.max(...values, lo + 1);
+    const range = hi - lo || 1;
     const stepX = 100 / (values.length - 1);
     return values
-      .map((v, i) => `${i * stepX},${height - (v / max) * height}`)
+      .map((v, i) => `${i * stepX},${height - ((v - lo) / range) * height}`)
       .join(' ');
   });
 </script>

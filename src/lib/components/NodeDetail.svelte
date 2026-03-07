@@ -159,7 +159,7 @@
           <span class="metric-label">CPU</span>
           <span class="metric-value">{formatPercent(node.metrics.cpuPercent)}</span>
         </div>
-        <Sparkline data={cpuData} label="CPU usage history" color={cpuColor} />
+        <Sparkline data={cpuData} label="CPU usage history" color={cpuColor} fixedMin={0} fixedMax={100} />
       </div>
 
       <div class="metric">
@@ -167,7 +167,7 @@
           <span class="metric-label">Memory</span>
           <span class="metric-value">{formatBytes(node.metrics.memoryUsedBytes)} / {formatBytes(node.metrics.memoryTotalBytes)}</span>
         </div>
-        <Sparkline data={memData} label="Memory usage history" color={memColor} />
+        <Sparkline data={memData} label="Memory usage history" color={memColor} fixedMin={0} fixedMax={100} />
       </div>
 
       <div class="metric">
@@ -175,7 +175,7 @@
           <span class="metric-label">Disk</span>
           <span class="metric-value">{formatBytes(node.metrics.diskUsedBytes)} / {formatBytes(node.metrics.diskTotalBytes)}</span>
         </div>
-        <Sparkline data={diskData} label="Disk usage history" color={diskColor} />
+        <Sparkline data={diskData} label="Disk usage history" color={diskColor} fixedMin={0} fixedMax={100} />
       </div>
     </div>
   {/if}
