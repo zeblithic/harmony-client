@@ -4,6 +4,7 @@ import {
   linkUtilizationColor,
   linkWidth,
   findNodeAtPoint,
+  findLinkAtPoint,
   advanceParticle,
   nodeRadius,
 } from './graph-utils';
@@ -119,6 +120,57 @@ describe('findNodeAtPoint', () => {
     ];
     const found = findNodeAtPoint(108, 100, close);
     expect(found?.address).toBe('b');
+  });
+});
+
+interface SimpleLink {
+  id: string;
+  source: { x: number; y: number };
+  target: { x: number; y: number };
+  utilizationPercent: number;
+}
+
+describe('findLinkAtPoint', () => {
+  const links: SimpleLink[] = [
+    { id: 'L1', source: { x: 0, y: 0 }, target: { x: 200, y: 0 }, utilizationPercent: 50 },
+    { id: 'L2', source: { x: 100, y: 100 }, target: { x: 100, y: 300 }, utilizationPercent: 20 },
+  ];
+
+  it('finds a horizontal link when clicking near it', () => {
+    const found = findLinkAtPoint(100, 2, links);
+    expect(found?.id).toBe('L1');
+  });
+
+  it('finds a vertical link when clicking near it', () => {
+    const found = findLinkAtPoint(102, 200, links);
+    expect(found?.id).toBe('L2');
+  });
+
+  it('returns null when clicking far from any link', () => {
+    const found = findLinkAtPoint(500, 500, links);
+    expect(found).toBeNull();
+  });
+
+  it('returns null for a zero-length link', () => {
+    const zeroLink: SimpleLink[] = [
+      { id: 'Z', source: { x: 50, y: 50 }, target: { x: 50, y: 50 }, utilizationPercent: 50 },
+    ];
+    const found = findLinkAtPoint(50, 50, zeroLink);
+    expect(found).toBeNull();
+  });
+
+  it('picks the closest link when near two', () => {
+    const close: SimpleLink[] = [
+      { id: 'A', source: { x: 0, y: 0 }, target: { x: 200, y: 0 }, utilizationPercent: 50 },
+      { id: 'B', source: { x: 0, y: 8 }, target: { x: 200, y: 8 }, utilizationPercent: 50 },
+    ];
+    const found = findLinkAtPoint(100, 6, close);
+    expect(found?.id).toBe('B');
+  });
+
+  it('respects segment bounds — clicking past endpoints misses', () => {
+    const found = findLinkAtPoint(-20, 0, links);
+    expect(found).toBeNull();
   });
 });
 
