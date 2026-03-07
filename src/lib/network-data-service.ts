@@ -224,7 +224,9 @@ export class MockNetworkDataService implements NetworkDataService {
 
       node.metrics = newMetrics;
       node.metricsHistory.push(newMetrics);
-      node.lastSeen = now;
+      if (node.status !== 'offline') {
+        node.lastSeen = now;
+      }
 
       // Status transitions based on CPU
       const prevStatus = node.status;

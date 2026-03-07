@@ -18,6 +18,7 @@
   <button
     class="toolbar-btn"
     aria-label="Re-center"
+    disabled={showTable}
     onclick={() => onRecenter?.()}
   >
     Re-center
@@ -26,6 +27,7 @@
   <button
     class="toolbar-btn"
     aria-label="Zoom to fit"
+    disabled={showTable}
     onclick={() => onZoomFit?.()}
   >
     Fit
@@ -67,7 +69,12 @@
     cursor: pointer;
   }
 
-  .toolbar-btn:hover {
+  .toolbar-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .toolbar-btn:hover:not(:disabled) {
     background: var(--bg-tertiary, #313338);
     color: var(--text-primary, #f2f3f5);
   }

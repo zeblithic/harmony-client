@@ -38,4 +38,20 @@ describe('NetworkToolbar', () => {
     await fireEvent.click(btn);
     expect(onRecenter).toHaveBeenCalled();
   });
+
+  it('disables graph-only buttons when in table mode', () => {
+    render(NetworkToolbar, { props: { showTable: true } });
+    const recenter = screen.getByRole('button', { name: /re-center/i });
+    const fit = screen.getByRole('button', { name: /zoom to fit/i });
+    expect(recenter).toHaveProperty('disabled', true);
+    expect(fit).toHaveProperty('disabled', true);
+  });
+
+  it('enables graph-only buttons when in graph mode', () => {
+    render(NetworkToolbar, { props: { showTable: false } });
+    const recenter = screen.getByRole('button', { name: /re-center/i });
+    const fit = screen.getByRole('button', { name: /zoom to fit/i });
+    expect(recenter).toHaveProperty('disabled', false);
+    expect(fit).toHaveProperty('disabled', false);
+  });
 });

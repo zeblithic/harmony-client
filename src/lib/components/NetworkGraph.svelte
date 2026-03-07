@@ -110,19 +110,29 @@
   }
 
   function syncData() {
-    // Update existing node statuses
+    // Update existing node statuses (O(n) via Map)
+    const nodeSourceMap = new Map(nodes.map((n) => [n.address, n]));
     for (const simNode of simNodes) {
-      const source = nodes.find((n) => n.address === simNode.address);
+      const source = nodeSourceMap.get(simNode.address);
       if (source) {
         simNode.status = source.status;
       }
     }
 
-    // Update existing link utilization
+    // Update existing link utilization + particle speeds (O(m) via Map)
+    const linkSourceMap = new Map(links.map((l) => [l.id, l]));
     for (const simLink of simLinks) {
-      const source = links.find((l) => l.id === simLink.id);
+      const source = linkSourceMap.get(simLink.id);
       if (source) {
         simLink.utilizationPercent = source.utilizationPercent;
+      }
+    }
+
+    // Update particle speeds to reflect current utilization
+    for (const particle of particles) {
+      const link = simLinks[particle.linkIndex];
+      if (link) {
+        particle.speed = 0.1 + (link.utilizationPercent / 100) * 0.4;
       }
     }
 

@@ -84,4 +84,26 @@ describe('DataTable', () => {
     expect(selected).toBeTruthy();
     expect(selected?.textContent).toContain('bravo');
   });
+
+  it('sorts memory by utilization ratio, not absolute bytes', async () => {
+    const nodesWithDifferentRatios: NetworkNode[] = [
+      makeNode({
+        address: 'x1',
+        displayName: 'highRatio',
+        metrics: { timestamp: 0, cpuPercent: 50, memoryUsedBytes: 6e9, memoryTotalBytes: 8e9, diskUsedBytes: 50e9, diskTotalBytes: 256e9 },
+      }),
+      makeNode({
+        address: 'x2',
+        displayName: 'lowRatio',
+        metrics: { timestamp: 0, cpuPercent: 50, memoryUsedBytes: 10e9, memoryTotalBytes: 64e9, diskUsedBytes: 50e9, diskTotalBytes: 256e9 },
+      }),
+    ];
+    render(DataTable, { props: { nodes: nodesWithDifferentRatios } });
+    const memBtn = screen.getByRole('button', { name: /sort by memory/i });
+    await fireEvent.click(memBtn);
+    const rows = screen.getAllByRole('row');
+    // lowRatio (10/64 = 15.6%) should sort before highRatio (6/8 = 75%)
+    expect(rows[1].textContent).toContain('lowRatio');
+    expect(rows[2].textContent).toContain('highRatio');
+  });
 });

@@ -37,10 +37,14 @@
           cmp = a.metrics.cpuPercent - b.metrics.cpuPercent;
           break;
         case 'memory':
-          cmp = a.metrics.memoryUsedBytes - b.metrics.memoryUsedBytes;
+          cmp =
+            a.metrics.memoryUsedBytes / a.metrics.memoryTotalBytes -
+            b.metrics.memoryUsedBytes / b.metrics.memoryTotalBytes;
           break;
         case 'disk':
-          cmp = a.metrics.diskUsedBytes - b.metrics.diskUsedBytes;
+          cmp =
+            a.metrics.diskUsedBytes / a.metrics.diskTotalBytes -
+            b.metrics.diskUsedBytes / b.metrics.diskTotalBytes;
           break;
       }
       return sortAsc ? cmp : -cmp;
