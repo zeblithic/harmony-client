@@ -1,4 +1,5 @@
 import type { MediaAttachment, TrustLevel, TrustSettings } from './types';
+import type { MockTrustGraphService } from './trust-graph-service';
 
 export class TrustService {
   readonly settings: TrustSettings;
@@ -6,13 +7,15 @@ export class TrustService {
   // Intentionally never pruned — entries are small strings and the set resets
   // when the app restarts. clearLoaded() exists for testing.
   private loadedAttachments = new Set<string>();
+  private trustGraph: MockTrustGraphService | null;
 
-  constructor() {
+  constructor(trustGraph?: MockTrustGraphService) {
     this.settings = {
       global: 'untrusted',
       perPeer: new Map(),
       perCommunity: new Map(),
     };
+    this.trustGraph = trustGraph ?? null;
   }
 
   resolve(peerAddress: string, communityId?: string): TrustLevel {
@@ -22,6 +25,11 @@ export class TrustService {
     if (communityId) {
       const commLevel = this.settings.perCommunity.get(communityId);
       if (commLevel !== undefined) return commLevel;
+    }
+
+    if (this.trustGraph) {
+      const graphLevel = this.trustGraph.resolveMediaTrust(peerAddress);
+      if (graphLevel !== null) return graphLevel;
     }
 
     return this.settings.global;
