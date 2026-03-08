@@ -15,8 +15,8 @@
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
-    else if (e.key === 'ArrowRight' && onNext) onNext();
-    else if (e.key === 'ArrowLeft' && onPrevious) onPrevious();
+    else if (e.key === 'ArrowRight' && onNext) { e.preventDefault(); onNext(); }
+    else if (e.key === 'ArrowLeft' && onPrevious) { e.preventDefault(); onPrevious(); }
   }
 
   let timeStr = $derived(

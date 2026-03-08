@@ -241,6 +241,9 @@
   }
 
   .nav-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
     padding: 8px 12px;
     border-top: 1px solid var(--border);
   }
