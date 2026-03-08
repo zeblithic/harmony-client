@@ -8,13 +8,18 @@
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
+  // Initialize from prop, then maintained locally as user views vines
+  let viewedIds = $state(new Set<string>(
+    // eslint-disable-next-line svelte/valid-compile -- intentional: seed from initial prop value
+    vines.filter(v => v.viewed).map(v => v.id)
+  ));
 
   let sortedVines = $derived(
     [...vines].sort((a, b) => b.createdAt - a.createdAt)
   );
 
   let unviewedCount = $derived(
-    vines.filter(v => !v.viewed).length
+    vines.filter(v => !viewedIds.has(v.id)).length
   );
 
   let activeIndex = $derived(
@@ -23,6 +28,8 @@
 
   function openPlayer(vine: VineVideo) {
     activeVine = vine;
+    viewedIds = new Set([...viewedIds, vine.id]);
+    // invoke('mark_vine_viewed', { vineId: vine.id }); // wire up when transport is ready
   }
 
   function closePlayer() {
@@ -56,7 +63,7 @@
     <div class="feed-list" role="list" aria-label="Vine feed">
       {#each sortedVines as vine (vine.id)}
         <div role="listitem">
-          <VineCard {vine} onPlay={openPlayer} />
+          <VineCard {vine} onPlay={openPlayer} isViewed={viewedIds.has(vine.id)} />
         </div>
       {/each}
     </div>

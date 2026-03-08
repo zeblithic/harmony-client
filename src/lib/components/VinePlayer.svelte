@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { VineVideo } from '../types';
 
   let { vine, onClose, onNext, onPrevious }: {
@@ -7,6 +8,10 @@
     onNext?: () => void;
     onPrevious?: () => void;
   } = $props();
+
+  let overlayEl: HTMLDivElement;
+
+  onMount(() => overlayEl?.focus());
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
@@ -21,8 +26,7 @@
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<div class="player-overlay" role="dialog" aria-label="Vine player" tabindex="-1" onkeydown={handleKeyDown}>
+<div class="player-overlay" role="dialog" aria-label="Vine player" aria-modal="true" tabindex="-1" bind:this={overlayEl}>
   <div class="player-header">
     <div class="creator-info">
       <span class="creator-name">{vine.creatorName}</span>

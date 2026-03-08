@@ -88,6 +88,19 @@ describe('VineFeed', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
+  it('decreases unviewed count after opening a vine', async () => {
+    render(VineFeed, { props: { vines } });
+    expect(screen.getByText('2 new')).toBeTruthy();
+    const cards = screen.getAllByRole('button');
+    // Click first card (Carol, unviewed)
+    await fireEvent.click(cards[0]);
+    // Close the player
+    const closeBtn = screen.getByLabelText('Close player');
+    await fireEvent.click(closeBtn);
+    // Badge should now show 1 new
+    expect(screen.getByText('1 new')).toBeTruthy();
+  });
+
   it('has accessible feed list', () => {
     render(VineFeed, { props: { vines } });
     expect(screen.getByRole('list', { name: 'Vine feed' })).toBeTruthy();

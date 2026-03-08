@@ -1,10 +1,13 @@
 <script lang="ts">
   import type { VineVideo } from '../types';
 
-  let { vine, onPlay }: {
+  let { vine, onPlay, isViewed }: {
     vine: VineVideo;
     onPlay: (vine: VineVideo) => void;
+    isViewed?: boolean;
   } = $props();
+
+  let viewed = $derived(isViewed ?? vine.viewed);
 
   let timeStr = $derived(
     new Date(vine.createdAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -24,7 +27,7 @@
 
 <div
   class="vine-card"
-  class:viewed={vine.viewed}
+  class:viewed={viewed}
   role="button"
   tabindex="0"
   aria-label="{vine.title ?? 'Untitled vine'} by {vine.creatorName}"
@@ -33,7 +36,7 @@
 >
   <div class="thumbnail">
     <span class="play-icon" aria-hidden="true">▶</span>
-    {#if !vine.viewed}
+    {#if !viewed}
       <span class="unviewed-dot" aria-label="Unviewed"></span>
     {/if}
   </div>

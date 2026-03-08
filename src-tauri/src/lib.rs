@@ -5,6 +5,7 @@ use serde::Serialize;
 /// Mirrors `harmony_content::vine::VineDescriptor` but uses hex-encoded
 /// strings for CIDs and addresses (easier to consume from TypeScript).
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VineVideoDto {
     pub id: String,
     pub creator_address: String,
