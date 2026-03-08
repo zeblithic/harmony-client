@@ -14,7 +14,7 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:vine-mode={mode === 'vines'}>
+<div class="layout" class:collapsed class:vine-mode={mode === 'vines' && vineFeed}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
