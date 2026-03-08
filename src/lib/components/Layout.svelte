@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import type { AppMode } from '../types';
 
   let { nav, textFeed, mediaFeed, vineFeed, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
     nav: Snippet;
@@ -9,7 +10,7 @@
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
-    mode?: 'messages' | 'vines';
+    mode?: AppMode;
   } = $props();
 </script>
 

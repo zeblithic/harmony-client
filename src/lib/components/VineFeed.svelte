@@ -38,13 +38,13 @@
 
   function nextVine() {
     if (activeIndex < sortedVines.length - 1) {
-      activeVine = sortedVines[activeIndex + 1];
+      openPlayer(sortedVines[activeIndex + 1]);
     }
   }
 
   function previousVine() {
     if (activeIndex > 0) {
-      activeVine = sortedVines[activeIndex - 1];
+      openPlayer(sortedVines[activeIndex - 1]);
     }
   }
 </script>

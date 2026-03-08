@@ -32,12 +32,12 @@
       <span class="creator-name">{vine.creatorName}</span>
       <span class="timestamp">{timeStr}</span>
     </div>
-    <button class="close-btn" onclick={onClose} aria-label="Close player">✕</button>
+    <button type="button" class="close-btn" onclick={onClose} aria-label="Close player">✕</button>
   </div>
 
   <div class="player-content">
     {#if onPrevious}
-      <button class="nav-btn nav-prev" onclick={onPrevious} aria-label="Previous vine">‹</button>
+      <button type="button" class="nav-btn nav-prev" onclick={onPrevious} aria-label="Previous vine">‹</button>
     {/if}
 
     <div class="video-area" aria-label={vine.title ?? 'Untitled vine'}>
@@ -48,7 +48,7 @@
     </div>
 
     {#if onNext}
-      <button class="nav-btn nav-next" onclick={onNext} aria-label="Next vine">›</button>
+      <button type="button" class="nav-btn nav-next" onclick={onNext} aria-label="Next vine">›</button>
     {/if}
   </div>
 

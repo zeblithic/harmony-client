@@ -9,10 +9,12 @@ use serde::Serialize;
 pub struct VineVideoDto {
     pub id: String,
     pub creator_address: String,
+    pub creator_name: String,
     pub created_at: u64,
     pub video_cid: String,
     pub title: Option<String>,
     pub reshare_of: Option<String>,
+    pub viewed: bool,
 }
 
 #[tauri::command]
