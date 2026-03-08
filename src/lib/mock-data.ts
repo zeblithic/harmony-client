@@ -1,4 +1,4 @@
-import type { Peer, Profile, Message, NavNode } from './types';
+import type { Peer, Profile, Message, NavNode, VineVideo } from './types';
 
 export const peers: Profile[] = [
   { address: 'a1b2c3d4', displayName: 'Alice', statusText: 'Working on transport layer' },
@@ -406,6 +406,56 @@ export const navNodes: NavNode[] = [
     unreadLevel: 'none',
     lastActivity: now - 3 * hour,
     peer: { address: 'q7r8s9t0', displayName: 'Eve' },
+  },
+];
+
+const vineBase = Date.now() / 1000 - 3600;
+
+export const vineVideos: VineVideo[] = [
+  {
+    id: 'vine-01',
+    creatorAddress: 'a1b2c3d4',
+    creatorName: 'Alice',
+    createdAt: vineBase,
+    videoCid: 'cid-video-alice-01',
+    title: 'Transport layer demo',
+    viewed: false,
+  },
+  {
+    id: 'vine-02',
+    creatorAddress: 'e5f6g7h8',
+    creatorName: 'Bob',
+    createdAt: vineBase + 120,
+    videoCid: 'cid-video-bob-01',
+    title: 'Mesh routing in action',
+    viewed: true,
+  },
+  {
+    id: 'vine-03',
+    creatorAddress: 'i9j0k1l2',
+    creatorName: 'Carol',
+    createdAt: vineBase + 300,
+    videoCid: 'cid-video-carol-01',
+    viewed: false,
+  },
+  {
+    id: 'vine-04',
+    creatorAddress: 'a1b2c3d4',
+    creatorName: 'Alice',
+    createdAt: vineBase + 600,
+    videoCid: 'cid-video-alice-02',
+    title: 'Cache hit rates explained',
+    reshareOf: 'vine-02',
+    viewed: false,
+  },
+  {
+    id: 'vine-05',
+    creatorAddress: 'm3n4o5p6',
+    creatorName: 'Dave',
+    createdAt: vineBase + 900,
+    videoCid: 'cid-video-dave-01',
+    title: 'Zenoh key expressions tutorial',
+    viewed: true,
   },
 ];
 

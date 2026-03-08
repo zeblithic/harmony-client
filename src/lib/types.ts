@@ -93,3 +93,25 @@ export interface NavNode {
   lastActivity?: number;
   peer?: Peer;
 }
+
+/** Mirrors harmony-content VineDescriptor on the TypeScript side. */
+export interface VineVideo {
+  /** Unique ID for this vine (hex-encoded bundle CID). */
+  id: string;
+  /** Hex-encoded 128-bit creator address. */
+  creatorAddress: string;
+  /** Creator display name (resolved from profile store). */
+  creatorName: string;
+  /** Unix timestamp in seconds when the vine was created. */
+  createdAt: number;
+  /** Hex-encoded CID of the raw video content blob. */
+  videoCid: string;
+  /** Optional human-readable title (max 140 bytes). */
+  title?: string;
+  /** If this vine is a reshare, the hex-encoded CID of the original. */
+  reshareOf?: string;
+  /** Whether the current user has viewed this vine. */
+  viewed: boolean;
+}
+
+export type AppMode = 'messages' | 'vines';
