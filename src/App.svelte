@@ -19,6 +19,16 @@
   let showSettings = $state(false);
   let appMode = $state<AppMode>('messages');
 
+  // Viewed vine IDs — lifted here so state survives VineFeed remounts on mode toggle
+  let vineViewedIds = $state(new Set<string>(
+    vineVideos.filter(v => v.viewed).map(v => v.id)
+  ));
+
+  function handleMarkVineViewed(id: string) {
+    vineViewedIds = new Set([...vineViewedIds, id]);
+    // invoke('mark_vine_viewed', { vineId: id }); // wire up when transport is ready
+  }
+
   let popoverProfile = $state<Profile | null>(null);
   let popoverX = $state(0);
   let popoverY = $state(0);
@@ -188,7 +198,7 @@
 
 <Layout {collapsed} {showSettings} mode={appMode}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeToggle={() => { appMode = appMode === 'messages' ? 'vines' : 'messages'; }} {appMode} />
+    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeToggle={() => { appMode = appMode === 'messages' ? 'vines' : 'messages'; showSettings = false; }} {appMode} />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -232,7 +242,7 @@
     />
   {/snippet}
   {#snippet vineFeed()}
-    <VineFeed vines={vineVideos} />
+    <VineFeed vines={vineVideos} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
   {/snippet}
 </Layout>
 

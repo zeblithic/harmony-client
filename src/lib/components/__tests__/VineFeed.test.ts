@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
 
@@ -33,37 +33,42 @@ const vines: VineVideo[] = [
   },
 ];
 
+/** Build a viewedIds set matching the initial viewed state of the vines. */
+function makeViewedIds(vs: VineVideo[] = vines): Set<string> {
+  return new Set(vs.filter(v => v.viewed).map(v => v.id));
+}
+
 describe('VineFeed', () => {
   it('renders feed title', () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     expect(screen.getByText('Vines')).toBeTruthy();
   });
 
   it('renders all vine cards', () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     expect(screen.getByText('Alice')).toBeTruthy();
     expect(screen.getByText('Bob')).toBeTruthy();
     expect(screen.getByText('Carol')).toBeTruthy();
   });
 
   it('shows unviewed count badge', () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     expect(screen.getByText('2 new')).toBeTruthy();
   });
 
   it('hides unviewed badge when all viewed', () => {
     const allViewed = vines.map(v => ({ ...v, viewed: true }));
-    render(VineFeed, { props: { vines: allViewed } });
+    render(VineFeed, { props: { vines: allViewed, viewedIds: makeViewedIds(allViewed) } });
     expect(screen.queryByText(/new/)).toBeNull();
   });
 
   it('shows empty state when no vines', () => {
-    render(VineFeed, { props: { vines: [] } });
+    render(VineFeed, { props: { vines: [], viewedIds: new Set() } });
     expect(screen.getByText(/No vines yet/)).toBeTruthy();
   });
 
   it('sorts vines newest first', () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     const items = screen.getAllByRole('listitem');
     expect(items.length).toBe(3);
     // Carol's vine (createdAt=200) should be first
@@ -71,7 +76,7 @@ describe('VineFeed', () => {
   });
 
   it('opens player when a card is clicked', async () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     const cards = screen.getAllByRole('button');
     await fireEvent.click(cards[0]); // Click first card (Carol, newest)
     // Player dialog should appear
@@ -79,7 +84,7 @@ describe('VineFeed', () => {
   });
 
   it('closes player when close button is clicked', async () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     const cards = screen.getAllByRole('button');
     await fireEvent.click(cards[0]);
     expect(screen.getByRole('dialog')).toBeTruthy();
@@ -88,21 +93,16 @@ describe('VineFeed', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  it('decreases unviewed count after opening a vine', async () => {
-    render(VineFeed, { props: { vines } });
-    expect(screen.getByText('2 new')).toBeTruthy();
+  it('calls onMarkViewed when a vine is opened', async () => {
+    const onMarkViewed = vi.fn();
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds(), onMarkViewed } });
     const cards = screen.getAllByRole('button');
-    // Click first card (Carol, unviewed)
-    await fireEvent.click(cards[0]);
-    // Close the player
-    const closeBtn = screen.getByLabelText('Close player');
-    await fireEvent.click(closeBtn);
-    // Badge should now show 1 new
-    expect(screen.getByText('1 new')).toBeTruthy();
+    await fireEvent.click(cards[0]); // Carol (vine-03)
+    expect(onMarkViewed).toHaveBeenCalledWith('vine-03');
   });
 
   it('has accessible feed list', () => {
-    render(VineFeed, { props: { vines } });
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
     expect(screen.getByRole('list', { name: 'Vine feed' })).toBeTruthy();
   });
 });

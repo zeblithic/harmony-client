@@ -3,16 +3,13 @@
   import VineCard from './VineCard.svelte';
   import VinePlayer from './VinePlayer.svelte';
 
-  let { vines }: {
+  let { vines, viewedIds, onMarkViewed }: {
     vines: VineVideo[];
+    viewedIds: Set<string>;
+    onMarkViewed?: (id: string) => void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
-  // Initialize from prop, then maintained locally as user views vines
-  let viewedIds = $state(new Set<string>(
-    // eslint-disable-next-line svelte/valid-compile -- intentional: seed from initial prop value
-    vines.filter(v => v.viewed).map(v => v.id)
-  ));
 
   let sortedVines = $derived(
     [...vines].sort((a, b) => b.createdAt - a.createdAt)
@@ -28,8 +25,7 @@
 
   function openPlayer(vine: VineVideo) {
     activeVine = vine;
-    viewedIds = new Set([...viewedIds, vine.id]);
-    // invoke('mark_vine_viewed', { vineId: vine.id }); // wire up when transport is ready
+    onMarkViewed?.(vine.id);
   }
 
   function closePlayer() {
@@ -37,7 +33,7 @@
   }
 
   function nextVine() {
-    if (activeIndex < sortedVines.length - 1) {
+    if (activeIndex >= 0 && activeIndex < sortedVines.length - 1) {
       openPlayer(sortedVines[activeIndex + 1]);
     }
   }
