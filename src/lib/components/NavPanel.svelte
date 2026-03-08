@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NavNode, DisplayMode, SortOrder } from '../types';
+  import type { AppMode, NavNode, DisplayMode, SortOrder } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -9,13 +9,17 @@
     collapsed = false,
     onNodeClick,
     onSettingsClick,
+    onModeToggle,
     profileLookup,
+    appMode = 'messages',
   }: {
     nodes: NavNode[];
     collapsed: boolean;
     onNodeClick?: (id: string) => void;
     onSettingsClick?: () => void;
+    onModeToggle?: () => void;
     profileLookup?: (address: string) => string | undefined;
+    appMode?: AppMode;
   } = $props();
 
   let navNodes = $state<NavNode[]>(nodes);
@@ -128,6 +132,16 @@
     <div class="nav-footer">
       <button
         type="button"
+        class="nav-action-btn mode-toggle"
+        class:active={appMode === 'vines'}
+        aria-label="Toggle vine feed"
+        aria-pressed={appMode === 'vines'}
+        onclick={() => onModeToggle?.()}
+      >
+        {appMode === 'vines' ? 'Messages' : 'Vines'}
+      </button>
+      <button
+        type="button"
         class="nav-action-btn"
         aria-label="Open network visualization"
         onclick={openNetworkWindow}
@@ -227,6 +241,9 @@
   }
 
   .nav-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
     padding: 8px 12px;
     border-top: 1px solid var(--border);
   }
@@ -244,6 +261,11 @@
   }
 
   .nav-action-btn:hover {
+    background: var(--accent);
+    color: var(--text-primary);
+  }
+
+  .mode-toggle.active {
     background: var(--accent);
     color: var(--text-primary);
   }
