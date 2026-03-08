@@ -4,18 +4,20 @@
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
+  import VineFeed from './lib/components/VineFeed.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
   import { TrustService } from './lib/trust-service';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
-  import { messages, navNodes, profileStore } from './lib/mock-data';
-  import type { MessagePriority, Profile, ThreadDisplayMode } from './lib/types';
+  import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
+  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
+  let appMode = $state<AppMode>('messages');
 
   let popoverProfile = $state<Profile | null>(null);
   let popoverX = $state(0);
@@ -184,9 +186,9 @@
 
 <svelte:window bind:innerWidth />
 
-<Layout {collapsed} {showSettings}>
+<Layout {collapsed} {showSettings} mode={appMode}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} />
+    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeToggle={() => { appMode = appMode === 'messages' ? 'vines' : 'messages'; }} {appMode} />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -228,6 +230,9 @@
       onClose={() => { showSettings = false; }}
       onTrustChange={handleTrustChange}
     />
+  {/snippet}
+  {#snippet vineFeed()}
+    <VineFeed vines={vineVideos} />
   {/snippet}
 </Layout>
 
