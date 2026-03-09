@@ -102,6 +102,7 @@
   function handleNavigateFolder(cid: string | null) {
     currentFolderCid = cid;
     selectedFileCid = null;
+    showCleanup = false;
   }
 
   function handleFileBurn() {

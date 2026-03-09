@@ -89,12 +89,12 @@ export class FileManagerService {
 
   /** Returns storage buddies. */
   getStorageBuddies(): StorageBuddy[] {
-    return this.storageBuddies;
+    return [...this.storageBuddies];
   }
 
   /** Returns published content. */
   getPublishedContent(): PublishedItem[] {
-    return this.publishedContent;
+    return [...this.publishedContent];
   }
 
   /** Permanently removes content items and frees their quota. */
