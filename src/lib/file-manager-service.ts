@@ -40,10 +40,10 @@ export class FileManagerService {
     this.storageBuddies = structuredClone(mockStorageBuddies);
   }
 
-  /** Returns private content. With no args returns all; with parentCid filters by parent. */
+  /** Returns private content. With no args returns a copy of all; with parentCid filters by parent. */
   getContents(parentCid?: string | null): ContentItem[] {
     if (parentCid === undefined) {
-      return this.privateContent;
+      return [...this.privateContent];
     }
     return this.privateContent.filter((item) => item.parentCid === parentCid);
   }

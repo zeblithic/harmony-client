@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { CleanupRecommendation } from '../types';
   import { categoryIcon, formatBytes } from '../file-utils';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   type CleanupAction = 'burn' | 'archive' | 'release' | 'publish' | 'pin';
 
@@ -21,8 +22,19 @@
   let recoverable = $derived(formatBytes(recommendation.spaceRecoverable));
   let stalenessPercent = $derived(Math.round(recommendation.stalenessScore * 100));
 
+  let showBurnConfirm = $state(false);
+
   function handleAction(action: CleanupAction) {
+    if (action === 'burn') {
+      showBurnConfirm = true;
+      return;
+    }
     onAction(recommendation.cid, action);
+  }
+
+  function confirmBurn() {
+    showBurnConfirm = false;
+    onAction(recommendation.cid, 'burn');
   }
 </script>
 
@@ -60,6 +72,17 @@
     <button class="action-btn pin" onclick={() => handleAction('pin')} aria-label="Pin {recommendation.name}">Pin</button>
   </div>
 </article>
+
+{#if showBurnConfirm}
+  <ConfirmDialog
+    title="Burn Content"
+    message='This will permanently delete "{recommendation.name}" and free {recoverable} of storage quota.'
+    confirmLabel="Burn"
+    destructive={true}
+    onConfirm={confirmBurn}
+    onCancel={() => { showBurnConfirm = false; }}
+  />
+{/if}
 
 <style>
   .recommendation-card {

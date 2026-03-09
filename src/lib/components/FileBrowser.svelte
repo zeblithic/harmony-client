@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { FileViewMode, ContentSection, CleanupRecommendation } from '../types';
+  import type { FileViewMode, ContentSection, CleanupRecommendation, ContentCategory, ReplicationTier } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
@@ -16,6 +16,7 @@
     viewMode = 'list' as FileViewMode,
     section = 'private' as ContentSection,
     searchQuery = '',
+    filters = {} as Record<string, unknown>,
     showCleanup = false,
     onItemClick,
     onNavigateFolder,
@@ -37,6 +38,7 @@
     viewMode?: FileViewMode;
     section?: ContentSection;
     searchQuery?: string;
+    filters?: Record<string, unknown>;
     showCleanup?: boolean;
     onItemClick: (cid: string) => void;
     onNavigateFolder: (cid: string | null) => void;
@@ -65,6 +67,26 @@
       const q = searchQuery.toLowerCase();
       contents = contents.filter((i) => i.name.toLowerCase().includes(q));
     }
+    // Apply quick filters
+    const cats = filters.categories as ContentCategory[] | undefined;
+    if (cats && cats.length > 0) {
+      const catSet = new Set(cats);
+      contents = contents.filter((i) => i.isFolder || catSet.has(i.category));
+    }
+    const tiers = filters.tiers as ReplicationTier[] | undefined;
+    if (tiers && tiers.length > 0) {
+      const tierSet = new Set(tiers);
+      contents = contents.filter((i) => i.isFolder || tierSet.has(i.replicationTier));
+    }
+    if (filters.stale) {
+      contents = contents.filter((i) => i.isFolder || i.stalenessScore >= 0.5);
+    }
+    if (filters.pinned) {
+      contents = contents.filter((i) => i.isFolder || i.pinned);
+    }
+    if (filters.licensed) {
+      contents = contents.filter((i) => i.isFolder || i.licensed);
+    }
     // folders first, then files
     return contents.sort((a, b) => {
       if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
@@ -88,8 +110,17 @@
       { cid: null, name: 'My Content' },
     ];
     if (currentFolderCid) {
-      const folder = service.getContents().find((i) => i.cid === currentFolderCid);
-      if (folder) path.push({ cid: folder.cid, name: folder.name });
+      const allContent = service.getContents();
+      // Walk up the parent chain to build the full ancestor path
+      const ancestors: Array<{ cid: string; name: string }> = [];
+      let cid: string | null = currentFolderCid;
+      while (cid) {
+        const folder = allContent.find((i) => i.cid === cid);
+        if (!folder) break;
+        ancestors.unshift({ cid: folder.cid, name: folder.name });
+        cid = folder.parentCid;
+      }
+      path.push(...ancestors);
     }
     return path;
   });
@@ -135,13 +166,13 @@
       {:else}
         <FileGrid {items} {selectedCid} onItemClick={handleItemClick} />
       {/if}
-    {/if}
 
-    <QuotaBar
-      usedBytes={quota.usedBytes}
-      totalBytes={quota.totalBytes}
-      {onCleanupClick}
-    />
+      <QuotaBar
+        usedBytes={quota.usedBytes}
+        totalBytes={quota.totalBytes}
+        {onCleanupClick}
+      />
+    {/if}
   {:else}
     <PublishedView items={publishedItems} />
   {/if}

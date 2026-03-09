@@ -88,12 +88,17 @@ describe('CleanupView', () => {
     expect(screen.getByText('family-reunion-2025.jpg')).toBeTruthy();
   });
 
-  it('fires onAction when a card action button is clicked', async () => {
+  it('fires onAction when a card Burn button is clicked and confirmed', async () => {
     const onAction = vi.fn();
     render(CleanupView, { props: { ...baseProps(), onAction } });
     // Each recommendation card has a Burn button
     const burnButtons = screen.getAllByRole('button', { name: /burn/i });
     await fireEvent.click(burnButtons[0]);
+    // Per-card burn now requires confirmation
+    expect(onAction).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'burn');
   });
 

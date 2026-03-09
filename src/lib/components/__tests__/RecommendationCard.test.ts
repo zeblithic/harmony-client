@@ -71,12 +71,17 @@ describe('RecommendationCard', () => {
     expect(screen.getByRole('button', { name: /pin/i })).toBeTruthy();
   });
 
-  it('fires onAction with cid and action when Burn clicked', async () => {
+  it('fires onAction with cid and action when Burn clicked and confirmed', async () => {
     const onAction = vi.fn();
     render(RecommendationCard, {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /burn/i }));
+    // Burn now requires confirmation
+    expect(onAction).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'burn');
   });
 

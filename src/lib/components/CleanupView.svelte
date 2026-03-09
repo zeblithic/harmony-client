@@ -27,16 +27,26 @@
 
   let selectedCids = $state<Set<string>>(new Set());
 
+  // Prune selectedCids when recommendations change (e.g., after burning an item)
+  let validSelectedCids = $derived.by(() => {
+    const recCids = new Set(recommendations.map(r => r.cid));
+    const pruned = new Set<string>();
+    for (const cid of selectedCids) {
+      if (recCids.has(cid)) pruned.add(cid);
+    }
+    return pruned;
+  });
+
   let allSelected = $derived(
-    recommendations.length > 0 && selectedCids.size === recommendations.length
+    recommendations.length > 0 && validSelectedCids.size === recommendations.length
   );
 
-  let selectedCount = $derived(selectedCids.size);
+  let selectedCount = $derived(validSelectedCids.size);
 
   let totalRecoverable = $derived.by(() => {
     let total = 0;
     for (const rec of recommendations) {
-      if (selectedCids.has(rec.cid)) {
+      if (validSelectedCids.has(rec.cid)) {
         total += rec.spaceRecoverable;
       }
     }
@@ -44,7 +54,7 @@
   });
 
   let selectedCidsArray = $derived(
-    recommendations.filter(r => selectedCids.has(r.cid)).map(r => r.cid)
+    recommendations.filter(r => validSelectedCids.has(r.cid)).map(r => r.cid)
   );
 
   function toggleSelectAll() {
@@ -134,7 +144,7 @@
           <div role="listitem">
             <RecommendationCard
               recommendation={rec}
-              checked={selectedCids.has(rec.cid)}
+              checked={validSelectedCids.has(rec.cid)}
               {onAction}
               onToggle={toggleItem}
             />

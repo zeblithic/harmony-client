@@ -75,6 +75,7 @@
   let showCleanup = $state(false);
   let fileSection = $state<ContentSection>('private');
   let fileSearchQuery = $state('');
+  let fileFilters = $state<Record<string, unknown>>({});
 
   // ── File manager derived data ───────────────────────────────────────
   let allFileContents = $derived.by(() => {
@@ -335,6 +336,7 @@
       {fileSection}
       {currentFolderCid}
       onFolderSelect={handleNavigateFolder}
+      onFilterChange={(filters) => { fileFilters = filters; }}
     />
   {/snippet}
   {#snippet textFeed()}
@@ -389,6 +391,7 @@
       viewMode={fileViewMode}
       section={fileSection}
       searchQuery={fileSearchQuery}
+      filters={fileFilters}
       {showCleanup}
       onItemClick={handleFileItemClick}
       onNavigateFolder={handleNavigateFolder}
