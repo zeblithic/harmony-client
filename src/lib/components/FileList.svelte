@@ -1,0 +1,81 @@
+<script lang="ts">
+  import type { ContentItem } from '../types';
+  import FileRow from './FileRow.svelte';
+
+  let {
+    items,
+    selectedCid,
+    onItemClick,
+  }: {
+    items: ContentItem[];
+    selectedCid: string | null;
+    onItemClick: (cid: string) => void;
+  } = $props();
+</script>
+
+<div class="file-list" role="table" aria-label="File list">
+  <div class="file-list-header" role="row">
+    <span class="header-icon" aria-hidden="true"></span>
+    <span class="header-name" role="columnheader">Name</span>
+    <span class="header-size" role="columnheader">Size</span>
+    <span class="header-accessed" role="columnheader">Last Accessed</span>
+    <span class="header-staleness" role="columnheader">Staleness</span>
+    <span class="header-replicas" role="columnheader">Replicas</span>
+    <span class="header-sensitivity" aria-hidden="true"></span>
+  </div>
+  {#each items as item (item.cid)}
+    <FileRow {item} onClick={onItemClick} selected={selectedCid === item.cid} />
+  {/each}
+</div>
+
+<style>
+  .file-list {
+    width: 100%;
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  .file-list-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--border, #3f4147);
+  }
+
+  .file-list-header span {
+    font-size: 0.75rem;
+    color: var(--text-muted, #949ba4);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+
+  .header-icon {
+    flex-shrink: 0;
+    width: 24px;
+  }
+
+  .header-name {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .header-size,
+  .header-accessed,
+  .header-replicas {
+    flex-shrink: 0;
+    min-width: 60px;
+    text-align: right;
+  }
+
+  .header-staleness {
+    flex-shrink: 0;
+    min-width: 8px;
+  }
+
+  .header-sensitivity {
+    flex-shrink: 0;
+    width: 24px;
+  }
+</style>
