@@ -115,8 +115,8 @@
   function handleFileArchive() {
     if (!selectedFileCid) return;
     fileManagerService.archive([selectedFileCid]);
-    fileManagerVersion++;
-    selectedFileCid = null;
+    // archive is a no-op stub — don't bump version or clear selection
+    // until the service actually moves items to cold storage
   }
 
   function handleFilePublish(cid: string) {
@@ -169,7 +169,7 @@
     else if (action === 'publish') fileManagerService.publish([cid]);
     else if (action === 'pin') fileManagerService.pin(cid);
     fileManagerVersion++;
-    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish' || action === 'archive')) {
+    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish')) {
       selectedFileCid = null;
     }
   }
@@ -184,10 +184,8 @@
 
   function handleBulkArchive(cids: string[]) {
     fileManagerService.archive(cids);
-    fileManagerVersion++;
-    if (selectedFileCid && cids.includes(selectedFileCid)) {
-      selectedFileCid = null;
-    }
+    // archive is a no-op stub — don't bump version or clear selection
+    // until the service actually moves items to cold storage
   }
 
   function handleBulkRelease(cids: string[]) {
