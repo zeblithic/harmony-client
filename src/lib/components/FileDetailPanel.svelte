@@ -1,13 +1,17 @@
 <script lang="ts">
-  import type { ContentDetail, ReplicationTier } from '../types';
+  import type { ContentDetail, ReplicationTier, PeerRef, StorageBuddy } from '../types';
   import FileMetadata from './FileMetadata.svelte';
   import SensitivityBadge from './SensitivityBadge.svelte';
   import StalenessIndicator from './StalenessIndicator.svelte';
   import ReplicationStatus from './ReplicationStatus.svelte';
   import FileActions from './FileActions.svelte';
+  import ShareList from './ShareList.svelte';
+  import StorageBuddyList from './StorageBuddyList.svelte';
 
   let {
     detail,
+    availablePeers = [],
+    storageBuddyDetails = [],
     onTierChange,
     onPublish,
     onRelease,
@@ -16,8 +20,14 @@
     onPin,
     onUnpin,
     onExport,
+    onShareAdd,
+    onShareRemove,
+    onBuddyAdd,
+    onBuddyRemove,
   }: {
     detail: ContentDetail;
+    availablePeers?: PeerRef[];
+    storageBuddyDetails?: StorageBuddy[];
     onTierChange: (tier: ReplicationTier) => void;
     onPublish: () => void;
     onRelease: () => void;
@@ -26,6 +36,10 @@
     onPin: () => void;
     onUnpin: () => void;
     onExport: () => void;
+    onShareAdd?: (peer: PeerRef) => void;
+    onShareRemove?: (peer: PeerRef) => void;
+    onBuddyAdd?: (peer: PeerRef) => void;
+    onBuddyRemove?: (buddy: StorageBuddy) => void;
   } = $props();
 
   let stalenessText = $derived(detail.stalenessScore.toFixed(2));
@@ -72,6 +86,24 @@
       {onPin}
       {onUnpin}
       {onExport}
+    />
+  </section>
+
+  <section class="panel-section">
+    <ShareList
+      sharedWith={detail.sharedWith}
+      {availablePeers}
+      onAdd={(peer) => onShareAdd?.(peer)}
+      onRemove={(peer) => onShareRemove?.(peer)}
+    />
+  </section>
+
+  <section class="panel-section">
+    <StorageBuddyList
+      buddies={storageBuddyDetails}
+      {availablePeers}
+      onAdd={(peer) => onBuddyAdd?.(peer)}
+      onRemove={(buddy) => onBuddyRemove?.(buddy)}
     />
   </section>
 </aside>
