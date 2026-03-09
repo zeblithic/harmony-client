@@ -29,7 +29,7 @@
   });
 </script>
 
-<div class="dialog-overlay">
+<div class="dialog-overlay" onkeydown={(e) => { if (e.key === 'Escape') onCancel(); }}>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
     <h2 class="dialog-title" id={titleId}>{title}</h2>
     <p class="dialog-message">{message}</p>
