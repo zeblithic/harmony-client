@@ -4,6 +4,7 @@
     message,
     confirmText,
     confirmLabel,
+    destructive = false,
     onConfirm,
     onCancel,
   }: {
@@ -11,13 +12,14 @@
     message: string;
     confirmText: string;
     confirmLabel: string;
+    destructive?: boolean;
     onConfirm: () => void;
     onCancel: () => void;
   } = $props();
 
   let typed = $state('');
   let matches = $derived(typed === confirmText);
-  const titleId = 'dialog-title';
+  const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
 </script>
 
 <div class="dialog-overlay">
@@ -34,7 +36,8 @@
     <div class="dialog-actions">
       <button class="cancel-btn" onclick={onCancel}>Cancel</button>
       <button
-        class="confirm-btn destructive"
+        class="confirm-btn"
+        class:destructive
         disabled={!matches}
         onclick={onConfirm}
       >

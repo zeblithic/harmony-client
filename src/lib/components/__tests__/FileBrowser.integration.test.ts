@@ -115,8 +115,8 @@ describe('File Manager Integration', () => {
     const folderRow = screen.getByLabelText('Projects');
     await fireEvent.click(folderRow);
 
-    // Should call both onItemClick and onNavigateFolder for folders
-    expect(callbacks.onItemClick).toHaveBeenCalledWith('cid-folder-projects');
+    // Folders navigate, not select — onItemClick should NOT be called
+    expect(callbacks.onItemClick).not.toHaveBeenCalled();
     expect(callbacks.onNavigateFolder).toHaveBeenCalledWith('cid-folder-projects');
   });
 

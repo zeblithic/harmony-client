@@ -134,6 +134,7 @@
     message="This action is irreversible. Type the filename to confirm."
     confirmText={filename}
     confirmLabel="Confirm Publish"
+    destructive={true}
     onConfirm={onTypeConfirm}
     onCancel={cancelFlow}
   />

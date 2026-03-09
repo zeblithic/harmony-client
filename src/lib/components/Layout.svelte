@@ -91,8 +91,8 @@
     grid-template-areas: "nav files detail";
   }
   .layout.files-mode.collapsed {
-    grid-template-columns: var(--nav-width-collapsed) 1fr 320px;
-    grid-template-areas: "nav files detail";
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav files";
   }
   .files-area {
     grid-area: files;

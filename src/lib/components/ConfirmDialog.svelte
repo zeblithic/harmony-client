@@ -15,7 +15,7 @@
     onCancel: () => void;
   } = $props();
 
-  const titleId = 'dialog-title';
+  const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
 </script>
 
 <div class="dialog-overlay">

@@ -4,8 +4,6 @@ import type {
   ContentItem,
   PublishedItem,
   CleanupRecommendation,
-  QuotaStatus,
-  ContentCategory,
 } from './types';
 
 const day = 86_400_000;
@@ -267,18 +265,3 @@ export const mockCleanupRecommendations: CleanupRecommendation[] = [
     confidence: 0.65,
   },
 ];
-
-// ── Quota ────────────────────────────────────────────────────────────
-
-export function mockQuotaStatus(): QuotaStatus {
-  const totalBytes = 10_000_000_000; // 10 GB
-  const byCategory: Partial<Record<ContentCategory, number>> = {};
-  let usedBytes = 0;
-
-  for (const item of mockPrivateContent) {
-    usedBytes += item.sizeBytes;
-    byCategory[item.category] = (byCategory[item.category] ?? 0) + item.sizeBytes;
-  }
-
-  return { usedBytes, totalBytes, byCategory };
-}

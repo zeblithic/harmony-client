@@ -75,6 +75,7 @@
     const item = items.find((i) => i.cid === cid);
     if (item?.isFolder) {
       onNavigateFolder(item.cid);
+      return;
     }
     onItemClick(cid);
   }

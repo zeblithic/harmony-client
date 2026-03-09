@@ -18,7 +18,7 @@
   } = $props();
 
   let gate = $state(1);
-  const titleId = 'dialog-title';
+  const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
 </script>
 
 <div class="dialog-overlay">
