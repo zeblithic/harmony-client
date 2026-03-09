@@ -1,7 +1,10 @@
 <script lang="ts">
-  import type { AppMode, NavNode, DisplayMode, SortOrder } from '../types';
+  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, StorageBuddy } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
+  import FolderTree from './FolderTree.svelte';
+  import QuickFilters from './QuickFilters.svelte';
+  import StorageBuddySummary from './StorageBuddySummary.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let {
@@ -12,6 +15,11 @@
     onModeChange,
     profileLookup,
     appMode = 'messages',
+    contentItems,
+    storageBuddies,
+    onFolderSelect,
+    onFilterChange,
+    onManageBuddies,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -20,6 +28,11 @@
     onModeChange?: (mode: AppMode) => void;
     profileLookup?: (address: string) => string | undefined;
     appMode?: AppMode;
+    contentItems?: ContentItem[];
+    storageBuddies?: StorageBuddy[];
+    onFolderSelect?: (cid: string | null) => void;
+    onFilterChange?: (filters: Record<string, unknown>) => void;
+    onManageBuddies?: () => void;
   } = $props();
 
   let navNodes = $state<NavNode[]>(nodes);
@@ -119,16 +132,24 @@
       <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>
     </div>
     <nav class="nav-tree-container">
-      <NavTree
-        nodes={filteredNodes}
-        parentId={null}
-        onToggle={toggleFolder}
-        onClick={onNodeClick}
-        onDisplayModeChange={changeDisplayMode}
-        onSortOrderChange={changeSortOrder}
-        {profileLookup}
-      />
+      {#if appMode === 'files'}
+        <FolderTree items={contentItems ?? []} {onFolderSelect} />
+        <QuickFilters {onFilterChange} />
+      {:else}
+        <NavTree
+          nodes={filteredNodes}
+          parentId={null}
+          onToggle={toggleFolder}
+          onClick={onNodeClick}
+          onDisplayModeChange={changeDisplayMode}
+          onSortOrderChange={changeSortOrder}
+          {profileLookup}
+        />
+      {/if}
     </nav>
+    {#if appMode === 'files'}
+      <StorageBuddySummary buddies={storageBuddies ?? []} {onManageBuddies} />
+    {/if}
     <div class="nav-footer">
       <div class="mode-toggles" role="group" aria-label="App mode">
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages'}
