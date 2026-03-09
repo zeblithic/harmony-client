@@ -142,4 +142,10 @@
     opacity: 0.4;
     cursor: not-allowed;
   }
+
+  .cancel-btn:focus-visible,
+  .confirm-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
 </style>

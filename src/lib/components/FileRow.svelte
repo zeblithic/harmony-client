@@ -57,6 +57,11 @@
     background: var(--bg-tertiary, #232428);
   }
 
+  .file-row:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: -2px;
+  }
+
   .file-row.selected {
     background: color-mix(in srgb, var(--accent, #5865f2) 10%, transparent);
   }

@@ -95,6 +95,11 @@
     border-radius: 4px;
   }
 
+  .section-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+
   .section-btn.active {
     background: var(--accent, #5865f2);
     color: var(--text-primary, #f2f3f5);
@@ -159,5 +164,15 @@
 
   .action-btn:hover {
     background: var(--bg-tertiary, #232428);
+  }
+
+  .action-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+
+  .view-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
 </style>

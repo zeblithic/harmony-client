@@ -61,6 +61,11 @@
     background: var(--bg-tertiary, #232428);
   }
 
+  .file-card:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+
   .file-card.selected {
     border-color: var(--accent, #5865f2);
   }

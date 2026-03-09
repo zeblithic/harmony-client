@@ -13,7 +13,7 @@
   } = $props();
 </script>
 
-<div class="file-grid">
+<div class="file-grid" aria-label="File grid">
   {#each items as item (item.cid)}
     <FileCard {item} onClick={onItemClick} selected={selectedCid === item.cid} />
   {/each}

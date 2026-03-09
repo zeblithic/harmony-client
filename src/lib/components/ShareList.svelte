@@ -172,6 +172,11 @@
     color: var(--text-primary, #f2f3f5);
   }
 
+  .remove-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+
   .picker-row {
     margin-top: 8px;
   }
@@ -185,6 +190,11 @@
     color: var(--text-primary, #f2f3f5);
     font-size: 0.8rem;
     cursor: pointer;
+  }
+
+  .peer-picker:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
 
   .visually-hidden {

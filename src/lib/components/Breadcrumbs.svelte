@@ -52,6 +52,11 @@
     text-decoration: underline;
   }
 
+  .breadcrumb-segment:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+
   .breadcrumb-segment:last-child {
     color: var(--text-primary, #f2f3f5);
     font-weight: 600;

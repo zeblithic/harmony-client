@@ -52,6 +52,11 @@
     background: var(--bg-tertiary, #232428);
   }
 
+  .quota-bar:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: -2px;
+  }
+
   .quota-track {
     height: 6px;
     background: var(--bg-tertiary, #232428);
