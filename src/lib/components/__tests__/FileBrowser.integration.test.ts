@@ -572,15 +572,14 @@ describe('File Manager Integration', () => {
       expect(nav!.getAttribute('aria-label')).toBe('File navigation');
     });
 
-    it('quota bar has progressbar role with aria attributes', () => {
+    it('quota bar button has descriptive aria-label', () => {
       const service = new FileManagerService();
       renderBrowser(service);
 
-      const bar = screen.getByRole('progressbar');
-      expect(bar).toBeTruthy();
-      expect(bar.getAttribute('aria-valuenow')).toBeTruthy();
-      expect(bar.getAttribute('aria-valuemin')).toBe('0');
-      expect(bar.getAttribute('aria-valuemax')).toBe('100');
+      const buttons = screen.getAllByRole('button');
+      const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
+      expect(quotaBtn).toBeTruthy();
+      expect(quotaBtn!.getAttribute('aria-label')).toMatch(/\d+.*used.*\d+%/);
     });
 
     it('section toggle buttons have aria-pressed', () => {

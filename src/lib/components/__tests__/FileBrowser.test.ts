@@ -43,9 +43,10 @@ describe('FileBrowser', () => {
 
   it('shows QuotaBar with correct usage', () => {
     render(FileBrowser, { props: makeProps() });
-    // QuotaBar renders a progressbar
-    const bar = screen.getByRole('progressbar');
-    expect(bar).toBeTruthy();
+    // QuotaBar renders a button with storage info in aria-label
+    const buttons = screen.getAllByRole('button');
+    const quotaBtn = buttons.find(b => b.getAttribute('aria-label')?.includes('Storage:'));
+    expect(quotaBtn).toBeTruthy();
   });
 
   it('shows folders before files', () => {

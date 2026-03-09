@@ -15,15 +15,11 @@
   let warning = $derived(percent >= 85);
 </script>
 
-<button class="quota-bar" onclick={onCleanupClick} aria-label="Storage quota — click to manage">
+<button class="quota-bar" onclick={onCleanupClick} aria-label="Storage: {formatBytes(usedBytes)} of {formatBytes(totalBytes)} used ({percent}%) — click to manage">
   <div class="quota-track">
     <div
       class="quota-fill"
       class:warning
-      role="progressbar"
-      aria-valuenow={percent}
-      aria-valuemin={0}
-      aria-valuemax={100}
       style:width="{percent}%"
     ></div>
   </div>

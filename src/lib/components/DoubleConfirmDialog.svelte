@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   let {
     title,
     firstMessage,
@@ -19,10 +21,15 @@
 
   let gate = $state(1);
   const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
+  let dialogEl: HTMLElement;
+
+  onMount(() => {
+    dialogEl?.querySelector<HTMLElement>('button')?.focus();
+  });
 </script>
 
 <div class="dialog-overlay">
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} bind:this={dialogEl}>
     <h2 class="dialog-title" id={titleId}>{title}</h2>
     {#if gate === 1}
       <p class="dialog-message">{firstMessage}</p>

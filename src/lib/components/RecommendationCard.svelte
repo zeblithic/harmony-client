@@ -22,6 +22,17 @@
   let recoverable = $derived(formatBytes(recommendation.spaceRecoverable));
   let stalenessPercent = $derived(Math.round(recommendation.stalenessScore * 100));
 
+  const REASON_HINTS: Record<string, string> = {
+    stale: 'Publish to preserve it forever, release to free quota, or burn if disposable.',
+    'over-replicated': 'Lower the replication tier in the detail panel to reclaim space without losing the file.',
+    'duplicate-of-public': 'A public copy already exists on the network — burn this private copy to recover the quota.',
+    expired: 'This content has passed its useful life. Burn it to free quota.',
+  };
+
+  let suggestion = $derived(
+    `This costs you ${size} across your devices. ${REASON_HINTS[recommendation.reason] ?? 'Review this item and take the appropriate action.'}`
+  );
+
   let showBurnConfirm = $state(false);
   let showPublishConfirm = $state(false);
   let showReleaseConfirm = $state(false);
@@ -81,7 +92,7 @@
   </div>
 
   <p class="suggestion">
-    This costs you {size} across your devices. Publish to preserve it forever, release to free quota, or burn if disposable.
+    {suggestion}
   </p>
 
   <div class="card-actions">

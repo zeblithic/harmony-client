@@ -165,8 +165,9 @@
     else if (action === 'archive') fileManagerService.archive([cid]);
     else if (action === 'release') fileManagerService.release([cid]);
     else if (action === 'publish') fileManagerService.publish([cid]);
+    else if (action === 'pin') fileManagerService.pin(cid);
     fileManagerVersion++;
-    if (selectedFileCid === cid && action !== 'archive') {
+    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish')) {
       selectedFileCid = null;
     }
   }
@@ -182,6 +183,9 @@
   function handleBulkArchive(cids: string[]) {
     fileManagerService.archive(cids);
     fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   function handleBulkRelease(cids: string[]) {
@@ -341,7 +345,7 @@
       {collapsed}
       onSettingsClick={() => { showSettings = !showSettings; }}
       profileLookup={(addr) => profileStore.get(addr)?.statusText}
-      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; }}
+      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; fileFilters = {}; }}
       {appMode}
       contentItems={allFileContents}
       storageBuddies={fileBuddies}

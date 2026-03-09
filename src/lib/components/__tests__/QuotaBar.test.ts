@@ -9,12 +9,12 @@ describe('QuotaBar', () => {
     expect(screen.getByText(/10\.0 GB/)).toBeTruthy();
   });
 
-  it('has role="progressbar" with aria attributes', () => {
+  it('has descriptive aria-label on button', () => {
     render(QuotaBar, { props: { usedBytes: 3_000_000_000, totalBytes: 10_000_000_000, onCleanupClick: vi.fn() } });
-    const bar = screen.getByRole('progressbar');
-    expect(bar.getAttribute('aria-valuenow')).toBe('30');
-    expect(bar.getAttribute('aria-valuemin')).toBe('0');
-    expect(bar.getAttribute('aria-valuemax')).toBe('100');
+    const btn = screen.getByRole('button');
+    expect(btn.getAttribute('aria-label')).toContain('3.0 GB');
+    expect(btn.getAttribute('aria-label')).toContain('10.0 GB');
+    expect(btn.getAttribute('aria-label')).toContain('30%');
   });
 
   it('calls onCleanupClick when clicked', async () => {

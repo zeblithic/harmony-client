@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   let {
     title,
     message,
@@ -20,6 +22,11 @@
   let typed = $state('');
   let matches = $derived(typed === confirmText);
   const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
+  let inputEl: HTMLInputElement;
+
+  onMount(() => {
+    inputEl?.focus();
+  });
 </script>
 
 <div class="dialog-overlay">
@@ -32,6 +39,7 @@
       type="text"
       aria-label="Type to confirm"
       bind:value={typed}
+      bind:this={inputEl}
     />
     <div class="dialog-actions">
       <button class="cancel-btn" onclick={onCancel}>Cancel</button>
