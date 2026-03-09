@@ -171,6 +171,9 @@
   function handleBulkBurn(cids: string[]) {
     fileManagerService.burn(cids);
     fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   function handleBulkArchive(cids: string[]) {
@@ -181,11 +184,17 @@
   function handleBulkRelease(cids: string[]) {
     fileManagerService.release(cids);
     fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   function handleBulkPublish(cids: string[]) {
     fileManagerService.publish(cids);
     fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   // Mock per-peer override to demonstrate settings
@@ -397,7 +406,7 @@
       onNavigateFolder={handleNavigateFolder}
       onViewModeChange={(mode) => { fileViewMode = mode; }}
       onSearchChange={(query) => { fileSearchQuery = query; }}
-      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; }}
       onUploadClick={handleFileUploadClick}
       onCleanupClick={handleFileCleanupClick}
       onCleanupAction={handleCleanupAction}
