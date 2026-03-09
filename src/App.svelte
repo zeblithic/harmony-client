@@ -166,6 +166,9 @@
     else if (action === 'release') fileManagerService.release([cid]);
     else if (action === 'publish') fileManagerService.publish([cid]);
     fileManagerVersion++;
+    if (selectedFileCid === cid && action !== 'archive') {
+      selectedFileCid = null;
+    }
   }
 
   function handleBulkBurn(cids: string[]) {
@@ -406,7 +409,7 @@
       onNavigateFolder={handleNavigateFolder}
       onViewModeChange={(mode) => { fileViewMode = mode; }}
       onSearchChange={(query) => { fileSearchQuery = query; }}
-      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; fileFilters = {}; }}
       onUploadClick={handleFileUploadClick}
       onCleanupClick={handleFileCleanupClick}
       onCleanupAction={handleCleanupAction}

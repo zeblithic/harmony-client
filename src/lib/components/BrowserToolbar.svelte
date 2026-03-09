@@ -38,14 +38,18 @@
     >Published</button>
   </div>
 
-  <input
-    class="search-input"
-    type="text"
-    placeholder="Search files..."
-    aria-label="Search files"
-    value={searchQuery}
-    oninput={(e) => onSearchChange(e.currentTarget.value)}
-  />
+  {#if section === 'private'}
+    <input
+      class="search-input"
+      type="text"
+      placeholder="Search files..."
+      aria-label="Search files"
+      value={searchQuery}
+      oninput={(e) => onSearchChange(e.currentTarget.value)}
+    />
+  {:else}
+    <div class="search-spacer"></div>
+  {/if}
 
   <div class="toolbar-right">
     <button
@@ -125,6 +129,10 @@
 
   .search-input:focus {
     border-color: var(--accent, #5865f2);
+  }
+
+  .search-spacer {
+    flex: 1;
   }
 
   .toolbar-right {
