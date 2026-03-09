@@ -7,6 +7,7 @@ const baseRec: CleanupRecommendation = {
   cid: 'cid-training-data',
   name: 'sensor-readings.parquet',
   category: 'dataset',
+  sensitivity: 'private',
   sizeBytes: 250_000_000,
   reason: 'stale',
   stalenessScore: 0.85,

@@ -118,7 +118,9 @@
       // Walk up the parent chain to build the full ancestor path
       const ancestors: Array<{ cid: string; name: string }> = [];
       let cid: string | null = currentFolderCid;
-      while (cid) {
+      const seen = new Set<string>();
+      while (cid && !seen.has(cid)) {
+        seen.add(cid);
         const folder = allContent.find((i) => i.cid === cid);
         if (!folder) break;
         ancestors.unshift({ cid: folder.cid, name: folder.name });

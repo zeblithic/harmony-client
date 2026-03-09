@@ -56,7 +56,7 @@ export class FileManagerService {
     return {
       ...item,
       sharedWith: [mockPeers[0], mockPeers[1]],
-      storageBuddies: [mockPeers[2]],
+      storageBuddies: [mockPeers[0]],
       origin: 'self-created',
     };
   }
@@ -80,9 +80,10 @@ export class FileManagerService {
 
   /** Returns cleanup recommendations, filtering out burned items, sorted by confidence desc. */
   getCleanupRecommendations(): CleanupRecommendation[] {
-    const activeCids = new Set(this.privateContent.map((i) => i.cid));
+    const activeCids = new Map(this.privateContent.map((i) => [i.cid, i]));
     return this.cleanupRecommendations
       .filter((r) => activeCids.has(r.cid))
+      .map((r) => ({ ...r, sensitivity: activeCids.get(r.cid)!.sensitivity }))
       .sort((a, b) => b.confidence - a.confidence);
   }
 

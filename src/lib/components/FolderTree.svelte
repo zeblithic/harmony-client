@@ -46,6 +46,13 @@
     }
   }
 
+  function handleLeafFolderKeydown(event: KeyboardEvent, cid: string) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onFolderSelect?.(cid);
+    }
+  }
+
   function handleRootKeydown(event: KeyboardEvent) {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
@@ -113,7 +120,7 @@
                               class:selected={selectedCid === grandchild.cid}
                               aria-current={selectedCid === grandchild.cid ? 'true' : undefined}
                               onclick={() => onFolderSelect?.(grandchild.cid)}
-                              onkeydown={(e) => handleFolderKeydown(e, grandchild.cid)}
+                              onkeydown={(e) => handleLeafFolderKeydown(e, grandchild.cid)}
                             >
                               <span class="folder-icon">{'\u{1F4C1}'}</span>
                               {grandchild.name}

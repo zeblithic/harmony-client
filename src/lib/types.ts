@@ -171,6 +171,7 @@ export interface CleanupRecommendation {
   cid: string;
   name: string;
   category: ContentCategory;
+  sensitivity: ContentSensitivity;
   sizeBytes: number;
   reason: CleanupReason;
   stalenessScore: number;

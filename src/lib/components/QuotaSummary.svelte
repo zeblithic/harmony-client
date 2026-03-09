@@ -28,7 +28,7 @@
           category: cat as ContentCategory,
           bytes,
           color: CATEGORY_COLORS[cat as ContentCategory],
-          widthPercent: (bytes / quota.totalBytes) * 100,
+          widthPercent: quota.totalBytes > 0 ? (bytes / quota.totalBytes) * 100 : 0,
         });
       }
     }
