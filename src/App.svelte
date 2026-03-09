@@ -9,6 +9,7 @@
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
   import { TrustService } from './lib/trust-service';
+  import { FileManagerService } from './lib/file-manager-service';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
   import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode } from './lib/types';
@@ -56,6 +57,7 @@
 
   const notificationService = new NotificationService();
   const trustService = new TrustService();
+  const fileManagerService = new FileManagerService();
   let trustVersion = $state(0);
 
   function handleTrustChange() {
@@ -198,7 +200,7 @@
 
 <Layout {collapsed} {showSettings} mode={appMode}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeToggle={() => { appMode = appMode === 'messages' ? 'vines' : 'messages'; showSettings = false; }} {appMode} />
+    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; }} {appMode} />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -243,6 +245,16 @@
   {/snippet}
   {#snippet vineFeed()}
     <VineFeed vines={vineVideos} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
+  {/snippet}
+  {#snippet fileBrowser()}
+    <div style="padding: 24px; color: var(--text-secondary);">
+      File Browser — coming in Task 7
+    </div>
+  {/snippet}
+  {#snippet fileDetailPanel()}
+    <div style="padding: 24px; color: var(--text-secondary);">
+      Detail Panel — coming in Task 8
+    </div>
   {/snippet}
 </Layout>
 

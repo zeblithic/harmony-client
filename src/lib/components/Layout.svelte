@@ -2,11 +2,13 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
     vineFeed?: Snippet;
+    fileBrowser?: Snippet;
+    fileDetailPanel?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -14,11 +16,20 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:vine-mode={mode === 'vines' && vineFeed}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
-  {#if mode === 'vines' && vineFeed}
+  {#if mode === 'files' && fileBrowser}
+    <main class="files-area">
+      {@render fileBrowser()}
+    </main>
+    {#if !collapsed && fileDetailPanel}
+      <section class="detail-area">
+        {@render fileDetailPanel()}
+      </section>
+    {/if}
+  {:else if mode === 'vines' && vineFeed}
     <main class="vine-area">
       {@render vineFeed()}
     </main>
@@ -73,6 +84,29 @@
     border-left: 1px solid var(--border);
     overflow-y: auto;
     padding: 12px;
+  }
+
+  .layout.files-mode {
+    grid-template-columns: var(--nav-width) 1fr 320px;
+    grid-template-areas: "nav files detail";
+  }
+  .layout.files-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr 320px;
+    grid-template-areas: "nav files detail";
+  }
+  .files-area {
+    grid-area: files;
+    background: var(--bg-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .detail-area {
+    grid-area: detail;
+    background: var(--bg-secondary);
+    overflow-y: auto;
+    padding: 12px;
+    border-left: 1px solid var(--border);
   }
 
   .layout.vine-mode {

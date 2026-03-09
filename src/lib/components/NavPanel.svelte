@@ -9,7 +9,7 @@
     collapsed = false,
     onNodeClick,
     onSettingsClick,
-    onModeToggle,
+    onModeChange,
     profileLookup,
     appMode = 'messages',
   }: {
@@ -17,7 +17,7 @@
     collapsed: boolean;
     onNodeClick?: (id: string) => void;
     onSettingsClick?: () => void;
-    onModeToggle?: () => void;
+    onModeChange?: (mode: AppMode) => void;
     profileLookup?: (address: string) => string | undefined;
     appMode?: AppMode;
   } = $props();
@@ -130,16 +130,17 @@
       />
     </nav>
     <div class="nav-footer">
-      <button
-        type="button"
-        class="nav-action-btn mode-toggle"
-        class:active={appMode === 'vines'}
-        aria-label="Toggle vine feed"
-        aria-pressed={appMode === 'vines'}
-        onclick={() => onModeToggle?.()}
-      >
-        {appMode === 'vines' ? 'Messages' : 'Vines'}
-      </button>
+      <div class="mode-toggles" role="group" aria-label="App mode">
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages'}
+          aria-label="Messages" aria-pressed={appMode === 'messages'}
+          onclick={() => onModeChange?.('messages')}>Messages</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'vines'}
+          aria-label="Vines" aria-pressed={appMode === 'vines'}
+          onclick={() => onModeChange?.('vines')}>Vines</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'files'}
+          aria-label="Files" aria-pressed={appMode === 'files'}
+          onclick={() => onModeChange?.('files')}>Files</button>
+      </div>
       <button
         type="button"
         class="nav-action-btn"
@@ -264,6 +265,9 @@
     background: var(--accent);
     color: var(--text-primary);
   }
+
+  .mode-toggles { display: flex; gap: 2px; }
+  .mode-toggles .mode-toggle { flex: 1; font-size: 0.75rem; padding: 4px 6px; }
 
   .mode-toggle.active {
     background: var(--accent);
