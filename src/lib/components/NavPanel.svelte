@@ -18,6 +18,7 @@
     contentItems,
     storageBuddies,
     fileSection,
+    currentFolderCid,
     onFolderSelect,
     onFilterChange,
     onManageBuddies,
@@ -32,6 +33,7 @@
     contentItems?: ContentItem[];
     storageBuddies?: StorageBuddy[];
     fileSection?: ContentSection;
+    currentFolderCid?: string | null;
     onFolderSelect?: (cid: string | null) => void;
     onFilterChange?: (filters: Record<string, unknown>) => void;
     onManageBuddies?: () => void;
@@ -136,7 +138,7 @@
     <nav class="nav-tree-container">
       {#if appMode === 'files'}
         {#if fileSection !== 'published'}
-          <FolderTree items={contentItems ?? []} {onFolderSelect} />
+          <FolderTree items={contentItems ?? []} {onFolderSelect} selectedCid={currentFolderCid ?? null} />
           <QuickFilters {onFilterChange} />
         {/if}
       {:else}

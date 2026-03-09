@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { FileViewMode, ContentSection } from '../types';
+  import type { FileViewMode, ContentSection, CleanupRecommendation } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
@@ -7,6 +7,7 @@
   import FileGrid from './FileGrid.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
+  import CleanupView from './CleanupView.svelte';
 
   let {
     service,
@@ -23,6 +24,11 @@
     onSectionChange,
     onUploadClick,
     onCleanupClick,
+    onCleanupAction,
+    onBulkBurn,
+    onBulkArchive,
+    onBulkRelease,
+    onBulkPublish,
     serviceVersion = 0,
   }: {
     service: FileManagerService;
@@ -39,6 +45,11 @@
     onSectionChange: (section: ContentSection) => void;
     onUploadClick: () => void;
     onCleanupClick: () => void;
+    onCleanupAction?: (cid: string, action: string) => void;
+    onBulkBurn?: (cids: string[]) => void;
+    onBulkArchive?: (cids: string[]) => void;
+    onBulkRelease?: (cids: string[]) => void;
+    onBulkPublish?: (cids: string[]) => void;
     serviceVersion?: number;
   } = $props();
 
@@ -66,7 +77,13 @@
     return service.getQuotaStatus();
   });
 
+  let cleanupRecommendations = $derived.by(() => {
+    void serviceVersion;
+    return service.getCleanupRecommendations();
+  });
+
   let breadcrumbPath = $derived.by(() => {
+    void serviceVersion;
     const path: Array<{ cid: string | null; name: string }> = [
       { cid: null, name: 'My Content' },
     ];
@@ -101,9 +118,15 @@
 
   {#if section === 'private'}
     {#if showCleanup}
-      <div class="cleanup-placeholder" data-testid="cleanup-view-placeholder">
-        <!-- Task 10: CleanupView will go here -->
-      </div>
+      <CleanupView
+        {quota}
+        recommendations={cleanupRecommendations}
+        onAction={(cid, action) => onCleanupAction?.(cid, action)}
+        onBulkBurn={(cids) => onBulkBurn?.(cids)}
+        onBulkArchive={(cids) => onBulkArchive?.(cids)}
+        onBulkRelease={(cids) => onBulkRelease?.(cids)}
+        onBulkPublish={(cids) => onBulkPublish?.(cids)}
+      />
     {:else}
       <Breadcrumbs path={breadcrumbPath} onNavigate={onNavigateFolder} />
 
@@ -132,7 +155,6 @@
     min-height: 0;
   }
 
-  .cleanup-placeholder,
   .published-placeholder {
     flex: 1;
     display: flex;

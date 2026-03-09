@@ -23,13 +23,16 @@
 
   function toggleFolder(cid: string) {
     const next = new Set(expandedCids);
-    if (next.has(cid)) {
-      next.delete(cid);
-    } else {
+    const isExpanding = !next.has(cid);
+    if (isExpanding) {
       next.add(cid);
+    } else {
+      next.delete(cid);
     }
     expandedCids = next;
-    onFolderSelect?.(cid);
+    if (isExpanding) {
+      onFolderSelect?.(cid);
+    }
   }
 
   function selectRoot() {

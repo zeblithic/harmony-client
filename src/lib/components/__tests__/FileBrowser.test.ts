@@ -64,9 +64,9 @@ describe('FileBrowser', () => {
     expect(container.querySelector('.breadcrumbs')).toBeNull();
   });
 
-  it('shows cleanup placeholder when showCleanup is true', () => {
+  it('shows CleanupView when showCleanup is true', () => {
     const { container } = render(FileBrowser, { props: makeProps({ showCleanup: true }) });
-    expect(container.querySelector('[data-testid="cleanup-view-placeholder"]')).toBeTruthy();
+    expect(container.querySelector('.cleanup-view')).toBeTruthy();
   });
 
   it('renders breadcrumbs with root at minimum', () => {

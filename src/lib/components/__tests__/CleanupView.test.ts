@@ -190,12 +190,16 @@ describe('CleanupView', () => {
     ]);
   });
 
-  it('fires onBulkArchive with selected CIDs', async () => {
+  it('fires onBulkArchive with selected CIDs after confirmation', async () => {
     const onBulkArchive = vi.fn();
     const { container } = render(CleanupView, { props: { ...baseProps(), onBulkArchive } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /archive all/i }));
+    expect(onBulkArchive).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBulkArchive).toHaveBeenCalledWith([
       'cid-training-data',
       'cid-video-lecture',
@@ -203,12 +207,16 @@ describe('CleanupView', () => {
     ]);
   });
 
-  it('fires onBulkRelease with selected CIDs', async () => {
+  it('fires onBulkRelease with selected CIDs after confirmation', async () => {
     const onBulkRelease = vi.fn();
     const { container } = render(CleanupView, { props: { ...baseProps(), onBulkRelease } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /release all/i }));
+    expect(onBulkRelease).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBulkRelease).toHaveBeenCalledWith([
       'cid-training-data',
       'cid-video-lecture',
@@ -216,12 +224,16 @@ describe('CleanupView', () => {
     ]);
   });
 
-  it('fires onBulkPublish with selected CIDs', async () => {
+  it('fires onBulkPublish with selected CIDs after confirmation', async () => {
     const onBulkPublish = vi.fn();
     const { container } = render(CleanupView, { props: { ...baseProps(), onBulkPublish } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /publish all/i }));
+    expect(onBulkPublish).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBulkPublish).toHaveBeenCalledWith([
       'cid-training-data',
       'cid-video-lecture',

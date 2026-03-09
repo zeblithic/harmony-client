@@ -68,10 +68,28 @@
   let itemWord = $derived(selectedCount === 1 ? 'item' : 'items');
 
   let showBulkBurnConfirm = $state(false);
+  let showBulkArchiveConfirm = $state(false);
+  let showBulkReleaseConfirm = $state(false);
+  let showBulkPublishConfirm = $state(false);
 
   function confirmBulkBurn() {
     showBulkBurnConfirm = false;
     onBulkBurn(selectedCidsArray);
+  }
+
+  function confirmBulkArchive() {
+    showBulkArchiveConfirm = false;
+    onBulkArchive(selectedCidsArray);
+  }
+
+  function confirmBulkRelease() {
+    showBulkReleaseConfirm = false;
+    onBulkRelease(selectedCidsArray);
+  }
+
+  function confirmBulkPublish() {
+    showBulkPublishConfirm = false;
+    onBulkPublish(selectedCidsArray);
   }
 </script>
 
@@ -101,9 +119,9 @@
         </span>
         <div class="bulk-buttons">
           <button class="bulk-btn burn" onclick={() => { showBulkBurnConfirm = true; }}>Burn All</button>
-          <button class="bulk-btn archive" onclick={() => onBulkArchive(selectedCidsArray)}>Archive All</button>
-          <button class="bulk-btn release" onclick={() => onBulkRelease(selectedCidsArray)}>Release All</button>
-          <button class="bulk-btn publish" onclick={() => onBulkPublish(selectedCidsArray)}>Publish All</button>
+          <button class="bulk-btn archive" onclick={() => { showBulkArchiveConfirm = true; }}>Archive All</button>
+          <button class="bulk-btn release" onclick={() => { showBulkReleaseConfirm = true; }}>Release All</button>
+          <button class="bulk-btn publish" onclick={() => { showBulkPublishConfirm = true; }}>Publish All</button>
         </div>
       </div>
     {/if}
@@ -135,6 +153,36 @@
     destructive={true}
     onConfirm={confirmBulkBurn}
     onCancel={() => { showBulkBurnConfirm = false; }}
+  />
+{/if}
+
+{#if showBulkArchiveConfirm}
+  <ConfirmDialog
+    title="Archive Selected Items"
+    message="This will archive {selectedCount} {itemWord}, moving them to cold storage. They can be restored later."
+    confirmLabel="Archive All"
+    onConfirm={confirmBulkArchive}
+    onCancel={() => { showBulkArchiveConfirm = false; }}
+  />
+{/if}
+
+{#if showBulkReleaseConfirm}
+  <ConfirmDialog
+    title="Release Selected Items"
+    message="This will release {selectedCount} {itemWord} ephemerally to the network. You retain no copy."
+    confirmLabel="Release All"
+    onConfirm={confirmBulkRelease}
+    onCancel={() => { showBulkReleaseConfirm = false; }}
+  />
+{/if}
+
+{#if showBulkPublishConfirm}
+  <ConfirmDialog
+    title="Publish Selected Items"
+    message="This will permanently publish {selectedCount} {itemWord} to the network. Published content is network-owned and cannot be retracted."
+    confirmLabel="Publish All"
+    onConfirm={confirmBulkPublish}
+    onCancel={() => { showBulkPublishConfirm = false; }}
   />
 {/if}
 

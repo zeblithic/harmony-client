@@ -159,6 +159,34 @@
     showCleanup = !showCleanup;
   }
 
+  function handleCleanupAction(cid: string, action: string) {
+    if (action === 'burn') fileManagerService.burn([cid]);
+    else if (action === 'archive') fileManagerService.archive([cid]);
+    else if (action === 'release') fileManagerService.release([cid]);
+    else if (action === 'publish') fileManagerService.publish([cid]);
+    fileManagerVersion++;
+  }
+
+  function handleBulkBurn(cids: string[]) {
+    fileManagerService.burn(cids);
+    fileManagerVersion++;
+  }
+
+  function handleBulkArchive(cids: string[]) {
+    fileManagerService.archive(cids);
+    fileManagerVersion++;
+  }
+
+  function handleBulkRelease(cids: string[]) {
+    fileManagerService.release(cids);
+    fileManagerVersion++;
+  }
+
+  function handleBulkPublish(cids: string[]) {
+    fileManagerService.publish(cids);
+    fileManagerVersion++;
+  }
+
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
 
@@ -305,6 +333,7 @@
       contentItems={allFileContents}
       storageBuddies={fileBuddies}
       {fileSection}
+      {currentFolderCid}
       onFolderSelect={handleNavigateFolder}
     />
   {/snippet}
@@ -368,6 +397,11 @@
       onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; }}
       onUploadClick={handleFileUploadClick}
       onCleanupClick={handleFileCleanupClick}
+      onCleanupAction={handleCleanupAction}
+      onBulkBurn={handleBulkBurn}
+      onBulkArchive={handleBulkArchive}
+      onBulkRelease={handleBulkRelease}
+      onBulkPublish={handleBulkPublish}
       serviceVersion={fileManagerVersion}
     />
   {/snippet}
@@ -376,7 +410,7 @@
       <FileDetailPanel
         detail={selectedFileDetail}
         availablePeers={mockPeers}
-        storageBuddyDetails={fileBuddies}
+        storageBuddyDetails={fileBuddies.filter(b => selectedFileDetail?.storageBuddies.some(sb => sb.address === b.address))}
         onTierChange={handleFileTierChange}
         onPublish={handleFilePublish}
         onRelease={handleFileRelease}
