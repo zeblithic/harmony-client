@@ -1,0 +1,97 @@
+<script lang="ts">
+  import type { ContentItem } from '../types';
+  import { categoryIcon, formatBytes, relativeTime, tierTarget } from '../file-utils';
+  import StalenessIndicator from './StalenessIndicator.svelte';
+
+  let {
+    item,
+    onClick,
+    selected = false,
+  }: {
+    item: ContentItem;
+    onClick?: (cid: string) => void;
+    selected?: boolean;
+  } = $props();
+
+  let icon = $derived(categoryIcon(item.category));
+  let size = $derived(formatBytes(item.sizeBytes));
+  let lastAccessed = $derived(relativeTime(item.lastAccessed));
+  let replication = $derived(`${item.replicaCount}/${tierTarget(item.replicationTier)}`);
+  let sensitivityIcon = $derived(
+    item.sensitivity === 'public' ? '\uD83C\uDF10' : '\uD83D\uDD12'
+  );
+</script>
+
+<button
+  class="file-row"
+  class:selected
+  role="row"
+  onclick={() => onClick?.(item.cid)}
+  aria-label={item.name}
+>
+  <span class="file-row-icon" aria-hidden="true">{icon}</span>
+  <span class="file-row-name" class:bold={selected}>{item.name}</span>
+  <span class="file-row-size">{size}</span>
+  <span class="file-row-accessed">{lastAccessed}</span>
+  <StalenessIndicator score={item.stalenessScore} pinned={item.pinned} />
+  <span class="file-row-replication">{replication}</span>
+  <span class="file-row-sensitivity" aria-hidden="true">{sensitivityIcon}</span>
+</button>
+
+<style>
+  .file-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .file-row:hover {
+    background: var(--bg-tertiary, #232428);
+  }
+
+  .file-row.selected {
+    background: color-mix(in srgb, var(--accent, #5865f2) 10%, transparent);
+  }
+
+  .file-row-icon {
+    flex-shrink: 0;
+    width: 24px;
+    text-align: center;
+  }
+
+  .file-row-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-row-name.bold {
+    font-weight: 600;
+  }
+
+  .file-row-size,
+  .file-row-accessed,
+  .file-row-replication {
+    flex-shrink: 0;
+    font-size: 0.8rem;
+    color: var(--text-muted, #949ba4);
+    min-width: 60px;
+    text-align: right;
+  }
+
+  .file-row-sensitivity {
+    flex-shrink: 0;
+    width: 24px;
+    text-align: center;
+  }
+</style>

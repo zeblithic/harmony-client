@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { formatBytes } from '../file-utils';
+
   let {
     usedBytes,
     totalBytes,
@@ -11,13 +13,6 @@
 
   let percent = $derived(Math.min(100, Math.round((usedBytes / totalBytes) * 100)));
   let warning = $derived(percent >= 85);
-
-  function formatBytes(bytes: number): string {
-    if (bytes >= 1_000_000_000) return (bytes / 1_000_000_000).toFixed(1) + ' GB';
-    if (bytes >= 1_000_000) return (bytes / 1_000_000).toFixed(1) + ' MB';
-    if (bytes >= 1_000) return (bytes / 1_000).toFixed(1) + ' KB';
-    return bytes + ' B';
-  }
 </script>
 
 <button class="quota-bar" onclick={onCleanupClick} aria-label="Storage quota — click to manage">
