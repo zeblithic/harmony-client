@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ContentDetail, ContentSensitivity } from '../types';
   import PublishButton from './PublishButton.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   let {
     item,
@@ -23,6 +24,13 @@
     onUnpin?: () => void;
     onExport?: () => void;
   } = $props();
+
+  let showBurnConfirm = $state(false);
+
+  function confirmBurn() {
+    showBurnConfirm = false;
+    onBurn?.();
+  }
 </script>
 
 <div class="file-actions">
@@ -35,7 +43,7 @@
     onRelease={(cid) => onRelease?.(cid)}
   />
 
-  <button class="action-btn destructive" onclick={() => onBurn?.()} aria-label="Burn">
+  <button class="action-btn destructive" onclick={() => { showBurnConfirm = true; }} aria-label="Burn">
     <span class="action-icon" aria-hidden="true">{'\u{1F525}'}</span>
     Burn
   </button>
@@ -62,6 +70,17 @@
     Export
   </button>
 </div>
+
+{#if showBurnConfirm}
+  <ConfirmDialog
+    title="Burn Content"
+    message="This will permanently delete &quot;{item.name}&quot; and free its storage quota. This cannot be undone."
+    confirmLabel="Burn"
+    destructive={true}
+    onConfirm={confirmBurn}
+    onCancel={() => { showBurnConfirm = false; }}
+  />
+{/if}
 
 <style>
   .file-actions {

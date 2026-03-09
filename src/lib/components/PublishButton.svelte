@@ -65,7 +65,11 @@
 
   function onDoubleConfirm() {
     if (flowMode === 'release') {
-      // Release always completes after double confirm
+      // Release completes after double confirm regardless of sensitivity level.
+      // Rationale: release is ephemeral — content may fade from the network.
+      // This is deliberately lower-stakes than durable publish, which uses
+      // the full graduated gate sequence (type-to-confirm, OOB) for
+      // intimate/confidential content.
       onRelease(cid);
       cancelFlow();
       return;

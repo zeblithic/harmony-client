@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, StorageBuddy } from '../types';
+  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, ContentSection, StorageBuddy } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
   import FolderTree from './FolderTree.svelte';
@@ -17,6 +17,7 @@
     appMode = 'messages',
     contentItems,
     storageBuddies,
+    fileSection,
     onFolderSelect,
     onFilterChange,
     onManageBuddies,
@@ -30,6 +31,7 @@
     appMode?: AppMode;
     contentItems?: ContentItem[];
     storageBuddies?: StorageBuddy[];
+    fileSection?: ContentSection;
     onFolderSelect?: (cid: string | null) => void;
     onFilterChange?: (filters: Record<string, unknown>) => void;
     onManageBuddies?: () => void;
@@ -133,8 +135,10 @@
     </div>
     <nav class="nav-tree-container">
       {#if appMode === 'files'}
-        <FolderTree items={contentItems ?? []} {onFolderSelect} />
-        <QuickFilters {onFilterChange} />
+        {#if fileSection !== 'published'}
+          <FolderTree items={contentItems ?? []} {onFolderSelect} />
+          <QuickFilters {onFilterChange} />
+        {/if}
       {:else}
         <NavTree
           nodes={filteredNodes}

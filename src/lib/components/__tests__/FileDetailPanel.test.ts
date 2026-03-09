@@ -88,7 +88,7 @@ describe('FileDetailPanel', () => {
     expect(screen.getByLabelText('Unpin')).toBeTruthy();
   });
 
-  it('fires action callbacks when buttons are clicked', async () => {
+  it('fires burn callback after confirmation dialog', async () => {
     const onBurn = vi.fn();
     render(FileDetailPanel, {
       props: {
@@ -104,6 +104,12 @@ describe('FileDetailPanel', () => {
       },
     });
     await fireEvent.click(screen.getByLabelText('Burn'));
+    // Burn now requires confirmation
+    expect(onBurn).not.toHaveBeenCalled();
+    // Click the confirm button inside the dialog
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBurn).toHaveBeenCalledOnce();
   });
 });

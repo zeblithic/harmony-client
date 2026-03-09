@@ -304,6 +304,7 @@
       {appMode}
       contentItems={allFileContents}
       storageBuddies={fileBuddies}
+      {fileSection}
       onFolderSelect={handleNavigateFolder}
     />
   {/snippet}
@@ -364,7 +365,7 @@
       onNavigateFolder={handleNavigateFolder}
       onViewModeChange={(mode) => { fileViewMode = mode; }}
       onSearchChange={(query) => { fileSearchQuery = query; }}
-      onSectionChange={(section) => { fileSection = section; selectedFileCid = null; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; }}
       onUploadClick={handleFileUploadClick}
       onCleanupClick={handleFileCleanupClick}
       serviceVersion={fileManagerVersion}

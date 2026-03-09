@@ -194,13 +194,11 @@ describe('File Manager Integration', () => {
     expect(callbacks.onSectionChange).toHaveBeenCalledWith('published');
   });
 
-  it('shows published placeholder when section is published', () => {
+  it('shows PublishedView when section is published', () => {
     const service = new FileManagerService();
     const { container } = renderBrowser(service, { section: 'published' });
 
-    expect(
-      container.querySelector('[data-testid="published-view-placeholder"]'),
-    ).toBeTruthy();
+    expect(container.querySelector('.published-view')).toBeTruthy();
   });
 
   // ── 9. Selected file detail panel ────────────────────────────────

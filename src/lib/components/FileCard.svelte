@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
-  import { categoryIcon, formatBytes } from '../file-utils';
+  import { categoryIcon, formatBytes, sensitivityIcon } from '../file-utils';
   import StalenessIndicator from './StalenessIndicator.svelte';
 
   let {
@@ -15,9 +15,7 @@
 
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
-  let sensitivityIcon = $derived(
-    item.sensitivity === 'public' ? '\uD83C\uDF10' : '\uD83D\uDD12'
-  );
+  let sensIcon = $derived(sensitivityIcon(item.sensitivity));
 </script>
 
 <button
@@ -27,7 +25,7 @@
   aria-label={item.name}
 >
   <div class="file-card-overlay-top">
-    <span class="file-card-sensitivity" aria-hidden="true">{sensitivityIcon}</span>
+    <span class="file-card-sensitivity" aria-hidden="true">{sensIcon}</span>
     <span class="file-card-staleness">
       <StalenessIndicator score={item.stalenessScore} pinned={item.pinned} />
     </span>

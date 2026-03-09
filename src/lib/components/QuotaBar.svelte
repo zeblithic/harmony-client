@@ -11,7 +11,7 @@
     onCleanupClick: () => void;
   } = $props();
 
-  let percent = $derived(Math.min(100, Math.round((usedBytes / totalBytes) * 100)));
+  let percent = $derived(totalBytes > 0 ? Math.min(100, Math.round((usedBytes / totalBytes) * 100)) : 0);
   let warning = $derived(percent >= 85);
 </script>
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
-  import { categoryIcon, formatBytes, relativeTime, tierTarget } from '../file-utils';
+  import { categoryIcon, formatBytes, relativeTime, tierTarget, sensitivityIcon } from '../file-utils';
   import StalenessIndicator from './StalenessIndicator.svelte';
 
   let {
@@ -17,9 +17,7 @@
   let size = $derived(formatBytes(item.sizeBytes));
   let lastAccessed = $derived(relativeTime(item.lastAccessed));
   let replication = $derived(`${item.replicaCount}/${tierTarget(item.replicationTier)}`);
-  let sensitivityIcon = $derived(
-    item.sensitivity === 'public' ? '\uD83C\uDF10' : '\uD83D\uDD12'
-  );
+  let sensIcon = $derived(sensitivityIcon(item.sensitivity));
 </script>
 
 <button
@@ -35,7 +33,7 @@
   <span class="file-row-accessed">{lastAccessed}</span>
   <StalenessIndicator score={item.stalenessScore} pinned={item.pinned} />
   <span class="file-row-replication">{replication}</span>
-  <span class="file-row-sensitivity" aria-hidden="true">{sensitivityIcon}</span>
+  <span class="file-row-sensitivity" aria-hidden="true">{sensIcon}</span>
 </button>
 
 <style>

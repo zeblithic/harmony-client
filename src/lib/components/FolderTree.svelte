@@ -103,7 +103,21 @@
                     <ul role="group" class="folder-children">
                       {#each grandchildren as grandchild (grandchild.cid)}
                         <li role="treeitem" aria-selected={selectedCid === grandchild.cid}>
-                          <span class="file-entry">{grandchild.name}</span>
+                          {#if grandchild.isFolder}
+                            <button
+                              type="button"
+                              class="folder-btn child-btn"
+                              class:selected={selectedCid === grandchild.cid}
+                              aria-current={selectedCid === grandchild.cid ? 'true' : undefined}
+                              onclick={() => onFolderSelect?.(grandchild.cid)}
+                              onkeydown={(e) => handleFolderKeydown(e, grandchild.cid)}
+                            >
+                              <span class="folder-icon">{'\u{1F4C1}'}</span>
+                              {grandchild.name}
+                            </button>
+                          {:else}
+                            <span class="file-entry">{grandchild.name}</span>
+                          {/if}
                         </li>
                       {/each}
                     </ul>

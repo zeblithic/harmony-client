@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentSensitivity } from '../types';
+  import { sensitivityIcon } from '../file-utils';
 
   let {
     sensitivity,
@@ -14,7 +15,7 @@
     confidential: 'Confidential',
   };
 
-  let icon = $derived(sensitivity === 'public' ? '\u{1F310}' : '\u{1F512}');
+  let icon = $derived(sensitivityIcon(sensitivity));
   let label = $derived(LABELS[sensitivity]);
 </script>
 

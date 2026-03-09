@@ -30,15 +30,17 @@ describe('SensitivityBadge', () => {
     }
   });
 
-  it('renders "Intimate" with lock icon for intimate sensitivity', () => {
+  it('renders "Intimate" with shield icon for intimate sensitivity', () => {
     render(SensitivityBadge, { props: { sensitivity: 'intimate' } });
     expect(screen.getByText(/Intimate/)).toBeTruthy();
-    expect(screen.getByText(/\u{1F512}/u)).toBeTruthy();
+    // Shield emoji 🛡️
+    expect(screen.getByText(/\u{1F6E1}/u)).toBeTruthy();
   });
 
-  it('renders "Confidential" with lock icon for confidential sensitivity', () => {
+  it('renders "Confidential" with warning icon for confidential sensitivity', () => {
     render(SensitivityBadge, { props: { sensitivity: 'confidential' } });
     expect(screen.getByText(/Confidential/)).toBeTruthy();
-    expect(screen.getByText(/\u{1F512}/u)).toBeTruthy();
+    // Warning emoji ⚠️
+    expect(screen.getByText(/\u{26A0}/u)).toBeTruthy();
   });
 });

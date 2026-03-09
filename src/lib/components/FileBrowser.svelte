@@ -6,6 +6,7 @@
   import FileList from './FileList.svelte';
   import FileGrid from './FileGrid.svelte';
   import QuotaBar from './QuotaBar.svelte';
+  import PublishedView from './PublishedView.svelte';
 
   let {
     service,
@@ -40,6 +41,11 @@
     onCleanupClick: () => void;
     serviceVersion?: number;
   } = $props();
+
+  let publishedItems = $derived.by(() => {
+    void serviceVersion;
+    return service.getPublishedContent();
+  });
 
   let items = $derived.by(() => {
     void serviceVersion; // trigger reactivity
@@ -114,9 +120,7 @@
       {onCleanupClick}
     />
   {:else}
-    <div class="published-placeholder" data-testid="published-view-placeholder">
-      <!-- Task 11: PublishedView will go here -->
-    </div>
+    <PublishedView items={publishedItems} />
   {/if}
 </div>
 

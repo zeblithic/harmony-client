@@ -8,7 +8,7 @@
     quota: QuotaStatus;
   } = $props();
 
-  let percent = $derived(Math.min(100, Math.round((quota.usedBytes / quota.totalBytes) * 100)));
+  let percent = $derived(quota.totalBytes > 0 ? Math.min(100, Math.round((quota.usedBytes / quota.totalBytes) * 100)) : 0);
 
   const CATEGORY_COLORS: Record<ContentCategory, string> = {
     music: '#1abc9c',

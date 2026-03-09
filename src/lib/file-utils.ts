@@ -1,4 +1,4 @@
-import type { ContentCategory, ReplicationTier } from './types';
+import type { ContentCategory, ContentSensitivity, ReplicationTier } from './types';
 
 const CATEGORY_ICONS: Record<ContentCategory, string> = {
   music: '\u266A',
@@ -18,6 +18,17 @@ const TIER_TARGETS: Record<ReplicationTier, number> = {
   ultra: 9,
 };
 
+const SENSITIVITY_ICONS: Record<ContentSensitivity, string> = {
+  public: '\uD83C\uDF10',       // 🌐
+  private: '\uD83D\uDD12',      // 🔒
+  intimate: '\uD83D\uDEE1\uFE0F', // 🛡️
+  confidential: '\u26A0\uFE0F', // ⚠️
+};
+
+export function sensitivityIcon(sensitivity: ContentSensitivity): string {
+  return SENSITIVITY_ICONS[sensitivity];
+}
+
 export function categoryIcon(category: ContentCategory): string {
   return CATEGORY_ICONS[category] ?? '\uD83D\uDCC4';
 }
@@ -35,7 +46,9 @@ export function formatBytes(bytes: number): string {
 
 export function relativeTime(timestamp: number): string {
   const diff = Date.now() - timestamp;
+  if (diff < 0) return 'just now';
   const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h ago`;

@@ -3,6 +3,7 @@
   import { formatBytes } from '../file-utils';
   import QuotaSummary from './QuotaSummary.svelte';
   import RecommendationCard from './RecommendationCard.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   type CleanupAction = 'burn' | 'archive' | 'release' | 'publish' | 'pin';
 
@@ -65,6 +66,13 @@
   }
 
   let itemWord = $derived(selectedCount === 1 ? 'item' : 'items');
+
+  let showBulkBurnConfirm = $state(false);
+
+  function confirmBulkBurn() {
+    showBulkBurnConfirm = false;
+    onBulkBurn(selectedCidsArray);
+  }
 </script>
 
 <div class="cleanup-view">
@@ -92,7 +100,7 @@
           {selectedCount} {itemWord} selected — {formatBytes(totalRecoverable)} recoverable
         </span>
         <div class="bulk-buttons">
-          <button class="bulk-btn burn" onclick={() => onBulkBurn(selectedCidsArray)}>Burn All</button>
+          <button class="bulk-btn burn" onclick={() => { showBulkBurnConfirm = true; }}>Burn All</button>
           <button class="bulk-btn archive" onclick={() => onBulkArchive(selectedCidsArray)}>Archive All</button>
           <button class="bulk-btn release" onclick={() => onBulkRelease(selectedCidsArray)}>Release All</button>
           <button class="bulk-btn publish" onclick={() => onBulkPublish(selectedCidsArray)}>Publish All</button>
@@ -118,6 +126,17 @@
     {/if}
   </div>
 </div>
+
+{#if showBulkBurnConfirm}
+  <ConfirmDialog
+    title="Burn Selected Items"
+    message="This will permanently delete {selectedCount} {itemWord} and free {formatBytes(totalRecoverable)} of storage quota. This cannot be undone."
+    confirmLabel="Burn All"
+    destructive={true}
+    onConfirm={confirmBulkBurn}
+    onCancel={() => { showBulkBurnConfirm = false; }}
+  />
+{/if}
 
 <style>
   .cleanup-view {

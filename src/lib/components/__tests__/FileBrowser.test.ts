@@ -57,9 +57,9 @@ describe('FileBrowser', () => {
     expect(firstRowName?.textContent).toBe('Projects');
   });
 
-  it('shows published placeholder when section is published', () => {
+  it('shows PublishedView when section is published', () => {
     const { container } = render(FileBrowser, { props: makeProps({ section: 'published' }) });
-    expect(container.querySelector('[data-testid="published-view-placeholder"]')).toBeTruthy();
+    expect(container.querySelector('.published-view')).toBeTruthy();
     // No file list or breadcrumbs in published mode
     expect(container.querySelector('.breadcrumbs')).toBeNull();
   });

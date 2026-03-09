@@ -172,12 +172,17 @@ describe('CleanupView', () => {
     expect(screen.getByRole('button', { name: /publish all/i })).toBeTruthy();
   });
 
-  it('fires onBulkBurn with selected CIDs', async () => {
+  it('fires onBulkBurn with selected CIDs after confirmation', async () => {
     const onBulkBurn = vi.fn();
     const { container } = render(CleanupView, { props: { ...baseProps(), onBulkBurn } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /burn all/i }));
+    // Burn All now requires confirmation
+    expect(onBulkBurn).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBulkBurn).toHaveBeenCalledWith([
       'cid-training-data',
       'cid-video-lecture',
@@ -231,6 +236,10 @@ describe('CleanupView', () => {
     const checkboxes = container.querySelectorAll('input[type="checkbox"]');
     await fireEvent.click(checkboxes[2]);
     await fireEvent.click(screen.getByRole('button', { name: /burn all/i }));
+    // Confirm the burn dialog
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onBulkBurn).toHaveBeenCalledWith(['cid-video-lecture']);
   });
 
