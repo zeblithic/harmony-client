@@ -114,4 +114,95 @@ export interface VineVideo {
   viewed: boolean;
 }
 
-export type AppMode = 'messages' | 'vines';
+export type AppMode = 'messages' | 'vines' | 'files';
+
+// ── File Manager Types ──────────────────────────────────────────────
+
+export type ReplicationTier = 'expendable' | 'light' | 'default' | 'high' | 'ultra';
+export type ContentSensitivity = 'public' | 'private' | 'intimate' | 'confidential';
+export type FileViewMode = 'list' | 'grid';
+export type ContentSection = 'private' | 'published';
+export type PublishMode = 'durable' | 'ephemeral';
+export type ContentOrigin = 'self-created' | 'peer-replicated' | 'downloaded' | 'cached-in-transit';
+export type CleanupReason = 'stale' | 'duplicate-of-public' | 'over-replicated' | 'expired';
+
+/** Mirrors harmony-roxy ContentCategory. */
+export type ContentCategory = 'music' | 'video' | 'text' | 'image' | 'software' | 'dataset' | 'bundle';
+
+/** Mirrors harmony-roxy UsageRights bitflags as a simpler TS set. */
+export type UsageRight = 'stream' | 'download' | 'remix' | 'reshare';
+
+export interface PeerRef {
+  address: string;
+  displayName: string;
+}
+
+export interface ContentItem {
+  cid: string;
+  name: string;
+  category: ContentCategory;
+  sensitivity: ContentSensitivity;
+  sizeBytes: number;
+  storedAt: number;
+  lastAccessed: number;
+  accessCount: number;
+  stalenessScore: number;
+  replicationTier: ReplicationTier;
+  replicaCount: number;
+  pinned: boolean;
+  licensed: boolean;
+  parentCid: string | null;
+  isFolder: boolean;
+}
+
+export interface ContentDetail extends ContentItem {
+  sharedWith: PeerRef[];
+  storageBuddies: PeerRef[];
+  origin: ContentOrigin;
+}
+
+export interface QuotaStatus {
+  usedBytes: number;
+  totalBytes: number;
+  byCategory: Partial<Record<ContentCategory, number>>;
+}
+
+export interface CleanupRecommendation {
+  cid: string;
+  name: string;
+  category: ContentCategory;
+  sizeBytes: number;
+  reason: CleanupReason;
+  stalenessScore: number;
+  spaceRecoverable: number;
+  confidence: number;
+}
+
+export interface StorageBuddy {
+  address: string;
+  displayName: string;
+  storageUsedBytes: number;
+  online: boolean;
+}
+
+export interface PublishedItem {
+  cid: string;
+  name: string;
+  category: ContentCategory;
+  sizeBytes: number;
+  publishedAt: number;
+  publishMode: PublishMode;
+}
+
+export interface UploadCandidate {
+  file: File;
+  sensitivity: ContentSensitivity;
+  replicationTier: ReplicationTier;
+}
+
+export interface FileManagerSettings {
+  defaultReplicationTier: ReplicationTier;
+  quotaBytes: number;
+  defaultViewMode: FileViewMode;
+  confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
+}
