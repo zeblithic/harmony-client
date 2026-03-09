@@ -94,21 +94,29 @@ describe('RecommendationCard', () => {
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'archive');
   });
 
-  it('fires onAction with cid and action when Release clicked', async () => {
+  it('fires onAction with cid and release after confirmation', async () => {
     const onAction = vi.fn();
     render(RecommendationCard, {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /release/i }));
+    expect(onAction).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'release');
   });
 
-  it('fires onAction with cid and action when Publish clicked', async () => {
+  it('fires onAction with cid and publish after confirmation', async () => {
     const onAction = vi.fn();
     render(RecommendationCard, {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /publish/i }));
+    expect(onAction).not.toHaveBeenCalled();
+    const dialog = screen.getByRole('dialog');
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'publish');
   });
 

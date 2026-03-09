@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { FileViewMode, ContentSection, CleanupRecommendation, ContentCategory, ReplicationTier } from '../types';
   import { FileManagerService } from '../file-manager-service';
+  import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
   import FileList from './FileList.svelte';
@@ -86,6 +87,9 @@
     }
     if (filters.licensed) {
       contents = contents.filter((i) => i.isFolder || i.licensed);
+    }
+    if (filters.underReplicated) {
+      contents = contents.filter((i) => i.isFolder || i.replicaCount < tierTarget(i.replicationTier));
     }
     // folders first, then files
     return contents.sort((a, b) => {
@@ -184,14 +188,5 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-  }
-
-  .published-placeholder {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted, #949ba4);
-    font-size: 0.9rem;
   }
 </style>

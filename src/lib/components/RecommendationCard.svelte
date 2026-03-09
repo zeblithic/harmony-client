@@ -23,10 +23,20 @@
   let stalenessPercent = $derived(Math.round(recommendation.stalenessScore * 100));
 
   let showBurnConfirm = $state(false);
+  let showPublishConfirm = $state(false);
+  let showReleaseConfirm = $state(false);
 
   function handleAction(action: CleanupAction) {
     if (action === 'burn') {
       showBurnConfirm = true;
+      return;
+    }
+    if (action === 'publish') {
+      showPublishConfirm = true;
+      return;
+    }
+    if (action === 'release') {
+      showReleaseConfirm = true;
       return;
     }
     onAction(recommendation.cid, action);
@@ -35,6 +45,16 @@
   function confirmBurn() {
     showBurnConfirm = false;
     onAction(recommendation.cid, 'burn');
+  }
+
+  function confirmPublish() {
+    showPublishConfirm = false;
+    onAction(recommendation.cid, 'publish');
+  }
+
+  function confirmRelease() {
+    showReleaseConfirm = false;
+    onAction(recommendation.cid, 'release');
   }
 </script>
 
@@ -81,6 +101,27 @@
     destructive={true}
     onConfirm={confirmBurn}
     onCancel={() => { showBurnConfirm = false; }}
+  />
+{/if}
+
+{#if showPublishConfirm}
+  <ConfirmDialog
+    title="Publish Content"
+    message='Publishing "{recommendation.name}" makes it permanently public. Anyone can access, copy, and redistribute it. This cannot be undone.'
+    confirmLabel="Publish"
+    destructive={true}
+    onConfirm={confirmPublish}
+    onCancel={() => { showPublishConfirm = false; }}
+  />
+{/if}
+
+{#if showReleaseConfirm}
+  <ConfirmDialog
+    title="Release Content"
+    message='Releasing "{recommendation.name}" will make it publicly available. You retain no copy and it may persist or fade from the network.'
+    confirmLabel="Release"
+    onConfirm={confirmRelease}
+    onCancel={() => { showReleaseConfirm = false; }}
   />
 {/if}
 
