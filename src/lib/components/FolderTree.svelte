@@ -28,6 +28,8 @@
       next.add(cid);
     } else {
       next.delete(cid);
+      const folder = items.find((i) => i.cid === cid);
+      onFolderSelect?.(folder?.parentCid ?? null);
     }
     expandedCids = next;
     if (isExpanding) {
