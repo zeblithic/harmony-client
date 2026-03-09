@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ContentDetail, ReplicationTier, PeerRef, StorageBuddy } from '../types';
+  import type { ContentDetail, ContentSensitivity, ReplicationTier, PeerRef, StorageBuddy } from '../types';
   import FileMetadata from './FileMetadata.svelte';
   import SensitivityBadge from './SensitivityBadge.svelte';
   import StalenessIndicator from './StalenessIndicator.svelte';
@@ -12,6 +12,7 @@
     detail,
     availablePeers = [],
     storageBuddyDetails = [],
+    confirmationOverrides = {},
     onTierChange,
     onPublish,
     onRelease,
@@ -28,9 +29,10 @@
     detail: ContentDetail;
     availablePeers?: PeerRef[];
     storageBuddyDetails?: StorageBuddy[];
+    confirmationOverrides?: Partial<Record<ContentSensitivity, number>>;
     onTierChange: (tier: ReplicationTier) => void;
-    onPublish: () => void;
-    onRelease: () => void;
+    onPublish: (cid: string) => void;
+    onRelease: (cid: string) => void;
     onBurn: () => void;
     onArchive: () => void;
     onPin: () => void;
@@ -79,6 +81,7 @@
   <section class="panel-section">
     <FileActions
       item={detail}
+      {confirmationOverrides}
       {onPublish}
       {onRelease}
       {onBurn}

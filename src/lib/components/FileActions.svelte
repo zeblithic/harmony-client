@@ -1,8 +1,10 @@
 <script lang="ts">
-  import type { ContentDetail } from '../types';
+  import type { ContentDetail, ContentSensitivity } from '../types';
+  import PublishButton from './PublishButton.svelte';
 
   let {
     item,
+    confirmationOverrides = {},
     onPublish,
     onRelease,
     onBurn,
@@ -12,8 +14,9 @@
     onExport,
   }: {
     item: ContentDetail;
-    onPublish?: () => void;
-    onRelease?: () => void;
+    confirmationOverrides?: Partial<Record<ContentSensitivity, number>>;
+    onPublish?: (cid: string) => void;
+    onRelease?: (cid: string) => void;
     onBurn?: () => void;
     onArchive?: () => void;
     onPin?: () => void;
@@ -23,15 +26,14 @@
 </script>
 
 <div class="file-actions">
-  <button class="action-btn" onclick={() => onPublish?.()} aria-label="Publish">
-    <span class="action-icon" aria-hidden="true">{'\u{1F310}'}</span>
-    Publish
-  </button>
-
-  <button class="action-btn" onclick={() => onRelease?.()} aria-label="Release">
-    <span class="action-icon" aria-hidden="true">{'\u{1F4A8}'}</span>
-    Release
-  </button>
+  <PublishButton
+    filename={item.name}
+    cid={item.cid}
+    sensitivity={item.sensitivity}
+    {confirmationOverrides}
+    onPublish={(cid) => onPublish?.(cid)}
+    onRelease={(cid) => onRelease?.(cid)}
+  />
 
   <button class="action-btn destructive" onclick={() => onBurn?.()} aria-label="Burn">
     <span class="action-icon" aria-hidden="true">{'\u{1F525}'}</span>

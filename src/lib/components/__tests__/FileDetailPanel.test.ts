@@ -54,8 +54,8 @@ describe('FileDetailPanel', () => {
 
   it('renders action buttons', () => {
     renderPanel();
-    expect(screen.getByLabelText('Publish')).toBeTruthy();
-    expect(screen.getByLabelText('Release')).toBeTruthy();
+    expect(screen.getByLabelText('Publish (permanent)')).toBeTruthy();
+    expect(screen.getByLabelText('Release (ephemeral)')).toBeTruthy();
     expect(screen.getByLabelText('Burn')).toBeTruthy();
     expect(screen.getByLabelText('Archive')).toBeTruthy();
     expect(screen.getByLabelText('Export')).toBeTruthy();
