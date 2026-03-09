@@ -43,7 +43,7 @@
   {#if section === 'private'}
     <input
       class="search-input"
-      type="text"
+      type="search"
       placeholder="Search files..."
       aria-label="Search files"
       value={searchQuery}

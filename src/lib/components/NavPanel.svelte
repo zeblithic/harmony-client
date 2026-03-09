@@ -21,6 +21,7 @@
     currentFolderCid,
     onFolderSelect,
     onFilterChange,
+    filters,
     onManageBuddies,
   }: {
     nodes: NavNode[];
@@ -36,6 +37,7 @@
     currentFolderCid?: string | null;
     onFolderSelect?: (cid: string | null) => void;
     onFilterChange?: (filters: Record<string, unknown>) => void;
+    filters?: Record<string, unknown>;
     onManageBuddies?: () => void;
   } = $props();
 
@@ -139,7 +141,7 @@
       {#if appMode === 'files'}
         {#if fileSection !== 'published'}
           <FolderTree items={contentItems ?? []} {onFolderSelect} selectedCid={currentFolderCid ?? null} />
-          <QuickFilters {onFilterChange} />
+          <QuickFilters {onFilterChange} {filters} />
         {/if}
       {:else}
         <NavTree

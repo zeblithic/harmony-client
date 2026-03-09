@@ -169,7 +169,7 @@
     else if (action === 'publish') fileManagerService.publish([cid]);
     else if (action === 'pin') fileManagerService.pin(cid);
     fileManagerVersion++;
-    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish')) {
+    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish' || action === 'archive')) {
       selectedFileCid = null;
     }
   }
@@ -354,6 +354,7 @@
       {fileSection}
       {currentFolderCid}
       onFolderSelect={handleNavigateFolder}
+      filters={fileFilters}
       onFilterChange={(filters) => { fileFilters = filters; }}
     />
   {/snippet}

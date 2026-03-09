@@ -113,10 +113,7 @@
 
 <style>
   .file-detail-panel {
-    width: 320px;
-    flex-shrink: 0;
     background: var(--bg-secondary, #2b2d31);
-    border-left: 1px solid var(--bg-tertiary, #313338);
     overflow-y: auto;
     padding: 0 16px;
   }

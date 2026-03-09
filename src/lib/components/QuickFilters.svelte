@@ -3,9 +3,23 @@
 
   let {
     onFilterChange,
+    filters = {},
   }: {
     onFilterChange?: (filters: Record<string, unknown>) => void;
+    filters?: Record<string, unknown>;
   } = $props();
+
+  // Reset internal state when parent clears filters externally
+  $effect(() => {
+    if (Object.keys(filters).length === 0) {
+      selectedCategories = new Set();
+      stale = false;
+      pinned = false;
+      licensed = false;
+      underReplicated = false;
+      selectedTiers = new Set();
+    }
+  });
 
   const allCategories: { key: ContentCategory; label: string }[] = [
     { key: 'music', label: 'Music' },

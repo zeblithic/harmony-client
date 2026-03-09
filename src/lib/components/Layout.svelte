@@ -105,7 +105,6 @@
     grid-area: detail;
     background: var(--bg-secondary);
     overflow-y: auto;
-    padding: 12px;
     border-left: 1px solid var(--border);
   }
 
