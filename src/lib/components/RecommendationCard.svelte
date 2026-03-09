@@ -1,7 +1,9 @@
 <script lang="ts">
-  import type { CleanupRecommendation } from '../types';
+  import type { CleanupRecommendation, ContentSensitivity } from '../types';
   import { categoryIcon, formatBytes } from '../file-utils';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import DoubleConfirmDialog from './DoubleConfirmDialog.svelte';
+  import TypeToConfirmDialog from './TypeToConfirmDialog.svelte';
 
   type CleanupAction = 'burn' | 'archive' | 'release' | 'publish' | 'pin';
 
@@ -33,9 +35,19 @@
     `This costs you ${size} across your devices. ${REASON_HINTS[recommendation.reason] ?? 'Review this item and take the appropriate action.'}`
   );
 
+  // Graduated confirmation gates — matching PublishButton's system
+  const BASE_LEVELS: Record<ContentSensitivity, number> = {
+    public: 2, private: 2, intimate: 3, confidential: 4,
+  };
+
+  type GateStage = 'idle' | 'double' | 'type' | 'oob';
+  type FlowMode = 'publish' | 'release';
+
   let showBurnConfirm = $state(false);
-  let showPublishConfirm = $state(false);
-  let showReleaseConfirm = $state(false);
+  let flowMode = $state<FlowMode | null>(null);
+  let gate = $state<GateStage>('idle');
+
+  let confirmLevel = $derived(BASE_LEVELS[recommendation.sensitivity] ?? 2);
 
   function handleAction(action: CleanupAction) {
     if (action === 'burn') {
@@ -43,29 +55,56 @@
       return;
     }
     if (action === 'publish') {
-      showPublishConfirm = true;
+      flowMode = 'publish';
+      gate = 'double';
       return;
     }
     if (action === 'release') {
-      showReleaseConfirm = true;
+      flowMode = 'release';
+      gate = 'double';
       return;
     }
     onAction(recommendation.cid, action);
   }
 
+  function cancelFlow() {
+    flowMode = null;
+    gate = 'idle';
+  }
+
+  function onDoubleConfirm() {
+    if (flowMode === 'release') {
+      // Release completes after double confirm regardless of sensitivity.
+      // Release is ephemeral — lower stakes than durable publish.
+      onAction(recommendation.cid, 'release');
+      cancelFlow();
+      return;
+    }
+    if (confirmLevel >= 3) {
+      gate = 'type';
+    } else {
+      onAction(recommendation.cid, 'publish');
+      cancelFlow();
+    }
+  }
+
+  function onTypeConfirm() {
+    if (confirmLevel >= 4) {
+      gate = 'oob';
+    } else {
+      onAction(recommendation.cid, 'publish');
+      cancelFlow();
+    }
+  }
+
+  function onOobConfirm() {
+    onAction(recommendation.cid, 'publish');
+    cancelFlow();
+  }
+
   function confirmBurn() {
     showBurnConfirm = false;
     onAction(recommendation.cid, 'burn');
-  }
-
-  function confirmPublish() {
-    showPublishConfirm = false;
-    onAction(recommendation.cid, 'publish');
-  }
-
-  function confirmRelease() {
-    showReleaseConfirm = false;
-    onAction(recommendation.cid, 'release');
   }
 </script>
 
@@ -115,24 +154,50 @@
   />
 {/if}
 
-{#if showPublishConfirm}
-  <ConfirmDialog
+{#if gate === 'double' && flowMode === 'publish'}
+  <DoubleConfirmDialog
     title="Publish Content"
-    message='Publishing "{recommendation.name}" makes it permanently public. Anyone can access, copy, and redistribute it. This cannot be undone.'
-    confirmLabel="Publish"
+    firstMessage='Publishing makes this content permanently public. Anyone in the world can access, copy, and redistribute it. This cannot be undone.'
+    secondMessage='You are about to publish "{recommendation.name}". This is irreversible.'
+    confirmLabel="Confirm Publish"
     destructive={true}
-    onConfirm={confirmPublish}
-    onCancel={() => { showPublishConfirm = false; }}
+    onConfirm={onDoubleConfirm}
+    onCancel={cancelFlow}
   />
 {/if}
 
-{#if showReleaseConfirm}
-  <ConfirmDialog
+{#if gate === 'double' && flowMode === 'release'}
+  <DoubleConfirmDialog
     title="Release Content"
-    message='Releasing "{recommendation.name}" will make it publicly available. You retain no copy and it may persist or fade from the network.'
-    confirmLabel="Release"
-    onConfirm={confirmRelease}
-    onCancel={() => { showReleaseConfirm = false; }}
+    firstMessage='This will make your content publicly available. It may persist on the network or fade over time. You can&apos;t take it back, but nobody&apos;s obligated to keep it either.'
+    secondMessage='You are about to release "{recommendation.name}".'
+    confirmLabel="Confirm Release"
+    destructive={false}
+    onConfirm={onDoubleConfirm}
+    onCancel={cancelFlow}
+  />
+{/if}
+
+{#if gate === 'type' && flowMode === 'publish'}
+  <TypeToConfirmDialog
+    title="Confirm Publish"
+    message="This action is irreversible. Type the filename to confirm."
+    confirmText={recommendation.name}
+    confirmLabel="Confirm Publish"
+    destructive={true}
+    onConfirm={onTypeConfirm}
+    onCancel={cancelFlow}
+  />
+{/if}
+
+{#if gate === 'oob' && flowMode === 'publish'}
+  <ConfirmDialog
+    title="Out-of-Band Verification"
+    message="In a future version, verify on another device. For now, confirm here."
+    confirmLabel="Confirm"
+    destructive={true}
+    onConfirm={onOobConfirm}
+    onCancel={cancelFlow}
   />
 {/if}
 

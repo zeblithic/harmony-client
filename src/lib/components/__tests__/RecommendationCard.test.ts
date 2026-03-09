@@ -95,27 +95,59 @@ describe('RecommendationCard', () => {
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'archive');
   });
 
-  it('fires onAction with cid and release after confirmation', async () => {
+  it('fires onAction with cid and release after double confirmation', async () => {
     const onAction = vi.fn();
     render(RecommendationCard, {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /release/i }));
     expect(onAction).not.toHaveBeenCalled();
+    // Gate 1: click Continue
     const dialog = screen.getByRole('dialog');
+    const continueBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(continueBtn);
+    // Gate 2: click Confirm Release — release always completes after double confirm
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'release');
   });
 
-  it('fires onAction with cid and publish after confirmation', async () => {
+  it('fires onAction with cid and publish after double confirmation (private sensitivity)', async () => {
     const onAction = vi.fn();
     render(RecommendationCard, {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /publish/i }));
     expect(onAction).not.toHaveBeenCalled();
+    // Gate 1: click Continue
     const dialog = screen.getByRole('dialog');
+    const continueBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(continueBtn);
+    // Gate 2: click Confirm Publish — private sensitivity = level 2, completes here
+    const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
+    await fireEvent.click(confirmBtn);
+    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'publish');
+  });
+
+  it('requires type-to-confirm for intimate publish', async () => {
+    const onAction = vi.fn();
+    const intimateRec = { ...baseRec, sensitivity: 'intimate' as const };
+    render(RecommendationCard, {
+      props: { recommendation: intimateRec, checked: false, onAction, onToggle: vi.fn() },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /publish/i }));
+    // Gate 1: Continue through double-confirm
+    let dialog = screen.getByRole('dialog');
+    await fireEvent.click(dialog.querySelector('.confirm-btn') as HTMLElement);
+    // Gate 2: Continue through second gate of double-confirm
+    await fireEvent.click(dialog.querySelector('.confirm-btn') as HTMLElement);
+    expect(onAction).not.toHaveBeenCalled();
+    // Gate 3: Type-to-confirm dialog should now be shown
+    dialog = screen.getByRole('dialog');
+    const input = dialog.querySelector('input[type="text"]') as HTMLInputElement;
+    expect(input).toBeTruthy();
+    // Type the filename
+    await fireEvent.input(input, { target: { value: 'sensor-readings.parquet' } });
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
     expect(onAction).toHaveBeenCalledWith('cid-training-data', 'publish');

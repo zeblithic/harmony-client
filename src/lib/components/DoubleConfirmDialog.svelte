@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-
   let {
     title,
     firstMessage,
@@ -23,7 +21,8 @@
   const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
   let dialogEl: HTMLElement;
 
-  onMount(() => {
+  $effect(() => {
+    void gate;
     dialogEl?.querySelector<HTMLElement>('button')?.focus();
   });
 </script>

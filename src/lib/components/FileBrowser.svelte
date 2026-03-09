@@ -149,6 +149,7 @@
     {onSearchChange}
     {onUploadClick}
     {onCleanupClick}
+    {showCleanup}
     {section}
     {onSectionChange}
   />

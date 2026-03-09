@@ -8,6 +8,7 @@
     onSearchChange,
     onUploadClick,
     onCleanupClick,
+    showCleanup = false,
     section,
     onSectionChange,
   }: {
@@ -17,6 +18,7 @@
     onSearchChange: (query: string) => void;
     onUploadClick: () => void;
     onCleanupClick: () => void;
+    showCleanup?: boolean;
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
   } = $props();
@@ -67,7 +69,7 @@
 
     {#if section === 'private'}
       <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
-      <button class="action-btn" onclick={onCleanupClick} aria-label="Cleanup">🧹 Cleanup</button>
+      <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
     {/if}
   </div>
 </div>
@@ -172,6 +174,12 @@
 
   .action-btn:hover {
     background: var(--bg-tertiary, #232428);
+  }
+
+  .action-btn.active {
+    background: var(--accent, #5865f2);
+    color: var(--text-primary, #f2f3f5);
+    border-color: var(--accent, #5865f2);
   }
 
   .action-btn:focus-visible {

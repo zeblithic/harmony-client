@@ -115,6 +115,7 @@
     if (!selectedFileCid) return;
     fileManagerService.archive([selectedFileCid]);
     fileManagerVersion++;
+    selectedFileCid = null;
   }
 
   function handleFilePublish(cid: string) {
@@ -345,7 +346,7 @@
       {collapsed}
       onSettingsClick={() => { showSettings = !showSettings; }}
       profileLookup={(addr) => profileStore.get(addr)?.statusText}
-      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; fileFilters = {}; }}
+      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; }}
       {appMode}
       contentItems={allFileContents}
       storageBuddies={fileBuddies}
