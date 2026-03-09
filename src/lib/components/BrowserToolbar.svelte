@@ -40,7 +40,7 @@
     >Published</button>
   </div>
 
-  {#if section === 'private'}
+  {#if section === 'private' && !showCleanup}
     <input
       class="search-input"
       type="search"
@@ -55,19 +55,21 @@
 
   <div class="toolbar-right">
     {#if section === 'private'}
-      <button
-        class="view-btn"
-        aria-label="List view"
-        aria-pressed={viewMode === 'list'}
-        onclick={() => onViewModeChange('list')}
-      >☰</button>
-      <button
-        class="view-btn"
-        aria-label="Grid view"
-        aria-pressed={viewMode === 'grid'}
-        onclick={() => onViewModeChange('grid')}
-      >⊞</button>
-      <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
+      {#if !showCleanup}
+        <button
+          class="view-btn"
+          aria-label="List view"
+          aria-pressed={viewMode === 'list'}
+          onclick={() => onViewModeChange('list')}
+        >☰</button>
+        <button
+          class="view-btn"
+          aria-label="Grid view"
+          aria-pressed={viewMode === 'grid'}
+          onclick={() => onViewModeChange('grid')}
+        >⊞</button>
+        <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
+      {/if}
       <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
     {/if}
   </div>

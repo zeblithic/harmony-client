@@ -164,7 +164,7 @@
 
   function handleCleanupAction(cid: string, action: string) {
     if (action === 'burn') fileManagerService.burn([cid]);
-    else if (action === 'archive') fileManagerService.archive([cid]);
+    else if (action === 'archive') { fileManagerService.archive([cid]); return; }
     else if (action === 'release') fileManagerService.release([cid]);
     else if (action === 'publish') fileManagerService.publish([cid]);
     else if (action === 'pin') fileManagerService.pin(cid);
