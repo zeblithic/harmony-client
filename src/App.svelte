@@ -414,7 +414,7 @@
       onNavigateFolder={handleNavigateFolder}
       onViewModeChange={(mode) => { fileViewMode = mode; }}
       onSearchChange={(query) => { fileSearchQuery = query; }}
-      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; fileFilters = {}; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; }}
       onUploadClick={handleFileUploadClick}
       onCleanupClick={handleFileCleanupClick}
       onCleanupAction={handleCleanupAction}
