@@ -349,7 +349,7 @@
       {collapsed}
       onSettingsClick={() => { showSettings = !showSettings; }}
       profileLookup={(addr) => profileStore.get(addr)?.statusText}
-      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; }}
+      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; selectedFileCid = null; currentFolderCid = null; }}
       {appMode}
       contentItems={allFileContents}
       storageBuddies={fileBuddies}
@@ -435,6 +435,7 @@
         detail={selectedFileDetail}
         availablePeers={availablePeers}
         storageBuddyDetails={fileBuddies.filter(b => selectedFileDetail?.storageBuddies.some(sb => sb.address === b.address))}
+        confirmationOverrides={fileManagerService.settings.confirmationOverrides}
         onTierChange={handleFileTierChange}
         onPublish={handleFilePublish}
         onRelease={handleFileRelease}

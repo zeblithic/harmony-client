@@ -62,7 +62,7 @@
       <span class="staleness-value">{stalenessText}</span>
       <StalenessIndicator score={detail.stalenessScore} pinned={detail.pinned} />
     </div>
-    <div class="staleness-bar-track">
+    <div class="staleness-bar-track" role="progressbar" aria-label="Staleness" aria-valuenow={Math.round(detail.stalenessScore * 100)} aria-valuemin={0} aria-valuemax={100}>
       <div
         class="staleness-bar-fill"
         style="width: {Math.min(detail.stalenessScore * 100, 100)}%"

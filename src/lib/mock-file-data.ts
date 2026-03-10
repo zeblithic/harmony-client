@@ -194,7 +194,7 @@ export const mockPrivateContent: ContentItem[] = [
     accessCount: 5,
     stalenessScore: 0.55,
     replicationTier: 'light',
-    replicaCount: 2,
+    replicaCount: 3,
     pinned: false,
     licensed: false,
     parentCid: null,

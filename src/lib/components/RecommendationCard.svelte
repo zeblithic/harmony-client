@@ -126,7 +126,7 @@
     <span class="recoverable">{recoverable} recoverable</span>
   </div>
 
-  <div class="staleness-bar-track" aria-label="Staleness: {stalenessPercent}%">
+  <div class="staleness-bar-track" role="progressbar" aria-label="Staleness" aria-valuenow={stalenessPercent} aria-valuemin={0} aria-valuemax={100}>
     <div class="staleness-bar-fill" style:width="{stalenessPercent}%"></div>
   </div>
 
