@@ -8,6 +8,7 @@ import type {
   FileManagerSettings,
   ReplicationTier,
   ContentCategory,
+  PeerRef,
 } from './types';
 import {
   mockPrivateContent,
@@ -78,7 +79,9 @@ export class FileManagerService {
     };
   }
 
-  /** Returns cleanup recommendations, filtering out burned items, sorted by confidence desc. */
+  /** Returns cleanup recommendations, filtering out burned items, sorted by confidence desc.
+   *  TODO: Re-evaluate recommendation reasons dynamically (e.g., drop 'over-replicated'
+   *  after tier change) once real replication backends are wired in. */
   getCleanupRecommendations(): CleanupRecommendation[] {
     const activeCids = new Map(this.privateContent.map((i) => [i.cid, i]));
     return this.cleanupRecommendations
@@ -95,6 +98,11 @@ export class FileManagerService {
   /** Returns published content. */
   getPublishedContent(): PublishedItem[] {
     return [...this.publishedContent];
+  }
+
+  /** Returns available peers for sharing/buddy assignment. */
+  getAvailablePeers(): PeerRef[] {
+    return [...mockPeers];
   }
 
   /** Permanently removes content items and frees their quota. */

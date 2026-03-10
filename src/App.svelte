@@ -12,7 +12,6 @@
   import { NotificationService } from './lib/notification-service';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
-  import { mockPeers } from './lib/mock-file-data';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
   import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
@@ -92,6 +91,11 @@
   let fileBuddies = $derived.by(() => {
     void fileManagerVersion;
     return fileManagerService.getStorageBuddies();
+  });
+
+  let availablePeers = $derived.by(() => {
+    void fileManagerVersion;
+    return fileManagerService.getAvailablePeers();
   });
 
   // ── File manager callbacks ──────────────────────────────────────────
@@ -429,7 +433,7 @@
     {#if selectedFileDetail}
       <FileDetailPanel
         detail={selectedFileDetail}
-        availablePeers={mockPeers}
+        availablePeers={availablePeers}
         storageBuddyDetails={fileBuddies.filter(b => selectedFileDetail?.storageBuddies.some(sb => sb.address === b.address))}
         onTierChange={handleFileTierChange}
         onPublish={handleFilePublish}

@@ -169,7 +169,7 @@
 {#if showBulkArchiveConfirm}
   <ConfirmDialog
     title="Archive Selected Items"
-    message="This will archive {selectedCount} {itemWord}, moving them to cold storage. They can be restored later."
+    message="Archive is not yet implemented. This action will have no effect."
     confirmLabel="Archive All"
     onConfirm={confirmBulkArchive}
     onCancel={() => { showBulkArchiveConfirm = false; }}
