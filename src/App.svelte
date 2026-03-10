@@ -5,13 +5,16 @@
   import TextFeed from './lib/components/TextFeed.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
   import VineFeed from './lib/components/VineFeed.svelte';
+  import FileBrowser from './lib/components/FileBrowser.svelte';
+  import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
   import { TrustService } from './lib/trust-service';
+  import { FileManagerService } from './lib/file-manager-service';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
   import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode } from './lib/types';
+  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
 
   let innerWidth = $state(window.innerWidth);
@@ -56,10 +59,153 @@
 
   const notificationService = new NotificationService();
   const trustService = new TrustService();
+  const fileManagerService = new FileManagerService();
   let trustVersion = $state(0);
 
   function handleTrustChange() {
     trustVersion++;
+  }
+
+  // ── File manager state ──────────────────────────────────────────────
+  let fileManagerVersion = $state(0);
+  let selectedFileCid = $state<string | null>(null);
+  let currentFolderCid = $state<string | null>(null);
+  let fileViewMode = $state<FileViewMode>('list');
+  let showCleanup = $state(false);
+  let fileSection = $state<ContentSection>('private');
+  let fileSearchQuery = $state('');
+  let fileFilters = $state<Record<string, unknown>>({});
+
+  // ── File manager derived data ───────────────────────────────────────
+  let allFileContents = $derived.by(() => {
+    void fileManagerVersion;
+    return fileManagerService.getContents();
+  });
+
+  let selectedFileDetail = $derived.by(() => {
+    void fileManagerVersion;
+    if (!selectedFileCid) return undefined;
+    return fileManagerService.getContentDetail(selectedFileCid);
+  });
+
+  let fileBuddies = $derived.by(() => {
+    void fileManagerVersion;
+    return fileManagerService.getStorageBuddies();
+  });
+
+  let availablePeers = $derived.by(() => {
+    void fileManagerVersion;
+    return fileManagerService.getAvailablePeers();
+  });
+
+  // ── File manager callbacks ──────────────────────────────────────────
+  function handleFileItemClick(cid: string) {
+    selectedFileCid = cid;
+  }
+
+  function handleNavigateFolder(cid: string | null) {
+    currentFolderCid = cid;
+    selectedFileCid = null;
+    showCleanup = false;
+  }
+
+  function handleFileBurn() {
+    if (!selectedFileCid) return;
+    fileManagerService.burn([selectedFileCid]);
+    fileManagerVersion++;
+    selectedFileCid = null;
+  }
+
+  function handleFileArchive() {
+    if (!selectedFileCid) return;
+    fileManagerService.archive([selectedFileCid]);
+    // archive is a no-op stub — don't bump version or clear selection
+    // until the service actually moves items to cold storage
+  }
+
+  function handleFilePublish(cid: string) {
+    fileManagerService.publish([cid]);
+    fileManagerVersion++;
+    selectedFileCid = null;
+  }
+
+  function handleFileRelease(cid: string) {
+    fileManagerService.release([cid]);
+    fileManagerVersion++;
+    selectedFileCid = null;
+  }
+
+  function handleFilePin() {
+    if (!selectedFileCid) return;
+    fileManagerService.pin(selectedFileCid);
+    fileManagerVersion++;
+  }
+
+  function handleFileUnpin() {
+    if (!selectedFileCid) return;
+    fileManagerService.unpin(selectedFileCid);
+    fileManagerVersion++;
+  }
+
+  function handleFileExport() {
+    if (!selectedFileCid) return;
+    fileManagerService.exportToDevice([selectedFileCid]);
+  }
+
+  function handleFileTierChange(tier: ReplicationTier) {
+    if (!selectedFileCid) return;
+    fileManagerService.setReplicationTier([selectedFileCid], tier);
+    fileManagerVersion++;
+  }
+
+  function handleFileUploadClick() {
+    // Future: open file picker via Tauri dialog
+  }
+
+  function handleFileCleanupClick() {
+    showCleanup = !showCleanup;
+  }
+
+  function handleCleanupAction(cid: string, action: string) {
+    if (action === 'burn') fileManagerService.burn([cid]);
+    else if (action === 'archive') { fileManagerService.archive([cid]); return; }
+    else if (action === 'release') fileManagerService.release([cid]);
+    else if (action === 'publish') fileManagerService.publish([cid]);
+    else if (action === 'pin') fileManagerService.pin(cid);
+    fileManagerVersion++;
+    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish')) {
+      selectedFileCid = null;
+    }
+  }
+
+  function handleBulkBurn(cids: string[]) {
+    fileManagerService.burn(cids);
+    fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
+  }
+
+  function handleBulkArchive(cids: string[]) {
+    fileManagerService.archive(cids);
+    // archive is a no-op stub — don't bump version or clear selection
+    // until the service actually moves items to cold storage
+  }
+
+  function handleBulkRelease(cids: string[]) {
+    fileManagerService.release(cids);
+    fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
+  }
+
+  function handleBulkPublish(cids: string[]) {
+    fileManagerService.publish(cids);
+    fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   // Mock per-peer override to demonstrate settings
@@ -198,7 +344,21 @@
 
 <Layout {collapsed} {showSettings} mode={appMode}>
   {#snippet nav()}
-    <NavPanel nodes={navNodes} {collapsed} onSettingsClick={() => { showSettings = !showSettings; }} profileLookup={(addr) => profileStore.get(addr)?.statusText} onModeToggle={() => { appMode = appMode === 'messages' ? 'vines' : 'messages'; showSettings = false; }} {appMode} />
+    <NavPanel
+      nodes={navNodes}
+      {collapsed}
+      onSettingsClick={() => { showSettings = !showSettings; }}
+      profileLookup={(addr) => profileStore.get(addr)?.statusText}
+      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; selectedFileCid = null; currentFolderCid = null; }}
+      {appMode}
+      contentItems={allFileContents}
+      storageBuddies={fileBuddies}
+      {fileSection}
+      {currentFolderCid}
+      onFolderSelect={handleNavigateFolder}
+      filters={fileFilters}
+      onFilterChange={(filters) => { fileFilters = filters; }}
+    />
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -244,6 +404,53 @@
   {#snippet vineFeed()}
     <VineFeed vines={vineVideos} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
   {/snippet}
+  {#snippet fileBrowser()}
+    <FileBrowser
+      service={fileManagerService}
+      {currentFolderCid}
+      selectedCid={selectedFileCid}
+      viewMode={fileViewMode}
+      section={fileSection}
+      searchQuery={fileSearchQuery}
+      filters={fileFilters}
+      {showCleanup}
+      onItemClick={handleFileItemClick}
+      onNavigateFolder={handleNavigateFolder}
+      onViewModeChange={(mode) => { fileViewMode = mode; }}
+      onSearchChange={(query) => { fileSearchQuery = query; }}
+      onSectionChange={(newSection) => { fileSection = newSection; selectedFileCid = null; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; }}
+      onUploadClick={handleFileUploadClick}
+      onCleanupClick={handleFileCleanupClick}
+      onCleanupAction={handleCleanupAction}
+      onBulkBurn={handleBulkBurn}
+      onBulkArchive={handleBulkArchive}
+      onBulkRelease={handleBulkRelease}
+      onBulkPublish={handleBulkPublish}
+      serviceVersion={fileManagerVersion}
+    />
+  {/snippet}
+  {#snippet fileDetailPanel()}
+    {#if selectedFileDetail}
+      <FileDetailPanel
+        detail={selectedFileDetail}
+        availablePeers={availablePeers}
+        storageBuddyDetails={fileBuddies.filter(b => selectedFileDetail?.storageBuddies.some(sb => sb.address === b.address))}
+        confirmationOverrides={fileManagerService.settings.confirmationOverrides}
+        onTierChange={handleFileTierChange}
+        onPublish={handleFilePublish}
+        onRelease={handleFileRelease}
+        onBurn={handleFileBurn}
+        onArchive={handleFileArchive}
+        onPin={handleFilePin}
+        onUnpin={handleFileUnpin}
+        onExport={handleFileExport}
+      />
+    {:else}
+      <div class="file-detail-empty">
+        <p>Select a file to view details</p>
+      </div>
+    {/if}
+  {/snippet}
 </Layout>
 
 {#if popoverProfile}
@@ -262,5 +469,13 @@
 
   :global(.text-message.highlight) {
     background: rgba(88, 101, 242, 0.15) !important;
+  }
+
+  .file-detail-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted, #949ba4);
   }
 </style>

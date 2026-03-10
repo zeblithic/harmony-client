@@ -9,7 +9,7 @@ vi.mock('@tauri-apps/api/webviewWindow', () => ({
 }));
 
 import NavPanel from '../NavPanel.svelte';
-import type { NavNode } from '../../types';
+import type { NavNode, ContentItem, StorageBuddy } from '../../types';
 
 const testNodes: NavNode[] = [
   {
@@ -97,5 +97,100 @@ describe('NavPanel', () => {
     // Non-matching nodes should be filtered out
     expect(screen.queryByText('Friends')).toBeNull();
     expect(screen.queryByText('Eve')).toBeNull();
+  });
+
+  describe('files mode', () => {
+    const testContentItems: ContentItem[] = [
+      {
+        cid: 'cid-folder-projects',
+        name: 'Projects',
+        category: 'bundle',
+        sensitivity: 'private',
+        sizeBytes: 0,
+        storedAt: Date.now(),
+        lastAccessed: Date.now(),
+        accessCount: 1,
+        stalenessScore: 0,
+        replicationTier: 'default',
+        replicaCount: 3,
+        pinned: false,
+        licensed: false,
+        parentCid: null,
+        isFolder: true,
+      },
+    ];
+
+    const testBuddies: StorageBuddy[] = [
+      { address: 'addr1', displayName: 'Alice', storageUsedBytes: 100, online: true },
+      { address: 'addr2', displayName: 'Bob', storageUsedBytes: 200, online: false },
+    ];
+
+    it('shows FolderTree and QuickFilters when appMode is files', () => {
+      render(NavPanel, {
+        props: {
+          nodes: testNodes,
+          collapsed: false,
+          appMode: 'files',
+          contentItems: testContentItems,
+          storageBuddies: testBuddies,
+        },
+      });
+      // FolderTree root
+      expect(screen.getByText('All Files')).toBeTruthy();
+      // FolderTree folder
+      expect(screen.getByText('Projects')).toBeTruthy();
+      // QuickFilters sections
+      expect(screen.getByText('Category')).toBeTruthy();
+      expect(screen.getByText('Status')).toBeTruthy();
+      expect(screen.getByText('Replication Tier')).toBeTruthy();
+    });
+
+    it('shows StorageBuddySummary when appMode is files', () => {
+      render(NavPanel, {
+        props: {
+          nodes: testNodes,
+          collapsed: false,
+          appMode: 'files',
+          contentItems: testContentItems,
+          storageBuddies: testBuddies,
+        },
+      });
+      expect(screen.getByText(/2 buddies/)).toBeTruthy();
+      expect(screen.getByText(/1 online/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: /Manage/ })).toBeTruthy();
+    });
+
+    it('does not show NavTree when in files mode', () => {
+      render(NavPanel, {
+        props: {
+          nodes: testNodes,
+          collapsed: false,
+          appMode: 'files',
+          contentItems: testContentItems,
+          storageBuddies: testBuddies,
+        },
+      });
+      // NavTree items should not be rendered
+      expect(screen.queryByText('Work')).toBeNull();
+      expect(screen.queryByText('general')).toBeNull();
+    });
+
+    it('does not show file components when in messages mode', () => {
+      render(NavPanel, {
+        props: {
+          nodes: testNodes,
+          collapsed: false,
+          appMode: 'messages',
+          contentItems: testContentItems,
+          storageBuddies: testBuddies,
+        },
+      });
+      // File components should not render
+      expect(screen.queryByText('All Files')).toBeNull();
+      expect(screen.queryByText('Category')).toBeNull();
+      expect(screen.queryByText(/buddies/)).toBeNull();
+      // NavTree should render
+      expect(screen.getByText('Work')).toBeTruthy();
+    });
   });
 });

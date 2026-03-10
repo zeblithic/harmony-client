@@ -1,7 +1,10 @@
 <script lang="ts">
-  import type { AppMode, NavNode, DisplayMode, SortOrder } from '../types';
+  import type { AppMode, NavNode, DisplayMode, SortOrder, ContentItem, ContentSection, StorageBuddy } from '../types';
   import { getChildNodes, findNode } from '../nav-utils';
   import NavTree from './NavTree.svelte';
+  import FolderTree from './FolderTree.svelte';
+  import QuickFilters from './QuickFilters.svelte';
+  import StorageBuddySummary from './StorageBuddySummary.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let {
@@ -9,17 +12,33 @@
     collapsed = false,
     onNodeClick,
     onSettingsClick,
-    onModeToggle,
+    onModeChange,
     profileLookup,
     appMode = 'messages',
+    contentItems,
+    storageBuddies,
+    fileSection,
+    currentFolderCid,
+    onFolderSelect,
+    onFilterChange,
+    filters,
+    onManageBuddies,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
     onNodeClick?: (id: string) => void;
     onSettingsClick?: () => void;
-    onModeToggle?: () => void;
+    onModeChange?: (mode: AppMode) => void;
     profileLookup?: (address: string) => string | undefined;
     appMode?: AppMode;
+    contentItems?: ContentItem[];
+    storageBuddies?: StorageBuddy[];
+    fileSection?: ContentSection;
+    currentFolderCid?: string | null;
+    onFolderSelect?: (cid: string | null) => void;
+    onFilterChange?: (filters: Record<string, unknown>) => void;
+    filters?: Record<string, unknown>;
+    onManageBuddies?: () => void;
   } = $props();
 
   let navNodes = $state<NavNode[]>(nodes);
@@ -119,27 +138,38 @@
       <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>
     </div>
     <nav class="nav-tree-container">
-      <NavTree
-        nodes={filteredNodes}
-        parentId={null}
-        onToggle={toggleFolder}
-        onClick={onNodeClick}
-        onDisplayModeChange={changeDisplayMode}
-        onSortOrderChange={changeSortOrder}
-        {profileLookup}
-      />
+      {#if appMode === 'files'}
+        {#if fileSection !== 'published'}
+          <FolderTree items={contentItems ?? []} {onFolderSelect} selectedCid={currentFolderCid ?? null} />
+          <QuickFilters {onFilterChange} {filters} />
+        {/if}
+      {:else}
+        <NavTree
+          nodes={filteredNodes}
+          parentId={null}
+          onToggle={toggleFolder}
+          onClick={onNodeClick}
+          onDisplayModeChange={changeDisplayMode}
+          onSortOrderChange={changeSortOrder}
+          {profileLookup}
+        />
+      {/if}
     </nav>
+    {#if appMode === 'files'}
+      <StorageBuddySummary buddies={storageBuddies ?? []} {onManageBuddies} />
+    {/if}
     <div class="nav-footer">
-      <button
-        type="button"
-        class="nav-action-btn mode-toggle"
-        class:active={appMode === 'vines'}
-        aria-label="Toggle vine feed"
-        aria-pressed={appMode === 'vines'}
-        onclick={() => onModeToggle?.()}
-      >
-        {appMode === 'vines' ? 'Messages' : 'Vines'}
-      </button>
+      <div class="mode-toggles" role="group" aria-label="App mode">
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages'}
+          aria-label="Messages" aria-pressed={appMode === 'messages'}
+          onclick={() => onModeChange?.('messages')}>Messages</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'vines'}
+          aria-label="Vines" aria-pressed={appMode === 'vines'}
+          onclick={() => onModeChange?.('vines')}>Vines</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'files'}
+          aria-label="Files" aria-pressed={appMode === 'files'}
+          onclick={() => onModeChange?.('files')}>Files</button>
+      </div>
       <button
         type="button"
         class="nav-action-btn"
@@ -264,6 +294,9 @@
     background: var(--accent);
     color: var(--text-primary);
   }
+
+  .mode-toggles { display: flex; gap: 2px; }
+  .mode-toggles .mode-toggle { flex: 1; font-size: 0.75rem; padding: 4px 6px; }
 
   .mode-toggle.active {
     background: var(--accent);
