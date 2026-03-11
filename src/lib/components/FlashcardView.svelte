@@ -69,6 +69,8 @@
     pttActive = false;
     // Release PTT = cancel current row (banked rows kept)
     rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
+    // Reset card timer so off-air gaps don't inflate elapsed time
+    cardStartTime = null;
     // PTT release breaks the combo streak (design spec: "without PTT release or timeout")
     if (stats.combo > 0) {
       stats = { ...stats, combo: 0 };

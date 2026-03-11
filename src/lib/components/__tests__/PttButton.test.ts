@@ -94,6 +94,29 @@ describe('PttButton', () => {
     document.body.removeChild(other);
   });
 
+  it('does not fire onPttStop when mouse released while spacebar still held', async () => {
+    const onPttStart = vi.fn();
+    const onPttStop = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart, onPttStop } });
+    const btn = screen.getByRole('button', { name: /push to talk/i });
+
+    // Spacebar activates PTT
+    await fireEvent.keyDown(window, { code: 'Space' });
+    expect(onPttStart).toHaveBeenCalledOnce();
+
+    // Mouse also pressed (no duplicate start)
+    await fireEvent.mouseDown(btn);
+    expect(onPttStart).toHaveBeenCalledOnce();
+
+    // Mouse released — spacebar still held, so no stop
+    await fireEvent.mouseUp(btn);
+    expect(onPttStop).not.toHaveBeenCalled();
+
+    // Spacebar released — now all sources cleared, fire stop
+    await fireEvent.keyUp(window, { code: 'Space' });
+    expect(onPttStop).toHaveBeenCalledOnce();
+  });
+
   it('does not fire onPttStart when spacebar pressed on select', async () => {
     const onPttStart = vi.fn();
     render(PttButton, { props: { active: false, onPttStart } });

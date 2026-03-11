@@ -13,14 +13,21 @@
     onPttStop?: () => void;
   } = $props();
 
-  function handleMouseDown() {
+  // Track which input sources are currently held to prevent one release
+  // from canceling another (e.g. mouse-up while spacebar still held).
+  const activeInputs = new Set<string>();
+
+  function activate(source: string) {
     if (disabled) return;
-    onPttStart?.();
+    const wasEmpty = activeInputs.size === 0;
+    activeInputs.add(source);
+    if (wasEmpty) onPttStart?.();
   }
 
-  function handleMouseUp() {
+  function deactivate(source: string) {
     if (disabled) return;
-    onPttStop?.();
+    activeInputs.delete(source);
+    if (activeInputs.size === 0) onPttStop?.();
   }
 
   function isFormControl(target: EventTarget | null): boolean {
@@ -35,14 +42,14 @@
     if (e.code !== 'Space' || e.repeat || disabled) return;
     if (isFormControl(e.target)) return;
     e.preventDefault();
-    onPttStart?.();
+    activate('keyboard');
   }
 
   function handleKeyUp(e: KeyboardEvent) {
     if (e.code !== 'Space' || disabled) return;
     if (isFormControl(e.target)) return;
     e.preventDefault();
-    onPttStop?.();
+    deactivate('keyboard');
   }
 </script>
 
@@ -54,11 +61,11 @@
   class:active
   class:processing
   aria-label="Push to talk"
-  onmousedown={handleMouseDown}
-  onmouseup={handleMouseUp}
-  onmouseleave={active ? handleMouseUp : undefined}
-  ontouchstart={(e) => { e.preventDefault(); handleMouseDown(); }}
-  ontouchend={(e) => { e.preventDefault(); handleMouseUp(); }}
+  onmousedown={() => activate('mouse')}
+  onmouseup={() => deactivate('mouse')}
+  onmouseleave={active ? () => deactivate('mouse') : undefined}
+  ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
+  ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
   {disabled}
 >
   <span class="ptt-icon" aria-hidden="true">
