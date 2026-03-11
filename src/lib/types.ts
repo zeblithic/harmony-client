@@ -114,7 +114,7 @@ export interface VineVideo {
   viewed: boolean;
 }
 
-export type AppMode = 'messages' | 'vines' | 'files';
+export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook';
 
 // ── File Manager Types ──────────────────────────────────────────────
 
