@@ -45,17 +45,19 @@
   let cardActiveMs = $state(0);
   let pttSegmentStart = $state<number | null>(null);
 
-  // Generate challenge when level changes (or on mount, since previousLevel starts null)
+  // Generate challenge when level changes (or on mount, since previousLevel starts null).
+  // previousLevel is set inside newChallenge() AFTER the ready check passes, so if the
+  // service isn't ready yet the effect will re-fire on the next reactive change.
   let previousLevel: FlashcardLevel | null = null;
   $effect(() => {
     if (level !== previousLevel) {
-      previousLevel = level;
       newChallenge();
     }
   });
 
   function newChallenge() {
     if (!stq8Service.isReady()) return;
+    previousLevel = level;
     challenge = stq8Service.generateChallenge(level);
     activeRowIndex = 0;
     rowStates = [];
