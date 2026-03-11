@@ -77,6 +77,38 @@ describe('FlashcardGrid', () => {
     expect(cells[1].classList.contains('yellow')).toBe(true);
   });
 
+  it('applies completed-perfect class to all-green row', () => {
+    const rowStates: RowState[] = [
+      { rowIndex: 0, byteResults: ['green', 'green'], completed: true },
+    ];
+    render(FlashcardGrid, {
+      props: {
+        rows: [[0x00, 0xFF]],
+        activeRowIndex: 1,
+        rowStates,
+      },
+    });
+    const rows = screen.getAllByTestId('grid-row');
+    expect(rows[0].classList.contains('completed-perfect')).toBe(true);
+    expect(rows[0].classList.contains('completed-express')).toBe(false);
+  });
+
+  it('applies completed-express class to row with yellow bytes', () => {
+    const rowStates: RowState[] = [
+      { rowIndex: 0, byteResults: ['green', 'yellow'], completed: true },
+    ];
+    render(FlashcardGrid, {
+      props: {
+        rows: [[0x00, 0xFF]],
+        activeRowIndex: 1,
+        rowStates,
+      },
+    });
+    const rows = screen.getAllByTestId('grid-row');
+    expect(rows[0].classList.contains('completed-express')).toBe(true);
+    expect(rows[0].classList.contains('completed-perfect')).toBe(false);
+  });
+
   it('renders with accessible role', () => {
     render(FlashcardGrid, {
       props: {

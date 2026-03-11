@@ -31,7 +31,8 @@
     <div
       class="grid-row"
       class:active={rowIdx === activeRowIndex}
-      class:completed={rowStates.some(s => s.rowIndex === rowIdx && s.completed)}
+      class:completed-perfect={rowStates.some(s => s.rowIndex === rowIdx && s.completed && s.byteResults.every(r => r === 'green'))}
+      class:completed-express={rowStates.some(s => s.rowIndex === rowIdx && s.completed && s.byteResults.some(r => r === 'yellow'))}
       data-testid="grid-row"
       role="row"
     >
@@ -73,6 +74,14 @@
 
   .grid-row.active {
     border-color: var(--accent, #5865f2);
+  }
+
+  .grid-row.completed-perfect {
+    background: rgba(87, 242, 135, 0.05);
+  }
+
+  .grid-row.completed-express {
+    background: rgba(254, 231, 92, 0.05);
   }
 
   .byte-cell {

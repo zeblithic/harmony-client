@@ -76,18 +76,19 @@
     const row = challenge.rows[activeRowIndex];
     if (!row) return;
 
-    const { results, creditedBits, hasRed } = evaluateBytes(
+    const { results, hasRed } = evaluateBytes(
       row, heardNibbles, expressLane,
     );
 
     if (hasRed) {
       // Brief red flash, then reset row
+      const failedRowIndex = activeRowIndex;
       rowStates = [
-        ...rowStates.filter(s => s.rowIndex !== activeRowIndex),
-        { rowIndex: activeRowIndex, byteResults: results, completed: false },
+        ...rowStates.filter(s => s.rowIndex !== failedRowIndex),
+        { rowIndex: failedRowIndex, byteResults: results, completed: false },
       ];
       setTimeout(() => {
-        rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex);
+        rowStates = rowStates.filter(s => s.rowIndex !== failedRowIndex);
       }, 300);
       stats = { ...stats, combo: 0 };
       return;
@@ -102,13 +103,13 @@
 
     // Check if card is complete
     if (activeRowIndex >= challenge.rows.length - 1) {
-      handleCardComplete(results);
+      handleCardComplete();
     } else {
       activeRowIndex++;
     }
   }
 
-  function handleCardComplete(lastRowResults: ByteResult[]) {
+  function handleCardComplete() {
     const elapsed = cardStartTime ? Date.now() - cardStartTime : 0;
 
     // Sum credited bits from all completed rows (including the last row,

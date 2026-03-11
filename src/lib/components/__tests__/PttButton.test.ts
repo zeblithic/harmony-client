@@ -62,4 +62,27 @@ describe('PttButton', () => {
     const btn = screen.getByRole('button', { name: /push to talk/i });
     expect(btn.hasAttribute('disabled')).toBe(true);
   });
+
+  it('does not fire onPttStart when spacebar pressed on form controls', async () => {
+    const onPttStart = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart } });
+
+    // Simulate spacebar originating from an <input> element
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    await fireEvent.keyDown(input, { code: 'Space' });
+    expect(onPttStart).not.toHaveBeenCalled();
+    document.body.removeChild(input);
+  });
+
+  it('does not fire onPttStart when spacebar pressed on select', async () => {
+    const onPttStart = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart } });
+
+    const select = document.createElement('select');
+    document.body.appendChild(select);
+    await fireEvent.keyDown(select, { code: 'Space' });
+    expect(onPttStart).not.toHaveBeenCalled();
+    document.body.removeChild(select);
+  });
 });

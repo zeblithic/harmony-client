@@ -23,14 +23,21 @@
     onPttStop?.();
   }
 
+  function isFormControl(target: EventTarget | null): boolean {
+    const tag = (target as HTMLElement | null)?.tagName ?? '';
+    return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag);
+  }
+
   function handleKeyDown(e: KeyboardEvent) {
     if (e.code !== 'Space' || e.repeat || disabled) return;
+    if (isFormControl(e.target)) return;
     e.preventDefault();
     onPttStart?.();
   }
 
   function handleKeyUp(e: KeyboardEvent) {
     if (e.code !== 'Space' || disabled) return;
+    if (isFormControl(e.target)) return;
     e.preventDefault();
     onPttStop?.();
   }
