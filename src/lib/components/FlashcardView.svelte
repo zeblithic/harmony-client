@@ -69,6 +69,11 @@
     pttActive = false;
     // Release PTT = cancel current row (banked rows kept)
     rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
+    // PTT release breaks the combo streak (design spec: "without PTT release or timeout")
+    if (stats.combo > 0) {
+      stats = { ...stats, combo: 0 };
+      onStatsUpdate(stats);
+    }
   }
 
   function handleRowComplete(heardNibbles: number[]) {
@@ -88,7 +93,7 @@
         { rowIndex: failedRowIndex, byteResults: results, completed: false },
       ];
       setTimeout(() => {
-        rowStates = rowStates.filter(s => s.rowIndex !== failedRowIndex);
+        rowStates = rowStates.filter(s => s.rowIndex !== failedRowIndex || s.completed);
       }, 300);
       stats = { ...stats, combo: 0 };
       onStatsUpdate(stats);
