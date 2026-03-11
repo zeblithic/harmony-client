@@ -2,13 +2,15 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
     vineFeed?: Snippet;
     fileBrowser?: Snippet;
     fileDetailPanel?: Snippet;
+    spellbookContent?: Snippet;
+    spellbookDetail?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -16,7 +18,7 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
@@ -33,6 +35,15 @@
     <main class="vine-area">
       {@render vineFeed()}
     </main>
+  {:else if mode === 'spellbook' && spellbookContent}
+    <main class="spellbook-area">
+      {@render spellbookContent()}
+    </main>
+    {#if !collapsed && spellbookDetail}
+      <section class="detail-area">
+        {@render spellbookDetail()}
+      </section>
+    {/if}
   {:else}
     <main class="text-area">
       {@render textFeed()}
@@ -120,6 +131,22 @@
 
   .vine-area {
     grid-area: vine;
+    background: var(--bg-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .layout.spellbook-mode {
+    grid-template-columns: var(--nav-width) 1fr 320px;
+    grid-template-areas: "nav spellbook detail";
+  }
+  .layout.spellbook-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav spellbook";
+  }
+  .spellbook-area {
+    grid-area: spellbook;
     background: var(--bg-primary);
     overflow-y: auto;
     display: flex;

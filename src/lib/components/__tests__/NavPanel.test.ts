@@ -193,4 +193,16 @@ describe('NavPanel', () => {
       expect(screen.getByText('Work')).toBeTruthy();
     });
   });
+
+  it('renders Spellbook mode button', () => {
+    render(NavPanel, { props: { nodes: testNodes, collapsed: false } });
+    expect(screen.getByRole('button', { name: /spellbook/i })).toBeTruthy();
+  });
+
+  it('calls onModeChange with spellbook when clicked', async () => {
+    const onModeChange = vi.fn();
+    render(NavPanel, { props: { nodes: testNodes, collapsed: false, onModeChange } });
+    await fireEvent.click(screen.getByRole('button', { name: /spellbook/i }));
+    expect(onModeChange).toHaveBeenCalledWith('spellbook');
+  });
 });

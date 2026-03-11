@@ -8,8 +8,12 @@
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
+  import SpellbookMode from './lib/components/SpellbookMode.svelte';
+  import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
+  import { Stq8Service } from './lib/stq8-service';
+  import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
   // TODO: Replace mock-data imports with real data sources once content transport is wired up
@@ -60,6 +64,8 @@
   const notificationService = new NotificationService();
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
+  const stq8Service = new Stq8Service(null); // WASM loaded async later
+  let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
 
   function handleTrustChange() {
@@ -450,6 +456,15 @@
         <p>Select a file to view details</p>
       </div>
     {/if}
+  {/snippet}
+  {#snippet spellbookContent()}
+    <SpellbookMode
+      {stq8Service}
+      onStatsUpdate={(stats) => { flashcardStats = stats; }}
+    />
+  {/snippet}
+  {#snippet spellbookDetail()}
+    <FlashcardStats stats={flashcardStats} />
   {/snippet}
 </Layout>
 
