@@ -91,6 +91,7 @@
         rowStates = rowStates.filter(s => s.rowIndex !== failedRowIndex);
       }, 300);
       stats = { ...stats, combo: 0 };
+      onStatsUpdate(stats);
       return;
     }
 

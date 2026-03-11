@@ -24,7 +24,10 @@
   }
 
   function isFormControl(target: EventTarget | null): boolean {
-    const tag = (target as HTMLElement | null)?.tagName ?? '';
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    if (el.classList?.contains('ptt-button')) return false;
+    const tag = el.tagName ?? '';
     return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag);
   }
 
@@ -54,8 +57,8 @@
   onmousedown={handleMouseDown}
   onmouseup={handleMouseUp}
   onmouseleave={active ? handleMouseUp : undefined}
-  ontouchstart={handleMouseDown}
-  ontouchend={handleMouseUp}
+  ontouchstart={(e) => { e.preventDefault(); handleMouseDown(); }}
+  ontouchend={(e) => { e.preventDefault(); handleMouseUp(); }}
   {disabled}
 >
   <span class="ptt-icon" aria-hidden="true">

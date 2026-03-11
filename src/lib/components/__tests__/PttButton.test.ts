@@ -75,6 +75,25 @@ describe('PttButton', () => {
     document.body.removeChild(input);
   });
 
+  it('fires onPttStart on spacebar when PTT button is focused', async () => {
+    const onPttStart = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart } });
+    const btn = screen.getByRole('button', { name: /push to talk/i });
+    await fireEvent.keyDown(btn, { code: 'Space' });
+    expect(onPttStart).toHaveBeenCalledOnce();
+  });
+
+  it('does not fire onPttStart when spacebar pressed on other buttons', async () => {
+    const onPttStart = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart } });
+
+    const other = document.createElement('button');
+    document.body.appendChild(other);
+    await fireEvent.keyDown(other, { code: 'Space' });
+    expect(onPttStart).not.toHaveBeenCalled();
+    document.body.removeChild(other);
+  });
+
   it('does not fire onPttStart when spacebar pressed on select', async () => {
     const onPttStart = vi.fn();
     render(PttButton, { props: { active: false, onPttStart } });
