@@ -7,6 +7,7 @@ export class AudioService {
   private context: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private active = false;
+  private onChunk: PcmChunkCallback | null = null;
 
   isActive(): boolean {
     return this.active;
@@ -33,6 +34,7 @@ export class AudioService {
     const analyser = this.context.createAnalyser();
     this.source.connect(analyser);
 
+    this.onChunk = onChunk;
     this.active = true;
   }
 
@@ -46,6 +48,7 @@ export class AudioService {
     this.source = null;
     this.stream = null;
     this.context = null;
+    this.onChunk = null;
     this.active = false;
   }
 }

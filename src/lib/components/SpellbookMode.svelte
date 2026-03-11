@@ -39,8 +39,10 @@
       <button
         type="button"
         role="tab"
+        id="tab-spells"
         aria-label="Spells"
         aria-selected={activeTab === 'spells'}
+        aria-controls="tabpanel-spellbook"
         class="tab-btn"
         class:active={activeTab === 'spells'}
         onclick={() => { activeTab = 'spells'; }}
@@ -48,8 +50,10 @@
       <button
         type="button"
         role="tab"
+        id="tab-practice"
         aria-label="Practice"
         aria-selected={activeTab === 'practice'}
+        aria-controls="tabpanel-spellbook"
         class="tab-btn"
         class:active={activeTab === 'practice'}
         onclick={() => { activeTab = 'practice'; }}
@@ -59,7 +63,6 @@
     {#if activeTab === 'practice'}
       <div class="toolbar-controls">
         <label class="level-selector">
-          <span class="sr-only">Level</span>
           <select aria-label="Level" value={level} onchange={handleLevelChange}>
             {#each LEVELS as l}
               <option value={l}>{LEVEL_NAMES[l]}</option>
@@ -79,7 +82,7 @@
     {/if}
   </header>
 
-  <div class="spellbook-content" role="tabpanel">
+  <div class="spellbook-content" role="tabpanel" id="tabpanel-spellbook" aria-labelledby={activeTab === 'spells' ? 'tab-spells' : 'tab-practice'}>
     {#if activeTab === 'spells'}
       <SpellList />
     {:else}
@@ -165,14 +168,4 @@
     overflow-y: auto;
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    border: 0;
-  }
 </style>

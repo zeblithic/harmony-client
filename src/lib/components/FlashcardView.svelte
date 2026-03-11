@@ -67,6 +67,81 @@
 
   function handlePttStop() {
     pttActive = false;
+    // Release PTT = cancel current row (banked rows kept)
+    rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
+  }
+
+  function handleRowComplete(heardNibbles: number[]) {
+    if (!challenge) return;
+    const row = challenge.rows[activeRowIndex];
+    if (!row) return;
+
+    const { results, creditedBits, hasRed } = evaluateBytes(
+      row, heardNibbles, expressLane,
+    );
+
+    if (hasRed) {
+      // Brief red flash, then reset row
+      rowStates = [
+        ...rowStates.filter(s => s.rowIndex !== activeRowIndex),
+        { rowIndex: activeRowIndex, byteResults: results, completed: false },
+      ];
+      setTimeout(() => {
+        rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex);
+      }, 300);
+      stats = { ...stats, combo: 0 };
+      return;
+    }
+
+    // Row passed — bank it
+    const newRowState = { rowIndex: activeRowIndex, byteResults: results, completed: true };
+    rowStates = [
+      ...rowStates.filter(s => s.rowIndex !== activeRowIndex),
+      newRowState,
+    ];
+
+    // Check if card is complete
+    if (activeRowIndex >= challenge.rows.length - 1) {
+      handleCardComplete(creditedBits, results);
+    } else {
+      activeRowIndex++;
+    }
+  }
+
+  function handleCardComplete(lastRowBits: number, lastRowResults: ByteResult[]) {
+    const elapsed = cardStartTime ? Date.now() - cardStartTime : 0;
+
+    // Sum all credited bits across all completed rows
+    let totalBits = lastRowBits;
+    for (const rs of rowStates) {
+      if (rs.completed) {
+        totalBits += rs.byteResults.filter(r => r === 'green').length * 8
+          + rs.byteResults.filter(r => r === 'yellow').length * 4;
+      }
+    }
+
+    const hasYellow = rowStates.some(s =>
+      s.byteResults.some(r => r === 'yellow')
+    ) || lastRowResults.some(r => r === 'yellow');
+
+    const newStats: SessionStats = {
+      cardsCompleted: stats.cardsCompleted + 1,
+      perfectCards: stats.perfectCards + (hasYellow ? 0 : 1),
+      expressCards: stats.expressCards + (hasYellow ? 1 : 0),
+      bestTimeMs: stats.bestTimeMs === null
+        ? elapsed
+        : Math.min(stats.bestTimeMs, elapsed),
+      totalTimeMs: stats.totalTimeMs + elapsed,
+      previousTimeMs: elapsed,
+      combo: stats.combo + 1,
+      totalCreditedBits: stats.totalCreditedBits + totalBits,
+    };
+
+    stats = newStats;
+    onStatsUpdate(newStats);
+
+    // Auto-advance to next card
+    newChallenge();
   }
 
   // Flat text for active row hint
