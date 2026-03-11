@@ -48,8 +48,9 @@
 
   function handleKeyUp(e: KeyboardEvent) {
     if (e.code !== 'Space' || disabled) return;
-    if (isFormControl(e.target)) return;
-    e.preventDefault();
+    // No form-control guard here — if keyboard was activated, it must deactivate
+    // even if focus moved to a form control before release. The has() guard in
+    // deactivate() already handles the case where keyboard was never activated.
     deactivate('keyboard');
   }
 </script>
@@ -67,6 +68,7 @@
   onmouseleave={() => deactivate('mouse')}
   ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
   ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
+  ontouchcancel={() => deactivate('touch')}
   {disabled}
 >
   <span class="ptt-icon" aria-hidden="true">

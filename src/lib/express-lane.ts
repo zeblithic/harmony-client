@@ -34,9 +34,8 @@ export function evaluateBytes(
   expectedBytes: number[],
   heardNibbles: number[],
   expressMode: ExpressMode,
-): { results: ByteResult[]; creditedBits: number; hasRed: boolean } {
+): { results: ByteResult[]; hasRed: boolean } {
   const results: ByteResult[] = [];
-  let creditedBits = 0;
   let hasRed = false;
 
   for (let i = 0; i < expectedBytes.length; i++) {
@@ -55,19 +54,17 @@ export function evaluateBytes(
 
     if (expHigh === heardHigh && expLow === heardLow) {
       results.push('green');
-      creditedBits += 8;
     } else if (
       expressMode !== 'off' &&
       nibbleExpressMatch(expHigh, heardHigh, expressMode) &&
       nibbleExpressMatch(expLow, heardLow, expressMode)
     ) {
       results.push('yellow');
-      creditedBits += 4;
     } else {
       results.push('red');
       hasRed = true;
     }
   }
 
-  return { results, creditedBits, hasRed };
+  return { results, hasRed };
 }
