@@ -52,4 +52,19 @@ describe('evaluateBytes', () => {
     expect(results).toEqual(['red']);
     expect(hasRed).toBe(true);
   });
+
+  it('missing nibbles produce red, not false consonant match', () => {
+    // heardNibbles shorter than expected — should be red, not yellow
+    // (previously -1 fallback matched consonant index 3 for nibbles 12-15)
+    const { results, hasRed } = evaluateBytes([0xff], [], true);
+    expect(results).toEqual(['red']);
+    expect(hasRed).toBe(true);
+  });
+
+  it('partially missing nibbles produce red', () => {
+    // Only one nibble heard for a byte that needs two
+    const { results, hasRed } = evaluateBytes([0x00], [0], true);
+    expect(results).toEqual(['red']);
+    expect(hasRed).toBe(true);
+  });
 });

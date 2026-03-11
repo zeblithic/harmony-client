@@ -23,8 +23,15 @@ export function evaluateBytes(
     const byte = expectedBytes[i];
     const expHigh = (byte >> 4) & 0x0f;
     const expLow = byte & 0x0f;
-    const heardHigh = heardNibbles[i * 2] ?? -1;
-    const heardLow = heardNibbles[i * 2 + 1] ?? -1;
+    const heardHigh = heardNibbles[i * 2];
+    const heardLow = heardNibbles[i * 2 + 1];
+
+    // Missing nibbles → red (fail the row)
+    if (heardHigh === undefined || heardLow === undefined) {
+      results.push('red');
+      hasRed = true;
+      continue;
+    }
 
     if (expHigh === heardHigh && expLow === heardLow) {
       results.push('green');

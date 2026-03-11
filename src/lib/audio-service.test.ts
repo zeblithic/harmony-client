@@ -60,12 +60,12 @@ describe('AudioService', () => {
   it('stop releases resources', async () => {
     const service = new AudioService();
     await service.start(vi.fn(), () => mockCtx as unknown as AudioContext);
-    service.stop();
+    await service.stop();
     expect(service.isActive()).toBe(false);
   });
 
-  it('stop is safe to call when not active', () => {
+  it('stop is safe to call when not active', async () => {
     const service = new AudioService();
-    expect(() => service.stop()).not.toThrow();
+    await expect(service.stop()).resolves.toBeUndefined();
   });
 });

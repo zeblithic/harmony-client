@@ -38,12 +38,12 @@ export class AudioService {
     this.active = true;
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (!this.active) return;
 
     this.source?.disconnect();
     this.stream?.getTracks().forEach(t => t.stop());
-    this.context?.close();
+    await this.context?.close();
 
     this.source = null;
     this.stream = null;

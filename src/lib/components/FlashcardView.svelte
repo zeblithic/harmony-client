@@ -102,17 +102,18 @@
 
     // Check if card is complete
     if (activeRowIndex >= challenge.rows.length - 1) {
-      handleCardComplete(creditedBits, results);
+      handleCardComplete(results);
     } else {
       activeRowIndex++;
     }
   }
 
-  function handleCardComplete(lastRowBits: number, lastRowResults: ByteResult[]) {
+  function handleCardComplete(lastRowResults: ByteResult[]) {
     const elapsed = cardStartTime ? Date.now() - cardStartTime : 0;
 
-    // Sum all credited bits across all completed rows
-    let totalBits = lastRowBits;
+    // Sum credited bits from all completed rows (including the last row,
+    // which was already pushed to rowStates before this call).
+    let totalBits = 0;
     for (const rs of rowStates) {
       if (rs.completed) {
         totalBits += rs.byteResults.filter(r => r === 'green').length * 8
@@ -122,7 +123,7 @@
 
     const hasYellow = rowStates.some(s =>
       s.byteResults.some(r => r === 'yellow')
-    ) || lastRowResults.some(r => r === 'yellow');
+    );
 
     const newStats: SessionStats = {
       cardsCompleted: stats.cardsCompleted + 1,
