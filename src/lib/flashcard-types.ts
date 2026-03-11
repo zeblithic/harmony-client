@@ -3,9 +3,9 @@
 /** WASM level index (0-4). Maps to stq8-core flashcard::Level. */
 export type FlashcardLevel = 0 | 1 | 2 | 3 | 4;
 
-export const LEVELS: FlashcardLevel[] = [0, 1, 2, 3, 4];
+export const LEVELS: readonly FlashcardLevel[] = [0, 1, 2, 3, 4] as const;
 
-export const LEVEL_NAMES: Record<FlashcardLevel, string> = {
+export const LEVEL_NAMES: Readonly<Record<FlashcardLevel, string>> = {
   0: 'Novice',
   1: 'Apprentice',
   2: 'Journeyman',
