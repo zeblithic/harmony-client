@@ -16,10 +16,11 @@ describe('PttButton', () => {
     expect(onPttStart).toHaveBeenCalledOnce();
   });
 
-  it('fires onPttStop on mouseup', async () => {
+  it('fires onPttStop on mouseup after mousedown', async () => {
     const onPttStop = vi.fn();
-    render(PttButton, { props: { active: true, onPttStop } });
+    render(PttButton, { props: { active: false, onPttStop } });
     const btn = screen.getByRole('button', { name: /push to talk/i });
+    await fireEvent.mouseDown(btn);
     await fireEvent.mouseUp(btn);
     expect(onPttStop).toHaveBeenCalledOnce();
   });
@@ -43,9 +44,10 @@ describe('PttButton', () => {
     expect(onPttStart).toHaveBeenCalledOnce();
   });
 
-  it('fires onPttStop on spacebar keyup', async () => {
+  it('fires onPttStop on spacebar keyup after keydown', async () => {
     const onPttStop = vi.fn();
-    render(PttButton, { props: { active: true, onPttStop } });
+    render(PttButton, { props: { active: false, onPttStop } });
+    await fireEvent.keyDown(window, { code: 'Space' });
     await fireEvent.keyUp(window, { code: 'Space' });
     expect(onPttStop).toHaveBeenCalledOnce();
   });

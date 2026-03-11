@@ -26,6 +26,7 @@
 
   function deactivate(source: string) {
     if (disabled) return;
+    if (!activeInputs.has(source)) return;
     activeInputs.delete(source);
     if (activeInputs.size === 0) onPttStop?.();
   }
@@ -63,7 +64,7 @@
   aria-label="Push to talk"
   onmousedown={() => activate('mouse')}
   onmouseup={() => deactivate('mouse')}
-  onmouseleave={active ? () => deactivate('mouse') : undefined}
+  onmouseleave={() => deactivate('mouse')}
   ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
   ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
   {disabled}

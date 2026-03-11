@@ -3,7 +3,6 @@
     FlashcardLevel,
     Challenge,
     RowState,
-    ByteResult,
     SessionStats,
   } from '../flashcard-types';
   import { initialSessionStats } from '../flashcard-types';
@@ -16,6 +15,7 @@
     level,
     expressLane,
     stq8Service,
+    initialStats = initialSessionStats(),
     onStatsUpdate,
   }: {
     level: FlashcardLevel;
@@ -30,6 +30,7 @@
       };
       generateChallenge(l: FlashcardLevel): Challenge;
     };
+    initialStats?: SessionStats;
     onStatsUpdate: (stats: SessionStats) => void;
   } = $props();
 
@@ -38,13 +39,15 @@
   let rowStates = $state<RowState[]>([]);
   let pttActive = $state(false);
   let showHint = $state(false);
-  let stats = $state(initialSessionStats());
-  let cardStartTime = $state<number | null>(null);
+  let stats = $state(initialStats);
+  // Accumulated active PTT time (ms) for the current card, excluding off-air gaps.
+  let cardActiveMs = $state(0);
+  let pttSegmentStart = $state<number | null>(null);
 
-  // Generate challenge when level changes
+  // Generate challenge when level changes (or on mount, since previousLevel starts null)
   let previousLevel: FlashcardLevel | null = null;
   $effect(() => {
-    if (level !== previousLevel || !challenge) {
+    if (level !== previousLevel) {
       previousLevel = level;
       newChallenge();
     }
@@ -55,22 +58,25 @@
     challenge = stq8Service.generateChallenge(level);
     activeRowIndex = 0;
     rowStates = [];
-    cardStartTime = null;
+    // If PTT is already held (auto-advance), start timing immediately
+    cardActiveMs = 0;
+    pttSegmentStart = pttActive ? Date.now() : null;
   }
 
   function handlePttStart() {
     pttActive = true;
-    if (cardStartTime === null) {
-      cardStartTime = Date.now();
-    }
+    pttSegmentStart = Date.now();
   }
 
   function handlePttStop() {
     pttActive = false;
+    // Bank active time from this PTT segment
+    if (pttSegmentStart !== null) {
+      cardActiveMs += Date.now() - pttSegmentStart;
+      pttSegmentStart = null;
+    }
     // Release PTT = cancel current row (banked rows kept)
     rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
-    // Reset card timer so off-air gaps don't inflate elapsed time
-    cardStartTime = null;
     // PTT release breaks the combo streak (design spec: "without PTT release or timeout")
     if (stats.combo > 0) {
       stats = { ...stats, combo: 0 };
@@ -118,7 +124,8 @@
   }
 
   function handleCardComplete() {
-    const elapsed = cardStartTime ? Date.now() - cardStartTime : 0;
+    // Total active PTT time: accumulated segments + current segment (if PTT still held)
+    const elapsed = cardActiveMs + (pttSegmentStart !== null ? Date.now() - pttSegmentStart : 0);
 
     // Sum credited bits from all completed rows (including the last row,
     // which was already pushed to rowStates before this call).

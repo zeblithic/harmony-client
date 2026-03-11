@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { FlashcardLevel, SessionStats, Challenge } from '../flashcard-types';
-  import { LEVELS, LEVEL_NAMES } from '../flashcard-types';
+  import { LEVELS, LEVEL_NAMES, initialSessionStats } from '../flashcard-types';
   import SpellList from './SpellList.svelte';
   import FlashcardView from './FlashcardView.svelte';
 
@@ -20,10 +20,17 @@
   let activeTab = $state<SpellbookTab>('practice');
   let level = $state<FlashcardLevel>(0);
   let expressLane = $state(false);
+  // Preserved across tab switches — FlashcardView remounts with this state
+  let lastStats = $state(initialSessionStats());
 
   function handleLevelChange(e: Event) {
     const target = e.target as HTMLSelectElement;
     level = Number(target.value) as FlashcardLevel;
+  }
+
+  function handleStatsUpdate(newStats: SessionStats) {
+    lastStats = newStats;
+    onStatsUpdate?.(newStats);
   }
 </script>
 
@@ -84,7 +91,8 @@
         {level}
         {expressLane}
         {stq8Service}
-        onStatsUpdate={(s) => onStatsUpdate?.(s)}
+        initialStats={lastStats}
+        onStatsUpdate={handleStatsUpdate}
       />
     {/if}
   </div>
