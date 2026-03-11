@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { FlashcardLevel, SessionStats, Challenge } from '../flashcard-types';
-  import { LEVELS, LEVEL_NAMES, initialSessionStats } from '../flashcard-types';
+  import type { FlashcardLevel, SessionStats, Challenge, ExpressMode } from '../flashcard-types';
+  import { LEVELS, LEVEL_NAMES, EXPRESS_MODES, EXPRESS_MODE_LABELS, initialSessionStats } from '../flashcard-types';
   import SpellList from './SpellList.svelte';
   import FlashcardView from './FlashcardView.svelte';
 
@@ -19,7 +19,7 @@
   type SpellbookTab = 'spells' | 'practice';
   let activeTab = $state<SpellbookTab>('practice');
   let level = $state<FlashcardLevel>(0);
-  let expressLane = $state(false);
+  let expressMode = $state<ExpressMode>('off');
   // Preserved across tab switches — FlashcardView remounts with this state
   let lastStats = $state(initialSessionStats());
 
@@ -71,13 +71,17 @@
           </select>
         </label>
 
-        <label class="express-toggle">
-          <input
-            type="checkbox"
-            bind:checked={expressLane}
-            aria-label="Express lane"
-          />
+        <label class="express-selector">
           <span>Express</span>
+          <select
+            aria-label="Express lane mode"
+            value={expressMode}
+            onchange={(e) => { expressMode = (e.target as HTMLSelectElement).value as ExpressMode; }}
+          >
+            {#each EXPRESS_MODES as mode}
+              <option value={mode}>{EXPRESS_MODE_LABELS[mode]}</option>
+            {/each}
+          </select>
         </label>
       </div>
     {/if}
@@ -89,7 +93,7 @@
     {:else}
       <FlashcardView
         {level}
-        {expressLane}
+        {expressMode}
         {stq8Service}
         initialStats={lastStats}
         onStatsUpdate={handleStatsUpdate}
@@ -152,17 +156,21 @@
     font-size: 0.8125rem;
   }
 
-  .express-toggle {
+  .express-selector {
     display: flex;
     align-items: center;
     gap: 4px;
     color: var(--text-secondary, #b5bac1);
     font-size: 0.8125rem;
-    cursor: pointer;
   }
 
-  .express-toggle input[type="checkbox"] {
-    accent-color: var(--accent, #5865f2);
+  .express-selector select {
+    padding: 4px 8px;
+    border: 1px solid var(--border, #3f4147);
+    border-radius: 4px;
+    background: var(--bg-tertiary, #313338);
+    color: var(--text-primary, #f2f3f5);
+    font-size: 0.8125rem;
   }
 
   .spellbook-content {

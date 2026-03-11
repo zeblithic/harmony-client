@@ -25,7 +25,7 @@ describe('FlashcardView', () => {
     render(FlashcardView, {
       props: {
         level: 1,
-        expressLane: false,
+        expressMode: 'off',
         stq8Service: mockService,
         onStatsUpdate: vi.fn(),
       },
@@ -38,7 +38,7 @@ describe('FlashcardView', () => {
     render(FlashcardView, {
       props: {
         level: 1,
-        expressLane: false,
+        expressMode: 'off',
         stq8Service: createMockService(),
         onStatsUpdate: vi.fn(),
       },
@@ -52,7 +52,7 @@ describe('FlashcardView', () => {
     render(FlashcardView, {
       props: {
         level: 1,
-        expressLane: false,
+        expressMode: 'off',
         stq8Service: mockService,
         onStatsUpdate: vi.fn(),
       },
@@ -64,7 +64,7 @@ describe('FlashcardView', () => {
     render(FlashcardView, {
       props: {
         level: 1,
-        expressLane: false,
+        expressMode: 'off',
         stq8Service: createMockService(),
         onStatsUpdate: vi.fn(),
       },

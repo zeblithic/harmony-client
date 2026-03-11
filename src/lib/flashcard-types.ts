@@ -28,6 +28,18 @@ export interface Challenge {
   rows: number[][];
 }
 
+/** Express lane mode: which phoneme dimension(s) to match on. */
+export type ExpressMode = 'off' | 'consonant' | 'vowel' | 'both';
+
+export const EXPRESS_MODES: readonly ExpressMode[] = ['off', 'consonant', 'vowel', 'both'] as const;
+
+export const EXPRESS_MODE_LABELS: Readonly<Record<ExpressMode, string>> = {
+  off: 'Off',
+  consonant: 'Consonant',
+  vowel: 'Vowel',
+  both: 'Both',
+};
+
 /** Per-byte evaluation result for express lane scoring. */
 export type ByteResult = 'pending' | 'green' | 'yellow' | 'red';
 

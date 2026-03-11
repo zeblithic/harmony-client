@@ -1,19 +1,39 @@
 // src/lib/express-lane.ts
-import type { ByteResult } from './flashcard-types';
-import { consonantIndex } from './q8-utils';
+import type { ByteResult, ExpressMode } from './flashcard-types';
+import { consonantIndex, vowelIndex } from './q8-utils';
+
+/**
+ * Check if a single nibble passes express matching for the given mode.
+ *
+ * A nibble passes if its consonant matches (consonant/both mode)
+ * or its vowel matches (vowel/both mode).
+ */
+function nibbleExpressMatch(
+  expected: number,
+  heard: number,
+  mode: ExpressMode,
+): boolean {
+  if (mode === 'consonant' || mode === 'both') {
+    if (consonantIndex(expected) === consonantIndex(heard)) return true;
+  }
+  if (mode === 'vowel' || mode === 'both') {
+    if (vowelIndex(expected) === vowelIndex(heard)) return true;
+  }
+  return false;
+}
 
 /**
  * Express lane per-byte evaluation.
  *
  * For each byte (pair of nibbles), compare expected vs heard:
  * - Both nibbles match exactly → green (8 bits)
- * - Consonants match, vowels differ, express ON → yellow (4 bits)
- * - Consonant doesn't match → red (0 bits)
+ * - Both nibbles pass express matching → yellow (4 bits)
+ * - Any nibble fails → red (0 bits)
  */
 export function evaluateBytes(
   expectedBytes: number[],
   heardNibbles: number[],
-  express: boolean,
+  expressMode: ExpressMode,
 ): { results: ByteResult[]; creditedBits: number; hasRed: boolean } {
   const results: ByteResult[] = [];
   let creditedBits = 0;
@@ -37,9 +57,9 @@ export function evaluateBytes(
       results.push('green');
       creditedBits += 8;
     } else if (
-      express &&
-      consonantIndex(expHigh) === consonantIndex(heardHigh) &&
-      consonantIndex(expLow) === consonantIndex(heardLow)
+      expressMode !== 'off' &&
+      nibbleExpressMatch(expHigh, heardHigh, expressMode) &&
+      nibbleExpressMatch(expLow, heardLow, expressMode)
     ) {
       results.push('yellow');
       creditedBits += 4;

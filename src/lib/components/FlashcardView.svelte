@@ -4,6 +4,7 @@
     Challenge,
     RowState,
     SessionStats,
+    ExpressMode,
   } from '../flashcard-types';
   import { initialSessionStats } from '../flashcard-types';
   import { evaluateBytes } from '../express-lane';
@@ -13,13 +14,13 @@
 
   let {
     level,
-    expressLane,
+    expressMode,
     stq8Service,
     initialStats = initialSessionStats(),
     onStatsUpdate,
   }: {
     level: FlashcardLevel;
-    expressLane: boolean;
+    expressMode: ExpressMode;
     stq8Service: {
       isReady(): boolean;
       getLevelInfo(l: FlashcardLevel): {
@@ -90,7 +91,7 @@
     if (!row) return;
 
     const { results, hasRed } = evaluateBytes(
-      row, heardNibbles, expressLane,
+      row, heardNibbles, expressMode,
     );
 
     if (hasRed) {
