@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -7,6 +8,10 @@ use tokio::task::JoinHandle;
 struct ZenohState {
     session: Option<zenoh::Session>,
     task: Option<JoinHandle<()>>,
+    /// Set to true by disconnect_inner before closing the session.
+    /// The subscriber task checks this to distinguish clean disconnect
+    /// from unexpected session loss.
+    closing: Arc<AtomicBool>,
 }
 
 impl Default for ZenohState {
@@ -14,6 +19,7 @@ impl Default for ZenohState {
         Self {
             session: None,
             task: None,
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -60,13 +66,13 @@ async fn disconnect_inner(app: &AppHandle, state: &Mutex<ZenohState>) {
             Ok(g) => g,
             Err(_) => return,
         };
+        // Signal the subscriber task that this is a clean disconnect.
+        // The task checks this flag to suppress the "session lost" error event.
+        guard.closing.store(true, Ordering::SeqCst);
         (guard.session.take(), guard.task.take())
     }; // Guard dropped here, before the await
 
     // Explicitly close the session so all subscribers receive Err.
-    // Zenoh sessions are Arc-based — dropping the Option alone only
-    // decrements the refcount. The subscriber task holds its own Arc
-    // clone, so recv_async() would never error without an explicit close.
     let had_session = session.is_some();
     if let Some(session) = session {
         let _ = session.close().await;
@@ -140,12 +146,18 @@ async fn connect_zenoh(
         })?;
 
     // Store session BEFORE spawning task to prevent race with disconnect.
-    // If disconnect_zenoh is called between spawn and store, it would miss
-    // the session and leave an orphaned connection.
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.session = Some(session);
+        // Reset closing flag for this new connection
+        guard.closing.store(false, Ordering::SeqCst);
     }
+
+    // Clone closing flag for the subscriber task
+    let closing = {
+        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.closing.clone()
+    };
 
     // Spawn subscriber task
     let app_handle = app.clone();
@@ -159,7 +171,21 @@ async fn connect_zenoh(
                         let _ = app_handle.emit("capacity-update", &update);
                     }
                 }
-                Err(_) => break, // Session closed, exit cleanly
+                Err(e) => {
+                    // Distinguish clean disconnect from unexpected session loss.
+                    if !closing.load(Ordering::SeqCst) {
+                        // Unexpected — notify frontend so UI reflects broken state
+                        let _ = app_handle.emit(
+                            "zenoh-status",
+                            &ZenohStatus {
+                                status: "error".to_string(),
+                                endpoint: None,
+                                error: Some(format!("session lost: {e}")),
+                            },
+                        );
+                    }
+                    break;
+                }
             }
         }
     });
