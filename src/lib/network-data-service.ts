@@ -7,6 +7,8 @@ import type {
   LinkSnapshot,
   InterfaceType,
   NodeStatus,
+  NodeCapability,
+  TransportType,
   NetworkDataService,
 } from './network-types';
 
@@ -19,6 +21,8 @@ const NATO_NAMES = [
 ];
 
 const INTERFACE_TYPES: InterfaceType[] = ['tcp', 'udp', 'serial', 'i2p', 'lora', 'pipe'];
+
+const MODEL_NAMES = ['qwen3-4b', 'qwen3-0.8b', 'qwen3-9b'];
 
 const METRICS_HISTORY_CAPACITY = 300;
 
@@ -39,11 +43,25 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function randomCapabilities(): { capabilities: NodeCapability[]; modelName?: string } {
+  const caps: NodeCapability[] = [];
+  if (Math.random() < 0.8) caps.push('routing');
+  if (Math.random() < 0.6) caps.push('storage');
+  if (Math.random() < 0.4) caps.push('compute');
+  let modelName: string | undefined;
+  if (Math.random() < 0.3) {
+    caps.push('inference');
+    modelName = pickRandom(MODEL_NAMES);
+  }
+  if (caps.length === 0) caps.push('routing');
+  return { capabilities: caps, modelName };
+}
+
 function pickRandom<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function createInitialMetrics(): NodeMetrics {
+function createInitialMetrics(hotBaseline: boolean): NodeMetrics {
   const memoryTotalBytes = randomInt(4, 32) * 1024 * 1024 * 1024;
   const memoryUsedFraction = randomBetween(0.2, 0.6);
   const diskTotalBytes = randomInt(64, 512) * 1024 * 1024 * 1024;
@@ -51,7 +69,7 @@ function createInitialMetrics(): NodeMetrics {
 
   return {
     timestamp: Date.now(),
-    cpuPercent: randomBetween(10, 50),
+    cpuPercent: hotBaseline ? randomBetween(40, 60) : randomBetween(10, 30),
     memoryUsedBytes: Math.floor(memoryTotalBytes * memoryUsedFraction),
     memoryTotalBytes,
     diskUsedBytes: Math.floor(diskTotalBytes * diskUsedFraction),
@@ -63,20 +81,34 @@ function createNode(
   name: string,
   isLocal: boolean,
   hopDistance: number,
+  capabilities: NodeCapability[],
+  modelName?: string,
 ): NetworkNode {
+  const hotBaseline = capabilities.includes('inference');
+  const metrics = createInitialMetrics(hotBaseline);
+  const memPercent = (metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100;
+  const heatPercent = clamp(0.6 * metrics.cpuPercent + 0.4 * memPercent, 0, 100);
   return {
     address: randomHexAddress(),
     displayName: name,
     isLocal,
     hopDistance,
     status: 'online',
-    metrics: createInitialMetrics(),
+    metrics,
     metricsHistory: new RingBuffer<NodeMetrics>(METRICS_HISTORY_CAPACITY),
     lastSeen: Date.now(),
+    capabilities,
+    heatPercent,
+    modelName,
   };
 }
 
-function createLink(source: string, target: string): NetworkLink {
+function createLink(
+  source: string,
+  target: string,
+  sourceNode: NetworkNode,
+  targetNode: NetworkNode,
+): NetworkLink {
   const interfaceType = pickRandom(INTERFACE_TYPES);
   const capacityMap: Record<InterfaceType, number> = {
     tcp: 100_000_000,
@@ -87,6 +119,24 @@ function createLink(source: string, target: string): NetworkLink {
     pipe: 1_000_000_000,
   };
 
+  const bothInference = sourceNode.capabilities.includes('inference')
+    && targetNode.capabilities.includes('inference');
+  const neitherInference = !sourceNode.capabilities.includes('inference')
+    && !targetNode.capabilities.includes('inference');
+
+  let transportType: TransportType;
+  let encrypted: boolean;
+  if (bothInference) {
+    transportType = 'iroh';
+    encrypted = true;
+  } else if (neitherInference) {
+    transportType = 'reticulum';
+    encrypted = false;
+  } else {
+    transportType = 'zenoh';
+    encrypted = true;
+  }
+
   return {
     id: `${source.slice(0, 8)}-${target.slice(0, 8)}`,
     source,
@@ -96,6 +146,8 @@ function createLink(source: string, target: string): NetworkLink {
     utilizationPercent: randomBetween(5, 40),
     latencyMs: randomBetween(1, 200),
     utilizationHistory: new RingBuffer<LinkSnapshot>(METRICS_HISTORY_CAPACITY),
+    transportType,
+    encrypted,
   };
 }
 
@@ -120,31 +172,34 @@ export class MockNetworkDataService implements NetworkDataService {
     this.nodes = [];
     this.links = [];
 
-    // Create local node (hop 0)
+    // Create local node (hop 0) — local node has all capabilities
     const localName = this.pickUniqueName();
-    this.nodes.push(createNode(localName, true, 0));
+    const allCapabilities: NodeCapability[] = ['routing', 'storage', 'compute', 'inference'];
+    this.nodes.push(createNode(localName, true, 0, allCapabilities, pickRandom(MODEL_NAMES)));
 
     // Create 3 hop-1 nodes
     for (let i = 0; i < 3; i++) {
-      this.nodes.push(createNode(this.pickUniqueName(), false, 1));
+      const { capabilities, modelName } = randomCapabilities();
+      this.nodes.push(createNode(this.pickUniqueName(), false, 1, capabilities, modelName));
     }
 
     // Create remaining hop-2 nodes
     for (let i = 4; i < nodeCount; i++) {
-      this.nodes.push(createNode(this.pickUniqueName(), false, 2));
+      const { capabilities, modelName } = randomCapabilities();
+      this.nodes.push(createNode(this.pickUniqueName(), false, 2, capabilities, modelName));
     }
 
     // Create a connected graph of links
     // Connect each hop-1 node to the local node
-    const localAddr = this.nodes[0].address;
+    const localNode = this.nodes[0];
     for (let i = 1; i <= 3; i++) {
-      this.links.push(createLink(localAddr, this.nodes[i].address));
+      this.links.push(createLink(localNode.address, this.nodes[i].address, localNode, this.nodes[i]));
     }
 
     // Connect hop-2 nodes to random hop-1 nodes
     for (let i = 4; i < this.nodes.length; i++) {
       const hop1Index = randomInt(1, 3);
-      this.links.push(createLink(this.nodes[hop1Index].address, this.nodes[i].address));
+      this.links.push(createLink(this.nodes[hop1Index].address, this.nodes[i].address, this.nodes[hop1Index], this.nodes[i]));
     }
 
     // Add a few extra links for mesh redundancy
@@ -160,7 +215,7 @@ export class MockNetworkDataService implements NetworkDataService {
             (l.source === this.nodes[b].address && l.target === this.nodes[a].address),
         );
         if (!existingLink) {
-          this.links.push(createLink(this.nodes[a].address, this.nodes[b].address));
+          this.links.push(createLink(this.nodes[a].address, this.nodes[b].address, this.nodes[a], this.nodes[b]));
         }
       }
     }
@@ -229,6 +284,10 @@ export class MockNetworkDataService implements NetworkDataService {
 
         node.metrics = newMetrics;
         node.metricsHistory.push(newMetrics);
+
+        const memPercent = (newMetrics.memoryUsedBytes / newMetrics.memoryTotalBytes) * 100;
+        node.heatPercent = clamp(0.6 * newMetrics.cpuPercent + 0.4 * memPercent, 0, 100);
+
         node.lastSeen = now;
       }
 
@@ -301,14 +360,19 @@ export class MockNetworkDataService implements NetworkDataService {
   }
 
   private addDiscoveredNodes(parentAddress: string): void {
-    const count = randomInt(2, 3);
     const parentNode = this.nodes.find((n) => n.address === parentAddress);
-    const parentHop = parentNode ? parentNode.hopDistance : 2;
+    if (!parentNode) {
+      // Parent not in our node list — skip to avoid creating links
+      // with incorrect transport types (self-comparison).
+      return;
+    }
+    const count = randomInt(2, 3);
 
     for (let i = 0; i < count; i++) {
-      const newNode = createNode(this.pickUniqueName(), false, parentHop + 1);
+      const { capabilities, modelName } = randomCapabilities();
+      const newNode = createNode(this.pickUniqueName(), false, parentNode.hopDistance + 1, capabilities, modelName);
       this.nodes.push(newNode);
-      this.links.push(createLink(parentAddress, newNode.address));
+      this.links.push(createLink(parentAddress, newNode.address, parentNode, newNode));
     }
   }
 

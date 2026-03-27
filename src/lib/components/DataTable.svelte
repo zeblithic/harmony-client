@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { NetworkNode } from '../network-types';
-  import { nodeHealthColor } from '../graph-utils';
+  import { heatToColor } from '../graph-utils';
 
   type SortKey = 'displayName' | 'status' | 'hopDistance' | 'cpuPercent' | 'memory' | 'disk';
 
@@ -126,7 +126,7 @@
       >
         <td class="name-cell">{node.displayName}</td>
         <td>
-          <span class="status-dot" style="background: {nodeHealthColor(node.status, node.isLocal)}"></span>
+          <span class="status-dot" style="background: {heatToColor(node.heatPercent, node.status, node.isLocal)}"></span>
           {node.status}
         </td>
         <td>{node.hopDistance}</td>

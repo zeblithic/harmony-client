@@ -16,14 +16,16 @@ function makeTestLink(): NetworkLink {
     utilizationPercent: 67,
     latencyMs: 23,
     utilizationHistory: history,
+    transportType: 'zenoh',
+    encrypted: false,
   };
 }
 
 function makeNodes(): NetworkNode[] {
   const metrics: NodeMetrics = { timestamp: 0, cpuPercent: 50, memoryUsedBytes: 4e9, memoryTotalBytes: 8e9, diskUsedBytes: 50e9, diskTotalBytes: 256e9 };
   return [
-    { address: 'aaa', displayName: 'alpha', isLocal: true, hopDistance: 0, status: 'online', metrics, metricsHistory: new RingBuffer(10), lastSeen: Date.now() },
-    { address: 'bbb', displayName: 'bravo', isLocal: false, hopDistance: 1, status: 'online', metrics, metricsHistory: new RingBuffer(10), lastSeen: Date.now() },
+    { address: 'aaa', displayName: 'alpha', isLocal: true, hopDistance: 0, status: 'online', metrics, metricsHistory: new RingBuffer(10), lastSeen: Date.now(), capabilities: ['routing'], heatPercent: 25 },
+    { address: 'bbb', displayName: 'bravo', isLocal: false, hopDistance: 1, status: 'online', metrics, metricsHistory: new RingBuffer(10), lastSeen: Date.now(), capabilities: ['routing'], heatPercent: 25 },
   ];
 }
 

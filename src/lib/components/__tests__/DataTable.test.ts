@@ -20,6 +20,8 @@ function makeNode(overrides: Partial<NetworkNode> & { address: string; displayNa
     metrics,
     metricsHistory: new RingBuffer<NodeMetrics>(10),
     lastSeen: Date.now(),
+    capabilities: ['routing'],
+    heatPercent: 25,
     ...overrides,
   };
 }

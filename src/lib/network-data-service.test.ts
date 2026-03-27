@@ -85,4 +85,45 @@ describe('MockNetworkDataService', () => {
     vi.advanceTimersByTime(60000);
     expect(alerts.length).toBeGreaterThan(0);
   });
+
+  it('generates nodes with capabilities', () => {
+    const service = new MockNetworkDataService();
+    for (const node of service.nodes) {
+      expect(node.capabilities.length).toBeGreaterThan(0);
+      for (const cap of node.capabilities) {
+        expect(['inference', 'storage', 'routing', 'compute']).toContain(cap);
+      }
+    }
+  });
+
+  it('assigns modelName only to inference nodes', () => {
+    const service = new MockNetworkDataService();
+    for (const node of service.nodes) {
+      if (node.capabilities.includes('inference')) {
+        expect(node.modelName).toBeDefined();
+      } else {
+        expect(node.modelName).toBeUndefined();
+      }
+    }
+  });
+
+  it('generates links with valid transport types', () => {
+    const service = new MockNetworkDataService();
+    for (const link of service.links) {
+      expect(['iroh', 'reticulum', 'zenoh', 'rawlink', 's3']).toContain(link.transportType);
+      expect(typeof link.encrypted).toBe('boolean');
+    }
+  });
+
+  it('computes heatPercent after tick', () => {
+    const service = new MockNetworkDataService();
+    service.start();
+    vi.advanceTimersByTime(1000);
+    service.stop();
+    const onlineNode = service.nodes.find(n => n.status !== 'offline');
+    if (onlineNode) {
+      expect(onlineNode.heatPercent).toBeGreaterThanOrEqual(0);
+      expect(onlineNode.heatPercent).toBeLessThanOrEqual(100);
+    }
+  });
 });

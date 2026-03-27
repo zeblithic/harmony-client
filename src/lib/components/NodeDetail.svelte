@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import type { NetworkNode, NetworkLink } from '../network-types';
   import { generateIdenticon } from '../identicon';
-  import { nodeHealthColor, linkUtilizationColor } from '../graph-utils';
+  import { heatToColor, linkUtilizationColor } from '../graph-utils';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -31,7 +31,7 @@
       : node.address,
   );
 
-  let statusColor = $derived(nodeHealthColor(node.status, node.isLocal));
+  let statusColor = $derived(heatToColor(node.heatPercent, node.status, node.isLocal));
 
   let hopLabel = $derived(
     node.hopDistance === 0 ? 'local' : node.hopDistance === 1 ? '1 hop' : `${node.hopDistance} hops`,
@@ -149,6 +149,15 @@
   <p class="meta-line">
     {hopLabel} · last seen: {lastSeenSeconds}s
   </p>
+
+  {#if node.capabilities.length > 0}
+    <p class="meta-line">
+      {node.capabilities.join(', ')}
+      {#if node.modelName}
+        · Model: {node.modelName}
+      {/if}
+    </p>
+  {/if}
 
   {#if node.status === 'offline'}
     <p class="meta-line" style="color: var(--text-muted, #72767d)">No metrics available — node is offline</p>
