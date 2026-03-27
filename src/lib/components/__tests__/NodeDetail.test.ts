@@ -24,12 +24,14 @@ function makeTestNode(): NetworkNode {
     metrics,
     metricsHistory: history,
     lastSeen: Date.now(),
+    capabilities: ['routing'],
+    heatPercent: 25,
   };
 }
 
 const testLinks: NetworkLink[] = [
-  { id: 'l1', source: 'a7f3c219deadbeef', target: 'aaa', interfaceType: 'tcp', capacityBps: 1e8, utilizationPercent: 12, latencyMs: 8, utilizationHistory: new RingBuffer(10) },
-  { id: 'l2', source: 'a7f3c219deadbeef', target: 'bbb', interfaceType: 'udp', capacityBps: 1e8, utilizationPercent: 67, latencyMs: 23, utilizationHistory: new RingBuffer(10) },
+  { id: 'l1', source: 'a7f3c219deadbeef', target: 'aaa', interfaceType: 'tcp', capacityBps: 1e8, utilizationPercent: 12, latencyMs: 8, utilizationHistory: new RingBuffer(10), transportType: 'zenoh', encrypted: false },
+  { id: 'l2', source: 'a7f3c219deadbeef', target: 'bbb', interfaceType: 'udp', capacityBps: 1e8, utilizationPercent: 67, latencyMs: 23, utilizationHistory: new RingBuffer(10), transportType: 'zenoh', encrypted: false },
 ];
 
 describe('NodeDetail', () => {

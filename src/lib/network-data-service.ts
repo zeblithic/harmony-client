@@ -7,6 +7,8 @@ import type {
   LinkSnapshot,
   InterfaceType,
   NodeStatus,
+  NodeCapability,
+  TransportType,
   NetworkDataService,
 } from './network-types';
 
@@ -73,6 +75,8 @@ function createNode(
     metrics: createInitialMetrics(),
     metricsHistory: new RingBuffer<NodeMetrics>(METRICS_HISTORY_CAPACITY),
     lastSeen: Date.now(),
+    capabilities: ['routing'] as NodeCapability[],
+    heatPercent: 0,
   };
 }
 
@@ -96,6 +100,8 @@ function createLink(source: string, target: string): NetworkLink {
     utilizationPercent: randomBetween(5, 40),
     latencyMs: randomBetween(1, 200),
     utilizationHistory: new RingBuffer<LinkSnapshot>(METRICS_HISTORY_CAPACITY),
+    transportType: 'zenoh' as TransportType,
+    encrypted: false,
   };
 }
 

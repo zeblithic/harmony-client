@@ -19,6 +19,8 @@ export interface LinkSnapshot {
 
 export type NodeStatus = 'online' | 'degraded' | 'offline';
 export type InterfaceType = 'tcp' | 'udp' | 'serial' | 'i2p' | 'lora' | 'pipe';
+export type NodeCapability = 'inference' | 'storage' | 'routing' | 'compute';
+export type TransportType = 'iroh' | 'reticulum' | 'zenoh' | 'rawlink' | 's3';
 
 export interface NetworkNode {
   address: string;
@@ -29,6 +31,9 @@ export interface NetworkNode {
   metrics: NodeMetrics;
   metricsHistory: RingBuffer<NodeMetrics>;
   lastSeen: number;
+  capabilities: NodeCapability[];
+  heatPercent: number;
+  modelName?: string;
 }
 
 export interface NetworkLink {
@@ -40,6 +45,8 @@ export interface NetworkLink {
   utilizationPercent: number;
   latencyMs: number;
   utilizationHistory: RingBuffer<LinkSnapshot>;
+  transportType: TransportType;
+  encrypted: boolean;
 }
 
 export interface NetworkDataService {
