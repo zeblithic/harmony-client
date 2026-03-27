@@ -145,50 +145,44 @@ async fn connect_zenoh(
             msg
         })?;
 
-    // Store session and clone closing flag in a single lock scope to
-    // prevent a concurrent disconnect from setting closing=true between
-    // the two operations.
-    let closing = {
+    // Store session, spawn task, and store task handle in a single lock
+    // scope. tokio::spawn doesn't block — it just schedules the future —
+    // so holding the mutex across it is safe and prevents a concurrent
+    // disconnect from taking the session before the task handle is stored.
+    {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.session = Some(session);
         guard.closing.store(false, Ordering::SeqCst);
-        guard.closing.clone()
-    };
+        let closing = guard.closing.clone();
 
-    // Spawn subscriber task
-    let app_handle = app.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            match subscriber.recv_async().await {
-                Ok(sample) => {
-                    let key = sample.key_expr().as_str();
-                    let payload = sample.payload().to_bytes();
-                    if let Some(update) = parse_capacity(key, &payload) {
-                        let _ = app_handle.emit("capacity-update", &update);
+        let app_handle = app.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                match subscriber.recv_async().await {
+                    Ok(sample) => {
+                        let key = sample.key_expr().as_str();
+                        let payload = sample.payload().to_bytes();
+                        if let Some(update) = parse_capacity(key, &payload) {
+                            let _ = app_handle.emit("capacity-update", &update);
+                        }
                     }
-                }
-                Err(e) => {
-                    // Distinguish clean disconnect from unexpected session loss.
-                    if !closing.load(Ordering::SeqCst) {
-                        // Unexpected — notify frontend so UI reflects broken state
-                        let _ = app_handle.emit(
-                            "zenoh-status",
-                            &ZenohStatus {
-                                status: "error".to_string(),
-                                endpoint: None,
-                                error: Some(format!("session lost: {e}")),
-                            },
-                        );
+                    Err(e) => {
+                        // Distinguish clean disconnect from unexpected session loss.
+                        if !closing.load(Ordering::SeqCst) {
+                            let _ = app_handle.emit(
+                                "zenoh-status",
+                                &ZenohStatus {
+                                    status: "error".to_string(),
+                                    endpoint: None,
+                                    error: Some(format!("session lost: {e}")),
+                                },
+                            );
+                        }
+                        break;
                     }
-                    break;
                 }
             }
-        }
-    });
-
-    // Store task handle (session already stored above)
-    {
-        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        });
         guard.task = Some(task);
     }
 
