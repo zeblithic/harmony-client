@@ -41,6 +41,7 @@
         listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
       };
       zenohService = new ZenohService(adapter);
+      zenohService.onChange = syncZenohState;
       await zenohService.init();
       if (destroyed) {
         zenohService.destroy();
@@ -62,9 +63,8 @@
 
   function handleConnect(endpoint: string) {
     if (zenohService) {
-      // Set connecting immediately for responsive UI
-      zenohStatus = 'connecting';
-      zenohService.connect(endpoint).then(syncZenohState);
+      // ZenohService.connect() calls onChange → syncZenohState immediately
+      zenohService.connect(endpoint);
     } else {
       zenohStatus = 'connecting';
       console.log('Zenoh connect requested (no Tauri):', endpoint);

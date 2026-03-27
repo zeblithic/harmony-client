@@ -30,6 +30,9 @@ export class ZenohService {
   discoveredNodes: Map<string, DiscoveredNode> = new Map();
   errorMessage?: string;
 
+  /** Called whenever service state changes so the UI can sync immediately. */
+  onChange?: () => void;
+
   private adapter: TauriAdapter;
   private unlisteners: Array<() => void> = [];
 
@@ -46,6 +49,7 @@ export class ZenohService {
           ...update,
           lastSeen: Date.now(),
         });
+        this.onChange?.();
       },
     );
     this.unlisteners.push(unlistenCapacity);
@@ -69,6 +73,7 @@ export class ZenohService {
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
         }
+        this.onChange?.();
       },
     );
     this.unlisteners.push(unlistenStatus);
@@ -77,11 +82,13 @@ export class ZenohService {
   async connect(endpoint: string): Promise<void> {
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
+    this.onChange?.();
     try {
       await this.adapter.invoke('connect_zenoh', { endpoint });
     } catch (e) {
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
+      this.onChange?.();
     }
   }
 
@@ -89,6 +96,7 @@ export class ZenohService {
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();
+    this.onChange?.();
     try {
       await this.adapter.invoke('disconnect_zenoh');
     } catch {

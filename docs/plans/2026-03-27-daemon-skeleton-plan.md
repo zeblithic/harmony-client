@@ -215,7 +215,7 @@ async fn connect_zenoh(
     // (zenoh v1 config is serde-based, not direct field access)
     let mut config = zenoh::Config::default();
     config
-        .insert_json5("connect/endpoints", &format!("[\"{}\"]", endpoint))
+        .insert_json5("connect/endpoints", &format!("[{}]", serde_json::to_string(&endpoint).unwrap()))
         .map_err(|e| format!("config error: {e}"))?;
 
     // Open session
