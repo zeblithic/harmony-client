@@ -8,6 +8,7 @@
   import DataTable from './lib/components/DataTable.svelte';
   import AriaAnnouncer from './lib/components/AriaAnnouncer.svelte';
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
+  import ConnectionBar from './lib/components/ConnectionBar.svelte';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -17,6 +18,29 @@
   let showTable = $state(false);
   let announcement = $state('');
   let graphComponent: NetworkGraph;
+
+  // Zenoh connection state (stubs for dev/browser mode)
+  let zenohStatus = $state<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  let discoveredCount = $state(0);
+  let zenohError = $state<string | undefined>(undefined);
+
+  function handleConnect(endpoint: string) {
+    zenohStatus = 'connecting';
+    console.log('Zenoh connect requested:', endpoint);
+    // In Tauri mode, ZenohService.connect() would be called here.
+    // In dev browser mode, no Tauri available — reset after timeout.
+    setTimeout(() => {
+      if (zenohStatus === 'connecting') {
+        zenohStatus = 'disconnected';
+      }
+    }, 2000);
+  }
+
+  function handleDisconnect() {
+    zenohStatus = 'disconnected';
+    discoveredCount = 0;
+    zenohError = undefined;
+  }
 
   // Load table preference from localStorage
   if (typeof localStorage !== 'undefined') {
@@ -79,6 +103,14 @@
     onToggleView={toggleView}
     onRecenter={() => graphComponent?.recenter()}
     onZoomFit={() => graphComponent?.zoomToFit()}
+  />
+
+  <ConnectionBar
+    connectionStatus={zenohStatus}
+    {discoveredCount}
+    errorMessage={zenohError}
+    onConnect={handleConnect}
+    onDisconnect={handleDisconnect}
   />
 
   <div class="content">
