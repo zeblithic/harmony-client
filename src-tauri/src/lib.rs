@@ -55,26 +55,31 @@ fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
 }
 
 async fn disconnect_inner(app: &AppHandle, state: &Mutex<ZenohState>) {
-    let task = {
+    let (had_session, task) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         // Drop session → subscriber's recv_async() returns Err → task exits cleanly
-        guard.session.take();
-        guard.task.take()
+        let had = guard.session.take().is_some();
+        (had, guard.task.take())
     }; // Guard dropped here, before the await
     if let Some(task) = task {
         let _ = task.await;
     }
-    let _ = app.emit(
-        "zenoh-status",
-        &ZenohStatus {
-            status: "disconnected".to_string(),
-            endpoint: None,
-            error: None,
-        },
-    );
+    // Only emit disconnected if there was actually a session to disconnect.
+    // Prevents spurious disconnected event during connect_zenoh's teardown
+    // of a previous connection, which would flicker the UI.
+    if had_session {
+        let _ = app.emit(
+            "zenoh-status",
+            &ZenohStatus {
+                status: "disconnected".to_string(),
+                endpoint: None,
+                error: None,
+            },
+        );
+    }
 }
 
 #[tauri::command]
@@ -86,10 +91,14 @@ async fn connect_zenoh(
     // Disconnect if already connected
     disconnect_inner(&app, &state).await;
 
-    // Build zenoh config
+    // Build zenoh config — use serde_json to safely serialize the endpoint
+    // string, preventing JSON injection via crafted input like:
+    // tcp/host:7447","tcp/attacker:7447
     let mut config = zenoh::Config::default();
+    let endpoint_json = serde_json::to_string(&endpoint)
+        .map_err(|e| format!("endpoint serialize error: {e}"))?;
     config
-        .insert_json5("connect/endpoints", &format!("[\"{}\"]", endpoint))
+        .insert_json5("connect/endpoints", &format!("[{}]", endpoint_json))
         .map_err(|e| format!("config error: {e}"))?;
 
     // Open session
