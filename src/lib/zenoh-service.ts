@@ -35,6 +35,11 @@ export class ZenohService {
 
   private adapter: TauriAdapter;
   private unlisteners: Array<() => void> = [];
+  /** Monotonic generation counter — incremented on connect/disconnect.
+   *  Status events are only processed if the generation matches the
+   *  one that was current when the operation started. This prevents
+   *  stale 'connected' events from overriding a user-initiated disconnect. */
+  private generation = 0;
 
   constructor(adapter: TauriAdapter) {
     this.adapter = adapter;
@@ -44,6 +49,8 @@ export class ZenohService {
     const unlistenCapacity = await this.adapter.listen(
       'capacity-update',
       (event) => {
+        // Only accept capacity updates when connected
+        if (this.connectionStatus !== 'connected') return;
         const update = event.payload as CapacityUpdate;
         this.discoveredNodes.set(update.nodeAddr, {
           ...update,
@@ -59,8 +66,14 @@ export class ZenohService {
       (event) => {
         const status = event.payload as ZenohStatusEvent;
         if (status.status === 'connected') {
-          this.connectionStatus = 'connected';
-          this.errorMessage = undefined;
+          // Only accept 'connected' if we're still in 'connecting' state.
+          // If disconnect() was called while connect was in flight,
+          // connectionStatus is already 'disconnected' and we must ignore
+          // the stale 'connected' event from the backend.
+          if (this.connectionStatus === 'connecting') {
+            this.connectionStatus = 'connected';
+            this.errorMessage = undefined;
+          }
         } else if (status.status === 'disconnected') {
           // Don't regress from 'connecting' — a stale 'disconnected' event
           // from disconnect_inner tearing down the previous session should
@@ -80,6 +93,7 @@ export class ZenohService {
   }
 
   async connect(endpoint: string): Promise<void> {
+    this.generation++;
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
     this.onChange?.();
@@ -93,6 +107,7 @@ export class ZenohService {
   }
 
   async disconnect(): Promise<void> {
+    this.generation++;
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();

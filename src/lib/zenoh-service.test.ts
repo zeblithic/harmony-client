@@ -49,11 +49,14 @@ describe('ZenohService', () => {
     await promise;
   });
 
-  it('updates status on zenoh-status connected event', () => {
+  it('updates status on zenoh-status connected event', async () => {
+    // Must be in 'connecting' state for 'connected' event to be accepted
+    const promise = service.connect('tcp/127.0.0.1:7447');
     mock.emit('zenoh-status', {
       status: 'connected',
       endpoint: 'tcp/127.0.0.1:7447',
     } satisfies ZenohStatusEvent);
+    await promise;
     expect(service.connectionStatus).toBe('connected');
   });
 
@@ -66,7 +69,12 @@ describe('ZenohService', () => {
     expect(service.errorMessage).toBe('connection refused');
   });
 
-  it('upserts discovered node on capacity-update', () => {
+  it('upserts discovered node on capacity-update', async () => {
+    // Must be connected for capacity updates to be accepted
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
     mock.emit('capacity-update', {
       nodeAddr: 'deadbeef',
       modelCid: 'aabb',
@@ -79,7 +87,11 @@ describe('ZenohService', () => {
     expect(node.lastSeen).toBeGreaterThan(0);
   });
 
-  it('updates lastSeen on duplicate capacity-update', () => {
+  it('updates lastSeen on duplicate capacity-update', async () => {
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
     mock.emit('capacity-update', {
       nodeAddr: 'node1',
       modelCid: 'cc',
@@ -98,6 +110,10 @@ describe('ZenohService', () => {
   });
 
   it('disconnect clears discovered nodes', async () => {
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
     mock.emit('capacity-update', {
       nodeAddr: 'node1',
       modelCid: 'cc',

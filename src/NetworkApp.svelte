@@ -144,6 +144,10 @@
     return () => {
       destroyed = true;
       service.stop();
+      // Disconnect the backend session before removing listeners.
+      // Without this, the Zenoh session stays open (subscriber task
+      // keeps running) for the lifetime of the app process.
+      zenohService?.disconnect();
       zenohService?.destroy();
     };
   });
