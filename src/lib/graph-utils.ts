@@ -29,6 +29,7 @@ function lerpColor(a: string, b: string, t: number): string {
 
 export function heatToColor(percent: number, status: NodeStatus, isLocal: boolean): string {
   if (status === 'offline') return '#72767d';
+  if (status === 'degraded') return '#faa61a';
   if (isLocal) return '#5865f2';
   const p = Math.max(0, Math.min(100, percent));
   if (p <= 50) {
@@ -59,6 +60,10 @@ export function linkDashPattern(transportType: TransportType): number[] {
     case 'zenoh': return [2, 4];
     case 'rawlink': return [4, 8];
     case 's3': return [1, 3];
+    default: {
+      const _exhaustive: never = transportType;
+      return [];
+    }
   }
 }
 

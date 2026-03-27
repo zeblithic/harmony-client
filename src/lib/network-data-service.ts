@@ -357,16 +357,19 @@ export class MockNetworkDataService implements NetworkDataService {
   }
 
   private addDiscoveredNodes(parentAddress: string): void {
-    const count = randomInt(2, 3);
     const parentNode = this.nodes.find((n) => n.address === parentAddress);
-    const parentHop = parentNode ? parentNode.hopDistance : 2;
+    if (!parentNode) {
+      // Parent not in our node list — skip to avoid creating links
+      // with incorrect transport types (self-comparison).
+      return;
+    }
+    const count = randomInt(2, 3);
 
     for (let i = 0; i < count; i++) {
       const { capabilities, modelName } = randomCapabilities();
-      const newNode = createNode(this.pickUniqueName(), false, parentHop + 1, capabilities, modelName);
+      const newNode = createNode(this.pickUniqueName(), false, parentNode.hopDistance + 1, capabilities, modelName);
       this.nodes.push(newNode);
-      const srcNode = parentNode ?? newNode;
-      this.links.push(createLink(parentAddress, newNode.address, srcNode, newNode));
+      this.links.push(createLink(parentAddress, newNode.address, parentNode, newNode));
     }
   }
 

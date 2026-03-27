@@ -29,6 +29,11 @@ describe('heatToColor', () => {
     expect(heatToColor(50, 'offline', false)).toBe('#72767d');
   });
 
+  it('returns amber for degraded regardless of heat', () => {
+    expect(heatToColor(0, 'degraded', false)).toBe('#faa61a');
+    expect(heatToColor(80, 'degraded', false)).toBe('#faa61a');
+  });
+
   it('returns accent blue for local node', () => {
     expect(heatToColor(50, 'online', true)).toBe('#5865f2');
   });
