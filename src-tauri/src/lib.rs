@@ -145,17 +145,13 @@ async fn connect_zenoh(
             msg
         })?;
 
-    // Store session BEFORE spawning task to prevent race with disconnect.
-    {
+    // Store session and clone closing flag in a single lock scope to
+    // prevent a concurrent disconnect from setting closing=true between
+    // the two operations.
+    let closing = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.session = Some(session);
-        // Reset closing flag for this new connection
         guard.closing.store(false, Ordering::SeqCst);
-    }
-
-    // Clone closing flag for the subscriber task
-    let closing = {
-        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.closing.clone()
     };
 
