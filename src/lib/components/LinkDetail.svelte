@@ -62,8 +62,12 @@
   </header>
 
   <p class="meta-line">
-    <span class="interface-type">{link.interfaceType.toUpperCase()}</span>
+    <span class="interface-type">{link.transportType}</span>
+    ({link.interfaceType.toUpperCase()})
     · capacity: {formatBandwidth(link.capacityBps)}
+    {#if link.encrypted}
+      · <span class="encrypted-badge" title="Post-quantum encrypted">🔒</span>
+    {/if}
   </p>
 
   <div class="metrics-section">
@@ -184,5 +188,9 @@
 
   .throughput-down {
     color: #5865f2;
+  }
+
+  .encrypted-badge {
+    font-size: 12px;
   }
 </style>

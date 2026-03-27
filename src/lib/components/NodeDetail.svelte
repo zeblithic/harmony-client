@@ -150,6 +150,15 @@
     {hopLabel} · last seen: {lastSeenSeconds}s
   </p>
 
+  {#if node.capabilities.length > 0}
+    <p class="meta-line">
+      {node.capabilities.join(', ')}
+      {#if node.modelName}
+        · Model: {node.modelName}
+      {/if}
+    </p>
+  {/if}
+
   {#if node.status === 'offline'}
     <p class="meta-line" style="color: var(--text-muted, #72767d)">No metrics available — node is offline</p>
   {:else}
