@@ -85,17 +85,20 @@ function createNode(
   modelName?: string,
 ): NetworkNode {
   const hotBaseline = capabilities.includes('inference');
+  const metrics = createInitialMetrics(hotBaseline);
+  const memPercent = (metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100;
+  const heatPercent = clamp(0.6 * metrics.cpuPercent + 0.4 * memPercent, 0, 100);
   return {
     address: randomHexAddress(),
     displayName: name,
     isLocal,
     hopDistance,
     status: 'online',
-    metrics: createInitialMetrics(hotBaseline),
+    metrics,
     metricsHistory: new RingBuffer<NodeMetrics>(METRICS_HISTORY_CAPACITY),
     lastSeen: Date.now(),
     capabilities,
-    heatPercent: 0,
+    heatPercent,
     modelName,
   };
 }
