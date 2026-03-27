@@ -40,15 +40,19 @@
         invoke: (cmd, args) => invoke(cmd, args),
         listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
       };
-      zenohService = new ZenohService(adapter);
-      zenohService.onChange = syncZenohState;
-      await zenohService.init();
+      const svc = new ZenohService(adapter);
+      svc.onChange = syncZenohState;
+      await svc.init();
+      // Only assign after successful init — if init() throws,
+      // zenohService stays null and stubs are used.
       if (destroyed) {
-        zenohService.destroy();
-        zenohService = null;
+        svc.destroy();
+      } else {
+        zenohService = svc;
       }
     } catch {
-      // Not in Tauri — zenohService stays null, stubs used
+      // Not in Tauri or init failed — zenohService stays null, stubs used
+      zenohService = null;
       console.log('Tauri not available — Zenoh connection disabled');
     }
   }
