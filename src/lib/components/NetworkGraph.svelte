@@ -14,7 +14,7 @@
   import { select } from 'd3-selection';
   import type { NetworkNode, NetworkLink } from '../network-types';
   import {
-    nodeHealthColor,
+    heatToColor,
     linkUtilizationColor,
     linkWidth,
     nodeRadius,
@@ -223,7 +223,7 @@
     for (const node of simNodes) {
       if (node.x == null || node.y == null) continue;
       const radius = nodeRadius(node.hopDistance);
-      const color = nodeHealthColor(node.status, node.isLocal);
+      const color = heatToColor(node.heatPercent, node.status, node.isLocal);
 
       // Selected glow
       if (selectedAddress && node.address === selectedAddress) {

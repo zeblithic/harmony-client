@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import type { NetworkNode, NetworkLink } from '../network-types';
   import { generateIdenticon } from '../identicon';
-  import { nodeHealthColor, linkUtilizationColor } from '../graph-utils';
+  import { heatToColor, linkUtilizationColor } from '../graph-utils';
   import Sparkline from './Sparkline.svelte';
   import { RingBuffer } from '../ring-buffer';
 
@@ -31,7 +31,7 @@
       : node.address,
   );
 
-  let statusColor = $derived(nodeHealthColor(node.status, node.isLocal));
+  let statusColor = $derived(heatToColor(node.heatPercent, node.status, node.isLocal));
 
   let hopLabel = $derived(
     node.hopDistance === 0 ? 'local' : node.hopDistance === 1 ? '1 hop' : `${node.hopDistance} hops`,

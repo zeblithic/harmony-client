@@ -1,13 +1,64 @@
-import type { NodeStatus } from './network-types';
+import type { NodeStatus, NodeCapability, TransportType } from './network-types';
 
-export function nodeHealthColor(status: NodeStatus, isLocal: boolean): string {
-  switch (status) {
-    case 'online':
-      return isLocal ? '#5865f2' : '#43b581';
-    case 'degraded':
-      return '#faa61a';
-    case 'offline':
-      return '#72767d';
+export const CAPABILITY_COLORS: Record<NodeCapability, string> = {
+  inference: '#5865f2',
+  storage: '#57f287',
+  routing: '#fee75c',
+  compute: '#eb459e',
+};
+
+const CAPABILITY_INDEX: Record<NodeCapability, number> = {
+  inference: 0,
+  storage: 1,
+  routing: 2,
+  compute: 3,
+};
+
+function lerpColor(a: string, b: string, t: number): string {
+  const ar = parseInt(a.slice(1, 3), 16);
+  const ag = parseInt(a.slice(3, 5), 16);
+  const ab = parseInt(a.slice(5, 7), 16);
+  const br = parseInt(b.slice(1, 3), 16);
+  const bg = parseInt(b.slice(3, 5), 16);
+  const bb = parseInt(b.slice(5, 7), 16);
+  const r = Math.round(ar + (br - ar) * t);
+  const g = Math.round(ag + (bg - ag) * t);
+  const bl = Math.round(ab + (bb - ab) * t);
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${bl.toString(16).padStart(2, '0')}`;
+}
+
+export function heatToColor(percent: number, status: NodeStatus, isLocal: boolean): string {
+  if (status === 'offline') return '#72767d';
+  if (isLocal) return '#5865f2';
+  const p = Math.max(0, Math.min(100, percent));
+  if (p <= 50) {
+    return lerpColor('#43b581', '#faa61a', p / 50);
+  }
+  return lerpColor('#faa61a', '#ed4245', (p - 50) / 50);
+}
+
+export function badgePosition(
+  capability: NodeCapability,
+  nr: number,
+): { dx: number; dy: number } {
+  const offset = Math.round(nr * 0.7);
+  const index = CAPABILITY_INDEX[capability];
+  switch (index) {
+    case 0: return { dx: offset, dy: -offset };
+    case 1: return { dx: offset, dy: offset };
+    case 2: return { dx: -offset, dy: offset };
+    case 3: return { dx: -offset, dy: -offset };
+    default: return { dx: offset, dy: -offset };
+  }
+}
+
+export function linkDashPattern(transportType: TransportType): number[] {
+  switch (transportType) {
+    case 'iroh': return [];
+    case 'reticulum': return [8, 4];
+    case 'zenoh': return [2, 4];
+    case 'rawlink': return [4, 8];
+    case 's3': return [1, 3];
   }
 }
 

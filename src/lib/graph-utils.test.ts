@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
-  nodeHealthColor,
+  heatToColor,
+  badgePosition,
+  linkDashPattern,
+  CAPABILITY_COLORS,
   linkUtilizationColor,
   linkWidth,
   findNodeAtPoint,
@@ -9,29 +12,98 @@ import {
   nodeRadius,
 } from './graph-utils';
 
-describe('nodeHealthColor', () => {
-  it('returns green for healthy online nodes', () => {
-    expect(nodeHealthColor('online', false)).toBe('#43b581');
+describe('heatToColor', () => {
+  it('returns green for 0% online non-local', () => {
+    expect(heatToColor(0, 'online', false)).toBe('#43b581');
   });
 
-  it('returns accent blue for local node when online', () => {
-    expect(nodeHealthColor('online', true)).toBe('#5865f2');
+  it('returns amber for 50% online non-local', () => {
+    expect(heatToColor(50, 'online', false)).toBe('#faa61a');
   });
 
-  it('returns amber for degraded', () => {
-    expect(nodeHealthColor('degraded', false)).toBe('#faa61a');
-  });
-
-  it('returns amber for degraded local node', () => {
-    expect(nodeHealthColor('degraded', true)).toBe('#faa61a');
+  it('returns red for 100% online non-local', () => {
+    expect(heatToColor(100, 'online', false)).toBe('#ed4245');
   });
 
   it('returns gray for offline', () => {
-    expect(nodeHealthColor('offline', false)).toBe('#72767d');
+    expect(heatToColor(50, 'offline', false)).toBe('#72767d');
   });
 
-  it('returns gray for offline local node', () => {
-    expect(nodeHealthColor('offline', true)).toBe('#72767d');
+  it('returns accent blue for local node', () => {
+    expect(heatToColor(50, 'online', true)).toBe('#5865f2');
+  });
+
+  it('clamps below 0 to same as 0%', () => {
+    expect(heatToColor(-10, 'online', false)).toBe(heatToColor(0, 'online', false));
+  });
+
+  it('clamps above 100 to same as 100%', () => {
+    expect(heatToColor(150, 'online', false)).toBe(heatToColor(100, 'online', false));
+  });
+
+  it('interpolates at 25%', () => {
+    const color = heatToColor(25, 'online', false);
+    expect(color).toMatch(/^#[0-9a-f]{6}$/);
+    expect(color).not.toBe('#43b581');
+    expect(color).not.toBe('#faa61a');
+  });
+});
+
+describe('badgePosition', () => {
+  it('places inference at top-right', () => {
+    expect(badgePosition('inference', 10)).toEqual({ dx: 7, dy: -7 });
+  });
+
+  it('places storage at bottom-right', () => {
+    expect(badgePosition('storage', 10)).toEqual({ dx: 7, dy: 7 });
+  });
+
+  it('places routing at bottom-left', () => {
+    expect(badgePosition('routing', 10)).toEqual({ dx: -7, dy: 7 });
+  });
+
+  it('places compute at top-left', () => {
+    expect(badgePosition('compute', 10)).toEqual({ dx: -7, dy: -7 });
+  });
+});
+
+describe('linkDashPattern', () => {
+  it('returns solid for iroh', () => {
+    expect(linkDashPattern('iroh')).toEqual([]);
+  });
+
+  it('returns long dash for reticulum', () => {
+    expect(linkDashPattern('reticulum')).toEqual([8, 4]);
+  });
+
+  it('returns short dash for zenoh', () => {
+    expect(linkDashPattern('zenoh')).toEqual([2, 4]);
+  });
+
+  it('returns sparse dash for rawlink', () => {
+    expect(linkDashPattern('rawlink')).toEqual([4, 8]);
+  });
+
+  it('returns dot pattern for s3', () => {
+    expect(linkDashPattern('s3')).toEqual([1, 3]);
+  });
+});
+
+describe('CAPABILITY_COLORS', () => {
+  it('maps inference to blurple', () => {
+    expect(CAPABILITY_COLORS.inference).toBe('#5865f2');
+  });
+
+  it('maps storage to green', () => {
+    expect(CAPABILITY_COLORS.storage).toBe('#57f287');
+  });
+
+  it('maps routing to yellow', () => {
+    expect(CAPABILITY_COLORS.routing).toBe('#fee75c');
+  });
+
+  it('maps compute to pink', () => {
+    expect(CAPABILITY_COLORS.compute).toBe('#eb459e');
   });
 });
 
