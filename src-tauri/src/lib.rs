@@ -55,15 +55,22 @@ fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
 }
 
 async fn disconnect_inner(app: &AppHandle, state: &Mutex<ZenohState>) {
-    let (had_session, task) = {
+    let (session, task) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        // Drop session → subscriber's recv_async() returns Err → task exits cleanly
-        let had = guard.session.take().is_some();
-        (had, guard.task.take())
+        (guard.session.take(), guard.task.take())
     }; // Guard dropped here, before the await
+
+    // Explicitly close the session so all subscribers receive Err.
+    // Zenoh sessions are Arc-based — dropping the Option alone only
+    // decrements the refcount. The subscriber task holds its own Arc
+    // clone, so recv_async() would never error without an explicit close.
+    let had_session = session.is_some();
+    if let Some(session) = session {
+        let _ = session.close().await;
+    }
     if let Some(task) = task {
         let _ = task.await;
     }

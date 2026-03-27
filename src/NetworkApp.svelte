@@ -26,30 +26,46 @@
   let discoveredCount = $state(0);
   let zenohError = $state<string | undefined>(undefined);
   let zenohService: ZenohService | null = null;
+  let destroyed = false;
 
-  // Detect Tauri environment and create real ZenohService
+  // Detect Tauri environment and create real ZenohService.
+  // Uses a `destroyed` flag to handle the race where the component
+  // unmounts before the async init resolves — prevents listener leaks.
   async function initZenohService() {
     try {
-      // Dynamic import — fails gracefully in browser dev mode (no Tauri)
       const { invoke } = await import('@tauri-apps/api/core');
       const { listen } = await import('@tauri-apps/api/event');
+      if (destroyed) return; // Component unmounted during await
       const adapter: TauriAdapter = {
         invoke: (cmd, args) => invoke(cmd, args),
         listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
       };
       zenohService = new ZenohService(adapter);
       await zenohService.init();
+      if (destroyed) {
+        zenohService.destroy();
+        zenohService = null;
+      }
     } catch {
       // Not in Tauri — zenohService stays null, stubs used
       console.log('Tauri not available — Zenoh connection disabled');
     }
   }
 
+  function syncZenohState() {
+    if (zenohService) {
+      zenohStatus = zenohService.connectionStatus;
+      discoveredCount = zenohService.discoveredNodes.size;
+      zenohError = zenohService.errorMessage;
+    }
+  }
+
   function handleConnect(endpoint: string) {
     if (zenohService) {
-      zenohService.connect(endpoint);
+      // Set connecting immediately for responsive UI
+      zenohStatus = 'connecting';
+      zenohService.connect(endpoint).then(syncZenohState);
     } else {
-      // Stub for browser dev mode
       zenohStatus = 'connecting';
       console.log('Zenoh connect requested (no Tauri):', endpoint);
       setTimeout(() => {
@@ -59,12 +75,12 @@
   }
 
   function handleDisconnect() {
+    // Update UI immediately — don't wait for async invoke
+    zenohStatus = 'disconnected';
+    discoveredCount = 0;
+    zenohError = undefined;
     if (zenohService) {
       zenohService.disconnect();
-    } else {
-      zenohStatus = 'disconnected';
-      discoveredCount = 0;
-      zenohError = undefined;
     }
   }
 
@@ -128,6 +144,7 @@
     service.start();
     initZenohService();
     return () => {
+      destroyed = true;
       service.stop();
       zenohService?.destroy();
     };
