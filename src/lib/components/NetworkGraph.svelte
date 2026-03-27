@@ -12,7 +12,7 @@
   } from 'd3-force';
   import { zoom, zoomIdentity, type ZoomTransform, type ZoomBehavior } from 'd3-zoom';
   import { select } from 'd3-selection';
-  import type { NetworkNode, NetworkLink } from '../network-types';
+  import type { NetworkNode, NetworkLink, NodeCapability, TransportType } from '../network-types';
   import {
     heatToColor,
     linkUtilizationColor,
@@ -21,6 +21,9 @@
     findNodeAtPoint,
     findLinkAtPoint,
     advanceParticle,
+    badgePosition,
+    linkDashPattern,
+    CAPABILITY_COLORS,
   } from '../graph-utils';
 
   interface SimNode extends SimulationNodeDatum {
@@ -29,11 +32,16 @@
     hopDistance: number;
     status: 'online' | 'degraded' | 'offline';
     isLocal: boolean;
+    capabilities: NodeCapability[];
+    heatPercent: number;
+    modelName?: string;
   }
 
   interface SimLink extends SimulationLinkDatum<SimNode> {
     id: string;
     utilizationPercent: number;
+    transportType: TransportType;
+    encrypted: boolean;
   }
 
   interface Particle {
@@ -77,6 +85,9 @@
       hopDistance: n.hopDistance,
       status: n.status,
       isLocal: n.isLocal,
+      capabilities: n.capabilities,
+      heatPercent: n.heatPercent,
+      modelName: n.modelName,
     }));
   }
 
@@ -89,6 +100,8 @@
         source: nodeMap.get(l.source)!,
         target: nodeMap.get(l.target)!,
         utilizationPercent: l.utilizationPercent,
+        transportType: l.transportType,
+        encrypted: l.encrypted,
       }));
   }
 
@@ -117,6 +130,8 @@
       const source = nodeSourceMap.get(simNode.address);
       if (source) {
         simNode.status = source.status;
+        simNode.heatPercent = source.heatPercent;
+        simNode.capabilities = source.capabilities;
       }
     }
 
@@ -126,6 +141,8 @@
       const source = linkSourceMap.get(simLink.id);
       if (source) {
         simLink.utilizationPercent = source.utilizationPercent;
+        simLink.transportType = source.transportType;
+        simLink.encrypted = source.encrypted;
       }
     }
 
@@ -149,6 +166,9 @@
           hopDistance: n.hopDistance,
           status: n.status,
           isLocal: n.isLocal,
+          capabilities: n.capabilities,
+          heatPercent: n.heatPercent,
+          modelName: n.modelName,
         };
       });
       simLinks = createSimLinks(links, simNodes);
@@ -188,6 +208,20 @@
       const target = link.target as SimNode;
       if (source.x == null || source.y == null || target.x == null || target.y == null) continue;
 
+      // Encrypted link glow
+      if (link.encrypted) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.lineWidth = linkWidth(link.utilizationPercent) * 2;
+        ctx.setLineDash(linkDashPattern(link.transportType));
+        ctx.beginPath();
+        ctx.moveTo(source.x, source.y);
+        ctx.lineTo(target.x, target.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      ctx.setLineDash(linkDashPattern(link.transportType));
       ctx.beginPath();
       ctx.moveTo(source.x, source.y);
       ctx.lineTo(target.x, target.y);
@@ -195,6 +229,7 @@
       ctx.lineWidth = linkWidth(link.utilizationPercent);
       ctx.stroke();
     }
+    ctx.setLineDash([]);
   }
 
   function drawParticles(ctx: CanvasRenderingContext2D) {
@@ -258,6 +293,21 @@
       const label =
         node.displayName.length > 12 ? node.displayName.slice(0, 12) + '...' : node.displayName;
       ctx.fillText(label, node.x, node.y + radius + 14);
+
+      // Draw capability badges when zoomed in enough
+      if (transform.k > 0.5) {
+        const r = nodeRadius(node.hopDistance);
+        for (const cap of node.capabilities) {
+          const { dx, dy } = badgePosition(cap, r);
+          ctx.beginPath();
+          ctx.arc(node.x + dx, node.y + dy, 4, 0, Math.PI * 2);
+          ctx.fillStyle = CAPABILITY_COLORS[cap];
+          ctx.fill();
+          ctx.strokeStyle = '#1e1f22';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
     }
   }
 
