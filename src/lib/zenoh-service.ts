@@ -81,12 +81,14 @@ export class ZenohService {
   }
 
   async disconnect(): Promise<void> {
+    this.connectionStatus = 'disconnected';
+    this.errorMessage = undefined;
+    this.discoveredNodes.clear();
     try {
       await this.adapter.invoke('disconnect_zenoh');
     } catch {
-      // Ignore disconnect errors
+      // Ignore disconnect errors — backend may already be gone
     }
-    this.discoveredNodes.clear();
   }
 
   destroy(): void {

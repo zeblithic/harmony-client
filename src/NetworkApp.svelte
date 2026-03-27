@@ -2,6 +2,7 @@
   import './app.css';
   import { MockNetworkDataService } from './lib/network-data-service';
   import type { NetworkNode, NetworkLink } from './lib/network-types';
+  import { ZenohService, type TauriAdapter } from './lib/zenoh-service';
   import NetworkToolbar from './lib/components/NetworkToolbar.svelte';
   import NetworkGraph from './lib/components/NetworkGraph.svelte';
   import DetailPanel from './lib/components/DetailPanel.svelte';
@@ -19,27 +20,52 @@
   let announcement = $state('');
   let graphComponent: NetworkGraph;
 
-  // Zenoh connection state (stubs for dev/browser mode)
+  // Zenoh connection state — owned by NetworkApp as $state for reactivity.
+  // ZenohService updates its internal fields; we sync them on each tick.
   let zenohStatus = $state<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   let discoveredCount = $state(0);
   let zenohError = $state<string | undefined>(undefined);
+  let zenohService: ZenohService | null = null;
+
+  // Detect Tauri environment and create real ZenohService
+  async function initZenohService() {
+    try {
+      // Dynamic import — fails gracefully in browser dev mode (no Tauri)
+      const { invoke } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+      const adapter: TauriAdapter = {
+        invoke: (cmd, args) => invoke(cmd, args),
+        listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
+      };
+      zenohService = new ZenohService(adapter);
+      await zenohService.init();
+    } catch {
+      // Not in Tauri — zenohService stays null, stubs used
+      console.log('Tauri not available — Zenoh connection disabled');
+    }
+  }
 
   function handleConnect(endpoint: string) {
-    zenohStatus = 'connecting';
-    console.log('Zenoh connect requested:', endpoint);
-    // In Tauri mode, ZenohService.connect() would be called here.
-    // In dev browser mode, no Tauri available — reset after timeout.
-    setTimeout(() => {
-      if (zenohStatus === 'connecting') {
-        zenohStatus = 'disconnected';
-      }
-    }, 2000);
+    if (zenohService) {
+      zenohService.connect(endpoint);
+    } else {
+      // Stub for browser dev mode
+      zenohStatus = 'connecting';
+      console.log('Zenoh connect requested (no Tauri):', endpoint);
+      setTimeout(() => {
+        if (zenohStatus === 'connecting') zenohStatus = 'disconnected';
+      }, 2000);
+    }
   }
 
   function handleDisconnect() {
-    zenohStatus = 'disconnected';
-    discoveredCount = 0;
-    zenohError = undefined;
+    if (zenohService) {
+      zenohService.disconnect();
+    } else {
+      zenohStatus = 'disconnected';
+      discoveredCount = 0;
+      zenohError = undefined;
+    }
   }
 
   // Load table preference from localStorage
@@ -72,6 +98,13 @@
   service.onTick = () => {
     nodes = service.nodes.map((n) => ({ ...n }));
     links = service.links.map((l) => ({ ...l }));
+
+    // Sync ZenohService state into reactive $state variables
+    if (zenohService) {
+      zenohStatus = zenohService.connectionStatus;
+      discoveredCount = zenohService.discoveredNodes.size;
+      zenohError = zenohService.errorMessage;
+    }
   };
 
   function handleNodeClick(address: string) {
@@ -93,7 +126,11 @@
 
   $effect(() => {
     service.start();
-    return () => service.stop();
+    initZenohService();
+    return () => {
+      service.stop();
+      zenohService?.destroy();
+    };
   });
 </script>
 

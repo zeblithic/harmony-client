@@ -123,6 +123,14 @@ async fn connect_zenoh(
             msg
         })?;
 
+    // Store session BEFORE spawning task to prevent race with disconnect.
+    // If disconnect_zenoh is called between spawn and store, it would miss
+    // the session and leave an orphaned connection.
+    {
+        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.session = Some(session);
+    }
+
     // Spawn subscriber task
     let app_handle = app.clone();
     let task = tokio::spawn(async move {
@@ -140,10 +148,9 @@ async fn connect_zenoh(
         }
     });
 
-    // Store state
+    // Store task handle (session already stored above)
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.session = Some(session);
         guard.task = Some(task);
     }
 
