@@ -114,13 +114,7 @@
   service.onTick = () => {
     nodes = service.nodes.map((n) => ({ ...n }));
     links = service.links.map((l) => ({ ...l }));
-
-    // Sync ZenohService state into reactive $state variables
-    if (zenohService) {
-      zenohStatus = zenohService.connectionStatus;
-      discoveredCount = zenohService.discoveredNodes.size;
-      zenohError = zenohService.errorMessage;
-    }
+    syncZenohState();
   };
 
   function handleNodeClick(address: string) {
