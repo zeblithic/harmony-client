@@ -33,7 +33,10 @@
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
-    // Publish to network if Tauri is available
+    // Publish to network if Tauri is available.
+    // Uses direct invoke rather than ZenohService.publishProfile() because
+    // ZenohService lives in NetworkApp (not accessible here). Both paths
+    // invoke the same 'publish_profile' command.
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('publish_profile', {

@@ -197,14 +197,14 @@ async fn connect_zenoh(
     };
 
     // Subscribe to profile updates.
-    let profile_subscriber = session
-        .declare_subscriber("harmony/profile/*")
-        .await
-        .map_err(|e| {
+    let profile_subscriber = match session.declare_subscriber("harmony/profile/*").await {
+        Ok(s) => s,
+        Err(e) => {
             let msg = format!("profile subscribe failed: {e}");
-            let _ = session.close(); // don't await in error path
-            msg
-        })?;
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
 
     // Check again after declare_subscriber awaits
     let was_cancelled = closing.load(Ordering::SeqCst);
@@ -264,7 +264,21 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("profile-update", &profile);
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                // Same error handling as capacity branch — emit
+                                // session-lost so frontend can auto-reconnect.
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -311,6 +325,16 @@ async fn publish_profile(
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.session.clone().ok_or_else(|| "not connected".to_string())?
     };
+    // Validate address — reject Zenoh reserved characters
+    if profile.address.contains('/')
+        || profile.address.contains('*')
+        || profile.address.contains('?')
+        || profile.address.contains('#')
+        || profile.address.contains('$')
+        || profile.address.is_empty()
+    {
+        return Err(format!("invalid address: {}", profile.address));
+    }
     let key = format!("harmony/profile/{}", profile.address);
     let payload =
         serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
