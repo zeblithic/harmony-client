@@ -65,34 +65,30 @@ export class ZenohService {
       (event) => {
         const status = event.payload as ZenohStatusEvent;
         if (status.status === 'connected') {
-          // Only accept 'connected' if we're still in 'connecting' state.
-          // If disconnect() was called while connect was in flight,
-          // connectionStatus is already 'disconnected' and we must ignore
-          // the stale 'connected' event from the backend.
           if (this.connectionStatus === 'connecting') {
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
             this.reconnectAttempt = 0;
-            this.cancelReconnect(); // Cancel any pending reconnect timer
+            this.cancelReconnect();
+            this.onChange?.();
           }
         } else if (status.status === 'disconnected') {
           if (this.connectionStatus === 'disconnected') {
             this.errorMessage = undefined;
+            this.onChange?.();
           }
         } else if (status.status === 'error') {
-          // Ignore stale error events after user-initiated disconnect.
           if (this.userDisconnected) return;
-          // If a reconnect timer is already active, don't overwrite
-          // 'reconnecting' status with 'error' — it would confuse the
-          // UI into showing an error while a timer is silently ticking.
           if (this.reconnectTimer !== null) return;
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
           if (this.lastEndpoint) {
+            // scheduleReconnect calls onChange internally
             this.scheduleReconnect();
+          } else {
+            this.onChange?.();
           }
         }
-        this.onChange?.();
       },
     );
     this.unlisteners.push(unlistenStatus);
