@@ -13,7 +13,16 @@ export function loadProfile(): Profile {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored);
-      return { ...DEFAULT_PROFILE, ...parsed };
+      // Filter out null/undefined values so they don't override defaults.
+      // e.g. { "address": null } in stored JSON shouldn't bypass the
+      // required string fields from DEFAULT_PROFILE.
+      const safe: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(parsed)) {
+        if (value != null) {
+          safe[key] = value;
+        }
+      }
+      return { ...DEFAULT_PROFILE, ...safe };
     }
   } catch {
     // Corrupt or missing — return defaults

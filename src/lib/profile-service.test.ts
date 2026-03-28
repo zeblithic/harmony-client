@@ -38,6 +38,18 @@ describe('profile-service', () => {
     expect(loaded.displayName).toBe('Anonymous');
   });
 
+  it('filters null values from stored JSON', () => {
+    localStorage.setItem('harmony-profile', JSON.stringify({
+      address: null,
+      displayName: null,
+      statusText: 'valid',
+    }));
+    const loaded = loadProfile();
+    expect(loaded.address).toBe('local'); // default, not null
+    expect(loaded.displayName).toBe('Anonymous'); // default, not null
+    expect(loaded.statusText).toBe('valid');
+  });
+
   it('updateProfile merges and persists', () => {
     saveProfile({ address: 'local', displayName: 'Original' });
     const updated = updateProfile({ statusText: 'New status' });
