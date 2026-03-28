@@ -56,6 +56,7 @@
     connecting: '#faa61a',
     connected: '#43b581',
     error: '#ed4245',
+    reconnecting: '#faa61a',
   };
 
   let statusLabel = $derived.by(() => {
@@ -64,6 +65,7 @@
       case 'connecting': return 'Connecting...';
       case 'connected': return `Connected, ${discoveredCount} node${discoveredCount !== 1 ? 's' : ''} discovered`;
       case 'error': return `Error: ${errorMessage ?? 'unknown'}`;
+      case 'reconnecting': return errorMessage ?? 'Reconnecting...';
     }
   });
 </script>
@@ -74,17 +76,17 @@
     type="text"
     bind:value={endpoint}
     placeholder="tcp/host:port"
-    disabled={connectionStatus === 'connected' || connectionStatus === 'connecting'}
+    disabled={connectionStatus === 'connected' || connectionStatus === 'connecting' || connectionStatus === 'reconnecting'}
     onkeydown={handleKeydown}
     aria-label="Zenoh endpoint"
   />
 
-  {#if connectionStatus === 'connected' || connectionStatus === 'connecting'}
+  {#if connectionStatus === 'connected' || connectionStatus === 'connecting' || connectionStatus === 'reconnecting'}
     <button
       class="connect-btn disconnect"
       onclick={handleDisconnect}
     >
-      {connectionStatus === 'connecting' ? 'Cancel' : 'Disconnect'}
+      {connectionStatus === 'connecting' || connectionStatus === 'reconnecting' ? 'Cancel' : 'Disconnect'}
     </button>
   {:else}
     <button class="connect-btn" onclick={handleConnect}>

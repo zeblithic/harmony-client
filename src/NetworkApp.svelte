@@ -2,7 +2,7 @@
   import './app.css';
   import { MockNetworkDataService } from './lib/network-data-service';
   import type { NetworkNode, NetworkLink } from './lib/network-types';
-  import { ZenohService, type TauriAdapter } from './lib/zenoh-service';
+  import { ZenohService, type TauriAdapter, type ConnectionStatus } from './lib/zenoh-service';
   import NetworkToolbar from './lib/components/NetworkToolbar.svelte';
   import NetworkGraph from './lib/components/NetworkGraph.svelte';
   import DetailPanel from './lib/components/DetailPanel.svelte';
@@ -10,7 +10,7 @@
   import AriaAnnouncer from './lib/components/AriaAnnouncer.svelte';
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
   import ConnectionBar from './lib/components/ConnectionBar.svelte';
-  import { discoveredToNetworkNode, pruneRingBufferCache } from './lib/zenoh-utils';
+  import { discoveredToNetworkNode, pruneRingBufferCache, filterStaleNodes } from './lib/zenoh-utils';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -23,7 +23,7 @@
 
   // Zenoh connection state — owned by NetworkApp as $state for reactivity.
   // ZenohService updates its internal fields; we sync them on each tick.
-  let zenohStatus = $state<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  let zenohStatus = $state<ConnectionStatus>('disconnected');
   let discoveredCount = $state(0);
   let zenohError = $state<string | undefined>(undefined);
   let zenohService: ZenohService | null = null;
@@ -65,7 +65,8 @@
   function syncZenohState() {
     if (zenohService) {
       zenohStatus = zenohService.connectionStatus;
-      discoveredCount = zenohService.discoveredNodes.size;
+      // Use filtered count so the badge matches the graph (excludes stale nodes)
+      discoveredCount = filterStaleNodes(zenohService.discoveredNodes).length;
       zenohError = zenohService.errorMessage;
     }
   }
@@ -73,13 +74,14 @@
   /** Merge mock nodes with real discovered nodes for the graph. */
   function mergeNodes(): NetworkNode[] {
     const mockNodes = service.nodes.map((n) => ({ ...n }));
-    if (!zenohService || zenohService.connectionStatus !== 'connected' || zenohService.discoveredNodes.size === 0) {
+    if (!zenohService || zenohService.connectionStatus !== 'connected') {
       pruneRingBufferCache(new Set()); // Clear all cached buffers
       return mockNodes;
     }
+    const freshDiscovered = filterStaleNodes(zenohService.discoveredNodes);
     const realAddresses = new Set<string>();
     const realNodes: NetworkNode[] = [];
-    for (const discovered of zenohService.discoveredNodes.values()) {
+    for (const discovered of freshDiscovered) {
       realNodes.push(discoveredToNetworkNode(discovered));
       realAddresses.add(discovered.nodeAddr);
     }

@@ -27,6 +27,24 @@ export function pruneRingBufferCache(activeAddresses: Set<string>): void {
   }
 }
 
+/** Default age threshold in milliseconds (30 seconds). */
+export const NODE_AGE_THRESHOLD_MS = 30_000;
+
+/** Filter out discovered nodes whose lastSeen is older than the threshold. */
+export function filterStaleNodes(
+  nodes: Map<string, DiscoveredNode>,
+  now: number = Date.now(),
+  thresholdMs: number = NODE_AGE_THRESHOLD_MS,
+): DiscoveredNode[] {
+  const fresh: DiscoveredNode[] = [];
+  for (const node of nodes.values()) {
+    if (now - node.lastSeen <= thresholdMs) {
+      fresh.push(node);
+    }
+  }
+  return fresh;
+}
+
 /** Convert a DiscoveredNode from Zenoh capacity into a NetworkNode for the graph. */
 export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
   // Truncate to 4 chars so displayName "abcd (live)" = 11 chars,
