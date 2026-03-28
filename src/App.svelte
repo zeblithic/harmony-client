@@ -30,9 +30,23 @@
 
   let myProfile = $state(loadProfile());
 
-  function handleProfileSave(profile: Profile) {
+  async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
+    // Publish to network if Tauri is available
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('publish_profile', {
+        profile: {
+          address: profile.address,
+          displayName: profile.displayName,
+          statusText: profile.statusText,
+          avatarUrl: profile.avatarUrl,
+        },
+      });
+    } catch {
+      // Not in Tauri or not connected — profile saved locally only
+    }
   }
 
   // Viewed vine IDs — lifted here so state survives VineFeed remounts on mode toggle
