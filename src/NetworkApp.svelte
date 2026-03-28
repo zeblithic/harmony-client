@@ -68,7 +68,7 @@
   function handleConnect(endpoint: string) {
     if (zenohService) {
       // ZenohService.connect() calls onChange → syncZenohState immediately
-      zenohService.connect(endpoint);
+      zenohService.connect(endpoint).catch(() => {});
     } else {
       zenohStatus = 'connecting';
       console.log('Zenoh connect requested (no Tauri):', endpoint);
@@ -84,7 +84,7 @@
     discoveredCount = 0;
     zenohError = undefined;
     if (zenohService) {
-      zenohService.disconnect();
+      zenohService.disconnect().catch(() => {});
     }
   }
 
@@ -147,7 +147,7 @@
       // Disconnect the backend session before removing listeners.
       // Without this, the Zenoh session stays open (subscriber task
       // keeps running) for the lifetime of the app process.
-      zenohService?.disconnect();
+      zenohService?.disconnect().catch(() => {});
       zenohService?.destroy();
     };
   });
