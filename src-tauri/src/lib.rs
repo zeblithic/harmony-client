@@ -78,6 +78,34 @@ fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     })
 }
 
+/// Telemetry event pushed to the frontend via IPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryEventPayload {
+    pub node_addr: String,
+    pub intent: String,
+    pub sequence: u64,
+    pub timestamp: u64,
+    pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
+    let event = harmony_telemetry::decode_event(wire).ok()?;
+    Some(TelemetryEventPayload {
+        node_addr: event.node_addr,
+        intent: event.intent,
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        payload: event.payload,
+        confidence: event.confidence,
+        source: event.source,
+    })
+}
+
 /// Disconnect the current session. If `expected_gen` is `Some(n)`, only
 /// disconnect if the current generation matches — prevents a stale
 /// disconnect from tearing down a newer session. Pass `None` to
@@ -500,5 +528,55 @@ mod tests {
         assert!(!json.contains("\"display_name\""), "unexpected snake_case: {json}");
         // None fields should be skipped
         assert!(!json.contains("statusText"), "None field should be skipped: {json}");
+    }
+
+    #[test]
+    fn parse_telemetry_valid_health() {
+        let event = harmony_telemetry::TelemetryEvent {
+            node_addr: "abcd1234".to_string(),
+            intent: "health".to_string(),
+            sequence: 1,
+            timestamp: 1711600000,
+            payload: serde_json::json!({"cpu_percent": 42.5, "mem_mb": 512}),
+            confidence: None,
+            source: None,
+        };
+        let wire = harmony_telemetry::encode_event(&event).unwrap();
+        let result = parse_telemetry(&wire);
+        let payload = result.unwrap();
+        assert_eq!(payload.node_addr, "abcd1234");
+        assert_eq!(payload.intent, "health");
+        assert_eq!(payload.sequence, 1);
+        assert_eq!(payload.timestamp, 1711600000);
+    }
+
+    #[test]
+    fn parse_telemetry_valid_capacity_changed() {
+        let event = harmony_telemetry::TelemetryEvent {
+            node_addr: "node42".to_string(),
+            intent: "capacity_changed".to_string(),
+            sequence: 5,
+            timestamp: 1711600100,
+            payload: serde_json::json!({"model_cid": "aa".repeat(32), "ready": true}),
+            confidence: None,
+            source: Some("qwen3-0.6b".to_string()),
+        };
+        let wire = harmony_telemetry::encode_event(&event).unwrap();
+        let result = parse_telemetry(&wire);
+        let payload = result.unwrap();
+        assert_eq!(payload.intent, "capacity_changed");
+        assert_eq!(payload.source, Some("qwen3-0.6b".to_string()));
+    }
+
+    #[test]
+    fn parse_telemetry_empty_payload() {
+        let result = parse_telemetry(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_telemetry_bad_tag() {
+        let result = parse_telemetry(&[0xFF, b'{', b'}']);
+        assert!(result.is_none());
     }
 }
