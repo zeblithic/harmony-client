@@ -15,6 +15,7 @@ describe('discoveredToNetworkNode with telemetry', () => {
     // memoryUsedBytes stays 0 — without a real memoryTotalBytes,
     // setting used would produce astronomically wrong percentages.
     expect(node.metrics.memoryUsedBytes).toBe(0);
+    expect(node.metrics.memoryTotalBytes).toBe(1);
   });
 
   it('uses zero sentinels when no telemetry', () => {

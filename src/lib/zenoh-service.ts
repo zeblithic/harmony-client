@@ -145,6 +145,9 @@ export class ZenohService {
         const node = this.discoveredNodes.get(telem.nodeAddr);
         if (!node) return;
 
+        // Guard: payload must be a non-null object before accessing properties
+        if (telem.payload === null || typeof telem.payload !== 'object') return;
+
         if (telem.intent === 'health') {
           const p = telem.payload as import('./telemetry-types').HealthPayload;
           if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
