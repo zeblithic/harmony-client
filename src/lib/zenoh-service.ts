@@ -113,14 +113,20 @@ export class ZenohService {
     try {
       await this.adapter.invoke('connect_zenoh', { endpoint });
     } catch (e) {
-      // If user disconnected while invoke was in flight, don't overwrite
-      // the 'disconnected' status with 'error'.
+      // Guards matching the error event handler:
+      // 1. Don't overwrite 'disconnected' after user cancel
       if (this.userDisconnected) return;
+      // 2. Don't overwrite 'reconnecting' if the error event handler
+      //    already scheduled a reconnect for this failure
+      if (this.reconnectTimer !== null) return;
+
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
-      this.onChange?.();
       if (this.lastEndpoint) {
+        // scheduleReconnect sets status to 'reconnecting' before onChange
         this.scheduleReconnect();
+      } else {
+        this.onChange?.();
       }
     }
   }
