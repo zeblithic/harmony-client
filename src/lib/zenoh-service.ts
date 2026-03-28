@@ -41,6 +41,9 @@ export class ZenohService {
   discoveredNodes: Map<string, DiscoveredNode> = new Map();
   peerProfiles: Map<string, ProfilePayload> = new Map();
   errorMessage?: string;
+  /** Own address — profile updates matching this are filtered out
+   *  so our own published profile doesn't appear in peerProfiles. */
+  ownAddress: string | null = null;
 
   /** Called whenever service state changes so the UI can sync immediately. */
   onChange?: () => void;
@@ -80,6 +83,9 @@ export class ZenohService {
       (event) => {
         if (this.connectionStatus !== 'connected') return;
         const profile = event.payload as ProfilePayload;
+        // Filter out our own profile — Zenoh delivers local PUTs to
+        // local subscribers by default, so our published profile echoes back.
+        if (this.ownAddress && profile.address === this.ownAddress) return;
         this.peerProfiles.set(profile.address, profile);
         this.onChange?.();
       },

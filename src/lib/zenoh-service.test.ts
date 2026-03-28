@@ -179,6 +179,27 @@ describe('ZenohService', () => {
     expect(service.peerProfiles.size).toBe(0);
   });
 
+  it('filters own profile from peerProfiles', async () => {
+    service.ownAddress = 'myaddr';
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
+    // Own profile should be ignored
+    mock.emit('profile-update', {
+      address: 'myaddr',
+      displayName: 'Me',
+    } satisfies ProfilePayload);
+    expect(service.peerProfiles.size).toBe(0);
+
+    // Other peer's profile should be accepted
+    mock.emit('profile-update', {
+      address: 'other',
+      displayName: 'Alice',
+    } satisfies ProfilePayload);
+    expect(service.peerProfiles.size).toBe(1);
+  });
+
   it('publishProfile invokes publish_profile command', async () => {
     await service.publishProfile({
       address: 'local',
