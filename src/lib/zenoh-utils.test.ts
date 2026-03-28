@@ -17,7 +17,8 @@ describe('discoveredToNetworkNode', () => {
 
   it('truncates displayName and adds (live) suffix', () => {
     const node = discoveredToNetworkNode(sample);
-    expect(node.displayName).toBe('deadbeef (live)');
+    expect(node.displayName).toBe('dead (live)');
+    expect(node.displayName.length).toBeLessThanOrEqual(12);
   });
 
   it('marks online when ready', () => {

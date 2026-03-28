@@ -154,11 +154,14 @@
       }
     }
 
-    // Detect node count changes (additions or removals) — rebuild simNodes
-    // while preserving existing positions for smooth transitions.
-    // Previously only checked for growth (>), which left ghost nodes when
-    // real discovered nodes were removed on Zenoh disconnect.
-    if (nodes.length !== simNodes.length) {
+    // Detect node set changes — count change OR address swap at equal count.
+    // Compares address sets to catch one-departs-one-arrives scenarios.
+    const nodeAddresses = new Set(nodes.map((n) => n.address));
+    const simAddresses = new Set(simNodes.map((n) => n.address));
+    const nodesChanged =
+      nodes.length !== simNodes.length ||
+      nodes.some((n) => !simAddresses.has(n.address));
+    if (nodesChanged) {
       const existingMap = new Map(simNodes.map((n) => [n.address, n]));
       simNodes = nodes.map((n) => {
         const existing = existingMap.get(n.address);

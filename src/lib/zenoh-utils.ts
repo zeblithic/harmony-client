@@ -29,8 +29,10 @@ export function pruneRingBufferCache(activeAddresses: Set<string>): void {
 
 /** Convert a DiscoveredNode from Zenoh capacity into a NetworkNode for the graph. */
 export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
-  const shortAddr = node.nodeAddr.length > 8
-    ? node.nodeAddr.slice(0, 8)
+  // Truncate to 4 chars so displayName "abcd (live)" = 11 chars,
+  // fitting within NetworkGraph's 12-char label limit.
+  const shortAddr = node.nodeAddr.length > 4
+    ? node.nodeAddr.slice(0, 4)
     : node.nodeAddr;
   const shortCid = node.modelCid.length > 8
     ? node.modelCid.slice(0, 8)
