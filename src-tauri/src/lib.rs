@@ -201,6 +201,14 @@ async fn connect_zenoh(
         Ok(s) => s,
         Err(e) => {
             let msg = format!("profile subscribe failed: {e}");
+            let _ = app.emit(
+                "zenoh-status",
+                &ZenohStatus {
+                    status: "error".to_string(),
+                    endpoint: Some(endpoint.clone()),
+                    error: Some(msg.clone()),
+                },
+            );
             let _ = session.close().await;
             return Err(msg);
         }
