@@ -154,8 +154,11 @@
       }
     }
 
-    // Detect new nodes — preserve existing positions for smooth expansion
-    if (nodes.length > simNodes.length) {
+    // Detect node count changes (additions or removals) — rebuild simNodes
+    // while preserving existing positions for smooth transitions.
+    // Previously only checked for growth (>), which left ghost nodes when
+    // real discovered nodes were removed on Zenoh disconnect.
+    if (nodes.length !== simNodes.length) {
       const existingMap = new Map(simNodes.map((n) => [n.address, n]));
       simNodes = nodes.map((n) => {
         const existing = existingMap.get(n.address);
