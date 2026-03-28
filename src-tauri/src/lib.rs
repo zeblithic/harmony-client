@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::task::JoinHandle;
 
@@ -50,6 +50,18 @@ pub struct ZenohStatus {
     pub error: Option<String>,
 }
 
+/// Profile published to/received from the network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePayload {
+    pub address: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 
 fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
@@ -63,6 +75,34 @@ fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
         node_addr: node_addr.to_string(),
         model_cid,
         ready,
+    })
+}
+
+/// Telemetry event pushed to the frontend via IPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryEventPayload {
+    pub node_addr: String,
+    pub intent: String,
+    pub sequence: u64,
+    pub timestamp: u64,
+    pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
+    let event = harmony_telemetry::decode_event(wire).ok()?;
+    Some(TelemetryEventPayload {
+        node_addr: event.node_addr,
+        intent: event.intent,
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        payload: event.payload,
+        confidence: event.confidence,
+        source: event.source,
     })
 }
 
@@ -184,7 +224,61 @@ async fn connect_zenoh(
         }
     };
 
-    // Check again after declare_subscriber await
+    // Subscribe to profile updates.
+    let profile_subscriber = match session.declare_subscriber("harmony/profile/*").await {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("profile subscribe failed: {e}");
+            let _ = app.emit(
+                "zenoh-status",
+                &ZenohStatus {
+                    status: "error".to_string(),
+                    endpoint: Some(endpoint.clone()),
+                    error: Some(msg.clone()),
+                },
+            );
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
+
+    // Subscribe to telemetry health events.
+    let telem_health = match session
+        .declare_subscriber("harmony/telemetry/*/health")
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("telemetry subscribe failed: {e}");
+            let _ = app.emit("zenoh-status", &ZenohStatus {
+                status: "error".to_string(),
+                endpoint: Some(endpoint.clone()),
+                error: Some(msg.clone()),
+            });
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
+
+    // Subscribe to telemetry capacity_changed events.
+    let telem_capacity = match session
+        .declare_subscriber("harmony/telemetry/*/capacity_changed")
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("telemetry subscribe failed: {e}");
+            let _ = app.emit("zenoh-status", &ZenohStatus {
+                status: "error".to_string(),
+                endpoint: Some(endpoint.clone()),
+                error: Some(msg.clone()),
+            });
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
+
+    // Check again after declare_subscriber awaits
     let was_cancelled = closing.load(Ordering::SeqCst);
     if was_cancelled {
         let _ = session.close().await;
@@ -209,26 +303,77 @@ async fn connect_zenoh(
         let app_handle = app.clone();
         let task = tokio::spawn(async move {
             loop {
-                match subscriber.recv_async().await {
-                    Ok(sample) => {
-                        let key = sample.key_expr().as_str();
-                        let payload = sample.payload().to_bytes();
-                        if let Some(update) = parse_capacity(key, &payload) {
-                            let _ = app_handle.emit("capacity-update", &update);
+                tokio::select! {
+                    result = subscriber.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let key = sample.key_expr().as_str();
+                                let payload = sample.payload().to_bytes();
+                                if let Some(update) = parse_capacity(key, &payload) {
+                                    let _ = app_handle.emit("capacity-update", &update);
+                                }
+                            }
+                            Err(e) => {
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        if !task_closing.load(Ordering::SeqCst) {
-                            let _ = app_handle.emit(
-                                "zenoh-status",
-                                &ZenohStatus {
-                                    status: "error".to_string(),
-                                    endpoint: None,
-                                    error: Some(format!("session lost: {e}")),
-                                },
-                            );
+                    result = profile_subscriber.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Ok(profile) = serde_json::from_slice::<ProfilePayload>(&payload) {
+                                    let _ = app_handle.emit("profile-update", &profile);
+                                }
+                            }
+                            Err(e) => {
+                                // Same error handling as capacity branch — emit
+                                // session-lost so frontend can auto-reconnect.
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
-                        break;
+                    }
+                    result = telem_health.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Some(event) = parse_telemetry(&payload) {
+                                    let _ = app_handle.emit("telemetry-event", &event);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    result = telem_capacity.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Some(event) = parse_telemetry(&payload) {
+                                    let _ = app_handle.emit("telemetry-event", &event);
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
             }
@@ -262,6 +407,35 @@ async fn disconnect_zenoh(
         guard.generation
     };
     disconnect_inner(&app, &state, Some(gen)).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn publish_profile(
+    profile: ProfilePayload,
+    state: tauri::State<'_, Mutex<ZenohState>>,
+) -> Result<(), String> {
+    let session = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.session.clone().ok_or_else(|| "not connected".to_string())?
+    };
+    // Validate address — reject Zenoh reserved characters
+    if profile.address.contains('/')
+        || profile.address.contains('*')
+        || profile.address.contains('?')
+        || profile.address.contains('#')
+        || profile.address.contains('$')
+        || profile.address.is_empty()
+    {
+        return Err(format!("invalid address: {}", profile.address));
+    }
+    let key = format!("harmony/profile/{}", profile.address);
+    let payload =
+        serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
+    session
+        .put(&key, payload)
+        .await
+        .map_err(|e| format!("put failed: {e}"))?;
     Ok(())
 }
 
@@ -317,6 +491,7 @@ pub fn run() {
             mark_vine_viewed,
             connect_zenoh,
             disconnect_zenoh,
+            publish_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -379,6 +554,87 @@ mod tests {
             "harmony/compute/capacity/node1",
             &[],
         );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn profile_payload_roundtrip() {
+        let profile = ProfilePayload {
+            address: "deadbeef".to_string(),
+            display_name: "Alice".to_string(),
+            status_text: Some("Building".to_string()),
+            avatar_url: None,
+        };
+        let json = serde_json::to_vec(&profile).unwrap();
+        let parsed: ProfilePayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.address, "deadbeef");
+        assert_eq!(parsed.display_name, "Alice");
+        assert_eq!(parsed.status_text.as_deref(), Some("Building"));
+        assert!(parsed.avatar_url.is_none());
+    }
+
+    #[test]
+    fn profile_payload_camel_case() {
+        let profile = ProfilePayload {
+            address: "aa".to_string(),
+            display_name: "Bob".to_string(),
+            status_text: None,
+            avatar_url: None,
+        };
+        let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert!(json.contains("\"displayName\""), "expected camelCase: {json}");
+        assert!(!json.contains("\"display_name\""), "unexpected snake_case: {json}");
+        // None fields should be skipped
+        assert!(!json.contains("statusText"), "None field should be skipped: {json}");
+    }
+
+    #[test]
+    fn parse_telemetry_valid_health() {
+        let event = harmony_telemetry::TelemetryEvent {
+            node_addr: "abcd1234".to_string(),
+            intent: "health".to_string(),
+            sequence: 1,
+            timestamp: 1711600000,
+            payload: serde_json::json!({"cpu_percent": 42.5, "mem_mb": 512}),
+            confidence: None,
+            source: None,
+        };
+        let wire = harmony_telemetry::encode_event(&event).unwrap();
+        let result = parse_telemetry(&wire);
+        let payload = result.unwrap();
+        assert_eq!(payload.node_addr, "abcd1234");
+        assert_eq!(payload.intent, "health");
+        assert_eq!(payload.sequence, 1);
+        assert_eq!(payload.timestamp, 1711600000);
+    }
+
+    #[test]
+    fn parse_telemetry_valid_capacity_changed() {
+        let event = harmony_telemetry::TelemetryEvent {
+            node_addr: "node42".to_string(),
+            intent: "capacity_changed".to_string(),
+            sequence: 5,
+            timestamp: 1711600100,
+            payload: serde_json::json!({"model_cid": "aa".repeat(32), "ready": true}),
+            confidence: None,
+            source: Some("qwen3-0.6b".to_string()),
+        };
+        let wire = harmony_telemetry::encode_event(&event).unwrap();
+        let result = parse_telemetry(&wire);
+        let payload = result.unwrap();
+        assert_eq!(payload.intent, "capacity_changed");
+        assert_eq!(payload.source, Some("qwen3-0.6b".to_string()));
+    }
+
+    #[test]
+    fn parse_telemetry_empty_payload() {
+        let result = parse_telemetry(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_telemetry_bad_tag() {
+        let result = parse_telemetry(&[0xFF, b'{', b'}']);
         assert!(result.is_none());
     }
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ZenohService, type TauriAdapter, type CapacityUpdate, type ZenohStatusEvent } from './zenoh-service';
+import { ZenohService, type TauriAdapter, type CapacityUpdate, type ZenohStatusEvent, type ProfilePayload } from './zenoh-service';
 
 function createMockAdapter() {
   const listeners: Record<string, Array<(event: { payload: unknown }) => void>> = {};
@@ -146,6 +146,47 @@ describe('ZenohService', () => {
       ready: true,
     } satisfies CapacityUpdate);
     expect(service.discoveredNodes.size).toBe(0);
+  });
+
+  it('upserts peer profile on profile-update', async () => {
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
+    mock.emit('profile-update', {
+      address: 'peer1',
+      displayName: 'Alice',
+      statusText: 'Hello',
+    } satisfies ProfilePayload);
+    expect(service.peerProfiles.size).toBe(1);
+    const profile = service.peerProfiles.get('peer1')!;
+    expect(profile.displayName).toBe('Alice');
+    expect(profile.statusText).toBe('Hello');
+  });
+
+  it('clears peer profiles on disconnect', async () => {
+    const promise = service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+    await promise;
+
+    mock.emit('profile-update', {
+      address: 'peer1',
+      displayName: 'Bob',
+    } satisfies ProfilePayload);
+    expect(service.peerProfiles.size).toBe(1);
+
+    await service.disconnect();
+    expect(service.peerProfiles.size).toBe(0);
+  });
+
+  it('publishProfile invokes publish_profile command', async () => {
+    await service.publishProfile({
+      address: 'local',
+      displayName: 'Me',
+    });
+    expect(mock.adapter.invoke).toHaveBeenCalledWith('publish_profile', {
+      profile: { address: 'local', displayName: 'Me' },
+    });
   });
 });
 

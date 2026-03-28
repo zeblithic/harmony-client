@@ -9,12 +9,23 @@ export interface DiscoveredNode {
   modelCid: string;
   ready: boolean;
   lastSeen: number;
+  /** Latest CPU usage from health telemetry (0-100). */
+  cpuPercent?: number;
+  /** Latest memory usage in MB from health telemetry. */
+  memMb?: number;
 }
 
 export interface CapacityUpdate {
   nodeAddr: string;
   modelCid: string;
   ready: boolean;
+}
+
+export interface ProfilePayload {
+  address: string;
+  displayName: string;
+  statusText?: string;
+  avatarUrl?: string;
 }
 
 export interface ZenohStatusEvent {
@@ -28,6 +39,7 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 export class ZenohService {
   connectionStatus: ConnectionStatus = 'disconnected';
   discoveredNodes: Map<string, DiscoveredNode> = new Map();
+  peerProfiles: Map<string, ProfilePayload> = new Map();
   errorMessage?: string;
 
   /** Called whenever service state changes so the UI can sync immediately. */
@@ -62,6 +74,17 @@ export class ZenohService {
       },
     );
     this.unlisteners.push(unlistenCapacity);
+
+    const unlistenProfile = await this.adapter.listen(
+      'profile-update',
+      (event) => {
+        if (this.connectionStatus !== 'connected') return;
+        const profile = event.payload as ProfilePayload;
+        this.peerProfiles.set(profile.address, profile);
+        this.onChange?.();
+      },
+    );
+    this.unlisteners.push(unlistenProfile);
 
     const unlistenStatus = await this.adapter.listen(
       'zenoh-status',
@@ -103,6 +126,32 @@ export class ZenohService {
       },
     );
     this.unlisteners.push(unlistenStatus);
+
+    const unlistenTelemetry = await this.adapter.listen(
+      'telemetry-event',
+      (event) => {
+        if (this.connectionStatus !== 'connected') return;
+        const telem = event.payload as import('./telemetry-types').TelemetryEvent;
+        const node = this.discoveredNodes.get(telem.nodeAddr);
+        if (!node) return;
+
+        if (telem.intent === 'health') {
+          const p = telem.payload as import('./telemetry-types').HealthPayload;
+          if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
+          if (p.mem_mb !== undefined) node.memMb = p.mem_mb;
+          node.lastSeen = Date.now();
+          this.onChange?.();
+        } else if (telem.intent === 'capacity_changed') {
+          const p = telem.payload as import('./telemetry-types').CapacityChangedPayload;
+          if (p.ready !== undefined) node.ready = p.ready;
+          if (p.model_cid !== undefined) node.modelCid = p.model_cid;
+          node.lastSeen = Date.now();
+          this.onChange?.();
+        }
+        // Unknown intents: silently ignore (forward-compatible)
+      },
+    );
+    this.unlisteners.push(unlistenTelemetry);
   }
 
   async connect(endpoint: string, isReconnect = false): Promise<void> {
@@ -152,6 +201,7 @@ export class ZenohService {
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();
+    this.peerProfiles.clear();
     this.onChange?.();
     try {
       await this.adapter.invoke('disconnect_zenoh');
@@ -184,6 +234,10 @@ export class ZenohService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  async publishProfile(profile: ProfilePayload): Promise<void> {
+    await this.adapter.invoke('publish_profile', { profile });
   }
 
   destroy(): void {
