@@ -71,7 +71,7 @@ export class ZenohService {
           // Accept 'connected' if we're actively connecting OR if a connect
           // invoke is in flight (a stale error event may have temporarily
           // set status to 'reconnecting' while the invoke was pending).
-          if (this.connectionStatus === 'connecting' || this.connectInFlight) {
+          if ((this.connectionStatus === 'connecting' || this.connectInFlight) && !this.userDisconnected) {
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
             this.reconnectAttempt = 0;
@@ -133,6 +133,7 @@ export class ZenohService {
 
   async disconnect(): Promise<void> {
     this.userDisconnected = true;
+    this.connectInFlight = false;
     this.cancelReconnect();
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
@@ -172,6 +173,8 @@ export class ZenohService {
   }
 
   destroy(): void {
+    this.userDisconnected = true;
+    this.connectInFlight = false;
     this.cancelReconnect();
     for (const unlisten of this.unlisteners) {
       unlisten();
