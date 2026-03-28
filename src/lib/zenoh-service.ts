@@ -111,15 +111,13 @@ export class ZenohService {
     try {
       await this.adapter.invoke('connect_zenoh', { endpoint });
     } catch (e) {
+      // If user disconnected while invoke was in flight, don't overwrite
+      // the 'disconnected' status with 'error'.
+      if (this.userDisconnected) return;
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
       this.onChange?.();
-      // Schedule reconnect only if the error event handler hasn't already.
-      // Invoke failures (Tauri command errors) don't emit zenoh-status events,
-      // so the catch block must handle them. But if the backend also emits
-      // an error event, the handler will call scheduleReconnect first —
-      // cancelReconnect inside scheduleReconnect prevents double-scheduling.
-      if (!this.userDisconnected && this.lastEndpoint) {
+      if (this.lastEndpoint) {
         this.scheduleReconnect();
       }
     }
