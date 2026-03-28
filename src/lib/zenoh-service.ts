@@ -149,6 +149,9 @@ export class ZenohService {
         if (telem.intent === 'health') {
           const p = telem.payload as import('./telemetry-types').HealthPayload;
           if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
+          // mem_mb collected but not wired to display — memoryUsedBytes
+          // stays at sentinel until health payload adds mem_total_mb so
+          // we can compute a meaningful percentage.
           if (p.mem_mb !== undefined) node.memMb = p.mem_mb;
           node.lastSeen = Date.now();
           this.onChange?.();
