@@ -2,12 +2,14 @@
   import './app.css';
   import { MockNetworkDataService } from './lib/network-data-service';
   import type { NetworkNode, NetworkLink } from './lib/network-types';
+  import { ZenohService, type TauriAdapter } from './lib/zenoh-service';
   import NetworkToolbar from './lib/components/NetworkToolbar.svelte';
   import NetworkGraph from './lib/components/NetworkGraph.svelte';
   import DetailPanel from './lib/components/DetailPanel.svelte';
   import DataTable from './lib/components/DataTable.svelte';
   import AriaAnnouncer from './lib/components/AriaAnnouncer.svelte';
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
+  import ConnectionBar from './lib/components/ConnectionBar.svelte';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -17,6 +19,74 @@
   let showTable = $state(false);
   let announcement = $state('');
   let graphComponent: NetworkGraph;
+
+  // Zenoh connection state — owned by NetworkApp as $state for reactivity.
+  // ZenohService updates its internal fields; we sync them on each tick.
+  let zenohStatus = $state<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  let discoveredCount = $state(0);
+  let zenohError = $state<string | undefined>(undefined);
+  let zenohService: ZenohService | null = null;
+  let destroyed = false;
+
+  // Detect Tauri environment and create real ZenohService.
+  // Uses a `destroyed` flag to handle the race where the component
+  // unmounts before the async init resolves — prevents listener leaks.
+  async function initZenohService() {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+      if (destroyed) return; // Component unmounted during await
+      const adapter: TauriAdapter = {
+        invoke: (cmd, args) => invoke(cmd, args),
+        listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
+      };
+      const svc = new ZenohService(adapter);
+      svc.onChange = syncZenohState;
+      await svc.init();
+      // Only assign after successful init — if init() throws,
+      // zenohService stays null and stubs are used.
+      if (destroyed) {
+        svc.destroy();
+      } else {
+        zenohService = svc;
+      }
+    } catch {
+      // Not in Tauri or init failed — zenohService stays null, stubs used
+      zenohService = null;
+      console.log('Tauri not available — Zenoh connection disabled');
+    }
+  }
+
+  function syncZenohState() {
+    if (zenohService) {
+      zenohStatus = zenohService.connectionStatus;
+      discoveredCount = zenohService.discoveredNodes.size;
+      zenohError = zenohService.errorMessage;
+    }
+  }
+
+  function handleConnect(endpoint: string) {
+    if (zenohService) {
+      // ZenohService.connect() calls onChange → syncZenohState immediately
+      zenohService.connect(endpoint).catch(() => {});
+    } else {
+      zenohStatus = 'connecting';
+      console.log('Zenoh connect requested (no Tauri):', endpoint);
+      setTimeout(() => {
+        if (zenohStatus === 'connecting') zenohStatus = 'disconnected';
+      }, 2000);
+    }
+  }
+
+  function handleDisconnect() {
+    // Update UI immediately — don't wait for async invoke
+    zenohStatus = 'disconnected';
+    discoveredCount = 0;
+    zenohError = undefined;
+    if (zenohService) {
+      zenohService.disconnect().catch(() => {});
+    }
+  }
 
   // Load table preference from localStorage
   if (typeof localStorage !== 'undefined') {
@@ -48,6 +118,7 @@
   service.onTick = () => {
     nodes = service.nodes.map((n) => ({ ...n }));
     links = service.links.map((l) => ({ ...l }));
+    syncZenohState();
   };
 
   function handleNodeClick(address: string) {
@@ -69,7 +140,16 @@
 
   $effect(() => {
     service.start();
-    return () => service.stop();
+    initZenohService();
+    return () => {
+      destroyed = true;
+      service.stop();
+      // Disconnect the backend session before removing listeners.
+      // Without this, the Zenoh session stays open (subscriber task
+      // keeps running) for the lifetime of the app process.
+      zenohService?.disconnect().catch(() => {});
+      zenohService?.destroy();
+    };
   });
 </script>
 
@@ -79,6 +159,14 @@
     onToggleView={toggleView}
     onRecenter={() => graphComponent?.recenter()}
     onZoomFit={() => graphComponent?.zoomToFit()}
+  />
+
+  <ConnectionBar
+    connectionStatus={zenohStatus}
+    {discoveredCount}
+    errorMessage={zenohError}
+    onConnect={handleConnect}
+    onDisconnect={handleDisconnect}
   />
 
   <div class="content">
