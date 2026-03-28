@@ -155,8 +155,6 @@
     }
 
     // Detect node set changes — count change OR address swap at equal count.
-    // Compares address sets to catch one-departs-one-arrives scenarios.
-    const nodeAddresses = new Set(nodes.map((n) => n.address));
     const simAddresses = new Set(simNodes.map((n) => n.address));
     const nodesChanged =
       nodes.length !== simNodes.length ||
