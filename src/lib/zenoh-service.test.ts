@@ -183,17 +183,16 @@ describe('ZenohService auto-reconnect', () => {
     expect(mock.adapter.invoke).toHaveBeenCalledTimes(2); // original + reconnect
   });
 
-  it('does not reconnect after user disconnect', async () => {
+  it('ignores stale error after user disconnect', async () => {
     await service.connect('tcp/127.0.0.1:7447');
     mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
     await service.disconnect();
 
-    // Simulate an error arriving after disconnect
+    // Simulate a stale error arriving after disconnect — should be ignored
     mock.emit('zenoh-status', { status: 'error', error: 'stale' } satisfies ZenohStatusEvent);
-    expect(service.connectionStatus).toBe('error');
-    // Should NOT schedule reconnect
+    // Status stays 'disconnected', not overwritten to 'error'
+    expect(service.connectionStatus).toBe('disconnected');
     vi.advanceTimersByTime(30_000);
-    // invoke called 2 times: connect + disconnect, NOT a third reconnect
     expect(mock.adapter.invoke).toHaveBeenCalledTimes(2);
   });
 

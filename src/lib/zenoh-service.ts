@@ -72,21 +72,21 @@ export class ZenohService {
           if (this.connectionStatus === 'connecting') {
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
-            this.reconnectAttempt = 0; // Reset backoff on successful connect
+            this.reconnectAttempt = 0;
+            this.cancelReconnect(); // Cancel any pending reconnect timer
           }
         } else if (status.status === 'disconnected') {
-          // Only accept 'disconnected' if we're already disconnected
-          // (i.e., the user explicitly called disconnect()). Ignore stale
-          // events that arrive after a reconnect has already succeeded
-          // ('connected') or is in progress ('connecting').
           if (this.connectionStatus === 'disconnected') {
             this.errorMessage = undefined;
           }
         } else if (status.status === 'error') {
+          // Ignore stale error events after user-initiated disconnect.
+          // Without this guard, a late error from the old session would
+          // overwrite the 'disconnected' state set by disconnect().
+          if (this.userDisconnected) return;
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
-          // Auto-reconnect on unexpected error (not user-initiated disconnect)
-          if (!this.userDisconnected && this.lastEndpoint) {
+          if (this.lastEndpoint) {
             this.scheduleReconnect();
           }
         }
@@ -114,7 +114,14 @@ export class ZenohService {
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
       this.onChange?.();
-      this.scheduleReconnect();
+      // Schedule reconnect only if the error event handler hasn't already.
+      // Invoke failures (Tauri command errors) don't emit zenoh-status events,
+      // so the catch block must handle them. But if the backend also emits
+      // an error event, the handler will call scheduleReconnect first —
+      // cancelReconnect inside scheduleReconnect prevents double-scheduling.
+      if (!this.userDisconnected && this.lastEndpoint) {
+        this.scheduleReconnect();
+      }
     }
   }
 
@@ -133,7 +140,10 @@ export class ZenohService {
   }
 
   private scheduleReconnect(): void {
-    this.cancelReconnect();
+    // Idempotent — if already reconnecting with a timer, don't double-schedule.
+    // This prevents double-increment of reconnectAttempt when both the invoke
+    // catch and the error event handler call this method for the same failure.
+    if (this.reconnectTimer !== null) return;
     if (!this.lastEndpoint || this.userDisconnected) return;
     const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempt), 30_000);
     this.reconnectAttempt++;
