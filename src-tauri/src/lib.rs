@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -15,7 +15,8 @@ struct ZenohState {
     /// disconnect_zenoh captures the generation at call time and only
     /// tears down the session if the generation still matches, preventing
     /// a stale disconnect from closing a newer session.
-    generation: Arc<AtomicU64>,
+    /// Plain u64 — only accessed under the Mutex lock.
+    generation: u64,
 }
 
 impl Default for ZenohState {
@@ -24,7 +25,7 @@ impl Default for ZenohState {
             session: None,
             task: None,
             closing: Arc::new(AtomicBool::new(false)),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: 0,
         }
     }
 }
@@ -83,7 +84,7 @@ async fn disconnect_inner(
         // This prevents a stale disconnect_zenoh from tearing down a
         // newer session that was established after the disconnect was called.
         if let Some(gen) = expected_gen {
-            if guard.generation.load(Ordering::SeqCst) != gen {
+            if guard.generation != gen {
                 return; // Stale disconnect — newer session exists
             }
         }
@@ -130,7 +131,7 @@ async fn connect_zenoh(
         guard.closing = closing.clone();
         // Increment generation so any stale disconnect_zenoh commands
         // (from before this connect) will see a mismatch and no-op.
-        guard.generation.fetch_add(1, Ordering::SeqCst);
+        guard.generation += 1;
     }
 
     // Build zenoh config — use serde_json to safely serialize the endpoint
@@ -258,7 +259,7 @@ async fn disconnect_zenoh(
     // will have changed and this becomes a no-op.
     let gen = {
         let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.generation.load(Ordering::SeqCst)
+        guard.generation
     };
     disconnect_inner(&app, &state, Some(gen)).await;
     Ok(())

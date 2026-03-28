@@ -83,9 +83,8 @@
     <button
       class="connect-btn disconnect"
       onclick={handleDisconnect}
-      disabled={connectionStatus === 'connecting'}
     >
-      Disconnect
+      {connectionStatus === 'connecting' ? 'Cancel' : 'Disconnect'}
     </button>
   {:else}
     <button class="connect-btn" onclick={handleConnect}>
