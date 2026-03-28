@@ -150,13 +150,13 @@ export class ZenohService {
           const p = telem.payload as import('./telemetry-types').HealthPayload;
           if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
           if (p.mem_mb !== undefined) node.memMb = p.mem_mb;
-          node.lastSeen = telem.timestamp * 1000; // epoch seconds → ms
+          node.lastSeen = Date.now();
           this.onChange?.();
         } else if (telem.intent === 'capacity_changed') {
           const p = telem.payload as import('./telemetry-types').CapacityChangedPayload;
           if (p.ready !== undefined) node.ready = p.ready;
           if (p.model_cid !== undefined) node.modelCid = p.model_cid;
-          node.lastSeen = telem.timestamp * 1000; // epoch seconds → ms
+          node.lastSeen = Date.now();
           this.onChange?.();
         }
         // Unknown intents: silently ignore (forward-compatible)
