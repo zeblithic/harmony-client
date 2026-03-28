@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::task::JoinHandle;
 
@@ -48,6 +48,18 @@ pub struct ZenohStatus {
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Profile published to/received from the network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePayload {
+    pub address: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
@@ -184,7 +196,17 @@ async fn connect_zenoh(
         }
     };
 
-    // Check again after declare_subscriber await
+    // Subscribe to profile updates.
+    let profile_subscriber = session
+        .declare_subscriber("harmony/profile/*")
+        .await
+        .map_err(|e| {
+            let msg = format!("profile subscribe failed: {e}");
+            let _ = session.close(); // don't await in error path
+            msg
+        })?;
+
+    // Check again after declare_subscriber awaits
     let was_cancelled = closing.load(Ordering::SeqCst);
     if was_cancelled {
         let _ = session.close().await;
@@ -209,26 +231,41 @@ async fn connect_zenoh(
         let app_handle = app.clone();
         let task = tokio::spawn(async move {
             loop {
-                match subscriber.recv_async().await {
-                    Ok(sample) => {
-                        let key = sample.key_expr().as_str();
-                        let payload = sample.payload().to_bytes();
-                        if let Some(update) = parse_capacity(key, &payload) {
-                            let _ = app_handle.emit("capacity-update", &update);
+                tokio::select! {
+                    result = subscriber.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let key = sample.key_expr().as_str();
+                                let payload = sample.payload().to_bytes();
+                                if let Some(update) = parse_capacity(key, &payload) {
+                                    let _ = app_handle.emit("capacity-update", &update);
+                                }
+                            }
+                            Err(e) => {
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        if !task_closing.load(Ordering::SeqCst) {
-                            let _ = app_handle.emit(
-                                "zenoh-status",
-                                &ZenohStatus {
-                                    status: "error".to_string(),
-                                    endpoint: None,
-                                    error: Some(format!("session lost: {e}")),
-                                },
-                            );
+                    result = profile_subscriber.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Ok(profile) = serde_json::from_slice::<ProfilePayload>(&payload) {
+                                    let _ = app_handle.emit("profile-update", &profile);
+                                }
+                            }
+                            Err(_) => break,
                         }
-                        break;
                     }
                 }
             }
@@ -262,6 +299,25 @@ async fn disconnect_zenoh(
         guard.generation
     };
     disconnect_inner(&app, &state, Some(gen)).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn publish_profile(
+    profile: ProfilePayload,
+    state: tauri::State<'_, Mutex<ZenohState>>,
+) -> Result<(), String> {
+    let session = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.session.clone().ok_or_else(|| "not connected".to_string())?
+    };
+    let key = format!("harmony/profile/{}", profile.address);
+    let payload =
+        serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
+    session
+        .put(&key, payload)
+        .await
+        .map_err(|e| format!("put failed: {e}"))?;
     Ok(())
 }
 
@@ -317,6 +373,7 @@ pub fn run() {
             mark_vine_viewed,
             connect_zenoh,
             disconnect_zenoh,
+            publish_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -380,5 +437,36 @@ mod tests {
             &[],
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn profile_payload_roundtrip() {
+        let profile = ProfilePayload {
+            address: "deadbeef".to_string(),
+            display_name: "Alice".to_string(),
+            status_text: Some("Building".to_string()),
+            avatar_url: None,
+        };
+        let json = serde_json::to_vec(&profile).unwrap();
+        let parsed: ProfilePayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.address, "deadbeef");
+        assert_eq!(parsed.display_name, "Alice");
+        assert_eq!(parsed.status_text.as_deref(), Some("Building"));
+        assert!(parsed.avatar_url.is_none());
+    }
+
+    #[test]
+    fn profile_payload_camel_case() {
+        let profile = ProfilePayload {
+            address: "aa".to_string(),
+            display_name: "Bob".to_string(),
+            status_text: None,
+            avatar_url: None,
+        };
+        let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert!(json.contains("\"displayName\""), "expected camelCase: {json}");
+        assert!(!json.contains("\"display_name\""), "unexpected snake_case: {json}");
+        // None fields should be skipped
+        assert!(!json.contains("statusText"), "None field should be skipped: {json}");
     }
 }
