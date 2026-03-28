@@ -200,15 +200,6 @@ describe('ZenohService', () => {
     expect(service.peerProfiles.size).toBe(1);
   });
 
-  it('publishProfile invokes publish_profile command', async () => {
-    await service.publishProfile({
-      address: 'local',
-      displayName: 'Me',
-    });
-    expect(mock.adapter.invoke).toHaveBeenCalledWith('publish_profile', {
-      profile: { address: 'local', displayName: 'Me' },
-    });
-  });
 });
 
 describe('ZenohService auto-reconnect', () => {

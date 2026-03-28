@@ -249,10 +249,6 @@ export class ZenohService {
     }
   }
 
-  async publishProfile(profile: ProfilePayload): Promise<void> {
-    await this.adapter.invoke('publish_profile', { profile });
-  }
-
   destroy(): void {
     this.userDisconnected = true;
     this.connectInFlight = false;
