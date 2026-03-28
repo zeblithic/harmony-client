@@ -69,6 +69,7 @@ Tauri IPC event.
 
 ```rust
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TelemetryEventPayload {
     node_addr: String,
     intent: String,
@@ -80,9 +81,11 @@ struct TelemetryEventPayload {
 }
 ```
 
-Direct mapping from `harmony_telemetry::TelemetryEvent`. The JSON
-`payload` field is passed through opaquely — the frontend interprets
-it based on `intent`.
+Uses `camelCase` serialization to match the existing `CapacityUpdate`
+and `ZenohStatus` IPC structs. The `node_addr` field is taken from
+the decoded `TelemetryEvent` (authoritative source, already
+validated by the publisher). The JSON `payload` field is passed
+through opaquely — the frontend interprets it based on `intent`.
 
 ### Integration with Existing Subscriber
 
@@ -107,10 +110,13 @@ the session closes. Same lifecycle as today.
 ### Error Handling
 
 - `decode_event()` failures (malformed payload, unknown tag): log
-  with `tracing::warn!`, skip the message. Don't crash or
-  disconnect.
+  with `eprintln!` (or `tracing::warn!` if tracing is added), skip
+  the message. Don't crash or disconnect.
 - Subscriber receive errors: same handling as existing capacity
   subscriber (break loop, emit disconnected status).
+
+Note: `tracing` is not currently a dependency. Use `eprintln!` for
+now — adding tracing is a separate concern.
 
 ## Frontend Changes
 
@@ -119,16 +125,22 @@ the session closes. Same lifecycle as today.
 Create `src/lib/telemetry-types.ts`:
 
 ```typescript
+/** Matches the camelCase-serialized TelemetryEventPayload from the backend. */
 export interface TelemetryEvent {
-    node_addr: string;
+    nodeAddr: string;
     intent: string;
     sequence: number;
     timestamp: number;
-    payload: Record<string, unknown>;
+    /** Opaque JSON payload — shape depends on intent. May be an object,
+     *  array, string, number, or null. */
+    payload: unknown;
     confidence?: number;
     source?: string;
 }
 
+/** Shape of payload when intent === "health". Fields are snake_case
+ *  because they originate from the publishing node's JSON, not from
+ *  serde rename. */
 export interface HealthPayload {
     cpu_percent?: number;
     mem_mb?: number;
@@ -146,13 +158,17 @@ In `zenoh-service.ts`, register a listener for `telemetry-event`
 in `init()`:
 
 ```typescript
-this.unlistenTelemetry = await this.adapter.listen(
+this.unlisteners.push(await this.adapter.listen(
     'telemetry-event',
     (event) => this.handleTelemetryEvent(event.payload)
-);
+));
 ```
 
-`handleTelemetryEvent` switches on `intent`:
+The unlisten function is pushed to the existing `this.unlisteners`
+array, ensuring cleanup in `destroy()` follows the same pattern as
+other listeners.
+
+`handleTelemetryEvent` (private method) switches on `intent`:
 
 - **`health`**: Extract `cpu_percent` and `mem_mb` from
   `payload`. If the node exists in `discoveredNodes`, update its
@@ -188,8 +204,12 @@ available instead of zero sentinels:
 metrics: {
     timestamp: Date.now(),
     cpuPercent: node.cpuPercent ?? 0,
+    // mem_mb from health payload is used-memory only. Total memory
+    // is not available until a richer health payload is defined.
+    // Use used-memory for the "used" field; keep sentinel for "total"
+    // so percentage calculations don't show 100%.
     memoryUsedBytes: (node.memMb ?? 0) * 1024 * 1024,
-    memoryTotalBytes: (node.memMb ?? 0) * 1024 * 1024 || 1,
+    memoryTotalBytes: 1,
     diskUsedBytes: 0,
     diskTotalBytes: 1,
 }
