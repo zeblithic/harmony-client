@@ -72,6 +72,7 @@ export class ZenohService {
           if (this.connectionStatus === 'connecting') {
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
+            this.reconnectAttempt = 0; // Reset backoff on successful connect
           }
         } else if (status.status === 'disconnected') {
           // Only accept 'disconnected' if we're already disconnected
@@ -95,11 +96,15 @@ export class ZenohService {
     this.unlisteners.push(unlistenStatus);
   }
 
-  async connect(endpoint: string): Promise<void> {
+  async connect(endpoint: string, isReconnect = false): Promise<void> {
     this.userDisconnected = false;
     this.lastEndpoint = endpoint;
     this.cancelReconnect();
-    this.reconnectAttempt = 0;
+    // Only reset backoff counter on user-initiated connect, not auto-reconnect.
+    // Otherwise the exponential delay (2s→4s→8s→…) never grows.
+    if (!isReconnect) {
+      this.reconnectAttempt = 0;
+    }
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
     this.onChange?.();
@@ -138,7 +143,7 @@ export class ZenohService {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.lastEndpoint && !this.userDisconnected) {
-        this.connect(this.lastEndpoint).catch(() => {});
+        this.connect(this.lastEndpoint, true).catch(() => {});
       }
     }, delay);
   }

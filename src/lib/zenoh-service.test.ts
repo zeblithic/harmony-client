@@ -219,4 +219,27 @@ describe('ZenohService auto-reconnect', () => {
     mock.emit('zenoh-status', { status: 'error', error: 'lost' } satisfies ZenohStatusEvent);
     expect(service.errorMessage).toContain('2s');
   });
+
+  it('backoff delay grows on repeated failures', async () => {
+    await service.connect('tcp/127.0.0.1:7447');
+    mock.emit('zenoh-status', { status: 'connected' } satisfies ZenohStatusEvent);
+
+    // First error → 2s
+    mock.emit('zenoh-status', { status: 'error', error: 'lost' } satisfies ZenohStatusEvent);
+    expect(service.errorMessage).toContain('2s');
+
+    // First reconnect fires after 2s
+    vi.advanceTimersByTime(2000);
+    // connect is called again (isReconnect=true, counter NOT reset)
+    // Simulate it failing again
+    mock.emit('zenoh-status', { status: 'error', error: 'lost again' } satisfies ZenohStatusEvent);
+    // Second delay should be 4s (2000 * 2^1)
+    expect(service.errorMessage).toContain('4s');
+
+    // Third failure after 4s
+    vi.advanceTimersByTime(4000);
+    mock.emit('zenoh-status', { status: 'error', error: 'still lost' } satisfies ZenohStatusEvent);
+    // Third delay should be 8s (2000 * 2^2)
+    expect(service.errorMessage).toContain('8s');
+  });
 });

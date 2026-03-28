@@ -2,7 +2,7 @@
   import './app.css';
   import { MockNetworkDataService } from './lib/network-data-service';
   import type { NetworkNode, NetworkLink } from './lib/network-types';
-  import { ZenohService, type TauriAdapter } from './lib/zenoh-service';
+  import { ZenohService, type TauriAdapter, type ConnectionStatus } from './lib/zenoh-service';
   import NetworkToolbar from './lib/components/NetworkToolbar.svelte';
   import NetworkGraph from './lib/components/NetworkGraph.svelte';
   import DetailPanel from './lib/components/DetailPanel.svelte';
@@ -23,7 +23,7 @@
 
   // Zenoh connection state — owned by NetworkApp as $state for reactivity.
   // ZenohService updates its internal fields; we sync them on each tick.
-  let zenohStatus = $state<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  let zenohStatus = $state<ConnectionStatus>('disconnected');
   let discoveredCount = $state(0);
   let zenohError = $state<string | undefined>(undefined);
   let zenohService: ZenohService | null = null;
@@ -65,7 +65,8 @@
   function syncZenohState() {
     if (zenohService) {
       zenohStatus = zenohService.connectionStatus;
-      discoveredCount = zenohService.discoveredNodes.size;
+      // Use filtered count so the badge matches the graph (excludes stale nodes)
+      discoveredCount = filterStaleNodes(zenohService.discoveredNodes).length;
       zenohError = zenohService.errorMessage;
     }
   }
