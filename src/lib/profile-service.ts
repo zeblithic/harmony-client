@@ -39,10 +39,6 @@ export function saveProfile(profile: Profile): void {
   }
 }
 
-/** Update specific fields on the profile and save. */
-export function updateProfile(updates: Partial<Profile>): Profile {
-  const current = loadProfile();
-  const updated = { ...current, ...updates };
-  saveProfile(updated);
-  return updated;
+// updateProfile was removed — unused in production code.
+// Use loadProfile() + spread + saveProfile() at call sites instead.
 }

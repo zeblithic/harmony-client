@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { loadProfile, saveProfile, updateProfile } from './profile-service';
+import { loadProfile, saveProfile } from './profile-service';
 
 describe('profile-service', () => {
   beforeEach(() => {
@@ -50,14 +50,14 @@ describe('profile-service', () => {
     expect(loaded.statusText).toBe('valid');
   });
 
-  it('updateProfile merges and persists', () => {
+  it('load + merge + save roundtrip', () => {
     saveProfile({ address: 'local', displayName: 'Original' });
-    const updated = updateProfile({ statusText: 'New status' });
-    expect(updated.displayName).toBe('Original');
-    expect(updated.statusText).toBe('New status');
+    const current = loadProfile();
+    const updated = { ...current, statusText: 'New status' };
+    saveProfile(updated);
 
-    // Verify persistence
     const reloaded = loadProfile();
+    expect(reloaded.displayName).toBe('Original');
     expect(reloaded.statusText).toBe('New status');
   });
 });

@@ -16,6 +16,7 @@
   let displayName = $state(profile.displayName);
   let statusText = $state(profile.statusText ?? '');
   let saved = $state(false);
+  let savedTimer: ReturnType<typeof setTimeout> | null = null;
 
   function handleSave() {
     const updated: Profile = {
@@ -25,7 +26,8 @@
     };
     onSave(updated);
     saved = true;
-    setTimeout(() => { saved = false; }, 2000);
+    if (savedTimer !== null) clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => { saved = false; savedTimer = null; }, 2000);
   }
 
   function handleKeydown(e: KeyboardEvent) {
