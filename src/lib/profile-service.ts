@@ -41,4 +41,3 @@ export function saveProfile(profile: Profile): void {
 
 // updateProfile was removed — unused in production code.
 // Use loadProfile() + spread + saveProfile() at call sites instead.
-}
