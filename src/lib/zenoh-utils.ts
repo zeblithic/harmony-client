@@ -64,16 +64,16 @@ export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
     status: node.ready ? 'online' : 'degraded',
     metrics: {
       timestamp: node.lastSeen,
-      cpuPercent: 0,
-      memoryUsedBytes: 0,
-      memoryTotalBytes: 1, // sentinel — avoids NaN in usage% until real metrics arrive
+      cpuPercent: node.cpuPercent ?? 0,
+      memoryUsedBytes: (node.memMb ?? 0) * 1024 * 1024,
+      memoryTotalBytes: 1, // sentinel — total memory not available in current health payload
       diskUsedBytes: 0,
       diskTotalBytes: 1,   // sentinel — avoids NaN in usage% until real metrics arrive
     },
     metricsHistory: getCachedRingBuffer(node.nodeAddr),
     lastSeen: node.lastSeen,
     capabilities: ['inference', 'routing'],
-    heatPercent: 0,
+    heatPercent: node.cpuPercent ?? 0,
     modelName: shortCid,
   };
 }
