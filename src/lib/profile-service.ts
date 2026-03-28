@@ -2,32 +2,45 @@ import type { Profile } from './types';
 
 const STORAGE_KEY = 'harmony-profile';
 
-const DEFAULT_PROFILE: Profile = {
-  address: 'local',
-  displayName: 'Anonymous',
-};
+/** Generate a random 16-byte hex address (placeholder until real key management). */
+function generateRandomAddress(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
-/** Load the local user's profile from localStorage, or return defaults. */
+/** Load the local user's profile from localStorage, or create a new one
+ *  with a unique random address. The address is generated once on first
+ *  launch and persisted — all subsequent loads return the same address. */
 export function loadProfile(): Profile {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored);
-      // Filter out null/undefined values so they don't override defaults.
-      // e.g. { "address": null } in stored JSON shouldn't bypass the
-      // required string fields from DEFAULT_PROFILE.
       const safe: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(parsed)) {
         if (value != null) {
           safe[key] = value;
         }
       }
-      return { ...DEFAULT_PROFILE, ...safe };
+      const profile = { displayName: 'Anonymous', ...safe } as Profile;
+      // Migrate legacy 'local' address to a unique one
+      if (!profile.address || profile.address === 'local') {
+        profile.address = generateRandomAddress();
+        saveProfile(profile);
+      }
+      return profile;
     }
   } catch {
-    // Corrupt or missing — return defaults
+    // Corrupt or missing — create fresh
   }
-  return { ...DEFAULT_PROFILE };
+  // First launch: generate unique address and persist
+  const profile: Profile = {
+    address: generateRandomAddress(),
+    displayName: 'Anonymous',
+  };
+  saveProfile(profile);
+  return profile;
 }
 
 /** Save the local user's profile to localStorage. */
