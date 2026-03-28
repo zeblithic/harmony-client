@@ -35,11 +35,6 @@ export class ZenohService {
 
   private adapter: TauriAdapter;
   private unlisteners: Array<() => void> = [];
-  /** Monotonic generation counter — incremented on connect/disconnect.
-   *  Status events are only processed if the generation matches the
-   *  one that was current when the operation started. This prevents
-   *  stale 'connected' events from overriding a user-initiated disconnect. */
-  private generation = 0;
 
   constructor(adapter: TauriAdapter) {
     this.adapter = adapter;
@@ -93,7 +88,7 @@ export class ZenohService {
   }
 
   async connect(endpoint: string): Promise<void> {
-    this.generation++;
+
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
     this.onChange?.();
@@ -107,7 +102,7 @@ export class ZenohService {
   }
 
   async disconnect(): Promise<void> {
-    this.generation++;
+
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();

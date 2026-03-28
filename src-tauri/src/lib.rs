@@ -101,12 +101,17 @@ async fn connect_zenoh(
     app: AppHandle,
     state: tauri::State<'_, Mutex<ZenohState>>,
 ) -> Result<(), String> {
-    // Disconnect if already connected
+    // Disconnect if already connected, and set closing=false for the new
+    // connection attempt. If a concurrent disconnect_zenoh fires during
+    // one of the awaits below, it will set closing=true, and we check
+    // that after each await to bail instead of storing an orphaned session.
     disconnect_inner(&app, &state).await;
+    {
+        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.closing.store(false, Ordering::SeqCst);
+    }
 
     // Build zenoh config — use serde_json to safely serialize the endpoint
-    // string, preventing JSON injection via crafted input like:
-    // tcp/host:7447","tcp/attacker:7447
     let mut config = zenoh::Config::default();
     let endpoint_json = serde_json::to_string(&endpoint)
         .map_err(|e| format!("endpoint serialize error: {e}"))?;
@@ -128,6 +133,16 @@ async fn connect_zenoh(
         msg
     })?;
 
+    // Check if disconnect was called while we were awaiting zenoh::open
+    let was_cancelled = {
+        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.closing.load(Ordering::SeqCst)
+    };
+    if was_cancelled {
+        let _ = session.close().await;
+        return Ok(());
+    }
+
     // Subscribe to capacity advertisements
     let subscriber = session
         .declare_subscriber("harmony/compute/capacity/*")
@@ -145,10 +160,19 @@ async fn connect_zenoh(
             msg
         })?;
 
+    // Check again after declare_subscriber await
+    let was_cancelled = {
+        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.closing.load(Ordering::SeqCst)
+    };
+    if was_cancelled {
+        let _ = session.close().await;
+        return Ok(());
+    }
+
     // Store session, spawn task, and store task handle in a single lock
     // scope. tokio::spawn doesn't block — it just schedules the future —
-    // so holding the mutex across it is safe and prevents a concurrent
-    // disconnect from taking the session before the task handle is stored.
+    // so holding the mutex across it is safe.
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.session = Some(session);
