@@ -154,8 +154,12 @@
       }
     }
 
-    // Detect new nodes — preserve existing positions for smooth expansion
-    if (nodes.length > simNodes.length) {
+    // Detect node set changes — count change OR address swap at equal count.
+    const simAddresses = new Set(simNodes.map((n) => n.address));
+    const nodesChanged =
+      nodes.length !== simNodes.length ||
+      nodes.some((n) => !simAddresses.has(n.address));
+    if (nodesChanged) {
       const existingMap = new Map(simNodes.map((n) => [n.address, n]));
       simNodes = nodes.map((n) => {
         const existing = existingMap.get(n.address);

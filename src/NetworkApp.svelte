@@ -10,6 +10,7 @@
   import AriaAnnouncer from './lib/components/AriaAnnouncer.svelte';
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
   import ConnectionBar from './lib/components/ConnectionBar.svelte';
+  import { discoveredToNetworkNode, pruneRingBufferCache } from './lib/zenoh-utils';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -41,7 +42,11 @@
         listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
       };
       const svc = new ZenohService(adapter);
-      svc.onChange = syncZenohState;
+      svc.onChange = () => {
+        syncZenohState();
+        // Re-merge nodes so new discoveries appear immediately
+        nodes = mergeNodes();
+      };
       await svc.init();
       // Only assign after successful init — if init() throws,
       // zenohService stays null and stubs are used.
@@ -63,6 +68,24 @@
       discoveredCount = zenohService.discoveredNodes.size;
       zenohError = zenohService.errorMessage;
     }
+  }
+
+  /** Merge mock nodes with real discovered nodes for the graph. */
+  function mergeNodes(): NetworkNode[] {
+    const mockNodes = service.nodes.map((n) => ({ ...n }));
+    if (!zenohService || zenohService.connectionStatus !== 'connected' || zenohService.discoveredNodes.size === 0) {
+      pruneRingBufferCache(new Set()); // Clear all cached buffers
+      return mockNodes;
+    }
+    const realAddresses = new Set<string>();
+    const realNodes: NetworkNode[] = [];
+    for (const discovered of zenohService.discoveredNodes.values()) {
+      realNodes.push(discoveredToNetworkNode(discovered));
+      realAddresses.add(discovered.nodeAddr);
+    }
+    pruneRingBufferCache(realAddresses); // Remove buffers for departed nodes
+    // Mock nodes first (excluding any with same address), real nodes appended
+    return [...mockNodes.filter((n) => !realAddresses.has(n.address)), ...realNodes];
   }
 
   function handleConnect(endpoint: string) {
@@ -116,7 +139,7 @@
   };
 
   service.onTick = () => {
-    nodes = service.nodes.map((n) => ({ ...n }));
+    nodes = mergeNodes();
     links = service.links.map((l) => ({ ...l }));
     syncZenohState();
   };
