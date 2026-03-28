@@ -70,11 +70,11 @@ export class ZenohService {
             this.errorMessage = undefined;
           }
         } else if (status.status === 'disconnected') {
-          // Don't regress from 'connecting' — a stale 'disconnected' event
-          // from disconnect_inner tearing down the previous session should
-          // not overwrite the 'connecting' state of the new connection.
-          if (this.connectionStatus !== 'connecting') {
-            this.connectionStatus = 'disconnected';
+          // Only accept 'disconnected' if we're already disconnected
+          // (i.e., the user explicitly called disconnect()). Ignore stale
+          // events that arrive after a reconnect has already succeeded
+          // ('connected') or is in progress ('connecting').
+          if (this.connectionStatus === 'disconnected') {
             this.errorMessage = undefined;
           }
         } else if (status.status === 'error') {
