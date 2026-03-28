@@ -101,14 +101,14 @@ async fn connect_zenoh(
     app: AppHandle,
     state: tauri::State<'_, Mutex<ZenohState>>,
 ) -> Result<(), String> {
-    // Disconnect if already connected, and set closing=false for the new
-    // connection attempt. If a concurrent disconnect_zenoh fires during
-    // one of the awaits below, it will set closing=true, and we check
-    // that after each await to bail instead of storing an orphaned session.
+    // Disconnect if already connected, then allocate a fresh closing flag
+    // for this connection. Each connection gets its own Arc<AtomicBool> so
+    // the old subscriber task's flag is independent from the new one.
     disconnect_inner(&app, &state).await;
+    let closing = Arc::new(AtomicBool::new(false));
     {
-        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.closing.store(false, Ordering::SeqCst);
+        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.closing = closing.clone();
     }
 
     // Build zenoh config — use serde_json to safely serialize the endpoint
@@ -133,11 +133,10 @@ async fn connect_zenoh(
         msg
     })?;
 
-    // Check if disconnect was called while we were awaiting zenoh::open
-    let was_cancelled = {
-        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.closing.load(Ordering::SeqCst)
-    };
+    // Check if disconnect was called while we were awaiting zenoh::open.
+    // Uses our local `closing` Arc — not re-read from state, which may
+    // have been replaced by a subsequent connect call.
+    let was_cancelled = closing.load(Ordering::SeqCst);
     if was_cancelled {
         let _ = session.close().await;
         return Ok(());
@@ -161,10 +160,7 @@ async fn connect_zenoh(
         })?;
 
     // Check again after declare_subscriber await
-    let was_cancelled = {
-        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.closing.load(Ordering::SeqCst)
-    };
+    let was_cancelled = closing.load(Ordering::SeqCst);
     if was_cancelled {
         let _ = session.close().await;
         return Ok(());
@@ -176,8 +172,9 @@ async fn connect_zenoh(
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.session = Some(session);
-        guard.closing.store(false, Ordering::SeqCst);
-        let closing = guard.closing.clone();
+        // closing Arc is already set on guard from the start of connect_zenoh.
+        // Clone it for the subscriber task.
+        let task_closing = closing.clone();
 
         let app_handle = app.clone();
         let task = tokio::spawn(async move {
@@ -192,7 +189,7 @@ async fn connect_zenoh(
                     }
                     Err(e) => {
                         // Distinguish clean disconnect from unexpected session loss.
-                        if !closing.load(Ordering::SeqCst) {
+                        if !task_closing.load(Ordering::SeqCst) {
                             let _ = app_handle.emit(
                                 "zenoh-status",
                                 &ZenohStatus {
