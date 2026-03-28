@@ -1458,6 +1458,7 @@ dependencies = [
 name = "harmony-app"
 version = "0.1.0"
 dependencies = [
+ "harmony-telemetry",
  "hex",
  "serde",
  "serde_json",
@@ -1465,6 +1466,15 @@ dependencies = [
  "tauri-build",
  "tokio",
  "zenoh",
+]
+
+[[package]]
+name = "harmony-telemetry"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#73f526a7134979892001c9e29af1a4920a6aa95f"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

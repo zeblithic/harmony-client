@@ -11,6 +11,7 @@
   import NetworkStatusBar from './lib/components/NetworkStatusBar.svelte';
   import ConnectionBar from './lib/components/ConnectionBar.svelte';
   import { discoveredToNetworkNode, pruneRingBufferCache, filterStaleNodes } from './lib/zenoh-utils';
+  import { loadProfile } from './lib/profile-service';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -42,6 +43,7 @@
         listen: (event, handler) => listen(event, (e) => handler({ payload: e.payload })),
       };
       const svc = new ZenohService(adapter);
+      svc.ownAddress = loadProfile().address;
       svc.onChange = () => {
         syncZenohState();
         // Re-merge nodes so new discoveries appear immediately
