@@ -17,6 +17,13 @@ export interface CapacityUpdate {
   ready: boolean;
 }
 
+export interface ProfilePayload {
+  address: string;
+  displayName: string;
+  statusText?: string;
+  avatarUrl?: string;
+}
+
 export interface ZenohStatusEvent {
   status: 'connected' | 'disconnected' | 'error';
   endpoint?: string;
@@ -28,6 +35,7 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 export class ZenohService {
   connectionStatus: ConnectionStatus = 'disconnected';
   discoveredNodes: Map<string, DiscoveredNode> = new Map();
+  peerProfiles: Map<string, ProfilePayload> = new Map();
   errorMessage?: string;
 
   /** Called whenever service state changes so the UI can sync immediately. */
@@ -62,6 +70,17 @@ export class ZenohService {
       },
     );
     this.unlisteners.push(unlistenCapacity);
+
+    const unlistenProfile = await this.adapter.listen(
+      'profile-update',
+      (event) => {
+        if (this.connectionStatus !== 'connected') return;
+        const profile = event.payload as ProfilePayload;
+        this.peerProfiles.set(profile.address, profile);
+        this.onChange?.();
+      },
+    );
+    this.unlisteners.push(unlistenProfile);
 
     const unlistenStatus = await this.adapter.listen(
       'zenoh-status',
@@ -152,6 +171,7 @@ export class ZenohService {
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();
+    this.peerProfiles.clear();
     this.onChange?.();
     try {
       await this.adapter.invoke('disconnect_zenoh');
@@ -184,6 +204,10 @@ export class ZenohService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  async publishProfile(profile: ProfilePayload): Promise<void> {
+    await this.adapter.invoke('publish_profile', { profile });
   }
 
   destroy(): void {
