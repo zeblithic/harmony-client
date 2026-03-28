@@ -242,6 +242,42 @@ async fn connect_zenoh(
         }
     };
 
+    // Subscribe to telemetry health events.
+    let telem_health = match session
+        .declare_subscriber("harmony/telemetry/*/health")
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("telemetry subscribe failed: {e}");
+            let _ = app.emit("zenoh-status", &ZenohStatus {
+                status: "error".to_string(),
+                endpoint: Some(endpoint.clone()),
+                error: Some(msg.clone()),
+            });
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
+
+    // Subscribe to telemetry capacity_changed events.
+    let telem_capacity = match session
+        .declare_subscriber("harmony/telemetry/*/capacity_changed")
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("telemetry subscribe failed: {e}");
+            let _ = app.emit("zenoh-status", &ZenohStatus {
+                status: "error".to_string(),
+                endpoint: Some(endpoint.clone()),
+                error: Some(msg.clone()),
+            });
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
+
     // Check again after declare_subscriber awaits
     let was_cancelled = closing.load(Ordering::SeqCst);
     if was_cancelled {
@@ -315,6 +351,28 @@ async fn connect_zenoh(
                                 }
                                 break;
                             }
+                        }
+                    }
+                    result = telem_health.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Some(event) = parse_telemetry(&payload) {
+                                    let _ = app_handle.emit("telemetry-event", &event);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    result = telem_capacity.recv_async() => {
+                        match result {
+                            Ok(sample) => {
+                                let payload = sample.payload().to_bytes();
+                                if let Some(event) = parse_telemetry(&payload) {
+                                    let _ = app_handle.emit("telemetry-event", &event);
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
