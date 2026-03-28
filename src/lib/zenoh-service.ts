@@ -81,9 +81,11 @@ export class ZenohService {
           }
         } else if (status.status === 'error') {
           // Ignore stale error events after user-initiated disconnect.
-          // Without this guard, a late error from the old session would
-          // overwrite the 'disconnected' state set by disconnect().
           if (this.userDisconnected) return;
+          // If a reconnect timer is already active, don't overwrite
+          // 'reconnecting' status with 'error' — it would confuse the
+          // UI into showing an error while a timer is silently ticking.
+          if (this.reconnectTimer !== null) return;
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
           if (this.lastEndpoint) {
