@@ -23,7 +23,7 @@ export interface ZenohStatusEvent {
   error?: string;
 }
 
-export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error' | 'reconnecting';
 
 export class ZenohService {
   connectionStatus: ConnectionStatus = 'disconnected';
@@ -35,6 +35,10 @@ export class ZenohService {
 
   private adapter: TauriAdapter;
   private unlisteners: Array<() => void> = [];
+  private lastEndpoint: string | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private userDisconnected = false;
 
   constructor(adapter: TauriAdapter) {
     this.adapter = adapter;
@@ -80,6 +84,10 @@ export class ZenohService {
         } else if (status.status === 'error') {
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
+          // Auto-reconnect on unexpected error (not user-initiated disconnect)
+          if (!this.userDisconnected && this.lastEndpoint) {
+            this.scheduleReconnect();
+          }
         }
         this.onChange?.();
       },
@@ -88,7 +96,10 @@ export class ZenohService {
   }
 
   async connect(endpoint: string): Promise<void> {
-
+    this.userDisconnected = false;
+    this.lastEndpoint = endpoint;
+    this.cancelReconnect();
+    this.reconnectAttempt = 0;
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
     this.onChange?.();
@@ -98,11 +109,13 @@ export class ZenohService {
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
       this.onChange?.();
+      this.scheduleReconnect();
     }
   }
 
   async disconnect(): Promise<void> {
-
+    this.userDisconnected = true;
+    this.cancelReconnect();
     this.connectionStatus = 'disconnected';
     this.errorMessage = undefined;
     this.discoveredNodes.clear();
@@ -110,11 +123,35 @@ export class ZenohService {
     try {
       await this.adapter.invoke('disconnect_zenoh');
     } catch {
-      // Ignore disconnect errors — backend may already be gone
+      // Ignore disconnect errors
+    }
+  }
+
+  private scheduleReconnect(): void {
+    this.cancelReconnect();
+    if (!this.lastEndpoint || this.userDisconnected) return;
+    const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempt), 30_000);
+    this.reconnectAttempt++;
+    this.connectionStatus = 'reconnecting';
+    this.errorMessage = `Reconnecting in ${Math.round(delay / 1000)}s...`;
+    this.onChange?.();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.lastEndpoint && !this.userDisconnected) {
+        this.connect(this.lastEndpoint).catch(() => {});
+      }
+    }, delay);
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 
   destroy(): void {
+    this.cancelReconnect();
     for (const unlisten of this.unlisteners) {
       unlisten();
     }
