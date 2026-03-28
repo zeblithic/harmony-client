@@ -8,10 +8,12 @@
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
+  import ProfileEditor from './lib/components/ProfileEditor.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import { NotificationService } from './lib/notification-service';
+  import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
@@ -25,6 +27,13 @@
   let collapsed = $derived(innerWidth <= 768);
   let showSettings = $state(false);
   let appMode = $state<AppMode>('messages');
+
+  let myProfile = $state(loadProfile());
+
+  function handleProfileSave(profile: Profile) {
+    saveProfile(profile);
+    myProfile = profile;
+  }
 
   // Viewed vine IDs — lifted here so state survives VineFeed remounts on mode toggle
   let vineViewedIds = $state(new Set<string>(
@@ -398,6 +407,7 @@
     />
   {/snippet}
   {#snippet settingsPanel()}
+    <ProfileEditor profile={myProfile} onSave={handleProfileSave} />
     <NotificationSettingsPanel
       service={notificationService}
       {trustService}
