@@ -65,10 +65,12 @@ export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
     metrics: {
       timestamp: node.lastSeen,
       cpuPercent: node.cpuPercent ?? 0,
-      memoryUsedBytes: (node.memMb ?? 0) * 1024 * 1024,
-      // Total memory not available in current health payload. Mirror used-memory
-      // so percentage = 100% when data exists, 0/1 = 0% when absent.
-      memoryTotalBytes: node.memMb ? (node.memMb * 1024 * 1024) : 1,
+      // Memory used/total: health payload only provides mem_mb (used).
+      // Without total memory, we can't compute a meaningful percentage.
+      // Keep both at sentinel values (0/1 = 0%) until the health payload
+      // includes mem_total_mb. CPU is the primary health signal for now.
+      memoryUsedBytes: 0,
+      memoryTotalBytes: 1,
       diskUsedBytes: 0,
       diskTotalBytes: 1,   // sentinel — avoids NaN in usage% until real metrics arrive
     },
