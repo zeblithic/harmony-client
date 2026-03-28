@@ -9,6 +9,10 @@ export interface DiscoveredNode {
   modelCid: string;
   ready: boolean;
   lastSeen: number;
+  /** Latest CPU usage from health telemetry (0-100). */
+  cpuPercent?: number;
+  /** Latest memory usage in MB from health telemetry. */
+  memMb?: number;
 }
 
 export interface CapacityUpdate {
@@ -122,6 +126,32 @@ export class ZenohService {
       },
     );
     this.unlisteners.push(unlistenStatus);
+
+    const unlistenTelemetry = await this.adapter.listen(
+      'telemetry-event',
+      (event) => {
+        if (this.connectionStatus !== 'connected') return;
+        const telem = event.payload as import('./telemetry-types').TelemetryEvent;
+        const node = this.discoveredNodes.get(telem.nodeAddr);
+        if (!node) return;
+
+        if (telem.intent === 'health') {
+          const p = telem.payload as import('./telemetry-types').HealthPayload;
+          if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
+          if (p.mem_mb !== undefined) node.memMb = p.mem_mb;
+          node.lastSeen = Date.now();
+          this.onChange?.();
+        } else if (telem.intent === 'capacity_changed') {
+          const p = telem.payload as import('./telemetry-types').CapacityChangedPayload;
+          if (p.ready !== undefined) node.ready = p.ready;
+          if (p.model_cid !== undefined) node.modelCid = p.model_cid;
+          node.lastSeen = Date.now();
+          this.onChange?.();
+        }
+        // Unknown intents: silently ignore (forward-compatible)
+      },
+    );
+    this.unlisteners.push(unlistenTelemetry);
   }
 
   async connect(endpoint: string, isReconnect = false): Promise<void> {
