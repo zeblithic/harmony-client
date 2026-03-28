@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -9,9 +9,13 @@ struct ZenohState {
     session: Option<zenoh::Session>,
     task: Option<JoinHandle<()>>,
     /// Set to true by disconnect_inner before closing the session.
-    /// The subscriber task checks this to distinguish clean disconnect
-    /// from unexpected session loss.
+    /// Each connection gets a fresh Arc; the old task keeps its copy.
     closing: Arc<AtomicBool>,
+    /// Monotonic connection generation. Incremented on each connect.
+    /// disconnect_zenoh captures the generation at call time and only
+    /// tears down the session if the generation still matches, preventing
+    /// a stale disconnect from closing a newer session.
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for ZenohState {
@@ -20,6 +24,7 @@ impl Default for ZenohState {
             session: None,
             task: None,
             closing: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -60,17 +65,31 @@ fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     })
 }
 
-async fn disconnect_inner(app: &AppHandle, state: &Mutex<ZenohState>) {
+/// Disconnect the current session. If `expected_gen` is `Some(n)`, only
+/// disconnect if the current generation matches — prevents a stale
+/// disconnect from tearing down a newer session. Pass `None` to
+/// unconditionally disconnect (used by connect_zenoh's internal teardown).
+async fn disconnect_inner(
+    app: &AppHandle,
+    state: &Mutex<ZenohState>,
+    expected_gen: Option<u64>,
+) {
     let (session, task) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        // Signal the subscriber task that this is a clean disconnect.
-        // The task checks this flag to suppress the "session lost" error event.
+        // If a generation was specified, only disconnect if it matches.
+        // This prevents a stale disconnect_zenoh from tearing down a
+        // newer session that was established after the disconnect was called.
+        if let Some(gen) = expected_gen {
+            if guard.generation.load(Ordering::SeqCst) != gen {
+                return; // Stale disconnect — newer session exists
+            }
+        }
         guard.closing.store(true, Ordering::SeqCst);
         (guard.session.take(), guard.task.take())
-    }; // Guard dropped here, before the await
+    };
 
     // Explicitly close the session so all subscribers receive Err.
     let had_session = session.is_some();
@@ -104,11 +123,14 @@ async fn connect_zenoh(
     // Disconnect if already connected, then allocate a fresh closing flag
     // for this connection. Each connection gets its own Arc<AtomicBool> so
     // the old subscriber task's flag is independent from the new one.
-    disconnect_inner(&app, &state).await;
+    disconnect_inner(&app, &state, None).await;
     let closing = Arc::new(AtomicBool::new(false));
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.closing = closing.clone();
+        // Increment generation so any stale disconnect_zenoh commands
+        // (from before this connect) will see a mismatch and no-op.
+        guard.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     // Build zenoh config — use serde_json to safely serialize the endpoint
@@ -230,7 +252,15 @@ async fn disconnect_zenoh(
     app: AppHandle,
     state: tauri::State<'_, Mutex<ZenohState>>,
 ) -> Result<(), String> {
-    disconnect_inner(&app, &state).await;
+    // Capture the current generation — only disconnect if it still matches
+    // when disconnect_inner runs. If a connect_zenoh happened between the
+    // user clicking Disconnect and this command executing, the generation
+    // will have changed and this becomes a no-op.
+    let gen = {
+        let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.generation.load(Ordering::SeqCst)
+    };
+    disconnect_inner(&app, &state, Some(gen)).await;
     Ok(())
 }
 
