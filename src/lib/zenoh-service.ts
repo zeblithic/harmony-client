@@ -39,6 +39,9 @@ export class ZenohService {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private userDisconnected = false;
+  /** True while a connect invoke is in-flight. Used to accept 'connected'
+   *  events even if a stale error reset status to 'reconnecting'. */
+  private connectInFlight = false;
 
   constructor(adapter: TauriAdapter) {
     this.adapter = adapter;
@@ -65,7 +68,10 @@ export class ZenohService {
       (event) => {
         const status = event.payload as ZenohStatusEvent;
         if (status.status === 'connected') {
-          if (this.connectionStatus === 'connecting') {
+          // Accept 'connected' if we're actively connecting OR if a connect
+          // invoke is in flight (a stale error event may have temporarily
+          // set status to 'reconnecting' while the invoke was pending).
+          if (this.connectionStatus === 'connecting' || this.connectInFlight) {
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
             this.reconnectAttempt = 0;
@@ -105,25 +111,23 @@ export class ZenohService {
     }
     this.connectionStatus = 'connecting';
     this.errorMessage = undefined;
+    this.connectInFlight = true;
     this.onChange?.();
     try {
       await this.adapter.invoke('connect_zenoh', { endpoint });
     } catch (e) {
-      // Guards matching the error event handler:
-      // 1. Don't overwrite 'disconnected' after user cancel
       if (this.userDisconnected) return;
-      // 2. Don't overwrite 'reconnecting' if the error event handler
-      //    already scheduled a reconnect for this failure
       if (this.reconnectTimer !== null) return;
 
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
       if (this.lastEndpoint) {
-        // scheduleReconnect sets status to 'reconnecting' before onChange
         this.scheduleReconnect();
       } else {
         this.onChange?.();
       }
+    } finally {
+      this.connectInFlight = false;
     }
   }
 
