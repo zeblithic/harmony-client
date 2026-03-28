@@ -72,6 +72,7 @@ export class ZenohService {
           // invoke is in flight (a stale error event may have temporarily
           // set status to 'reconnecting' while the invoke was pending).
           if ((this.connectionStatus === 'connecting' || this.connectInFlight) && !this.userDisconnected) {
+            this.connectInFlight = false;
             this.connectionStatus = 'connected';
             this.errorMessage = undefined;
             this.reconnectAttempt = 0;
@@ -86,6 +87,7 @@ export class ZenohService {
         } else if (status.status === 'error') {
           if (this.userDisconnected) return;
           if (this.reconnectTimer !== null) return;
+          this.connectInFlight = false;
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
           if (this.lastEndpoint) {
@@ -116,9 +118,20 @@ export class ZenohService {
     try {
       await this.adapter.invoke('connect_zenoh', { endpoint });
     } catch (e) {
-      if (this.userDisconnected) return;
-      if (this.reconnectTimer !== null) return;
+      // connectInFlight stays true until the backend emits a status event.
+      // Don't clear it here — the connected/error event handlers need it
+      // to accept events that arrive after the invoke promise settles.
+      if (this.userDisconnected) {
+        this.connectInFlight = false;
+        return;
+      }
+      if (this.reconnectTimer !== null) {
+        // Error handler already scheduled a reconnect — don't double-handle.
+        // connectInFlight stays true for the connected handler.
+        return;
+      }
 
+      this.connectInFlight = false;
       this.connectionStatus = 'error';
       this.errorMessage = String(e);
       if (this.lastEndpoint) {
@@ -126,8 +139,6 @@ export class ZenohService {
       } else {
         this.onChange?.();
       }
-    } finally {
-      this.connectInFlight = false;
     }
   }
 
