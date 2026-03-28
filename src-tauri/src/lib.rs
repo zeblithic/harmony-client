@@ -142,11 +142,11 @@ async fn connect_zenoh(
         return Ok(());
     }
 
-    // Subscribe to capacity advertisements
-    let subscriber = session
-        .declare_subscriber("harmony/compute/capacity/*")
-        .await
-        .map_err(|e| {
+    // Subscribe to capacity advertisements.
+    // Close session explicitly on error — Drop alone can't do the full async close.
+    let subscriber = match session.declare_subscriber("harmony/compute/capacity/*").await {
+        Ok(s) => s,
+        Err(e) => {
             let msg = format!("subscribe failed: {e}");
             let _ = app.emit(
                 "zenoh-status",
@@ -156,8 +156,10 @@ async fn connect_zenoh(
                     error: Some(msg.clone()),
                 },
             );
-            msg
-        })?;
+            let _ = session.close().await;
+            return Err(msg);
+        }
+    };
 
     // Check again after declare_subscriber await
     let was_cancelled = closing.load(Ordering::SeqCst);
@@ -166,14 +168,19 @@ async fn connect_zenoh(
         return Ok(());
     }
 
-    // Store session, spawn task, and store task handle in a single lock
-    // scope. tokio::spawn doesn't block — it just schedules the future —
-    // so holding the mutex across it is safe.
+    // Store session, spawn task, and store task handle in a single lock scope.
+    // The block ensures the MutexGuard is dropped before any subsequent await.
     {
-        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        let mut guard = match state.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                // Can't await session.close() here (guard would cross await),
+                // but the session will be dropped which is acceptable for a
+                // poisoned-mutex edge case.
+                return Err(format!("lock error: {e}"));
+            }
+        };
         guard.session = Some(session);
-        // closing Arc is already set on guard from the start of connect_zenoh.
-        // Clone it for the subscriber task.
         let task_closing = closing.clone();
 
         let app_handle = app.clone();
@@ -188,7 +195,6 @@ async fn connect_zenoh(
                         }
                     }
                     Err(e) => {
-                        // Distinguish clean disconnect from unexpected session loss.
                         if !task_closing.load(Ordering::SeqCst) {
                             let _ = app_handle.emit(
                                 "zenoh-status",
