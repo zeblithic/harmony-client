@@ -69,7 +69,9 @@ export class ZenohService {
         // Only accept capacity updates when connected
         if (this.connectionStatus !== 'connected') return;
         const update = event.payload as CapacityUpdate;
+        const existing = this.discoveredNodes.get(update.nodeAddr);
         this.discoveredNodes.set(update.nodeAddr, {
+          ...existing,  // preserve cpuPercent, memMb from health telemetry
           ...update,
           lastSeen: Date.now(),
         });
@@ -141,17 +143,20 @@ export class ZenohService {
         const node = this.discoveredNodes.get(telem.nodeAddr);
         if (!node) return;
 
+        // Guard: payload must be a non-null object before accessing properties
+        if (telem.payload === null || typeof telem.payload !== 'object') return;
+
         if (telem.intent === 'health') {
           const p = telem.payload as import('./telemetry-types').HealthPayload;
           if (p.cpu_percent !== undefined) node.cpuPercent = p.cpu_percent;
           if (p.mem_mb !== undefined) node.memMb = p.mem_mb;
-          node.lastSeen = Date.now();
+          node.lastSeen = telem.timestamp * 1000; // epoch seconds → ms
           this.onChange?.();
         } else if (telem.intent === 'capacity_changed') {
           const p = telem.payload as import('./telemetry-types').CapacityChangedPayload;
           if (p.ready !== undefined) node.ready = p.ready;
           if (p.model_cid !== undefined) node.modelCid = p.model_cid;
-          node.lastSeen = Date.now();
+          node.lastSeen = telem.timestamp * 1000; // epoch seconds → ms
           this.onChange?.();
         }
         // Unknown intents: silently ignore (forward-compatible)

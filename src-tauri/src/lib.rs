@@ -361,7 +361,19 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("telemetry-event", &event);
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
                     result = telem_capacity.recv_async() => {
@@ -372,7 +384,19 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("telemetry-event", &event);
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                if !task_closing.load(Ordering::SeqCst) {
+                                    let _ = app_handle.emit(
+                                        "zenoh-status",
+                                        &ZenohStatus {
+                                            status: "error".to_string(),
+                                            endpoint: None,
+                                            error: Some(format!("session lost: {e}")),
+                                        },
+                                    );
+                                }
+                                break;
+                            }
                         }
                     }
                 }
