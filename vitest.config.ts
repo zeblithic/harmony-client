@@ -8,6 +8,14 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
+    environmentOptions: {
+      jsdom: {
+        url: 'http://localhost',
+      },
+    },
+    // Override Node.js 22+ built-in localStorage with jsdom's full Storage
+    // implementation (which supports .clear(), .key(), etc.).
+    setupFiles: ['./src/test-setup.ts'],
     globals: true,
     include: ['src/**/*.test.ts'],
   },
