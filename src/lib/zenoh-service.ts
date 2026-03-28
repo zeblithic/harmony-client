@@ -69,7 +69,11 @@ export class ZenohService {
         // Only accept capacity updates when connected
         if (this.connectionStatus !== 'connected') return;
         const update = event.payload as CapacityUpdate;
+        // Merge with existing entry to preserve telemetry fields
+        // (cpuPercent, memMb) that may have been set by telemetry events.
+        const existing = this.discoveredNodes.get(update.nodeAddr);
         this.discoveredNodes.set(update.nodeAddr, {
+          ...existing,
           ...update,
           lastSeen: Date.now(),
         });

@@ -65,8 +65,12 @@ export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
     metrics: {
       timestamp: node.lastSeen,
       cpuPercent: node.cpuPercent ?? 0,
-      memoryUsedBytes: (node.memMb ?? 0) * 1024 * 1024,
-      memoryTotalBytes: 1, // sentinel — total memory not available in current health payload
+      // Without a real memoryTotalBytes, keep both at sentinel values.
+      // Setting memoryUsedBytes from telemetry while total is a sentinel
+      // produces astronomically wrong percentages (e.g., 53687091200%).
+      // Real memory metrics require both used AND total from telemetry.
+      memoryUsedBytes: 0,
+      memoryTotalBytes: 1, // sentinel — avoids NaN in usage% (0/1 = 0%)
       diskUsedBytes: 0,
       diskTotalBytes: 1,   // sentinel — avoids NaN in usage% until real metrics arrive
     },
