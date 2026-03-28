@@ -87,13 +87,16 @@ export class ZenohService {
         } else if (status.status === 'error') {
           if (this.userDisconnected) return;
           if (this.reconnectTimer !== null) return;
-          this.connectInFlight = false;
+          // Don't clear connectInFlight here — the connected handler needs
+          // it to accept a valid connected event that arrives after this
+          // stale error. connectInFlight is cleared by: connected handler
+          // (success), disconnect(), destroy(), or catch block (no reconnect).
           this.connectionStatus = 'error';
           this.errorMessage = status.error;
           if (this.lastEndpoint) {
-            // scheduleReconnect calls onChange internally
             this.scheduleReconnect();
           } else {
+            this.connectInFlight = false;
             this.onChange?.();
           }
         }
