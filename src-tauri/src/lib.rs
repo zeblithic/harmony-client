@@ -302,6 +302,21 @@ async fn connect_zenoh(
 
         let app_handle = app.clone();
         let task = tokio::spawn(async move {
+            // Shared error handler for all subscriber branches.
+            // Emits zenoh-status:error unless this is a clean disconnect.
+            let emit_session_lost = |e: &dyn std::fmt::Display| {
+                if !task_closing.load(Ordering::SeqCst) {
+                    let _ = app_handle.emit(
+                        "zenoh-status",
+                        &ZenohStatus {
+                            status: "error".to_string(),
+                            endpoint: None,
+                            error: Some(format!("session lost: {e}")),
+                        },
+                    );
+                }
+            };
+
             loop {
                 tokio::select! {
                     result = subscriber.recv_async() => {
@@ -313,19 +328,7 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("capacity-update", &update);
                                 }
                             }
-                            Err(e) => {
-                                if !task_closing.load(Ordering::SeqCst) {
-                                    let _ = app_handle.emit(
-                                        "zenoh-status",
-                                        &ZenohStatus {
-                                            status: "error".to_string(),
-                                            endpoint: None,
-                                            error: Some(format!("session lost: {e}")),
-                                        },
-                                    );
-                                }
-                                break;
-                            }
+                            Err(e) => { emit_session_lost(&e); break; }
                         }
                     }
                     result = profile_subscriber.recv_async() => {
@@ -336,21 +339,7 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("profile-update", &profile);
                                 }
                             }
-                            Err(e) => {
-                                // Same error handling as capacity branch — emit
-                                // session-lost so frontend can auto-reconnect.
-                                if !task_closing.load(Ordering::SeqCst) {
-                                    let _ = app_handle.emit(
-                                        "zenoh-status",
-                                        &ZenohStatus {
-                                            status: "error".to_string(),
-                                            endpoint: None,
-                                            error: Some(format!("session lost: {e}")),
-                                        },
-                                    );
-                                }
-                                break;
-                            }
+                            Err(e) => { emit_session_lost(&e); break; }
                         }
                     }
                     result = telem_health.recv_async() => {
@@ -361,19 +350,7 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("telemetry-event", &event);
                                 }
                             }
-                            Err(e) => {
-                                if !task_closing.load(Ordering::SeqCst) {
-                                    let _ = app_handle.emit(
-                                        "zenoh-status",
-                                        &ZenohStatus {
-                                            status: "error".to_string(),
-                                            endpoint: None,
-                                            error: Some(format!("session lost: {e}")),
-                                        },
-                                    );
-                                }
-                                break;
-                            }
+                            Err(e) => { emit_session_lost(&e); break; }
                         }
                     }
                     result = telem_capacity.recv_async() => {
@@ -384,19 +361,7 @@ async fn connect_zenoh(
                                     let _ = app_handle.emit("telemetry-event", &event);
                                 }
                             }
-                            Err(e) => {
-                                if !task_closing.load(Ordering::SeqCst) {
-                                    let _ = app_handle.emit(
-                                        "zenoh-status",
-                                        &ZenohStatus {
-                                            status: "error".to_string(),
-                                            endpoint: None,
-                                            error: Some(format!("session lost: {e}")),
-                                        },
-                                    );
-                                }
-                                break;
-                            }
+                            Err(e) => { emit_session_lost(&e); break; }
                         }
                     }
                 }

@@ -12,8 +12,8 @@ describe('discoveredToNetworkNode with telemetry', () => {
       memMb: 512,
     });
     expect(node.metrics.cpuPercent).toBe(42.5);
-    // Memory percentage not displayed until health payload includes total.
-    // Used/total stay at sentinel (0/1) regardless of mem_mb.
+    // memoryUsedBytes stays 0 — without a real memoryTotalBytes,
+    // setting used would produce astronomically wrong percentages.
     expect(node.metrics.memoryUsedBytes).toBe(0);
     expect(node.metrics.memoryTotalBytes).toBe(1);
   });

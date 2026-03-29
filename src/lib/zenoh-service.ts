@@ -69,9 +69,11 @@ export class ZenohService {
         // Only accept capacity updates when connected
         if (this.connectionStatus !== 'connected') return;
         const update = event.payload as CapacityUpdate;
+        // Merge with existing entry to preserve telemetry fields
+        // (cpuPercent, memMb) that may have been set by telemetry events.
         const existing = this.discoveredNodes.get(update.nodeAddr);
         this.discoveredNodes.set(update.nodeAddr, {
-          ...existing,  // preserve cpuPercent, memMb from health telemetry
+          ...existing,
           ...update,
           lastSeen: Date.now(),
         });
@@ -248,10 +250,6 @@ export class ZenohService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-  }
-
-  async publishProfile(profile: ProfilePayload): Promise<void> {
-    await this.adapter.invoke('publish_profile', { profile });
   }
 
   destroy(): void {
