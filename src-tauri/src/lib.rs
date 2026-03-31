@@ -107,6 +107,19 @@ pub fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
 
 // ── Tauri commands ───────────────────────────────────────────────────────
 
+/// Stop a node given its extracted handles (called outside the lock).
+fn stop_handles(
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    thread: Option<thread::JoinHandle<()>>,
+) {
+    if let Some(tx) = shutdown_tx {
+        let _ = tx.send(true);
+    }
+    if let Some(thread) = thread {
+        let _ = thread.join();
+    }
+}
+
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
@@ -124,17 +137,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
-
-    // Signal the event loop to stop.
-    if let Some(tx) = shutdown_tx {
-        let _ = tx.send(true);
-    }
-
-    // Wait for the thread to finish outside the lock.
-    if let Some(thread) = thread {
-        let _ = thread.join();
-    }
-
+    stop_handles(shutdown_tx, thread);
     had_node
 }
 
@@ -142,24 +145,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
 /// as a background task. Emits `zenoh-status` events to the frontend.
-///
-/// The `endpoint` parameter is accepted for backward compatibility with the
-/// frontend's connect flow but currently unused — the Zenoh session uses
-/// default scouting to discover routers/peers.
 #[tauri::command]
 async fn start_node(
     endpoint: Option<String>,
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    // Shut down any existing node first (unconditional).
-    let _ = stop_inner(&state, None);
-    {
-        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.generation += 1;
-    }
-
-    // ── Identity ─────────────────────────────────────────────────────
+    // ── Identity + config (no lock needed) ───────────────────────────
     let id_path = identity::resolve_path(None)?;
     let id = identity::load_or_generate(&id_path)?;
     let identity::NodeIdentity { pq, ed25519 } = id;
@@ -171,8 +163,6 @@ async fn start_node(
     let local_pq_identity_hash = pq_pub.address_hash;
     let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
     let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
-
-    // PQ key not needed after config construction (no tunnel support yet).
     drop(pq);
 
     let reticulum_identity_bytes =
@@ -181,18 +171,17 @@ async fn start_node(
 
     tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
 
-    // ── NodeConfig (desktop defaults — no disk/archive/S3/inference) ──
     let config = NodeConfig {
         storage_budget: StorageBudget {
             cache_capacity: 512,
-            max_pinned_bytes: 50_000_000, // 50 MB
+            max_pinned_bytes: 50_000_000,
         },
         compute_budget: InstructionBudget { fuel: 100_000 },
         schedule: Default::default(),
         content_policy: ContentPolicy::default(),
         filter_broadcast_config: FilterBroadcastConfig {
             mutation_threshold: 10,
-            max_interval_ticks: 40, // 10 seconds at 250ms ticks
+            max_interval_ticks: 40,
             expected_items: 512,
             fp_rate: 0.001,
         },
@@ -214,51 +203,67 @@ async fn start_node(
         s3_enabled: false,
     };
 
-    // ── Spawn event loop on a dedicated thread ─────────────────────
-    // NodeRuntime is !Send (WorkflowEngine contains Box<dyn Any>), so it
-    // must be constructed AND run on the same thread. We move the Send-able
-    // NodeConfig to the new thread and construct NodeRuntime there.
+    // ── Atomic stop→spawn→store under a single lock ─────────────────
+    // This prevents concurrent start_node calls from orphaning threads.
+    // The lock is held across stop (which joins the old thread — blocking
+    // but bounded) and the new thread spawn + handle registration.
     //
-    // A oneshot channel lets the event loop report whether startup (UDP bind,
-    // Zenoh open) succeeded before we emit "connected" to the frontend.
+    // Handles are stored BEFORE awaiting ready_rx so that a concurrent
+    // stop_node can cancel an in-flight startup via shutdown_tx.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
-    let ep_clone = endpoint.clone();
-    let app_clone = app.clone();
-    let thread = thread::Builder::new()
-        .name("harmony-runtime".to_string())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create tokio runtime for harmony-runtime");
-            rt.block_on(async move {
-                let (runtime, startup_actions) =
-                    NodeRuntime::new(config, MemoryBookStore::new());
-                event_loop::run(
-                    runtime,
-                    startup_actions,
-                    app_clone,
-                    ep_clone,
-                    ready_tx,
-                    shutdown_rx,
-                    publish_rx,
-                )
-                .await;
-            });
-        })
-        .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
 
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+
+        // Stop existing node under the lock (prevents interleaving).
+        let old_shutdown = guard.shutdown_tx.take();
+        let old_thread = guard.thread.take();
+        // Drop the lock briefly to join — can't hold Mutex across blocking join
+        // if another thread might need to lock it. But since we took the handles,
+        // no one else can race with us on *this* node.
+        drop(guard);
+        stop_handles(old_shutdown, old_thread);
+
+        // Re-acquire and atomically register the new node.
+        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.generation += 1;
+
+        let ep_clone = endpoint.clone();
+        let app_clone = app.clone();
+        let thread = thread::Builder::new()
+            .name("harmony-runtime".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to create tokio runtime for harmony-runtime");
+                rt.block_on(async move {
+                    let (runtime, startup_actions) =
+                        NodeRuntime::new(config, MemoryBookStore::new());
+                    event_loop::run(
+                        runtime,
+                        startup_actions,
+                        app_clone,
+                        ep_clone,
+                        ready_tx,
+                        shutdown_rx,
+                        publish_rx,
+                    )
+                    .await;
+                });
+            })
+            .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
+
         guard.thread = Some(thread);
         guard.shutdown_tx = Some(shutdown_tx);
         guard.publish_tx = Some(publish_tx);
+        // Lock dropped here — handles are registered, stop_node can find them.
     }
 
     // Wait for the event loop to report startup success or failure.
-    // If the thread panics or the channel is dropped, treat as error.
+    // stop_node can cancel this by signaling shutdown_tx (now registered).
     match ready_rx.await {
         Ok(Ok(())) => {
             let _ = app.emit(
@@ -271,12 +276,8 @@ async fn start_node(
             );
             Ok(())
         }
-        Ok(Err(e)) => {
-            // Startup failed — error already emitted by event loop.
-            Err(e)
-        }
+        Ok(Err(e)) => Err(e),
         Err(_) => {
-            // Channel dropped — event loop panicked or exited before signaling.
             Err("runtime thread exited before reporting startup status".to_string())
         }
     }

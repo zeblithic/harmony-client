@@ -138,6 +138,10 @@ pub async fn run(
 
         tokio::select! {
             // ── UDP inbound ──────────────────────────────────────────
+            // Intentionally does NOT set should_tick — matches harmony-node.
+            // Packets are buffered and processed on the next 250ms timer tick.
+            // This ensures tick_count and filter broadcast timers advance at
+            // wall-clock rate regardless of packet arrival rate.
             result = udp.recv_from(&mut udp_buf) => {
                 match result {
                     Ok((len, _addr)) => {
