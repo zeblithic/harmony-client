@@ -17,6 +17,25 @@ serde_json = "1"
 # A desktop app benefits from all transports. Disabling defaults breaks
 # TCP connectivity (previous review confirmed this).
 zenoh = "1"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 hex = "0.4"
+rand = "0.8"
+zeroize = "1"
+tracing = "0.1"
+
+# Harmony crates — harmony-runtime is the core sans-I/O runtime.
+# harmony-identity and harmony-content are direct deps because we use
+# their types (PrivateIdentity, PqPrivateIdentity, MemoryBookStore, etc.).
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+
+# Pin pre-release PQ crypto deps to match the harmony workspace.
+# These RC crates have breaking changes between point releases; without
+# exact pins Cargo resolves to newer (incompatible) versions.
+ml-dsa = "=0.1.0-rc.7"
+ml-kem = "=0.3.0-rc.0"
+sha3 = "=0.11.0-rc.8"
+keccak = "=0.2.0-rc.2"

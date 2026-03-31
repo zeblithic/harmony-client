@@ -1,34 +1,29 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::thread;
 
+use harmony_compute::InstructionBudget;
+use harmony_content::book::MemoryBookStore;
+use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
+use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::task::JoinHandle;
 
-struct ZenohState {
-    session: Option<zenoh::Session>,
-    task: Option<JoinHandle<()>>,
-    /// Set to true by disconnect_inner before closing the session.
-    /// Each connection gets a fresh Arc; the old task keeps its copy.
-    closing: Arc<AtomicBool>,
-    /// Monotonic connection generation. Incremented on each connect.
-    /// disconnect_zenoh captures the generation at call time and only
-    /// tears down the session if the generation still matches, preventing
-    /// a stale disconnect from closing a newer session.
-    /// Plain u64 — only accessed under the Mutex lock.
+mod event_loop;
+mod identity;
+
+// ── Managed Tauri state ──────────────────────────────────────────────────
+
+#[derive(Default)]
+struct NodeState {
+    /// Background thread running the event loop (NodeRuntime is !Send).
+    thread: Option<thread::JoinHandle<()>>,
+    /// Send `true` to shut down the event loop.
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
 }
 
-impl Default for ZenohState {
-    fn default() -> Self {
-        Self {
-            session: None,
-            task: None,
-            closing: Arc::new(AtomicBool::new(false)),
-            generation: 0,
-        }
-    }
-}
+// ── Data types (shared with frontend via Tauri events) ───────────────────
 
 /// Parsed capacity advertisement from a harmony-node.
 #[derive(Debug, Clone, Serialize)]
@@ -62,22 +57,6 @@ pub struct ProfilePayload {
     pub avatar_url: Option<String>,
 }
 
-const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
-
-fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
-    let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
-    if payload.len() < 33 {
-        return None;
-    }
-    let model_cid = hex::encode(&payload[..32]);
-    let ready = payload[32] == 0x01;
-    Some(CapacityUpdate {
-        node_addr: node_addr.to_string(),
-        model_cid,
-        ready,
-    })
-}
-
 /// Telemetry event pushed to the frontend via IPC.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,7 +72,25 @@ pub struct TelemetryEventPayload {
     pub source: Option<String>,
 }
 
-fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
+// ── Parsing helpers (used by event_loop.rs and tests) ────────────────────
+
+const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
+
+pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
+    let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
+    if payload.len() < 33 {
+        return None;
+    }
+    let model_cid = hex::encode(&payload[..32]);
+    let ready = payload[32] == 0x01;
+    Some(CapacityUpdate {
+        node_addr: node_addr.to_string(),
+        model_cid,
+        ready,
+    })
+}
+
+pub fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
     let event = harmony_telemetry::decode_event(wire).ok()?;
     Some(TelemetryEventPayload {
         node_addr: event.node_addr,
@@ -106,275 +103,146 @@ fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
     })
 }
 
-/// Disconnect the current session. If `expected_gen` is `Some(n)`, only
-/// disconnect if the current generation matches — prevents a stale
-/// disconnect from tearing down a newer session. Pass `None` to
-/// unconditionally disconnect (used by connect_zenoh's internal teardown).
-async fn disconnect_inner(
-    app: &AppHandle,
-    state: &Mutex<ZenohState>,
-    expected_gen: Option<u64>,
-) {
-    let (session, task) = {
+// ── Tauri commands ───────────────────────────────────────────────────────
+
+/// Stop the running node (if any). Returns after the event loop thread exits.
+fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) {
+    let (shutdown_tx, thread) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        // If a generation was specified, only disconnect if it matches.
-        // This prevents a stale disconnect_zenoh from tearing down a
-        // newer session that was established after the disconnect was called.
         if let Some(gen) = expected_gen {
             if guard.generation != gen {
-                return; // Stale disconnect — newer session exists
+                return; // Stale stop — newer node exists
             }
         }
-        guard.closing.store(true, Ordering::SeqCst);
-        (guard.session.take(), guard.task.take())
+        (guard.shutdown_tx.take(), guard.thread.take())
     };
 
-    // Explicitly close the session so all subscribers receive Err.
-    let had_session = session.is_some();
-    if let Some(session) = session {
-        let _ = session.close().await;
+    // Signal the event loop to stop.
+    if let Some(tx) = shutdown_tx {
+        let _ = tx.send(true);
     }
-    if let Some(task) = task {
-        let _ = task.await;
-    }
-    // Only emit disconnected if there was actually a session to disconnect.
-    // Prevents spurious disconnected event during connect_zenoh's teardown
-    // of a previous connection, which would flicker the UI.
-    if had_session {
-        let _ = app.emit(
-            "zenoh-status",
-            &ZenohStatus {
-                status: "disconnected".to_string(),
-                endpoint: None,
-                error: None,
-            },
-        );
+
+    // Wait for the thread to finish outside the lock.
+    if let Some(thread) = thread {
+        let _ = thread.join();
     }
 }
 
+/// Start the harmony node with an embedded NodeRuntime.
+///
+/// Generates/loads identity, creates the runtime, and spawns the event loop
+/// as a background task. Emits `zenoh-status` events to the frontend.
+///
+/// The `endpoint` parameter is accepted for backward compatibility with the
+/// frontend's connect flow but currently unused — the Zenoh session uses
+/// default scouting to discover routers/peers.
 #[tauri::command]
-async fn connect_zenoh(
-    endpoint: String,
+async fn start_node(
+    endpoint: Option<String>,
     app: AppHandle,
-    state: tauri::State<'_, Mutex<ZenohState>>,
+    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    // Disconnect if already connected, then allocate a fresh closing flag
-    // for this connection. Each connection gets its own Arc<AtomicBool> so
-    // the old subscriber task's flag is independent from the new one.
-    disconnect_inner(&app, &state, None).await;
-    let closing = Arc::new(AtomicBool::new(false));
+    // Shut down any existing node first.
+    stop_inner(&state, None);
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.closing = closing.clone();
-        // Increment generation so any stale disconnect_zenoh commands
-        // (from before this connect) will see a mismatch and no-op.
         guard.generation += 1;
     }
 
-    // Build zenoh config — use serde_json to safely serialize the endpoint
-    let mut config = zenoh::Config::default();
-    let endpoint_json = serde_json::to_string(&endpoint)
-        .map_err(|e| format!("endpoint serialize error: {e}"))?;
-    config
-        .insert_json5("connect/endpoints", &format!("[{}]", endpoint_json))
-        .map_err(|e| format!("config error: {e}"))?;
+    // ── Identity ─────────────────────────────────────────────────────
+    let id_path = identity::resolve_path(None)?;
+    let id = identity::load_or_generate(&id_path)?;
+    let identity::NodeIdentity { pq, ed25519 } = id;
 
-    // Open session
-    let session = zenoh::open(config).await.map_err(|e| {
-        let msg = format!("zenoh open failed: {e}");
-        let _ = app.emit(
-            "zenoh-status",
-            &ZenohStatus {
-                status: "error".to_string(),
-                endpoint: Some(endpoint.clone()),
-                error: Some(msg.clone()),
-            },
-        );
-        msg
-    })?;
+    let our_addr_bytes: [u8; 16] = ed25519.public_identity().address_hash;
+    let node_addr = hex::encode(our_addr_bytes);
 
-    // Check if disconnect was called while we were awaiting zenoh::open.
-    // Uses our local `closing` Arc — not re-read from state, which may
-    // have been replaced by a subsequent connect call.
-    let was_cancelled = closing.load(Ordering::SeqCst);
-    if was_cancelled {
-        let _ = session.close().await;
-        return Ok(());
-    }
+    let pq_pub = pq.public_identity();
+    let local_pq_identity_hash = pq_pub.address_hash;
+    let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
+    let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
 
-    // Subscribe to capacity advertisements.
-    // Close session explicitly on error — Drop alone can't do the full async close.
-    let subscriber = match session.declare_subscriber("harmony/compute/capacity/*").await {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("subscribe failed: {e}");
-            let _ = app.emit(
-                "zenoh-status",
-                &ZenohStatus {
-                    status: "error".to_string(),
-                    endpoint: Some(endpoint.clone()),
-                    error: Some(msg.clone()),
-                },
-            );
-            let _ = session.close().await;
-            return Err(msg);
-        }
+    // PQ key not needed after config construction (no tunnel support yet).
+    drop(pq);
+
+    let reticulum_identity_bytes =
+        Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+    drop(ed25519);
+
+    tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
+
+    // ── NodeConfig (desktop defaults — no disk/archive/S3/inference) ──
+    let config = NodeConfig {
+        storage_budget: StorageBudget {
+            cache_capacity: 512,
+            max_pinned_bytes: 50_000_000, // 50 MB
+        },
+        compute_budget: InstructionBudget { fuel: 100_000 },
+        schedule: Default::default(),
+        content_policy: ContentPolicy::default(),
+        filter_broadcast_config: FilterBroadcastConfig {
+            mutation_threshold: 10,
+            max_interval_ticks: 40, // 10 seconds at 250ms ticks
+            expected_items: 512,
+            fp_rate: 0.001,
+        },
+        node_addr,
+        local_identity_hash: our_addr_bytes,
+        local_pq_identity_hash,
+        local_dsa_pubkey,
+        local_kem_pubkey,
+        reticulum_identity_bytes,
+        inference_gguf_cid: None,
+        inference_tokenizer_cid: None,
+        engram_manifest_cid: None,
+        disk_enabled: false,
+        disk_entries: Vec::new(),
+        disk_quota: None,
+        archive_enabled: false,
+        archive_entries: Vec::new(),
+        archive_quota: None,
+        s3_enabled: false,
     };
 
-    // Subscribe to profile updates.
-    let profile_subscriber = match session.declare_subscriber("harmony/profile/*").await {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("profile subscribe failed: {e}");
-            let _ = app.emit(
-                "zenoh-status",
-                &ZenohStatus {
-                    status: "error".to_string(),
-                    endpoint: Some(endpoint.clone()),
-                    error: Some(msg.clone()),
-                },
-            );
-            let _ = session.close().await;
-            return Err(msg);
-        }
-    };
-
-    // Subscribe to telemetry health events.
-    let telem_health = match session
-        .declare_subscriber("harmony/telemetry/*/health")
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("telemetry subscribe failed: {e}");
-            let _ = app.emit("zenoh-status", &ZenohStatus {
-                status: "error".to_string(),
-                endpoint: Some(endpoint.clone()),
-                error: Some(msg.clone()),
-            });
-            let _ = session.close().await;
-            return Err(msg);
-        }
-    };
-
-    // Subscribe to telemetry capacity_changed events.
-    let telem_capacity = match session
-        .declare_subscriber("harmony/telemetry/*/capacity_changed")
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("telemetry subscribe failed: {e}");
-            let _ = app.emit("zenoh-status", &ZenohStatus {
-                status: "error".to_string(),
-                endpoint: Some(endpoint.clone()),
-                error: Some(msg.clone()),
-            });
-            let _ = session.close().await;
-            return Err(msg);
-        }
-    };
-
-    // Check again after declare_subscriber awaits
-    let was_cancelled = closing.load(Ordering::SeqCst);
-    if was_cancelled {
-        let _ = session.close().await;
-        return Ok(());
-    }
-
-    // Store session, spawn task, and store task handle in a single lock scope.
-    // The block ensures the MutexGuard is dropped before any subsequent await.
-    {
-        let mut guard = match state.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                // Can't await session.close() here (guard would cross await),
-                // but the session will be dropped which is acceptable for a
-                // poisoned-mutex edge case.
-                return Err(format!("lock error: {e}"));
-            }
-        };
-        guard.session = Some(session);
-        let task_closing = closing.clone();
-
-        let app_handle = app.clone();
-        let task = tokio::spawn(async move {
-            // Shared error handler for all subscriber branches.
-            // Emits zenoh-status:error unless this is a clean disconnect.
-            let emit_session_lost = |e: &dyn std::fmt::Display| {
-                if !task_closing.load(Ordering::SeqCst) {
-                    let _ = app_handle.emit(
-                        "zenoh-status",
-                        &ZenohStatus {
-                            status: "error".to_string(),
-                            endpoint: None,
-                            error: Some(format!("session lost: {e}")),
-                        },
-                    );
+    // ── Spawn event loop on a dedicated thread ─────────────────────
+    // NodeRuntime is !Send (WorkflowEngine contains Box<dyn Any>), so it
+    // must be constructed AND run on the same thread. We move the Send-able
+    // NodeConfig to the new thread and construct NodeRuntime there.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let app_clone = app.clone();
+    let thread = thread::Builder::new()
+        .name("harmony-runtime".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime for harmony-runtime");
+            rt.block_on(async move {
+                let (runtime, startup_actions) =
+                    NodeRuntime::new(config, MemoryBookStore::new());
+                if let Err(e) =
+                    event_loop::run(runtime, startup_actions, app_clone, shutdown_rx).await
+                {
+                    tracing::error!(err = %e, "event loop error");
                 }
-            };
+            });
+        })
+        .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
 
-            loop {
-                tokio::select! {
-                    result = subscriber.recv_async() => {
-                        match result {
-                            Ok(sample) => {
-                                let key = sample.key_expr().as_str();
-                                let payload = sample.payload().to_bytes();
-                                if let Some(update) = parse_capacity(key, &payload) {
-                                    let _ = app_handle.emit("capacity-update", &update);
-                                }
-                            }
-                            Err(e) => { emit_session_lost(&e); break; }
-                        }
-                    }
-                    result = profile_subscriber.recv_async() => {
-                        match result {
-                            Ok(sample) => {
-                                let payload = sample.payload().to_bytes();
-                                if let Ok(profile) = serde_json::from_slice::<ProfilePayload>(&payload) {
-                                    let _ = app_handle.emit("profile-update", &profile);
-                                }
-                            }
-                            Err(e) => { emit_session_lost(&e); break; }
-                        }
-                    }
-                    result = telem_health.recv_async() => {
-                        match result {
-                            Ok(sample) => {
-                                let payload = sample.payload().to_bytes();
-                                if let Some(event) = parse_telemetry(&payload) {
-                                    let _ = app_handle.emit("telemetry-event", &event);
-                                }
-                            }
-                            Err(e) => { emit_session_lost(&e); break; }
-                        }
-                    }
-                    result = telem_capacity.recv_async() => {
-                        match result {
-                            Ok(sample) => {
-                                let payload = sample.payload().to_bytes();
-                                if let Some(event) = parse_telemetry(&payload) {
-                                    let _ = app_handle.emit("telemetry-event", &event);
-                                }
-                            }
-                            Err(e) => { emit_session_lost(&e); break; }
-                        }
-                    }
-                }
-            }
-        });
-        guard.task = Some(task);
+    {
+        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        guard.thread = Some(thread);
+        guard.shutdown_tx = Some(shutdown_tx);
     }
 
     let _ = app.emit(
         "zenoh-status",
         &ZenohStatus {
             status: "connected".to_string(),
-            endpoint: Some(endpoint),
+            endpoint,
             error: None,
         },
     );
@@ -382,33 +250,56 @@ async fn connect_zenoh(
     Ok(())
 }
 
+/// Stop the harmony node and clean up.
 #[tauri::command]
-async fn disconnect_zenoh(
+fn stop_node(
     app: AppHandle,
-    state: tauri::State<'_, Mutex<ZenohState>>,
+    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    // Capture the current generation — only disconnect if it still matches
-    // when disconnect_inner runs. If a connect_zenoh happened between the
-    // user clicking Disconnect and this command executing, the generation
-    // will have changed and this becomes a no-op.
     let gen = {
         let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation
     };
-    disconnect_inner(&app, &state, Some(gen)).await;
+    stop_inner(&state, Some(gen));
+    let _ = app.emit(
+        "zenoh-status",
+        &ZenohStatus {
+            status: "disconnected".to_string(),
+            endpoint: None,
+            error: None,
+        },
+    );
     Ok(())
 }
 
+// ── Legacy command aliases (backward compat with frontend) ───────────────
+
+/// Alias: the frontend calls `connect_zenoh` — route to `start_node`.
 #[tauri::command]
-async fn publish_profile(
-    profile: ProfilePayload,
-    state: tauri::State<'_, Mutex<ZenohState>>,
+async fn connect_zenoh(
+    endpoint: String,
+    app: AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let session = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.session.clone().ok_or_else(|| "not connected".to_string())?
-    };
-    // Validate address — reject Zenoh reserved characters
+    start_node(Some(endpoint), app, state).await
+}
+
+/// Alias: the frontend calls `disconnect_zenoh` — route to `stop_node`.
+#[tauri::command]
+fn disconnect_zenoh(
+    app: AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    stop_node(app, state)
+}
+
+/// Publish a profile to the mesh network via Zenoh.
+///
+/// TODO: Route through the NodeRuntime's Publish action instead of
+/// managing a separate Zenoh session. For now this opens a transient
+/// session since the event loop's session isn't directly accessible.
+#[tauri::command]
+async fn publish_profile(profile: ProfilePayload) -> Result<(), String> {
     if profile.address.contains('/')
         || profile.address.contains('*')
         || profile.address.contains('?')
@@ -418,6 +309,13 @@ async fn publish_profile(
     {
         return Err(format!("invalid address: {}", profile.address));
     }
+
+    // Open a transient session for the publish. This is not ideal but
+    // avoids threading the event loop's session through Tauri state.
+    // Follow-up: expose a channel into the event loop for publishes.
+    let session = zenoh::open(zenoh::Config::default())
+        .await
+        .map_err(|e| format!("zenoh open: {e}"))?;
     let key = format!("harmony/profile/{}", profile.address);
     let payload =
         serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
@@ -425,13 +323,13 @@ async fn publish_profile(
         .put(&key, payload)
         .await
         .map_err(|e| format!("put failed: {e}"))?;
+    let _ = session.close().await;
     Ok(())
 }
 
+// ── Vine stubs (unchanged) ───────────────────────────────────────────────
+
 /// Vine video descriptor returned to the frontend.
-///
-/// Mirrors `harmony_content::vine::VineDescriptor` but uses hex-encoded
-/// strings for CIDs and addresses (easier to consume from TypeScript).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VineVideoDto {
@@ -447,37 +345,36 @@ pub struct VineVideoDto {
 
 #[tauri::command]
 fn list_vine_videos() -> Vec<VineVideoDto> {
-    // Stub — returns empty until real content transport is wired up.
-    // The frontend uses mock data in the meantime.
     Vec::new()
 }
 
 #[tauri::command]
 fn follow_vine_creator(_address: String) -> bool {
-    // Stub — will subscribe to vine announce key expression via zenoh.
     true
 }
 
 #[tauri::command]
 fn unfollow_vine_creator(_address: String) -> bool {
-    // Stub — will unsubscribe from vine announce key expression.
     true
 }
 
 #[tauri::command]
 fn mark_vine_viewed(_vine_id: String) -> bool {
-    // Stub — will update viewed state in VineFeed state machine.
     true
 }
 
+// ── App entry point ──────────────────────────────────────────────────────
+
 pub fn run() {
     tauri::Builder::default()
-        .manage(Mutex::new(ZenohState::default()))
+        .manage(Mutex::new(NodeState::default()))
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
             follow_vine_creator,
             unfollow_vine_creator,
             mark_vine_viewed,
+            start_node,
+            stop_node,
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
@@ -573,7 +470,6 @@ mod tests {
         let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
         assert!(json.contains("\"displayName\""), "expected camelCase: {json}");
         assert!(!json.contains("\"display_name\""), "unexpected snake_case: {json}");
-        // None fields should be skipped
         assert!(!json.contains("statusText"), "None field should be skipped: {json}");
     }
 
