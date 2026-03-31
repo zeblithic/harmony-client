@@ -19,6 +19,8 @@ struct NodeState {
     thread: Option<thread::JoinHandle<()>>,
     /// Send `true` to shut down the event loop.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Channel for routing publish requests through the event loop's session.
+    publish_tx: Option<tokio::sync::mpsc::Sender<event_loop::PublishRequest>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
 }
@@ -221,6 +223,7 @@ async fn start_node(
     // Zenoh open) succeeded before we emit "connected" to the frontend.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let ep_clone = endpoint.clone();
     let app_clone = app.clone();
     let thread = thread::Builder::new()
@@ -240,6 +243,7 @@ async fn start_node(
                     ep_clone,
                     ready_tx,
                     shutdown_rx,
+                    publish_rx,
                 )
                 .await;
             });
@@ -250,6 +254,7 @@ async fn start_node(
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.thread = Some(thread);
         guard.shutdown_tx = Some(shutdown_tx);
+        guard.publish_tx = Some(publish_tx);
     }
 
     // Wait for the event loop to report startup success or failure.
@@ -323,13 +328,12 @@ fn disconnect_zenoh(
     stop_node(app, state)
 }
 
-/// Publish a profile to the mesh network via Zenoh.
-///
-/// TODO: Route through the NodeRuntime's Publish action instead of
-/// managing a separate Zenoh session. For now this opens a transient
-/// session since the event loop's session isn't directly accessible.
+/// Publish a profile to the mesh network via the event loop's Zenoh session.
 #[tauri::command]
-async fn publish_profile(profile: ProfilePayload) -> Result<(), String> {
+async fn publish_profile(
+    profile: ProfilePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
     if profile.address.contains('/')
         || profile.address.contains('*')
         || profile.address.contains('?')
@@ -340,19 +344,31 @@ async fn publish_profile(profile: ProfilePayload) -> Result<(), String> {
         return Err(format!("invalid address: {}", profile.address));
     }
 
-    // Open a transient session for the publish. This is not ideal but
-    // avoids threading the event loop's session through Tauri state.
-    // Follow-up: expose a channel into the event loop for publishes.
-    let session = zenoh::open(zenoh::Config::default())
-        .await
-        .map_err(|e| format!("zenoh open: {e}"))?;
-    let key = format!("harmony/profile/{}", profile.address);
+    let publish_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let key_expr = format!("harmony/profile/{}", profile.address);
     let payload =
         serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
-    let result = session.put(&key, payload).await;
-    // Always close the session, even on put failure.
-    let _ = session.close().await;
-    result.map_err(|e| format!("put failed: {e}"))
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
 // ── Vine stubs (unchanged) ───────────────────────────────────────────────

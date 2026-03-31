@@ -8,6 +8,8 @@
 //! No disk/archive/S3 persistence, no inference, no iroh tunnels.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
@@ -19,6 +21,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// Well-known UDP port for Reticulum mesh — must match harmony-node default
 /// so that all nodes on the LAN broadcast/listen on the same port.
 const RETICULUM_UDP_PORT: u16 = 4242;
+
+/// A publish request sent from the Tauri command thread into the event loop.
+pub struct PublishRequest {
+    pub key_expr: String,
+    pub payload: Vec<u8>,
+    pub reply: oneshot::Sender<Result<(), String>>,
+}
 
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
@@ -34,8 +43,9 @@ enum ZenohEvent {
 
 /// Run the NodeRuntime event loop as a background task.
 ///
-/// Sends `Ok(())` on `ready_tx` once UDP + Zenoh are initialized, or
-/// `Err(msg)` if startup fails. Returns when shutdown signal fires.
+/// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
+/// all initialized, or `Err(msg)` if any startup step fails.
+/// Returns when shutdown signal fires.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -43,8 +53,9 @@ pub async fn run(
     endpoint: Option<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
+    mut publish_rx: mpsc::Receiver<PublishRequest>,
 ) {
-    // ── Startup: bind UDP, open Zenoh, process actions ───────────────
+    // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     let startup = async {
         let udp = UdpSocket::bind(format!("0.0.0.0:{RETICULUM_UDP_PORT}"))
             .await
@@ -73,10 +84,7 @@ pub async fn run(
     };
 
     let (udp, broadcast_addr, session) = match startup.await {
-        Ok(v) => {
-            let _ = ready_tx.send(Ok(()));
-            v
-        }
+        Ok(v) => v,
         Err(e) => {
             let _ = ready_tx.send(Err(e.clone()));
             let _ = app.emit(
@@ -91,13 +99,30 @@ pub async fn run(
         }
     };
 
+    // Shared flag: set to true during intentional shutdown so spawned
+    // subscriber/queryable tasks don't emit false session-lost errors.
+    let closing = Arc::new(AtomicBool::new(false));
+
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
     // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {
-        dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &app).await;
+        dispatch_action(
+            action,
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+        )
+        .await;
     }
+
+    // Signal the caller that startup fully succeeded — UDP bound, Zenoh
+    // session open, all queryables and subscribers declared.
+    let _ = ready_tx.send(Ok(()));
 
     // ── Timer (250ms = 4 ticks/sec, same as harmony-node) ────────────
     let mut timer = tokio::time::interval(Duration::from_millis(250));
@@ -145,7 +170,7 @@ pub async fn run(
                 match event {
                     ZenohEvent::Query { key_expr, payload } => {
                         runtime.push_event(RuntimeEvent::QueryReceived {
-                            query_id: 0, // stub — SendReply not wired yet
+                            query_id: 0,
                             key_expr,
                             payload,
                         });
@@ -181,6 +206,15 @@ pub async fn run(
                 should_tick = true;
             }
 
+            // ── Publish requests from Tauri commands ─────────────────
+            Some(req) = publish_rx.recv() => {
+                let result = session
+                    .put(&req.key_expr, req.payload)
+                    .await
+                    .map_err(|e| format!("put failed: {e}"));
+                let _ = req.reply.send(result);
+            }
+
             // ── Shutdown signal ──────────────────────────────────────
             _ = shutdown.changed() => {
                 tracing::info!("shutdown signal received");
@@ -191,12 +225,22 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &app)
-                    .await;
+                dispatch_action(
+                    action,
+                    &session,
+                    &zenoh_tx,
+                    &udp,
+                    &broadcast_addr,
+                    &app,
+                    &closing,
+                )
+                .await;
             }
         }
     }
 
+    // Mark intentional shutdown so spawned tasks don't emit false errors.
+    closing.store(true, Ordering::SeqCst);
     let _ = session.close().await;
     tracing::info!("event loop stopped");
 }
@@ -209,6 +253,7 @@ async fn dispatch_action(
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
     app: &AppHandle,
+    closing: &Arc<AtomicBool>,
 ) {
     match action {
         // ── Network: Reticulum packet send ───────────────────────────
@@ -236,6 +281,7 @@ async fn dispatch_action(
             let is_compute = key_expr.starts_with("harmony/compute/");
             let tx = zenoh_tx.clone();
             let app = app.clone();
+            let closing = closing.clone();
             match session.declare_queryable(&key_expr).await {
                 Ok(qbl) => {
                     tokio::spawn(async move {
@@ -260,7 +306,10 @@ async fn dispatch_action(
                                 break;
                             }
                         }
-                        emit_session_lost(&app, "queryable closed unexpectedly");
+                        // Only emit session-lost if this wasn't an intentional shutdown.
+                        if !closing.load(Ordering::SeqCst) {
+                            emit_session_lost(&app, "queryable closed unexpectedly");
+                        }
                     });
                 }
                 Err(e) => {
@@ -273,6 +322,7 @@ async fn dispatch_action(
         RuntimeAction::Subscribe { key_expr } => {
             let tx = zenoh_tx.clone();
             let app = app.clone();
+            let closing = closing.clone();
             match session.declare_subscriber(&key_expr).await {
                 Ok(sub) => {
                     tokio::spawn(async move {
@@ -290,7 +340,9 @@ async fn dispatch_action(
                                 break;
                             }
                         }
-                        emit_session_lost(&app, "subscriber closed unexpectedly");
+                        if !closing.load(Ordering::SeqCst) {
+                            emit_session_lost(&app, "subscriber closed unexpectedly");
+                        }
                     });
                 }
                 Err(e) => {
@@ -302,8 +354,7 @@ async fn dispatch_action(
         // ── Zenoh: fetch content by CID ──────────────────────────────
         RuntimeAction::FetchContent { cid } => {
             let cid_hex = hex::encode(cid);
-            // Inline the key format from harmony-zenoh (avoids extra dep).
-            // Uses second hex nibble as shard prefix — matches fetch_key().
+            // Uses second hex nibble as shard prefix — matches harmony-zenoh fetch_key().
             let prefix = cid_hex.get(1..2).unwrap_or("");
             let key_expr = format!("harmony/content/{prefix}/{cid_hex}");
             let tx = zenoh_tx.clone();
@@ -340,16 +391,11 @@ async fn dispatch_action(
 
         // ── SendReply: stub (same as harmony-node) ───────────────────
         RuntimeAction::SendReply { .. } => {
-            // Not yet wired — Zenoh query objects can't pass through channels
-            // in zenoh 1.x without restructuring. Same limitation as harmony-node.
             tracing::trace!("SendReply not yet implemented in client");
         }
 
         // ── Actions not applicable to desktop client ─────────────────
-        _ => {
-            // Disk, archive, S3, inference, tunnel actions are silently
-            // skipped. The NodeConfig disables all of these tiers.
-        }
+        _ => {}
     }
 }
 
