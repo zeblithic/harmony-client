@@ -161,7 +161,7 @@ async fn start_node(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
 
-    {
+    let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
 
         // Stop existing node — extract handles under lock, join outside.
@@ -259,7 +259,8 @@ async fn start_node(
         guard.thread = Some(thread);
         guard.shutdown_tx = Some(shutdown_tx);
         guard.publish_tx = Some(publish_tx);
-    }
+        guard.generation
+    };
 
     // Wait for the event loop to report startup success or failure.
     // stop_node can cancel this by signaling shutdown_tx (now registered).
@@ -281,10 +282,12 @@ async fn start_node(
         }
     };
 
-    // On startup failure, clean up stale handles so NodeState accurately
-    // reflects that no node is running.
+    // On startup failure, clean up stale handles — but only if the
+    // generation still matches. A newer start_node may have already
+    // replaced our handles; passing our generation avoids tearing
+    // down the newer node.
     if result.is_err() {
-        let _ = stop_inner(&state, None);
+        let _ = stop_inner(&state, Some(our_gen));
     }
 
     result
