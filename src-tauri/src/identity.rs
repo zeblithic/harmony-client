@@ -30,14 +30,20 @@ impl std::fmt::Debug for NodeIdentity {
     }
 }
 
-/// Resolve the identity file path. Uses `$HOME/.harmony/identity.key` by default.
+/// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
+///
+/// Checks `$HOME` (Unix/macOS) then `$USERPROFILE` (Windows) for the home
+/// directory. An explicit override path bypasses both.
 pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        "Cannot determine identity file path: $HOME not set".to_string()
-    })?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| {
+            "Cannot determine identity file path: neither $HOME nor $USERPROFILE is set"
+                .to_string()
+        })?;
     Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
 }
 

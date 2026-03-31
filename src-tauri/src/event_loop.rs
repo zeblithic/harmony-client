@@ -14,7 +14,11 @@ use harmony_content::book::MemoryBookStore;
 use harmony_runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
 use tauri::{AppHandle, Emitter};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Well-known UDP port for Reticulum mesh — must match harmony-node default
+/// so that all nodes on the LAN broadcast/listen on the same port.
+const RETICULUM_UDP_PORT: u16 = 4242;
 
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
@@ -30,51 +34,72 @@ enum ZenohEvent {
 
 /// Run the NodeRuntime event loop as a background task.
 ///
-/// Returns when the shutdown signal fires or on fatal error.
+/// Sends `Ok(())` on `ready_tx` once UDP + Zenoh are initialized, or
+/// `Err(msg)` if startup fails. Returns when shutdown signal fires.
 pub async fn run(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
     app: AppHandle,
+    endpoint: Option<String>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), String> {
-    // ── UDP socket (Reticulum mesh) ──────────────────────────────────────
-    let udp = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("UDP bind failed: {e}"))?;
-    udp.set_broadcast(true)
-        .map_err(|e| format!("UDP set_broadcast failed: {e}"))?;
-    let local_port = udp
-        .local_addr()
-        .map_err(|e| format!("local_addr: {e}"))?
-        .port();
-    let broadcast_addr: SocketAddr = format!("255.255.255.255:{local_port}")
-        .parse()
-        .expect("static broadcast addr");
-    tracing::info!(port = local_port, "UDP socket bound");
+) {
+    // ── Startup: bind UDP, open Zenoh, process actions ───────────────
+    let startup = async {
+        let udp = UdpSocket::bind(format!("0.0.0.0:{RETICULUM_UDP_PORT}"))
+            .await
+            .map_err(|e| format!("UDP bind on port {RETICULUM_UDP_PORT} failed: {e}"))?;
+        udp.set_broadcast(true)
+            .map_err(|e| format!("UDP set_broadcast failed: {e}"))?;
+        let broadcast_addr: SocketAddr = format!("255.255.255.255:{RETICULUM_UDP_PORT}")
+            .parse()
+            .expect("static broadcast addr");
+        tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
 
-    // ── Zenoh session ────────────────────────────────────────────────────
-    let session = zenoh::open(zenoh::Config::default())
-        .await
-        .map_err(|e| format!("zenoh open failed: {e}"))?;
-    tracing::info!("Zenoh session opened");
+        let mut config = zenoh::Config::default();
+        if let Some(ref ep) = endpoint {
+            let ep_json = serde_json::to_string(ep)
+                .map_err(|e| format!("endpoint serialize error: {e}"))?;
+            config
+                .insert_json5("connect/endpoints", &format!("[{ep_json}]"))
+                .map_err(|e| format!("zenoh config error: {e}"))?;
+        }
+        let session = zenoh::open(config)
+            .await
+            .map_err(|e| format!("zenoh open failed: {e}"))?;
+        tracing::info!("Zenoh session opened");
+
+        Ok::<_, String>((udp, broadcast_addr, session))
+    };
+
+    let (udp, broadcast_addr, session) = match startup.await {
+        Ok(v) => {
+            let _ = ready_tx.send(Ok(()));
+            v
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(e.clone()));
+            let _ = app.emit(
+                "zenoh-status",
+                &crate::ZenohStatus {
+                    status: "error".to_string(),
+                    endpoint: None,
+                    error: Some(e),
+                },
+            );
+            return;
+        }
+    };
 
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
-    // ── Process startup actions (declare queryables + subscribers) ────────
+    // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {
-        dispatch_action(
-            action,
-            &session,
-            &zenoh_tx,
-            &udp,
-            &broadcast_addr,
-            &app,
-        )
-        .await;
+        dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &app).await;
     }
 
-    // ── Timer (250ms = 4 ticks/sec, same as harmony-node) ────────────────
+    // ── Timer (250ms = 4 ticks/sec, same as harmony-node) ────────────
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let start = std::time::Instant::now();
@@ -166,22 +191,14 @@ pub async fn run(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(
-                    action,
-                    &session,
-                    &zenoh_tx,
-                    &udp,
-                    &broadcast_addr,
-                    &app,
-                )
-                .await;
+                dispatch_action(action, &session, &zenoh_tx, &udp, &broadcast_addr, &app)
+                    .await;
             }
         }
     }
 
     let _ = session.close().await;
     tracing::info!("event loop stopped");
-    Ok(())
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
@@ -191,14 +208,11 @@ async fn dispatch_action(
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
-    _app: &AppHandle,
+    app: &AppHandle,
 ) {
     match action {
         // ── Network: Reticulum packet send ───────────────────────────
-        RuntimeAction::SendOnInterface {
-            raw, weight, ..
-        } => {
-            // Probabilistic broadcast: drop if random >= weight.
+        RuntimeAction::SendOnInterface { raw, weight, .. } => {
             if let Some(w) = weight {
                 if rand::random::<f32>() >= w {
                     return;
@@ -221,6 +235,7 @@ async fn dispatch_action(
         RuntimeAction::DeclareQueryable { key_expr } => {
             let is_compute = key_expr.starts_with("harmony/compute/");
             let tx = zenoh_tx.clone();
+            let app = app.clone();
             match session.declare_queryable(&key_expr).await {
                 Ok(qbl) => {
                     tokio::spawn(async move {
@@ -245,6 +260,7 @@ async fn dispatch_action(
                                 break;
                             }
                         }
+                        emit_session_lost(&app, "queryable closed unexpectedly");
                     });
                 }
                 Err(e) => {
@@ -256,6 +272,7 @@ async fn dispatch_action(
         // ── Zenoh: subscribe ─────────────────────────────────────────
         RuntimeAction::Subscribe { key_expr } => {
             let tx = zenoh_tx.clone();
+            let app = app.clone();
             match session.declare_subscriber(&key_expr).await {
                 Ok(sub) => {
                     tokio::spawn(async move {
@@ -273,6 +290,7 @@ async fn dispatch_action(
                                 break;
                             }
                         }
+                        emit_session_lost(&app, "subscriber closed unexpectedly");
                     });
                 }
                 Err(e) => {
@@ -285,6 +303,7 @@ async fn dispatch_action(
         RuntimeAction::FetchContent { cid } => {
             let cid_hex = hex::encode(cid);
             // Inline the key format from harmony-zenoh (avoids extra dep).
+            // Uses second hex nibble as shard prefix — matches fetch_key().
             let prefix = cid_hex.get(1..2).unwrap_or("");
             let key_expr = format!("harmony/content/{prefix}/{cid_hex}");
             let tx = zenoh_tx.clone();
@@ -322,7 +341,7 @@ async fn dispatch_action(
         // ── SendReply: stub (same as harmony-node) ───────────────────
         RuntimeAction::SendReply { .. } => {
             // Not yet wired — Zenoh query objects can't pass through channels
-            // in zenoh 1.x without restructuring. Logged at trace level.
+            // in zenoh 1.x without restructuring. Same limitation as harmony-node.
             tracing::trace!("SendReply not yet implemented in client");
         }
 
@@ -360,10 +379,19 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
     .unwrap_or_else(|_| Err(format!("fetch '{key_expr}' timed out after 30s")))
 }
 
+/// Emit zenoh-status error when a Zenoh session appears to have been lost.
+fn emit_session_lost(app: &AppHandle, reason: &str) {
+    let _ = app.emit(
+        "zenoh-status",
+        &crate::ZenohStatus {
+            status: "error".to_string(),
+            endpoint: None,
+            error: Some(format!("session lost: {reason}")),
+        },
+    );
+}
+
 /// Bridge Zenoh subscription messages to Tauri frontend events.
-///
-/// Intercepts well-known key expressions and emits the same events the
-/// old ZenohState subscriber did, keeping the frontend backward-compatible.
 fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8]) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(update) = crate::parse_capacity(key_expr, payload) {

@@ -106,19 +106,22 @@ pub fn parse_telemetry(wire: &[u8]) -> Option<TelemetryEventPayload> {
 // ── Tauri commands ───────────────────────────────────────────────────────
 
 /// Stop the running node (if any). Returns after the event loop thread exits.
-fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) {
+/// Returns `true` if a node was actually stopped, `false` if it was a no-op.
+fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     let (shutdown_tx, thread) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => return false,
         };
         if let Some(gen) = expected_gen {
             if guard.generation != gen {
-                return; // Stale stop — newer node exists
+                return false; // Stale stop — newer node exists
             }
         }
         (guard.shutdown_tx.take(), guard.thread.take())
     };
+
+    let had_node = shutdown_tx.is_some() || thread.is_some();
 
     // Signal the event loop to stop.
     if let Some(tx) = shutdown_tx {
@@ -129,6 +132,8 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) {
     if let Some(thread) = thread {
         let _ = thread.join();
     }
+
+    had_node
 }
 
 /// Start the harmony node with an embedded NodeRuntime.
@@ -145,8 +150,8 @@ async fn start_node(
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    // Shut down any existing node first.
-    stop_inner(&state, None);
+    // Shut down any existing node first (unconditional).
+    let _ = stop_inner(&state, None);
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation += 1;
@@ -211,7 +216,12 @@ async fn start_node(
     // NodeRuntime is !Send (WorkflowEngine contains Box<dyn Any>), so it
     // must be constructed AND run on the same thread. We move the Send-able
     // NodeConfig to the new thread and construct NodeRuntime there.
+    //
+    // A oneshot channel lets the event loop report whether startup (UDP bind,
+    // Zenoh open) succeeded before we emit "connected" to the frontend.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let ep_clone = endpoint.clone();
     let app_clone = app.clone();
     let thread = thread::Builder::new()
         .name("harmony-runtime".to_string())
@@ -223,11 +233,15 @@ async fn start_node(
             rt.block_on(async move {
                 let (runtime, startup_actions) =
                     NodeRuntime::new(config, MemoryBookStore::new());
-                if let Err(e) =
-                    event_loop::run(runtime, startup_actions, app_clone, shutdown_rx).await
-                {
-                    tracing::error!(err = %e, "event loop error");
-                }
+                event_loop::run(
+                    runtime,
+                    startup_actions,
+                    app_clone,
+                    ep_clone,
+                    ready_tx,
+                    shutdown_rx,
+                )
+                .await;
             });
         })
         .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
@@ -238,16 +252,29 @@ async fn start_node(
         guard.shutdown_tx = Some(shutdown_tx);
     }
 
-    let _ = app.emit(
-        "zenoh-status",
-        &ZenohStatus {
-            status: "connected".to_string(),
-            endpoint,
-            error: None,
-        },
-    );
-
-    Ok(())
+    // Wait for the event loop to report startup success or failure.
+    // If the thread panics or the channel is dropped, treat as error.
+    match ready_rx.await {
+        Ok(Ok(())) => {
+            let _ = app.emit(
+                "zenoh-status",
+                &ZenohStatus {
+                    status: "connected".to_string(),
+                    endpoint,
+                    error: None,
+                },
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            // Startup failed — error already emitted by event loop.
+            Err(e)
+        }
+        Err(_) => {
+            // Channel dropped — event loop panicked or exited before signaling.
+            Err("runtime thread exited before reporting startup status".to_string())
+        }
+    }
 }
 
 /// Stop the harmony node and clean up.
@@ -260,15 +287,18 @@ fn stop_node(
         let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation
     };
-    stop_inner(&state, Some(gen));
-    let _ = app.emit(
-        "zenoh-status",
-        &ZenohStatus {
-            status: "disconnected".to_string(),
-            endpoint: None,
-            error: None,
-        },
-    );
+    let stopped = stop_inner(&state, Some(gen));
+    // Only emit disconnected if we actually stopped a running node.
+    if stopped {
+        let _ = app.emit(
+            "zenoh-status",
+            &ZenohStatus {
+                status: "disconnected".to_string(),
+                endpoint: None,
+                error: None,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -319,12 +349,10 @@ async fn publish_profile(profile: ProfilePayload) -> Result<(), String> {
     let key = format!("harmony/profile/{}", profile.address);
     let payload =
         serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
-    session
-        .put(&key, payload)
-        .await
-        .map_err(|e| format!("put failed: {e}"))?;
+    let result = session.put(&key, payload).await;
+    // Always close the session, even on put failure.
     let _ = session.close().await;
-    Ok(())
+    result.map_err(|e| format!("put failed: {e}"))
 }
 
 // ── Vine stubs (unchanged) ───────────────────────────────────────────────
