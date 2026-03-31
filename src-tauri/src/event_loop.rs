@@ -56,36 +56,64 @@ pub async fn run(
     mut publish_rx: mpsc::Receiver<PublishRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
-    let startup = async {
-        let udp = UdpSocket::bind(format!("0.0.0.0:{RETICULUM_UDP_PORT}"))
-            .await
-            .map_err(|e| format!("UDP bind on port {RETICULUM_UDP_PORT} failed: {e}"))?;
-        udp.set_broadcast(true)
-            .map_err(|e| format!("UDP set_broadcast failed: {e}"))?;
-        let broadcast_addr: SocketAddr = format!("255.255.255.255:{RETICULUM_UDP_PORT}")
-            .parse()
-            .expect("static broadcast addr");
-        tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
+    // Each async step is raced against shutdown so stop_node can cancel
+    // a slow or stuck zenoh::open without hanging on thread.join().
+    macro_rules! cancellable {
+        ($fut:expr, $msg:expr) => {
+            tokio::select! {
+                result = $fut => result,
+                _ = shutdown.changed() => {
+                    let e = format!("cancelled during {}", $msg);
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            }
+        };
+    }
 
-        let mut config = zenoh::Config::default();
-        if let Some(ref ep) = endpoint {
-            let ep_json = serde_json::to_string(ep)
-                .map_err(|e| format!("endpoint serialize error: {e}"))?;
-            config
-                .insert_json5("connect/endpoints", &format!("[{ep_json}]"))
-                .map_err(|e| format!("zenoh config error: {e}"))?;
-        }
-        let session = zenoh::open(config)
-            .await
-            .map_err(|e| format!("zenoh open failed: {e}"))?;
-        tracing::info!("Zenoh session opened");
-
-        Ok::<_, String>((udp, broadcast_addr, session))
-    };
-
-    let (udp, broadcast_addr, session) = match startup.await {
-        Ok(v) => v,
+    let udp = match cancellable!(
+        UdpSocket::bind(format!("0.0.0.0:{RETICULUM_UDP_PORT}")),
+        "UDP bind"
+    ) {
+        Ok(s) => s,
         Err(e) => {
+            let e = format!("UDP bind on port {RETICULUM_UDP_PORT} failed: {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    if let Err(e) = udp.set_broadcast(true) {
+        let e = format!("UDP set_broadcast failed: {e}");
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+    let broadcast_addr: SocketAddr = format!("255.255.255.255:{RETICULUM_UDP_PORT}")
+        .parse()
+        .expect("static broadcast addr");
+    tracing::info!(port = RETICULUM_UDP_PORT, "UDP socket bound");
+
+    let mut config = zenoh::Config::default();
+    if let Some(ref ep) = endpoint {
+        match serde_json::to_string(ep) {
+            Ok(ep_json) => {
+                if let Err(e) = config.insert_json5("connect/endpoints", &format!("[{ep_json}]")) {
+                    let e = format!("zenoh config error: {e}");
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            }
+            Err(e) => {
+                let e = format!("endpoint serialize error: {e}");
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        }
+    }
+
+    let session = match cancellable!(zenoh::open(config), "zenoh::open") {
+        Ok(s) => s,
+        Err(e) => {
+            let e = format!("zenoh open failed: {e}");
             let _ = ready_tx.send(Err(e.clone()));
             let _ = app.emit(
                 "zenoh-status",
@@ -98,6 +126,7 @@ pub async fn run(
             return;
         }
     };
+    tracing::info!("Zenoh session opened");
 
     // Shared flag: set to true during intentional shutdown so spawned
     // subscriber/queryable tasks don't emit false session-lost errors.

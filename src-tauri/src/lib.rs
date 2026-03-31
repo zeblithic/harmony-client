@@ -123,7 +123,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread) = {
+    let (shutdown_tx, thread, publish_tx) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -133,10 +133,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
                 return false; // Stale stop — newer node exists
             }
         }
-        (guard.shutdown_tx.take(), guard.thread.take())
+        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take())
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
+    drop(publish_tx); // drop sender so event loop's recv returns None
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -151,65 +152,11 @@ async fn start_node(
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    // ── Identity + config (no lock needed) ───────────────────────────
-    let id_path = identity::resolve_path(None)?;
-    let id = identity::load_or_generate(&id_path)?;
-    let identity::NodeIdentity { pq, ed25519 } = id;
-
-    let our_addr_bytes: [u8; 16] = ed25519.public_identity().address_hash;
-    let node_addr = hex::encode(our_addr_bytes);
-
-    let pq_pub = pq.public_identity();
-    let local_pq_identity_hash = pq_pub.address_hash;
-    let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
-    let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
-    drop(pq);
-
-    let reticulum_identity_bytes =
-        Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
-    drop(ed25519);
-
-    tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
-
-    let config = NodeConfig {
-        storage_budget: StorageBudget {
-            cache_capacity: 512,
-            max_pinned_bytes: 50_000_000,
-        },
-        compute_budget: InstructionBudget { fuel: 100_000 },
-        schedule: Default::default(),
-        content_policy: ContentPolicy::default(),
-        filter_broadcast_config: FilterBroadcastConfig {
-            mutation_threshold: 10,
-            max_interval_ticks: 40,
-            expected_items: 512,
-            fp_rate: 0.001,
-        },
-        node_addr,
-        local_identity_hash: our_addr_bytes,
-        local_pq_identity_hash,
-        local_dsa_pubkey,
-        local_kem_pubkey,
-        reticulum_identity_bytes,
-        inference_gguf_cid: None,
-        inference_tokenizer_cid: None,
-        engram_manifest_cid: None,
-        disk_enabled: false,
-        disk_entries: Vec::new(),
-        disk_quota: None,
-        archive_enabled: false,
-        archive_entries: Vec::new(),
-        archive_quota: None,
-        s3_enabled: false,
-    };
-
-    // ── Atomic stop→spawn→store under a single lock ─────────────────
-    // This prevents concurrent start_node calls from orphaning threads.
-    // The lock is held across stop (which joins the old thread — blocking
-    // but bounded) and the new thread spawn + handle registration.
-    //
-    // Handles are stored BEFORE awaiting ready_rx so that a concurrent
-    // stop_node can cancel an in-flight startup via shutdown_tx.
+    // ── Atomic stop→identity→config→spawn→store ─────────────────────
+    // Everything from stop through handle registration runs under the
+    // lock (with a brief drop for the blocking thread join). This
+    // prevents concurrent start_node calls from racing on identity
+    // generation or orphaning threads.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
@@ -217,16 +164,69 @@ async fn start_node(
     {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
 
-        // Stop existing node under the lock (prevents interleaving).
+        // Stop existing node — extract handles under lock, join outside.
         let old_shutdown = guard.shutdown_tx.take();
         let old_thread = guard.thread.take();
-        // Drop the lock briefly to join — can't hold Mutex across blocking join
-        // if another thread might need to lock it. But since we took the handles,
-        // no one else can race with us on *this* node.
+        let old_publish = guard.publish_tx.take();
         drop(guard);
+        drop(old_publish);
         stop_handles(old_shutdown, old_thread);
 
-        // Re-acquire and atomically register the new node.
+        // ── Identity (serialized by the lock — no concurrent generation race)
+        let id_path = identity::resolve_path(None)?;
+        let id = identity::load_or_generate(&id_path)?;
+        let identity::NodeIdentity { pq, ed25519 } = id;
+
+        let our_addr_bytes: [u8; 16] = ed25519.public_identity().address_hash;
+        let node_addr = hex::encode(our_addr_bytes);
+
+        let pq_pub = pq.public_identity();
+        let local_pq_identity_hash = pq_pub.address_hash;
+        let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
+        let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
+        drop(pq);
+
+        let reticulum_identity_bytes =
+            Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+        drop(ed25519);
+
+        tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
+
+        let config = NodeConfig {
+            storage_budget: StorageBudget {
+                cache_capacity: 512,
+                max_pinned_bytes: 50_000_000,
+            },
+            compute_budget: InstructionBudget { fuel: 100_000 },
+            schedule: Default::default(),
+            content_policy: ContentPolicy::default(),
+            filter_broadcast_config: FilterBroadcastConfig {
+                mutation_threshold: 10,
+                max_interval_ticks: 40,
+                expected_items: 512,
+                fp_rate: 0.001,
+            },
+            node_addr,
+            local_identity_hash: our_addr_bytes,
+            local_pq_identity_hash,
+            local_dsa_pubkey,
+            local_kem_pubkey,
+            reticulum_identity_bytes,
+            inference_gguf_cid: None,
+            inference_tokenizer_cid: None,
+            engram_manifest_cid: None,
+            disk_enabled: false,
+            disk_entries: Vec::new(),
+            disk_quota: None,
+            archive_enabled: false,
+            archive_entries: Vec::new(),
+            archive_quota: None,
+            s3_enabled: false,
+        };
+
+        // Re-acquire lock and atomically register the new node.
+        // Handles are stored BEFORE awaiting ready_rx so stop_node can
+        // cancel an in-flight startup via shutdown_tx.
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation += 1;
 
@@ -259,12 +259,11 @@ async fn start_node(
         guard.thread = Some(thread);
         guard.shutdown_tx = Some(shutdown_tx);
         guard.publish_tx = Some(publish_tx);
-        // Lock dropped here — handles are registered, stop_node can find them.
     }
 
     // Wait for the event loop to report startup success or failure.
     // stop_node can cancel this by signaling shutdown_tx (now registered).
-    match ready_rx.await {
+    let result = match ready_rx.await {
         Ok(Ok(())) => {
             let _ = app.emit(
                 "zenoh-status",
@@ -280,7 +279,15 @@ async fn start_node(
         Err(_) => {
             Err("runtime thread exited before reporting startup status".to_string())
         }
+    };
+
+    // On startup failure, clean up stale handles so NodeState accurately
+    // reflects that no node is running.
+    if result.is_err() {
+        let _ = stop_inner(&state, None);
     }
+
+    result
 }
 
 /// Stop the harmony node and clean up.
