@@ -289,27 +289,6 @@
   let threadModes = $state<Map<string, ThreadDisplayMode>>(new Map());
   let pinnedThreadIds = $state<Set<string>>(new Set());
 
-  // Thread derivations
-  let threadMeta = $derived(getThreadMeta(allMessages));
-
-  let threadRoot = $derived(
-    openThreadId
-      ? allMessages.find(m => m.id === openThreadId) ?? null
-      : null
-  );
-
-  let threadReplies = $derived(
-    openThreadId
-      ? allMessages.filter(m => m.replyTo === openThreadId)
-      : []
-  );
-
-  let threadMessageIds = $derived(
-    openThreadId
-      ? new Set(threadReplies.map(m => m.id))
-      : new Set<string>()
-  );
-
   // TODO: Track the currently-selected channel/hub from nav panel selection.
   // For now, default to "general" in "harmony-dev" matching the mock nav tree.
   const activeChannel = 'general';
@@ -321,6 +300,28 @@
     allMessages.filter(m =>
       !m.channel || (m.channel === activeChannel && m.hub === activeHub)
     )
+  );
+
+  // Thread derivations — scoped to the active channel so thread
+  // indicators and panel contents don't leak cross-channel messages.
+  let threadMeta = $derived(getThreadMeta(channelMessages));
+
+  let threadRoot = $derived(
+    openThreadId
+      ? channelMessages.find(m => m.id === openThreadId) ?? null
+      : null
+  );
+
+  let threadReplies = $derived(
+    openThreadId
+      ? channelMessages.filter(m => m.replyTo === openThreadId)
+      : []
+  );
+
+  let threadMessageIds = $derived(
+    openThreadId
+      ? new Set(threadReplies.map(m => m.id))
+      : new Set<string>()
   );
 
   // Main feed: exclude replies for panel/muted threads, keep inline
