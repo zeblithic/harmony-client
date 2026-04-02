@@ -95,7 +95,11 @@
   const messageService = new MessageService();
   const stq8Service = new Stq8Service(null); // WASM loaded async later
 
-  // Always wire onChange so both online (Zenoh echo) and offline (local append)
+  // Declare allMessages before wiring onChange — avoids a temporal dead zone
+  // if onChange were ever triggered synchronously during init.
+  let allMessages = $state([...messageService.messages]);
+
+  // Wire onChange so both online (Zenoh echo) and offline (local append)
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
   messageService.ownDisplayName = myProfile.displayName || 'You';
@@ -277,8 +281,6 @@
 
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
-
-  let allMessages = $state([...messageService.messages]);
 
   // Thread state
   let openThreadId = $state<string | null>(null);

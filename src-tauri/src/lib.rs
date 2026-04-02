@@ -168,6 +168,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
                 return false; // Stale stop — newer node exists
             }
         }
+        guard.node_addr.clear();
         (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take())
     };
 
