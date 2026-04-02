@@ -62,6 +62,10 @@ export interface Message {
   priority: MessagePriority;
   /** ID of the thread root message this is a reply to */
   replyTo?: string;
+  /** Channel this message belongs to (e.g. "general"). */
+  channel?: string;
+  /** Community/hub this message belongs to (e.g. "harmony-dev"). */
+  hub?: string;
 }
 
 export type ThreadDisplayMode = 'panel' | 'inline' | 'muted';

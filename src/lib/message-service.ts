@@ -88,6 +88,8 @@ export class MessageService {
       media: [],
       priority,
       replyTo,
+      channel,
+      hub,
     };
     this.messages = [...this.messages, msg];
     this.onChange?.();
@@ -97,31 +99,26 @@ export class MessageService {
   private wireToMessage(wire: ChannelMessageEvent): Message {
     // Self-sent messages echo back via Zenoh — map to 'self'/'You'
     // so the rest of the UI (knownPeers filter, display name) works.
-    if (this.ownAddress && wire.senderAddress === this.ownAddress) {
-      return {
-        id: wire.id,
-        sender: { address: 'self', displayName: 'You' },
-        text: wire.text,
-        timestamp: wire.timestamp,
-        media: [],
-        priority: (wire.priority as MessagePriority) || 'standard',
-        replyTo: wire.replyTo,
-      };
-    }
+    const sender = (this.ownAddress && wire.senderAddress === this.ownAddress)
+      ? { address: 'self', displayName: 'You' }
+      : {
+          address: wire.senderAddress,
+          displayName:
+            profileStore.get(wire.senderAddress)?.displayName
+            || wire.senderName
+            || wire.senderAddress.slice(0, 8),
+        };
 
-    // Resolve sender display name: profile store → wire senderName → truncated address.
-    const knownProfile = profileStore.get(wire.senderAddress);
     return {
       id: wire.id,
-      sender: {
-        address: wire.senderAddress,
-        displayName: knownProfile?.displayName || wire.senderName || wire.senderAddress.slice(0, 8),
-      },
+      sender,
       text: wire.text,
       timestamp: wire.timestamp,
       media: [],
       priority: (wire.priority as MessagePriority) || 'standard',
       replyTo: wire.replyTo,
+      channel: wire.channel,
+      hub: wire.hub,
     };
   }
 
