@@ -76,12 +76,20 @@
 
   let showVinePublish = $state(false);
 
-  function handleVinePublish(videoCid: string, title?: string) {
-    vineService.publish(videoCid, title);
+  async function handleVinePublish(videoCid: string, title?: string) {
+    try {
+      await vineService.publish(videoCid, title);
+    } catch (err) {
+      console.error('Vine publish failed', err);
+    }
   }
 
-  function handleVineReshare(vine: import('./lib/types').VineVideo) {
-    vineService.publish(vine.videoCid, vine.title, vine.id);
+  async function handleVineReshare(vine: import('./lib/types').VineVideo) {
+    try {
+      await vineService.publish(vine.videoCid, vine.title, vine.id);
+    } catch (err) {
+      console.error('Vine reshare failed', err);
+    }
   }
 
   let popoverProfile = $state<Profile | null>(null);

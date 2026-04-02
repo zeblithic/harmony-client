@@ -9,12 +9,23 @@
     onClose: () => void;
     onNext?: () => void;
     onPrevious?: () => void;
-    onReshare?: (vine: VineVideo) => void;
+    onReshare?: (vine: VineVideo) => Promise<void> | void;
   } = $props();
 
   let overlayEl: HTMLDivElement;
+  let resharing = $state(false);
 
   onMount(() => overlayEl?.focus());
+
+  async function handleReshare() {
+    if (resharing) return;
+    resharing = true;
+    try {
+      await onReshare?.(vine);
+    } finally {
+      resharing = false;
+    }
+  }
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
@@ -64,8 +75,8 @@
     {/if}
     <div class="footer-actions">
       {#if onReshare}
-        <button type="button" class="action-btn" onclick={() => onReshare?.(vine)} aria-label="Reshare vine">
-          <span aria-hidden="true">↗</span> Reshare
+        <button type="button" class="action-btn" onclick={handleReshare} disabled={resharing} aria-label="Reshare vine">
+          <span aria-hidden="true">↗</span> {resharing ? 'Resharing\u2026' : 'Reshare'}
         </button>
       {/if}
     </div>
@@ -231,8 +242,13 @@
     transition: background 0.15s, color 0.15s;
   }
 
-  .action-btn:hover {
+  .action-btn:hover:not(:disabled) {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .action-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 </style>

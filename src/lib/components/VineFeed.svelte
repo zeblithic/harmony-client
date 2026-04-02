@@ -15,6 +15,10 @@
 
   let activeVine = $state<VineVideo | null>(null);
   let feedFilter = $state<FeedFilter>('all');
+  // Snapshot of the list at the time the player opened — prevents stale
+  // index when marking a vine viewed removes it from filteredVines.
+  let playerList = $state<VineVideo[]>([]);
+  let activeIndex = $state(-1);
 
   let sortedVines = $derived(
     [...vines].sort((a, b) => b.createdAt - a.createdAt)
@@ -30,28 +34,37 @@
     vines.filter(v => !viewedIds.has(v.id)).length
   );
 
-  let activeIndex = $derived(
-    activeVine ? filteredVines.findIndex(v => v.id === activeVine!.id) : -1
-  );
-
   function openPlayer(vine: VineVideo) {
+    // Only snapshot the list when opening fresh (not navigating within player).
+    if (!activeVine) {
+      playerList = [...filteredVines];
+    }
+    activeIndex = playerList.findIndex(v => v.id === vine.id);
     activeVine = vine;
     onMarkViewed?.(vine.id);
   }
 
   function closePlayer() {
     activeVine = null;
+    playerList = [];
+    activeIndex = -1;
   }
 
   function nextVine() {
-    if (activeIndex >= 0 && activeIndex < filteredVines.length - 1) {
-      openPlayer(filteredVines[activeIndex + 1]);
+    if (activeIndex >= 0 && activeIndex < playerList.length - 1) {
+      const next = playerList[activeIndex + 1];
+      activeIndex = activeIndex + 1;
+      activeVine = next;
+      onMarkViewed?.(next.id);
     }
   }
 
   function previousVine() {
     if (activeIndex > 0) {
-      openPlayer(filteredVines[activeIndex - 1]);
+      const prev = playerList[activeIndex - 1];
+      activeIndex = activeIndex - 1;
+      activeVine = prev;
+      onMarkViewed?.(prev.id);
     }
   }
 </script>
@@ -98,7 +111,7 @@
   <VinePlayer
     vine={activeVine}
     onClose={closePlayer}
-    onNext={activeIndex < filteredVines.length - 1 ? nextVine : undefined}
+    onNext={activeIndex >= 0 && activeIndex < playerList.length - 1 ? nextVine : undefined}
     onPrevious={activeIndex > 0 ? previousVine : undefined}
     {onReshare}
   />

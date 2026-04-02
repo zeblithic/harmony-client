@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+
   let { onPublish, onClose }: {
     onPublish: (videoCid: string, title?: string) => void;
     onClose: () => void;
@@ -7,6 +9,9 @@
   let videoCid = $state('');
   let title = $state('');
   let error = $state('');
+  let cidInput: HTMLInputElement;
+
+  onMount(() => cidInput?.focus());
 
   function handleSubmit() {
     const cid = videoCid.trim();
@@ -24,11 +29,15 @@
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
   }
+
+  function handleOverlayClick(e: MouseEvent) {
+    if (e.target === e.currentTarget) onClose();
+  }
 </script>
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="dialog-overlay" role="dialog" aria-label="Publish vine" aria-modal="true">
+<div class="dialog-overlay" role="dialog" aria-label="Publish vine" aria-modal="true" onclick={handleOverlayClick}>
   <div class="dialog-card">
     <header class="dialog-header">
       <h3>Publish a Vine</h3>
@@ -41,6 +50,7 @@
         <input
           type="text"
           bind:value={videoCid}
+          bind:this={cidInput}
           placeholder="Hex-encoded content ID"
           class="field-input"
           class:field-error={!!error}
