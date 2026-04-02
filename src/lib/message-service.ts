@@ -1,6 +1,6 @@
 import type { TauriAdapter } from './zenoh-service';
 import type { Message, MessagePriority } from './types';
-import { messages as mockMessages, profileStore } from './mock-data';
+import { messages as mockMessages } from './mock-data';
 
 /** Wire format for channel messages from the Rust backend. */
 export interface ChannelMessageEvent {
@@ -109,10 +109,7 @@ export class MessageService {
       ? { address: 'self', displayName: 'You' }
       : {
           address: wire.senderAddress,
-          displayName:
-            profileStore.get(wire.senderAddress)?.displayName
-            || wire.senderName
-            || wire.senderAddress.slice(0, 8),
+          displayName: wire.senderName || wire.senderAddress.slice(0, 8),
         };
 
     return {
