@@ -18,8 +18,9 @@
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
-  // TODO: Replace mock-data imports with real data sources once content transport is wired up
-  import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
+  import { MessageService } from './lib/message-service';
+  // TODO: Replace vine/nav mock-data imports with real data sources once content transport is wired up
+  import { navNodes, profileStore, vineVideos } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
 
@@ -33,6 +34,7 @@
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
+    messageService.ownDisplayName = profile.displayName || 'You';
     // Publish to network if Tauri is available.
     // Uses direct invoke rather than ZenohService.publishProfile() because
     // ZenohService lives in NetworkApp (not accessible here). Both paths
@@ -90,7 +92,46 @@
   const notificationService = new NotificationService();
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
+  const messageService = new MessageService();
+  $effect(() => () => messageService.destroy());
   const stq8Service = new Stq8Service(null); // WASM loaded async later
+
+  // Declare allMessages before wiring onChange — avoids a temporal dead zone
+  // if onChange were ever triggered synchronously during init.
+  let allMessages = $state([...messageService.messages]);
+
+  // Wire onChange so both online (Zenoh echo) and offline (local append)
+  // paths update the reactive allMessages state.
+  messageService.onChange = () => { allMessages = [...messageService.messages]; };
+  messageService.ownDisplayName = myProfile.displayName || 'You';
+
+  // Try to wire up real Tauri message transport.
+  (async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+      await messageService.connectAdapter({
+        invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
+        listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
+      });
+      // Fetch our node address so self-sent messages echo back as 'self'/'You'.
+      // Try immediately (node may already be connected after hot reload / auto-start),
+      // and also listen for future connect events.
+      async function fetchOwnAddress() {
+        try {
+          messageService.ownAddress = await invoke('get_node_addr') as string;
+        } catch { /* node not ready yet */ }
+      }
+      await fetchOwnAddress();
+      const unlistenStatus = await listen('zenoh-status', async (event) => {
+        const status = (event as { payload: { status: string } }).payload;
+        if (status.status === 'connected') await fetchOwnAddress();
+      });
+      messageService.addUnlisten(unlistenStatus as unknown as () => void);
+    } catch {
+      // Not in Tauri (browser dev mode) — mock data stays
+    }
+  })();
   let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
 
@@ -243,25 +284,37 @@
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
 
-  let allMessages = $state([...messages]);
-
   // Thread state
   let openThreadId = $state<string | null>(null);
   let threadModes = $state<Map<string, ThreadDisplayMode>>(new Map());
   let pinnedThreadIds = $state<Set<string>>(new Set());
 
-  // Thread derivations
-  let threadMeta = $derived(getThreadMeta(allMessages));
+  // TODO: Track the currently-selected channel/hub from nav panel selection.
+  // For now, default to "general" in "harmony-dev" matching the mock nav tree.
+  const activeChannel = 'general';
+  const activeHub = 'harmony-dev';
+
+  // Filter to messages in the active channel (mock messages without
+  // channel/hub pass through so pre-existing seed data still shows).
+  let channelMessages = $derived(
+    allMessages.filter(m =>
+      !m.channel || (m.channel === activeChannel && m.hub === activeHub)
+    )
+  );
+
+  // Thread derivations — scoped to the active channel so thread
+  // indicators and panel contents don't leak cross-channel messages.
+  let threadMeta = $derived(getThreadMeta(channelMessages));
 
   let threadRoot = $derived(
     openThreadId
-      ? allMessages.find(m => m.id === openThreadId) ?? null
+      ? channelMessages.find(m => m.id === openThreadId) ?? null
       : null
   );
 
   let threadReplies = $derived(
     openThreadId
-      ? allMessages.filter(m => m.replyTo === openThreadId)
+      ? channelMessages.filter(m => m.replyTo === openThreadId)
       : []
   );
 
@@ -273,7 +326,7 @@
 
   // Main feed: exclude replies for panel/muted threads, keep inline
   let mainFeedMessages = $derived(
-    allMessages.filter(m => {
+    channelMessages.filter(m => {
       if (!m.replyTo) return true;
       const mode = threadModes.get(m.replyTo) ?? 'panel';
       return mode === 'inline';
@@ -282,7 +335,7 @@
 
   // Media feed: main + open thread replies (exclude muted)
   let mediaMessages = $derived.by(() => {
-    const base = allMessages.filter(m => {
+    const base = channelMessages.filter(m => {
       if (!m.replyTo) return true;
       const mode = threadModes.get(m.replyTo) ?? 'panel';
       if (mode === 'muted') return false;
@@ -319,16 +372,12 @@
     setTimeout(() => el.classList.remove('highlight'), 1500);
   }
 
-  function handleSend(text: string, priority: MessagePriority) {
-    const newMsg = {
-      id: `msg-${Date.now()}`,
-      sender: { address: 'self', displayName: 'You' },
-      text,
-      timestamp: Date.now(),
-      media: [],
-      priority,
-    };
-    allMessages = [...allMessages, newMsg];
+  async function handleSend(text: string, priority: MessagePriority) {
+    try {
+      await messageService.send(text, priority, activeChannel, activeHub);
+    } catch (err) {
+      console.error('Failed to send message:', err);
+    }
   }
 
   function handleThreadOpen(rootId: string) {
@@ -339,18 +388,13 @@
     openThreadId = null;
   }
 
-  function handleThreadSend(text: string, priority: MessagePriority) {
+  async function handleThreadSend(text: string, priority: MessagePriority) {
     if (!openThreadId) return;
-    const newMsg = {
-      id: `msg-${Date.now()}`,
-      sender: { address: 'self', displayName: 'You' },
-      text,
-      timestamp: Date.now(),
-      media: [],
-      priority,
-      replyTo: openThreadId,
-    };
-    allMessages = [...allMessages, newMsg];
+    try {
+      await messageService.send(text, priority, activeChannel, activeHub, openThreadId);
+    } catch (err) {
+      console.error('Failed to send thread reply:', err);
+    }
   }
 
   // Extract community nodes (folders) for settings panel
