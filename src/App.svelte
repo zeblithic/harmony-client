@@ -19,8 +19,9 @@
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
-  // TODO: Replace vine/nav mock-data imports with real data sources once content transport is wired up
-  import { navNodes, profileStore, vineVideos } from './lib/mock-data';
+  import { VineService } from './lib/vine-service';
+  // TODO: Replace nav mock-data imports with real data sources once content transport is wired up
+  import { navNodes, profileStore } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
 
@@ -35,6 +36,7 @@
     saveProfile(profile);
     myProfile = profile;
     messageService.ownDisplayName = profile.displayName || 'You';
+    vineService.ownDisplayName = profile.displayName || 'You';
     // Publish to network if Tauri is available.
     // Uses direct invoke rather than ZenohService.publishProfile() because
     // ZenohService lives in NetworkApp (not accessible here). Both paths
@@ -54,14 +56,21 @@
     }
   }
 
-  // Viewed vine IDs — lifted here so state survives VineFeed remounts on mode toggle
-  let vineViewedIds = $state(new Set<string>(
-    vineVideos.filter(v => v.viewed).map(v => v.id)
-  ));
+  const vineService = new VineService();
+  $effect(() => () => vineService.destroy());
+
+  // Declare allVines and vineViewedIds before wiring onChange.
+  let allVines = $state([...vineService.vines]);
+  let vineViewedIds = $state(new Set(vineService.viewedIds));
+
+  vineService.onChange = () => {
+    allVines = [...vineService.vines];
+    vineViewedIds = new Set(vineService.viewedIds);
+  };
+  vineService.ownDisplayName = myProfile.displayName || 'You';
 
   function handleMarkVineViewed(id: string) {
-    vineViewedIds = new Set([...vineViewedIds, id]);
-    // invoke('mark_vine_viewed', { vineId: id }); // wire up when transport is ready
+    vineService.markViewed(id);
   }
 
   let popoverProfile = $state<Profile | null>(null);
@@ -105,21 +114,25 @@
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
   messageService.ownDisplayName = myProfile.displayName || 'You';
 
-  // Try to wire up real Tauri message transport.
+  // Try to wire up real Tauri transport (messages + vines).
   (async () => {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const { listen } = await import('@tauri-apps/api/event');
-      await messageService.connectAdapter({
+      const adapter = {
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
-      });
-      // Fetch our node address so self-sent messages echo back as 'self'/'You'.
+      };
+      await messageService.connectAdapter(adapter);
+      await vineService.connectAdapter(adapter);
+      // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
       // and also listen for future connect events.
       async function fetchOwnAddress() {
         try {
-          messageService.ownAddress = await invoke('get_node_addr') as string;
+          const addr = await invoke('get_node_addr') as string;
+          messageService.ownAddress = addr;
+          vineService.ownAddress = addr;
         } catch { /* node not ready yet */ }
       }
       await fetchOwnAddress();
@@ -479,7 +492,7 @@
     />
   {/snippet}
   {#snippet vineFeed()}
-    <VineFeed vines={vineVideos} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
+    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
   {/snippet}
   {#snippet fileBrowser()}
     <FileBrowser
