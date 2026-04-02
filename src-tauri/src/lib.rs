@@ -505,9 +505,38 @@ fn get_node_addr(
     Ok(guard.node_addr.clone())
 }
 
-// ── Vine stubs (unchanged) ───────────────────────────────────────────────
+// ── Vine types and commands ──────────────────────────────────────────────
 
-/// Vine video descriptor returned to the frontend.
+/// Vine descriptor published/received over Zenoh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineDescriptorPayload {
+    pub id: String,
+    pub creator_address: String,
+    pub creator_name: String,
+    pub created_at: u64,
+    pub video_cid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reshare_of: Option<String>,
+}
+
+/// Vine descriptor sent from the frontend to publish.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishVinePayload {
+    pub video_cid: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub reshare_of: Option<String>,
+    /// Creator's display name (included so receivers can display it).
+    #[serde(default)]
+    pub creator_name: String,
+}
+
+/// Vine video descriptor returned to the frontend (includes local viewed state).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VineVideoDto {
@@ -521,23 +550,96 @@ pub struct VineVideoDto {
     pub viewed: bool,
 }
 
+/// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
+///
+/// Publishes JSON to `harmony/vines/{creator_address}`.
+/// Other nodes subscribed to `harmony/vines/*` will receive the descriptor
+/// and emit it to their frontends as `vine-received` events.
+#[tauri::command]
+async fn publish_vine(
+    vine: PublishVinePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    if vine.video_cid.trim().is_empty() {
+        return Err("video_cid is required".to_string());
+    }
+    if let Some(ref title) = vine.title {
+        if title.len() > 140 {
+            return Err("title exceeds 140 bytes".to_string());
+        }
+    }
+
+    let (publish_tx, node_addr) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        (tx, guard.node_addr.clone())
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let wire = VineDescriptorPayload {
+        id: format!(
+            "vine-{}-{now_secs}-{:08x}",
+            &node_addr[..8.min(node_addr.len())],
+            rand::random::<u32>()
+        ),
+        creator_address: node_addr.clone(),
+        creator_name: vine.creator_name,
+        created_at: now_secs,
+        video_cid: vine.video_cid,
+        title: vine.title,
+        reshare_of: vine.reshare_of,
+    };
+
+    let key_expr = format!("harmony/vines/{}", node_addr);
+    let payload =
+        serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
 #[tauri::command]
 fn list_vine_videos() -> Vec<VineVideoDto> {
+    // Future: return cached/persisted vines. Real data flows via vine-received events.
     Vec::new()
 }
 
 #[tauri::command]
-fn follow_vine_creator(_address: String) -> bool {
+fn follow_vine_creator(address: String) -> bool {
+    // Future: subscribe to specific creator's vine key expression.
+    let _ = address;
     true
 }
 
 #[tauri::command]
-fn unfollow_vine_creator(_address: String) -> bool {
+fn unfollow_vine_creator(address: String) -> bool {
+    // Future: unsubscribe from specific creator's vine key expression.
+    let _ = address;
     true
 }
 
 #[tauri::command]
-fn mark_vine_viewed(_vine_id: String) -> bool {
+fn mark_vine_viewed(vine_id: String) -> bool {
+    // Future: persist viewed state + publish to network for cross-device sync.
+    let _ = vine_id;
     true
 }
 
@@ -551,6 +653,7 @@ pub fn run() {
             follow_vine_creator,
             unfollow_vine_creator,
             mark_vine_viewed,
+            publish_vine,
             start_node,
             stop_node,
             connect_zenoh,
@@ -776,5 +879,70 @@ mod tests {
         let parsed: SendMessagePayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.sender_name, "", "senderName must default to empty");
         assert!(parsed.reply_to.is_none());
+    }
+
+    #[test]
+    fn vine_descriptor_roundtrip() {
+        let vine = VineDescriptorPayload {
+            id: "vine-abc-1234".to_string(),
+            creator_address: "deadbeef01020304".to_string(),
+            creator_name: "Alice".to_string(),
+            created_at: 1711600000,
+            video_cid: "aa".repeat(32),
+            title: Some("Demo vine".to_string()),
+            reshare_of: None,
+        };
+        let json = serde_json::to_vec(&vine).unwrap();
+        let parsed: VineDescriptorPayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.id, "vine-abc-1234");
+        assert_eq!(parsed.creator_address, "deadbeef01020304");
+        assert_eq!(parsed.creator_name, "Alice");
+        assert_eq!(parsed.created_at, 1711600000);
+        assert_eq!(parsed.title.as_deref(), Some("Demo vine"));
+        assert!(parsed.reshare_of.is_none());
+    }
+
+    #[test]
+    fn vine_descriptor_camel_case() {
+        let vine = VineDescriptorPayload {
+            id: "vine-1".to_string(),
+            creator_address: "aa".to_string(),
+            creator_name: "Bob".to_string(),
+            created_at: 0,
+            video_cid: "bb".to_string(),
+            title: None,
+            reshare_of: Some("vine-0".to_string()),
+        };
+        let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
+        assert!(json.contains("\"creatorAddress\""), "expected camelCase: {json}");
+        assert!(json.contains("\"videoCid\""), "expected camelCase: {json}");
+        assert!(json.contains("\"reshareOf\""), "reshareOf should be present: {json}");
+        assert!(!json.contains("\"creator_address\""), "unexpected snake_case: {json}");
+        assert!(!json.contains("\"title\""), "None title should be skipped: {json}");
+    }
+
+    #[test]
+    fn publish_vine_payload_deserialize() {
+        let json = r#"{
+            "videoCid": "aabbccdd",
+            "title": "My vine",
+            "creatorName": "Alice"
+        }"#;
+        let parsed: PublishVinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.video_cid, "aabbccdd");
+        assert_eq!(parsed.title.as_deref(), Some("My vine"));
+        assert_eq!(parsed.creator_name, "Alice");
+        assert!(parsed.reshare_of.is_none());
+    }
+
+    #[test]
+    fn publish_vine_payload_creator_name_defaults() {
+        let json = r#"{
+            "videoCid": "aabb"
+        }"#;
+        let parsed: PublishVinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.creator_name, "", "creatorName must default to empty");
+        assert!(parsed.title.is_none());
+        assert!(parsed.reshare_of.is_none());
     }
 }
