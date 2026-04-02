@@ -560,7 +560,7 @@ async fn publish_vine(
     vine: PublishVinePayload,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    if vine.video_cid.is_empty() {
+    if vine.video_cid.trim().is_empty() {
         return Err("video_cid is required".to_string());
     }
     if let Some(ref title) = vine.title {

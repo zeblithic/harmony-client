@@ -55,6 +55,7 @@ export class VineService {
         if (this.seenIds.has(wire.id)) return;
         this.seenIds.add(wire.id);
         const vine = this.wireToVine(wire);
+        if (vine.viewed) this.viewedIds = new Set([...this.viewedIds, vine.id]);
         this.vines = [...this.vines, vine];
         this.onChange?.();
       },
@@ -86,6 +87,7 @@ export class VineService {
     // Offline fallback: append locally so the UI stays responsive.
     const id = `vine-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     this.seenIds.add(id);
+    this.viewedIds = new Set([...this.viewedIds, id]);
     const vine: VineVideo = {
       id,
       creatorAddress: 'self',
@@ -125,7 +127,7 @@ export class VineService {
       videoCid: wire.videoCid,
       title: wire.title,
       reshareOf: wire.reshareOf,
-      viewed: false,
+      viewed: isSelf,
     };
   }
 

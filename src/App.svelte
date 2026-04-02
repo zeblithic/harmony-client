@@ -140,7 +140,9 @@
         const status = (event as { payload: { status: string } }).payload;
         if (status.status === 'connected') await fetchOwnAddress();
       });
-      messageService.addUnlisten(unlistenStatus as unknown as () => void);
+      // zenoh-status serves both services (fetchOwnAddress sets both),
+      // so register cleanup on the service that's destroyed last.
+      vineService.addUnlisten(unlistenStatus as unknown as () => void);
     } catch {
       // Not in Tauri (browser dev mode) — mock data stays
     }
