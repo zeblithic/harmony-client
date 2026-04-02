@@ -310,9 +310,17 @@
       : new Set<string>()
   );
 
+  // Filter to messages in the active channel (mock messages without
+  // channel/hub pass through so pre-existing seed data still shows).
+  let channelMessages = $derived(
+    allMessages.filter(m =>
+      !m.channel || (m.channel === activeChannel && m.hub === activeHub)
+    )
+  );
+
   // Main feed: exclude replies for panel/muted threads, keep inline
   let mainFeedMessages = $derived(
-    allMessages.filter(m => {
+    channelMessages.filter(m => {
       if (!m.replyTo) return true;
       const mode = threadModes.get(m.replyTo) ?? 'panel';
       return mode === 'inline';
@@ -321,7 +329,7 @@
 
   // Media feed: main + open thread replies (exclude muted)
   let mediaMessages = $derived.by(() => {
-    const base = allMessages.filter(m => {
+    const base = channelMessages.filter(m => {
       if (!m.replyTo) return true;
       const mode = threadModes.get(m.replyTo) ?? 'panel';
       if (mode === 'muted') return false;
