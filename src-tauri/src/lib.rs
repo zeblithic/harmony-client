@@ -668,6 +668,9 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
     if cid_hex.is_empty() {
         return None;
     }
+    if !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     if payload.len() < 4 {
         return None;
     }
@@ -1055,5 +1058,13 @@ mod tests {
     #[test]
     fn content_announcement_empty_payload() {
         assert!(parse_content_announcement("harmony/announce/abc123", &[]).is_none());
+    }
+
+    #[test]
+    fn content_announcement_non_hex_cid() {
+        let payload = 100u32.to_be_bytes().to_vec();
+        assert!(parse_content_announcement("harmony/announce/<script>", &payload).is_none());
+        assert!(parse_content_announcement("harmony/announce/xyz!", &payload).is_none());
+        assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
     }
 }

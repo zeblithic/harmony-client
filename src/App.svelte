@@ -145,9 +145,10 @@
         const status = (event as { payload: { status: string } }).payload;
         if (status.status === 'connected') await fetchOwnAddress();
       });
-      // zenoh-status serves all three services (fetchOwnAddress sets both
-      // message + vine ownAddress); register on fileManagerService since all
-      // services are destroyed on component unmount.
+      // zenoh-status serves messages + vines (fetchOwnAddress sets both
+      // ownAddress fields). All three services are destroyed on unmount;
+      // cleanup order is irrelevant since no service depends on another's
+      // teardown. Registered on fileManagerService arbitrarily.
       fileManagerService.addUnlisten(unlistenStatus as unknown as () => void);
     } catch {
       // Not in Tauri (browser dev mode) — mock data stays

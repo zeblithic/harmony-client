@@ -57,6 +57,7 @@ export class FileManagerService {
 
   /** Connect a Tauri adapter and start listening for content announcements. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
+    if (this.adapter) return; // already wired; prevent duplicate listeners
     this.adapter = adapter;
     const unlisten = await adapter.listen(
       'content-announced',
@@ -69,7 +70,7 @@ export class FileManagerService {
         ]);
         this.onChange?.();
       },
-    ) as unknown as () => void;
+    );
     this.unlisteners.push(unlisten);
   }
 
