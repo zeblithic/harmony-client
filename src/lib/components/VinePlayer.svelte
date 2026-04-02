@@ -1,17 +1,42 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { VineVideo } from '../types';
+  import Avatar from './Avatar.svelte';
+  import { relativeTime } from '../file-utils';
 
-  let { vine, onClose, onNext, onPrevious }: {
+  let { vine, onClose, onNext, onPrevious, onReshare }: {
     vine: VineVideo;
     onClose: () => void;
     onNext?: () => void;
     onPrevious?: () => void;
+    onReshare?: (vine: VineVideo) => Promise<void> | void;
   } = $props();
 
   let overlayEl: HTMLDivElement;
+  let resharing = $state(false);
+  let reshareError = $state('');
+  let reshareGeneration = 0;
+
+  // Clear reshare state and invalidate in-flight calls when navigating.
+  $effect(() => { void vine; reshareGeneration++; resharing = false; reshareError = ''; });
 
   onMount(() => overlayEl?.focus());
+
+  async function handleReshare() {
+    if (resharing) return;
+    resharing = true;
+    reshareError = '';
+    const generation = ++reshareGeneration;
+    try {
+      await onReshare?.(vine);
+    } catch (err) {
+      if (generation === reshareGeneration) {
+        reshareError = err instanceof Error ? err.message : 'Reshare failed';
+      }
+    } finally {
+      if (generation === reshareGeneration) resharing = false;
+    }
+  }
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
@@ -19,9 +44,7 @@
     else if (e.key === 'ArrowLeft' && onPrevious) { e.preventDefault(); onPrevious(); }
   }
 
-  let timeStr = $derived(
-    new Date(vine.createdAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  );
+  let timeStr = $derived(relativeTime(vine.createdAt * 1000));
 </script>
 
 <svelte:window onkeydown={handleKeyDown} />
@@ -29,6 +52,7 @@
 <div class="player-overlay" role="dialog" aria-label="Vine player" aria-modal="true" tabindex="-1" bind:this={overlayEl}>
   <div class="player-header">
     <div class="creator-info">
+      <Avatar address={vine.creatorAddress} size={28} displayName={vine.creatorName} />
       <span class="creator-name">{vine.creatorName}</span>
       <span class="timestamp">{timeStr}</span>
     </div>
@@ -43,6 +67,7 @@
     <div class="video-area" aria-label={vine.title ?? 'Untitled vine'}>
       <div class="placeholder-video">
         <span class="play-icon" aria-hidden="true">▶</span>
+        <span class="placeholder-label">Video playback coming soon</span>
         <span class="cid-label">{vine.videoCid}</span>
       </div>
     </div>
@@ -59,6 +84,16 @@
     {#if vine.reshareOf}
       <p class="reshare-label">Reshared</p>
     {/if}
+    <div class="footer-actions">
+      {#if onReshare}
+        <button type="button" class="action-btn" onclick={handleReshare} disabled={resharing} aria-label="Reshare vine">
+          <span aria-hidden="true">↗</span> {resharing ? 'Resharing\u2026' : 'Reshare'}
+        </button>
+      {/if}
+      {#if reshareError}
+        <span class="reshare-error" role="alert">{reshareError}</span>
+      {/if}
+    </div>
   </div>
 </div>
 
@@ -83,7 +118,7 @@
 
   .creator-info {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
   }
 
@@ -165,11 +200,20 @@
     color: var(--text-muted);
   }
 
+  .placeholder-label {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+
   .cid-label {
     font-size: 0.7rem;
     color: var(--text-muted);
     font-family: monospace;
     opacity: 0.6;
+    max-width: 80%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .player-footer {
@@ -189,5 +233,42 @@
     color: var(--text-muted);
     font-size: 0.8rem;
     margin: 0;
+  }
+
+  .footer-actions {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 8px;
+  }
+
+  .reshare-error {
+    color: #ed4245;
+    font-size: 0.75rem;
+  }
+
+  .action-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: none;
+    border: 1px solid var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .action-btn:hover:not(:disabled) {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .action-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 </style>

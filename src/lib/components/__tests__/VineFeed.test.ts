@@ -77,16 +77,14 @@ describe('VineFeed', () => {
 
   it('opens player when a card is clicked', async () => {
     render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
-    const cards = screen.getAllByRole('button');
-    await fireEvent.click(cards[0]); // Click first card (Carol, newest)
-    // Player dialog should appear
+    // Carol's vine is newest → first card
+    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
     expect(screen.getByRole('dialog')).toBeTruthy();
   });
 
   it('closes player when close button is clicked', async () => {
     render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
-    const cards = screen.getAllByRole('button');
-    await fireEvent.click(cards[0]);
+    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
     expect(screen.getByRole('dialog')).toBeTruthy();
     const closeBtn = screen.getByLabelText('Close player');
     await fireEvent.click(closeBtn);
@@ -96,9 +94,33 @@ describe('VineFeed', () => {
   it('calls onMarkViewed when a vine is opened', async () => {
     const onMarkViewed = vi.fn();
     render(VineFeed, { props: { vines, viewedIds: makeViewedIds(), onMarkViewed } });
-    const cards = screen.getAllByRole('button');
-    await fireEvent.click(cards[0]); // Carol (vine-03)
+    await fireEvent.click(screen.getByLabelText('Third vine by Carol'));
     expect(onMarkViewed).toHaveBeenCalledWith('vine-03');
+  });
+
+  it('filters to unviewed when filter tab is clicked', async () => {
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds() } });
+    const unviewedTab = screen.getByText(/Unviewed/);
+    await fireEvent.click(unviewedTab);
+    const items = screen.getAllByRole('listitem');
+    // Only 2 unviewed vines (Alice, Carol)
+    expect(items.length).toBe(2);
+    expect(items[0].textContent).toContain('Carol');
+    expect(items[1].textContent).toContain('Alice');
+  });
+
+  it('shows all-caught-up message when filtering unviewed with none left', async () => {
+    const allViewed = vines.map(v => ({ ...v, viewed: true }));
+    render(VineFeed, { props: { vines: allViewed, viewedIds: makeViewedIds(allViewed) } });
+    const unviewedTab = screen.getByText('Unviewed');
+    await fireEvent.click(unviewedTab);
+    expect(screen.getByText(/All caught up/)).toBeTruthy();
+  });
+
+  it('renders create button when onPublish is provided', () => {
+    const onPublish = vi.fn();
+    render(VineFeed, { props: { vines, viewedIds: makeViewedIds(), onPublish } });
+    expect(screen.getByLabelText('Create vine')).toBeTruthy();
   });
 
   it('has accessible feed list', () => {

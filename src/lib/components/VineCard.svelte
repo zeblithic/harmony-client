@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { VineVideo } from '../types';
+  import Avatar from './Avatar.svelte';
+  import { relativeTime } from '../file-utils';
 
   let { vine, onPlay, isViewed }: {
     vine: VineVideo;
@@ -9,9 +11,7 @@
 
   let viewed = $derived(isViewed ?? vine.viewed);
 
-  let timeStr = $derived(
-    new Date(vine.createdAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  );
+  let timeStr = $derived(relativeTime(vine.createdAt * 1000));
 
   function handleClick() {
     onPlay(vine);
@@ -41,8 +41,11 @@
     {/if}
   </div>
   <div class="card-info">
-    <span class="creator-name">{vine.creatorName}</span>
-    <span class="timestamp">{timeStr}</span>
+    <div class="creator-row">
+      <Avatar address={vine.creatorAddress} size={18} displayName={vine.creatorName} />
+      <span class="creator-name">{vine.creatorName}</span>
+      <span class="timestamp">{timeStr}</span>
+    </div>
     {#if vine.title}
       <p class="vine-title">{vine.title}</p>
     {/if}
@@ -104,6 +107,12 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+  }
+
+  .creator-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .creator-name {
