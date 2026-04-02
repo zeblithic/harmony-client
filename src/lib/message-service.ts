@@ -27,6 +27,11 @@ export class MessageService {
   messages: Message[] = [];
   /** Called whenever the message list changes so the UI can re-render. */
   onChange?: () => void;
+  /** Hex-encoded node address — set after Zenoh connects so we can
+   *  identify self-sent messages in the echo. */
+  ownAddress: string | null = null;
+  /** Display name to include in outgoing messages. */
+  ownDisplayName = 'You';
 
   private adapter: TauriAdapter | null = null;
   private unlisten?: () => void;
@@ -62,7 +67,7 @@ export class MessageService {
     if (this.adapter) {
       try {
         await this.adapter.invoke('send_message', {
-          message: { channel, hub, text, priority, replyTo },
+          message: { channel, hub, text, priority, replyTo, senderName: this.ownDisplayName },
         });
         return; // Backend will echo via subscription → message-received event
       } catch (err: unknown) {
@@ -90,7 +95,21 @@ export class MessageService {
 
   /** Convert wire format to frontend Message type. */
   private wireToMessage(wire: ChannelMessageEvent): Message {
-    // Resolve sender display name from profile store, fall back to wire value.
+    // Self-sent messages echo back via Zenoh — map to 'self'/'You'
+    // so the rest of the UI (knownPeers filter, display name) works.
+    if (this.ownAddress && wire.senderAddress === this.ownAddress) {
+      return {
+        id: wire.id,
+        sender: { address: 'self', displayName: 'You' },
+        text: wire.text,
+        timestamp: wire.timestamp,
+        media: [],
+        priority: (wire.priority as MessagePriority) || 'standard',
+        replyTo: wire.replyTo,
+      };
+    }
+
+    // Resolve sender display name: profile store → wire senderName → truncated address.
     const knownProfile = profileStore.get(wire.senderAddress);
     return {
       id: wire.id,

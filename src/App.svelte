@@ -34,6 +34,7 @@
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
+    messageService.ownDisplayName = profile.displayName || 'You';
     // Publish to network if Tauri is available.
     // Uses direct invoke rather than ZenohService.publishProfile() because
     // ZenohService lives in NetworkApp (not accessible here). Both paths
@@ -97,6 +98,7 @@
   // Always wire onChange so both online (Zenoh echo) and offline (local append)
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
+  messageService.ownDisplayName = myProfile.displayName || 'You';
 
   // Try to wire up real Tauri message transport.
   (async () => {
@@ -106,6 +108,16 @@
       await messageService.connectAdapter({
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
+      });
+      // When the node connects, fetch our address so self-sent messages
+      // echo back as 'self'/'You' instead of a raw hex address.
+      await listen('zenoh-status', async (event) => {
+        const status = (event as { payload: { status: string } }).payload;
+        if (status.status === 'connected') {
+          try {
+            messageService.ownAddress = await invoke('get_node_addr') as string;
+          } catch { /* node not ready yet — will retry on next connect */ }
+        }
       });
     } catch {
       // Not in Tauri (browser dev mode) — mock data stays

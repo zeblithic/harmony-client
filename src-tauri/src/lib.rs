@@ -72,6 +72,10 @@ pub struct SendMessagePayload {
     pub text: String,
     pub priority: String,
     pub reply_to: Option<String>,
+    /// Sender's display name (included in wire format so receivers can
+    /// show it even before receiving a profile update).
+    #[serde(default)]
+    pub sender_name: String,
 }
 
 /// Channel message received from the network (emitted to frontend).
@@ -455,7 +459,7 @@ async fn send_message(
     let wire = ChannelMessagePayload {
         id: format!("msg-{}-{now_ms}-{:08x}", &node_addr[..8.min(node_addr.len())], rand::random::<u32>()),
         sender_address: node_addr.clone(),
-        sender_name: String::new(), // receiver resolves from profile store
+        sender_name: message.sender_name.clone(),
         channel: message.channel.clone(),
         hub: message.hub.clone(),
         text: message.text,
@@ -484,6 +488,20 @@ async fn send_message(
     reply_rx
         .await
         .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
+/// Return the hex-encoded node address (derived from the Ed25519 identity).
+///
+/// The frontend uses this to identify self-sent messages in the Zenoh echo.
+#[tauri::command]
+fn get_node_addr(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    if guard.node_addr.is_empty() {
+        return Err("not connected".to_string());
+    }
+    Ok(guard.node_addr.clone())
 }
 
 // ── Vine stubs (unchanged) ───────────────────────────────────────────────
@@ -538,6 +556,7 @@ pub fn run() {
             disconnect_zenoh,
             publish_profile,
             send_message,
+            get_node_addr,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -733,7 +752,8 @@ mod tests {
             "hub": "harmony-dev",
             "text": "test message",
             "priority": "loud",
-            "replyTo": "msg-42"
+            "replyTo": "msg-42",
+            "senderName": "Alice"
         }"#;
         let parsed: SendMessagePayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.channel, "general");
@@ -741,5 +761,19 @@ mod tests {
         assert_eq!(parsed.text, "test message");
         assert_eq!(parsed.priority, "loud");
         assert_eq!(parsed.reply_to.as_deref(), Some("msg-42"));
+        assert_eq!(parsed.sender_name, "Alice");
+    }
+
+    #[test]
+    fn send_message_payload_sender_name_defaults() {
+        let json = r#"{
+            "channel": "general",
+            "hub": "test",
+            "text": "hi",
+            "priority": "standard"
+        }"#;
+        let parsed: SendMessagePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.sender_name, "", "senderName must default to empty");
+        assert!(parsed.reply_to.is_none());
     }
 }
