@@ -1,5 +1,22 @@
-import { describe, it, expect } from 'vitest';
-import { FileManagerService } from './file-manager-service';
+import { describe, it, expect, vi } from 'vitest';
+import { FileManagerService, type ContentAnnouncementEvent } from './file-manager-service';
+import type { TauriAdapter } from './zenoh-service';
+
+function createMockAdapter() {
+  const listeners = new Map<string, (event: { payload: unknown }) => void>();
+  const unlisten = vi.fn();
+  const adapter: TauriAdapter = {
+    invoke: vi.fn().mockResolvedValue(undefined),
+    listen: vi.fn().mockImplementation((event: string, handler: (event: { payload: unknown }) => void) => {
+      listeners.set(event, handler);
+      return Promise.resolve(unlisten);
+    }),
+  };
+  function emit(event: string, payload: unknown) {
+    listeners.get(event)?.({ payload });
+  }
+  return { adapter, emit, unlisten };
+}
 
 describe('FileManagerService', () => {
   it('constructs with default settings', () => {
@@ -196,5 +213,101 @@ describe('FileManagerService', () => {
   it('exportToDevice is a stub that does not throw', () => {
     const svc = new FileManagerService();
     expect(() => svc.exportToDevice(['cid-design-doc'])).not.toThrow();
+  });
+
+  // ── connectAdapter ────────────────────────────────────────────────
+
+  it('registers a content-announced listener', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    expect(adapter.listen).toHaveBeenCalledWith('content-announced', expect.any(Function));
+  });
+
+  it('idempotent — second connectAdapter is a no-op', async () => {
+    const svc = new FileManagerService();
+    const { adapter: a1 } = createMockAdapter();
+    const { adapter: a2 } = createMockAdapter();
+    await svc.connectAdapter(a1);
+    await svc.connectAdapter(a2);
+    expect(a2.listen).not.toHaveBeenCalled();
+  });
+
+  it('tracks announced CIDs from network events', async () => {
+    const svc = new FileManagerService();
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('content-announced', { cid: 'abc123', sizeBytes: 4096 } satisfies ContentAnnouncementEvent);
+    expect(svc.announcedCids.has('abc123')).toBe(true);
+    expect(svc.announcedCids.get('abc123')!.sizeBytes).toBe(4096);
+  });
+
+  it('deduplicates announced CIDs', async () => {
+    const svc = new FileManagerService();
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    emit('content-announced', { cid: 'dup1', sizeBytes: 100 } satisfies ContentAnnouncementEvent);
+    emit('content-announced', { cid: 'dup1', sizeBytes: 200 } satisfies ContentAnnouncementEvent);
+    expect(svc.announcedCids.get('dup1')!.sizeBytes).toBe(100); // first wins
+    expect(svc.onChange).toHaveBeenCalledOnce();
+  });
+
+  it('calls onChange on new content announcement', async () => {
+    const svc = new FileManagerService();
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    emit('content-announced', { cid: 'new1', sizeBytes: 512 } satisfies ContentAnnouncementEvent);
+    expect(svc.onChange).toHaveBeenCalledOnce();
+  });
+
+  // ── adapter invoke on mutations ───────────────────────────────────
+
+  it('burn invokes burn_content on the adapter for each cid', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.burn(['cid-training-data', 'cid-video-lecture']);
+    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { cid: 'cid-training-data' });
+    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { cid: 'cid-video-lecture' });
+  });
+
+  it('pin invokes pin_content on the adapter', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.pin('cid-video-lecture');
+    expect(adapter.invoke).toHaveBeenCalledWith('pin_content', { cid: 'cid-video-lecture' });
+  });
+
+  it('unpin invokes unpin_content on the adapter', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.unpin('cid-song-favorite');
+    expect(adapter.invoke).toHaveBeenCalledWith('unpin_content', { cid: 'cid-song-favorite' });
+  });
+
+  // ── destroy / addUnlisten ─────────────────────────────────────────
+
+  it('destroy calls all registered unlisteners', async () => {
+    const svc = new FileManagerService();
+    const { adapter, unlisten } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    const external = vi.fn();
+    svc.addUnlisten(external);
+    svc.destroy();
+    expect(unlisten).toHaveBeenCalledOnce();
+    expect(external).toHaveBeenCalledOnce();
+  });
+
+  it('destroy is safe to call twice', async () => {
+    const svc = new FileManagerService();
+    const { adapter, unlisten } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.destroy();
+    svc.destroy();
+    expect(unlisten).toHaveBeenCalledOnce();
   });
 });
