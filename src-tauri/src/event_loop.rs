@@ -149,6 +149,20 @@ pub async fn run(
         .await;
     }
 
+    // Subscribe to community channel messages for real-time messaging.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/community/*/channels/*".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &udp,
+        &broadcast_addr,
+        &app,
+        &closing,
+    )
+    .await;
+
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
@@ -479,6 +493,10 @@ fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8]) {
     } else if key_expr.starts_with("harmony/profile/") {
         if let Ok(profile) = serde_json::from_slice::<crate::ProfilePayload>(payload) {
             let _ = app.emit("profile-update", &profile);
+        }
+    } else if key_expr.starts_with("harmony/community/") {
+        if let Ok(msg) = serde_json::from_slice::<crate::ChannelMessagePayload>(payload) {
+            let _ = app.emit("message-received", &msg);
         }
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {

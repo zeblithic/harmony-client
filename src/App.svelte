@@ -18,8 +18,9 @@
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
-  // TODO: Replace mock-data imports with real data sources once content transport is wired up
-  import { messages, navNodes, profileStore, vineVideos } from './lib/mock-data';
+  import { MessageService } from './lib/message-service';
+  // TODO: Replace vine/nav mock-data imports with real data sources once content transport is wired up
+  import { navNodes, profileStore, vineVideos } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
 
@@ -90,7 +91,23 @@
   const notificationService = new NotificationService();
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
+  const messageService = new MessageService();
   const stq8Service = new Stq8Service(null); // WASM loaded async later
+
+  // Try to wire up real Tauri message transport.
+  (async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+      messageService.onChange = () => { allMessages = [...messageService.messages]; };
+      await messageService.connectAdapter({
+        invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
+        listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
+      });
+    } catch {
+      // Not in Tauri (browser dev mode) — mock data stays
+    }
+  })();
   let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
 
@@ -243,7 +260,7 @@
   // Mock per-peer override to demonstrate settings
   notificationService.setPeerPolicy('q7r8s9t0', { quiet: 'silent' });
 
-  let allMessages = $state([...messages]);
+  let allMessages = $state([...messageService.messages]);
 
   // Thread state
   let openThreadId = $state<string | null>(null);
@@ -319,16 +336,15 @@
     setTimeout(() => el.classList.remove('highlight'), 1500);
   }
 
+  // TODO: Track the currently-selected channel/hub from nav panel selection.
+  // For now, default to "general" in "harmony-dev" matching the mock nav tree.
+  const activeChannel = 'general';
+  const activeHub = 'harmony-dev';
+
   function handleSend(text: string, priority: MessagePriority) {
-    const newMsg = {
-      id: `msg-${Date.now()}`,
-      sender: { address: 'self', displayName: 'You' },
-      text,
-      timestamp: Date.now(),
-      media: [],
-      priority,
-    };
-    allMessages = [...allMessages, newMsg];
+    messageService.send(text, priority, activeChannel, activeHub).then(() => {
+      allMessages = [...messageService.messages];
+    });
   }
 
   function handleThreadOpen(rootId: string) {
@@ -341,16 +357,9 @@
 
   function handleThreadSend(text: string, priority: MessagePriority) {
     if (!openThreadId) return;
-    const newMsg = {
-      id: `msg-${Date.now()}`,
-      sender: { address: 'self', displayName: 'You' },
-      text,
-      timestamp: Date.now(),
-      media: [],
-      priority,
-      replyTo: openThreadId,
-    };
-    allMessages = [...allMessages, newMsg];
+    messageService.send(text, priority, activeChannel, activeHub, openThreadId).then(() => {
+      allMessages = [...messageService.messages];
+    });
   }
 
   // Extract community nodes (folders) for settings panel
