@@ -10,7 +10,7 @@
     viewedIds: Set<string>;
     onMarkViewed?: (id: string) => void;
     onPublish?: () => void;
-    onReshare?: (vine: VineVideo) => void;
+    onReshare?: (vine: VineVideo) => Promise<void> | void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);

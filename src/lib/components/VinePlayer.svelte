@@ -15,9 +15,10 @@
   let overlayEl: HTMLDivElement;
   let resharing = $state(false);
   let reshareError = $state('');
+  let reshareGeneration = 0;
 
-  // Clear reshare state when navigating to a different vine.
-  $effect(() => { void vine; resharing = false; reshareError = ''; });
+  // Clear reshare state and invalidate in-flight calls when navigating.
+  $effect(() => { void vine; reshareGeneration++; resharing = false; reshareError = ''; });
 
   onMount(() => overlayEl?.focus());
 
@@ -25,12 +26,15 @@
     if (resharing) return;
     resharing = true;
     reshareError = '';
+    const generation = ++reshareGeneration;
     try {
       await onReshare?.(vine);
     } catch (err) {
-      reshareError = err instanceof Error ? err.message : 'Reshare failed';
+      if (generation === reshareGeneration) {
+        reshareError = err instanceof Error ? err.message : 'Reshare failed';
+      }
     } finally {
-      resharing = false;
+      if (generation === reshareGeneration) resharing = false;
     }
   }
 
