@@ -104,7 +104,7 @@
 
   .creator-info {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
   }
 

@@ -2,28 +2,37 @@
   import { onMount } from 'svelte';
 
   let { onPublish, onClose }: {
-    onPublish: (videoCid: string, title?: string) => void;
+    onPublish: (videoCid: string, title?: string) => Promise<void> | void;
     onClose: () => void;
   } = $props();
 
   let videoCid = $state('');
   let title = $state('');
   let error = $state('');
+  let publishing = $state(false);
   let cidInput: HTMLInputElement;
 
   onMount(() => cidInput?.focus());
 
-  function handleSubmit() {
+  async function handleSubmit() {
     const cid = videoCid.trim();
     if (!cid) {
       error = 'Video CID is required';
       return;
     }
+    if (publishing) return;
     error = '';
-    onPublish(cid, title.trim() || undefined);
-    videoCid = '';
-    title = '';
-    onClose();
+    publishing = true;
+    try {
+      await onPublish(cid, title.trim() || undefined);
+      videoCid = '';
+      title = '';
+      onClose();
+    } catch (err) {
+      error = err instanceof Error ? err.message : 'Publish failed';
+    } finally {
+      publishing = false;
+    }
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -74,7 +83,7 @@
 
       <div class="dialog-actions">
         <button type="button" class="btn btn-secondary" onclick={onClose}>Cancel</button>
-        <button type="submit" class="btn btn-primary">Publish</button>
+        <button type="submit" class="btn btn-primary" disabled={publishing}>{publishing ? 'Publishing\u2026' : 'Publish'}</button>
       </div>
     </form>
   </div>
