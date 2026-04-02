@@ -14,14 +14,18 @@
 
   let overlayEl: HTMLDivElement;
   let resharing = $state(false);
+  let reshareError = $state('');
 
   onMount(() => overlayEl?.focus());
 
   async function handleReshare() {
     if (resharing) return;
     resharing = true;
+    reshareError = '';
     try {
       await onReshare?.(vine);
+    } catch (err) {
+      reshareError = err instanceof Error ? err.message : 'Reshare failed';
     } finally {
       resharing = false;
     }
@@ -78,6 +82,9 @@
         <button type="button" class="action-btn" onclick={handleReshare} disabled={resharing} aria-label="Reshare vine">
           <span aria-hidden="true">↗</span> {resharing ? 'Resharing\u2026' : 'Reshare'}
         </button>
+      {/if}
+      {#if reshareError}
+        <span class="reshare-error" role="alert">{reshareError}</span>
       {/if}
     </div>
   </div>
@@ -223,9 +230,15 @@
 
   .footer-actions {
     display: flex;
+    align-items: center;
     justify-content: center;
     gap: 12px;
     margin-top: 8px;
+  }
+
+  .reshare-error {
+    color: #ed4245;
+    font-size: 0.75rem;
   }
 
   .action-btn {
