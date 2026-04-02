@@ -109,15 +109,18 @@
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
       });
-      // When the node connects, fetch our address so self-sent messages
-      // echo back as 'self'/'You' instead of a raw hex address.
+      // Fetch our node address so self-sent messages echo back as 'self'/'You'.
+      // Try immediately (node may already be connected after hot reload / auto-start),
+      // and also listen for future connect events.
+      async function fetchOwnAddress() {
+        try {
+          messageService.ownAddress = await invoke('get_node_addr') as string;
+        } catch { /* node not ready yet */ }
+      }
+      await fetchOwnAddress();
       await listen('zenoh-status', async (event) => {
         const status = (event as { payload: { status: string } }).payload;
-        if (status.status === 'connected') {
-          try {
-            messageService.ownAddress = await invoke('get_node_addr') as string;
-          } catch { /* node not ready yet — will retry on next connect */ }
-        }
+        if (status.status === 'connected') await fetchOwnAddress();
       });
     } catch {
       // Not in Tauri (browser dev mode) — mock data stays
@@ -356,8 +359,12 @@
   const activeChannel = 'general';
   const activeHub = 'harmony-dev';
 
-  function handleSend(text: string, priority: MessagePriority) {
-    messageService.send(text, priority, activeChannel, activeHub);
+  async function handleSend(text: string, priority: MessagePriority) {
+    try {
+      await messageService.send(text, priority, activeChannel, activeHub);
+    } catch (err) {
+      console.error('Failed to send message:', err);
+    }
   }
 
   function handleThreadOpen(rootId: string) {
@@ -368,9 +375,13 @@
     openThreadId = null;
   }
 
-  function handleThreadSend(text: string, priority: MessagePriority) {
+  async function handleThreadSend(text: string, priority: MessagePriority) {
     if (!openThreadId) return;
-    messageService.send(text, priority, activeChannel, activeHub, openThreadId);
+    try {
+      await messageService.send(text, priority, activeChannel, activeHub, openThreadId);
+    } catch (err) {
+      console.error('Failed to send thread reply:', err);
+    }
   }
 
   // Extract community nodes (folders) for settings panel
