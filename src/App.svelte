@@ -81,6 +81,7 @@
       await vineService.publish(videoCid, title);
     } catch (err) {
       console.error('Vine publish failed', err);
+      throw err;
     }
   }
 
@@ -89,6 +90,7 @@
       await vineService.publish(vine.videoCid, vine.title, vine.id);
     } catch (err) {
       console.error('Vine reshare failed', err);
+      throw err;
     }
   }
 
