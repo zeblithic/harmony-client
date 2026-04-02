@@ -643,6 +643,68 @@ fn mark_vine_viewed(vine_id: String) -> bool {
     true
 }
 
+// ── Content announcement types and file manager stubs ───────────────────
+
+/// Content availability announcement received from the mesh network.
+///
+/// When a node stores content, it publishes to `harmony/announce/{cid_hex}`
+/// with the payload size. The event loop routes these to the frontend as
+/// `content-announced` IPC events.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentAnnouncementPayload {
+    /// Hex-encoded CID from the key expression.
+    pub cid: String,
+    /// Payload size in bytes (from the 4-byte big-endian announcement body).
+    pub size_bytes: u32,
+}
+
+/// Parse a content announcement from key expression + payload.
+///
+/// Key format: `harmony/announce/{cid_hex}`
+/// Payload: 4 bytes big-endian u32 size.
+pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<ContentAnnouncementPayload> {
+    let cid_hex = key_expr.strip_prefix("harmony/announce/")?;
+    if cid_hex.is_empty() {
+        return None;
+    }
+    if payload.len() < 4 {
+        return None;
+    }
+    let size_bytes = u32::from_be_bytes(payload[..4].try_into().ok()?);
+    Some(ContentAnnouncementPayload {
+        cid: cid_hex.to_string(),
+        size_bytes,
+    })
+}
+
+#[tauri::command]
+fn list_content() -> Vec<serde_json::Value> {
+    // Future (bead fkz): query runtime's cache + disk index via query channel.
+    Vec::new()
+}
+
+#[tauri::command]
+fn pin_content(cid: String) -> Result<bool, String> {
+    // Future (bead fkz): send pin request to runtime via query channel.
+    let _ = cid;
+    Ok(true)
+}
+
+#[tauri::command]
+fn unpin_content(cid: String) -> Result<bool, String> {
+    // Future (bead fkz): send unpin request to runtime via query channel.
+    let _ = cid;
+    Ok(true)
+}
+
+#[tauri::command]
+fn burn_content(cid: String) -> Result<bool, String> {
+    // Future (bead fkz): send delete request to runtime via query channel.
+    let _ = cid;
+    Ok(true)
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -661,6 +723,10 @@ pub fn run() {
             publish_profile,
             send_message,
             get_node_addr,
+            list_content,
+            pin_content,
+            unpin_content,
+            burn_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -944,5 +1010,50 @@ mod tests {
         assert_eq!(parsed.creator_name, "", "creatorName must default to empty");
         assert!(parsed.title.is_none());
         assert!(parsed.reshare_of.is_none());
+    }
+
+    #[test]
+    fn content_announcement_valid() {
+        let size: u32 = 65536;
+        let payload = size.to_be_bytes().to_vec();
+        let result = parse_content_announcement(
+            "harmony/announce/aabbccdd11223344",
+            &payload,
+        );
+        let ann = result.unwrap();
+        assert_eq!(ann.cid, "aabbccdd11223344");
+        assert_eq!(ann.size_bytes, 65536);
+    }
+
+    #[test]
+    fn content_announcement_camel_case() {
+        let size: u32 = 1024;
+        let payload = size.to_be_bytes().to_vec();
+        let ann = parse_content_announcement("harmony/announce/abc123", &payload).unwrap();
+        let json = serde_json::to_string(&ann).unwrap();
+        assert!(json.contains("\"sizeBytes\""), "expected camelCase: {json}");
+        assert!(!json.contains("\"size_bytes\""), "unexpected snake_case: {json}");
+    }
+
+    #[test]
+    fn content_announcement_wrong_prefix() {
+        let payload = 100u32.to_be_bytes().to_vec();
+        assert!(parse_content_announcement("harmony/vines/abc", &payload).is_none());
+    }
+
+    #[test]
+    fn content_announcement_empty_cid() {
+        let payload = 100u32.to_be_bytes().to_vec();
+        assert!(parse_content_announcement("harmony/announce/", &payload).is_none());
+    }
+
+    #[test]
+    fn content_announcement_short_payload() {
+        assert!(parse_content_announcement("harmony/announce/abc123", &[0, 0]).is_none());
+    }
+
+    #[test]
+    fn content_announcement_empty_payload() {
+        assert!(parse_content_announcement("harmony/announce/abc123", &[]).is_none());
     }
 }

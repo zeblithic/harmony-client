@@ -1,3 +1,4 @@
+import type { TauriAdapter } from './zenoh-service';
 import type {
   ContentItem,
   ContentDetail,
@@ -18,8 +19,21 @@ import {
   mockPeers,
 } from './mock-file-data';
 
+/** Wire format for content availability announcements from the Rust backend. */
+export interface ContentAnnouncementEvent {
+  cid: string;
+  sizeBytes: number;
+}
+
 export class FileManagerService {
   readonly settings: FileManagerSettings;
+  /** Called whenever content state changes so the UI can re-render. */
+  onChange?: () => void;
+  /** CIDs announced on the mesh (real network data). */
+  announcedCids = new Map<string, { sizeBytes: number; firstSeen: number }>();
+
+  private adapter: TauriAdapter | null = null;
+  private unlisteners: Array<() => void> = [];
   private privateContent: ContentItem[];
   private publishedContent: PublishedItem[];
   private cleanupRecommendations: CleanupRecommendation[];
@@ -39,6 +53,24 @@ export class FileManagerService {
     this.publishedContent = structuredClone(mockPublishedContent);
     this.cleanupRecommendations = structuredClone(mockCleanupRecommendations);
     this.storageBuddies = structuredClone(mockStorageBuddies);
+  }
+
+  /** Connect a Tauri adapter and start listening for content announcements. */
+  async connectAdapter(adapter: TauriAdapter): Promise<void> {
+    this.adapter = adapter;
+    const unlisten = await adapter.listen(
+      'content-announced',
+      (event) => {
+        const wire = event.payload as ContentAnnouncementEvent;
+        if (this.announcedCids.has(wire.cid)) return;
+        this.announcedCids = new Map([
+          ...this.announcedCids,
+          [wire.cid, { sizeBytes: wire.sizeBytes, firstSeen: Date.now() }],
+        ]);
+        this.onChange?.();
+      },
+    ) as unknown as () => void;
+    this.unlisteners.push(unlisten);
   }
 
   /** Returns private content. With no args returns a copy of all; with parentCid filters by parent. */
@@ -109,6 +141,11 @@ export class FileManagerService {
   burn(cids: string[]): void {
     const cidSet = new Set(cids);
     this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+    if (this.adapter) {
+      for (const cid of cids) {
+        this.adapter.invoke('burn_content', { cid }).catch(() => {});
+      }
+    }
   }
 
   /** Archive stub — no-op for now. */
@@ -130,12 +167,18 @@ export class FileManagerService {
   pin(cid: string): void {
     const item = this.privateContent.find((i) => i.cid === cid);
     if (item) item.pinned = true;
+    if (this.adapter) {
+      this.adapter.invoke('pin_content', { cid }).catch(() => {});
+    }
   }
 
   /** Clears the pinned flag on a content item. */
   unpin(cid: string): void {
     const item = this.privateContent.find((i) => i.cid === cid);
     if (item) item.pinned = false;
+    if (this.adapter) {
+      this.adapter.invoke('unpin_content', { cid }).catch(() => {});
+    }
   }
 
   /** Updates the replication tier for specified items. */
@@ -151,6 +194,16 @@ export class FileManagerService {
   /** Export stub — no-op for now. */
   exportToDevice(_cids: string[]): void {
     // Future: trigger Tauri file save dialog
+  }
+
+  /** Register an external unlisten handle so it gets cleaned up alongside the service. */
+  addUnlisten(fn: () => void): void {
+    this.unlisteners.push(fn);
+  }
+
+  destroy(): void {
+    for (const fn of this.unlisteners) fn();
+    this.unlisteners = [];
   }
 
   // ── Private helpers ─────────────────────────────────────────────────

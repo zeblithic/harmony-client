@@ -177,6 +177,20 @@ pub async fn run(
     )
     .await;
 
+    // Subscribe to content availability announcements for the file manager.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/announce/*".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &udp,
+        &broadcast_addr,
+        &app,
+        &closing,
+    )
+    .await;
+
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
@@ -515,6 +529,10 @@ fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8]) {
     } else if key_expr.starts_with("harmony/vines/") {
         if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
             let _ = app.emit("vine-received", &vine);
+        }
+    } else if key_expr.starts_with("harmony/announce/") {
+        if let Some(announcement) = crate::parse_content_announcement(key_expr, payload) {
+            let _ = app.emit("content-announced", &announcement);
         }
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {
