@@ -3,16 +3,27 @@
   import VineCard from './VineCard.svelte';
   import VinePlayer from './VinePlayer.svelte';
 
-  let { vines, viewedIds, onMarkViewed }: {
+  type FeedFilter = 'all' | 'unviewed';
+
+  let { vines, viewedIds, onMarkViewed, onPublish, onReshare }: {
     vines: VineVideo[];
     viewedIds: Set<string>;
     onMarkViewed?: (id: string) => void;
+    onPublish?: () => void;
+    onReshare?: (vine: VineVideo) => void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
+  let feedFilter = $state<FeedFilter>('all');
 
   let sortedVines = $derived(
     [...vines].sort((a, b) => b.createdAt - a.createdAt)
+  );
+
+  let filteredVines = $derived(
+    feedFilter === 'unviewed'
+      ? sortedVines.filter(v => !viewedIds.has(v.id))
+      : sortedVines
   );
 
   let unviewedCount = $derived(
@@ -20,7 +31,7 @@
   );
 
   let activeIndex = $derived(
-    activeVine ? sortedVines.findIndex(v => v.id === activeVine!.id) : -1
+    activeVine ? filteredVines.findIndex(v => v.id === activeVine!.id) : -1
   );
 
   function openPlayer(vine: VineVideo) {
@@ -33,14 +44,14 @@
   }
 
   function nextVine() {
-    if (activeIndex >= 0 && activeIndex < sortedVines.length - 1) {
-      openPlayer(sortedVines[activeIndex + 1]);
+    if (activeIndex >= 0 && activeIndex < filteredVines.length - 1) {
+      openPlayer(filteredVines[activeIndex + 1]);
     }
   }
 
   function previousVine() {
     if (activeIndex > 0) {
-      openPlayer(sortedVines[activeIndex - 1]);
+      openPlayer(filteredVines[activeIndex - 1]);
     }
   }
 </script>
@@ -51,13 +62,30 @@
     {#if unviewedCount > 0}
       <span class="unviewed-count" aria-label="{unviewedCount} unviewed">{unviewedCount} new</span>
     {/if}
+    <div class="header-spacer"></div>
+    {#if onPublish}
+      <button type="button" class="create-btn" onclick={onPublish} aria-label="Create vine">+</button>
+    {/if}
   </header>
 
-  {#if sortedVines.length === 0}
-    <p class="empty-state">No vines yet. Follow creators to see their vines here.</p>
+  <div class="filter-bar">
+    <button type="button" class="filter-tab" class:active={feedFilter === 'all'} onclick={() => feedFilter = 'all'}>All</button>
+    <button type="button" class="filter-tab" class:active={feedFilter === 'unviewed'} onclick={() => feedFilter = 'unviewed'}>
+      Unviewed{#if unviewedCount > 0}&nbsp;({unviewedCount}){/if}
+    </button>
+  </div>
+
+  {#if filteredVines.length === 0}
+    <p class="empty-state">
+      {#if feedFilter === 'unviewed'}
+        All caught up — no unviewed vines.
+      {:else}
+        No vines yet. Follow creators to see their vines here.
+      {/if}
+    </p>
   {:else}
     <div class="feed-list" role="list" aria-label="Vine feed">
-      {#each sortedVines as vine (vine.id)}
+      {#each filteredVines as vine (vine.id)}
         <div role="listitem">
           <VineCard {vine} onPlay={openPlayer} isViewed={viewedIds.has(vine.id)} />
         </div>
@@ -70,8 +98,9 @@
   <VinePlayer
     vine={activeVine}
     onClose={closePlayer}
-    onNext={activeIndex < sortedVines.length - 1 ? nextVine : undefined}
+    onNext={activeIndex < filteredVines.length - 1 ? nextVine : undefined}
     onPrevious={activeIndex > 0 ? previousVine : undefined}
+    {onReshare}
   />
 {/if}
 
@@ -103,6 +132,58 @@
     background: rgba(88, 101, 242, 0.15);
     padding: 2px 8px;
     border-radius: 10px;
+  }
+
+  .header-spacer {
+    flex: 1;
+  }
+
+  .create-btn {
+    background: var(--accent);
+    color: white;
+    border: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.15s;
+  }
+
+  .create-btn:hover {
+    opacity: 0.85;
+  }
+
+  .filter-bar {
+    display: flex;
+    gap: 4px;
+    padding: 0 16px 8px;
+  }
+
+  .filter-tab {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .filter-tab:hover {
+    background: var(--bg-tertiary);
+  }
+
+  .filter-tab.active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-weight: 600;
   }
 
   .empty-state {

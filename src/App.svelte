@@ -12,6 +12,7 @@
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
+  import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
@@ -71,6 +72,16 @@
 
   function handleMarkVineViewed(id: string) {
     vineService.markViewed(id);
+  }
+
+  let showVinePublish = $state(false);
+
+  function handleVinePublish(videoCid: string, title?: string) {
+    vineService.publish(videoCid, title);
+  }
+
+  function handleVineReshare(vine: import('./lib/types').VineVideo) {
+    vineService.publish(vine.videoCid, vine.title, vine.id);
   }
 
   let popoverProfile = $state<Profile | null>(null);
@@ -500,7 +511,10 @@
     />
   {/snippet}
   {#snippet vineFeed()}
-    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} />
+    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} onPublish={() => showVinePublish = true} onReshare={handleVineReshare} />
+    {#if showVinePublish}
+      <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />
+    {/if}
   {/snippet}
   {#snippet fileBrowser()}
     <FileBrowser
