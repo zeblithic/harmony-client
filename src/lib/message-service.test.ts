@@ -1,23 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MessageService, type ChannelMessageEvent } from './message-service';
-import type { TauriAdapter } from './zenoh-service';
 import { messages as mockMessages } from './mock-data';
-
-function createMockAdapter() {
-  const listeners = new Map<string, (event: { payload: unknown }) => void>();
-  const unlisten = vi.fn();
-  const adapter: TauriAdapter = {
-    invoke: vi.fn().mockResolvedValue(undefined),
-    listen: vi.fn().mockImplementation((event: string, handler: (event: { payload: unknown }) => void) => {
-      listeners.set(event, handler);
-      return Promise.resolve(unlisten);
-    }),
-  };
-  function emit(event: string, payload: unknown) {
-    listeners.get(event)?.({ payload });
-  }
-  return { adapter, emit, unlisten };
-}
+import { createMockAdapter } from './test-utils';
 
 describe('MessageService', () => {
   let svc: MessageService;
@@ -32,10 +16,10 @@ describe('MessageService', () => {
     expect(svc.messages.length).toBe(mockMessages.length);
   });
 
-  it('populates seenIds from mock data', () => {
+  it('populates seenIds from mock data', async () => {
     // A second message with an existing ID should be deduped
     const { adapter, emit } = createMockAdapter();
-    svc.connectAdapter(adapter);
+    await svc.connectAdapter(adapter);
     const existingId = mockMessages[0].id;
     emit('message-received', { id: existingId, senderAddress: 'x', senderName: 'X', channel: 'c', hub: 'h', text: 'dup', timestamp: 1, priority: 'standard' } satisfies ChannelMessageEvent);
     expect(svc.messages.length).toBe(mockMessages.length);

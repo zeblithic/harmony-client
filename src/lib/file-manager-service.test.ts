@@ -1,22 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { FileManagerService, type ContentAnnouncementEvent } from './file-manager-service';
-import type { TauriAdapter } from './zenoh-service';
-
-function createMockAdapter() {
-  const listeners = new Map<string, (event: { payload: unknown }) => void>();
-  const unlisten = vi.fn();
-  const adapter: TauriAdapter = {
-    invoke: vi.fn().mockResolvedValue(undefined),
-    listen: vi.fn().mockImplementation((event: string, handler: (event: { payload: unknown }) => void) => {
-      listeners.set(event, handler);
-      return Promise.resolve(unlisten);
-    }),
-  };
-  function emit(event: string, payload: unknown) {
-    listeners.get(event)?.({ payload });
-  }
-  return { adapter, emit, unlisten };
-}
+import { createMockAdapter } from './test-utils';
 
 describe('FileManagerService', () => {
   it('constructs with default settings', () => {
