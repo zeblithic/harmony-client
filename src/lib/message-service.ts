@@ -45,6 +45,7 @@ export class MessageService {
 
   /** Connect a Tauri adapter and start listening for network messages. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
+    if (this.adapter) return; // already wired; prevent duplicate listeners
     this.adapter = adapter;
     const unlisten = await adapter.listen(
       'message-received',
@@ -56,7 +57,7 @@ export class MessageService {
         this.messages = [...this.messages, msg];
         this.onChange?.();
       },
-    ) as unknown as () => void;
+    );
     this.unlisteners.push(unlisten);
   }
 

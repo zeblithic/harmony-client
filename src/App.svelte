@@ -101,6 +101,10 @@
   const notificationService = new NotificationService();
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
+  $effect(() => () => fileManagerService.destroy());
+  // Declare fileManagerVersion before wiring onChange — same pattern as allMessages.
+  let fileManagerVersion = $state(0);
+  fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
   const stq8Service = new Stq8Service(null); // WASM loaded async later
@@ -114,7 +118,7 @@
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
   messageService.ownDisplayName = myProfile.displayName || 'You';
 
-  // Try to wire up real Tauri transport (messages + vines).
+  // Try to wire up real Tauri transport (messages, vines, file manager).
   (async () => {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -125,6 +129,7 @@
       };
       await messageService.connectAdapter(adapter);
       await vineService.connectAdapter(adapter);
+      await fileManagerService.connectAdapter(adapter);
       // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
       // and also listen for future connect events.
@@ -140,9 +145,11 @@
         const status = (event as { payload: { status: string } }).payload;
         if (status.status === 'connected') await fetchOwnAddress();
       });
-      // zenoh-status serves both services (fetchOwnAddress sets both),
-      // so register cleanup on the service that's destroyed last.
-      vineService.addUnlisten(unlistenStatus as unknown as () => void);
+      // zenoh-status serves messages + vines (fetchOwnAddress sets both
+      // ownAddress fields). All three services are destroyed on unmount;
+      // cleanup order is irrelevant since no service depends on another's
+      // teardown. Registered on fileManagerService arbitrarily.
+      fileManagerService.addUnlisten(unlistenStatus as unknown as () => void);
     } catch {
       // Not in Tauri (browser dev mode) — mock data stays
     }
@@ -155,7 +162,6 @@
   }
 
   // ── File manager state ──────────────────────────────────────────────
-  let fileManagerVersion = $state(0);
   let selectedFileCid = $state<string | null>(null);
   let currentFolderCid = $state<string | null>(null);
   let fileViewMode = $state<FileViewMode>('list');

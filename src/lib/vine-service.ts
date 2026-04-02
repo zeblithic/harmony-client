@@ -47,6 +47,7 @@ export class VineService {
 
   /** Connect a Tauri adapter and start listening for vine descriptors. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
+    if (this.adapter) return; // already wired; prevent duplicate listeners
     this.adapter = adapter;
     const unlisten = await adapter.listen(
       'vine-received',
@@ -59,7 +60,7 @@ export class VineService {
         this.vines = [...this.vines, vine];
         this.onChange?.();
       },
-    ) as unknown as () => void;
+    );
     this.unlisteners.push(unlisten);
   }
 
