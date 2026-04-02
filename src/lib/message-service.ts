@@ -84,7 +84,7 @@ export class MessageService {
     }
 
     // Offline fallback: append locally so the UI stays responsive.
-    const id = `msg-${Date.now()}`;
+    const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     this.seenIds.add(id);
     const msg: Message = {
       id,

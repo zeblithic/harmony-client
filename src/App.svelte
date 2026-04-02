@@ -93,6 +93,7 @@
   const trustService = new TrustService();
   const fileManagerService = new FileManagerService();
   const messageService = new MessageService();
+  $effect(() => () => messageService.destroy());
   const stq8Service = new Stq8Service(null); // WASM loaded async later
 
   // Declare allMessages before wiring onChange — avoids a temporal dead zone
