@@ -16,6 +16,9 @@
   let resharing = $state(false);
   let reshareError = $state('');
 
+  // Clear reshare state when navigating to a different vine.
+  $effect(() => { void vine; resharing = false; reshareError = ''; });
+
   onMount(() => overlayEl?.focus());
 
   async function handleReshare() {
