@@ -34,26 +34,30 @@ export class MessageService {
   ownDisplayName = 'You';
 
   private adapter: TauriAdapter | null = null;
-  private unlisten?: () => void;
+  private unlisteners: Array<() => void> = [];
+  private seenIds = new Set<string>();
 
   constructor() {
     // Seed with mock data — real messages append on top.
     this.messages = [...mockMessages];
+    for (const m of this.messages) this.seenIds.add(m.id);
   }
 
   /** Connect a Tauri adapter and start listening for network messages. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     this.adapter = adapter;
-    this.unlisten = await adapter.listen(
+    const unlisten = await adapter.listen(
       'message-received',
       (event) => {
         const wire = event.payload as ChannelMessageEvent;
-        if (this.messages.some(m => m.id === wire.id)) return; // deduplicate
+        if (this.seenIds.has(wire.id)) return;
+        this.seenIds.add(wire.id);
         const msg = this.wireToMessage(wire);
         this.messages = [...this.messages, msg];
         this.onChange?.();
       },
     ) as unknown as () => void;
+    this.unlisteners.push(unlisten);
   }
 
   /** Send a channel message via Tauri command. */
@@ -80,8 +84,10 @@ export class MessageService {
     }
 
     // Offline fallback: append locally so the UI stays responsive.
+    const id = `msg-${Date.now()}`;
+    this.seenIds.add(id);
     const msg: Message = {
-      id: `msg-${Date.now()}`,
+      id,
       sender: { address: 'self', displayName: 'You' },
       text,
       timestamp: Date.now(),
@@ -122,8 +128,14 @@ export class MessageService {
     };
   }
 
+  /** Register an external unlisten handle (e.g. zenoh-status listener)
+   *  so it gets cleaned up alongside the service. */
+  addUnlisten(fn: () => void): void {
+    this.unlisteners.push(fn);
+  }
+
   destroy(): void {
-    this.unlisten?.();
-    this.unlisten = undefined;
+    for (const fn of this.unlisteners) fn();
+    this.unlisteners = [];
   }
 }
