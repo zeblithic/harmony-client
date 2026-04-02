@@ -310,6 +310,11 @@
       : new Set<string>()
   );
 
+  // TODO: Track the currently-selected channel/hub from nav panel selection.
+  // For now, default to "general" in "harmony-dev" matching the mock nav tree.
+  const activeChannel = 'general';
+  const activeHub = 'harmony-dev';
+
   // Filter to messages in the active channel (mock messages without
   // channel/hub pass through so pre-existing seed data still shows).
   let channelMessages = $derived(
@@ -365,11 +370,6 @@
     el.classList.add('highlight');
     setTimeout(() => el.classList.remove('highlight'), 1500);
   }
-
-  // TODO: Track the currently-selected channel/hub from nav panel selection.
-  // For now, default to "general" in "harmony-dev" matching the mock nav tree.
-  const activeChannel = 'general';
-  const activeHub = 'harmony-dev';
 
   async function handleSend(text: string, priority: MessagePriority) {
     try {
