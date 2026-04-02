@@ -71,7 +71,6 @@ pub struct SendMessagePayload {
     pub hub: String,
     pub text: String,
     pub priority: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
 }
 
@@ -454,7 +453,7 @@ async fn send_message(
         .as_millis() as u64;
 
     let wire = ChannelMessagePayload {
-        id: format!("msg-{}-{now_ms}", &node_addr[..8.min(node_addr.len())]),
+        id: format!("msg-{}-{now_ms}-{:08x}", &node_addr[..8.min(node_addr.len())], rand::random::<u32>()),
         sender_address: node_addr.clone(),
         sender_name: String::new(), // receiver resolves from profile store
         channel: message.channel.clone(),

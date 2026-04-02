@@ -43,6 +43,7 @@ export class MessageService {
       'message-received',
       (event) => {
         const wire = event.payload as ChannelMessageEvent;
+        if (this.messages.some(m => m.id === wire.id)) return; // deduplicate
         const msg = this.wireToMessage(wire);
         this.messages = [...this.messages, msg];
         this.onChange?.();
@@ -64,8 +65,12 @@ export class MessageService {
           message: { channel, hub, text, priority, replyTo },
         });
         return; // Backend will echo via subscription → message-received event
-      } catch {
-        // Fall through to local-only append if not connected
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Only fall back locally when genuinely disconnected; re-throw real errors.
+        if (!msg.includes('not connected') && !msg.includes('event loop')) {
+          throw err;
+        }
       }
     }
 
@@ -91,7 +96,7 @@ export class MessageService {
       id: wire.id,
       sender: {
         address: wire.senderAddress,
-        displayName: knownProfile?.displayName ?? wire.senderName ?? wire.senderAddress.slice(0, 8),
+        displayName: knownProfile?.displayName || wire.senderName || wire.senderAddress.slice(0, 8),
       },
       text: wire.text,
       timestamp: wire.timestamp,

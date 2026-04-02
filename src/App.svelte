@@ -94,12 +94,15 @@
   const messageService = new MessageService();
   const stq8Service = new Stq8Service(null); // WASM loaded async later
 
+  // Always wire onChange so both online (Zenoh echo) and offline (local append)
+  // paths update the reactive allMessages state.
+  messageService.onChange = () => { allMessages = [...messageService.messages]; };
+
   // Try to wire up real Tauri message transport.
   (async () => {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const { listen } = await import('@tauri-apps/api/event');
-      messageService.onChange = () => { allMessages = [...messageService.messages]; };
       await messageService.connectAdapter({
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
@@ -342,9 +345,7 @@
   const activeHub = 'harmony-dev';
 
   function handleSend(text: string, priority: MessagePriority) {
-    messageService.send(text, priority, activeChannel, activeHub).then(() => {
-      allMessages = [...messageService.messages];
-    });
+    messageService.send(text, priority, activeChannel, activeHub);
   }
 
   function handleThreadOpen(rootId: string) {
@@ -357,9 +358,7 @@
 
   function handleThreadSend(text: string, priority: MessagePriority) {
     if (!openThreadId) return;
-    messageService.send(text, priority, activeChannel, activeHub, openThreadId).then(() => {
-      allMessages = [...messageService.messages];
-    });
+    messageService.send(text, priority, activeChannel, activeHub, openThreadId);
   }
 
   // Extract community nodes (folders) for settings panel
