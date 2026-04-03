@@ -1,14 +1,6 @@
-import type { TauriAdapter } from './zenoh-service';
+import type { TauriAdapter, ProfilePayload } from './zenoh-service';
 import type { NavNode, Profile } from './types';
 import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
-
-/** Wire format for profile updates from the Rust backend. */
-export interface ProfileUpdateEvent {
-  address: string;
-  displayName: string;
-  statusText?: string;
-  avatarUrl?: string;
-}
 
 /**
  * Manages navigation tree state and peer profile lookups.
@@ -41,7 +33,7 @@ export class NavService {
     const unlistenProfile = await adapter.listen(
       'profile-update',
       (event) => {
-        const wire = event.payload as ProfileUpdateEvent;
+        const wire = event.payload as ProfilePayload;
         // Filter own profile echoes
         if (this.ownAddress && wire.address === this.ownAddress) return;
         this.profiles.set(wire.address, {
@@ -50,14 +42,18 @@ export class NavService {
           statusText: wire.statusText,
           avatarUrl: wire.avatarUrl,
         });
-        // Update DM node names to match latest displayName
+        // Update DM nodes to match latest peer profile
         let nodeChanged = false;
         const updated = this.nodes.map((n) => {
-          if (n.peer?.address === wire.address && n.name !== wire.displayName) {
-            nodeChanged = true;
-            return { ...n, name: wire.displayName, peer: { ...n.peer, displayName: wire.displayName } };
-          }
-          return n;
+          if (n.peer?.address !== wire.address) return n;
+          const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== wire.avatarUrl;
+          if (!peerChanged) return n;
+          nodeChanged = true;
+          return {
+            ...n,
+            name: wire.displayName,
+            peer: { ...n.peer, displayName: wire.displayName, avatarUrl: wire.avatarUrl },
+          };
         });
         if (nodeChanged) this.nodes = updated;
         this.onChange?.();
