@@ -13,12 +13,15 @@ export interface DiscoveredNode {
   cpuPercent?: number;
   /** Latest memory usage in MB from health telemetry. */
   memMb?: number;
+  /** Hop distance derived from Zenoh routing: 1 = direct peer, 2 = via router. */
+  hopDistance?: number;
 }
 
 export interface CapacityUpdate {
   nodeAddr: string;
   modelCid: string;
   ready: boolean;
+  hopDistance?: number;
 }
 
 export interface ProfilePayload {

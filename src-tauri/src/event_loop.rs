@@ -39,7 +39,7 @@ pub struct FetchRequest {
 enum ZenohEvent {
     Query { key_expr: String, payload: Vec<u8> },
     ComputeQuery { key_expr: String, payload: Vec<u8> },
-    Subscription { key_expr: String, payload: Vec<u8> },
+    Subscription { key_expr: String, payload: Vec<u8>, source_zid: Option<String> },
     FetchResponse {
         cid: [u8; 32],
         is_module: bool,
@@ -135,6 +135,10 @@ pub async fn run(
     };
     tracing::info!("Zenoh session opened");
 
+    // Own Zenoh session ID — attached to capacity publications so receivers
+    // can determine hop distance by comparing against their peers_zid().
+    let own_zid = session.zid().to_string();
+
     // Shared flag: set to true during intentional shutdown so spawned
     // subscriber/queryable tasks don't emit false session-lost errors.
     let closing = Arc::new(AtomicBool::new(false));
@@ -152,6 +156,7 @@ pub async fn run(
             &broadcast_addr,
             &app,
             &closing,
+            &own_zid,
         )
         .await;
     }
@@ -167,6 +172,7 @@ pub async fn run(
         &broadcast_addr,
         &app,
         &closing,
+        &own_zid,
     )
     .await;
 
@@ -181,6 +187,7 @@ pub async fn run(
         &broadcast_addr,
         &app,
         &closing,
+        &own_zid,
     )
     .await;
 
@@ -195,6 +202,7 @@ pub async fn run(
         &broadcast_addr,
         &app,
         &closing,
+        &own_zid,
     )
     .await;
 
@@ -208,6 +216,11 @@ pub async fn run(
     let start = std::time::Instant::now();
 
     let mut udp_buf = vec![0u8; 65535];
+
+    // Directly connected Zenoh peers — refreshed every 20 ticks (~5s).
+    // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
+    let mut direct_peer_zids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut peer_refresh_counter: u64 = 0;
 
     tracing::info!("event loop running");
 
@@ -264,8 +277,11 @@ pub async fn run(
                             payload,
                         });
                     }
-                    ZenohEvent::Subscription { key_expr, payload } => {
-                        emit_frontend_event(&app, &key_expr, &payload);
+                    ZenohEvent::Subscription { key_expr, payload, source_zid } => {
+                        let hop_distance = source_zid.as_ref().map(|zid| {
+                            if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
+                        });
+                        emit_frontend_event(&app, &key_expr, &payload, hop_distance);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -316,6 +332,18 @@ pub async fn run(
         }
 
         if should_tick {
+            // Refresh direct peer set every 20 ticks (~5 seconds).
+            peer_refresh_counter += 1;
+            if peer_refresh_counter % 20 == 0 {
+                direct_peer_zids = session
+                    .info()
+                    .peers_zid()
+                    .await
+                    .into_iter()
+                    .map(|z| z.to_string())
+                    .collect();
+            }
+
             let actions = runtime.tick();
             for action in actions {
                 dispatch_action(
@@ -326,6 +354,7 @@ pub async fn run(
                     &broadcast_addr,
                     &app,
                     &closing,
+                    &own_zid,
                 )
                 .await;
             }
@@ -347,6 +376,7 @@ async fn dispatch_action(
     broadcast_addr: &SocketAddr,
     app: &AppHandle,
     closing: &Arc<AtomicBool>,
+    own_zid: &str,
 ) {
     match action {
         // ── Network: Reticulum packet send ───────────────────────────
@@ -362,8 +392,19 @@ async fn dispatch_action(
         // ── Zenoh: publish ───────────────────────────────────────────
         RuntimeAction::Publish { key_expr, payload } => {
             let session = session.clone();
+            // Attach our ZenohId to capacity publications so receivers can
+            // determine hop distance by comparing against their peers_zid().
+            let zid_attachment = if key_expr.starts_with("harmony/compute/capacity/") {
+                Some(own_zid.to_string())
+            } else {
+                None
+            };
             tokio::spawn(async move {
-                if let Err(e) = session.put(&key_expr, payload).await {
+                let mut builder = session.put(&key_expr, payload);
+                if let Some(zid) = zid_attachment {
+                    builder = builder.attachment(zid.as_bytes());
+                }
+                if let Err(e) = builder.await {
                     tracing::warn!(%key_expr, err = %e, "zenoh put failed");
                 }
             });
@@ -422,10 +463,15 @@ async fn dispatch_action(
                         while let Ok(sample) = sub.recv_async().await {
                             let skey = sample.key_expr().to_string();
                             let payload = sample.payload().to_bytes().to_vec();
+                            // Extract publisher's ZenohId from attachment (if present).
+                            let source_zid = sample
+                                .attachment()
+                                .and_then(|a| String::from_utf8(a.to_bytes().to_vec()).ok());
                             if tx
                                 .send(ZenohEvent::Subscription {
                                     key_expr: skey,
                                     payload,
+                                    source_zid,
                                 })
                                 .await
                                 .is_err()
@@ -531,9 +577,10 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
-fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8]) {
+fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_distance: Option<u8>) {
     if key_expr.starts_with("harmony/compute/capacity/") {
-        if let Some(update) = crate::parse_capacity(key_expr, payload) {
+        if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
+            update.hop_distance = hop_distance;
             let _ = app.emit("capacity-update", &update);
         }
     } else if key_expr.starts_with("harmony/profile/") {
