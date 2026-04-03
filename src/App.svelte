@@ -21,8 +21,7 @@
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
   import { VineService } from './lib/vine-service';
-  // TODO: Replace nav mock-data imports with real data sources once content transport is wired up
-  import { navNodes, profileStore } from './lib/mock-data';
+  import { NavService } from './lib/nav-service';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
@@ -95,6 +94,15 @@
     }
   }
 
+  const navService = new NavService();
+  $effect(() => () => navService.destroy());
+
+  let navNodes = $state([...navService.nodes]);
+
+  navService.onChange = () => {
+    navNodes = [...navService.nodes];
+  };
+
   let popoverProfile = $state<Profile | null>(null);
   let popoverX = $state(0);
   let popoverY = $state(0);
@@ -104,7 +112,7 @@
       popoverProfile = null;
       return;
     }
-    const profile = profileStore.get(address);
+    const profile = navService.getProfile(address);
     if (!profile) return;
     const el = (event.target as HTMLElement).closest('.avatar') as HTMLElement | null;
     if (!el) return;
@@ -152,6 +160,7 @@
       await messageService.connectAdapter(adapter);
       await vineService.connectAdapter(adapter);
       await fileManagerService.connectAdapter(adapter);
+      await navService.connectAdapter(adapter);
       // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
       // and also listen for future connect events.
@@ -160,6 +169,7 @@
           const addr = await invoke('get_node_addr') as string;
           messageService.ownAddress = addr;
           vineService.ownAddress = addr;
+          navService.ownAddress = addr;
         } catch { /* node not ready yet */ }
       }
       await fetchOwnAddress();
@@ -167,8 +177,8 @@
         const status = (event as { payload: { status: string } }).payload;
         if (status.status === 'connected') await fetchOwnAddress();
       });
-      // zenoh-status serves messages + vines (fetchOwnAddress sets both
-      // ownAddress fields). All three services are destroyed on unmount;
+      // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
+      // all ownAddress fields). All four services are destroyed on unmount;
       // cleanup order is irrelevant since no service depends on another's
       // teardown. Registered on fileManagerService arbitrarily.
       fileManagerService.addUnlisten(unlistenStatus as unknown as () => void);
@@ -497,7 +507,7 @@
       activeNodeId={activeChannel}
       onNodeClick={handleNodeClick}
       onSettingsClick={() => { showSettings = !showSettings; }}
-      profileLookup={(addr) => profileStore.get(addr)?.statusText}
+      profileLookup={(addr) => navService.profileLookup(addr)}
       onModeChange={switchMode}
       {appMode}
       contentItems={allFileContents}
