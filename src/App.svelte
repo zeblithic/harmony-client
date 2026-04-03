@@ -22,6 +22,7 @@
   import { MessageService } from './lib/message-service';
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
+  import { AvatarResolver } from './lib/avatar-resolver';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
@@ -94,11 +95,17 @@
     }
   }
 
+  const avatarResolver = new AvatarResolver();
+  $effect(() => () => avatarResolver.destroy());
+
   const navService = new NavService();
+  navService.setAvatarResolver(avatarResolver);
   $effect(() => () => navService.destroy());
 
   let navNodes = $state([...navService.nodes]);
 
+  // When avatar CIDs finish resolving, push blob URLs into stored profiles/nodes.
+  avatarResolver.onChange = () => navService.refreshAvatars();
   navService.onChange = () => {
     navNodes = [...navService.nodes];
   };
@@ -160,6 +167,7 @@
       await messageService.connectAdapter(adapter);
       await vineService.connectAdapter(adapter);
       await fileManagerService.connectAdapter(adapter);
+      avatarResolver.connectAdapter(adapter);
       await navService.connectAdapter(adapter);
       // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
