@@ -217,9 +217,17 @@ pub async fn run(
 
     let mut udp_buf = vec![0u8; 65535];
 
-    // Directly connected Zenoh peers — refreshed every 20 ticks (~5s).
+    // Directly connected Zenoh peers — refreshed every 20 timer ticks (~5s).
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
-    let mut direct_peer_zids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Eagerly populated so capacity updates arriving before the first refresh
+    // aren't misclassified as hop 2.
+    let mut direct_peer_zids: std::collections::HashSet<String> = session
+        .info()
+        .peers_zid()
+        .await
+        .into_iter()
+        .map(|z| z.to_string())
+        .collect();
     let mut peer_refresh_counter: u64 = 0;
 
     tracing::info!("event loop running");
@@ -258,6 +266,20 @@ pub async fn run(
                     .as_secs();
                 runtime.push_event(RuntimeEvent::TimerTick { now, unix_now });
                 should_tick = true;
+
+                // Refresh direct peer set every 20 timer ticks (~5 seconds).
+                // Driven by timer only (not Zenoh events) to avoid excessive
+                // peers_zid() calls under high message traffic.
+                peer_refresh_counter += 1;
+                if peer_refresh_counter % 20 == 0 {
+                    direct_peer_zids = session
+                        .info()
+                        .peers_zid()
+                        .await
+                        .into_iter()
+                        .map(|z| z.to_string())
+                        .collect();
+                }
             }
 
             // ── Zenoh events (from spawned tasks) ────────────────────
@@ -332,18 +354,6 @@ pub async fn run(
         }
 
         if should_tick {
-            // Refresh direct peer set every 20 ticks (~5 seconds).
-            peer_refresh_counter += 1;
-            if peer_refresh_counter % 20 == 0 {
-                direct_peer_zids = session
-                    .info()
-                    .peers_zid()
-                    .await
-                    .into_iter()
-                    .map(|z| z.to_string())
-                    .collect();
-            }
-
             let actions = runtime.tick();
             for action in actions {
                 dispatch_action(
@@ -394,7 +404,7 @@ async fn dispatch_action(
             let session = session.clone();
             // Attach our ZenohId to capacity publications so receivers can
             // determine hop distance by comparing against their peers_zid().
-            let zid_attachment = if key_expr.starts_with("harmony/compute/capacity/") {
+            let zid_attachment = if key_expr.starts_with(crate::CAPACITY_PREFIX) {
                 Some(own_zid.to_string())
             } else {
                 None
