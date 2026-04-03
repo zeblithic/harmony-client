@@ -68,13 +68,11 @@ describe('VineFeed Integration', () => {
 
   it('renders vine cards sorted newest first', () => {
     renderFeed();
-    const cards = screen.getAllByRole('button').filter(
-      btn => btn.getAttribute('aria-label')?.includes('by ')
-    );
+    const items = screen.getAllByRole('listitem');
     // v4 (newest) should appear before v1 (oldest)
-    expect(cards.length).toBe(4);
-    expect(cards[0].getAttribute('aria-label')).toContain('Cache explained');
-    expect(cards[cards.length - 1].getAttribute('aria-label')).toContain('Transport demo');
+    expect(items.length).toBe(4);
+    expect(items[0].querySelector('[role="button"]')?.getAttribute('aria-label')).toContain('Cache explained');
+    expect(items[items.length - 1].querySelector('[role="button"]')?.getAttribute('aria-label')).toContain('Transport demo');
   });
 
   it('shows creator names on cards', () => {
@@ -126,6 +124,8 @@ describe('VineFeed Integration', () => {
     expect(screen.queryByText('Transport demo')).toBeNull();
     expect(screen.queryByText('Mesh routing')).toBeNull();
     expect(screen.getByText('Cache explained')).toBeTruthy();
+    // v3 has no title — verify it's still present via its aria-label
+    expect(screen.getByLabelText('Untitled vine by Carol')).toBeTruthy();
   });
 
   it('shows empty state when all vines are viewed in Unviewed filter', async () => {

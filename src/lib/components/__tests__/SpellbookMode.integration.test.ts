@@ -39,17 +39,21 @@ function createMockStq8(ready = true) {
 
 function renderSpellbook(overrides: Record<string, unknown> = {}) {
   const onStatsUpdate = vi.fn();
-  const stq8Service = createMockStq8();
+  const defaultStq8Service = createMockStq8();
 
-  const result = render(SpellbookMode, {
-    props: {
-      stq8Service,
-      onStatsUpdate,
-      ...overrides,
-    },
-  });
+  const effectiveProps = {
+    stq8Service: defaultStq8Service,
+    onStatsUpdate,
+    ...overrides,
+  };
 
-  return { ...result, stq8Service, onStatsUpdate };
+  const result = render(SpellbookMode, { props: effectiveProps });
+
+  return {
+    ...result,
+    stq8Service: effectiveProps.stq8Service as ReturnType<typeof createMockStq8>,
+    onStatsUpdate,
+  };
 }
 
 describe('SpellbookMode Integration', () => {
