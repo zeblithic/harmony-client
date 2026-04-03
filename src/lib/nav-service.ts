@@ -48,15 +48,18 @@ export class NavService {
           address: wire.address,
           displayName: wire.displayName,
           statusText: wire.statusText,
-          avatarCid: wire.avatarUrl,
+          avatarUrl: wire.avatarUrl,
         });
         // Update DM node names to match latest displayName
-        this.nodes = this.nodes.map((n) => {
+        let nodeChanged = false;
+        const updated = this.nodes.map((n) => {
           if (n.peer?.address === wire.address && n.name !== wire.displayName) {
+            nodeChanged = true;
             return { ...n, name: wire.displayName, peer: { ...n.peer, displayName: wire.displayName } };
           }
           return n;
         });
+        if (nodeChanged) this.nodes = updated;
         this.onChange?.();
       },
     );
