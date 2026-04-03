@@ -15,6 +15,7 @@ export class AvatarResolver {
   private cache = new Map<string, string>();
   private pending = new Set<string>();
   private failed = new Set<string>();
+  private destroyed = false;
 
   connectAdapter(adapter: TauriAdapter): void {
     this.adapter = adapter;
@@ -36,19 +37,24 @@ export class AvatarResolver {
     this.pending.add(cid);
     try {
       const bytes = (await this.adapter.invoke('fetch_content', { cid })) as number[];
-      const blob = new Blob([new Uint8Array(bytes)]);
+      if (this.destroyed) return;
+      const mime = detectImageMime(bytes);
+      const blob = new Blob([new Uint8Array(bytes)], { type: mime });
       const url = URL.createObjectURL(blob);
       this.cache.set(cid, url);
       this.onChange?.();
     } catch (err) {
-      console.warn(`Avatar fetch failed for CID ${cid}:`, err);
-      this.failed.add(cid);
+      if (!this.destroyed) {
+        console.warn(`Avatar fetch failed for CID ${cid}:`, err);
+        this.failed.add(cid);
+      }
     } finally {
       this.pending.delete(cid);
     }
   }
 
   destroy(): void {
+    this.destroyed = true;
     for (const url of this.cache.values()) {
       URL.revokeObjectURL(url);
     }
@@ -56,4 +62,13 @@ export class AvatarResolver {
     this.pending.clear();
     this.failed.clear();
   }
+}
+
+/** Detect image MIME type from magic bytes, defaulting to image/png. */
+function detectImageMime(bytes: number[]): string {
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+  if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
+  if (bytes[0] === 0x52 && bytes[1] === 0x49) return 'image/webp';
+  return 'image/png';
 }

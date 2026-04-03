@@ -97,6 +97,8 @@ export class NavService {
     if (!this.avatarResolver) return;
     let changed = false;
     for (const [, profile] of this.profiles) {
+      // Don't override a direct avatarUrl with a CID blob URL.
+      if (profile.avatarUrl && !profile.avatarUrl.startsWith('blob:')) continue;
       const cid = profile.avatarMiniCid ?? profile.avatarCid;
       if (!cid) continue;
       const resolved = this.avatarResolver.resolve(cid);
