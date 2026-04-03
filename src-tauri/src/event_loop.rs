@@ -29,6 +29,12 @@ pub struct PublishRequest {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+/// A content-fetch request sent from the Tauri command thread into the event loop.
+pub struct FetchRequest {
+    pub cid_hex: String,
+    pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query { key_expr: String, payload: Vec<u8> },
@@ -54,6 +60,7 @@ pub async fn run(
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
     mut publish_rx: mpsc::Receiver<PublishRequest>,
+    mut fetch_rx: mpsc::Receiver<FetchRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -288,6 +295,17 @@ pub async fn run(
                     .await
                     .map_err(|e| format!("put failed: {e}"));
                 let _ = req.reply.send(result);
+            }
+
+            // ── Content-fetch requests from Tauri commands ──────────
+            Some(req) = fetch_rx.recv() => {
+                let prefix = req.cid_hex.get(1..2).unwrap_or("");
+                let key_expr = format!("harmony/content/{prefix}/{}", req.cid_hex);
+                let session = session.clone();
+                tokio::spawn(async move {
+                    let result = fetch_via_zenoh(&session, &key_expr).await;
+                    let _ = req.reply.send(result);
+                });
             }
 
             // ── Shutdown signal ──────────────────────────────────────

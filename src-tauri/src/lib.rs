@@ -21,6 +21,8 @@ struct NodeState {
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Channel for routing publish requests through the event loop's session.
     publish_tx: Option<tokio::sync::mpsc::Sender<event_loop::PublishRequest>>,
+    /// Channel for routing content-fetch requests through the event loop's session.
+    fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -59,6 +61,12 @@ pub struct ProfilePayload {
     pub status_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// Hex-encoded CID for full-size avatar content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_cid: Option<String>,
+    /// Hex-encoded CID for thumbnail avatar content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_mini_cid: Option<String>,
 }
 
 /// Channel message sent from the frontend.
@@ -158,7 +166,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -169,11 +177,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take())
+        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take(), guard.fetch_tx.take())
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
     drop(publish_tx); // drop sender so event loop's recv returns None
+    drop(fetch_tx);
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -196,6 +205,7 @@ async fn start_node(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
+    let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
 
     let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -204,8 +214,10 @@ async fn start_node(
         let old_shutdown = guard.shutdown_tx.take();
         let old_thread = guard.thread.take();
         let old_publish = guard.publish_tx.take();
+        let old_fetch = guard.fetch_tx.take();
         drop(guard);
         drop(old_publish);
+        drop(old_fetch);
         stop_handles(old_shutdown, old_thread);
 
         // ── Identity (serialized by the lock — no concurrent generation race)
@@ -287,6 +299,7 @@ async fn start_node(
                         ready_tx,
                         shutdown_rx,
                         publish_rx,
+                        fetch_rx,
                     )
                     .await;
                 });
@@ -296,6 +309,7 @@ async fn start_node(
         guard.thread = Some(thread);
         guard.shutdown_tx = Some(shutdown_tx);
         guard.publish_tx = Some(publish_tx);
+        guard.fetch_tx = Some(fetch_tx);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
@@ -708,6 +722,42 @@ fn burn_content(cid: String) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Fetch raw content bytes by hex-encoded CID via Zenoh get().
+///
+/// Used by the frontend to resolve avatar CIDs (and other content) into
+/// displayable blob URLs.
+#[tauri::command]
+async fn fetch_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<u8>, String> {
+    // Validate hex CID
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -730,6 +780,7 @@ pub fn run() {
             pin_content,
             unpin_content,
             burn_content,
+            fetch_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -802,6 +853,8 @@ mod tests {
             display_name: "Alice".to_string(),
             status_text: Some("Building".to_string()),
             avatar_url: None,
+            avatar_cid: None,
+            avatar_mini_cid: None,
         };
         let json = serde_json::to_vec(&profile).unwrap();
         let parsed: ProfilePayload = serde_json::from_slice(&json).unwrap();
@@ -818,6 +871,8 @@ mod tests {
             display_name: "Bob".to_string(),
             status_text: None,
             avatar_url: None,
+            avatar_cid: None,
+            avatar_mini_cid: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
         assert!(json.contains("\"displayName\""), "expected camelCase: {json}");

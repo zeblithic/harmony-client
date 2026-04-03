@@ -26,6 +26,8 @@ export interface ProfilePayload {
   displayName: string;
   statusText?: string;
   avatarUrl?: string;
+  avatarCid?: string;
+  avatarMiniCid?: string;
 }
 
 export interface ZenohStatusEvent {
