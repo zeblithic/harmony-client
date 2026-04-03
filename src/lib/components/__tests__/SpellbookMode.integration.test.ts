@@ -11,7 +11,7 @@
 import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import SpellbookMode from '../SpellbookMode.svelte';
-import type { FlashcardLevel, Challenge, SessionStats } from '../../flashcard-types';
+import type { FlashcardLevel, Challenge } from '../../flashcard-types';
 
 afterEach(cleanup);
 

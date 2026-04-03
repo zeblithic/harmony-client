@@ -12,7 +12,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import TextFeed from '../TextFeed.svelte';
 import { TrustService } from '../../trust-service';
-import type { Message, MessagePriority, Peer } from '../../types';
+import type { Message, Peer } from '../../types';
 import type { ThreadMetaEntry } from '../../feed-utils';
 
 // jsdom lacks IntersectionObserver — provide a minimal mock
