@@ -82,6 +82,16 @@ export function sortNodes(nodes: NavNode[], order: SortOrder): NavNode[] {
   }
 }
 
+/** Find the nearest folder ancestor of a node (its "hub"). Returns the folder's ID, or null. */
+export function findNearestFolder(nodes: NavNode[], nodeId: string): string | null {
+  const node = findNode(nodes, nodeId);
+  if (!node || node.parentId === null) return null;
+  const parent = findNode(nodes, node.parentId);
+  if (!parent) return null;
+  if (parent.type === 'folder') return parent.id;
+  return findNearestFolder(nodes, parent.id);
+}
+
 /** Walk up ancestors for displayMode, fallback 'text'. */
 export function getInheritedDisplayMode(nodes: NavNode[], nodeId: string): DisplayMode {
   let current = findNode(nodes, nodeId);

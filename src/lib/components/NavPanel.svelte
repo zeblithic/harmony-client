@@ -10,6 +10,7 @@
   let {
     nodes,
     collapsed = false,
+    activeNodeId,
     onNodeClick,
     onSettingsClick,
     onModeChange,
@@ -26,6 +27,7 @@
   }: {
     nodes: NavNode[];
     collapsed: boolean;
+    activeNodeId?: string | null;
     onNodeClick?: (id: string) => void;
     onSettingsClick?: () => void;
     onModeChange?: (mode: AppMode) => void;
@@ -149,6 +151,7 @@
         <NavTree
           nodes={filteredNodes}
           parentId={null}
+          {activeNodeId}
           onToggle={toggleFolder}
           onClick={onNodeClick}
           onDisplayModeChange={changeDisplayMode}

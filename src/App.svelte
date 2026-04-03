@@ -25,6 +25,7 @@
   import { navNodes, profileStore } from './lib/mock-data';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
+  import { findNode, findNearestFolder } from './lib/nav-utils';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -331,10 +332,22 @@
   let threadModes = $state<Map<string, ThreadDisplayMode>>(new Map());
   let pinnedThreadIds = $state<Set<string>>(new Set());
 
-  // TODO: Track the currently-selected channel/hub from nav panel selection.
-  // For now, default to "general" in "harmony-dev" matching the mock nav tree.
-  const activeChannel = 'general';
-  const activeHub = 'harmony-dev';
+  let activeChannel = $state('general');
+  let activeHub = $state('harmony-dev');
+
+  function handleNodeClick(id: string) {
+    const node = findNode(navNodes, id);
+    if (!node || node.type === 'folder') return;
+    activeChannel = node.id;
+    activeHub = findNearestFolder(navNodes, node.id) ?? '';
+    // Switch to messages mode when selecting a channel/DM
+    if (appMode !== 'messages') {
+      appMode = 'messages';
+      showSettings = false;
+    }
+    // Close any open thread when switching channels
+    openThreadId = null;
+  }
 
   // Filter to messages in the active channel (mock messages without
   // channel/hub pass through so pre-existing seed data still shows).
@@ -465,6 +478,8 @@
     <NavPanel
       nodes={navNodes}
       {collapsed}
+      activeNodeId={activeChannel}
+      onNodeClick={handleNodeClick}
       onSettingsClick={() => { showSettings = !showSettings; }}
       profileLookup={(addr) => profileStore.get(addr)?.statusText}
       onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; selectedFileCid = null; currentFolderCid = null; }}
@@ -482,6 +497,7 @@
     <TextFeed
       messages={mainFeedMessages}
       {collapsed}
+      channelName={activeChannel}
       onMediaClick={scrollToMedia}
       onSend={handleSend}
       onAvatarClick={handleAvatarClick}

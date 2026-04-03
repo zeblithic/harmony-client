@@ -13,6 +13,7 @@
   let {
     messages,
     collapsed = false,
+    channelName = 'general',
     onMediaClick,
     onSend,
     onAvatarClick,
@@ -30,6 +31,7 @@
   }: {
     messages: Message[];
     collapsed?: boolean;
+    channelName?: string;
     onMediaClick?: (mediaId: string) => void;
     onSend?: (text: string, priority: MessagePriority) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
@@ -159,7 +161,7 @@
         {/if}
       {/each}
     </div>
-    <ComposeBar {onSend} />
+    <ComposeBar {onSend} {channelName} />
   </div>
 
   {#if showThreadPanel && threadRoot}

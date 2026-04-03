@@ -7,6 +7,7 @@
   let {
     nodes,
     parentId,
+    activeNodeId,
     onToggle,
     onClick,
     onDisplayModeChange,
@@ -15,6 +16,7 @@
   }: {
     nodes: NavNode[];
     parentId: string | null;
+    activeNodeId?: string | null;
     onToggle?: (id: string) => void;
     onClick?: (id: string) => void;
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
@@ -39,6 +41,7 @@
     colorAncestry={ancestry}
     displayMode={dm}
     isLastChild={isLast}
+    active={activeNodeId === child.id}
     statusText={child.peer && profileLookup ? profileLookup(child.peer.address) : undefined}
     {onToggle}
     {onClick}
@@ -47,6 +50,6 @@
   />
 
   {#if child.type === 'folder' && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} />
+    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} />
   {/if}
 {/each}
