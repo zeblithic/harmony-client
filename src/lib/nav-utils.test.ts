@@ -189,7 +189,7 @@ describe('findNearestFolder', () => {
     expect(findNearestFolder(TREE, 'f1')).toBeNull();
   });
 
-  it('returns the grandparent folder for a nested folder', () => {
+  it('returns the parent folder for a nested folder', () => {
     expect(findNearestFolder(TREE, 'f3')).toBe('f1');
   });
 });

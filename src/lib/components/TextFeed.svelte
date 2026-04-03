@@ -14,6 +14,7 @@
     messages,
     collapsed = false,
     channelName = 'general',
+    channelType = 'channel',
     onMediaClick,
     onSend,
     onAvatarClick,
@@ -32,6 +33,7 @@
     messages: Message[];
     collapsed?: boolean;
     channelName?: string;
+    channelType?: 'channel' | 'dm' | 'group-chat';
     onMediaClick?: (mediaId: string) => void;
     onSend?: (text: string, priority: MessagePriority) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
@@ -161,7 +163,7 @@
         {/if}
       {/each}
     </div>
-    <ComposeBar {onSend} {channelName} />
+    <ComposeBar {onSend} {channelName} {channelType} />
   </div>
 
   {#if showThreadPanel && threadRoot}

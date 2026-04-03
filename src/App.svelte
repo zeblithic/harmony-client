@@ -334,16 +334,26 @@
 
   let activeChannel = $state('general');
   let activeHub = $state('harmony-dev');
+  let activeChannelName = $state('general');
+  let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
 
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
     activeChannel = node.id;
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
-    // Switch to messages mode when selecting a channel/DM
+    activeChannelName = node.name;
+    activeChannelType = node.type as 'channel' | 'dm' | 'group-chat';
+    // Switch to messages mode when selecting a channel/DM, resetting
+    // file-browsing state the same way onModeChange does.
     if (appMode !== 'messages') {
       appMode = 'messages';
       showSettings = false;
+      showCleanup = false;
+      fileFilters = {};
+      fileSearchQuery = '';
+      selectedFileCid = null;
+      currentFolderCid = null;
     }
     // Close any open thread when switching channels
     openThreadId = null;
@@ -497,7 +507,8 @@
     <TextFeed
       messages={mainFeedMessages}
       {collapsed}
-      channelName={activeChannel}
+      channelName={activeChannelName}
+      channelType={activeChannelType}
       onMediaClick={scrollToMedia}
       onSend={handleSend}
       onAvatarClick={handleAvatarClick}
