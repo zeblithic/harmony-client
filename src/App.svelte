@@ -340,6 +340,7 @@
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    const switched = id !== activeChannel;
     activeChannel = node.id;
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
     activeChannelName = node.name;
@@ -355,8 +356,11 @@
       selectedFileCid = null;
       currentFolderCid = null;
     }
-    // Close any open thread when switching channels
-    openThreadId = null;
+    // Close any open thread when switching channels (but not when
+    // re-clicking the already-active channel).
+    if (switched) {
+      openThreadId = null;
+    }
   }
 
   // Filter to messages in the active channel (mock messages without
