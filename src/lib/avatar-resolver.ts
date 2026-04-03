@@ -1,5 +1,8 @@
 import type { TauriAdapter } from './zenoh-service';
 
+/** How long to wait before retrying a failed CID fetch (30s). */
+const RETRY_COOLDOWN_MS = 30_000;
+
 /**
  * Resolves avatar CIDs to displayable blob URLs via content transport.
  *
@@ -14,7 +17,8 @@ export class AvatarResolver {
   private adapter: TauriAdapter | null = null;
   private cache = new Map<string, string>();
   private pending = new Set<string>();
-  private failed = new Set<string>();
+  /** CID → timestamp of last failure. Retryable after RETRY_COOLDOWN_MS. */
+  private failedAt = new Map<string, number>();
   private destroyed = false;
 
   connectAdapter(adapter: TauriAdapter): void {
@@ -26,7 +30,9 @@ export class AvatarResolver {
   resolve(cid: string): string | undefined {
     const cached = this.cache.get(cid);
     if (cached) return cached;
-    if (!this.pending.has(cid) && !this.failed.has(cid)) {
+    const failTime = this.failedAt.get(cid);
+    const cooledOff = failTime !== undefined && Date.now() - failTime >= RETRY_COOLDOWN_MS;
+    if (!this.pending.has(cid) && (failTime === undefined || cooledOff)) {
       this.fetchCid(cid);
     }
     return undefined;
@@ -46,7 +52,7 @@ export class AvatarResolver {
     } catch (err) {
       if (!this.destroyed) {
         console.warn(`Avatar fetch failed for CID ${cid}:`, err);
-        this.failed.add(cid);
+        this.failedAt.set(cid, Date.now());
       }
     } finally {
       this.pending.delete(cid);
@@ -60,7 +66,7 @@ export class AvatarResolver {
     }
     this.cache.clear();
     this.pending.clear();
-    this.failed.clear();
+    this.failedAt.clear();
   }
 }
 
