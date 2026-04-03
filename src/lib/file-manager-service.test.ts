@@ -189,14 +189,54 @@ describe('FileManagerService', () => {
     expect(svc2.getContents().find((i) => i.cid === 'cid-training-data')).toBeDefined();
   });
 
-  it('archive is a no-op stub that does not throw', () => {
+  it('archive removes content from private and frees quota', () => {
     const svc = new FileManagerService();
-    expect(() => svc.archive(['cid-design-doc'])).not.toThrow();
+    const before = svc.getQuotaStatus();
+    const target = svc.getContents().find((i) => i.cid === 'cid-design-doc');
+    expect(target).toBeDefined();
+
+    svc.archive([target!.cid]);
+
+    const after = svc.getQuotaStatus();
+    expect(after.usedBytes).toBe(before.usedBytes - target!.sizeBytes);
+    expect(svc.getContents().find((i) => i.cid === 'cid-design-doc')).toBeUndefined();
   });
 
-  it('exportToDevice is a stub that does not throw', () => {
+  it('archive invokes archive_content on the adapter for each cid', async () => {
     const svc = new FileManagerService();
-    expect(() => svc.exportToDevice(['cid-design-doc'])).not.toThrow();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.archive(['cid-design-doc', 'cid-video-lecture']);
+    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { cid: 'cid-design-doc' });
+    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { cid: 'cid-video-lecture' });
+  });
+
+  it('exportToDevice invokes export_content with cid and file name', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.exportToDevice(['cid-design-doc']);
+    expect(adapter.invoke).toHaveBeenCalledWith('export_content', {
+      cid: 'cid-design-doc',
+      fileName: 'mesh-design.md',
+    });
+  });
+
+  it('exportToDevice uses cid as fallback name for unknown items', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.exportToDevice(['unknown-cid']);
+    expect(adapter.invoke).toHaveBeenCalledWith('export_content', {
+      cid: 'unknown-cid',
+      fileName: 'unknown-cid',
+    });
+  });
+
+  it('exportToDevice is a no-op without adapter', async () => {
+    const svc = new FileManagerService();
+    // Should not throw when adapter is null
+    await expect(svc.exportToDevice(['cid-design-doc'])).resolves.toBeUndefined();
   });
 
   // ── connectAdapter ────────────────────────────────────────────────
