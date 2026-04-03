@@ -1,10 +1,15 @@
 <script lang="ts">
   import type { MessagePriority } from '../types';
 
-  let { onSend, channelName = 'general' }: {
+  let { onSend, channelName = 'general', channelType = 'channel' }: {
     onSend?: (text: string, priority: MessagePriority) => void;
     channelName?: string;
+    channelType?: 'channel' | 'dm' | 'group-chat';
   } = $props();
+
+  let composePlaceholder = $derived(
+    channelType === 'channel' ? `Message #${channelName}` : `Message ${channelName}`
+  );
 
   let draft = $state('');
   let priority = $state<MessagePriority>('standard');
@@ -54,7 +59,7 @@
   <div class="compose-input-wrapper">
     <textarea
       class="compose-input"
-      placeholder="Message #{channelName}"
+      placeholder={composePlaceholder}
       bind:value={draft}
       onkeydown={handleKeyDown}
       rows="1"

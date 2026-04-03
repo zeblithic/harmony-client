@@ -7,6 +7,7 @@ import {
   getInheritedDisplayMode,
   getInheritedSortOrder,
   findNode,
+  findNearestFolder,
   getNodeDepth,
   getColorAncestry,
 } from './nav-utils';
@@ -168,5 +169,27 @@ describe('getColorAncestry', () => {
     expect(ancestry.length).toBe(2);
     expect(ancestry[0]).toBe(getNodeColor(TREE, 'f1'));
     expect(ancestry[1]).toBe(getNodeColor(TREE, 'f3'));
+  });
+});
+
+describe('findNearestFolder', () => {
+  it('returns the parent folder for a channel', () => {
+    expect(findNearestFolder(TREE, 'c1')).toBe('f1');
+  });
+
+  it('returns the immediate parent folder for a deeply nested channel', () => {
+    expect(findNearestFolder(TREE, 'c2')).toBe('f3');
+  });
+
+  it('returns null for a top-level node with no parent', () => {
+    expect(findNearestFolder(TREE, 'c3')).toBeNull();
+  });
+
+  it('returns null for a top-level folder', () => {
+    expect(findNearestFolder(TREE, 'f1')).toBeNull();
+  });
+
+  it('returns the parent folder for a nested folder', () => {
+    expect(findNearestFolder(TREE, 'f3')).toBe('f1');
   });
 });

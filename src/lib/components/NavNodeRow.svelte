@@ -21,6 +21,7 @@
     colorAncestry,
     displayMode,
     isLastChild,
+    active = false,
     onToggle,
     onClick,
     onDisplayModeChange,
@@ -31,6 +32,7 @@
     colorAncestry: number[];
     displayMode: DisplayMode;
     isLastChild: boolean;
+    active?: boolean;
     onToggle?: (id: string) => void;
     onClick?: (id: string) => void;
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
@@ -79,6 +81,7 @@
 
 <div
   class="nav-row"
+  class:active
   role="button"
   tabindex="0"
   data-testid="nav-row-{node.id}"
@@ -168,6 +171,11 @@
   }
 
   .nav-row:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .nav-row.active {
     background: var(--bg-tertiary);
     color: var(--text-primary);
   }
