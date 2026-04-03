@@ -60,7 +60,7 @@ export function discoveredToNetworkNode(node: DiscoveredNode): NetworkNode {
     address: node.nodeAddr,
     displayName: `${shortAddr} (live)`,
     isLocal: false,
-    hopDistance: 2, // TODO: derive from Zenoh routing info; placeholder for now
+    hopDistance: node.hopDistance ?? 2,
     status: node.ready ? 'online' : 'degraded',
     metrics: {
       timestamp: node.lastSeen,

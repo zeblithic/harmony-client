@@ -38,6 +38,10 @@ pub struct CapacityUpdate {
     pub node_addr: String,
     pub model_cid: String,
     pub ready: bool,
+    /// Hop distance derived from Zenoh routing: 1 = direct peer, 2 = via router.
+    /// `None` when the publisher didn't include a ZenohId attachment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop_distance: Option<u8>,
 }
 
 /// Zenoh connection status pushed to the frontend.
@@ -132,6 +136,7 @@ pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> 
         node_addr: node_addr.to_string(),
         model_cid,
         ready,
+        hop_distance: None, // Set by emit_frontend_event after ZID matching
     })
 }
 
