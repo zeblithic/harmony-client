@@ -337,6 +337,16 @@
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
 
+  function switchMode(mode: AppMode) {
+    appMode = mode;
+    showSettings = false;
+    showCleanup = false;
+    fileFilters = {};
+    fileSearchQuery = '';
+    selectedFileCid = null;
+    currentFolderCid = null;
+  }
+
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
@@ -345,16 +355,8 @@
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
     activeChannelName = node.name;
     activeChannelType = node.type as 'channel' | 'dm' | 'group-chat';
-    // Switch to messages mode when selecting a channel/DM, resetting
-    // file-browsing state the same way onModeChange does.
     if (appMode !== 'messages') {
-      appMode = 'messages';
-      showSettings = false;
-      showCleanup = false;
-      fileFilters = {};
-      fileSearchQuery = '';
-      selectedFileCid = null;
-      currentFolderCid = null;
+      switchMode('messages');
     }
     // Close any open thread when switching channels (but not when
     // re-clicking the already-active channel).
@@ -496,7 +498,7 @@
       onNodeClick={handleNodeClick}
       onSettingsClick={() => { showSettings = !showSettings; }}
       profileLookup={(addr) => profileStore.get(addr)?.statusText}
-      onModeChange={(mode: AppMode) => { appMode = mode; showSettings = false; showCleanup = false; fileFilters = {}; fileSearchQuery = ''; selectedFileCid = null; currentFolderCid = null; }}
+      onModeChange={switchMode}
       {appMode}
       contentItems={allFileContents}
       storageBuddies={fileBuddies}
