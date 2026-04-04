@@ -838,7 +838,7 @@ async fn ingest_content(
         .map_err(|_| "dialog error".to_string())?
         .ok_or_else(|| "upload cancelled".to_string())?;
 
-    // 2. Read file bytes.
+    // 2. Read file bytes (with size guard to avoid OOM on large files).
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
@@ -847,6 +847,16 @@ async fn ingest_content(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if meta.len() > harmony_content::cid::MAX_PAYLOAD_SIZE as u64 {
+        return Err(format!(
+            "file too large ({} bytes, max {})",
+            meta.len(),
+            harmony_content::cid::MAX_PAYLOAD_SIZE,
+        ));
+    }
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
