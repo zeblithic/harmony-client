@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
@@ -35,8 +35,11 @@
     videoLoading = true;
     videoError = '';
 
+    let ownUrl: string | null = null;
+
     resolver(cid).then((url) => {
       if (gen !== videoGeneration) { URL.revokeObjectURL(url); return; }
+      ownUrl = url;
       videoUrl = url;
       videoLoading = false;
     }).catch((err) => {
@@ -47,7 +50,9 @@
 
     return () => {
       // Revoke blob URL when vine changes or component unmounts.
-      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      // Uses local ownUrl (not reactive videoUrl) so cleanup works
+      // even if the component unmounts while a fetch is in-flight.
+      if (ownUrl) URL.revokeObjectURL(ownUrl);
     };
   });
 
