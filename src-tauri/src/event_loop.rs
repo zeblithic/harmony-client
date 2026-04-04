@@ -361,8 +361,14 @@ pub async fn run(
                     key_expr,
                     payload: req.data,
                 });
+                // Tick immediately so content is committed before replying.
+                for action in runtime.tick() {
+                    dispatch_action(
+                        action, &session, &zenoh_tx, &udp,
+                        &broadcast_addr, &app, &closing, &own_zid,
+                    ).await;
+                }
                 let _ = req.reply.send(Ok(()));
-                should_tick = true;
             }
 
             // ── Shutdown signal ──────────────────────────────────────

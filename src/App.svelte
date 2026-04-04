@@ -300,8 +300,11 @@
     try {
       const item = await fileManagerService.ingest(currentFolderCid);
       if (item) fileManagerVersion++;
-    } catch {
-      // Upload can fail if user cancels the dialog or node is disconnected.
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('upload cancelled')) {
+        console.error('File upload failed:', msg);
+      }
     }
   }
 

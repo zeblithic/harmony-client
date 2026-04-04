@@ -431,7 +431,22 @@ describe('FileManagerService', () => {
     expect(afterQuota).toBe(beforeQuota + 50_000);
   });
 
-  it('ingest calls onChange', async () => {
+  it('ingest deduplicates by CID', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockResolvedValue({ cid: 'dup-cid', fileName: 'file.txt', sizeBytes: 100 });
+    await svc.connectAdapter(adapter);
+
+    const first = await svc.ingest();
+    expect(first).toBeDefined();
+    const countAfterFirst = svc.getContents().length;
+
+    const second = await svc.ingest();
+    expect(second).toBeUndefined();
+    expect(svc.getContents().length).toBe(countAfterFirst);
+  });
+
+  it('ingest does not call onChange (caller bumps version)', async () => {
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     adapter.invoke = vi.fn().mockResolvedValue({ cid: 'jkl012', fileName: 'song.mp3', sizeBytes: 1000 });
@@ -439,6 +454,6 @@ describe('FileManagerService', () => {
     svc.onChange = vi.fn();
 
     await svc.ingest();
-    expect(svc.onChange).toHaveBeenCalledOnce();
+    expect(svc.onChange).not.toHaveBeenCalled();
   });
 });

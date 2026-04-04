@@ -240,6 +240,8 @@ export class FileManagerService {
   async ingest(parentCid?: string | null): Promise<ContentItem | undefined> {
     if (!this.adapter) return undefined;
     const result = (await this.adapter.invoke('ingest_content')) as IngestResult;
+    // Deduplicate: if this CID already exists in private content, skip.
+    if (this.privateContent.some((i) => i.cid === result.cid)) return undefined;
     const item: ContentItem = {
       cid: result.cid,
       name: result.fileName,
@@ -258,7 +260,6 @@ export class FileManagerService {
       isFolder: false,
     };
     this.privateContent.push(item);
-    this.onChange?.();
     return item;
   }
 
