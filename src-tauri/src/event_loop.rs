@@ -35,6 +35,13 @@ pub struct FetchRequest {
     pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
+/// A content-ingest request: store local file bytes in the runtime's storage tier.
+pub struct IngestRequest {
+    pub cid_hex: String,
+    pub data: Vec<u8>,
+    pub reply: oneshot::Sender<Result<(), String>>,
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query { key_expr: String, payload: Vec<u8> },
@@ -61,6 +68,7 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
     mut publish_rx: mpsc::Receiver<PublishRequest>,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
+    mut ingest_rx: mpsc::Receiver<IngestRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -344,6 +352,17 @@ pub async fn run(
                     let result = fetch_via_zenoh(&session, &key_expr).await;
                     let _ = req.reply.send(result);
                 });
+            }
+
+            // ── Content-ingest requests from Tauri commands ────────
+            Some(req) = ingest_rx.recv() => {
+                let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
+                runtime.push_event(RuntimeEvent::SubscriptionMessage {
+                    key_expr,
+                    payload: req.data,
+                });
+                let _ = req.reply.send(Ok(()));
+                should_tick = true;
             }
 
             // ── Shutdown signal ──────────────────────────────────────

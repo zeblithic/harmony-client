@@ -23,6 +23,8 @@ struct NodeState {
     publish_tx: Option<tokio::sync::mpsc::Sender<event_loop::PublishRequest>>,
     /// Channel for routing content-fetch requests through the event loop's session.
     fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
+    /// Channel for routing content-ingest requests through the event loop.
+    ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -171,7 +173,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -182,12 +184,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take(), guard.fetch_tx.take())
+        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take(), guard.fetch_tx.take(), guard.ingest_tx.take())
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
+    drop(ingest_tx);
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -211,6 +214,7 @@ async fn start_node(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
 
     let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -220,9 +224,11 @@ async fn start_node(
         let old_thread = guard.thread.take();
         let old_publish = guard.publish_tx.take();
         let old_fetch = guard.fetch_tx.take();
+        let old_ingest = guard.ingest_tx.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
+        drop(old_ingest);
         stop_handles(old_shutdown, old_thread);
 
         // ── Identity (serialized by the lock — no concurrent generation race)
@@ -305,6 +311,7 @@ async fn start_node(
                         shutdown_rx,
                         publish_rx,
                         fetch_rx,
+                        ingest_rx,
                     )
                     .await;
                 });
@@ -315,6 +322,7 @@ async fn start_node(
         guard.shutdown_tx = Some(shutdown_tx);
         guard.publish_tx = Some(publish_tx);
         guard.fetch_tx = Some(fetch_tx);
+        guard.ingest_tx = Some(ingest_tx);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
@@ -700,6 +708,15 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
     })
 }
 
+/// Result returned to the frontend after a successful file ingest.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestResult {
+    pub cid: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+}
+
 #[tauri::command]
 fn list_content() -> Vec<serde_json::Value> {
     // Future (bead fkz): query runtime's cache + disk index via query channel.
@@ -798,6 +815,76 @@ async fn export_content(
     Ok(true)
 }
 
+/// Ingest a local file into the content store via a native open-file dialog.
+///
+/// Opens a file picker, reads the selected file, computes a CID, and stores
+/// the content in the runtime's storage tier (which handles announcement to
+/// the mesh). Returns metadata so the frontend can add it to the file list.
+#[tauri::command]
+async fn ingest_content(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IngestResult, String> {
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use tauri_plugin_dialog::DialogExt;
+
+    // 1. Open a native file picker dialog.
+    let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |path| {
+        let _ = path_tx.send(path);
+    });
+    let file_path = path_rx
+        .await
+        .map_err(|_| "dialog error".to_string())?
+        .ok_or_else(|| "upload cancelled".to_string())?;
+
+    // 2. Read file bytes.
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "unsupported file path".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let size_bytes = bytes.len() as u64;
+
+    // 3. Compute CID (single-book, public+durable, blake3 hash).
+    let cid = ContentId::for_book(&bytes, ContentFlags::default())
+        .map_err(|e| format!("CID error: {e:?}"))?;
+    let cid_hex = hex::encode(cid.to_bytes());
+
+    // 4. Store in the runtime via the ingest channel.
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    ingest_tx
+        .send(event_loop::IngestRequest {
+            cid_hex: cid_hex.clone(),
+            data: bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped ingest request".to_string())??;
+
+    Ok(IngestResult {
+        cid: cid_hex,
+        file_name,
+        size_bytes,
+    })
+}
+
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().
 ///
 /// Used by the frontend to resolve avatar CIDs (and other content) into
@@ -860,6 +947,7 @@ pub fn run() {
             archive_content,
             fetch_content,
             export_content,
+            ingest_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");

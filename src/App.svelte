@@ -296,8 +296,13 @@
     fileManagerVersion++;
   }
 
-  function handleFileUploadClick() {
-    // Future: open file picker via Tauri dialog
+  async function handleFileUploadClick() {
+    try {
+      const item = await fileManagerService.ingest(currentFolderCid);
+      if (item) fileManagerVersion++;
+    } catch {
+      // Upload can fail if user cancels the dialog or node is disconnected.
+    }
   }
 
   function handleFileCleanupClick() {

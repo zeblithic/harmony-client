@@ -25,6 +25,30 @@ export interface ContentAnnouncementEvent {
   sizeBytes: number;
 }
 
+/** Wire format returned by the ingest_content Tauri command. */
+interface IngestResult {
+  cid: string;
+  fileName: string;
+  sizeBytes: number;
+}
+
+const MUSIC_EXTS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus', 'wma'];
+const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'];
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'ico', 'tiff'];
+const SOFTWARE_EXTS = ['exe', 'app', 'dmg', 'deb', 'rpm', 'msi', 'wasm', 'tar', 'gz', 'zip', 'rar', '7z'];
+const DATASET_EXTS = ['csv', 'parquet', 'arrow', 'jsonl', 'ndjson', 'tsv', 'sqlite', 'db'];
+
+/** Infer a content category from a file name's extension. */
+export function inferCategory(fileName: string): ContentCategory {
+  const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+  if (MUSIC_EXTS.includes(ext)) return 'music';
+  if (VIDEO_EXTS.includes(ext)) return 'video';
+  if (IMAGE_EXTS.includes(ext)) return 'image';
+  if (SOFTWARE_EXTS.includes(ext)) return 'software';
+  if (DATASET_EXTS.includes(ext)) return 'dataset';
+  return 'text';
+}
+
 export class FileManagerService {
   readonly settings: FileManagerSettings;
   /** Called whenever content state changes so the UI can re-render. */
@@ -208,6 +232,34 @@ export class FileManagerService {
       const fileName = item?.name ?? cid;
       await this.adapter.invoke('export_content', { cid, fileName });
     }
+  }
+
+  /** Open a file picker, ingest the selected file into the content store,
+   *  and add it to the private content list.
+   *  Returns the new ContentItem, or undefined if the user cancels or no adapter. */
+  async ingest(parentCid?: string | null): Promise<ContentItem | undefined> {
+    if (!this.adapter) return undefined;
+    const result = (await this.adapter.invoke('ingest_content')) as IngestResult;
+    const item: ContentItem = {
+      cid: result.cid,
+      name: result.fileName,
+      category: inferCategory(result.fileName),
+      sensitivity: 'private',
+      sizeBytes: result.sizeBytes,
+      storedAt: Date.now(),
+      lastAccessed: Date.now(),
+      accessCount: 0,
+      stalenessScore: 0,
+      replicationTier: this.settings.defaultReplicationTier,
+      replicaCount: 1,
+      pinned: false,
+      licensed: false,
+      parentCid: parentCid ?? null,
+      isFolder: false,
+    };
+    this.privateContent.push(item);
+    this.onChange?.();
+    return item;
   }
 
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */
