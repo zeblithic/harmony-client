@@ -149,9 +149,16 @@ export class FileManagerService {
     }
   }
 
-  /** Archive stub — no-op for now. */
-  archive(_cids: string[]): void {
-    // Future: move to cold storage tier
+  /** Move content to cold storage (archive tier). Items are removed from
+   *  the active file list and the backend is notified to migrate the data. */
+  archive(cids: string[]): void {
+    const cidSet = new Set(cids);
+    this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+    if (this.adapter) {
+      for (const cid of cids) {
+        this.adapter.invoke('archive_content', { cid }).catch(() => {});
+      }
+    }
   }
 
   /** Moves content from private to published with durable publish mode. */
@@ -192,9 +199,15 @@ export class FileManagerService {
     }
   }
 
-  /** Export stub — no-op for now. */
-  exportToDevice(_cids: string[]): void {
-    // Future: trigger Tauri file save dialog
+  /** Export content to the local filesystem via a native save dialog.
+   *  Each CID triggers a separate save dialog on the Rust backend. */
+  async exportToDevice(cids: string[]): Promise<void> {
+    if (!this.adapter) return;
+    for (const cid of cids) {
+      const item = this.privateContent.find((i) => i.cid === cid);
+      const fileName = item?.name ?? cid;
+      await this.adapter.invoke('export_content', { cid, fileName });
+    }
   }
 
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */

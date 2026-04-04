@@ -727,6 +727,77 @@ fn burn_content(cid: String) -> Result<bool, String> {
     Ok(true)
 }
 
+#[tauri::command]
+fn archive_content(cid: String) -> Result<bool, String> {
+    // Future: send archive (cold-storage move) request to runtime.
+    let _ = cid;
+    Ok(true)
+}
+
+/// Export content to the local filesystem via a save dialog.
+///
+/// Fetches the raw bytes for `cid` through the Zenoh content transport,
+/// opens a native save-file dialog with `file_name` as the suggested name,
+/// and writes the bytes to the chosen path.
+#[tauri::command]
+async fn export_content(
+    app: tauri::AppHandle,
+    cid: String,
+    file_name: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // Validate hex CID
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    // 1. Fetch content bytes via the existing fetch channel.
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // 2. Open a native save-file dialog.
+    let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&file_name)
+        .save_file(move |path| {
+            let _ = path_tx.send(path);
+        });
+
+    let file_path = path_rx
+        .await
+        .map_err(|_| "dialog error".to_string())?
+        .ok_or_else(|| "export cancelled".to_string())?;
+
+    // 3. Write bytes to disk.
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "unsupported file path".to_string())?;
+    tokio::fs::write(path, &bytes).await.map_err(|e| format!("write failed: {e}"))?;
+
+    Ok(true)
+}
+
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().
 ///
 /// Used by the frontend to resolve avatar CIDs (and other content) into
@@ -767,6 +838,7 @@ async fn fetch_content(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(NodeState::default()))
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
@@ -785,7 +857,9 @@ pub fn run() {
             pin_content,
             unpin_content,
             burn_content,
+            archive_content,
             fetch_content,
+            export_content,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");

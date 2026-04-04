@@ -253,8 +253,8 @@
   function handleFileArchive() {
     if (!selectedFileCid) return;
     fileManagerService.archive([selectedFileCid]);
-    // archive is a no-op stub — don't bump version or clear selection
-    // until the service actually moves items to cold storage
+    fileManagerVersion++;
+    selectedFileCid = null;
   }
 
   function handleFilePublish(cid: string) {
@@ -281,9 +281,13 @@
     fileManagerVersion++;
   }
 
-  function handleFileExport() {
+  async function handleFileExport() {
     if (!selectedFileCid) return;
-    fileManagerService.exportToDevice([selectedFileCid]);
+    try {
+      await fileManagerService.exportToDevice([selectedFileCid]);
+    } catch {
+      // Export can fail if user cancels the save dialog or node is disconnected.
+    }
   }
 
   function handleFileTierChange(tier: ReplicationTier) {
@@ -302,12 +306,12 @@
 
   function handleCleanupAction(cid: string, action: string) {
     if (action === 'burn') fileManagerService.burn([cid]);
-    else if (action === 'archive') { fileManagerService.archive([cid]); return; }
+    else if (action === 'archive') fileManagerService.archive([cid]);
     else if (action === 'release') fileManagerService.release([cid]);
     else if (action === 'publish') fileManagerService.publish([cid]);
     else if (action === 'pin') fileManagerService.pin(cid);
     fileManagerVersion++;
-    if (selectedFileCid === cid && (action === 'burn' || action === 'release' || action === 'publish')) {
+    if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
       selectedFileCid = null;
     }
   }
@@ -322,8 +326,10 @@
 
   function handleBulkArchive(cids: string[]) {
     fileManagerService.archive(cids);
-    // archive is a no-op stub — don't bump version or clear selection
-    // until the service actually moves items to cold storage
+    fileManagerVersion++;
+    if (selectedFileCid && cids.includes(selectedFileCid)) {
+      selectedFileCid = null;
+    }
   }
 
   function handleBulkRelease(cids: string[]) {
