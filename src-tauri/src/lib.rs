@@ -793,7 +793,7 @@ async fn export_content(
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
-    std::fs::write(path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    tokio::fs::write(path, &bytes).await.map_err(|e| format!("write failed: {e}"))?;
 
     Ok(true)
 }
