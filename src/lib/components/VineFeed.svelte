@@ -5,12 +5,13 @@
 
   type FeedFilter = 'all' | 'unviewed';
 
-  let { vines, viewedIds, onMarkViewed, onPublish, onReshare }: {
+  let { vines, viewedIds, onMarkViewed, onPublish, onReshare, resolveVideo }: {
     vines: VineVideo[];
     viewedIds: Set<string>;
     onMarkViewed?: (id: string) => void;
     onPublish?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
+    resolveVideo?: (cid: string) => Promise<string>;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
@@ -114,6 +115,7 @@
     onNext={activeIndex >= 0 && activeIndex < playerList.length - 1 ? nextVine : undefined}
     onPrevious={activeIndex > 0 ? previousVine : undefined}
     {onReshare}
+    {resolveVideo}
   />
 {/if}
 
