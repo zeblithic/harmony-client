@@ -296,8 +296,16 @@
     fileManagerVersion++;
   }
 
-  function handleFileUploadClick() {
-    // Future: open file picker via Tauri dialog
+  async function handleFileUploadClick() {
+    try {
+      const item = await fileManagerService.ingest(currentFolderCid);
+      if (item) fileManagerVersion++;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('upload cancelled')) {
+        console.error('File upload failed:', msg);
+      }
+    }
   }
 
   function handleFileCleanupClick() {

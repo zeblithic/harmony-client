@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { FileManagerService, type ContentAnnouncementEvent } from './file-manager-service';
+import { FileManagerService, inferCategory, type ContentAnnouncementEvent } from './file-manager-service';
 import { createMockAdapter } from './test-utils';
 
 describe('FileManagerService', () => {
@@ -333,5 +333,127 @@ describe('FileManagerService', () => {
     svc.destroy();
     svc.destroy();
     expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  // ── inferCategory ────────────────────────────────────────────────
+
+  it('inferCategory identifies music files', () => {
+    expect(inferCategory('song.mp3')).toBe('music');
+    expect(inferCategory('album.flac')).toBe('music');
+    expect(inferCategory('track.ogg')).toBe('music');
+  });
+
+  it('inferCategory identifies video files', () => {
+    expect(inferCategory('clip.mp4')).toBe('video');
+    expect(inferCategory('movie.mkv')).toBe('video');
+  });
+
+  it('inferCategory identifies image files', () => {
+    expect(inferCategory('photo.jpg')).toBe('image');
+    expect(inferCategory('icon.png')).toBe('image');
+    expect(inferCategory('diagram.svg')).toBe('image');
+  });
+
+  it('inferCategory identifies software files', () => {
+    expect(inferCategory('app.exe')).toBe('software');
+    expect(inferCategory('release.tar')).toBe('software');
+    expect(inferCategory('bundle.zip')).toBe('software');
+  });
+
+  it('inferCategory identifies dataset files', () => {
+    expect(inferCategory('data.csv')).toBe('dataset');
+    expect(inferCategory('table.parquet')).toBe('dataset');
+  });
+
+  it('inferCategory falls back to text', () => {
+    expect(inferCategory('readme.md')).toBe('text');
+    expect(inferCategory('config.toml')).toBe('text');
+    expect(inferCategory('noextension')).toBe('text');
+  });
+
+  it('inferCategory is case-insensitive', () => {
+    expect(inferCategory('TRACK.MP3')).toBe('music');
+    expect(inferCategory('Photo.JPG')).toBe('image');
+  });
+
+  // ── ingest ───────────────────────────────────────────────────────
+
+  it('ingest calls ingest_content on the adapter and adds item', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'ingest_content') {
+        return Promise.resolve({ cid: 'abc123', fileName: 'photo.jpg', sizeBytes: 4096 });
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    const beforeCount = svc.getContents().length;
+    const item = await svc.ingest();
+
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_content');
+    expect(item).toBeDefined();
+    expect(item!.cid).toBe('abc123');
+    expect(item!.name).toBe('photo.jpg');
+    expect(item!.category).toBe('image');
+    expect(item!.sizeBytes).toBe(4096);
+    expect(item!.sensitivity).toBe('private');
+    expect(item!.replicationTier).toBe('default');
+    expect(svc.getContents().length).toBe(beforeCount + 1);
+  });
+
+  it('ingest assigns parentCid when provided', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockResolvedValue({ cid: 'def456', fileName: 'doc.md', sizeBytes: 100 });
+    await svc.connectAdapter(adapter);
+
+    const item = await svc.ingest('cid-folder-projects');
+    expect(item!.parentCid).toBe('cid-folder-projects');
+  });
+
+  it('ingest returns undefined without adapter', async () => {
+    const svc = new FileManagerService();
+    const result = await svc.ingest();
+    expect(result).toBeUndefined();
+  });
+
+  it('ingest updates quota', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockResolvedValue({ cid: 'ghi789', fileName: 'data.csv', sizeBytes: 50_000 });
+    await svc.connectAdapter(adapter);
+
+    const beforeQuota = svc.getQuotaStatus().usedBytes;
+    await svc.ingest();
+    const afterQuota = svc.getQuotaStatus().usedBytes;
+    expect(afterQuota).toBe(beforeQuota + 50_000);
+  });
+
+  it('ingest deduplicates by CID', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockResolvedValue({ cid: 'dup-cid', fileName: 'file.txt', sizeBytes: 100 });
+    await svc.connectAdapter(adapter);
+
+    const first = await svc.ingest();
+    expect(first).toBeDefined();
+    const countAfterFirst = svc.getContents().length;
+
+    const second = await svc.ingest();
+    expect(second).toBeUndefined();
+    expect(svc.getContents().length).toBe(countAfterFirst);
+  });
+
+  it('ingest does not call onChange (caller bumps version)', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockResolvedValue({ cid: 'jkl012', fileName: 'song.mp3', sizeBytes: 1000 });
+    await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn();
+
+    await svc.ingest();
+    expect(svc.onChange).not.toHaveBeenCalled();
   });
 });
