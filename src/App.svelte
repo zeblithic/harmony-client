@@ -95,6 +95,20 @@
     }
   }
 
+  /** Detect video MIME type from magic bytes. */
+  function detectVideoMime(bytes: number[]): string {
+    // MP4/M4V: byte 4-7 = 'ftyp'
+    if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return 'video/mp4';
+    // WebM/Matroska: 0x1A 0x45 0xDF 0xA3
+    if (bytes[0] === 0x1A && bytes[1] === 0x45 && bytes[2] === 0xDF && bytes[3] === 0xA3) return 'video/webm';
+    // AVI: 'RIFF' header + 'AVI ' subtype at bytes 8-11
+    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+        && bytes[8] === 0x41 && bytes[9] === 0x56 && bytes[10] === 0x49 && bytes[11] === 0x20) return 'video/avi';
+    return 'video/mp4';
+  }
+
+  let resolveVideoFn = $state<((cid: string) => Promise<string>) | undefined>(undefined);
+
   const avatarResolver = new AvatarResolver();
   $effect(() => () => avatarResolver.destroy());
 
@@ -168,6 +182,12 @@
       await vineService.connectAdapter(adapter);
       await fileManagerService.connectAdapter(adapter);
       avatarResolver.connectAdapter(adapter);
+      resolveVideoFn = async (cid: string) => {
+        const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
+        const mime = detectVideoMime(bytes);
+        const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+        return URL.createObjectURL(blob);
+      };
       await navService.connectAdapter(adapter);
       // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
@@ -586,7 +606,7 @@
     />
   {/snippet}
   {#snippet vineFeed()}
-    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} onPublish={() => showVinePublish = true} onReshare={handleVineReshare} />
+    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} onPublish={() => showVinePublish = true} onReshare={handleVineReshare} resolveVideo={resolveVideoFn} />
     {#if showVinePublish}
       <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />
     {/if}

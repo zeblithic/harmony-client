@@ -4,18 +4,57 @@
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onClose, onNext, onPrevious, onReshare }: {
+  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo }: {
     vine: VineVideo;
     onClose: () => void;
     onNext?: () => void;
     onPrevious?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
+    resolveVideo?: (cid: string) => Promise<string>;
   } = $props();
 
   let overlayEl: HTMLDivElement;
   let resharing = $state(false);
   let reshareError = $state('');
   let reshareGeneration = 0;
+
+  // ── Video resolution state ──────────────────────────────────────────
+  let videoUrl = $state<string | null>(null);
+  let videoLoading = $state(false);
+  let videoError = $state('');
+  let videoGeneration = 0;
+
+  $effect(() => {
+    const cid = vine.videoCid;
+    const resolver = resolveVideo;
+    if (!resolver || !cid) return;
+
+    // Invalidate any in-flight fetch from a previous vine.
+    const gen = ++videoGeneration;
+    videoUrl = null;
+    videoLoading = true;
+    videoError = '';
+
+    let ownUrl: string | null = null;
+
+    resolver(cid).then((url) => {
+      if (gen !== videoGeneration) { URL.revokeObjectURL(url); return; }
+      ownUrl = url;
+      videoUrl = url;
+      videoLoading = false;
+    }).catch((err) => {
+      if (gen !== videoGeneration) return;
+      videoError = err instanceof Error ? err.message : 'Failed to load video';
+      videoLoading = false;
+    });
+
+    return () => {
+      // Revoke blob URL when vine changes or component unmounts.
+      // Uses local ownUrl (not reactive videoUrl) so cleanup works
+      // even if the component unmounts while a fetch is in-flight.
+      if (ownUrl) URL.revokeObjectURL(ownUrl);
+    };
+  });
 
   // Clear reshare state and invalidate in-flight calls when navigating.
   $effect(() => { void vine; reshareGeneration++; resharing = false; reshareError = ''; });
@@ -65,11 +104,34 @@
     {/if}
 
     <div class="video-area" aria-label={vine.title ?? 'Untitled vine'}>
-      <div class="placeholder-video">
-        <span class="play-icon" aria-hidden="true">▶</span>
-        <span class="placeholder-label">Video playback coming soon</span>
-        <span class="cid-label">{vine.videoCid}</span>
-      </div>
+      {#if videoUrl}
+        <!-- svelte-ignore a11y_media_has_caption -->
+        <video
+          class="vine-video"
+          src={videoUrl}
+          controls
+          autoplay
+          loop
+          playsinline
+          aria-label="Vine video"
+        ></video>
+      {:else if videoLoading}
+        <div class="placeholder-video">
+          <span class="loading-label">Loading video…</span>
+          <span class="cid-label">{vine.videoCid}</span>
+        </div>
+      {:else if videoError}
+        <div class="placeholder-video">
+          <span class="error-label">{videoError}</span>
+          <span class="cid-label">{vine.videoCid}</span>
+        </div>
+      {:else}
+        <div class="placeholder-video">
+          <span class="play-icon" aria-hidden="true">▶</span>
+          <span class="placeholder-label">Video playback coming soon</span>
+          <span class="cid-label">{vine.videoCid}</span>
+        </div>
+      {/if}
     </div>
 
     {#if onNext}
@@ -184,6 +246,13 @@
     overflow: hidden;
   }
 
+  .vine-video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
+
   .placeholder-video {
     width: 100%;
     height: 100%;
@@ -200,9 +269,15 @@
     color: var(--text-muted);
   }
 
-  .placeholder-label {
+  .placeholder-label,
+  .loading-label {
     font-size: 0.85rem;
     color: var(--text-muted);
+  }
+
+  .error-label {
+    font-size: 0.85rem;
+    color: #ed4245;
   }
 
   .cid-label {

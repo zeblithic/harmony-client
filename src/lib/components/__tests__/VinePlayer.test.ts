@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import VinePlayer from '../VinePlayer.svelte';
 import type { VineVideo } from '../../types';
@@ -62,13 +62,43 @@ describe('VinePlayer', () => {
     expect(onNext).toHaveBeenCalledOnce();
   });
 
-  it('shows video CID in placeholder', () => {
+  it('shows placeholder when no resolveVideo provided', () => {
     render(VinePlayer, { props: { vine, onClose: vi.fn() } });
+    expect(screen.getByText('Video playback coming soon')).toBeTruthy();
     expect(screen.getByText('cid-abc123')).toBeTruthy();
   });
 
   it('has dialog role for accessibility', () => {
     render(VinePlayer, { props: { vine, onClose: vi.fn() } });
     expect(screen.getByRole('dialog')).toBeTruthy();
+  });
+
+  // ── Video playback ──────────────────────────────────────────────
+
+  it('shows loading state while resolving video', () => {
+    // Never-resolving promise simulates an in-flight fetch.
+    const resolveVideo = vi.fn().mockReturnValue(new Promise(() => {}));
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), resolveVideo } });
+    expect(screen.getByText('Loading video…')).toBeTruthy();
+    expect(resolveVideo).toHaveBeenCalledWith('cid-abc123');
+  });
+
+  it('shows video element after resolution', async () => {
+    const blobUrl = 'blob:http://localhost/fake-video';
+    const resolveVideo = vi.fn().mockResolvedValue(blobUrl);
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), resolveVideo } });
+    await waitFor(() => {
+      const video = screen.getByLabelText('Vine video') as HTMLVideoElement;
+      expect(video.tagName).toBe('VIDEO');
+      expect(video.src).toBe(blobUrl);
+    });
+  });
+
+  it('shows error state when resolution fails', async () => {
+    const resolveVideo = vi.fn().mockRejectedValue(new Error('not found'));
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), resolveVideo } });
+    await waitFor(() => {
+      expect(screen.getByText('not found')).toBeTruthy();
+    });
   });
 });
