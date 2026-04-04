@@ -356,19 +356,30 @@ pub async fn run(
 
             // ── Content-ingest requests from Tauri commands ────────
             Some(req) = ingest_rx.recv() => {
-                let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
-                runtime.push_event(RuntimeEvent::SubscriptionMessage {
-                    key_expr,
-                    payload: req.data,
-                });
-                // Tick immediately so content is committed before replying.
-                for action in runtime.tick() {
-                    dispatch_action(
-                        action, &session, &zenoh_tx, &udp,
-                        &broadcast_addr, &app, &closing, &own_zid,
-                    ).await;
+                // Validate the CID hex decodes to exactly 32 bytes — this is
+                // the only precondition for parse_subscription_event to route
+                // the message into StorageTierEvent::PublishContent.
+                let cid_ok = hex::decode(&req.cid_hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .is_some();
+                if !cid_ok {
+                    let _ = req.reply.send(Err(format!("invalid CID hex: {}", req.cid_hex)));
+                } else {
+                    let key_expr = format!("harmony/content/publish/{}", req.cid_hex);
+                    runtime.push_event(RuntimeEvent::SubscriptionMessage {
+                        key_expr,
+                        payload: req.data,
+                    });
+                    // Tick immediately so content is committed before replying.
+                    for action in runtime.tick() {
+                        dispatch_action(
+                            action, &session, &zenoh_tx, &udp,
+                            &broadcast_addr, &app, &closing, &own_zid,
+                        ).await;
+                    }
+                    let _ = req.reply.send(Ok(()));
                 }
-                let _ = req.reply.send(Ok(()));
             }
 
             // ── Shutdown signal ──────────────────────────────────────
