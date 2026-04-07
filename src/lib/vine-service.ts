@@ -259,6 +259,11 @@ export class VineService {
     // matches the real hex address in self-echo dedup (avoids double-count
     // if a self-echo arrives before ownAddress is set).
     const selfKey = this.ownAddress ?? 'self';
+    // Migrate stale 'self' reactor entry if ownAddress was set after initial like
+    if (selfKey !== 'self' && entry.reactors.has('self')) {
+      entry.reactors.delete('self');
+      entry.reactors.add(selfKey);
+    }
     entry.likedByMe = newLiked;
     entry.count = Math.max(0, entry.count + (newLiked ? 1 : -1));
     if (newLiked) {
@@ -270,11 +275,13 @@ export class VineService {
     this.onChange?.();
 
     if (this.adapter) {
+      // Can't safely publish without our own address — self-echo suppression
+      // and reactor dedup both depend on knowing the real hex address.
+      if (!this.ownAddress) return;
       const creatorAddr =
         vine.creatorAddress === 'self'
           ? this.ownAddress
           : vine.creatorAddress;
-      if (!creatorAddr) return; // ownAddress not yet fetched; skip publish
       try {
         await this.adapter.invoke('publish_vine_reaction', {
           reaction: {

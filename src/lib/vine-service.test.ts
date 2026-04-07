@@ -359,6 +359,7 @@ describe('VineService', () => {
 
   it('toggleLike calls publish_vine_reaction on adapter', async () => {
     const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
     await svc.connectAdapter(adapter);
     const vine = mockVines[0];
     await svc.toggleLike(vine);
@@ -388,6 +389,31 @@ describe('VineService', () => {
     });
   });
 
+  it('toggleLike skips publish when ownAddress is null', async () => {
+    const { adapter } = createMockAdapter();
+    // ownAddress is null (not yet fetched)
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    // Optimistic update should still apply
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+    // But no publish should have been sent
+    expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine_reaction', expect.anything());
+  });
+
+  it('toggleLike migrates stale self entry when ownAddress becomes available', async () => {
+    // Like offline (ownAddress is null) — stores 'self' in reactors
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+    // Now ownAddress gets set
+    svc.ownAddress = 'myaddr';
+    // Unlike — should migrate 'self' to 'myaddr' and correctly decrement
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(false);
+    expect(svc.getReaction(vine.id).count).toBe(0);
+  });
+
   it('toggleLike works offline without adapter', async () => {
     const vine = mockVines[0];
     await svc.toggleLike(vine);
@@ -396,6 +422,7 @@ describe('VineService', () => {
 
   it('toggleLike rolls back on adapter error', async () => {
     const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
     (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network error'));
     await svc.connectAdapter(adapter);
     const vine = mockVines[0];
