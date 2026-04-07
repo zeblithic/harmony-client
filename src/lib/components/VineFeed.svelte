@@ -4,39 +4,60 @@
   import VinePlayer from './VinePlayer.svelte';
 
   type FeedFilter = 'all' | 'unviewed';
+  type FeedTab = 'following' | 'discover';
 
-  let { vines, viewedIds, onMarkViewed, onPublish, onReshare, resolveVideo }: {
-    vines: VineVideo[];
+  let {
+    followedVines = [],
+    discoverVines = [],
+    viewedIds,
+    activeTab = 'following' as FeedTab,
+    followedAddresses = new Set<string>(),
+    onTabChange,
+    onMarkViewed,
+    onPublish,
+    onReshare,
+    onFollow,
+    onUnfollow,
+    resolveVideo,
+  }: {
+    followedVines?: VineVideo[];
+    discoverVines?: VineVideo[];
     viewedIds: Set<string>;
+    activeTab?: FeedTab;
+    followedAddresses?: Set<string>;
+    onTabChange?: (tab: FeedTab) => void;
     onMarkViewed?: (id: string) => void;
     onPublish?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
+    onFollow?: (address: string, name: string) => void;
+    onUnfollow?: (address: string) => void;
     resolveVideo?: (cid: string) => Promise<string>;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
   let feedFilter = $state<FeedFilter>('all');
-  // Snapshot of the list at the time the player opened — prevents stale
-  // index when marking a vine viewed removes it from filteredVines.
   let playerList = $state<VineVideo[]>([]);
   let activeIndex = $state(-1);
 
+  let activeVines = $derived(
+    activeTab === 'following' ? followedVines : discoverVines
+  );
+
   let sortedVines = $derived(
-    [...vines].sort((a, b) => b.createdAt - a.createdAt)
+    [...activeVines].sort((a, b) => b.createdAt - a.createdAt)
   );
 
   let filteredVines = $derived(
-    feedFilter === 'unviewed'
+    activeTab === 'following' && feedFilter === 'unviewed'
       ? sortedVines.filter(v => !viewedIds.has(v.id))
       : sortedVines
   );
 
   let unviewedCount = $derived(
-    vines.filter(v => !viewedIds.has(v.id)).length
+    followedVines.filter(v => !viewedIds.has(v.id)).length
   );
 
   function openPlayer(vine: VineVideo) {
-    // Only snapshot the list when opening fresh (not navigating within player).
     if (!activeVine) {
       playerList = [...filteredVines];
     }
@@ -82,26 +103,45 @@
     {/if}
   </header>
 
-  <div class="filter-bar">
-    <button type="button" class="filter-tab" class:active={feedFilter === 'all'} onclick={() => feedFilter = 'all'}>All</button>
-    <button type="button" class="filter-tab" class:active={feedFilter === 'unviewed'} onclick={() => feedFilter = 'unviewed'}>
-      Unviewed{#if unviewedCount > 0}&nbsp;({unviewedCount}){/if}
-    </button>
+  <div class="tab-bar">
+    <button type="button" class="tab" class:active={activeTab === 'following'} onclick={() => onTabChange?.('following')}>Following</button>
+    <button type="button" class="tab" class:active={activeTab === 'discover'} onclick={() => onTabChange?.('discover')}>Discover</button>
   </div>
+
+  {#if activeTab === 'following'}
+    <div class="filter-bar">
+      <button type="button" class="filter-tab" class:active={feedFilter === 'all'} onclick={() => feedFilter = 'all'}>All</button>
+      <button type="button" class="filter-tab" class:active={feedFilter === 'unviewed'} onclick={() => feedFilter = 'unviewed'}>
+        Unviewed{#if unviewedCount > 0}&nbsp;({unviewedCount}){/if}
+      </button>
+    </div>
+  {/if}
 
   {#if filteredVines.length === 0}
     <p class="empty-state">
-      {#if feedFilter === 'unviewed'}
-        All caught up — no unviewed vines.
+      {#if activeTab === 'following'}
+        {#if feedFilter === 'unviewed'}
+          All caught up — no unviewed vines.
+        {:else}
+          Follow creators to build your feed. Check out the Discover tab to find people to follow.
+        {/if}
       {:else}
-        No vines yet. Follow creators to see their vines here.
+        No vines on the network yet.
       {/if}
     </p>
   {:else}
     <div class="feed-list" role="list" aria-label="Vine feed">
       {#each filteredVines as vine (vine.id)}
         <div role="listitem">
-          <VineCard {vine} onPlay={openPlayer} isViewed={viewedIds.has(vine.id)} />
+          <VineCard
+            {vine}
+            onPlay={openPlayer}
+            isViewed={viewedIds.has(vine.id)}
+            showFollowButton={vine.creatorAddress !== 'self'}
+            isFollowed={followedAddresses.has(vine.creatorAddress)}
+            {onFollow}
+            {onUnfollow}
+          />
         </div>
       {/each}
     </div>
@@ -171,6 +211,35 @@
 
   .create-btn:hover {
     opacity: 0.85;
+  }
+
+  .tab-bar {
+    display: flex;
+    gap: 0;
+    padding: 0 16px 4px;
+    border-bottom: 1px solid var(--bg-tertiary);
+  }
+
+  .tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 8px 16px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .tab:hover {
+    color: var(--text-primary);
+  }
+
+  .tab.active {
+    color: var(--text-primary);
+    font-weight: 600;
+    border-bottom-color: var(--accent);
   }
 
   .filter-bar {

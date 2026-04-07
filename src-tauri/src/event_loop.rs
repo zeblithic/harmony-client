@@ -42,6 +42,12 @@ pub struct IngestRequest {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+/// A follow/unfollow request sent from the Tauri command thread into the event loop.
+pub enum FollowRequest {
+    Follow { address: String },
+    Unfollow { address: String },
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query { key_expr: String, payload: Vec<u8> },
@@ -69,6 +75,8 @@ pub async fn run(
     mut publish_rx: mpsc::Receiver<PublishRequest>,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
+    mut follow_rx: mpsc::Receiver<FollowRequest>,
+    followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -199,6 +207,13 @@ pub async fn run(
     )
     .await;
 
+    // Note: per-creator Zenoh subscriptions are not used yet because the
+    // publish path (harmony/vines/{addr}) does not include /announce/.
+    // Once harmony-node adopts the full keyspace protocol
+    // (harmony/vines/{addr}/announce/{cid}), per-creator subscriptions can
+    // be added here for write-side filtering. For now, the wildcard
+    // subscription above catches all vines and we route by followed_set.
+
     // Subscribe to content availability announcements for the file manager.
     dispatch_action(
         RuntimeAction::Subscribe {
@@ -311,7 +326,7 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance);
+                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -381,6 +396,13 @@ pub async fn run(
                     let _ = req.reply.send(Ok(()));
                 }
             }
+
+            // Follow/unfollow updates are applied to followed_set directly
+            // by the Tauri command handlers. When per-creator Zenoh
+            // subscriptions are added (once the publish path includes
+            // /announce/), the follow_rx channel will drive Subscribe/
+            // Unsubscribe actions here.
+            Some(_req) = follow_rx.recv() => {}
 
             // ── Shutdown signal ──────────────────────────────────────
             _ = shutdown.changed() => {
@@ -623,7 +645,13 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
-fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_distance: Option<u8>) {
+fn emit_frontend_event(
+    app: &AppHandle,
+    key_expr: &str,
+    payload: &[u8],
+    hop_distance: Option<u8>,
+    followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
             update.hop_distance = hop_distance;
@@ -638,8 +666,21 @@ fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_dist
             let _ = app.emit("message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
+        // Deserialize as typed payload first to reject malformed data,
+        // then re-serialize with the source tag injected.
         if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
-            let _ = app.emit("vine-received", &vine);
+            let is_followed = {
+                let set = followed_set.lock().unwrap();
+                set.contains(vine.creator_address.as_str())
+            };
+            let source = if is_followed { "followed" } else { "discover" };
+            // Re-serialize to Value so we can inject the source field
+            if let Ok(mut val) = serde_json::to_value(&vine) {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+                }
+                let _ = app.emit("vine-received", &val);
+            }
         }
     } else if key_expr.starts_with("harmony/announce/") {
         if let Some(announcement) = crate::parse_content_announcement(key_expr, payload) {

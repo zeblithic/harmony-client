@@ -78,4 +78,34 @@ describe('VineCard', () => {
     const card = screen.getByRole('button');
     expect(card.getAttribute('aria-label')).toBe('Untitled vine by Alice');
   });
+
+  it('renders follow button when showFollowButton is true and not followed', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: false, onFollow: vi.fn() } });
+    expect(screen.getByLabelText(/Follow/)).toBeTruthy();
+  });
+
+  it('does not render follow button when showFollowButton is false', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: false } });
+    expect(screen.queryByLabelText(/Follow/)).toBeNull();
+  });
+
+  it('renders Following badge when followed', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: true, onUnfollow: vi.fn() } });
+    expect(screen.getByText('Following')).toBeTruthy();
+  });
+
+  it('calls onFollow with address and name when follow clicked', async () => {
+    const onFollow = vi.fn();
+    render(VineCard, { props: { vine, onPlay: vi.fn(), showFollowButton: true, isFollowed: false, onFollow } });
+    await fireEvent.click(screen.getByLabelText(/Follow/));
+    expect(onFollow).toHaveBeenCalledWith('a1b2c3d4', 'Alice');
+  });
+
+  it('follow button click does not trigger onPlay', async () => {
+    const onPlay = vi.fn();
+    const onFollow = vi.fn();
+    render(VineCard, { props: { vine, onPlay, showFollowButton: true, isFollowed: false, onFollow } });
+    await fireEvent.click(screen.getByLabelText(/Follow/));
+    expect(onPlay).not.toHaveBeenCalled();
+  });
 });

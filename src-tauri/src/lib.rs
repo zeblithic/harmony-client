@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 mod event_loop;
+mod follows;
 mod identity;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
@@ -25,6 +26,12 @@ struct NodeState {
     fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
     /// Channel for routing content-ingest requests through the event loop.
     ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
+    /// Channel for routing follow/unfollow requests through the event loop.
+    follow_tx: Option<tokio::sync::mpsc::Sender<event_loop::FollowRequest>>,
+    /// Persistent follow manager (disk-backed follow list).
+    follow_mgr: Option<follows::FollowManager>,
+    /// Shared set of followed addresses (read by the event loop for source tagging).
+    followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -173,7 +180,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, _follow_mgr, _followed_set) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -184,13 +191,23 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take(), guard.fetch_tx.take(), guard.ingest_tx.take())
+        (
+            guard.shutdown_tx.take(),
+            guard.thread.take(),
+            guard.publish_tx.take(),
+            guard.fetch_tx.take(),
+            guard.ingest_tx.take(),
+            guard.follow_tx.take(),
+            guard.follow_mgr.take(),
+            guard.followed_set.take(),
+        )
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
+    drop(follow_tx);
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -215,6 +232,19 @@ async fn start_node(
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
     let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
+    let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
+
+    // Load the follow list from disk and create the shared followed set.
+    let app_data_dir = {
+        use tauri::Manager;
+        app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?
+    };
+    std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
+    let follow_mgr = follows::FollowManager::load(&app_data_dir);
+    let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
+        follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
+    ));
+    let followed_set_clone = followed_set.clone();
 
     let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -225,10 +255,14 @@ async fn start_node(
         let old_publish = guard.publish_tx.take();
         let old_fetch = guard.fetch_tx.take();
         let old_ingest = guard.ingest_tx.take();
+        let old_follow = guard.follow_tx.take();
+        let _old_follow_mgr = guard.follow_mgr.take();
+        let _old_followed_set = guard.followed_set.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
+        drop(old_follow);
         stop_handles(old_shutdown, old_thread);
 
         // ── Identity (serialized by the lock — no concurrent generation race)
@@ -312,6 +346,8 @@ async fn start_node(
                         publish_rx,
                         fetch_rx,
                         ingest_rx,
+                        follow_rx,
+                        followed_set_clone,
                     )
                     .await;
                 });
@@ -323,6 +359,9 @@ async fn start_node(
         guard.publish_tx = Some(publish_tx);
         guard.fetch_tx = Some(fetch_tx);
         guard.ingest_tx = Some(ingest_tx);
+        guard.follow_tx = Some(follow_tx);
+        guard.follow_mgr = Some(follow_mgr);
+        guard.followed_set = Some(followed_set);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
@@ -577,6 +616,15 @@ pub struct VineVideoDto {
     pub viewed: bool,
 }
 
+/// Response returned by list_followed — one entry per followed address.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowEntryResponse {
+    pub address: String,
+    pub name: Option<String>,
+    pub followed_at: u64,
+}
+
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
 ///
 /// Publishes JSON to `harmony/vines/{creator_address}`.
@@ -650,18 +698,79 @@ fn list_vine_videos() -> Vec<VineVideoDto> {
 }
 
 #[tauri::command]
-fn follow_vine_creator(address: String) -> bool {
-    // Future: subscribe to specific creator's vine key expression.
-    let _ = address;
-    true
+async fn follow_vine_creator(
+    address: String,
+    name: Option<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+
+    if address == guard.node_addr {
+        return Err("cannot follow yourself".to_string());
+    }
+
+    let mgr = guard.follow_mgr.as_mut().ok_or("not connected")?;
+    if !mgr.follow(address.clone(), name) {
+        return Ok(false);
+    }
+
+    if let Some(ref set) = guard.followed_set {
+        let mut s = set.lock().unwrap();
+        s.insert(address.clone());
+    }
+
+    if let Some(ref tx) = guard.follow_tx {
+        if tx.try_send(event_loop::FollowRequest::Follow { address }).is_err() {
+            tracing::error!("follow_tx full — follow update not sent to event loop");
+        }
+    }
+
+    Ok(true)
 }
 
 #[tauri::command]
-fn unfollow_vine_creator(address: String) -> bool {
-    // Future: unsubscribe from specific creator's vine key expression.
-    let _ = address;
-    true
+async fn unfollow_vine_creator(
+    address: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+
+    let mgr = guard.follow_mgr.as_mut().ok_or("not connected")?;
+    if !mgr.unfollow(&address) {
+        return Ok(false);
+    }
+
+    if let Some(ref set) = guard.followed_set {
+        let mut s = set.lock().unwrap();
+        s.remove(&address);
+    }
+
+    if let Some(ref tx) = guard.follow_tx {
+        if tx.try_send(event_loop::FollowRequest::Unfollow { address }).is_err() {
+            tracing::error!("follow_tx full — unfollow update not sent to event loop");
+        }
+    }
+
+    Ok(true)
 }
+
+#[tauri::command]
+fn list_followed(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<FollowEntryResponse>, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
+    Ok(mgr
+        .list()
+        .into_iter()
+        .map(|e| FollowEntryResponse {
+            address: e.address,
+            name: e.name,
+            followed_at: e.followed_at,
+        })
+        .collect())
+}
+
 
 #[tauri::command]
 fn mark_vine_viewed(vine_id: String) -> bool {
@@ -941,6 +1050,7 @@ pub fn run() {
             list_vine_videos,
             follow_vine_creator,
             unfollow_vine_creator,
+            list_followed,
             mark_vine_viewed,
             publish_vine,
             start_node,

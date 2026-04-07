@@ -11,6 +11,7 @@ export interface VineDescriptorEvent {
   videoCid: string;
   title?: string;
   reshareOf?: string;
+  source?: 'followed' | 'discover';
 }
 
 /**
@@ -21,7 +22,12 @@ export interface VineDescriptorEvent {
  * UI is never empty. Call `connectAdapter()` to upgrade from offline to live.
  */
 export class VineService {
-  vines: VineVideo[] = [];
+  followedVines: VineVideo[] = [];
+  discoverVines: VineVideo[] = [];
+  /** Backwards-compat getter — combines both feeds. */
+  get vines(): VineVideo[] {
+    return [...this.followedVines, ...this.discoverVines];
+  }
   /** Called whenever the vine list or viewed state changes so the UI can re-render. */
   onChange?: () => void;
   /** Hex-encoded node address — set after Zenoh connects so we can
@@ -31,6 +37,7 @@ export class VineService {
   ownDisplayName = 'You';
   /** Locally tracked viewed vine IDs. */
   viewedIds = new Set<string>();
+  followedAddresses = new Set<string>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -38,8 +45,8 @@ export class VineService {
 
   constructor() {
     // Seed with mock data — real vines append on top.
-    this.vines = [...mockVines];
-    for (const v of this.vines) {
+    this.discoverVines = [...mockVines];
+    for (const v of this.discoverVines) {
       this.seenIds.add(v.id);
       if (v.viewed) this.viewedIds.add(v.id);
     }
@@ -57,7 +64,11 @@ export class VineService {
         this.seenIds.add(wire.id);
         const vine = this.wireToVine(wire);
         if (vine.viewed) this.viewedIds = new Set([...this.viewedIds, vine.id]);
-        this.vines = [...this.vines, vine];
+        if (wire.source === 'followed') {
+          this.followedVines = [...this.followedVines, vine];
+        } else {
+          this.discoverVines = [...this.discoverVines, vine];
+        }
         this.onChange?.();
       },
     );
@@ -99,7 +110,7 @@ export class VineService {
       reshareOf,
       viewed: true,
     };
-    this.vines = [...this.vines, vine];
+    this.discoverVines = [...this.discoverVines, vine];
     this.onChange?.();
   }
 
@@ -111,6 +122,67 @@ export class VineService {
     if (this.adapter) {
       this.adapter.invoke('mark_vine_viewed', { vineId: id }).catch(() => {});
     }
+  }
+
+  async follow(address: string, name?: string): Promise<void> {
+    // Guard against following yourself — wireToVine remaps own address to
+    // 'self', so the UI may pass either the real hex or 'self'.
+    if (address === 'self' || (this.ownAddress && address === this.ownAddress)) {
+      return;
+    }
+    if (this.adapter) {
+      await this.adapter.invoke('follow_vine_creator', { address, name: name ?? null });
+    }
+    this.followedAddresses.add(address);
+    const toMove = this.discoverVines.filter(v => v.creatorAddress === address);
+    if (toMove.length > 0) {
+      this.discoverVines = this.discoverVines.filter(v => v.creatorAddress !== address);
+      this.followedVines = [...this.followedVines, ...toMove];
+    }
+    this.onChange?.();
+  }
+
+  async unfollow(address: string): Promise<void> {
+    if (this.adapter) {
+      await this.adapter.invoke('unfollow_vine_creator', { address });
+    }
+    this.followedAddresses.delete(address);
+    const toMove = this.followedVines.filter(v => v.creatorAddress === address);
+    this.followedVines = this.followedVines.filter(v => v.creatorAddress !== address);
+    if (toMove.length > 0) {
+      this.discoverVines = [...toMove, ...this.discoverVines];
+    }
+    this.onChange?.();
+  }
+
+  async loadFollowed(): Promise<void> {
+    if (!this.adapter) return;
+    try {
+      const entries = await this.adapter.invoke('list_followed', {}) as Array<{
+        address: string;
+        name: string | null;
+        followedAt: number;
+      }>;
+      for (const entry of entries) {
+        this.followedAddresses.add(entry.address);
+      }
+      // Reconcile: move any vines from discover to followed that
+      // arrived before the follow list was loaded.
+      const toMove = this.discoverVines.filter(v => this.followedAddresses.has(v.creatorAddress));
+      if (toMove.length > 0) {
+        this.discoverVines = this.discoverVines.filter(v => !this.followedAddresses.has(v.creatorAddress));
+        this.followedVines = [...this.followedVines, ...toMove];
+      }
+      // Always fire onChange so UI picks up followedAddresses changes
+      // (e.g., follow buttons render correctly even when no vines to reconcile)
+      this.onChange?.();
+    } catch {
+      // Not connected yet
+    }
+  }
+
+  isFollowed(address: string): boolean {
+    return this.followedAddresses.has(address);
   }
 
   /** Convert wire format to frontend VineVideo type. */
