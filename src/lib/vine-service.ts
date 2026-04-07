@@ -40,6 +40,8 @@ export class VineService {
   followedAddresses = new Set<string>();
   /** In-memory reaction state per vine. */
   private reactionMap = new Map<string, { count: number; likedByMe: boolean; reactors: Set<string> }>();
+  /** Vine IDs with an in-flight toggleLike call — prevents concurrent mutations. */
+  private likePending = new Set<string>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -239,27 +241,45 @@ export class VineService {
 
   /** Toggle like on a vine with optimistic update. */
   async toggleLike(vine: VineVideo): Promise<void> {
+    if (this.likePending.has(vine.id)) return; // Prevent concurrent toggleLike calls
+    this.likePending.add(vine.id);
+    try {
+      await this._toggleLikeInner(vine);
+    } finally {
+      this.likePending.delete(vine.id);
+    }
+  }
+
+  private async _toggleLikeInner(vine: VineVideo): Promise<void> {
     const entry = this.reactionMap.get(vine.id) ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
     const wasLiked = entry.likedByMe;
     const newLiked = !wasLiked;
 
-    // Optimistic update
+    // Optimistic update — use ownAddress when available so the reactor key
+    // matches the real hex address in self-echo dedup (avoids double-count
+    // if a self-echo arrives before ownAddress is set).
+    const selfKey = this.ownAddress ?? 'self';
     entry.likedByMe = newLiked;
     entry.count = Math.max(0, entry.count + (newLiked ? 1 : -1));
     if (newLiked) {
-      entry.reactors.add('self');
+      entry.reactors.add(selfKey);
     } else {
-      entry.reactors.delete('self');
+      entry.reactors.delete(selfKey);
     }
     this.reactionMap.set(vine.id, entry);
     this.onChange?.();
 
     if (this.adapter) {
+      const creatorAddr =
+        vine.creatorAddress === 'self'
+          ? this.ownAddress
+          : vine.creatorAddress;
+      if (!creatorAddr) return; // ownAddress not yet fetched; skip publish
       try {
         await this.adapter.invoke('publish_vine_reaction', {
           reaction: {
             vineId: vine.id,
-            vineCreatorAddress: vine.creatorAddress === 'self' ? (this.ownAddress ?? vine.creatorAddress) : vine.creatorAddress,
+            vineCreatorAddress: creatorAddr,
             liked: newLiked,
             reactorName: this.ownDisplayName,
           },
@@ -269,9 +289,9 @@ export class VineService {
         entry.likedByMe = wasLiked;
         entry.count = Math.max(0, entry.count + (wasLiked ? 1 : -1));
         if (wasLiked) {
-          entry.reactors.add('self');
+          entry.reactors.add(selfKey);
         } else {
-          entry.reactors.delete('self');
+          entry.reactors.delete(selfKey);
         }
         this.reactionMap.set(vine.id, entry);
         this.onChange?.();

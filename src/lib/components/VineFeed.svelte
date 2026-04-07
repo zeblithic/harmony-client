@@ -136,6 +136,7 @@
   {:else}
     <div class="feed-list" role="list" aria-label="Vine feed">
       {#each filteredVines as vine (vine.id)}
+        {@const reaction = getReaction?.(vine.id)}
         <div role="listitem">
           <VineCard
             {vine}
@@ -145,8 +146,8 @@
             isFollowed={followedAddresses.has(vine.creatorAddress)}
             {onFollow}
             {onUnfollow}
-            reactionCount={getReaction?.(vine.id)?.count ?? 0}
-            likedByMe={getReaction?.(vine.id)?.likedByMe ?? false}
+            reactionCount={reaction?.count ?? 0}
+            likedByMe={reaction?.likedByMe ?? false}
             {onToggleLike}
           />
         </div>
