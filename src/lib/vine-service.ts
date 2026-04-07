@@ -38,6 +38,8 @@ export class VineService {
   /** Locally tracked viewed vine IDs. */
   viewedIds = new Set<string>();
   followedAddresses = new Set<string>();
+  /** In-memory reaction state per vine. */
+  private reactionMap = new Map<string, { count: number; likedByMe: boolean; reactors: Set<string> }>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -183,6 +185,55 @@ export class VineService {
 
   isFollowed(address: string): boolean {
     return this.followedAddresses.has(address);
+  }
+
+  /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
+  getReaction(vineId: string): { count: number; likedByMe: boolean } {
+    const entry = this.reactionMap.get(vineId);
+    return entry
+      ? { count: entry.count, likedByMe: entry.likedByMe }
+      : { count: 0, likedByMe: false };
+  }
+
+  /** Toggle like on a vine with optimistic update. */
+  async toggleLike(vine: VineVideo): Promise<void> {
+    const entry = this.reactionMap.get(vine.id) ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+    const wasLiked = entry.likedByMe;
+    const newLiked = !wasLiked;
+
+    // Optimistic update
+    entry.likedByMe = newLiked;
+    entry.count = Math.max(0, entry.count + (newLiked ? 1 : -1));
+    if (newLiked) {
+      entry.reactors.add('self');
+    } else {
+      entry.reactors.delete('self');
+    }
+    this.reactionMap.set(vine.id, entry);
+    this.onChange?.();
+
+    if (this.adapter) {
+      try {
+        await this.adapter.invoke('publish_vine_reaction', {
+          reaction: {
+            vineId: vine.id,
+            vineCreatorAddress: vine.creatorAddress,
+            liked: newLiked,
+          },
+        });
+      } catch {
+        // Rollback on failure
+        entry.likedByMe = wasLiked;
+        entry.count = Math.max(0, entry.count + (wasLiked ? 1 : -1));
+        if (wasLiked) {
+          entry.reactors.add('self');
+        } else {
+          entry.reactors.delete('self');
+        }
+        this.reactionMap.set(vine.id, entry);
+        this.onChange?.();
+      }
+    }
   }
 
   /** Convert wire format to frontend VineVideo type. */

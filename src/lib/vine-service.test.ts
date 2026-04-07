@@ -328,6 +328,64 @@ describe('VineService', () => {
     expect(svc.isFollowed('ccdd')).toBe(false);
   });
 
+  // ── Reactions ──────────────────────────────────────────────────────
+
+  it('getReaction returns zero state for unknown vine', () => {
+    const r = svc.getReaction('nonexistent');
+    expect(r.count).toBe(0);
+    expect(r.likedByMe).toBe(false);
+  });
+
+  it('toggleLike optimistically sets likedByMe and increments count', async () => {
+    const vine = mockVines[0];
+    svc.onChange = vi.fn();
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(true);
+    expect(r.count).toBe(1);
+    expect(svc.onChange).toHaveBeenCalled();
+  });
+
+  it('toggleLike again unlikes and decrements count', async () => {
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(false);
+    expect(r.count).toBe(0);
+  });
+
+  it('toggleLike calls publish_vine_reaction on adapter', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine_reaction', {
+      reaction: {
+        vineId: vine.id,
+        vineCreatorAddress: vine.creatorAddress,
+        liked: true,
+      },
+    });
+  });
+
+  it('toggleLike works offline without adapter', async () => {
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+  });
+
+  it('toggleLike rolls back on adapter error', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network error'));
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(false);
+    expect(r.count).toBe(0);
+  });
+
   it('loadFollowed populates followedAddresses', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
