@@ -197,4 +197,28 @@ describe('VineFeed', () => {
     const matches = screen.getAllByText('Following');
     expect(matches.length).toBe(4);
   });
+
+  it('passes reaction data to vine cards', () => {
+    const getReaction = vi.fn().mockReturnValue({ count: 5, likedByMe: true });
+    render(VineFeed, { props: {
+      followedVines: vines, viewedIds: makeViewedIds(),
+      activeTab: 'following', followedAddresses: new Set(), getReaction,
+    } });
+    expect(getReaction).toHaveBeenCalled();
+    const counts = screen.getAllByText('5');
+    expect(counts.length).toBeGreaterThan(0);
+  });
+
+  it('calls onToggleLike when card like is clicked', async () => {
+    const onToggleLike = vi.fn();
+    const getReaction = vi.fn().mockReturnValue({ count: 1, likedByMe: false });
+    render(VineFeed, { props: {
+      followedVines: vines, viewedIds: makeViewedIds(),
+      activeTab: 'following', followedAddresses: new Set(),
+      getReaction, onToggleLike,
+    } });
+    const likeBtn = screen.getAllByLabelText(/Like/)[0];
+    await fireEvent.click(likeBtn);
+    expect(onToggleLike).toHaveBeenCalled();
+  });
 });
