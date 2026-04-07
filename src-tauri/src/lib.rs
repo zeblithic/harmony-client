@@ -771,15 +771,6 @@ fn list_followed(
         .collect())
 }
 
-#[tauri::command]
-fn is_followed(
-    address: String,
-    state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<bool, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
-    Ok(mgr.is_followed(&address))
-}
 
 #[tauri::command]
 fn mark_vine_viewed(vine_id: String) -> bool {
@@ -1060,7 +1051,6 @@ pub fn run() {
             follow_vine_creator,
             unfollow_vine_creator,
             list_followed,
-            is_followed,
             mark_vine_viewed,
             publish_vine,
             start_node,
