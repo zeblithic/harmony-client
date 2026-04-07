@@ -61,13 +61,17 @@
   const vineService = new VineService();
   $effect(() => () => vineService.destroy());
 
-  // Declare allVines and vineViewedIds before wiring onChange.
-  let allVines = $state([...vineService.vines]);
+  let followedVines = $state([...vineService.followedVines]);
+  let discoverVines = $state([...vineService.discoverVines]);
   let vineViewedIds = $state(new Set(vineService.viewedIds));
+  let vineTab = $state<'following' | 'discover'>('following');
+  let followedAddresses = $state(new Set(vineService.followedAddresses));
 
   vineService.onChange = () => {
-    allVines = [...vineService.vines];
+    followedVines = [...vineService.followedVines];
+    discoverVines = [...vineService.discoverVines];
     vineViewedIds = new Set(vineService.viewedIds);
+    followedAddresses = new Set(vineService.followedAddresses);
   };
   vineService.ownDisplayName = myProfile.displayName || 'You';
 
@@ -92,6 +96,22 @@
     } catch (err) {
       console.error('Vine reshare failed', err);
       throw err;
+    }
+  }
+
+  async function handleVineFollow(address: string, name: string) {
+    try {
+      await vineService.follow(address, name);
+    } catch (err) {
+      console.error('Follow failed', err);
+    }
+  }
+
+  async function handleVineUnfollow(address: string) {
+    try {
+      await vineService.unfollow(address);
+    } catch (err) {
+      console.error('Unfollow failed', err);
     }
   }
 
@@ -180,6 +200,7 @@
       };
       await messageService.connectAdapter(adapter);
       await vineService.connectAdapter(adapter);
+      await vineService.loadFollowed();
       await fileManagerService.connectAdapter(adapter);
       avatarResolver.connectAdapter(adapter);
       resolveVideoFn = async (cid: string) => {
@@ -606,7 +627,20 @@
     />
   {/snippet}
   {#snippet vineFeed()}
-    <VineFeed vines={allVines} viewedIds={vineViewedIds} onMarkViewed={handleMarkVineViewed} onPublish={() => showVinePublish = true} onReshare={handleVineReshare} resolveVideo={resolveVideoFn} />
+    <VineFeed
+      {followedVines}
+      {discoverVines}
+      viewedIds={vineViewedIds}
+      activeTab={vineTab}
+      {followedAddresses}
+      onTabChange={(tab) => { vineTab = tab; }}
+      onMarkViewed={handleMarkVineViewed}
+      onPublish={() => showVinePublish = true}
+      onReshare={handleVineReshare}
+      onFollow={handleVineFollow}
+      onUnfollow={handleVineUnfollow}
+      resolveVideo={resolveVideoFn}
+    />
     {#if showVinePublish}
       <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />
     {/if}
