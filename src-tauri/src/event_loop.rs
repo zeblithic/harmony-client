@@ -76,7 +76,6 @@ pub async fn run(
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
-    initial_follows: Vec<String>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
@@ -667,19 +666,21 @@ fn emit_frontend_event(
             let _ = app.emit("message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
-        if let Ok(mut vine) = serde_json::from_slice::<serde_json::Value>(payload) {
-            let creator = vine.get("creatorAddress")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        // Deserialize as typed payload first to reject malformed data,
+        // then re-serialize with the source tag injected.
+        if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
             let is_followed = {
                 let set = followed_set.lock().unwrap();
-                set.contains(creator)
+                set.contains(vine.creator_address.as_str())
             };
             let source = if is_followed { "followed" } else { "discover" };
-            if let Some(obj) = vine.as_object_mut() {
-                obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+            // Re-serialize to Value so we can inject the source field
+            if let Ok(mut val) = serde_json::to_value(&vine) {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+                }
+                let _ = app.emit("vine-received", &val);
             }
-            let _ = app.emit("vine-received", &vine);
         }
     } else if key_expr.starts_with("harmony/announce/") {
         if let Some(announcement) = crate::parse_content_announcement(key_expr, payload) {

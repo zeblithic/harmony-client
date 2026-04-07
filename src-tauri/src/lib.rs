@@ -241,9 +241,8 @@ async fn start_node(
     };
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
     let follow_mgr = follows::FollowManager::load(&app_data_dir);
-    let initial_follows = follow_mgr.addresses();
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
-        initial_follows.iter().cloned().collect::<std::collections::HashSet<String>>(),
+        follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
     ));
     let followed_set_clone = followed_set.clone();
 
@@ -348,7 +347,6 @@ async fn start_node(
                         fetch_rx,
                         ingest_rx,
                         follow_rx,
-                        initial_follows,
                         followed_set_clone,
                     )
                     .await;
