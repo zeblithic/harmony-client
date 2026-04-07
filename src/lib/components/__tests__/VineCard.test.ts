@@ -108,4 +108,40 @@ describe('VineCard', () => {
     await fireEvent.click(screen.getByLabelText(/Follow/));
     expect(onPlay).not.toHaveBeenCalled();
   });
+
+  it('shows like count when count > 0', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 3, likedByMe: false } });
+    expect(screen.getByText('3')).toBeTruthy();
+  });
+
+  it('shows filled heart when liked by me', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: true } });
+    expect(screen.getByLabelText('Unlike Demo vine')).toBeTruthy();
+  });
+
+  it('shows outline heart when not liked by me', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: false } });
+    expect(screen.getByLabelText('Like Demo vine')).toBeTruthy();
+  });
+
+  it('hides like row when count is 0 and not liked', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 0, likedByMe: false } });
+    expect(screen.queryByLabelText(/Like/)).toBeNull();
+    expect(screen.queryByLabelText(/Unlike/)).toBeNull();
+  });
+
+  it('calls onToggleLike when heart clicked', async () => {
+    const onToggleLike = vi.fn();
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reactionCount: 1, likedByMe: false, onToggleLike } });
+    await fireEvent.click(screen.getByLabelText('Like Demo vine'));
+    expect(onToggleLike).toHaveBeenCalledWith(vine);
+  });
+
+  it('like button click does not trigger onPlay', async () => {
+    const onPlay = vi.fn();
+    const onToggleLike = vi.fn();
+    render(VineCard, { props: { vine, onPlay, reactionCount: 1, likedByMe: false, onToggleLike } });
+    await fireEvent.click(screen.getByLabelText('Like Demo vine'));
+    expect(onPlay).not.toHaveBeenCalled();
+  });
 });
