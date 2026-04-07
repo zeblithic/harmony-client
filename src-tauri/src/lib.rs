@@ -711,6 +711,69 @@ async fn publish_vine(
         .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
+/// Publish a vine reaction (like/unlike) to the mesh network via Zenoh pub/sub.
+///
+/// Publishes JSON to `harmony/vines/{vine_creator_address}/reactions/{vine_id}/{own_addr}`.
+#[tauri::command]
+async fn publish_vine_reaction(
+    reaction: PublishReactionPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    if reaction.vine_id.trim().is_empty() {
+        return Err("vine_id is required".to_string());
+    }
+    if reaction.vine_creator_address.trim().is_empty() {
+        return Err("vine_creator_address is required".to_string());
+    }
+
+    let (publish_tx, node_addr, display_name) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let name = if guard.node_addr.is_empty() {
+            "Unknown".to_string()
+        } else {
+            guard.node_addr[..8.min(guard.node_addr.len())].to_string()
+        };
+        (tx, guard.node_addr.clone(), name)
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let wire = VineReactionPayload {
+        vine_id: reaction.vine_id.clone(),
+        reactor_address: node_addr.clone(),
+        reactor_name: display_name,
+        liked: reaction.liked,
+        timestamp: now_secs,
+    };
+
+    let key_expr = format!(
+        "harmony/vines/{}/reactions/{}/{}",
+        reaction.vine_creator_address, reaction.vine_id, node_addr
+    );
+    let payload = serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
 #[tauri::command]
 fn list_vine_videos() -> Vec<VineVideoDto> {
     // Future: return cached/persisted vines. Real data flows via vine-received events.
@@ -1073,6 +1136,7 @@ pub fn run() {
             list_followed,
             mark_vine_viewed,
             publish_vine,
+            publish_vine_reaction,
             start_node,
             stop_node,
             connect_zenoh,
