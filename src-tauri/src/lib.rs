@@ -643,6 +643,8 @@ pub struct PublishReactionPayload {
     pub vine_id: String,
     pub vine_creator_address: String,
     pub liked: bool,
+    #[serde(default)]
+    pub reactor_name: String,
 }
 
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
@@ -726,18 +728,13 @@ async fn publish_vine_reaction(
         return Err("vine_creator_address is required".to_string());
     }
 
-    let (publish_tx, node_addr, display_name) = {
+    let (publish_tx, node_addr) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .publish_tx
             .clone()
             .ok_or_else(|| "not connected".to_string())?;
-        let name = if guard.node_addr.is_empty() {
-            "Unknown".to_string()
-        } else {
-            guard.node_addr[..8.min(guard.node_addr.len())].to_string()
-        };
-        (tx, guard.node_addr.clone(), name)
+        (tx, guard.node_addr.clone())
     };
 
     let now_secs = std::time::SystemTime::now()
@@ -748,7 +745,7 @@ async fn publish_vine_reaction(
     let wire = VineReactionPayload {
         vine_id: reaction.vine_id.clone(),
         reactor_address: node_addr.clone(),
-        reactor_name: display_name,
+        reactor_name: reaction.reactor_name,
         liked: reaction.liked,
         timestamp: now_secs,
     };
@@ -1482,12 +1479,25 @@ mod tests {
         let json = r#"{
             "vineId": "vine-abc",
             "vineCreatorAddress": "deadbeef",
-            "liked": true
+            "liked": true,
+            "reactorName": "Alice"
         }"#;
         let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.vine_id, "vine-abc");
         assert_eq!(parsed.vine_creator_address, "deadbeef");
         assert!(parsed.liked);
+        assert_eq!(parsed.reactor_name, "Alice");
+    }
+
+    #[test]
+    fn publish_reaction_payload_reactor_name_defaults() {
+        let json = r#"{
+            "vineId": "vine-abc",
+            "vineCreatorAddress": "deadbeef",
+            "liked": true
+        }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.reactor_name, "", "reactorName must default to empty");
     }
 
     #[test]

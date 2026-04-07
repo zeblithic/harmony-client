@@ -259,8 +259,9 @@ export class VineService {
         await this.adapter.invoke('publish_vine_reaction', {
           reaction: {
             vineId: vine.id,
-            vineCreatorAddress: vine.creatorAddress,
+            vineCreatorAddress: vine.creatorAddress === 'self' ? (this.ownAddress ?? vine.creatorAddress) : vine.creatorAddress,
             liked: newLiked,
+            reactorName: this.ownDisplayName,
           },
         });
       } catch {

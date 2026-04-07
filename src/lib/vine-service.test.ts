@@ -367,6 +367,23 @@ describe('VineService', () => {
         vineId: vine.id,
         vineCreatorAddress: vine.creatorAddress,
         liked: true,
+        reactorName: 'You',
+      },
+    });
+  });
+
+  it('toggleLike resolves self address for own vines', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    await svc.connectAdapter(adapter);
+    const selfVine = { ...mockVines[0], creatorAddress: 'self' };
+    await svc.toggleLike(selfVine);
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine_reaction', {
+      reaction: {
+        vineId: selfVine.id,
+        vineCreatorAddress: 'myaddr',
+        liked: true,
+        reactorName: 'You',
       },
     });
   });
