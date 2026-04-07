@@ -129,15 +129,6 @@ impl FollowManager {
         entries
     }
 
-    /// Update the display name for an existing follow entry and save.
-    /// Does nothing if the address is not followed.
-    pub fn update_name(&mut self, address: &str, name: String) {
-        if let Some(entry) = self.follows.iter_mut().find(|e| e.address == address) {
-            entry.name = Some(name);
-            self.save();
-        }
-    }
-
     /// Returns all followed addresses.
     pub fn addresses(&self) -> Vec<String> {
         self.follows.iter().map(|e| e.address.clone()).collect()
@@ -223,23 +214,6 @@ mod tests {
         assert!(mgr2.is_followed("addr2"));
         let alice = list.iter().find(|e| e.address == "addr1").unwrap();
         assert_eq!(alice.name.as_deref(), Some("Alice"));
-    }
-
-    #[test]
-    fn update_name() {
-        let dir = temp_dir();
-        let mut mgr = FollowManager::load(&dir);
-        mgr.follow("addr1".to_string(), Some("OldName".to_string()));
-        mgr.update_name("addr1", "NewName".to_string());
-
-        // Verify in-memory
-        let entry = mgr.list().into_iter().find(|e| e.address == "addr1").unwrap();
-        assert_eq!(entry.name.as_deref(), Some("NewName"));
-
-        // Verify persisted
-        let mgr2 = FollowManager::load(&dir);
-        let entry2 = mgr2.list().into_iter().find(|e| e.address == "addr1").unwrap();
-        assert_eq!(entry2.name.as_deref(), Some("NewName"));
     }
 
     #[test]

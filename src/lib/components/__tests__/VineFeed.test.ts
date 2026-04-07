@@ -193,7 +193,8 @@ describe('VineFeed', () => {
       followedVines: vines, discoverVines: [], viewedIds: makeViewedIds(),
       activeTab: 'following', followedAddresses: new Set(['a1b2c3d4', 'e5f6g7h8', 'i9j0k1l2']),
     } });
-    const badges = screen.getAllByText('Following');
-    expect(badges.length).toBeGreaterThan(0);
+    // 1 "Following" from the tab button + 3 from VineCard badges = 4
+    const matches = screen.getAllByText('Following');
+    expect(matches.length).toBe(4);
   });
 });
