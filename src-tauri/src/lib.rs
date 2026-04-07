@@ -722,7 +722,9 @@ async fn follow_vine_creator(
     }
 
     if let Some(ref tx) = guard.follow_tx {
-        let _ = tx.try_send(event_loop::FollowRequest::Follow { address });
+        if tx.try_send(event_loop::FollowRequest::Follow { address }).is_err() {
+            tracing::error!("follow_tx full — follow update not sent to event loop");
+        }
     }
 
     Ok(true)
@@ -746,7 +748,9 @@ async fn unfollow_vine_creator(
     }
 
     if let Some(ref tx) = guard.follow_tx {
-        let _ = tx.try_send(event_loop::FollowRequest::Unfollow { address });
+        if tx.try_send(event_loop::FollowRequest::Unfollow { address }).is_err() {
+            tracing::error!("follow_tx full — unfollow update not sent to event loop");
+        }
     }
 
     Ok(true)

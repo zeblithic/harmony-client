@@ -142,7 +142,11 @@ export class VineService {
       await this.adapter.invoke('unfollow_vine_creator', { address });
     }
     this.followedAddresses.delete(address);
+    const toMove = this.followedVines.filter(v => v.creatorAddress === address);
     this.followedVines = this.followedVines.filter(v => v.creatorAddress !== address);
+    if (toMove.length > 0) {
+      this.discoverVines = [...toMove, ...this.discoverVines];
+    }
     this.onChange?.();
   }
 
@@ -163,8 +167,10 @@ export class VineService {
       if (toMove.length > 0) {
         this.discoverVines = this.discoverVines.filter(v => !this.followedAddresses.has(v.creatorAddress));
         this.followedVines = [...this.followedVines, ...toMove];
-        this.onChange?.();
       }
+      // Always fire onChange so UI picks up followedAddresses changes
+      // (e.g., follow buttons render correctly even when no vines to reconcile)
+      this.onChange?.();
     } catch {
       // Not connected yet
     }

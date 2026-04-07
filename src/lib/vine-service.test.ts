@@ -294,7 +294,7 @@ describe('VineService', () => {
     });
   });
 
-  it('unfollow removes vines from followedVines', async () => {
+  it('unfollow moves vines from followedVines back to discoverVines', async () => {
     const { adapter, emit } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
     await svc.connectAdapter(adapter);
@@ -303,9 +303,12 @@ describe('VineService', () => {
       id: 'uf-1', creatorAddress: 'aabb', creatorName: 'Alice',
       createdAt: 1, videoCid: 'cid-uf1', source: 'followed',
     });
+    const discoverBefore = svc.discoverVines.length;
     await svc.unfollow('aabb');
     expect(svc.followedVines.length).toBe(0);
     expect(svc.followedAddresses.has('aabb')).toBe(false);
+    expect(svc.discoverVines.find(v => v.id === 'uf-1')).toBeTruthy();
+    expect(svc.discoverVines.length).toBe(discoverBefore + 1);
   });
 
   it('unfollow calls unfollow_vine_creator Tauri command', async () => {

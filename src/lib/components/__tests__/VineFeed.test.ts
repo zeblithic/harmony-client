@@ -176,7 +176,7 @@ describe('VineFeed', () => {
     expect(onTabChange).toHaveBeenCalledWith('discover');
   });
 
-  it('passes showFollowButton to cards in Discover tab', () => {
+  it('shows follow button on cards in Discover tab', () => {
     const discoverVines: VineVideo[] = [{
       id: 'fb-01', creatorAddress: 'xyz', creatorName: 'Eve',
       createdAt: 1700000300, videoCid: 'cid-e', title: 'Eve vine', viewed: false,
@@ -186,5 +186,14 @@ describe('VineFeed', () => {
       activeTab: 'discover', followedAddresses: new Set(),
     } });
     expect(screen.getByLabelText(/Follow Eve/)).toBeTruthy();
+  });
+
+  it('shows Following badge on cards in Following tab for followed creators', () => {
+    render(VineFeed, { props: {
+      followedVines: vines, discoverVines: [], viewedIds: makeViewedIds(),
+      activeTab: 'following', followedAddresses: new Set(['a1b2c3d4', 'e5f6g7h8', 'i9j0k1l2']),
+    } });
+    const badges = screen.getAllByText('Following');
+    expect(badges.length).toBeGreaterThan(0);
   });
 });

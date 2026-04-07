@@ -137,7 +137,7 @@
             {vine}
             onPlay={openPlayer}
             isViewed={viewedIds.has(vine.id)}
-            showFollowButton={activeTab === 'discover'}
+            showFollowButton={true}
             isFollowed={followedAddresses.has(vine.creatorAddress)}
             {onFollow}
             {onUnfollow}

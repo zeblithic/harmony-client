@@ -208,15 +208,12 @@ pub async fn run(
     )
     .await;
 
-    // Subscribe to per-creator vine announcements for initially followed creators.
-    for address in &initial_follows {
-        dispatch_action(
-            RuntimeAction::Subscribe {
-                key_expr: format!("harmony/vines/{address}/announce/**"),
-            },
-            &session, &zenoh_tx, &udp, &broadcast_addr, &app, &closing, &own_zid,
-        ).await;
-    }
+    // Note: per-creator Zenoh subscriptions are not used yet because the
+    // publish path (harmony/vines/{addr}) does not include /announce/.
+    // Once harmony-node adopts the full keyspace protocol
+    // (harmony/vines/{addr}/announce/{cid}), per-creator subscriptions can
+    // be added here for write-side filtering. For now, the wildcard
+    // subscription above catches all vines and we route by followed_set.
 
     // Subscribe to content availability announcements for the file manager.
     dispatch_action(
@@ -405,22 +402,12 @@ pub async fn run(
             Some(req) = follow_rx.recv() => {
                 match req {
                     FollowRequest::Follow { address } => {
-                        {
-                            let mut set = followed_set.lock().unwrap();
-                            set.insert(address.clone());
-                        }
-                        dispatch_action(
-                            RuntimeAction::Subscribe {
-                                key_expr: format!("harmony/vines/{address}/announce/**"),
-                            },
-                            &session, &zenoh_tx, &udp, &broadcast_addr, &app, &closing, &own_zid,
-                        ).await;
+                        let mut set = followed_set.lock().unwrap();
+                        set.insert(address);
+                        // No per-creator Zenoh subscription yet — the wildcard
+                        // catches all vines and we route by followed_set.
                     }
                     FollowRequest::Unfollow { address } => {
-                        // RuntimeAction::Unsubscribe does not exist yet, so we
-                        // only remove from the followed_set. The wildcard sub
-                        // will still catch their vines — they just won't be
-                        // tagged as "followed" anymore.
                         let mut set = followed_set.lock().unwrap();
                         set.remove(&address);
                     }
@@ -697,14 +684,7 @@ fn emit_frontend_event(
                 let set = followed_set.lock().unwrap();
                 set.contains(creator)
             };
-            let is_per_creator_sub = key_expr.contains("/announce/");
-            if !is_per_creator_sub && is_followed {
-                return; // Suppress wildcard duplicate for followed creators
-            }
-            if is_per_creator_sub && !is_followed {
-                return; // Suppress stale per-creator sub for unfollowed creator
-            }
-            let source = if is_per_creator_sub { "followed" } else { "discover" };
+            let source = if is_followed { "followed" } else { "discover" };
             if let Some(obj) = vine.as_object_mut() {
                 obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
             }
