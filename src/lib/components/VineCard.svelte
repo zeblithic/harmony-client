@@ -3,10 +3,14 @@
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onPlay, isViewed }: {
+  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow }: {
     vine: VineVideo;
     onPlay: (vine: VineVideo) => void;
     isViewed?: boolean;
+    showFollowButton?: boolean;
+    isFollowed?: boolean;
+    onFollow?: (address: string, name: string) => void;
+    onUnfollow?: (address: string) => void;
   } = $props();
 
   let viewed = $derived(isViewed ?? vine.viewed);
@@ -21,6 +25,15 @@
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       onPlay(vine);
+    }
+  }
+
+  function handleFollowClick(e: MouseEvent) {
+    e.stopPropagation();
+    if (isFollowed) {
+      onUnfollow?.(vine.creatorAddress);
+    } else {
+      onFollow?.(vine.creatorAddress, vine.creatorName);
     }
   }
 </script>
@@ -51,6 +64,17 @@
     {/if}
     {#if vine.reshareOf}
       <span class="reshare-badge">reshare</span>
+    {/if}
+    {#if showFollowButton}
+      <button
+        type="button"
+        class="follow-btn"
+        class:following={isFollowed}
+        aria-label={isFollowed ? `Unfollow ${vine.creatorName}` : `Follow ${vine.creatorName}`}
+        onclick={handleFollowClick}
+      >
+        {isFollowed ? 'Following' : 'Follow'}
+      </button>
     {/if}
   </div>
 </div>
@@ -143,5 +167,34 @@
     padding: 1px 6px;
     border-radius: 4px;
     width: fit-content;
+  }
+
+  .follow-btn {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    width: fit-content;
+    transition: background 0.15s, color 0.15s;
+    background: var(--accent);
+    color: white;
+    border: 1px solid var(--accent);
+  }
+
+  .follow-btn:hover {
+    opacity: 0.85;
+  }
+
+  .follow-btn.following {
+    background: transparent;
+    color: var(--text-muted);
+    border-color: var(--text-muted);
+  }
+
+  .follow-btn.following:hover {
+    border-color: #e74c3c;
+    color: #e74c3c;
   }
 </style>
