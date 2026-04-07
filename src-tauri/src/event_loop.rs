@@ -42,6 +42,12 @@ pub struct IngestRequest {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+/// A follow/unfollow request sent from the Tauri command thread into the event loop.
+pub enum FollowRequest {
+    Follow { address: String },
+    Unfollow { address: String },
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query { key_expr: String, payload: Vec<u8> },
@@ -69,6 +75,9 @@ pub async fn run(
     mut publish_rx: mpsc::Receiver<PublishRequest>,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
+    mut follow_rx: mpsc::Receiver<FollowRequest>,
+    initial_follows: Vec<String>,
+    followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -199,6 +208,16 @@ pub async fn run(
     )
     .await;
 
+    // Subscribe to per-creator vine announcements for initially followed creators.
+    for address in &initial_follows {
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("harmony/vines/{address}/announce/**"),
+            },
+            &session, &zenoh_tx, &udp, &broadcast_addr, &app, &closing, &own_zid,
+        ).await;
+    }
+
     // Subscribe to content availability announcements for the file manager.
     dispatch_action(
         RuntimeAction::Subscribe {
@@ -311,7 +330,7 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance);
+                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -379,6 +398,32 @@ pub async fn run(
                         ).await;
                     }
                     let _ = req.reply.send(Ok(()));
+                }
+            }
+
+            // ── Follow/unfollow requests from Tauri commands ────────
+            Some(req) = follow_rx.recv() => {
+                match req {
+                    FollowRequest::Follow { address } => {
+                        {
+                            let mut set = followed_set.lock().unwrap();
+                            set.insert(address.clone());
+                        }
+                        dispatch_action(
+                            RuntimeAction::Subscribe {
+                                key_expr: format!("harmony/vines/{address}/announce/**"),
+                            },
+                            &session, &zenoh_tx, &udp, &broadcast_addr, &app, &closing, &own_zid,
+                        ).await;
+                    }
+                    FollowRequest::Unfollow { address } => {
+                        // RuntimeAction::Unsubscribe does not exist yet, so we
+                        // only remove from the followed_set. The wildcard sub
+                        // will still catch their vines — they just won't be
+                        // tagged as "followed" anymore.
+                        let mut set = followed_set.lock().unwrap();
+                        set.remove(&address);
+                    }
                 }
             }
 
@@ -623,7 +668,13 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
-fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_distance: Option<u8>) {
+fn emit_frontend_event(
+    app: &AppHandle,
+    key_expr: &str,
+    payload: &[u8],
+    hop_distance: Option<u8>,
+    followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
             update.hop_distance = hop_distance;
@@ -638,7 +689,22 @@ fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_dist
             let _ = app.emit("message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
-        if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
+        if let Ok(mut vine) = serde_json::from_slice::<serde_json::Value>(payload) {
+            let creator = vine.get("creatorAddress")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_followed = {
+                let set = followed_set.lock().unwrap();
+                set.contains(creator)
+            };
+            let is_per_creator_sub = key_expr.contains("/announce/");
+            if !is_per_creator_sub && is_followed {
+                return; // Suppress wildcard duplicate
+            }
+            let source = if is_per_creator_sub { "followed" } else { "discover" };
+            if let Some(obj) = vine.as_object_mut() {
+                obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+            }
             let _ = app.emit("vine-received", &vine);
         }
     } else if key_expr.starts_with("harmony/announce/") {

@@ -26,6 +26,12 @@ struct NodeState {
     fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
     /// Channel for routing content-ingest requests through the event loop.
     ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
+    /// Channel for routing follow/unfollow requests through the event loop.
+    follow_tx: Option<tokio::sync::mpsc::Sender<event_loop::FollowRequest>>,
+    /// Persistent follow manager (disk-backed follow list).
+    follow_mgr: Option<follows::FollowManager>,
+    /// Shared set of followed addresses (read by the event loop for source tagging).
+    followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -174,7 +180,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, _follow_mgr, _followed_set) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -185,13 +191,23 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (guard.shutdown_tx.take(), guard.thread.take(), guard.publish_tx.take(), guard.fetch_tx.take(), guard.ingest_tx.take())
+        (
+            guard.shutdown_tx.take(),
+            guard.thread.take(),
+            guard.publish_tx.take(),
+            guard.fetch_tx.take(),
+            guard.ingest_tx.take(),
+            guard.follow_tx.take(),
+            guard.follow_mgr.take(),
+            guard.followed_set.take(),
+        )
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
+    drop(follow_tx);
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -216,6 +232,20 @@ async fn start_node(
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
     let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
+    let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
+
+    // Load the follow list from disk and create the shared followed set.
+    let app_data_dir = {
+        use tauri::Manager;
+        app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?
+    };
+    std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
+    let follow_mgr = follows::FollowManager::load(&app_data_dir);
+    let initial_follows = follow_mgr.addresses();
+    let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
+        initial_follows.iter().cloned().collect::<std::collections::HashSet<String>>(),
+    ));
+    let followed_set_clone = followed_set.clone();
 
     let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -226,10 +256,14 @@ async fn start_node(
         let old_publish = guard.publish_tx.take();
         let old_fetch = guard.fetch_tx.take();
         let old_ingest = guard.ingest_tx.take();
+        let old_follow = guard.follow_tx.take();
+        let _old_follow_mgr = guard.follow_mgr.take();
+        let _old_followed_set = guard.followed_set.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
+        drop(old_follow);
         stop_handles(old_shutdown, old_thread);
 
         // ── Identity (serialized by the lock — no concurrent generation race)
@@ -313,6 +347,9 @@ async fn start_node(
                         publish_rx,
                         fetch_rx,
                         ingest_rx,
+                        follow_rx,
+                        initial_follows,
+                        followed_set_clone,
                     )
                     .await;
                 });
@@ -324,6 +361,9 @@ async fn start_node(
         guard.publish_tx = Some(publish_tx);
         guard.fetch_tx = Some(fetch_tx);
         guard.ingest_tx = Some(ingest_tx);
+        guard.follow_tx = Some(follow_tx);
+        guard.follow_mgr = Some(follow_mgr);
+        guard.followed_set = Some(followed_set);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
