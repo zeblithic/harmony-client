@@ -207,6 +207,21 @@ pub async fn run(
     )
     .await;
 
+    // Subscribe to vine reactions (likes/unlikes).
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/vines/*/reactions/**".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &udp,
+        &broadcast_addr,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
     // Note: per-creator Zenoh subscriptions are not used yet because the
     // publish path (harmony/vines/{addr}) does not include /announce/.
     // Once harmony-node adopts the full keyspace protocol
@@ -666,20 +681,27 @@ fn emit_frontend_event(
             let _ = app.emit("message-received", &msg);
         }
     } else if key_expr.starts_with("harmony/vines/") {
-        // Deserialize as typed payload first to reject malformed data,
-        // then re-serialize with the source tag injected.
-        if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
-            let is_followed = {
-                let set = followed_set.lock().unwrap();
-                set.contains(vine.creator_address.as_str())
-            };
-            let source = if is_followed { "followed" } else { "discover" };
-            // Re-serialize to Value so we can inject the source field
-            if let Ok(mut val) = serde_json::to_value(&vine) {
-                if let Some(obj) = val.as_object_mut() {
-                    obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+        if key_expr.contains("/reactions/") {
+            // Vine reaction event — emit directly to frontend.
+            if let Ok(reaction) = serde_json::from_slice::<crate::VineReactionPayload>(payload) {
+                let _ = app.emit("vine-reaction-received", &reaction);
+            }
+        } else {
+            // Vine descriptor — deserialize as typed payload first to reject malformed data,
+            // then re-serialize with the source tag injected.
+            if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
+                let is_followed = {
+                    let set = followed_set.lock().unwrap();
+                    set.contains(vine.creator_address.as_str())
+                };
+                let source = if is_followed { "followed" } else { "discover" };
+                // Re-serialize to Value so we can inject the source field
+                if let Ok(mut val) = serde_json::to_value(&vine) {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+                    }
+                    let _ = app.emit("vine-received", &val);
                 }
-                let _ = app.emit("vine-received", &val);
             }
         }
     } else if key_expr.starts_with("harmony/announce/") {
