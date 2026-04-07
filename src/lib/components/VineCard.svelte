@@ -23,6 +23,8 @@
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
+      // Don't intercept keyboard events from child buttons (e.g. follow button)
+      if (e.target instanceof HTMLButtonElement) return;
       e.preventDefault();
       onPlay(vine);
     }
