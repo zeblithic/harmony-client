@@ -699,7 +699,10 @@ fn emit_frontend_event(
             };
             let is_per_creator_sub = key_expr.contains("/announce/");
             if !is_per_creator_sub && is_followed {
-                return; // Suppress wildcard duplicate
+                return; // Suppress wildcard duplicate for followed creators
+            }
+            if is_per_creator_sub && !is_followed {
+                return; // Suppress stale per-creator sub for unfollowed creator
             }
             let source = if is_per_creator_sub { "followed" } else { "discover" };
             if let Some(obj) = vine.as_object_mut() {
