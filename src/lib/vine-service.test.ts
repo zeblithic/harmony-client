@@ -341,4 +341,27 @@ describe('VineService', () => {
     expect(svc.followedAddresses.has('aabb')).toBe(true);
     expect(svc.followedAddresses.has('ccdd')).toBe(true);
   });
+
+  it('reconciles misrouted vines after loadFollowed', async () => {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'list_followed') {
+        return Promise.resolve([
+          { address: 'aabb', name: 'Alice', followedAt: 1 },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+    // Vine arrives before loadFollowed — routes to discover
+    emit('vine-received', {
+      id: 'recon-1', creatorAddress: 'aabb', creatorName: 'Alice',
+      createdAt: 1, videoCid: 'cid-r1', source: 'discover',
+    });
+    expect(svc.discoverVines.find(v => v.id === 'recon-1')).toBeTruthy();
+    // Now load follows — should move to followed
+    await svc.loadFollowed();
+    expect(svc.discoverVines.find(v => v.id === 'recon-1')).toBeFalsy();
+    expect(svc.followedVines.find(v => v.id === 'recon-1')).toBeTruthy();
+  });
 });

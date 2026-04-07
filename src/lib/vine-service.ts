@@ -157,6 +157,14 @@ export class VineService {
       for (const entry of entries) {
         this.followedAddresses.add(entry.address);
       }
+      // Reconcile: move any vines from discover to followed that
+      // arrived before the follow list was loaded.
+      const toMove = this.discoverVines.filter(v => this.followedAddresses.has(v.creatorAddress));
+      if (toMove.length > 0) {
+        this.discoverVines = this.discoverVines.filter(v => !this.followedAddresses.has(v.creatorAddress));
+        this.followedVines = [...this.followedVines, ...toMove];
+        this.onChange?.();
+      }
     } catch {
       // Not connected yet
     }
