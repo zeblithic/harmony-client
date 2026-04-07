@@ -625,6 +625,26 @@ pub struct FollowEntryResponse {
     pub followed_at: u64,
 }
 
+/// Vine reaction published/received over Zenoh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineReactionPayload {
+    pub vine_id: String,
+    pub reactor_address: String,
+    pub reactor_name: String,
+    pub liked: bool,
+    pub timestamp: u64,
+}
+
+/// Vine reaction sent from the frontend to publish.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishReactionPayload {
+    pub vine_id: String,
+    pub vine_creator_address: String,
+    pub liked: bool,
+}
+
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
 ///
 /// Publishes JSON to `harmony/vines/{creator_address}`.
@@ -1355,6 +1375,54 @@ mod tests {
         assert_eq!(parsed.creator_name, "", "creatorName must default to empty");
         assert!(parsed.title.is_none());
         assert!(parsed.reshare_of.is_none());
+    }
+
+    #[test]
+    fn vine_reaction_payload_roundtrip() {
+        let reaction = VineReactionPayload {
+            vine_id: "vine-abc-1234".to_string(),
+            reactor_address: "deadbeef01020304".to_string(),
+            reactor_name: "Alice".to_string(),
+            liked: true,
+            timestamp: 1711600000,
+        };
+        let json = serde_json::to_vec(&reaction).unwrap();
+        let parsed: VineReactionPayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.vine_id, "vine-abc-1234");
+        assert_eq!(parsed.reactor_address, "deadbeef01020304");
+        assert_eq!(parsed.reactor_name, "Alice");
+        assert!(parsed.liked);
+        assert_eq!(parsed.timestamp, 1711600000);
+    }
+
+    #[test]
+    fn vine_reaction_payload_camel_case() {
+        let reaction = VineReactionPayload {
+            vine_id: "vine-1".to_string(),
+            reactor_address: "aa".to_string(),
+            reactor_name: "Bob".to_string(),
+            liked: false,
+            timestamp: 0,
+        };
+        let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
+        assert!(json.contains("\"vineId\""), "expected camelCase: {json}");
+        assert!(json.contains("\"reactorAddress\""), "expected camelCase: {json}");
+        assert!(json.contains("\"reactorName\""), "expected camelCase: {json}");
+        assert!(!json.contains("\"vine_id\""), "unexpected snake_case: {json}");
+        assert!(!json.contains("\"reactor_address\""), "unexpected snake_case: {json}");
+    }
+
+    #[test]
+    fn publish_reaction_payload_deserialize() {
+        let json = r#"{
+            "vineId": "vine-abc",
+            "vineCreatorAddress": "deadbeef",
+            "liked": true
+        }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.vine_id, "vine-abc");
+        assert_eq!(parsed.vine_creator_address, "deadbeef");
+        assert!(parsed.liked);
     }
 
     #[test]
