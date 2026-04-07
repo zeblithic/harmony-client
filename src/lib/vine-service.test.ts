@@ -235,4 +235,110 @@ describe('VineService', () => {
     svc.destroy();
     expect(unlisten).toHaveBeenCalledOnce();
   });
+
+  // ── Follow / feed routing ──────────────────────────────────────────
+
+  it('routes "followed" vines to followedVines', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'fv-1', creatorAddress: 'aabb', creatorName: 'Alice',
+      createdAt: 1, videoCid: 'cid-f1', source: 'followed',
+    });
+    expect(svc.followedVines.length).toBe(1);
+    expect(svc.discoverVines.length).toBe(mockVines.length);
+  });
+
+  it('routes "discover" vines to discoverVines', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'dv-1', creatorAddress: 'ccdd', creatorName: 'Bob',
+      createdAt: 1, videoCid: 'cid-d1', source: 'discover',
+    });
+    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+    expect(svc.followedVines.length).toBe(0);
+  });
+
+  it('treats vines without source as discover', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'ns-1', creatorAddress: 'eeff', creatorName: 'Carol',
+      createdAt: 1, videoCid: 'cid-ns',
+    });
+    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+  });
+
+  it('follow moves existing vines from discover to followed', async () => {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'mv-1', creatorAddress: 'aabb', creatorName: 'Alice',
+      createdAt: 1, videoCid: 'cid-mv1', source: 'discover',
+    });
+    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+    await svc.follow('aabb', 'Alice');
+    expect(svc.discoverVines.find(v => v.id === 'mv-1')).toBeFalsy();
+    expect(svc.followedVines.find(v => v.id === 'mv-1')).toBeTruthy();
+  });
+
+  it('follow calls follow_creator Tauri command', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    await svc.connectAdapter(adapter);
+    await svc.follow('aabb', 'Alice');
+    expect(adapter.invoke).toHaveBeenCalledWith('follow_vine_creator', {
+      address: 'aabb', name: 'Alice',
+    });
+  });
+
+  it('unfollow removes vines from followedVines', async () => {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    await svc.connectAdapter(adapter);
+    svc.followedAddresses.add('aabb');
+    emit('vine-received', {
+      id: 'uf-1', creatorAddress: 'aabb', creatorName: 'Alice',
+      createdAt: 1, videoCid: 'cid-uf1', source: 'followed',
+    });
+    await svc.unfollow('aabb');
+    expect(svc.followedVines.length).toBe(0);
+    expect(svc.followedAddresses.has('aabb')).toBe(false);
+  });
+
+  it('unfollow calls unfollow_vine_creator Tauri command', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    await svc.connectAdapter(adapter);
+    svc.followedAddresses.add('aabb');
+    await svc.unfollow('aabb');
+    expect(adapter.invoke).toHaveBeenCalledWith('unfollow_vine_creator', {
+      address: 'aabb',
+    });
+  });
+
+  it('isFollowed checks local cache', () => {
+    svc.followedAddresses.add('aabb');
+    expect(svc.isFollowed('aabb')).toBe(true);
+    expect(svc.isFollowed('ccdd')).toBe(false);
+  });
+
+  it('loadFollowed populates followedAddresses', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'list_followed') {
+        return Promise.resolve([
+          { address: 'aabb', name: 'Alice', followedAt: 1 },
+          { address: 'ccdd', name: null, followedAt: 2 },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+    await svc.loadFollowed();
+    expect(svc.followedAddresses.has('aabb')).toBe(true);
+    expect(svc.followedAddresses.has('ccdd')).toBe(true);
+  });
 });
