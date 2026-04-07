@@ -19,6 +19,8 @@
     onFollow,
     onUnfollow,
     resolveVideo,
+    getReaction,
+    onToggleLike,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -32,6 +34,8 @@
     onFollow?: (address: string, name: string) => void;
     onUnfollow?: (address: string) => void;
     resolveVideo?: (cid: string) => Promise<string>;
+    getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
+    onToggleLike?: (vine: VineVideo) => void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
@@ -132,6 +136,7 @@
   {:else}
     <div class="feed-list" role="list" aria-label="Vine feed">
       {#each filteredVines as vine (vine.id)}
+        {@const reaction = getReaction?.(vine.id)}
         <div role="listitem">
           <VineCard
             {vine}
@@ -141,6 +146,9 @@
             isFollowed={followedAddresses.has(vine.creatorAddress)}
             {onFollow}
             {onUnfollow}
+            reactionCount={reaction?.count ?? 0}
+            likedByMe={reaction?.likedByMe ?? false}
+            {onToggleLike}
           />
         </div>
       {/each}
@@ -156,6 +164,9 @@
     onPrevious={activeIndex > 0 ? previousVine : undefined}
     {onReshare}
     {resolveVideo}
+    reactionCount={getReaction?.(activeVine.id)?.count ?? 0}
+    likedByMe={getReaction?.(activeVine.id)?.likedByMe ?? false}
+    {onToggleLike}
   />
 {/if}
 

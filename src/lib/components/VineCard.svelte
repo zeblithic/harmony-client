@@ -3,7 +3,7 @@
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow }: {
+  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike }: {
     vine: VineVideo;
     onPlay: (vine: VineVideo) => void;
     isViewed?: boolean;
@@ -11,6 +11,9 @@
     isFollowed?: boolean;
     onFollow?: (address: string, name: string) => void;
     onUnfollow?: (address: string) => void;
+    reactionCount?: number;
+    likedByMe?: boolean;
+    onToggleLike?: (vine: VineVideo) => void;
   } = $props();
 
   let viewed = $derived(isViewed ?? vine.viewed);
@@ -37,6 +40,11 @@
     } else {
       onFollow?.(vine.creatorAddress, vine.creatorName);
     }
+  }
+
+  function handleLikeClick(e: MouseEvent) {
+    e.stopPropagation();
+    onToggleLike?.(vine);
   }
 </script>
 
@@ -77,6 +85,19 @@
       >
         {isFollowed ? 'Following' : 'Follow'}
       </button>
+    {/if}
+    {#if reactionCount > 0 || likedByMe}
+      <div class="card-like-row">
+        <button
+          type="button"
+          class="card-heart"
+          onclick={handleLikeClick}
+          aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
+        >
+          {likedByMe ? '❤️' : '🤍'}
+        </button>
+        <span class="card-like-count">{reactionCount}</span>
+      </div>
     {/if}
   </div>
 </div>
@@ -198,5 +219,32 @@
   .follow-btn.following:hover {
     border-color: #e74c3c;
     color: #e74c3c;
+  }
+
+  .card-like-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 2px;
+  }
+
+  .card-heart {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.8rem;
+    padding: 0;
+    line-height: 1;
+    transition: transform 0.15s;
+  }
+
+  .card-heart:hover {
+    transform: scale(1.2);
+  }
+
+  .card-like-count {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-weight: 500;
   }
 </style>

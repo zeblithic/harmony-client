@@ -38,6 +38,10 @@ export class VineService {
   /** Locally tracked viewed vine IDs. */
   viewedIds = new Set<string>();
   followedAddresses = new Set<string>();
+  /** In-memory reaction state per vine. */
+  private reactionMap = new Map<string, { count: number; likedByMe: boolean; reactors: Set<string> }>();
+  /** Vine IDs with an in-flight toggleLike call — prevents concurrent mutations. */
+  private likePending = new Set<string>();
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -73,6 +77,48 @@ export class VineService {
       },
     );
     this.unlisteners.push(unlisten);
+
+    const unlistenReaction = await adapter.listen(
+      'vine-reaction-received',
+      (event) => {
+        const wire = event.payload as {
+          vineId: string;
+          reactorAddress: string;
+          reactorName: string;
+          liked: boolean;
+          timestamp: number;
+        };
+
+        // Skip self-echo — already applied optimistically
+        if (wire.reactorAddress === 'self' || (this.ownAddress && wire.reactorAddress === this.ownAddress)) {
+          return;
+        }
+
+        // Ignore reactions for vines not in our feed
+        const known = this.followedVines.some(v => v.id === wire.vineId)
+          || this.discoverVines.some(v => v.id === wire.vineId);
+        if (!known) return;
+
+        const entry = this.reactionMap.get(wire.vineId)
+          ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+
+        const alreadyTracked = entry.reactors.has(wire.reactorAddress);
+
+        if (wire.liked) {
+          if (alreadyTracked) return; // Already counted
+          entry.reactors.add(wire.reactorAddress);
+          entry.count += 1;
+        } else {
+          if (!alreadyTracked) return; // Nothing to remove
+          entry.reactors.delete(wire.reactorAddress);
+          entry.count = Math.max(0, entry.count - 1);
+        }
+
+        this.reactionMap.set(wire.vineId, entry);
+        this.onChange?.();
+      },
+    );
+    this.unlisteners.push(unlistenReaction);
   }
 
   /** Publish a vine via Tauri command. */
@@ -183,6 +229,81 @@ export class VineService {
 
   isFollowed(address: string): boolean {
     return this.followedAddresses.has(address);
+  }
+
+  /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
+  getReaction(vineId: string): { count: number; likedByMe: boolean } {
+    const entry = this.reactionMap.get(vineId);
+    return entry
+      ? { count: entry.count, likedByMe: entry.likedByMe }
+      : { count: 0, likedByMe: false };
+  }
+
+  /** Toggle like on a vine with optimistic update. */
+  async toggleLike(vine: VineVideo): Promise<void> {
+    if (this.likePending.has(vine.id)) return; // Prevent concurrent toggleLike calls
+    this.likePending.add(vine.id);
+    try {
+      await this._toggleLikeInner(vine);
+    } finally {
+      this.likePending.delete(vine.id);
+    }
+  }
+
+  private async _toggleLikeInner(vine: VineVideo): Promise<void> {
+    const entry = this.reactionMap.get(vine.id) ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+    const wasLiked = entry.likedByMe;
+    const newLiked = !wasLiked;
+
+    // Optimistic update — use ownAddress when available so the reactor key
+    // matches the real hex address in self-echo dedup (avoids double-count
+    // if a self-echo arrives before ownAddress is set).
+    const selfKey = this.ownAddress ?? 'self';
+    // Migrate stale 'self' reactor entry if ownAddress was set after initial like
+    if (selfKey !== 'self' && entry.reactors.has('self')) {
+      entry.reactors.delete('self');
+      entry.reactors.add(selfKey);
+    }
+    entry.likedByMe = newLiked;
+    entry.count = Math.max(0, entry.count + (newLiked ? 1 : -1));
+    if (newLiked) {
+      entry.reactors.add(selfKey);
+    } else {
+      entry.reactors.delete(selfKey);
+    }
+    this.reactionMap.set(vine.id, entry);
+    this.onChange?.();
+
+    if (this.adapter) {
+      // Can't safely publish without our own address — self-echo suppression
+      // and reactor dedup both depend on knowing the real hex address.
+      if (!this.ownAddress) return;
+      const creatorAddr =
+        vine.creatorAddress === 'self'
+          ? this.ownAddress
+          : vine.creatorAddress;
+      try {
+        await this.adapter.invoke('publish_vine_reaction', {
+          reaction: {
+            vineId: vine.id,
+            vineCreatorAddress: creatorAddr,
+            liked: newLiked,
+            reactorName: this.ownDisplayName,
+          },
+        });
+      } catch {
+        // Rollback on failure
+        entry.likedByMe = wasLiked;
+        entry.count = Math.max(0, entry.count + (wasLiked ? 1 : -1));
+        if (wasLiked) {
+          entry.reactors.add(selfKey);
+        } else {
+          entry.reactors.delete(selfKey);
+        }
+        this.reactionMap.set(vine.id, entry);
+        this.onChange?.();
+      }
+    }
   }
 
   /** Convert wire format to frontend VineVideo type. */

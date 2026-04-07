@@ -224,7 +224,8 @@ describe('VineService', () => {
     const external = vi.fn();
     svc.addUnlisten(external);
     svc.destroy();
-    expect(unlisten).toHaveBeenCalledOnce();
+    // Two adapter listeners registered (vine-received + vine-reaction-received)
+    expect(unlisten).toHaveBeenCalledTimes(2);
     expect(external).toHaveBeenCalledOnce();
   });
 
@@ -233,7 +234,8 @@ describe('VineService', () => {
     await svc.connectAdapter(adapter);
     svc.destroy();
     svc.destroy();
-    expect(unlisten).toHaveBeenCalledOnce();
+    // Two adapter listeners registered (vine-received + vine-reaction-received)
+    expect(unlisten).toHaveBeenCalledTimes(2);
   });
 
   // ── Follow / feed routing ──────────────────────────────────────────
@@ -328,6 +330,108 @@ describe('VineService', () => {
     expect(svc.isFollowed('ccdd')).toBe(false);
   });
 
+  // ── Reactions ──────────────────────────────────────────────────────
+
+  it('getReaction returns zero state for unknown vine', () => {
+    const r = svc.getReaction('nonexistent');
+    expect(r.count).toBe(0);
+    expect(r.likedByMe).toBe(false);
+  });
+
+  it('toggleLike optimistically sets likedByMe and increments count', async () => {
+    const vine = mockVines[0];
+    svc.onChange = vi.fn();
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(true);
+    expect(r.count).toBe(1);
+    expect(svc.onChange).toHaveBeenCalled();
+  });
+
+  it('toggleLike again unlikes and decrements count', async () => {
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(false);
+    expect(r.count).toBe(0);
+  });
+
+  it('toggleLike calls publish_vine_reaction on adapter', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine_reaction', {
+      reaction: {
+        vineId: vine.id,
+        vineCreatorAddress: vine.creatorAddress,
+        liked: true,
+        reactorName: 'You',
+      },
+    });
+  });
+
+  it('toggleLike resolves self address for own vines', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    await svc.connectAdapter(adapter);
+    const selfVine = { ...mockVines[0], creatorAddress: 'self' };
+    await svc.toggleLike(selfVine);
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine_reaction', {
+      reaction: {
+        vineId: selfVine.id,
+        vineCreatorAddress: 'myaddr',
+        liked: true,
+        reactorName: 'You',
+      },
+    });
+  });
+
+  it('toggleLike skips publish when ownAddress is null', async () => {
+    const { adapter } = createMockAdapter();
+    // ownAddress is null (not yet fetched)
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    // Optimistic update should still apply
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+    // But no publish should have been sent
+    expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine_reaction', expect.anything());
+  });
+
+  it('toggleLike migrates stale self entry when ownAddress becomes available', async () => {
+    // Like offline (ownAddress is null) — stores 'self' in reactors
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+    // Now ownAddress gets set
+    svc.ownAddress = 'myaddr';
+    // Unlike — should migrate 'self' to 'myaddr' and correctly decrement
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(false);
+    expect(svc.getReaction(vine.id).count).toBe(0);
+  });
+
+  it('toggleLike works offline without adapter', async () => {
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).likedByMe).toBe(true);
+  });
+
+  it('toggleLike rolls back on adapter error', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network error'));
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    const r = svc.getReaction(vine.id);
+    expect(r.likedByMe).toBe(false);
+    expect(r.count).toBe(0);
+  });
+
   it('loadFollowed populates followedAddresses', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
@@ -343,6 +447,103 @@ describe('VineService', () => {
     await svc.loadFollowed();
     expect(svc.followedAddresses.has('aabb')).toBe(true);
     expect(svc.followedAddresses.has('ccdd')).toBe(true);
+  });
+
+  it('incoming reaction increments count', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    const r = svc.getReaction(mockVines[0].id);
+    expect(r.count).toBe(1);
+    expect(r.likedByMe).toBe(false);
+  });
+
+  it('incoming reaction deduplicates by reactor address', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    const event = {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    };
+    emit('vine-reaction-received', event);
+    emit('vine-reaction-received', event);
+    expect(svc.getReaction(mockVines[0].id).count).toBe(1);
+  });
+
+  it('incoming unlike decrements count', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: false,
+      timestamp: 1700000600,
+    });
+    expect(svc.getReaction(mockVines[0].id).count).toBe(0);
+  });
+
+  it('skips self-echo reactions', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).count).toBe(1);
+    emit('vine-reaction-received', {
+      vineId: vine.id,
+      reactorAddress: 'myaddr',
+      reactorName: 'You',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.getReaction(vine.id).count).toBe(1);
+  });
+
+  it('ignores reactions for unknown vine IDs', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
+    emit('vine-reaction-received', {
+      vineId: 'nonexistent-vine',
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.onChange).not.toHaveBeenCalled();
+  });
+
+  it('calls onChange when reaction arrives', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-xyz',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.onChange).toHaveBeenCalledOnce();
   });
 
   it('reconciles misrouted vines after loadFollowed', async () => {

@@ -101,4 +101,34 @@ describe('VinePlayer', () => {
       expect(screen.getByText('not found')).toBeTruthy();
     });
   });
+
+  // ── Like button ──────────────────────────────────────────────────
+
+  it('renders like button when onToggleLike provided', () => {
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), onToggleLike: vi.fn(), reactionCount: 0, likedByMe: false } });
+    expect(screen.getByLabelText('Like Demo vine')).toBeTruthy();
+  });
+
+  it('does not render like button when onToggleLike absent', () => {
+    render(VinePlayer, { props: { vine, onClose: vi.fn() } });
+    expect(screen.queryByLabelText(/Like/)).toBeNull();
+    expect(screen.queryByLabelText(/Unlike/)).toBeNull();
+  });
+
+  it('shows filled heart when liked', () => {
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), onToggleLike: vi.fn(), reactionCount: 3, likedByMe: true } });
+    expect(screen.getByLabelText('Unlike Demo vine')).toBeTruthy();
+  });
+
+  it('shows reaction count', () => {
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), onToggleLike: vi.fn(), reactionCount: 5, likedByMe: false } });
+    expect(screen.getByText('5')).toBeTruthy();
+  });
+
+  it('calls onToggleLike when like button clicked', async () => {
+    const onToggleLike = vi.fn();
+    render(VinePlayer, { props: { vine, onClose: vi.fn(), onToggleLike, reactionCount: 0, likedByMe: false } });
+    await fireEvent.click(screen.getByLabelText('Like Demo vine'));
+    expect(onToggleLike).toHaveBeenCalledWith(vine);
+  });
 });

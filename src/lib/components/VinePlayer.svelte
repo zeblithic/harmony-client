@@ -4,13 +4,16 @@
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo }: {
+  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo, onToggleLike, reactionCount = 0, likedByMe = false }: {
     vine: VineVideo;
     onClose: () => void;
     onNext?: () => void;
     onPrevious?: () => void;
     onReshare?: (vine: VineVideo) => Promise<void> | void;
     resolveVideo?: (cid: string) => Promise<string>;
+    onToggleLike?: (vine: VineVideo) => void;
+    reactionCount?: number;
+    likedByMe?: boolean;
   } = $props();
 
   let overlayEl: HTMLDivElement;
@@ -147,6 +150,20 @@
       <p class="reshare-label">Reshared</p>
     {/if}
     <div class="footer-actions">
+      {#if onToggleLike}
+        <button
+          type="button"
+          class="action-btn like-btn"
+          class:liked={likedByMe}
+          onclick={() => onToggleLike?.(vine)}
+          aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
+        >
+          <span class="heart">{likedByMe ? '❤️' : '🤍'}</span>
+          {#if reactionCount > 0}
+            <span class="like-count">{reactionCount}</span>
+          {/if}
+        </button>
+      {/if}
       {#if onReshare}
         <button type="button" class="action-btn" onclick={handleReshare} disabled={resharing} aria-label="Reshare vine">
           <span aria-hidden="true">↗</span> {resharing ? 'Resharing\u2026' : 'Reshare'}
@@ -345,5 +362,18 @@
   .action-btn:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+
+  .like-btn.liked {
+    color: #ed4245;
+    border-color: rgba(237, 66, 69, 0.3);
+  }
+
+  .heart {
+    font-size: 1rem;
+  }
+
+  .like-count {
+    font-size: 0.8rem;
   }
 </style>

@@ -625,6 +625,28 @@ pub struct FollowEntryResponse {
     pub followed_at: u64,
 }
 
+/// Vine reaction published/received over Zenoh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VineReactionPayload {
+    pub vine_id: String,
+    pub reactor_address: String,
+    pub reactor_name: String,
+    pub liked: bool,
+    pub timestamp: u64,
+}
+
+/// Vine reaction sent from the frontend to publish.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishReactionPayload {
+    pub vine_id: String,
+    pub vine_creator_address: String,
+    pub liked: bool,
+    #[serde(default)]
+    pub reactor_name: String,
+}
+
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
 ///
 /// Publishes JSON to `harmony/vines/{creator_address}`.
@@ -675,6 +697,64 @@ async fn publish_vine(
     let key_expr = format!("harmony/vines/{}", node_addr);
     let payload =
         serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    publish_tx
+        .send(event_loop::PublishRequest {
+            key_expr,
+            payload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
+/// Publish a vine reaction (like/unlike) to the mesh network via Zenoh pub/sub.
+///
+/// Publishes JSON to `harmony/vines/{vine_creator_address}/reactions/{vine_id}/{own_addr}`.
+#[tauri::command]
+async fn publish_vine_reaction(
+    reaction: PublishReactionPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    if reaction.vine_id.trim().is_empty() {
+        return Err("vine_id is required".to_string());
+    }
+    if reaction.vine_creator_address.trim().is_empty() {
+        return Err("vine_creator_address is required".to_string());
+    }
+
+    let (publish_tx, node_addr) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        (tx, guard.node_addr.clone())
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let wire = VineReactionPayload {
+        vine_id: reaction.vine_id.clone(),
+        reactor_address: node_addr.clone(),
+        reactor_name: reaction.reactor_name,
+        liked: reaction.liked,
+        timestamp: now_secs,
+    };
+
+    let key_expr = format!(
+        "harmony/vines/{}/reactions/{}/{}",
+        reaction.vine_creator_address, reaction.vine_id, node_addr
+    );
+    let payload = serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     publish_tx
@@ -1053,6 +1133,7 @@ pub fn run() {
             list_followed,
             mark_vine_viewed,
             publish_vine,
+            publish_vine_reaction,
             start_node,
             stop_node,
             connect_zenoh,
@@ -1355,6 +1436,79 @@ mod tests {
         assert_eq!(parsed.creator_name, "", "creatorName must default to empty");
         assert!(parsed.title.is_none());
         assert!(parsed.reshare_of.is_none());
+    }
+
+    #[test]
+    fn vine_reaction_payload_roundtrip() {
+        let reaction = VineReactionPayload {
+            vine_id: "vine-abc-1234".to_string(),
+            reactor_address: "deadbeef01020304".to_string(),
+            reactor_name: "Alice".to_string(),
+            liked: true,
+            timestamp: 1711600000,
+        };
+        let json = serde_json::to_vec(&reaction).unwrap();
+        let parsed: VineReactionPayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.vine_id, "vine-abc-1234");
+        assert_eq!(parsed.reactor_address, "deadbeef01020304");
+        assert_eq!(parsed.reactor_name, "Alice");
+        assert!(parsed.liked);
+        assert_eq!(parsed.timestamp, 1711600000);
+    }
+
+    #[test]
+    fn vine_reaction_payload_camel_case() {
+        let reaction = VineReactionPayload {
+            vine_id: "vine-1".to_string(),
+            reactor_address: "aa".to_string(),
+            reactor_name: "Bob".to_string(),
+            liked: false,
+            timestamp: 0,
+        };
+        let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
+        assert!(json.contains("\"vineId\""), "expected camelCase: {json}");
+        assert!(json.contains("\"reactorAddress\""), "expected camelCase: {json}");
+        assert!(json.contains("\"reactorName\""), "expected camelCase: {json}");
+        assert!(!json.contains("\"vine_id\""), "unexpected snake_case: {json}");
+        assert!(!json.contains("\"reactor_address\""), "unexpected snake_case: {json}");
+        assert!(!json.contains("\"reactor_name\""), "unexpected snake_case: {json}");
+    }
+
+    #[test]
+    fn publish_reaction_payload_deserialize() {
+        let json = r#"{
+            "vineId": "vine-abc",
+            "vineCreatorAddress": "deadbeef",
+            "liked": true,
+            "reactorName": "Alice"
+        }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.vine_id, "vine-abc");
+        assert_eq!(parsed.vine_creator_address, "deadbeef");
+        assert!(parsed.liked);
+        assert_eq!(parsed.reactor_name, "Alice");
+    }
+
+    #[test]
+    fn publish_reaction_payload_reactor_name_defaults() {
+        let json = r#"{
+            "vineId": "vine-abc",
+            "vineCreatorAddress": "deadbeef",
+            "liked": true
+        }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.reactor_name, "", "reactorName must default to empty");
+    }
+
+    #[test]
+    fn publish_reaction_payload_liked_false() {
+        let json = r#"{
+        "vineId": "vine-xyz",
+        "vineCreatorAddress": "aabb",
+        "liked": false
+    }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert!(!parsed.liked);
     }
 
     #[test]
