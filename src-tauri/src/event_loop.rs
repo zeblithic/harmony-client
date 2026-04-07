@@ -398,21 +398,12 @@ pub async fn run(
                 }
             }
 
-            // ── Follow/unfollow requests from Tauri commands ────────
-            Some(req) = follow_rx.recv() => {
-                match req {
-                    FollowRequest::Follow { address } => {
-                        let mut set = followed_set.lock().unwrap();
-                        set.insert(address);
-                        // No per-creator Zenoh subscription yet — the wildcard
-                        // catches all vines and we route by followed_set.
-                    }
-                    FollowRequest::Unfollow { address } => {
-                        let mut set = followed_set.lock().unwrap();
-                        set.remove(&address);
-                    }
-                }
-            }
+            // Follow/unfollow updates are applied to followed_set directly
+            // by the Tauri command handlers. When per-creator Zenoh
+            // subscriptions are added (once the publish path includes
+            // /announce/), the follow_rx channel will drive Subscribe/
+            // Unsubscribe actions here.
+            Some(_req) = follow_rx.recv() => {}
 
             // ── Shutdown signal ──────────────────────────────────────
             _ = shutdown.changed() => {

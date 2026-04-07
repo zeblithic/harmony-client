@@ -125,6 +125,11 @@ export class VineService {
   }
 
   async follow(address: string, name?: string): Promise<void> {
+    // Guard against following yourself — wireToVine remaps own address to
+    // 'self', so the UI may pass either the real hex or 'self'.
+    if (address === 'self' || (this.ownAddress && address === this.ownAddress)) {
+      return;
+    }
     if (this.adapter) {
       await this.adapter.invoke('follow_vine_creator', { address, name: name ?? null });
     }
