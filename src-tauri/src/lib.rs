@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 mod event_loop;
+mod follows;
 mod identity;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
