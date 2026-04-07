@@ -224,7 +224,8 @@ describe('VineService', () => {
     const external = vi.fn();
     svc.addUnlisten(external);
     svc.destroy();
-    expect(unlisten).toHaveBeenCalledOnce();
+    // Two adapter listeners registered (vine-received + vine-reaction-received)
+    expect(unlisten).toHaveBeenCalledTimes(2);
     expect(external).toHaveBeenCalledOnce();
   });
 
@@ -233,7 +234,8 @@ describe('VineService', () => {
     await svc.connectAdapter(adapter);
     svc.destroy();
     svc.destroy();
-    expect(unlisten).toHaveBeenCalledOnce();
+    // Two adapter listeners registered (vine-received + vine-reaction-received)
+    expect(unlisten).toHaveBeenCalledTimes(2);
   });
 
   // ── Follow / feed routing ──────────────────────────────────────────
@@ -401,6 +403,103 @@ describe('VineService', () => {
     await svc.loadFollowed();
     expect(svc.followedAddresses.has('aabb')).toBe(true);
     expect(svc.followedAddresses.has('ccdd')).toBe(true);
+  });
+
+  it('incoming reaction increments count', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    const r = svc.getReaction(mockVines[0].id);
+    expect(r.count).toBe(1);
+    expect(r.likedByMe).toBe(false);
+  });
+
+  it('incoming reaction deduplicates by reactor address', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    const event = {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    };
+    emit('vine-reaction-received', event);
+    emit('vine-reaction-received', event);
+    expect(svc.getReaction(mockVines[0].id).count).toBe(1);
+  });
+
+  it('incoming unlike decrements count', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: false,
+      timestamp: 1700000600,
+    });
+    expect(svc.getReaction(mockVines[0].id).count).toBe(0);
+  });
+
+  it('skips self-echo reactions', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    await svc.connectAdapter(adapter);
+    const vine = mockVines[0];
+    await svc.toggleLike(vine);
+    expect(svc.getReaction(vine.id).count).toBe(1);
+    emit('vine-reaction-received', {
+      vineId: vine.id,
+      reactorAddress: 'myaddr',
+      reactorName: 'You',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.getReaction(vine.id).count).toBe(1);
+  });
+
+  it('ignores reactions for unknown vine IDs', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
+    emit('vine-reaction-received', {
+      vineId: 'nonexistent-vine',
+      reactorAddress: 'peer-abc',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.onChange).not.toHaveBeenCalled();
+  });
+
+  it('calls onChange when reaction arrives', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
+    emit('vine-reaction-received', {
+      vineId: mockVines[0].id,
+      reactorAddress: 'peer-xyz',
+      reactorName: 'Peer',
+      liked: true,
+      timestamp: 1700000500,
+    });
+    expect(svc.onChange).toHaveBeenCalledOnce();
   });
 
   it('reconciles misrouted vines after loadFollowed', async () => {

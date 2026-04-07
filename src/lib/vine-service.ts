@@ -75,6 +75,48 @@ export class VineService {
       },
     );
     this.unlisteners.push(unlisten);
+
+    const unlistenReaction = await adapter.listen(
+      'vine-reaction-received',
+      (event) => {
+        const wire = event.payload as {
+          vineId: string;
+          reactorAddress: string;
+          reactorName: string;
+          liked: boolean;
+          timestamp: number;
+        };
+
+        // Skip self-echo — already applied optimistically
+        if (wire.reactorAddress === 'self' || (this.ownAddress && wire.reactorAddress === this.ownAddress)) {
+          return;
+        }
+
+        // Ignore reactions for vines not in our feed
+        const known = this.followedVines.some(v => v.id === wire.vineId)
+          || this.discoverVines.some(v => v.id === wire.vineId);
+        if (!known) return;
+
+        const entry = this.reactionMap.get(wire.vineId)
+          ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+
+        const alreadyTracked = entry.reactors.has(wire.reactorAddress);
+
+        if (wire.liked) {
+          if (alreadyTracked) return; // Already counted
+          entry.reactors.add(wire.reactorAddress);
+          entry.count += 1;
+        } else {
+          if (!alreadyTracked) return; // Nothing to remove
+          entry.reactors.delete(wire.reactorAddress);
+          entry.count = Math.max(0, entry.count - 1);
+        }
+
+        this.reactionMap.set(wire.vineId, entry);
+        this.onChange?.();
+      },
+    );
+    this.unlisteners.push(unlistenReaction);
   }
 
   /** Publish a vine via Tauri command. */
