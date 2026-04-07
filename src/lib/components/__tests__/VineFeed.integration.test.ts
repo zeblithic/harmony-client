@@ -53,8 +53,11 @@ function renderFeed(overrides: Record<string, unknown> = {}) {
 
   const result = render(VineFeed, {
     props: {
-      vines: VINES,
+      followedVines: VINES,
+      discoverVines: [],
       viewedIds: new Set<string>(),
+      activeTab: 'following' as const,
+      followedAddresses: new Set<string>(),
       ...callbacks,
       ...overrides,
     },
@@ -138,8 +141,8 @@ describe('VineFeed Integration', () => {
   });
 
   it('shows empty state when no vines exist', () => {
-    renderFeed({ vines: [] });
-    expect(screen.getByText(/No vines yet/)).toBeTruthy();
+    renderFeed({ followedVines: [] });
+    expect(screen.getByText(/Follow creators/)).toBeTruthy();
   });
 
   // ── 4. Player ─────────────────────────────────────────────────────
