@@ -1410,6 +1410,7 @@ mod tests {
         assert!(json.contains("\"reactorName\""), "expected camelCase: {json}");
         assert!(!json.contains("\"vine_id\""), "unexpected snake_case: {json}");
         assert!(!json.contains("\"reactor_address\""), "unexpected snake_case: {json}");
+        assert!(!json.contains("\"reactor_name\""), "unexpected snake_case: {json}");
     }
 
     #[test]
@@ -1423,6 +1424,17 @@ mod tests {
         assert_eq!(parsed.vine_id, "vine-abc");
         assert_eq!(parsed.vine_creator_address, "deadbeef");
         assert!(parsed.liked);
+    }
+
+    #[test]
+    fn publish_reaction_payload_liked_false() {
+        let json = r#"{
+        "vineId": "vine-xyz",
+        "vineCreatorAddress": "aabb",
+        "liked": false
+    }"#;
+        let parsed: PublishReactionPayload = serde_json::from_str(json).unwrap();
+        assert!(!parsed.liked);
     }
 
     #[test]
