@@ -618,6 +618,15 @@ pub struct VineVideoDto {
     pub viewed: bool,
 }
 
+/// Response returned by list_followed — one entry per followed address.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowEntryResponse {
+    pub address: String,
+    pub name: Option<String>,
+    pub followed_at: u64,
+}
+
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
 ///
 /// Publishes JSON to `harmony/vines/{creator_address}`.
@@ -691,17 +700,83 @@ fn list_vine_videos() -> Vec<VineVideoDto> {
 }
 
 #[tauri::command]
-fn follow_vine_creator(address: String) -> bool {
-    // Future: subscribe to specific creator's vine key expression.
-    let _ = address;
-    true
+async fn follow_vine_creator(
+    address: String,
+    name: Option<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+
+    if address == guard.node_addr {
+        return Err("cannot follow yourself".to_string());
+    }
+
+    let mgr = guard.follow_mgr.as_mut().ok_or("not connected")?;
+    if !mgr.follow(address.clone(), name) {
+        return Ok(false);
+    }
+
+    if let Some(ref set) = guard.followed_set {
+        let mut s = set.lock().unwrap();
+        s.insert(address.clone());
+    }
+
+    if let Some(ref tx) = guard.follow_tx {
+        let _ = tx.try_send(event_loop::FollowRequest::Follow { address });
+    }
+
+    Ok(true)
 }
 
 #[tauri::command]
-fn unfollow_vine_creator(address: String) -> bool {
-    // Future: unsubscribe from specific creator's vine key expression.
-    let _ = address;
-    true
+async fn unfollow_vine_creator(
+    address: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+
+    let mgr = guard.follow_mgr.as_mut().ok_or("not connected")?;
+    if !mgr.unfollow(&address) {
+        return Ok(false);
+    }
+
+    if let Some(ref set) = guard.followed_set {
+        let mut s = set.lock().unwrap();
+        s.remove(&address);
+    }
+
+    if let Some(ref tx) = guard.follow_tx {
+        let _ = tx.try_send(event_loop::FollowRequest::Unfollow { address });
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
+fn list_followed(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<FollowEntryResponse>, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
+    Ok(mgr
+        .list()
+        .into_iter()
+        .map(|e| FollowEntryResponse {
+            address: e.address,
+            name: e.name,
+            followed_at: e.followed_at,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn is_followed(
+    address: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr = guard.follow_mgr.as_ref().ok_or("not connected")?;
+    Ok(mgr.is_followed(&address))
 }
 
 #[tauri::command]
@@ -982,6 +1057,8 @@ pub fn run() {
             list_vine_videos,
             follow_vine_creator,
             unfollow_vine_creator,
+            list_followed,
+            is_followed,
             mark_vine_viewed,
             publish_vine,
             start_node,
