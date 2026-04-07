@@ -57,7 +57,7 @@ impl FollowManager {
     }
 
     /// Atomically write the follow list to disk (temp file + rename).
-    pub fn save(&self) {
+    fn save(&self) {
         let file = FollowsFile {
             version: FILE_VERSION,
             follows: self.follows.clone(),
