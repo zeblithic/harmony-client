@@ -66,12 +66,16 @@
   let vineViewedIds = $state(new Set(vineService.viewedIds));
   let vineTab = $state<'following' | 'discover'>('following');
   let followedAddresses = $state(new Set(vineService.followedAddresses));
+  let vineGetReaction = $state<(vineId: string) => { count: number; likedByMe: boolean }>(
+    (vineId: string) => vineService.getReaction(vineId)
+  );
 
   vineService.onChange = () => {
     followedVines = [...vineService.followedVines];
     discoverVines = [...vineService.discoverVines];
     vineViewedIds = new Set(vineService.viewedIds);
     followedAddresses = new Set(vineService.followedAddresses);
+    vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
   };
   vineService.ownDisplayName = myProfile.displayName || 'You';
 
@@ -113,6 +117,12 @@
     } catch (err) {
       console.error('Unfollow failed', err);
     }
+  }
+
+  function handleVineToggleLike(vine: import('./lib/types').VineVideo) {
+    vineService.toggleLike(vine).catch((err) => {
+      console.error('Toggle like failed', err);
+    });
   }
 
   /** Detect video MIME type from magic bytes. */
@@ -639,6 +649,8 @@
       onReshare={handleVineReshare}
       onFollow={handleVineFollow}
       onUnfollow={handleVineUnfollow}
+      getReaction={vineGetReaction}
+      onToggleLike={handleVineToggleLike}
       resolveVideo={resolveVideoFn}
     />
     {#if showVinePublish}
