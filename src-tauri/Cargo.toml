@@ -23,6 +23,7 @@ hex = "0.4"
 rand = "0.8"
 zeroize = "1"
 tracing = "0.1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
@@ -40,3 +41,6 @@ ml-dsa = "=0.1.0-rc.7"
 ml-kem = "=0.3.0-rc.0"
 sha3 = "=0.11.0-rc.8"
 keccak = "=0.2.0-rc.2"
+
+[dev-dependencies]
+tempfile = "3"
