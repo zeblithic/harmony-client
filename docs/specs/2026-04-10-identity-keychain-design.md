@@ -84,18 +84,18 @@ manual recovery if a keychain interaction goes wrong.
 
 ## Error Handling & Fallback
 
-The keychain can fail: no D-Bus session (headless Linux), locked keychain
-with user cancel (macOS), permission denied (managed Windows).
+The keychain can fail at two levels: construction (no backend available)
+or I/O (backend exists but operations fail).
 
 | Scenario | Behavior |
 |----------|----------|
-| Keychain read fails | Fall back to file store, log warning |
+| Keychain backend unavailable (`Entry::new` fails) | File-only mode, fully transparent |
+| Keychain read fails (I/O error, not NoEntry) | Use file if present (no migration attempted); generate to file if nothing exists. Keychain writes skipped to avoid overwriting an inaccessible entry. |
 | Keychain write fails (generation) | Write to file store instead, log warning |
 | Keychain write fails (migration) | Keep using file store, don't rename to `.bak` |
 | File store also fails | Hard error, cannot start node (same as today) |
 
-No retry logic, no user prompts. The fallback is transparent — if the
-keychain isn't available, file storage works exactly as it does today.
+No retry logic, no user prompts.
 
 ## Testing Strategy
 

@@ -221,6 +221,14 @@ impl KeychainStore {
         let entry = keyring::Entry::new_with_credential(Box::new(credential));
         Self { entry }
     }
+
+    /// Create a store where ALL operations fail (simulates inaccessible keychain).
+    #[cfg(test)]
+    pub fn new_load_failing_mock() -> Self {
+        let credential = AlwaysFailOnLoad;
+        let entry = keyring::Entry::new_with_credential(Box::new(credential));
+        Self { entry }
+    }
 }
 
 impl KeyStore for KeychainStore {
@@ -297,20 +305,18 @@ fn load_or_generate_with_stores(
         return Ok(identity);
     }
 
-    // 3. Generate fresh identity — only if keychain is healthy.
-    // If keychain errored and no file exists, refuse to generate to avoid
-    // creating a new identity that could overwrite an inaccessible keychain entry.
-    if keychain_load_failed {
-        return Err(
-            "keychain read failed and no identity file exists; refusing to generate new identity \
-             to avoid overwriting an inaccessible keychain entry"
-                .to_string(),
-        );
-    }
-
+    // 3. Generate fresh identity.
     let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
     let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
     let identity = NodeIdentity { pq, ed25519 };
+
+    // If keychain errored, don't attempt writes — an inaccessible entry may
+    // exist and we'd overwrite it. Save to file only.
+    if keychain_load_failed {
+        tracing::warn!("keychain unhealthy, saving new identity to file only");
+        file_store.save(&identity)?;
+        return Ok(identity);
+    }
 
     match keychain.save(&identity) {
         Ok(()) => tracing::info!("new identity stored in OS keychain"),
@@ -353,6 +359,41 @@ pub fn load_or_generate(path: &Path) -> Result<NodeIdentity, String> {
 #[cfg(test)]
 #[derive(Debug)]
 struct AlwaysFailOnSave;
+
+/// A `CredentialApi` implementation that returns a platform error on ALL operations.
+/// Simulates a keychain that is constructed successfully but fails at I/O time
+/// (e.g., locked macOS keychain, missing D-Bus session).
+#[cfg(test)]
+#[derive(Debug)]
+struct AlwaysFailOnLoad;
+
+#[cfg(test)]
+impl keyring::credential::CredentialApi for AlwaysFailOnLoad {
+    fn set_secret(&self, _secret: &[u8]) -> keyring::Result<()> {
+        Err(keyring::Error::Invalid(
+            "simulated platform failure".to_string(),
+            "always fails".to_string(),
+        ))
+    }
+
+    fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+        Err(keyring::Error::Invalid(
+            "simulated platform failure".to_string(),
+            "always fails".to_string(),
+        ))
+    }
+
+    fn delete_credential(&self) -> keyring::Result<()> {
+        Err(keyring::Error::Invalid(
+            "simulated platform failure".to_string(),
+            "always fails".to_string(),
+        ))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 #[cfg(test)]
 impl keyring::credential::CredentialApi for AlwaysFailOnSave {
@@ -642,6 +683,66 @@ mod tests {
                 assert!(path.exists(), "original file should still exist");
                 let bak = path.with_extension("key.bak");
                 assert!(!bak.exists(), "backup file should NOT exist when migration fails");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn keychain_load_error_no_file_generates_to_file() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Keychain that errors on load (not NoEntry — a real error)
+                let keychain = KeychainStore::new_load_failing_mock();
+                let file_store = FileStore::new(path.clone());
+
+                // Should succeed — falls back to file generation
+                let identity = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Saved to file (keychain was skipped)
+                assert!(path.exists(), "identity should be saved to file");
+                let from_file = file_store.load().unwrap().expect("should be on disk");
+                assert_eq!(
+                    from_file.ed25519.public_identity().address_hash,
+                    identity.ed25519.public_identity().address_hash,
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn keychain_load_error_with_file_uses_file_without_migration() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+                let bak_path = dir.path().join("identity.key.bak");
+
+                // Pre-create an identity file
+                let file_store = FileStore::new(path.clone());
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let original = NodeIdentity { pq, ed25519 };
+                let original_addr = original.ed25519.public_identity().address_hash;
+                file_store.save(&original).unwrap();
+
+                // Keychain that errors on load
+                let keychain = KeychainStore::new_load_failing_mock();
+                let loaded = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Same identity from file
+                assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
+                // File NOT renamed — migration was skipped (keychain unhealthy)
+                assert!(path.exists(), "file should still exist (no migration)");
+                assert!(!bak_path.exists(), "no .bak (migration was skipped)");
             })
             .unwrap()
             .join()
