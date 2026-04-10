@@ -43,15 +43,22 @@ export class VoiceSender {
   /**
    * Initialize the codec, start audio capture, and begin streaming frames.
    * Idempotent — calling start() while already active or starting is a no-op.
+   *
+   * Sequence and timestamp persist across PTT sessions so the receiver's
+   * jitter buffer sees a continuous stream rather than a reset to zero.
    */
   async start(): Promise<void> {
     if (this.active) return;
     if (this.starting) return this.starting;
-    this.sequence = 0;
-    this.timestamp = 0;
     this.starting = (async () => {
       await this.config.codec.init(16000, 1);
-      await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
+      try {
+        await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
+      } catch (err) {
+        // Codec initialized but capture failed — clean up codec to prevent leak
+        this.config.codec.destroy();
+        throw err;
+      }
       this.active = true;
     })();
     try {
@@ -72,23 +79,28 @@ export class VoiceSender {
     if (!this.active) return;
     await this.config.capture.stop();
     // Send TAIL_FRAME_COUNT silence frames with PTT=false so receivers
-    // know the push-to-talk session has ended.
+    // know the push-to-talk session has ended. Awaited so tail frames
+    // reach Rust/Zenoh before codec is destroyed.
     const silence = new Float32Array(320);
     for (let i = 0; i < TAIL_FRAME_COUNT; i++) {
-      this.sendFrame(silence, false);
+      await this.sendFrame(silence, false);
     }
     this.config.codec.destroy();
     this.active = false;
   }
 
   /**
-   * Encode one PCM frame, prepend the voice-packet header, and fire-and-forget
-   * to the Rust backend via Tauri IPC.
+   * Encode one PCM frame, prepend the voice-packet header, and send to
+   * the Rust backend via Tauri IPC.
+   *
+   * Returns the IPC promise. In the audio callback hot path, the return
+   * value is ignored (fire-and-forget). In stop(), tail frames are awaited
+   * to ensure end-of-transmission reaches the mesh before teardown.
    *
    * The sequence number wraps at 65535 (u16); the timestamp accumulates
    * FRAME_MS (20 ms) per frame and wraps naturally as a u32.
    */
-  private sendFrame(pcm: Float32Array, pttActive: boolean): void {
+  private sendFrame(pcm: Float32Array, pttActive: boolean): Promise<unknown> {
     const opus = this.config.codec.encode(pcm);
     const header = encodeHeader({
       pttActive,
@@ -102,15 +114,16 @@ export class VoiceSender {
     // Tauri v2 deserializes invoke args by parameter name — the Rust command
     // parameter is `payload: SendVoiceFramePayload`, so we wrap accordingly.
     // Uint8Array → number[] for JSON serialization over IPC.
-    void this.config.invoke('send_voice_frame', {
+    const promise = this.config.invoke('send_voice_frame', {
       payload: {
         channelId: this.config.channelId,
         frameBytes: Array.from(frame),
       },
     }).catch(() => {
-      // Fire-and-forget: IPC errors are non-fatal for individual frames
+      // IPC errors are non-fatal for individual frames
     });
     this.sequence = (this.sequence + 1) & 0xffff;
     this.timestamp += FRAME_MS;
+    return promise;
   }
 }

@@ -180,4 +180,34 @@ describe('VoiceSender', () => {
 
     expect(pttFalseCount).toBe(3);
   });
+
+  it('persists sequence across PTT sessions (no reset on re-start)', async () => {
+    const sender = new VoiceSender(ctx.config);
+    await sender.start();
+
+    const onFrame = ctx.getCapturedOnFrame()!;
+    const pcm = new Float32Array(320);
+
+    // Send 2 active frames: seq 0, 1
+    onFrame(pcm);
+    onFrame(pcm);
+
+    // Stop: sends 3 tail frames at seq 2, 3, 4
+    await sender.stop();
+
+    // Re-start — sequence should NOT reset to 0
+    await sender.start();
+    const onFrame2 = ctx.getCapturedOnFrame()!;
+    onFrame2(pcm);
+
+    // Total: 2 active + 3 tail + 1 new = 6
+    expect(ctx.mockInvoke.mock.calls.length).toBe(6);
+
+    // Last frame should have sequence 5 (continuing from previous session)
+    const lastCall = ctx.mockInvoke.mock.calls[5];
+    const payload = (lastCall[1] as Record<string, unknown>).payload as Record<string, unknown>;
+    const frameBytes = payload.frameBytes as number[];
+    const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
+    expect(decodeHeader(headerBuf).sequence).toBe(5);
+  });
 });

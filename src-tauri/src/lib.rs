@@ -1141,11 +1141,27 @@ async fn fetch_content(
 
 // ── Voice commands ──────────────────────────────────────────────────────
 
+/// Reject channel IDs that could escape the intended Zenoh key namespace.
+/// Same forbidden characters as send_message's channel/hub validation.
+fn validate_voice_channel_id(channel_id: &str) -> Result<(), String> {
+    if channel_id.is_empty()
+        || channel_id.contains('/')
+        || channel_id.contains('*')
+        || channel_id.contains('?')
+        || channel_id.contains('#')
+        || channel_id.contains('$')
+    {
+        return Err(format!("invalid voice channel_id: {channel_id}"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn send_voice_frame(
     payload: voice::SendVoiceFramePayload,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    validate_voice_channel_id(&payload.channel_id)?;
     let voice_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -1167,6 +1183,7 @@ async fn join_voice_channel(
     channel_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    validate_voice_channel_id(&channel_id)?;
     let tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -1184,6 +1201,7 @@ async fn leave_voice_channel(
     channel_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    validate_voice_channel_id(&channel_id)?;
     let tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard

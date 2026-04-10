@@ -5,6 +5,8 @@ import type { OpusCodec } from './opus-codec';
 const FRAME_MS = 20;
 const BUFFER_DEPTH = 4; // 80ms
 const IDLE_TIMEOUT_MS = 2000;
+/** Max frames queued during async codec init (~320ms of audio). */
+const MAX_PENDING_FRAMES = 16;
 
 interface PendingFrame {
   sequence: number;
@@ -77,29 +79,40 @@ export class VoiceReceiver {
       };
       this.senders.set(senderHex, state);
 
-      // Init codec asynchronously, then drain pending frames and start playback
+      // Capture state reference for stale-closure guard — if the sender is
+      // removed and re-created during init, this closure must not operate
+      // on the new state (which would install a duplicate playback timer).
+      const stateRef = state;
       codec.init(16000, 1).then(() => {
-        const s = this.senders.get(senderHex);
-        if (!s) return; // sender was removed during init
-        s.ready = true;
-        for (const pf of s.pendingFrames) {
+        if (this.senders.get(senderHex) !== stateRef) return; // stale
+        stateRef.ready = true;
+        for (const pf of stateRef.pendingFrames) {
           try {
-            const pcm = s.codec.decode(pf.opusPayload);
-            s.jitterBuffer.insert(pf.sequence, pcm);
+            const pcm = stateRef.codec.decode(pf.opusPayload);
+            stateRef.jitterBuffer.insert(pf.sequence, pcm);
           } catch {
             // Drop undecodable frame — jitter buffer will produce silence
           }
         }
-        s.pendingFrames = [];
+        stateRef.pendingFrames = [];
         // Start playback timer only after codec is ready
-        s.playbackTimer = setInterval(() => {
+        stateRef.playbackTimer = setInterval(() => {
           this.advancePlayback(senderHex);
         }, FRAME_MS);
       }).catch(() => {
-        this.removeSender(senderHex);
+        if (this.senders.get(senderHex) === stateRef) {
+          this.removeSender(senderHex);
+        }
       });
     }
 
+    // Detect new PTT session: the sender stopped (PTT=false / tail frames)
+    // and has now started speaking again. Reset the jitter buffer so it
+    // re-seeds playSeq from the new sequence number — otherwise the playback
+    // timer has advanced playSeq past the new frames during silence.
+    if (header.pttActive && !state.speaking && state.ready) {
+      state.jitterBuffer.reset();
+    }
     state.speaking = header.pttActive;
 
     if (state.idleTimer) clearTimeout(state.idleTimer);
@@ -114,7 +127,7 @@ export class VoiceReceiver {
       } catch {
         // Drop malformed frame — jitter buffer will produce silence
       }
-    } else {
+    } else if (state.pendingFrames.length < MAX_PENDING_FRAMES) {
       state.pendingFrames.push({ sequence: header.sequence, opusPayload });
     }
   }
