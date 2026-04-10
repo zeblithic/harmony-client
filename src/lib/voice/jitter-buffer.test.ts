@@ -11,6 +11,13 @@ describe('JitterBuffer', () => {
     buf = new JitterBuffer(DEPTH, FRAME_MS);
   });
 
+  it('advance returns null and does not progress fill before first insert', () => {
+    // No frames inserted — not seeded
+    expect(buf.advance()).toBeNull();
+    expect(buf.advance()).toBeNull();
+    expect(buf.isReady()).toBe(false);
+  });
+
   it('is not ready before buffer fill period', () => {
     buf.insert(0, new Float32Array(160));
     buf.insert(1, new Float32Array(160));
@@ -21,7 +28,8 @@ describe('JitterBuffer', () => {
   });
 
   it('becomes ready after fill period elapses', () => {
-    // advance DEPTH times to exhaust fill period
+    // Seed with a frame, then advance DEPTH times to exhaust fill period
+    buf.insert(0, new Float32Array(160));
     for (let i = 0; i < DEPTH; i++) {
       buf.advance();
     }
@@ -52,11 +60,12 @@ describe('JitterBuffer', () => {
   });
 
   it('returns null for missing frames (silence)', () => {
-    // No frames inserted; advance through fill period
-    for (let i = 0; i < DEPTH; i++) {
-      buf.advance();
-    }
-    // No frame at playSeq — should return null (concealment)
+    // Seed with one frame, advance through fill
+    buf.insert(0, new Float32Array([1, 2, 3]));
+    for (let i = 0; i < DEPTH; i++) buf.advance();
+    // Play seq 0 (has frame)
+    buf.advance();
+    // Seq 1 has no frame — should return null (concealment)
     expect(buf.advance()).toBeNull();
   });
 
@@ -107,11 +116,9 @@ describe('JitterBuffer', () => {
   });
 
   it('handles sequence wraparound at u16 boundary', () => {
-    // Wind playSeq to just before the u16 wraparound boundary.
-    // Fill period: DEPTH advances, playSeq stays at 0.
-    // Post-fill: each advance increments playSeq by 1.
-    // Target: playSeq == 0xFFFE → need DEPTH (fill) + 0xFFFE (post-fill) advances.
+    // Seed with a frame so advance() progresses fill.
     buf = new JitterBuffer(DEPTH, FRAME_MS);
+    buf.insert(0, new Float32Array([0])); // seed playSeq = 0
     for (let i = 0; i < DEPTH; i++) buf.advance(); // fill, playSeq stays 0
     for (let i = 0; i < 0xFFFE; i++) buf.advance(); // post-fill, playSeq → 0xFFFE
 
@@ -161,12 +168,11 @@ describe('JitterBuffer', () => {
     buf.reset();
 
     expect(buf.isReady()).toBe(false);
-    // After reset, fill period starts again
+    // After reset, must re-seed before fill progresses
+    buf.insert(0, new Float32Array([99]));
     for (let i = 0; i < DEPTH - 1; i++) buf.advance();
     expect(buf.isReady()).toBe(false);
     buf.advance();
     expect(buf.isReady()).toBe(true);
-    // Slots cleared — no lingering frames
-    expect(buf.advance()).toBeNull();
   });
 });

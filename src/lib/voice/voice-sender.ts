@@ -33,6 +33,8 @@ export class VoiceSender {
   private sequence = 0;
   private timestamp = 0;
   private active = false;
+  /** Non-null while async initialization is in progress. */
+  private starting: Promise<void> | null = null;
 
   constructor(config: VoiceSenderConfig) {
     this.config = config;
@@ -40,19 +42,22 @@ export class VoiceSender {
 
   /**
    * Initialize the codec, start audio capture, and begin streaming frames.
-   * Idempotent — calling start() while already active is a no-op.
+   * Idempotent — calling start() while already active or starting is a no-op.
    */
   async start(): Promise<void> {
     if (this.active) return;
-    this.active = true;
+    if (this.starting) return this.starting;
     this.sequence = 0;
     this.timestamp = 0;
-    try {
+    this.starting = (async () => {
       await this.config.codec.init(16000, 1);
       await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
-    } catch (err) {
-      this.active = false;
-      throw err;
+      this.active = true;
+    })();
+    try {
+      await this.starting;
+    } finally {
+      this.starting = null;
     }
   }
 
@@ -62,6 +67,8 @@ export class VoiceSender {
    * Idempotent — calling stop() while not active is a no-op.
    */
   async stop(): Promise<void> {
+    // Wait for any in-progress start to finish before tearing down.
+    if (this.starting) await this.starting.catch(() => {});
     if (!this.active) return;
     await this.config.capture.stop();
     // Send TAIL_FRAME_COUNT silence frames with PTT=false so receivers

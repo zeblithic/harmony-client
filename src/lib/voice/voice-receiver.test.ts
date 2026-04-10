@@ -234,4 +234,38 @@ describe('VoiceReceiver', () => {
 
     receiver.destroy();
   });
+
+  // -------------------------------------------------------------------------
+  // Test 7: filters out own sender to prevent self-echo
+  // -------------------------------------------------------------------------
+  it('filters out own sender to prevent self-echo', async () => {
+    const ownHash = makeSenderHash(0xff);
+    const ownHex = senderHexOf(0xff);
+    const receiver = new VoiceReceiver({
+      ...config,
+      ownSenderHex: ownHex,
+    });
+    await receiver.init();
+
+    // Emit a frame from own sender — should be filtered
+    emitVoiceFrame(mockListen.emit, {
+      senderHash: ownHash,
+      sequence: 0,
+      pttActive: true,
+    });
+
+    expect(receiver.getActiveSenders().length).toBe(0);
+    expect(receiver.isSpeaking(ownHex)).toBe(false);
+
+    // Emit a frame from a different sender — should be accepted
+    emitVoiceFrame(mockListen.emit, {
+      senderHash: makeSenderHash(0xaa),
+      sequence: 0,
+      pttActive: true,
+    });
+
+    expect(receiver.getActiveSenders().length).toBe(1);
+
+    receiver.destroy();
+  });
 });

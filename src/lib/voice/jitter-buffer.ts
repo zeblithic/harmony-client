@@ -64,6 +64,9 @@ export class JitterBuffer {
    * increments playSeq with u16 wraparound.
    */
   advance(): Float32Array | null {
+    // Don't progress fill until we have a stream anchor.
+    if (!this.seeded) return null;
+
     if (this.fillCount < this.depth) {
       // Still in fill period — let frames accumulate without consuming them.
       this.fillCount++;
@@ -79,7 +82,7 @@ export class JitterBuffer {
 
   /** Whether the fill period has elapsed and playback has begun. */
   isReady(): boolean {
-    return this.fillCount >= this.depth;
+    return this.seeded && this.fillCount >= this.depth;
   }
 
   /** Clear all state — fill period resets to the beginning. */

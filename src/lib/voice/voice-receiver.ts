@@ -15,7 +15,6 @@ interface SenderState {
   jitterBuffer: JitterBuffer;
   codec: OpusCodec;
   speaking: boolean;
-  lastFrameTime: number;
   playbackTimer: ReturnType<typeof setInterval> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   /** False until codec.init() resolves. Frames are queued while false. */
@@ -30,6 +29,9 @@ export interface VoiceReceiverConfig {
   ) => Promise<() => void>;
   createCodec: () => OpusCodec;
   onPlayFrame?: (senderHex: string, pcm: Float32Array | null) => void;
+  /** Hex-encoded local sender hash — frames from this sender are filtered
+   *  out to prevent self-echo (Zenoh delivers local puts to local subscribers). */
+  ownSenderHex?: string;
 }
 
 export class VoiceReceiver {
@@ -58,6 +60,9 @@ export class VoiceReceiver {
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
 
+    // Filter out own frames to prevent self-echo
+    if (this.config.ownSenderHex && senderHex === this.config.ownSenderHex) return;
+
     let state = this.senders.get(senderHex);
     if (!state) {
       const codec = this.config.createCodec();
@@ -65,7 +70,6 @@ export class VoiceReceiver {
         jitterBuffer: new JitterBuffer(BUFFER_DEPTH, FRAME_MS),
         codec,
         speaking: false,
-        lastFrameTime: Date.now(),
         playbackTimer: null,
         idleTimer: null,
         ready: false,
@@ -97,7 +101,6 @@ export class VoiceReceiver {
     }
 
     state.speaking = header.pttActive;
-    state.lastFrameTime = Date.now();
 
     if (state.idleTimer) clearTimeout(state.idleTimer);
     state.idleTimer = setTimeout(() => {
