@@ -47,7 +47,7 @@
     // Also treat elements with interactive ARIA roles as form controls
     // (e.g., CodecToggle's role="radio" divs)
     const role = el.getAttribute?.('role') ?? '';
-    return ['radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox', 'listbox', 'textbox'].includes(role);
+    return ['button', 'radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox', 'listbox', 'textbox'].includes(role);
   }
 
   function handleKeyDown(e: KeyboardEvent) {

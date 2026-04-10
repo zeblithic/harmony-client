@@ -137,6 +137,11 @@ export class VoiceReceiver {
       this.removeSender(senderHex);
     }, IDLE_TIMEOUT_MS);
 
+    // Update frameSize from every incoming frame's codec type so comfort
+    // noise always matches the active codec (handles reactivation of an
+    // existing codec entry after a round-trip switch).
+    state.frameSize = header.codec === 'codec2' ? 160 : 320;
+
     // Get or create the codec entry for this frame's codec type
     const entry = this.getOrCreateCodecEntry(state, header.codec);
 
