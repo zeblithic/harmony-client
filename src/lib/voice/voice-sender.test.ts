@@ -163,7 +163,7 @@ describe('VoiceSender', () => {
     await sender.stop();
 
     // Total calls: 1 active + 3 tail
-    expect(ctx.mockInvoke.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(ctx.mockInvoke.mock.calls.length).toBe(4);
 
     // Count frames with PTT=false
     const pttFalseCount = ctx.mockInvoke.mock.calls.filter(([, args]) => {
@@ -172,6 +172,6 @@ describe('VoiceSender', () => {
       return !decodeHeader(headerBuf).pttActive;
     }).length;
 
-    expect(pttFalseCount).toBeGreaterThanOrEqual(2);
+    expect(pttFalseCount).toBe(3);
   });
 });
