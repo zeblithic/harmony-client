@@ -43,7 +43,11 @@
     if (!el) return false;
     if (el.classList?.contains('ptt-button')) return false;
     const tag = el.tagName ?? '';
-    return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag);
+    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag)) return true;
+    // Also treat elements with interactive ARIA roles as form controls
+    // (e.g., CodecToggle's role="radio" divs)
+    const role = el.getAttribute?.('role') ?? '';
+    return ['radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox', 'listbox', 'textbox'].includes(role);
   }
 
   function handleKeyDown(e: KeyboardEvent) {

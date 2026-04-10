@@ -48,6 +48,9 @@ export class AdaptiveJitterBuffer {
   private playSeq = 0;
   private fillCount = 0;
   private seeded = false;
+  /** True once the initial fill period has completed. Depth growth after
+   *  this point does not re-enter the fill period. */
+  private initialFillComplete = false;
 
   /** Exponentially weighted jitter estimate in ms. */
   private jitter = 0;
@@ -106,9 +109,14 @@ export class AdaptiveJitterBuffer {
   advance(): Float32Array | null {
     if (!this.seeded) return null;
 
-    if (this.fillCount < this.depth) {
-      this.fillCount++;
-      return null;
+    if (!this.initialFillComplete) {
+      if (this.fillCount < this.depth) {
+        this.fillCount++;
+        if (this.fillCount >= this.depth) {
+          this.initialFillComplete = true;
+        }
+        return null;
+      }
     }
 
     const seq = this.playSeq;
@@ -133,7 +141,7 @@ export class AdaptiveJitterBuffer {
 
   /** Whether the fill period has elapsed and playback has begun. */
   isReady(): boolean {
-    return this.seeded && this.fillCount >= this.depth;
+    return this.initialFillComplete;
   }
 
   /** Clear all state — fill period resets, depth returns to minimum. */
@@ -143,6 +151,7 @@ export class AdaptiveJitterBuffer {
     this.playSeq = 0;
     this.fillCount = 0;
     this.seeded = false;
+    this.initialFillComplete = false;
     this.jitter = 0;
     this.lastArrival = null;
     this.cleanRun = 0;

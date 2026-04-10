@@ -90,7 +90,8 @@ export class VoiceSender {
     // Send TAIL_FRAME_COUNT silence frames with PTT=false so receivers
     // know the push-to-talk session has ended. Awaited so tail frames
     // reach Rust/Zenoh before codec is destroyed.
-    const sr = this.config.sampleRate ?? 16000;
+    const sr = this.config.sampleRate ??
+      (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
     const frameSize = Math.round(sr * 0.02);
     const silence = new Float32Array(frameSize);
     for (let i = 0; i < TAIL_FRAME_COUNT; i++) {
@@ -112,7 +113,7 @@ export class VoiceSender {
    * FRAME_MS (20 ms) per frame and wraps naturally as a u32.
    */
   private sendFrame(pcm: Float32Array, pttActive: boolean): Promise<unknown> {
-    const opus = this.config.codec.encode(pcm);
+    const encoded = this.config.codec.encode(pcm);
     const header = encodeHeader({
       pttActive,
       sequence: this.sequence & 0xffff,
@@ -120,9 +121,9 @@ export class VoiceSender {
       senderHash: this.config.senderHash,
       codec: this.config.codec.codecType,
     });
-    const frame = new Uint8Array(HEADER_SIZE + opus.byteLength);
+    const frame = new Uint8Array(HEADER_SIZE + encoded.byteLength);
     frame.set(header, 0);
-    frame.set(opus, HEADER_SIZE);
+    frame.set(encoded, HEADER_SIZE);
     // Tauri v2 deserializes invoke args by parameter name — the Rust command
     // parameter is `payload: SendVoiceFramePayload`, so we wrap accordingly.
     // Uint8Array → number[] for JSON serialization over IPC.

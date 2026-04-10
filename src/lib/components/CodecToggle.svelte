@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { CodecType } from '../voice/voice-codec';
 
   let {
@@ -16,9 +17,15 @@
     { value: 'codec2', label: 'codec2' },
   ];
 
-  function select(codec: CodecType) {
+  /** Element refs keyed by codec type, for programmatic focus. */
+  const optionRefs: Record<string, HTMLElement | undefined> = {};
+
+  async function select(codec: CodecType) {
     if (disabled || codec === selected) return;
     onCodecChange?.(codec);
+    // After Svelte updates tabindex, move focus to the newly selected option
+    await tick();
+    optionRefs[codec]?.focus();
   }
 
   function handleKeyDown(e: KeyboardEvent, codec: CodecType) {
@@ -57,6 +64,7 @@
       aria-label={option.label}
       aria-disabled={disabled}
       tabindex={disabled ? -1 : selected === option.value ? 0 : -1}
+      bind:this={optionRefs[option.value]}
       onclick={() => select(option.value)}
       onkeydown={(e) => handleKeyDown(e, option.value)}
     >

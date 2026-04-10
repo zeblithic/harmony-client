@@ -53,12 +53,17 @@ export class Codec2Codec implements VoiceCodec {
     this.speechPtr = this.module._malloc(this.samplesPerFrame * 2); // int16 = 2 bytes
     if (this.speechPtr === 0) {
       this.module._codec2_destroy(this.statePtr);
+      this.module = null;
+      this.statePtr = 0;
       throw new Error('Failed to allocate codec2 speech buffer');
     }
     this.bitsPtr = this.module._malloc(this.bytesPerFrame);
     if (this.bitsPtr === 0) {
       this.module._free(this.speechPtr);
       this.module._codec2_destroy(this.statePtr);
+      this.module = null;
+      this.statePtr = 0;
+      this.speechPtr = 0;
       throw new Error('Failed to allocate codec2 bits buffer');
     }
   }

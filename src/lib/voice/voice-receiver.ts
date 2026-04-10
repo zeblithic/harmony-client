@@ -174,6 +174,7 @@ export class VoiceReceiver {
     if (!entry) {
       entry = this.createCodecEntry(codecType);
       state.codecs.set(codecType, entry);
+      const prevFrameSize = state.frameSize;
       state.frameSize = codecType === 'codec2' ? 160 : 320;
 
       // Start async init — drain pending frames when ready
@@ -184,6 +185,8 @@ export class VoiceReceiver {
       }).catch(() => {
         entryRef.codec.destroy();
         state.codecs.delete(codecType);
+        // Restore frame size if this was the only codec of this type
+        state.frameSize = prevFrameSize;
       });
     }
     return entry;
