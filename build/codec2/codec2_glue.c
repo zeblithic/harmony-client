@@ -10,4 +10,4 @@
  *     -o ../../src/lib/voice/codec2-wasm.js
  */
 
-#include "codec2/codec2.h"
+#include "codec2.h"

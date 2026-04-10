@@ -51,7 +51,16 @@ export class Codec2Codec implements VoiceCodec {
 
     // Allocate heap buffers: speech (int16) and bits (uint8)
     this.speechPtr = this.module._malloc(this.samplesPerFrame * 2); // int16 = 2 bytes
+    if (this.speechPtr === 0) {
+      this.module._codec2_destroy(this.statePtr);
+      throw new Error('Failed to allocate codec2 speech buffer');
+    }
     this.bitsPtr = this.module._malloc(this.bytesPerFrame);
+    if (this.bitsPtr === 0) {
+      this.module._free(this.speechPtr);
+      this.module._codec2_destroy(this.statePtr);
+      throw new Error('Failed to allocate codec2 bits buffer');
+    }
   }
 
   encode(pcm: Float32Array): Uint8Array {

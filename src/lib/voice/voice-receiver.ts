@@ -16,16 +16,22 @@ interface PendingFrame {
   codec: CodecType;
 }
 
+/** Tracks a codec instance and its initialization state. */
+interface CodecEntry {
+  codec: VoiceCodec;
+  ready: boolean;
+  pendingFrames: PendingFrame[];
+}
+
 interface SenderState {
   jitterBuffer: AdaptiveJitterBuffer;
   /** One decoder per codec type, lazy-created on first frame of that type. */
-  codecs: Map<CodecType, VoiceCodec>;
+  codecs: Map<CodecType, CodecEntry>;
   speaking: boolean;
   playbackTimer: ReturnType<typeof setInterval> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
-  /** False until codec.init() resolves. Frames are queued while false. */
-  ready: boolean;
-  pendingFrames: PendingFrame[];
+  /** True once the initial codec has been initialized and playback timer started. */
+  initialReady: boolean;
   /** Frame size for comfort noise (320 for opus, 160 for codec2). */
   frameSize: number;
 }
@@ -59,6 +65,11 @@ export class VoiceReceiver {
     );
   }
 
+  /** Map codec type to sample rate. */
+  private static sampleRateFor(codecType: CodecType): number {
+    return codecType === 'codec2' ? 8000 : 16000;
+  }
+
   private handleFrame(payload: { frameBytes: number[] }): void {
     const bytes = new Uint8Array(payload.frameBytes);
     if (bytes.byteLength < HEADER_SIZE) return;
@@ -74,7 +85,7 @@ export class VoiceReceiver {
 
     let state = this.senders.get(senderHex);
     if (!state) {
-      const codec = this.config.createCodec(header.codec);
+      const entry = this.createCodecEntry(header.codec);
       const frameSize = header.codec === 'codec2' ? 160 : 320;
       state = {
         jitterBuffer: new AdaptiveJitterBuffer({
@@ -82,40 +93,27 @@ export class VoiceReceiver {
           maxDepth: MAX_BUFFER_DEPTH,
           frameMs: FRAME_MS,
         }),
-        codecs: new Map([[header.codec, codec]]),
+        codecs: new Map([[header.codec, entry]]),
         speaking: false,
         playbackTimer: null,
         idleTimer: null,
-        ready: false,
-        pendingFrames: [],
+        initialReady: false,
         frameSize,
       };
       this.senders.set(senderHex, state);
 
-      // Capture state reference for stale-closure guard — if the sender is
-      // removed and re-created during init, this closure must not operate
-      // on the new state (which would install a duplicate playback timer).
+      // Capture state reference for stale-closure guard
       const stateRef = state;
-      codec.init(16000, 1).then(() => {
+      entry.codec.init(VoiceReceiver.sampleRateFor(header.codec), 1).then(() => {
         if (this.senders.get(senderHex) !== stateRef) {
-          // Stale closure — sender was removed/recreated during init.
-          // init() allocated a new OpusScript on the Emscripten heap;
-          // destroy it so it doesn't leak.
-          stateRef.codecs.forEach((c) => c.destroy());
+          stateRef.codecs.forEach((e) => e.codec.destroy());
           return;
         }
-        stateRef.ready = true;
-        for (const pf of stateRef.pendingFrames) {
-          try {
-            const decoder = this.getOrCreateCodec(stateRef, pf.codec);
-            const pcm = decoder.decode(pf.payload);
-            stateRef.jitterBuffer.insert(pf.sequence, pcm);
-          } catch {
-            // Drop undecodable frame — jitter buffer will produce silence
-          }
-        }
-        stateRef.pendingFrames = [];
-        // Start playback timer only after codec is ready
+        entry.ready = true;
+        stateRef.initialReady = true;
+        // Drain pending frames for this codec
+        this.drainPendingFrames(entry, stateRef.jitterBuffer);
+        // Start playback timer only after initial codec is ready
         stateRef.playbackTimer = setInterval(() => {
           this.advancePlayback(senderHex);
         }, FRAME_MS);
@@ -128,9 +126,8 @@ export class VoiceReceiver {
 
     // Detect new PTT session: the sender stopped (PTT=false / tail frames)
     // and has now started speaking again. Reset the jitter buffer so it
-    // re-seeds playSeq from the new sequence number — otherwise the playback
-    // timer has advanced playSeq past the new frames during silence.
-    if (header.pttActive && !state.speaking && state.ready) {
+    // re-seeds playSeq from the new sequence number.
+    if (header.pttActive && !state.speaking && state.initialReady) {
       state.jitterBuffer.reset();
     }
     state.speaking = header.pttActive;
@@ -140,16 +137,18 @@ export class VoiceReceiver {
       this.removeSender(senderHex);
     }, IDLE_TIMEOUT_MS);
 
-    if (state.ready) {
+    // Get or create the codec entry for this frame's codec type
+    const entry = this.getOrCreateCodecEntry(state, header.codec);
+
+    if (entry.ready) {
       try {
-        const decoder = this.getOrCreateCodec(state, header.codec);
-        const pcm = decoder.decode(encodedPayload);
+        const pcm = entry.codec.decode(encodedPayload);
         state.jitterBuffer.insert(header.sequence, pcm);
       } catch {
-        // Drop malformed frame — jitter buffer will produce silence
+        // Drop malformed frame
       }
-    } else if (state.pendingFrames.length < MAX_PENDING_FRAMES) {
-      state.pendingFrames.push({
+    } else if (entry.pendingFrames.length < MAX_PENDING_FRAMES) {
+      entry.pendingFrames.push({
         sequence: header.sequence,
         payload: encodedPayload,
         codec: header.codec,
@@ -157,27 +156,58 @@ export class VoiceReceiver {
     }
   }
 
+  /** Create a codec entry and start async init. */
+  private createCodecEntry(codecType: CodecType): CodecEntry {
+    return {
+      codec: this.config.createCodec(codecType),
+      ready: false,
+      pendingFrames: [],
+    };
+  }
+
   /**
-   * Get or lazily create a decoder for the given codec type within
-   * a sender's state.
+   * Get or lazily create a codec entry for the given codec type.
+   * New codecs are initialized asynchronously — frames queue until ready.
    */
-  private getOrCreateCodec(state: SenderState, codecType: CodecType): VoiceCodec {
-    let codec = state.codecs.get(codecType);
-    if (!codec) {
-      codec = this.config.createCodec(codecType);
-      state.codecs.set(codecType, codec);
-      // Update frame size if we see a new codec type
+  private getOrCreateCodecEntry(state: SenderState, codecType: CodecType): CodecEntry {
+    let entry = state.codecs.get(codecType);
+    if (!entry) {
+      entry = this.createCodecEntry(codecType);
+      state.codecs.set(codecType, entry);
       state.frameSize = codecType === 'codec2' ? 160 : 320;
+
+      // Start async init — drain pending frames when ready
+      const entryRef = entry;
+      entry.codec.init(VoiceReceiver.sampleRateFor(codecType), 1).then(() => {
+        entryRef.ready = true;
+        this.drainPendingFrames(entryRef, state.jitterBuffer);
+      }).catch(() => {
+        entryRef.codec.destroy();
+        state.codecs.delete(codecType);
+      });
     }
-    return codec;
+    return entry;
+  }
+
+  /** Decode and insert all pending frames for a codec entry. */
+  private drainPendingFrames(entry: CodecEntry, jitterBuffer: AdaptiveJitterBuffer): void {
+    for (const pf of entry.pendingFrames) {
+      try {
+        const pcm = entry.codec.decode(pf.payload);
+        jitterBuffer.insert(pf.sequence, pcm);
+      } catch {
+        // Drop undecodable frame
+      }
+    }
+    entry.pendingFrames = [];
   }
 
   private advancePlayback(senderHex: string): void {
     const state = this.senders.get(senderHex);
     if (!state) return;
     let pcm = state.jitterBuffer.advance();
-    // Generate comfort noise for missing frames (only after fill period)
-    if (pcm === null && state.jitterBuffer.isReady()) {
+    // Generate comfort noise for missing frames only while sender is speaking
+    if (pcm === null && state.speaking && state.jitterBuffer.isReady()) {
       pcm = generateComfortNoise(state.frameSize, 0.005);
     }
     this.config.onPlayFrame?.(senderHex, pcm);
@@ -188,7 +218,7 @@ export class VoiceReceiver {
     if (!state) return;
     if (state.playbackTimer) clearInterval(state.playbackTimer);
     if (state.idleTimer) clearTimeout(state.idleTimer);
-    state.codecs.forEach((c) => c.destroy());
+    state.codecs.forEach((e) => e.codec.destroy());
     this.senders.delete(senderHex);
   }
 

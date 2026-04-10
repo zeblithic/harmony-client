@@ -37,7 +37,7 @@ $(CODEC2_BUILD)/src/libcodec2.a: $(CODEC2_DIR)/CMakeLists.txt
 	cd $(CODEC2_BUILD) && emmake make codec2
 
 fetch:
-	git clone --depth 1 https://github.com/drowe67/codec2.git $(CODEC2_DIR)
+	git clone --depth 1 --branch v1.2.0 https://github.com/drowe67/codec2.git $(CODEC2_DIR)
 
 clean:
 	rm -rf $(CODEC2_BUILD) $(OUTPUT) $(OUTPUT:.js=.wasm)

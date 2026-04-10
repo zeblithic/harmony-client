@@ -53,7 +53,8 @@ export class VoiceSender {
     if (this.active) return;
     if (this.starting) return this.starting;
     this.starting = (async () => {
-      const sr = this.config.sampleRate ?? 16000;
+      const sr = this.config.sampleRate ??
+        (this.config.codec.codecType === 'codec2' ? 8000 : 16000);
       await this.config.codec.init(sr, 1);
       try {
         await this.config.capture.start(

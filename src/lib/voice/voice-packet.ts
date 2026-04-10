@@ -44,7 +44,8 @@ export interface DecodedVoiceHeader {
  * Encode a 23-byte voice packet header.
  *
  * Header layout:
- *   Byte 0:      [4-bit version=0x1][PTT flag][3 reserved bits]
+ *   Byte 0:      [4-bit version=0x1][PTT flag][codec bit][2 reserved bits]
+ *                codec bit: 0=opus, 1=codec2
  *   Bytes 1–2:   sequence (u16 big-endian)
  *   Bytes 3–6:   timestamp (u32 big-endian, ms since stream start)
  *   Bytes 7–22:  sender address hash (16 bytes)

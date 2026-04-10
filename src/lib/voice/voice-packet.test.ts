@@ -163,15 +163,19 @@ describe('voice-packet header', () => {
   });
 
   it('existing packets without codec field decode as opus', () => {
-    // Simulate a Slice 1 packet (no codec field)
-    const fields: VoiceHeaderFields = {
-      pttActive: false,
-      sequence: 42,
-      timestamp: 1000,
-      senderHash: makeSenderHash(),
-    };
-    const buf = encodeHeader(fields);
+    // Construct raw Slice 1 header bytes directly (no encodeHeader) to ensure
+    // backward compatibility even if the encoder regresses.
+    const buf = new Uint8Array(HEADER_SIZE);
+    const view = new DataView(buf.buffer);
+    // version=1 in high nibble, PTT=false, all reserved bits clear
+    buf[0] = VOICE_VERSION << 4;
+    view.setUint16(1, 42, false);
+    view.setUint32(3, 1000, false);
+    buf.set(makeSenderHash(), 7);
+
     const decoded = decodeHeader(buf);
     expect(decoded.codec).toBe('opus');
+    expect(decoded.sequence).toBe(42);
+    expect(decoded.timestamp).toBe(1000);
   });
 });

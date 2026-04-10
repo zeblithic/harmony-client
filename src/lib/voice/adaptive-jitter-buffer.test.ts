@@ -151,15 +151,21 @@ describe('AdaptiveJitterBuffer', () => {
       now: mockNow,
     });
 
-    // Insert stable frames
-    for (let i = 0; i < 100; i++) {
+    // Seed with frames for fill period
+    for (let i = 0; i < MIN_DEPTH; i++) {
       mockNow.mockReturnValue(i * 20);
       buf.insert(i, new Float32Array(160));
     }
 
-    // Fill + advance
+    // Fill period
     for (let i = 0; i < MIN_DEPTH; i++) buf.advance();
-    for (let i = 0; i < 80; i++) buf.advance();
+
+    // Stable streaming with interleaved insert + advance
+    for (let i = MIN_DEPTH; i < 100; i++) {
+      mockNow.mockReturnValue(i * 20);
+      buf.insert(i, new Float32Array(160));
+      buf.advance();
+    }
 
     expect(buf.getDepth()).toBe(MIN_DEPTH);
   });
