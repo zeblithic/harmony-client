@@ -174,8 +174,13 @@ export class VoiceReceiver {
     if (!entry) {
       entry = this.createCodecEntry(codecType);
       state.codecs.set(codecType, entry);
+      const newFrameSize = codecType === 'codec2' ? 160 : 320;
+      // Reset jitter buffer on codec switch to avoid mixing different-length frames
+      if (newFrameSize !== state.frameSize) {
+        state.jitterBuffer.reset();
+      }
       const prevFrameSize = state.frameSize;
-      state.frameSize = codecType === 'codec2' ? 160 : 320;
+      state.frameSize = newFrameSize;
 
       // Start async init — drain pending frames when ready
       const entryRef = entry;
@@ -185,7 +190,6 @@ export class VoiceReceiver {
       }).catch(() => {
         entryRef.codec.destroy();
         state.codecs.delete(codecType);
-        // Restore frame size if this was the only codec of this type
         state.frameSize = prevFrameSize;
       });
     }

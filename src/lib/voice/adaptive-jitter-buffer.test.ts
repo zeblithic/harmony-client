@@ -27,10 +27,14 @@ describe('AdaptiveJitterBuffer', () => {
 
   it('becomes ready after fill period at minDepth', () => {
     buf.insert(0, new Float32Array(160));
+    // Fill period: MIN_DEPTH advances return null, isReady stays false
     for (let i = 0; i < MIN_DEPTH; i++) {
       expect(buf.isReady()).toBe(false);
       buf.advance();
     }
+    // isReady becomes true on the first post-fill advance (which returns a frame)
+    expect(buf.isReady()).toBe(false);
+    buf.advance(); // first post-fill advance sets the flag
     expect(buf.isReady()).toBe(true);
   });
 
@@ -188,7 +192,8 @@ describe('AdaptiveJitterBuffer', () => {
 
   it('reset clears all state', () => {
     buf.insert(0, new Float32Array([1]));
-    for (let i = 0; i < MIN_DEPTH; i++) buf.advance();
+    // Fill period + one post-fill advance to set initialFillComplete
+    for (let i = 0; i < MIN_DEPTH + 1; i++) buf.advance();
     expect(buf.isReady()).toBe(true);
 
     buf.reset();

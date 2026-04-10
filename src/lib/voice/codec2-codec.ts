@@ -36,7 +36,12 @@ export class Codec2Codec implements VoiceCodec {
   private samplesPerFrame = 0;
   private bytesPerFrame = 0;
 
-  async init(_sampleRate: number, _channels: number): Promise<void> {
+  async init(sampleRate: number, channels: number): Promise<void> {
+    if (sampleRate !== 8000 || channels !== 1) {
+      throw new Error(
+        `codec2 3200 requires 8000 Hz mono, got ${sampleRate} Hz / ${channels} ch`,
+      );
+    }
     if (this.module !== null) {
       this.destroy();
     }
@@ -45,6 +50,10 @@ export class Codec2Codec implements VoiceCodec {
     this.module = await loader() as Codec2Module;
 
     this.statePtr = this.module._codec2_create(CODEC2_MODE_3200);
+    if (this.statePtr === 0) {
+      this.module = null;
+      throw new Error('Failed to create codec2 state (mode 3200)');
+    }
     this.samplesPerFrame = this.module._codec2_samples_per_frame(this.statePtr);
     const bitsPerFrame = this.module._codec2_bits_per_frame(this.statePtr);
     this.bytesPerFrame = Math.ceil(bitsPerFrame / 8);

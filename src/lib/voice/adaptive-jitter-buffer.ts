@@ -112,11 +112,11 @@ export class AdaptiveJitterBuffer {
     if (!this.initialFillComplete) {
       if (this.fillCount < this.depth) {
         this.fillCount++;
-        if (this.fillCount >= this.depth) {
-          this.initialFillComplete = true;
-        }
         return null;
       }
+      // Fill period complete — flag set here so isReady() is false during
+      // all fill advances (prevents comfort noise on the boundary tick).
+      this.initialFillComplete = true;
     }
 
     const seq = this.playSeq;
@@ -167,17 +167,17 @@ export class AdaptiveJitterBuffer {
     return Math.round(this.jitter * 100) / 100;
   }
 
-  /**
-   * Recalculate target depth from jitter and grow if needed.
-   * Growth is immediate — no delay.
-   */
-  private adaptDepth(): void {
-    // target = ceil(jitter * 3 / frameMs), clamped to [min, max]
-    const target = Math.max(
+  /** Compute target depth from current jitter, clamped to [min, max]. */
+  private targetDepth(): number {
+    return Math.max(
       this.minDepth,
       Math.min(this.maxDepth, Math.ceil((this.jitter * 3) / this.frameMs)),
     );
+  }
 
+  /** Grow depth immediately if jitter demands it. */
+  private adaptDepth(): void {
+    const target = this.targetDepth();
     if (target > this.depth) {
       this.depth = target;
     }
@@ -185,11 +185,7 @@ export class AdaptiveJitterBuffer {
 
   /** Shrink buffer by one slot if jitter allows. */
   private tryShrink(): void {
-    const target = Math.max(
-      this.minDepth,
-      Math.min(this.maxDepth, Math.ceil((this.jitter * 3) / this.frameMs)),
-    );
-
+    const target = this.targetDepth();
     if (target < this.depth) {
       // Shrink by 1 at a time to be conservative
       this.depth = this.depth - 1;
