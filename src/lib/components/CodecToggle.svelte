@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { CodecType } from '$lib/voice/voice-codec';
+  import type { CodecType } from '../voice/voice-codec';
 
   let {
     selected = 'opus' as CodecType,

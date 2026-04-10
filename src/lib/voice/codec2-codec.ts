@@ -36,7 +36,7 @@ export class Codec2Codec implements VoiceCodec {
   private samplesPerFrame = 0;
   private bytesPerFrame = 0;
 
-  async init(sampleRate: number, channels: number): Promise<void> {
+  async init(_sampleRate: number, _channels: number): Promise<void> {
     if (this.module !== null) {
       this.destroy();
     }
