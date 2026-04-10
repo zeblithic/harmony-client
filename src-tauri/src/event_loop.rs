@@ -76,6 +76,8 @@ pub async fn run(
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
+    mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
+    mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
@@ -268,6 +270,10 @@ pub async fn run(
         .collect();
     let mut peer_refresh_counter: u64 = 0;
 
+    // Dynamic voice channel subscriptions — keyed by channel_id.
+    let mut voice_subs: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+
     tracing::info!("event loop running");
 
     loop {
@@ -419,6 +425,56 @@ pub async fn run(
             // Unsubscribe actions here.
             Some(_req) = follow_rx.recv() => {}
 
+            // ── Voice frame relay (frontend → Zenoh) ────────────────
+            // Await directly instead of spawning per-frame tasks — preserves
+            // ordering and applies natural backpressure from Zenoh.
+            Some(voice) = voice_rx.recv() => {
+                if voice.frame.len() >= 23 {
+                    let node_addr = hex::encode(&voice.frame[7..23]);
+                    let key_expr = format!("harmony/voice/{}/{}", voice.channel_id, node_addr);
+                    if let Err(e) = session.put(&key_expr, voice.frame).await {
+                        tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                    }
+                }
+            }
+
+            // ── Voice channel join/leave ────────────────────────────
+            Some(req) = voice_channel_rx.recv() => {
+                match req {
+                    crate::voice::VoiceChannelRequest::Join { channel_id } => {
+                        let key_expr = format!("harmony/voice/{}/*", channel_id);
+                        let app = app.clone();
+                        let closing = closing.clone();
+                        match session.declare_subscriber(&key_expr).await {
+                            Ok(sub) => {
+                                let handle = tokio::spawn(async move {
+                                    while let Ok(sample) = sub.recv_async().await {
+                                        let payload = sample.payload().to_bytes().to_vec();
+                                        let _ = app.emit("voice-frame-received", serde_json::json!({
+                                            "frameBytes": payload,
+                                        }));
+                                    }
+                                    if !closing.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tracing::warn!("voice subscriber closed unexpectedly");
+                                    }
+                                });
+                                if let Some(old) = voice_subs.insert(channel_id, handle) {
+                                    old.abort();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%key_expr, err = %e, "voice subscribe failed");
+                            }
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::Leave { channel_id } => {
+                        if let Some(handle) = voice_subs.remove(&channel_id) {
+                            handle.abort();
+                        }
+                    }
+                }
+            }
+
             // ── Shutdown signal ──────────────────────────────────────
             _ = shutdown.changed() => {
                 tracing::info!("shutdown signal received");
@@ -446,6 +502,9 @@ pub async fn run(
 
     // Mark intentional shutdown so spawned tasks don't emit false errors.
     closing.store(true, Ordering::SeqCst);
+    for (_, handle) in voice_subs.drain() {
+        handle.abort();
+    }
     let _ = session.close().await;
     tracing::info!("event loop stopped");
 }

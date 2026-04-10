@@ -36,8 +36,10 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
+    "buffer": "^6.0.3",
     "d3-force": "^3.0.0",
     "d3-selection": "^3.0.0",
-    "d3-zoom": "^3.0.0"
+    "d3-zoom": "^3.0.0",
+    "opusscript": "^0.1.1"
   }
 }

@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter};
 mod event_loop;
 mod follows;
 mod identity;
+mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
@@ -28,6 +29,10 @@ struct NodeState {
     ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
     /// Channel for routing follow/unfollow requests through the event loop.
     follow_tx: Option<tokio::sync::mpsc::Sender<event_loop::FollowRequest>>,
+    /// Channel for sending outbound voice frames to the event loop.
+    voice_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceOutbound>>,
+    /// Channel for voice channel join/leave requests.
+    voice_channel_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceChannelRequest>>,
     /// Persistent follow manager (disk-backed follow list).
     follow_mgr: Option<follows::FollowManager>,
     /// Shared set of followed addresses (read by the event loop for source tagging).
@@ -180,7 +185,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, _follow_mgr, _followed_set) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -198,6 +203,8 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.fetch_tx.take(),
             guard.ingest_tx.take(),
             guard.follow_tx.take(),
+            guard.voice_tx.take(),
+            guard.voice_channel_tx.take(),
             guard.follow_mgr.take(),
             guard.followed_set.take(),
         )
@@ -208,6 +215,8 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(fetch_tx);
     drop(ingest_tx);
     drop(follow_tx);
+    drop(voice_tx);
+    drop(voice_channel_tx);
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -233,6 +242,8 @@ async fn start_node(
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
     let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
+    let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
+    let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
 
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
@@ -256,6 +267,8 @@ async fn start_node(
         let old_fetch = guard.fetch_tx.take();
         let old_ingest = guard.ingest_tx.take();
         let old_follow = guard.follow_tx.take();
+        let old_voice = guard.voice_tx.take();
+        let old_voice_channel = guard.voice_channel_tx.take();
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
         drop(guard);
@@ -263,6 +276,8 @@ async fn start_node(
         drop(old_fetch);
         drop(old_ingest);
         drop(old_follow);
+        drop(old_voice);
+        drop(old_voice_channel);
         stop_handles(old_shutdown, old_thread);
 
         // ── Identity (serialized by the lock — no concurrent generation race)
@@ -347,6 +362,8 @@ async fn start_node(
                         fetch_rx,
                         ingest_rx,
                         follow_rx,
+                        voice_rx,
+                        voice_channel_rx,
                         followed_set_clone,
                     )
                     .await;
@@ -360,6 +377,8 @@ async fn start_node(
         guard.fetch_tx = Some(fetch_tx);
         guard.ingest_tx = Some(ingest_tx);
         guard.follow_tx = Some(follow_tx);
+        guard.voice_tx = Some(voice_tx);
+        guard.voice_channel_tx = Some(voice_channel_tx);
         guard.follow_mgr = Some(follow_mgr);
         guard.followed_set = Some(followed_set);
         guard.node_addr = node_addr_for_state;
@@ -1120,6 +1139,81 @@ async fn fetch_content(
         .map_err(|_| "event loop dropped fetch request".to_string())?
 }
 
+// ── Voice commands ──────────────────────────────────────────────────────
+
+/// Reject channel IDs that could escape the intended Zenoh key namespace.
+/// Same forbidden characters as send_message's channel/hub validation.
+fn validate_voice_channel_id(channel_id: &str) -> Result<(), String> {
+    if channel_id.is_empty()
+        || channel_id.contains('/')
+        || channel_id.contains('*')
+        || channel_id.contains('?')
+        || channel_id.contains('#')
+        || channel_id.contains('$')
+    {
+        return Err(format!("invalid voice channel_id: {channel_id}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_voice_frame(
+    payload: voice::SendVoiceFramePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    validate_voice_channel_id(&payload.channel_id)?;
+    let voice_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    voice_tx
+        .send(voice::VoiceOutbound {
+            channel_id: payload.channel_id,
+            frame: payload.frame_bytes,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+#[tauri::command]
+async fn join_voice_channel(
+    channel_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    validate_voice_channel_id(&channel_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::Join { channel_id })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+#[tauri::command]
+async fn leave_voice_channel(
+    channel_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    validate_voice_channel_id(&channel_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::Leave { channel_id })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -1149,6 +1243,9 @@ pub fn run() {
             fetch_content,
             export_content,
             ingest_content,
+            send_voice_frame,
+            join_voice_channel,
+            leave_voice_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
