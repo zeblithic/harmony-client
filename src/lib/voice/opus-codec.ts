@@ -15,6 +15,8 @@
  *   16 kHz mono, 20 ms frames → 320 samples per frame.
  */
 
+import type { VoiceCodec, CodecType } from './voice-codec';
+
 // Dynamic import so the WASM binary is loaded lazily and test mocks intercept
 // the import before the module executes.
 type OpusScriptModule = {
@@ -37,7 +39,8 @@ interface OpusScriptInstance {
   delete(): void;
 }
 
-export class OpusCodec {
+export class OpusCodec implements VoiceCodec {
+  readonly codecType: CodecType = 'opus';
   private _codec: OpusScriptInstance | null = null;
   private _sampleRate = 0;
   private _channels = 0;

@@ -94,4 +94,8 @@ describe('OpusCodec', () => {
     const pcm = new Float32Array(320);
     expect(() => codec.encode(pcm)).toThrow('not initialized');
   });
+
+  it('exposes codecType as opus', () => {
+    expect(codec.codecType).toBe('opus');
+  });
 });
