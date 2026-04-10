@@ -182,15 +182,22 @@ export class VoiceReceiver {
       const prevFrameSize = state.frameSize;
       state.frameSize = newFrameSize;
 
-      // Start async init — drain pending frames when ready
+      // Start async init — drain pending frames when ready.
+      // Stale-closure guard: verify entry is still in the map before operating.
       const entryRef = entry;
       entry.codec.init(VoiceReceiver.sampleRateFor(codecType), 1).then(() => {
+        if (state.codecs.get(codecType) !== entryRef) {
+          entryRef.codec.destroy();
+          return;
+        }
         entryRef.ready = true;
         this.drainPendingFrames(entryRef, state.jitterBuffer);
       }).catch(() => {
+        if (state.codecs.get(codecType) === entryRef) {
+          state.codecs.delete(codecType);
+          state.frameSize = prevFrameSize;
+        }
         entryRef.codec.destroy();
-        state.codecs.delete(codecType);
-        state.frameSize = prevFrameSize;
       });
     }
     return entry;

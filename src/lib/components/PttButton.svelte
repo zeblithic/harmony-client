@@ -93,7 +93,7 @@
   </button>
   <CodecToggle
     selected={selectedCodec}
-    disabled={active || !onCodecChange}
+    disabled={disabled || active || !onCodecChange}
     {onCodecChange}
   />
 </div>
