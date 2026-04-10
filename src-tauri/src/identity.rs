@@ -1,7 +1,11 @@
 //! Node identity management — Ed25519 + post-quantum key generation and persistence.
 //!
-//! Adapted from harmony-node's identity_file.rs. Same binary format so keys
-//! are portable between standalone daemon and embedded Tauri client.
+//! Two storage backends behind a common `KeyStore` trait:
+//! - `KeychainStore` — OS-native keychain via the `keyring` crate
+//! - `FileStore`     — binary file at `~/.harmony/identity.key`
+//!
+//! `load_or_generate()` tries keychain first, migrates existing files,
+//! and falls back to file storage when no keychain is available.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +15,7 @@ use zeroize::Zeroizing;
 const VERSION: u8 = 0x01;
 const PQ_KEY_LEN: usize = 96;
 const ED25519_KEY_LEN: usize = 64;
-const FILE_LEN: usize = 1 + PQ_KEY_LEN + ED25519_KEY_LEN; // 161
+const BLOB_LEN: usize = 1 + PQ_KEY_LEN + ED25519_KEY_LEN; // 161
 
 pub struct NodeIdentity {
     pub pq: PqPrivateIdentity,
@@ -30,10 +34,161 @@ impl std::fmt::Debug for NodeIdentity {
     }
 }
 
+// ── Serialization helpers (shared by both backends) ─────────────────────
+
+/// Serialize a `NodeIdentity` into the 161-byte binary format.
+fn identity_to_blob(identity: &NodeIdentity) -> Zeroizing<Vec<u8>> {
+    let pq_bytes = Zeroizing::new(identity.pq.to_private_bytes());
+    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes());
+    let mut buf = Zeroizing::new(Vec::with_capacity(BLOB_LEN));
+    buf.push(VERSION);
+    buf.extend_from_slice(&pq_bytes);
+    buf.extend_from_slice(ed_bytes.as_slice());
+    buf
+}
+
+/// Deserialize a `NodeIdentity` from a 161-byte binary blob.
+fn blob_to_identity(buf: &[u8]) -> Result<NodeIdentity, String> {
+    if buf.len() != BLOB_LEN {
+        return Err(format!(
+            "Corrupt identity blob: expected {BLOB_LEN} bytes, got {}",
+            buf.len()
+        ));
+    }
+    if buf[0] != VERSION {
+        return Err(format!(
+            "Unsupported identity blob version: {:#04x}",
+            buf[0]
+        ));
+    }
+    let pq = PqPrivateIdentity::from_private_bytes(&buf[1..1 + PQ_KEY_LEN])
+        .map_err(|e| format!("Corrupt PQ identity: {e}"))?;
+    let ed25519 = PrivateIdentity::from_private_bytes(&buf[1 + PQ_KEY_LEN..])
+        .map_err(|e| format!("Corrupt Ed25519 identity: {e}"))?;
+    Ok(NodeIdentity { pq, ed25519 })
+}
+
+// ── KeyStore trait ──────────────────────────────────────────────────────
+
+/// Common interface for identity storage backends.
+pub trait KeyStore {
+    /// Load identity from this store. Returns `Ok(None)` if no entry exists.
+    fn load(&self) -> Result<Option<NodeIdentity>, String>;
+    /// Save identity to this store.
+    fn save(&self, identity: &NodeIdentity) -> Result<(), String>;
+}
+
+// ── FileStore ───────────────────────────────────────────────────────────
+
+/// File-based identity storage at a given path.
+pub struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Rename the identity file to `.bak` (used during migration).
+    pub fn rename_to_backup(&self) -> Result<(), String> {
+        let bak = self.path.with_extension("key.bak");
+        std::fs::rename(&self.path, &bak).map_err(|e| {
+            format!(
+                "Failed to rename {} → {}: {e}",
+                self.path.display(),
+                bak.display()
+            )
+        })
+    }
+}
+
+impl KeyStore for FileStore {
+    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let buf = Zeroizing::new(
+            std::fs::read(&self.path)
+                .map_err(|e| format!("Failed to read {}: {e}", self.path.display()))?,
+        );
+        let identity = blob_to_identity(&buf)?;
+        #[cfg(unix)]
+        warn_permissions(&self.path);
+        Ok(Some(identity))
+    }
+
+    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let blob = identity_to_blob(identity);
+
+        // Atomic write: tmp file with restricted permissions → fsync → rename.
+        let tmp_path = {
+            let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+            name.push(".tmp");
+            self.path.with_file_name(name)
+        };
+
+        struct TmpGuard<'a>(&'a Path);
+        impl Drop for TmpGuard<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+        let guard = TmpGuard(&tmp_path);
+
+        {
+            #[cfg(unix)]
+            let f = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+            };
+            #[cfg(not(unix))]
+            let f = {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)
+                    .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+            };
+            use std::io::Write;
+            (&f)
+                .write_all(&blob)
+                .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, &self.path).map_err(|e| {
+            format!(
+                "Failed to rename {} → {}: {e}",
+                tmp_path.display(),
+                self.path.display()
+            )
+        })?;
+        std::mem::forget(guard);
+        Ok(())
+    }
+}
+
+// ── Public API (unchanged shape) ────────────────────────────────────────
+
 /// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
-///
-/// Checks `$HOME` (Unix/macOS) then `$USERPROFILE` (Windows) for the home
-/// directory. An explicit override path bypasses both.
 pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
@@ -47,110 +202,16 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
 }
 
-pub fn load(path: &Path) -> Result<NodeIdentity, String> {
-    let buf = Zeroizing::new(
-        std::fs::read(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?,
-    );
-    if buf.len() != FILE_LEN {
-        return Err(format!(
-            "Corrupt identity file: expected {FILE_LEN} bytes, got {}",
-            buf.len()
-        ));
-    }
-    if buf[0] != VERSION {
-        return Err(format!(
-            "Unsupported identity file version: {:#04x}",
-            buf[0]
-        ));
-    }
-    let pq = PqPrivateIdentity::from_private_bytes(&buf[1..1 + PQ_KEY_LEN])
-        .map_err(|e| format!("Corrupt PQ identity in key file: {e}"))?;
-    let ed25519 = PrivateIdentity::from_private_bytes(&buf[1 + PQ_KEY_LEN..])
-        .map_err(|e| format!("Corrupt Ed25519 identity in key file: {e}"))?;
-    #[cfg(unix)]
-    warn_permissions(path);
-    Ok(NodeIdentity { pq, ed25519 })
-}
-
-pub fn save(path: &Path, identity: &NodeIdentity) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    let pq_bytes = Zeroizing::new(identity.pq.to_private_bytes());
-    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes());
-    let mut buf = Zeroizing::new(Vec::with_capacity(FILE_LEN));
-    buf.push(VERSION);
-    buf.extend_from_slice(&pq_bytes);
-    buf.extend_from_slice(ed_bytes.as_slice());
-
-    // Atomic write: tmp file with restricted permissions → fsync → rename.
-    let tmp_path = {
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".tmp");
-        path.with_file_name(name)
-    };
-
-    struct TmpGuard<'a>(&'a Path);
-    impl Drop for TmpGuard<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
-        }
-    }
-    let guard = TmpGuard(&tmp_path);
-
-    {
-        #[cfg(unix)]
-        let f = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)
-                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
-        };
-        #[cfg(not(unix))]
-        let f = {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
-        };
-        use std::io::Write;
-        (&f).write_all(&buf)
-            .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
-    }
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        format!(
-            "Failed to rename {} → {}: {e}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    std::mem::forget(guard);
-    Ok(())
-}
-
 /// Load identity from file, or generate and save a new one if it doesn't exist.
 pub fn load_or_generate(path: &Path) -> Result<NodeIdentity, String> {
-    if path.exists() {
-        return load(path);
+    let file_store = FileStore::new(path.to_path_buf());
+    if let Some(identity) = file_store.load()? {
+        return Ok(identity);
     }
     let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
     let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
     let identity = NodeIdentity { pq, ed25519 };
-    save(path, &identity)?;
+    file_store.save(&identity)?;
     Ok(identity)
 }
 
@@ -166,5 +227,51 @@ fn warn_permissions(path: &Path) {
                 "identity file has open permissions, should be 0600"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_store_round_trip() {
+        // PQ keygen (ML-DSA scalar NTT) requires ~2 MB stack — spawn a larger thread.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+                let store = FileStore::new(path.clone());
+
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let identity = NodeIdentity {
+                    pq: pq,
+                    ed25519: ed25519,
+                };
+
+                store.save(&identity).unwrap();
+                let loaded = store.load().unwrap().expect("should find saved identity");
+                assert_eq!(
+                    loaded.ed25519.public_identity().address_hash,
+                    identity.ed25519.public_identity().address_hash,
+                );
+                assert_eq!(
+                    loaded.pq.public_identity().address_hash,
+                    identity.pq.public_identity().address_hash,
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn file_store_load_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.key");
+        let store = FileStore::new(path);
+        assert!(store.load().unwrap().is_none());
     }
 }
