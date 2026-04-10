@@ -61,25 +61,26 @@ describe('JitterBuffer', () => {
   });
 
   it('handles out-of-order arrival', () => {
-    // Insert frames 0–3 out of order during the fill period
-    const pcm0 = new Float32Array([1]);
-    const pcm1 = new Float32Array([2]);
-    const pcm2 = new Float32Array([3]);
-    const pcm3 = new Float32Array([4]);
+    // First insert seeds playSeq; subsequent frames arrive out of order
+    // but all are within the buffer depth ahead of the seed.
+    const frame0 = new Float32Array([1]);
+    const frame1 = new Float32Array([2]);
+    const frame2 = new Float32Array([3]);
+    const frame3 = new Float32Array([4]);
 
-    buf.insert(2, pcm2);
-    buf.insert(0, pcm0);
-    buf.insert(3, pcm3);
-    buf.insert(1, pcm1);
+    buf.insert(0, frame0); // seeds playSeq = 0
+    buf.insert(3, frame3); // arrives out of order
+    buf.insert(1, frame1);
+    buf.insert(2, frame2);
 
     // Fill period
     for (let i = 0; i < DEPTH; i++) buf.advance();
 
     // Playback returns frames in ascending sequence order
-    expect(buf.advance()).toEqual(pcm0); // seq 0
-    expect(buf.advance()).toEqual(pcm1); // seq 1
-    expect(buf.advance()).toEqual(pcm2); // seq 2
-    expect(buf.advance()).toEqual(pcm3); // seq 3
+    expect(buf.advance()).toEqual(frame0); // seq 0
+    expect(buf.advance()).toEqual(frame1); // seq 1
+    expect(buf.advance()).toEqual(frame2); // seq 2
+    expect(buf.advance()).toEqual(frame3); // seq 3
   });
 
   it('drops late frames (already played past that sequence)', () => {
@@ -128,6 +129,28 @@ describe('JitterBuffer', () => {
     expect(buf.advance()).toEqual(pcmB);
     expect(buf.advance()).toEqual(pcmC);
     expect(buf.advance()).toEqual(pcmD);
+  });
+
+  it('seeds playSeq from first frame for mid-stream join', () => {
+    // Sender is already at seq 500 when receiver joins
+    const pcm0 = new Float32Array([10]);
+    const pcm1 = new Float32Array([20]);
+    const pcm2 = new Float32Array([30]);
+    const pcm3 = new Float32Array([40]);
+
+    buf.insert(500, pcm0);
+    buf.insert(501, pcm1);
+    buf.insert(502, pcm2);
+    buf.insert(503, pcm3);
+
+    // Fill period
+    for (let i = 0; i < DEPTH; i++) expect(buf.advance()).toBeNull();
+
+    // Frames are played starting from the seeded sequence
+    expect(buf.advance()).toEqual(pcm0);
+    expect(buf.advance()).toEqual(pcm1);
+    expect(buf.advance()).toEqual(pcm2);
+    expect(buf.advance()).toEqual(pcm3);
   });
 
   it('reset clears all state', () => {

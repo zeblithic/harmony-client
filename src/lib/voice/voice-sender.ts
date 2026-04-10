@@ -44,11 +44,16 @@ export class VoiceSender {
    */
   async start(): Promise<void> {
     if (this.active) return;
+    this.active = true;
     this.sequence = 0;
     this.timestamp = 0;
-    await this.config.codec.init(16000, 1);
-    await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
-    this.active = true;
+    try {
+      await this.config.codec.init(16000, 1);
+      await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
+    } catch (err) {
+      this.active = false;
+      throw err;
+    }
   }
 
   /**

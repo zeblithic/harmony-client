@@ -13,6 +13,8 @@ export class JitterBuffer {
   private slots: (Float32Array | null)[];
   private playSeq: number;
   private fillCount: number;
+  /** Whether playSeq has been seeded from the first received frame. */
+  private seeded: boolean;
 
   /**
    * @param depth   Number of slots (and fill-period duration in frames).
@@ -24,6 +26,7 @@ export class JitterBuffer {
     this.slots = new Array<Float32Array | null>(depth).fill(null);
     this.playSeq = 0;
     this.fillCount = 0;
+    this.seeded = false;
   }
 
   /**
@@ -34,6 +37,12 @@ export class JitterBuffer {
    * overwriting a slot that hasn't been played yet.
    */
   insert(seq: number, pcm: Float32Array): void {
+    // Seed playSeq from the first received frame so mid-stream joins work.
+    if (!this.seeded) {
+      this.playSeq = seq;
+      this.seeded = true;
+    }
+
     // Modular distance: positive means seq is ahead of playSeq
     const dist = (seq - this.playSeq + 0x10000) & 0xffff;
 
@@ -78,5 +87,6 @@ export class JitterBuffer {
     this.slots = new Array<Float32Array | null>(this.depth).fill(null);
     this.playSeq = 0;
     this.fillCount = 0;
+    this.seeded = false;
   }
 }
