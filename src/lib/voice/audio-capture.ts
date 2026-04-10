@@ -22,17 +22,18 @@ export class AudioCapture {
     onFrame: FrameCallback,
     createContext?: () => AudioContext,
     createWorkletNode?: (ctx: AudioContext) => AudioWorkletNode,
+    sampleRate = 16000,
   ): Promise<void> {
     if (this.active) return;
 
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: false },
+        audio: { sampleRate, channelCount: 1, echoCancellation: false },
       });
 
       this.context = createContext
         ? createContext()
-        : new AudioContext({ sampleRate: 16000 });
+        : new AudioContext({ sampleRate });
 
       if (!createWorkletNode) {
         await this.context.audioWorklet.addModule(

@@ -59,6 +59,19 @@ describe('AudioCapture', () => {
     });
   });
 
+  it('start passes sampleRate to getUserMedia', async () => {
+    const capture = new AudioCapture();
+    await capture.start(
+      vi.fn(),
+      () => mocks.ctx as unknown as AudioContext,
+      () => mocks.workletNode as unknown as AudioWorkletNode,
+      8000,
+    );
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
+      audio: { sampleRate: 8000, channelCount: 1, echoCancellation: false },
+    });
+  });
+
   it('stop releases resources', async () => {
     const capture = new AudioCapture();
     await capture.start(

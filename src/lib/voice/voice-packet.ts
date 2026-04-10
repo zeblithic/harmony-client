@@ -1,3 +1,5 @@
+import type { CodecType } from './voice-codec';
+
 /** Size of the voice packet header in bytes. */
 export const HEADER_SIZE = 23;
 
@@ -18,6 +20,8 @@ export interface VoiceHeaderFields {
    * Only the first 16 bytes are used; any excess is silently ignored.
    */
   senderHash: Uint8Array;
+  /** Codec type. Defaults to 'opus' if omitted (backward compatible). */
+  codec?: CodecType;
 }
 
 /** Decoded representation of a voice packet header. */
@@ -32,13 +36,16 @@ export interface DecodedVoiceHeader {
   timestamp: number;
   /** 16-byte sender address hash (copy of bytes 7–22). */
   senderHash: Uint8Array;
+  /** Codec identified by bit 2 of the flags byte. */
+  codec: CodecType;
 }
 
 /**
  * Encode a 23-byte voice packet header.
  *
  * Header layout:
- *   Byte 0:      [4-bit version=0x1][PTT flag][3 reserved bits]
+ *   Byte 0:      [4-bit version=0x1][PTT flag][codec bit][2 reserved bits]
+ *                codec bit: 0=opus, 1=codec2
  *   Bytes 1–2:   sequence (u16 big-endian)
  *   Bytes 3–6:   timestamp (u32 big-endian, ms since stream start)
  *   Bytes 7–22:  sender address hash (16 bytes)
@@ -47,8 +54,9 @@ export function encodeHeader(fields: VoiceHeaderFields): Uint8Array {
   const buf = new Uint8Array(HEADER_SIZE);
   const view = new DataView(buf.buffer);
 
-  // Byte 0: version nibble | PTT bit | 3 reserved bits
-  const flags = (VOICE_VERSION << 4) | (fields.pttActive ? 0x08 : 0x00);
+  // Byte 0: version nibble | PTT bit | codec bit | 2 reserved bits
+  const codecBit = fields.codec === 'codec2' ? 0x04 : 0x00;
+  const flags = (VOICE_VERSION << 4) | (fields.pttActive ? 0x08 : 0x00) | codecBit;
   buf[0] = flags;
 
   // Bytes 1–2: sequence (big-endian u16)
@@ -80,9 +88,10 @@ export function decodeHeader(buf: Uint8Array): DecodedVoiceHeader {
   const flagsByte = buf[0];
   const version = (flagsByte >> 4) & 0x0f;
   const pttActive = (flagsByte & 0x08) !== 0;
+  const codec: CodecType = (flagsByte & 0x04) !== 0 ? 'codec2' : 'opus';
   const sequence = view.getUint16(1, false);
   const timestamp = view.getUint32(3, false);
   const senderHash = buf.slice(7, 23);
 
-  return { version, pttActive, sequence, timestamp, senderHash };
+  return { version, pttActive, codec, sequence, timestamp, senderHash };
 }

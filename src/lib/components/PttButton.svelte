@@ -1,16 +1,23 @@
 <script lang="ts">
+  import type { CodecType } from '../voice/voice-codec';
+  import CodecToggle from './CodecToggle.svelte';
+
   let {
     active = false,
     processing = false,
     disabled = false,
+    selectedCodec = 'opus' as CodecType,
     onPttStart,
     onPttStop,
+    onCodecChange,
   }: {
     active?: boolean;
     processing?: boolean;
     disabled?: boolean;
+    selectedCodec?: CodecType;
     onPttStart?: () => void;
     onPttStop?: () => void;
+    onCodecChange?: (codec: CodecType) => void;
   } = $props();
 
   // Track which input sources are currently held to prevent one release
@@ -36,7 +43,11 @@
     if (!el) return false;
     if (el.classList?.contains('ptt-button')) return false;
     const tag = el.tagName ?? '';
-    return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag);
+    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'A'].includes(tag)) return true;
+    // Also treat elements with interactive ARIA roles as form controls
+    // (e.g., CodecToggle's role="radio" divs)
+    const role = el.getAttribute?.('role') ?? '';
+    return ['button', 'radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox', 'listbox', 'textbox'].includes(role);
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -57,28 +68,35 @@
 
 <svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} />
 
-<button
-  type="button"
-  class="ptt-button"
-  class:active
-  class:processing
-  aria-label="Push to talk"
-  onmousedown={() => activate('mouse')}
-  onmouseup={() => deactivate('mouse')}
-  onmouseleave={() => deactivate('mouse')}
-  ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
-  ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
-  ontouchcancel={() => deactivate('touch')}
-  {disabled}
->
-  <span class="ptt-icon" aria-hidden="true">
-    {#if processing}
-      ...
-    {:else}
-      🎤
-    {/if}
-  </span>
-</button>
+<div class="ptt-container">
+  <button
+    type="button"
+    class="ptt-button"
+    class:active
+    class:processing
+    aria-label="Push to talk"
+    onmousedown={() => activate('mouse')}
+    onmouseup={() => deactivate('mouse')}
+    onmouseleave={() => deactivate('mouse')}
+    ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
+    ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
+    ontouchcancel={() => deactivate('touch')}
+    {disabled}
+  >
+    <span class="ptt-icon" aria-hidden="true">
+      {#if processing}
+        ...
+      {:else}
+        🎤
+      {/if}
+    </span>
+  </button>
+  <CodecToggle
+    selected={selectedCodec}
+    disabled={disabled || active || !onCodecChange}
+    {onCodecChange}
+  />
+</div>
 
 <style>
   .ptt-button {
@@ -119,5 +137,12 @@
 
   .ptt-icon {
     pointer-events: none;
+  }
+
+  .ptt-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
   }
 </style>

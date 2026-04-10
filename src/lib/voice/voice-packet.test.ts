@@ -116,4 +116,66 @@ describe('voice-packet header', () => {
     const short = new Uint8Array(10);
     expect(() => decodeHeader(short)).toThrow();
   });
+
+  it('encodes codec=opus (bit 2 clear) by default', () => {
+    const fields: VoiceHeaderFields = {
+      pttActive: true,
+      sequence: 0,
+      timestamp: 0,
+      senderHash: makeSenderHash(),
+    };
+    const buf = encodeHeader(fields);
+    // Bit 2 should be 0 (Opus)
+    expect(buf[0] & 0x04).toBe(0);
+    const decoded = decodeHeader(buf);
+    expect(decoded.codec).toBe('opus');
+  });
+
+  it('encodes codec=codec2 when specified', () => {
+    const fields: VoiceHeaderFields = {
+      pttActive: true,
+      sequence: 10,
+      timestamp: 200,
+      senderHash: makeSenderHash(),
+      codec: 'codec2',
+    };
+    const buf = encodeHeader(fields);
+    // Bit 2 should be set
+    expect(buf[0] & 0x04).toBe(0x04);
+    const decoded = decodeHeader(buf);
+    expect(decoded.codec).toBe('codec2');
+  });
+
+  it('roundtrips codec2 with PTT active', () => {
+    const fields: VoiceHeaderFields = {
+      pttActive: true,
+      sequence: 100,
+      timestamp: 5000,
+      senderHash: makeSenderHash(),
+      codec: 'codec2',
+    };
+    const buf = encodeHeader(fields);
+    const decoded = decodeHeader(buf);
+    expect(decoded.pttActive).toBe(true);
+    expect(decoded.codec).toBe('codec2');
+    expect(decoded.sequence).toBe(100);
+    expect(decoded.timestamp).toBe(5000);
+  });
+
+  it('existing packets without codec field decode as opus', () => {
+    // Construct raw Slice 1 header bytes directly (no encodeHeader) to ensure
+    // backward compatibility even if the encoder regresses.
+    const buf = new Uint8Array(HEADER_SIZE);
+    const view = new DataView(buf.buffer);
+    // version=1 in high nibble, PTT=false, all reserved bits clear
+    buf[0] = VOICE_VERSION << 4;
+    view.setUint16(1, 42, false);
+    view.setUint32(3, 1000, false);
+    buf.set(makeSenderHash(), 7);
+
+    const decoded = decodeHeader(buf);
+    expect(decoded.codec).toBe('opus');
+    expect(decoded.sequence).toBe(42);
+    expect(decoded.timestamp).toBe(1000);
+  });
 });
