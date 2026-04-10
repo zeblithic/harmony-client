@@ -27,10 +27,10 @@ keychain is available.
 
 Two backends behind a common interface:
 
-```
+```rust
 KeyStore (trait)
-  load() -> Option<(PrivateIdentity, PqPrivateIdentity)>
-  save(ed25519_bytes, pq_bytes) -> Result<()>
+  fn load(&self) -> Result<Option<NodeIdentity>, String>
+  fn save(&self, identity: &NodeIdentity) -> Result<(), String>
 
 KeychainStore  -- delegates to keyring::Entry
 FileStore      -- current ~/.harmony/identity.key logic, extracted
