@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { VoiceSender, type VoiceSenderConfig } from './voice-sender';
 import { decodeHeader, HEADER_SIZE } from './voice-packet';
-import type { OpusCodec } from './opus-codec';
+import type { VoiceCodec } from './voice-codec';
 import type { AudioCapture } from './audio-capture';
 
 // ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ function makeConfig(): {
   config: VoiceSenderConfig;
   mockInvoke: ReturnType<typeof vi.fn>;
   mockEncode: ReturnType<typeof vi.fn>;
-  mockCodec: OpusCodec;
+  mockCodec: VoiceCodec;
   mockCapture: AudioCapture;
   getCapturedOnFrame: () => ((pcm: Float32Array) => void) | undefined;
 } {
@@ -26,11 +26,12 @@ function makeConfig(): {
   const mockEncode = vi.fn((_pcm: Float32Array) => new Uint8Array(40));
 
   const mockCodec = {
+    codecType: 'opus' as const,
     init: vi.fn().mockResolvedValue(undefined),
     encode: mockEncode,
     decode: vi.fn(),
     destroy: vi.fn(),
-  } as unknown as OpusCodec;
+  } as unknown as VoiceCodec;
 
   let capturedOnFrame: ((pcm: Float32Array) => void) | undefined;
 
@@ -209,5 +210,59 @@ describe('VoiceSender', () => {
     const frameBytes = payload.frameBytes as number[];
     const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
     expect(decodeHeader(headerBuf).sequence).toBe(5);
+  });
+
+  it('sets codec bit to 0 for opus', async () => {
+    const sender = new VoiceSender(ctx.config);
+    await sender.start();
+
+    const onFrame = ctx.getCapturedOnFrame()!;
+    onFrame(new Float32Array(320));
+
+    const [, args] = ctx.mockInvoke.mock.calls[0] as [string, Record<string, unknown>];
+    const payload = args.payload as Record<string, unknown>;
+    const frameBytes = payload.frameBytes as number[];
+    const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
+    const decoded = decodeHeader(headerBuf);
+    expect(decoded.codec).toBe('opus');
+  });
+
+  it('sets codec bit to 1 for codec2', async () => {
+    const codec2Mock = {
+      codecType: 'codec2' as const,
+      init: vi.fn().mockResolvedValue(undefined),
+      encode: vi.fn((_pcm: Float32Array) => new Uint8Array(8)),
+      decode: vi.fn(),
+      destroy: vi.fn(),
+    } as unknown as VoiceCodec;
+
+    const config: VoiceSenderConfig = {
+      ...ctx.config,
+      codec: codec2Mock,
+      sampleRate: 8000,
+    };
+    const sender = new VoiceSender(config);
+    await sender.start();
+
+    const onFrame = ctx.getCapturedOnFrame()!;
+    onFrame(new Float32Array(160));
+
+    const [, args] = ctx.mockInvoke.mock.calls[0] as [string, Record<string, unknown>];
+    const payload = args.payload as Record<string, unknown>;
+    const frameBytes = payload.frameBytes as number[];
+    const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
+    const decoded = decodeHeader(headerBuf);
+    expect(decoded.codec).toBe('codec2');
+  });
+
+  it('uses configured sampleRate for codec init', async () => {
+    const config: VoiceSenderConfig = {
+      ...ctx.config,
+      sampleRate: 8000,
+    };
+    const sender = new VoiceSender(config);
+    await sender.start();
+
+    expect((ctx.mockCodec.init as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(8000, 1);
   });
 });

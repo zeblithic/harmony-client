@@ -1,5 +1,5 @@
 import { type AudioCapture } from './audio-capture';
-import { type OpusCodec } from './opus-codec';
+import { type VoiceCodec } from './voice-codec';
 import { encodeHeader, HEADER_SIZE } from './voice-packet';
 
 const FRAME_MS = 20;
@@ -12,10 +12,12 @@ export interface VoiceSenderConfig {
   channelId: string;
   /** Tauri invoke function — wraps window.__TAURI__.invoke in production. */
   invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown>;
-  /** Opus encoder/decoder instance. */
-  codec: OpusCodec;
+  /** Voice codec instance (OpusCodec or Codec2Codec). */
+  codec: VoiceCodec;
   /** AudioWorklet-based PCM capture service. */
   capture: AudioCapture;
+  /** Sample rate for audio capture and codec init. Default: 16000. */
+  sampleRate?: number;
 }
 
 /**
@@ -51,9 +53,15 @@ export class VoiceSender {
     if (this.active) return;
     if (this.starting) return this.starting;
     this.starting = (async () => {
-      await this.config.codec.init(16000, 1);
+      const sr = this.config.sampleRate ?? 16000;
+      await this.config.codec.init(sr, 1);
       try {
-        await this.config.capture.start((pcm) => this.sendFrame(pcm, true));
+        await this.config.capture.start(
+          (pcm) => this.sendFrame(pcm, true),
+          undefined,
+          undefined,
+          sr,
+        );
       } catch (err) {
         // Codec initialized but capture failed — clean up codec to prevent leak
         this.config.codec.destroy();
@@ -81,7 +89,9 @@ export class VoiceSender {
     // Send TAIL_FRAME_COUNT silence frames with PTT=false so receivers
     // know the push-to-talk session has ended. Awaited so tail frames
     // reach Rust/Zenoh before codec is destroyed.
-    const silence = new Float32Array(320);
+    const sr = this.config.sampleRate ?? 16000;
+    const frameSize = Math.round(sr * 0.02);
+    const silence = new Float32Array(frameSize);
     for (let i = 0; i < TAIL_FRAME_COUNT; i++) {
       await this.sendFrame(silence, false);
     }
@@ -107,6 +117,7 @@ export class VoiceSender {
       sequence: this.sequence & 0xffff,
       timestamp: this.timestamp >>> 0,
       senderHash: this.config.senderHash,
+      codec: this.config.codec.codecType,
     });
     const frame = new Uint8Array(HEADER_SIZE + opus.byteLength);
     frame.set(header, 0);
