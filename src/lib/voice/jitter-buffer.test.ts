@@ -66,19 +66,26 @@ describe('JitterBuffer', () => {
   });
 
   it('handles out-of-order arrival', () => {
-    // Insert frames out of order
-    buf.insert(1, new Float32Array([2]));
-    buf.insert(0, new Float32Array([1]));
-    buf.insert(3, new Float32Array([4]));
-    buf.insert(2, new Float32Array([3]));
-
-    // Advance through fill period (seq 0..3 consumed)
+    // Advance through fill period first; playSeq is now DEPTH (4)
     for (let i = 0; i < DEPTH; i++) {
       buf.advance();
     }
 
-    // Frames 4+ are not inserted, so next advance should return null
-    expect(buf.advance()).toBeNull();
+    // Insert frames DEPTH..DEPTH+3 out of order
+    const pcmA = new Float32Array([1]); // seq DEPTH+1 arrives first
+    const pcmB = new Float32Array([2]); // seq DEPTH arrives second
+    const pcmC = new Float32Array([3]); // seq DEPTH+3 arrives third
+    const pcmD = new Float32Array([4]); // seq DEPTH+2 arrives last
+    buf.insert(DEPTH + 1, pcmA);
+    buf.insert(DEPTH + 0, pcmB);
+    buf.insert(DEPTH + 3, pcmC);
+    buf.insert(DEPTH + 2, pcmD);
+
+    // advance() should return frames in ascending sequence order regardless of insertion order
+    expect(buf.advance()).toEqual(pcmB); // seq DEPTH
+    expect(buf.advance()).toEqual(pcmA); // seq DEPTH+1
+    expect(buf.advance()).toEqual(pcmD); // seq DEPTH+2
+    expect(buf.advance()).toEqual(pcmC); // seq DEPTH+3
   });
 
   it('drops late frames (already played past that sequence)', () => {
