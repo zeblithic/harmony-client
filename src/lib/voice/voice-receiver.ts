@@ -1,27 +1,33 @@
-import { JitterBuffer } from './jitter-buffer';
+import { AdaptiveJitterBuffer } from './adaptive-jitter-buffer';
+import { generateComfortNoise } from './comfort-noise';
 import { decodeHeader, HEADER_SIZE } from './voice-packet';
-import type { OpusCodec } from './opus-codec';
+import type { VoiceCodec, CodecType } from './voice-codec';
 
 const FRAME_MS = 20;
-const BUFFER_DEPTH = 4; // 80ms
 const IDLE_TIMEOUT_MS = 2000;
 /** Max frames queued during async codec init (~320ms of audio). */
 const MAX_PENDING_FRAMES = 16;
+const MIN_BUFFER_DEPTH = 2;
+const MAX_BUFFER_DEPTH = 10;
 
 interface PendingFrame {
   sequence: number;
-  opusPayload: Uint8Array;
+  payload: Uint8Array;
+  codec: CodecType;
 }
 
 interface SenderState {
-  jitterBuffer: JitterBuffer;
-  codec: OpusCodec;
+  jitterBuffer: AdaptiveJitterBuffer;
+  /** One decoder per codec type, lazy-created on first frame of that type. */
+  codecs: Map<CodecType, VoiceCodec>;
   speaking: boolean;
   playbackTimer: ReturnType<typeof setInterval> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   /** False until codec.init() resolves. Frames are queued while false. */
   ready: boolean;
   pendingFrames: PendingFrame[];
+  /** Frame size for comfort noise (320 for opus, 160 for codec2). */
+  frameSize: number;
 }
 
 export interface VoiceReceiverConfig {
@@ -29,7 +35,8 @@ export interface VoiceReceiverConfig {
     event: string,
     handler: (event: { payload: unknown }) => void,
   ) => Promise<() => void>;
-  createCodec: () => OpusCodec;
+  /** Factory that creates a codec instance for the given type. */
+  createCodec: (codecType: CodecType) => VoiceCodec;
   onPlayFrame?: (senderHex: string, pcm: Float32Array | null) => void;
   /** Hex-encoded local sender hash — frames from this sender are filtered
    *  out to prevent self-echo (Zenoh delivers local puts to local subscribers). */
@@ -57,7 +64,7 @@ export class VoiceReceiver {
     if (bytes.byteLength < HEADER_SIZE) return;
 
     const header = decodeHeader(bytes);
-    const opusPayload = bytes.slice(HEADER_SIZE);
+    const encodedPayload = bytes.slice(HEADER_SIZE);
     const senderHex = Array.from(header.senderHash)
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
@@ -67,15 +74,21 @@ export class VoiceReceiver {
 
     let state = this.senders.get(senderHex);
     if (!state) {
-      const codec = this.config.createCodec();
+      const codec = this.config.createCodec(header.codec);
+      const frameSize = header.codec === 'codec2' ? 160 : 320;
       state = {
-        jitterBuffer: new JitterBuffer(BUFFER_DEPTH, FRAME_MS),
-        codec,
+        jitterBuffer: new AdaptiveJitterBuffer({
+          minDepth: MIN_BUFFER_DEPTH,
+          maxDepth: MAX_BUFFER_DEPTH,
+          frameMs: FRAME_MS,
+        }),
+        codecs: new Map([[header.codec, codec]]),
         speaking: false,
         playbackTimer: null,
         idleTimer: null,
         ready: false,
         pendingFrames: [],
+        frameSize,
       };
       this.senders.set(senderHex, state);
 
@@ -88,13 +101,14 @@ export class VoiceReceiver {
           // Stale closure — sender was removed/recreated during init.
           // init() allocated a new OpusScript on the Emscripten heap;
           // destroy it so it doesn't leak.
-          stateRef.codec.destroy();
+          stateRef.codecs.forEach((c) => c.destroy());
           return;
         }
         stateRef.ready = true;
         for (const pf of stateRef.pendingFrames) {
           try {
-            const pcm = stateRef.codec.decode(pf.opusPayload);
+            const decoder = this.getOrCreateCodec(stateRef, pf.codec);
+            const pcm = decoder.decode(pf.payload);
             stateRef.jitterBuffer.insert(pf.sequence, pcm);
           } catch {
             // Drop undecodable frame — jitter buffer will produce silence
@@ -128,20 +142,44 @@ export class VoiceReceiver {
 
     if (state.ready) {
       try {
-        const pcm = state.codec.decode(opusPayload);
+        const decoder = this.getOrCreateCodec(state, header.codec);
+        const pcm = decoder.decode(encodedPayload);
         state.jitterBuffer.insert(header.sequence, pcm);
       } catch {
         // Drop malformed frame — jitter buffer will produce silence
       }
     } else if (state.pendingFrames.length < MAX_PENDING_FRAMES) {
-      state.pendingFrames.push({ sequence: header.sequence, opusPayload });
+      state.pendingFrames.push({
+        sequence: header.sequence,
+        payload: encodedPayload,
+        codec: header.codec,
+      });
     }
+  }
+
+  /**
+   * Get or lazily create a decoder for the given codec type within
+   * a sender's state.
+   */
+  private getOrCreateCodec(state: SenderState, codecType: CodecType): VoiceCodec {
+    let codec = state.codecs.get(codecType);
+    if (!codec) {
+      codec = this.config.createCodec(codecType);
+      state.codecs.set(codecType, codec);
+      // Update frame size if we see a new codec type
+      state.frameSize = codecType === 'codec2' ? 160 : 320;
+    }
+    return codec;
   }
 
   private advancePlayback(senderHex: string): void {
     const state = this.senders.get(senderHex);
     if (!state) return;
-    const pcm = state.jitterBuffer.advance();
+    let pcm = state.jitterBuffer.advance();
+    // Generate comfort noise for missing frames (only after fill period)
+    if (pcm === null && state.jitterBuffer.isReady()) {
+      pcm = generateComfortNoise(state.frameSize, 0.005);
+    }
     this.config.onPlayFrame?.(senderHex, pcm);
   }
 
@@ -150,7 +188,7 @@ export class VoiceReceiver {
     if (!state) return;
     if (state.playbackTimer) clearInterval(state.playbackTimer);
     if (state.idleTimer) clearTimeout(state.idleTimer);
-    state.codec.destroy();
+    state.codecs.forEach((c) => c.destroy());
     this.senders.delete(senderHex);
   }
 

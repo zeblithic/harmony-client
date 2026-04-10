@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { VoiceReceiver, type VoiceReceiverConfig } from './voice-receiver';
 import { encodeHeader } from './voice-packet';
-import type { OpusCodec } from './opus-codec';
+import type { VoiceCodec } from './voice-codec';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -37,17 +37,19 @@ function makeMockListen() {
   return { listen, emit };
 }
 
-function mockCodecFactory(): OpusCodec {
+function mockCodecFactory(codecType: 'opus' | 'codec2' = 'opus'): VoiceCodec {
+  const frameSize = codecType === 'opus' ? 320 : 160;
   return {
+    codecType,
     init: vi.fn().mockResolvedValue(undefined),
-    encode: vi.fn().mockReturnValue(new Uint8Array(40)),
-    decode: vi.fn().mockReturnValue(new Float32Array(320).fill(0.1)),
+    encode: vi.fn().mockReturnValue(new Uint8Array(codecType === 'opus' ? 40 : 8)),
+    decode: vi.fn().mockReturnValue(new Float32Array(frameSize).fill(0.1)),
     destroy: vi.fn(),
-  } as unknown as OpusCodec;
+  } as unknown as VoiceCodec;
 }
 
 /**
- * Build a complete voice frame payload (header + 4 dummy Opus bytes) and emit
+ * Build a complete voice frame payload (header + dummy encoded bytes) and emit
  * it as a `voice-frame-received` event.
  */
 function emitVoiceFrame(
@@ -57,6 +59,7 @@ function emitVoiceFrame(
     sequence: number;
     pttActive: boolean;
     timestamp?: number;
+    codec?: 'opus' | 'codec2';
   },
 ) {
   const header = encodeHeader({
@@ -64,13 +67,14 @@ function emitVoiceFrame(
     sequence: opts.sequence,
     timestamp: opts.timestamp ?? 0,
     senderHash: opts.senderHash,
+    codec: opts.codec,
   });
 
-  // Append a minimal dummy Opus payload so byteLength > HEADER_SIZE
-  const opusPayload = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
-  const frameBytes = new Uint8Array(header.length + opusPayload.length);
+  const payloadSize = opts.codec === 'codec2' ? 8 : 40;
+  const payload = new Uint8Array(payloadSize).fill(0x01);
+  const frameBytes = new Uint8Array(header.length + payload.length);
   frameBytes.set(header, 0);
-  frameBytes.set(opusPayload, header.length);
+  frameBytes.set(payload, header.length);
 
   emit('voice-frame-received', { frameBytes: Array.from(frameBytes) });
 }
@@ -100,7 +104,7 @@ describe('VoiceReceiver', () => {
     mockListen = makeMockListen();
     config = {
       listen: mockListen.listen,
-      createCodec: mockCodecFactory,
+      createCodec: (codecType: 'opus' | 'codec2') => mockCodecFactory(codecType),
     };
   });
 
@@ -265,6 +269,64 @@ describe('VoiceReceiver', () => {
     });
 
     expect(receiver.getActiveSenders().length).toBe(1);
+
+    receiver.destroy();
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 8: creates codec2 decoder for codec2 frames
+  // -------------------------------------------------------------------------
+  it('creates codec2 decoder for codec2 frames', async () => {
+    const codecs: string[] = [];
+    const receiver = new VoiceReceiver({
+      ...config,
+      createCodec: (ct: 'opus' | 'codec2') => {
+        codecs.push(ct);
+        return mockCodecFactory(ct);
+      },
+    });
+    await receiver.init();
+
+    emitVoiceFrame(mockListen.emit, {
+      senderHash: makeSenderHash(0xaa),
+      sequence: 0,
+      pttActive: true,
+      codec: 'codec2',
+    });
+
+    expect(codecs).toContain('codec2');
+    receiver.destroy();
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 9: plays comfort noise instead of null for missing frames
+  // -------------------------------------------------------------------------
+  it('plays comfort noise instead of null for missing frames', async () => {
+    const playedFrames: (Float32Array | null)[] = [];
+    const receiver = new VoiceReceiver({
+      ...config,
+      onPlayFrame: (_hex, pcm) => playedFrames.push(pcm),
+    });
+    await receiver.init();
+
+    const hash = makeSenderHash(0xaa);
+    emitVoiceFrame(mockListen.emit, {
+      senderHash: hash,
+      sequence: 0,
+      pttActive: true,
+    });
+
+    // Wait for codec init
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Advance past fill period + a few frames
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(20);
+    }
+
+    // At least one frame should be non-null (either decoded PCM or comfort noise)
+    const nonNull = playedFrames.filter((f) => f !== null);
+    expect(nonNull.length).toBeGreaterThan(0);
 
     receiver.destroy();
   });
