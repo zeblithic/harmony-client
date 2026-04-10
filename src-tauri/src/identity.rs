@@ -266,29 +266,48 @@ fn load_or_generate_with_stores(
     file_store: &FileStore,
 ) -> Result<NodeIdentity, String> {
     // 1. Try keychain first
-    match keychain.load() {
+    let keychain_load_failed = match keychain.load() {
         Ok(Some(identity)) => return Ok(identity),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("keychain load failed, trying file: {e}"),
-    }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("keychain load failed, trying file: {e}");
+            true
+        }
+    };
 
     // 2. Check for existing file — migrate to keychain if found
     if let Some(identity) = file_store.load()? {
-        match keychain.save(&identity) {
-            Ok(()) => {
-                if let Err(e) = file_store.rename_to_backup() {
-                    tracing::warn!("failed to rename identity file to .bak: {e}");
+        // Only attempt migration if keychain is healthy (load returned Ok).
+        // If keychain errored, the entry may still exist but be inaccessible —
+        // writing could overwrite it.
+        if !keychain_load_failed {
+            match keychain.save(&identity) {
+                Ok(()) => {
+                    if let Err(e) = file_store.rename_to_backup() {
+                        tracing::warn!("identity saved to keychain but file rename to .bak failed: {e}");
+                    } else {
+                        tracing::info!("migrated identity from file to OS keychain");
+                    }
                 }
-                tracing::info!("migrated identity from file to OS keychain");
-            }
-            Err(e) => {
-                tracing::warn!("keychain write failed during migration, keeping file: {e}");
+                Err(e) => {
+                    tracing::warn!("keychain write failed during migration, keeping file: {e}");
+                }
             }
         }
         return Ok(identity);
     }
 
-    // 3. Generate fresh identity
+    // 3. Generate fresh identity — only if keychain is healthy.
+    // If keychain errored and no file exists, refuse to generate to avoid
+    // creating a new identity that could overwrite an inaccessible keychain entry.
+    if keychain_load_failed {
+        return Err(
+            "keychain read failed and no identity file exists; refusing to generate new identity \
+             to avoid overwriting an inaccessible keychain entry"
+                .to_string(),
+        );
+    }
+
     let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
     let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
     let identity = NodeIdentity { pq, ed25519 };

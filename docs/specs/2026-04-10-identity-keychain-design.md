@@ -119,7 +119,8 @@ Using `keyring`'s `mock` feature for tests that don't require a real keychain:
    new identity generated in keychain
 2. Verify entry visible in macOS Keychain Access under "harmony"
 3. Kill app, relaunch -> same identity loaded from keychain
-4. Delete keychain entry -> falls back to file store on next launch
+4. Delete keychain entry -> next launch generates a fresh identity
+   (original file was renamed to `.bak` during migration, not read back)
 
 ## Known Limitations
 
