@@ -186,6 +186,54 @@ impl KeyStore for FileStore {
     }
 }
 
+// ── KeychainStore ───────────────────────────────────────────────────────
+
+const KEYCHAIN_SERVICE: &str = "harmony";
+const KEYCHAIN_ACCOUNT: &str = "identity";
+
+/// OS-native keychain storage via the `keyring` crate.
+pub struct KeychainStore {
+    entry: keyring::Entry,
+}
+
+impl KeychainStore {
+    /// Create a store backed by the real OS keychain.
+    pub fn new() -> Result<Self, String> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .map_err(|e| format!("keychain entry creation failed: {e}"))?;
+        Ok(Self { entry })
+    }
+
+    /// Create a store backed by the keyring mock credential store (for tests).
+    #[cfg(test)]
+    pub fn new_mock() -> Self {
+        let credential = keyring::mock::MockCredential::default();
+        let entry = keyring::Entry::new_with_credential(Box::new(credential));
+        Self { entry }
+    }
+}
+
+impl KeyStore for KeychainStore {
+    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+        match self.entry.get_secret() {
+            Ok(bytes) => {
+                let buf = Zeroizing::new(bytes);
+                let identity = blob_to_identity(&buf)?;
+                Ok(Some(identity))
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(format!("keychain load failed: {e}")),
+        }
+    }
+
+    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
+        let blob = identity_to_blob(identity);
+        self.entry
+            .set_secret(&blob)
+            .map_err(|e| format!("keychain save failed: {e}"))
+    }
+}
+
 // ── Public API (unchanged shape) ────────────────────────────────────────
 
 /// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
@@ -272,6 +320,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.key");
         let store = FileStore::new(path);
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn keychain_store_round_trip() {
+        // PQ keygen (ML-DSA scalar NTT) requires ~2 MB stack — spawn a larger thread.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let store = KeychainStore::new_mock();
+
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let identity = NodeIdentity { pq, ed25519 };
+
+                store.save(&identity).unwrap();
+                let loaded = store.load().unwrap().expect("should find saved identity");
+                assert_eq!(
+                    loaded.ed25519.public_identity().address_hash,
+                    identity.ed25519.public_identity().address_hash,
+                );
+                assert_eq!(
+                    loaded.pq.public_identity().address_hash,
+                    identity.pq.public_identity().address_hash,
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn keychain_store_load_returns_none_when_empty() {
+        let store = KeychainStore::new_mock();
         assert!(store.load().unwrap().is_none());
     }
 }
