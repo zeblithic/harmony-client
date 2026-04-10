@@ -27,10 +27,9 @@ const SHRINK_DELAY = 50;
 
 /**
  * EWMA smoothing factor for jitter estimation.
- * Smaller divisor = faster convergence (more reactive to recent jitter).
- * RFC 3550 uses 16; we use 4 for faster adaptation to bursts.
+ * RFC 3550 §A.8: jitter += (deviation - jitter) / 16.
  */
-const EWMA_DIVISOR = 4;
+const EWMA_DIVISOR = 16;
 
 export class AdaptiveJitterBuffer {
   private readonly minDepth: number;

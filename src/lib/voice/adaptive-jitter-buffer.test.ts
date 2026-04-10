@@ -60,7 +60,12 @@ describe('AdaptiveJitterBuffer', () => {
   });
 
   it('grows depth when jitter increases', () => {
-    // Simulate high jitter by manipulating arrival times
+    // Simulate high jitter by manipulating arrival times.
+    // With EWMA divisor=16 (RFC 3550), convergence is slow — we need ~10 frames
+    // at deviation=80ms for jitter to reach ~38ms and target depth to exceed minDepth.
+    // Frame arrives every 100ms (expected every 20ms → deviation=80ms per frame).
+    // After 10 frames: jitter ≈ 80 * (1 - (15/16)^10) ≈ 38ms
+    // target = ceil(38*3/20) = 6 > minDepth=2.
     const mockNow = vi.fn();
     buf = new AdaptiveJitterBuffer({
       minDepth: MIN_DEPTH,
@@ -69,17 +74,10 @@ describe('AdaptiveJitterBuffer', () => {
       now: mockNow,
     });
 
-    // First frame at t=0
-    mockNow.mockReturnValue(0);
-    buf.insert(0, new Float32Array(160));
-
-    // Second frame arrives 80ms late (expected at 20ms, arrived at 100ms)
-    mockNow.mockReturnValue(100);
-    buf.insert(1, new Float32Array(160));
-
-    // Third frame also late
-    mockNow.mockReturnValue(200);
-    buf.insert(2, new Float32Array(160));
+    for (let i = 0; i < 10; i++) {
+      mockNow.mockReturnValue(i * 100);
+      buf.insert(i, new Float32Array(160));
+    }
 
     // Jitter should have increased, causing depth growth
     expect(buf.getDepth()).toBeGreaterThan(MIN_DEPTH);
@@ -112,13 +110,12 @@ describe('AdaptiveJitterBuffer', () => {
       now: mockNow,
     });
 
-    // Create high jitter to grow buffer
-    mockNow.mockReturnValue(0);
-    buf.insert(0, new Float32Array(160));
-    mockNow.mockReturnValue(100);
-    buf.insert(1, new Float32Array(160));
-    mockNow.mockReturnValue(200);
-    buf.insert(2, new Float32Array(160));
+    // Create high jitter to grow buffer (10 frames at 100ms intervals, deviation=80ms)
+    // With EWMA divisor=16, this yields jitter ≈ 38ms → depth > minDepth.
+    for (let i = 0; i < 10; i++) {
+      mockNow.mockReturnValue(i * 100);
+      buf.insert(i, new Float32Array(160));
+    }
 
     const grownDepth = buf.getDepth();
     expect(grownDepth).toBeGreaterThan(MIN_DEPTH);
@@ -127,10 +124,12 @@ describe('AdaptiveJitterBuffer', () => {
     // Fill period first
     for (let i = 0; i < grownDepth; i++) buf.advance();
 
-    // Insert frames at stable 20ms intervals and advance
-    let t = 200;
-    let seq = 3;
-    for (let i = 0; i < 100; i++) {
+    // Insert frames at stable 20ms intervals and advance.
+    // As jitter EWMA decays toward 0ms and cleanRun accumulates,
+    // tryShrink() fires every SHRINK_DELAY=50 advances.
+    let t = 10 * 100; // resume from last high-jitter timestamp
+    let seq = 10;
+    for (let i = 0; i < 200; i++) {
       t += 20;
       mockNow.mockReturnValue(t);
       buf.insert(seq, new Float32Array(160));
