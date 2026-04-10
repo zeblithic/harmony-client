@@ -181,13 +181,12 @@ export class VoiceReceiver {
     if (!entry) {
       entry = this.createCodecEntry(codecType);
       state.codecs.set(codecType, entry);
+      // Reset jitter buffer on codec switch to avoid mixing different-length frames.
+      // frameSize itself is updated per-frame in handleFrame, not here.
       const newFrameSize = codecType === 'codec2' ? 160 : 320;
-      // Reset jitter buffer on codec switch to avoid mixing different-length frames
       if (newFrameSize !== state.frameSize) {
         state.jitterBuffer.reset();
       }
-      const prevFrameSize = state.frameSize;
-      state.frameSize = newFrameSize;
 
       // Start async init — drain pending frames when ready.
       // Stale-closure guard: verify entry is still in the map before operating.
@@ -202,7 +201,6 @@ export class VoiceReceiver {
       }).catch(() => {
         if (state.codecs.get(codecType) === entryRef) {
           state.codecs.delete(codecType);
-          state.frameSize = prevFrameSize;
         }
         entryRef.codec.destroy();
       });
