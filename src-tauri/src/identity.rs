@@ -211,6 +211,16 @@ impl KeychainStore {
         let entry = keyring::Entry::new_with_credential(Box::new(credential));
         Self { entry }
     }
+
+    /// Create a store that always fails on save (for testing fallback).
+    ///
+    /// Load returns `NoEntry`; save always returns an error.
+    #[cfg(test)]
+    pub fn new_failing_mock() -> Self {
+        let credential = AlwaysFailOnSave;
+        let entry = keyring::Entry::new_with_credential(Box::new(credential));
+        Self { entry }
+    }
 }
 
 impl KeyStore for KeychainStore {
@@ -250,17 +260,101 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
 }
 
-/// Load identity from file, or generate and save a new one if it doesn't exist.
-pub fn load_or_generate(path: &Path) -> Result<NodeIdentity, String> {
-    let file_store = FileStore::new(path.to_path_buf());
+/// Internal resolution chain — accepts injected stores for testability.
+fn load_or_generate_with_stores(
+    keychain: &KeychainStore,
+    file_store: &FileStore,
+) -> Result<NodeIdentity, String> {
+    // 1. Try keychain first
+    match keychain.load() {
+        Ok(Some(identity)) => return Ok(identity),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("keychain load failed, trying file: {e}"),
+    }
+
+    // 2. Check for existing file — migrate to keychain if found
     if let Some(identity) = file_store.load()? {
+        match keychain.save(&identity) {
+            Ok(()) => {
+                if let Err(e) = file_store.rename_to_backup() {
+                    tracing::warn!("failed to rename identity file to .bak: {e}");
+                }
+                tracing::info!("migrated identity from file to OS keychain");
+            }
+            Err(e) => {
+                tracing::warn!("keychain write failed during migration, keeping file: {e}");
+            }
+        }
         return Ok(identity);
     }
+
+    // 3. Generate fresh identity
     let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
     let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
     let identity = NodeIdentity { pq, ed25519 };
-    file_store.save(&identity)?;
+
+    match keychain.save(&identity) {
+        Ok(()) => tracing::info!("new identity stored in OS keychain"),
+        Err(e) => {
+            tracing::warn!("keychain write failed, falling back to file: {e}");
+            file_store.save(&identity)?;
+        }
+    }
+
     Ok(identity)
+}
+
+/// Load identity from keychain or file, or generate and save a new one.
+///
+/// Resolution order:
+/// 1. OS keychain (via `keyring`)
+/// 2. File at `path` (migrated to keychain if found)
+/// 3. Generate fresh keys (stored in keychain, file fallback)
+pub fn load_or_generate(path: &Path) -> Result<NodeIdentity, String> {
+    let file_store = FileStore::new(path.to_path_buf());
+
+    match KeychainStore::new() {
+        Ok(keychain) => load_or_generate_with_stores(&keychain, &file_store),
+        Err(e) => {
+            tracing::warn!("keychain unavailable, using file storage: {e}");
+            if let Some(identity) = file_store.load()? {
+                return Ok(identity);
+            }
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let identity = NodeIdentity { pq, ed25519 };
+            file_store.save(&identity)?;
+            Ok(identity)
+        }
+    }
+}
+
+/// A `CredentialApi` implementation that always returns `NoEntry` on reads
+/// and `Error::Invalid` on writes. Used only in tests for failure-path coverage.
+#[cfg(test)]
+#[derive(Debug)]
+struct AlwaysFailOnSave;
+
+#[cfg(test)]
+impl keyring::credential::CredentialApi for AlwaysFailOnSave {
+    fn set_secret(&self, _secret: &[u8]) -> keyring::Result<()> {
+        Err(keyring::Error::Invalid(
+            "simulated keychain failure".to_string(),
+            "always fails".to_string(),
+        ))
+    }
+
+    fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+        Err(keyring::Error::NoEntry)
+    }
+
+    fn delete_credential(&self) -> keyring::Result<()> {
+        Err(keyring::Error::NoEntry)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(unix)]
@@ -355,5 +449,183 @@ mod tests {
     fn keychain_store_load_returns_none_when_empty() {
         let store = KeychainStore::new_mock();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn load_or_generate_migrates_file_to_keychain() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Pre-create a file via FileStore
+                let file_store = FileStore::new(path.clone());
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let original = NodeIdentity { pq, ed25519 };
+                let original_ed_hash = original.ed25519.public_identity().address_hash;
+                let original_pq_hash = original.pq.public_identity().address_hash;
+                file_store.save(&original).unwrap();
+
+                let keychain = KeychainStore::new_mock();
+                let result = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Same identity returned
+                assert_eq!(
+                    result.ed25519.public_identity().address_hash,
+                    original_ed_hash
+                );
+                assert_eq!(
+                    result.pq.public_identity().address_hash,
+                    original_pq_hash
+                );
+
+                // File renamed to .bak
+                assert!(!path.exists(), "original file should be renamed");
+                let bak = path.with_extension("key.bak");
+                assert!(bak.exists(), "backup file should exist");
+
+                // Identity in keychain
+                let from_keychain = keychain.load().unwrap().expect("identity should be in keychain");
+                assert_eq!(
+                    from_keychain.ed25519.public_identity().address_hash,
+                    original_ed_hash
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn load_or_generate_uses_keychain_when_present() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Pre-populate mock keychain
+                let keychain = KeychainStore::new_mock();
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let original = NodeIdentity { pq, ed25519 };
+                let original_ed_hash = original.ed25519.public_identity().address_hash;
+                keychain.save(&original).unwrap();
+
+                let file_store = FileStore::new(path.clone());
+                let result = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Same identity returned
+                assert_eq!(
+                    result.ed25519.public_identity().address_hash,
+                    original_ed_hash
+                );
+
+                // No file created on disk
+                assert!(!path.exists(), "no file should be created when keychain is used");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn load_or_generate_creates_new_in_keychain() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Nothing exists
+                let keychain = KeychainStore::new_mock();
+                let file_store = FileStore::new(path.clone());
+
+                let result = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Identity returned (non-trivial check: must have an address)
+                let _ = result.ed25519.public_identity().address_hash;
+
+                // Stored in keychain
+                let from_keychain = keychain.load().unwrap().expect("identity should be in keychain");
+                assert_eq!(
+                    from_keychain.ed25519.public_identity().address_hash,
+                    result.ed25519.public_identity().address_hash,
+                );
+
+                // NOT on disk
+                assert!(!path.exists(), "identity should be in keychain, not on disk");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn load_or_generate_falls_back_to_file_on_keychain_write_failure() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Use a failing mock keychain
+                let keychain = KeychainStore::new_failing_mock();
+                let file_store = FileStore::new(path.clone());
+
+                let result = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Identity returned
+                let ed_hash = result.ed25519.public_identity().address_hash;
+
+                // Stored on disk (fallback)
+                assert!(path.exists(), "identity should be on disk as fallback");
+                let from_file = file_store.load().unwrap().expect("should load from file");
+                assert_eq!(
+                    from_file.ed25519.public_identity().address_hash,
+                    ed_hash,
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_aborted_when_keychain_write_fails() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("identity.key");
+
+                // Pre-create a file
+                let file_store = FileStore::new(path.clone());
+                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+                let original = NodeIdentity { pq, ed25519 };
+                let original_ed_hash = original.ed25519.public_identity().address_hash;
+                file_store.save(&original).unwrap();
+
+                // Use failing mock keychain
+                let keychain = KeychainStore::new_failing_mock();
+                let result = load_or_generate_with_stores(&keychain, &file_store).unwrap();
+
+                // Identity loaded from file (same address)
+                assert_eq!(
+                    result.ed25519.public_identity().address_hash,
+                    original_ed_hash,
+                );
+
+                // File NOT renamed to .bak (migration was aborted)
+                assert!(path.exists(), "original file should still exist");
+                let bak = path.with_extension("key.bak");
+                assert!(!bak.exists(), "backup file should NOT exist when migration fails");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
