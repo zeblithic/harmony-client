@@ -6,6 +6,11 @@ const FRAME_MS = 20;
 const BUFFER_DEPTH = 4; // 80ms
 const IDLE_TIMEOUT_MS = 2000;
 
+interface PendingFrame {
+  sequence: number;
+  opusPayload: Uint8Array;
+}
+
 interface SenderState {
   jitterBuffer: JitterBuffer;
   codec: OpusCodec;
@@ -13,6 +18,9 @@ interface SenderState {
   lastFrameTime: number;
   playbackTimer: ReturnType<typeof setInterval> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
+  /** False until codec.init() resolves. Frames are queued while false. */
+  ready: boolean;
+  pendingFrames: PendingFrame[];
 }
 
 export interface VoiceReceiverConfig {
@@ -53,7 +61,6 @@ export class VoiceReceiver {
     let state = this.senders.get(senderHex);
     if (!state) {
       const codec = this.config.createCodec();
-      codec.init(16000, 1); // fire-and-forget
       state = {
         jitterBuffer: new JitterBuffer(BUFFER_DEPTH, FRAME_MS),
         codec,
@@ -61,11 +68,32 @@ export class VoiceReceiver {
         lastFrameTime: Date.now(),
         playbackTimer: null,
         idleTimer: null,
+        ready: false,
+        pendingFrames: [],
       };
       this.senders.set(senderHex, state);
-      state.playbackTimer = setInterval(() => {
-        this.advancePlayback(senderHex);
-      }, FRAME_MS);
+
+      // Init codec asynchronously, then drain pending frames and start playback
+      codec.init(16000, 1).then(() => {
+        const s = this.senders.get(senderHex);
+        if (!s) return; // sender was removed during init
+        s.ready = true;
+        for (const pf of s.pendingFrames) {
+          try {
+            const pcm = s.codec.decode(pf.opusPayload);
+            s.jitterBuffer.insert(pf.sequence, pcm);
+          } catch {
+            // Drop undecodable frame — jitter buffer will produce silence
+          }
+        }
+        s.pendingFrames = [];
+        // Start playback timer only after codec is ready
+        s.playbackTimer = setInterval(() => {
+          this.advancePlayback(senderHex);
+        }, FRAME_MS);
+      }).catch(() => {
+        this.removeSender(senderHex);
+      });
     }
 
     state.speaking = header.pttActive;
@@ -76,8 +104,16 @@ export class VoiceReceiver {
       this.removeSender(senderHex);
     }, IDLE_TIMEOUT_MS);
 
-    const pcm = state.codec.decode(opusPayload);
-    state.jitterBuffer.insert(header.sequence, pcm);
+    if (state.ready) {
+      try {
+        const pcm = state.codec.decode(opusPayload);
+        state.jitterBuffer.insert(header.sequence, pcm);
+      } catch {
+        // Drop malformed frame — jitter buffer will produce silence
+      }
+    } else {
+      state.pendingFrames.push({ sequence: header.sequence, opusPayload });
+    }
   }
 
   private advancePlayback(senderHex: string): void {
@@ -109,7 +145,7 @@ export class VoiceReceiver {
       this.unlisten();
       this.unlisten = null;
     }
-    for (const [key] of this.senders) {
+    for (const key of [...this.senders.keys()]) {
       this.removeSender(key);
     }
   }

@@ -87,10 +87,16 @@ export class VoiceSender {
     const frame = new Uint8Array(HEADER_SIZE + opus.byteLength);
     frame.set(header, 0);
     frame.set(opus, HEADER_SIZE);
-    // Tauri invoke requires a serializable value — convert Uint8Array to number[]
-    this.config.invoke('send_voice_frame', {
-      channelId: this.config.channelId,
-      frameBytes: Array.from(frame),
+    // Tauri v2 deserializes invoke args by parameter name — the Rust command
+    // parameter is `payload: SendVoiceFramePayload`, so we wrap accordingly.
+    // Uint8Array → number[] for JSON serialization over IPC.
+    void this.config.invoke('send_voice_frame', {
+      payload: {
+        channelId: this.config.channelId,
+        frameBytes: Array.from(frame),
+      },
+    }).catch(() => {
+      // Fire-and-forget: IPC errors are non-fatal for individual frames
     });
     this.sequence = (this.sequence + 1) & 0xffff;
     this.timestamp += FRAME_MS;

@@ -26,7 +26,11 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       pos += toCopy;
 
       if (this.offset === FRAME_SIZE) {
-        this.port.postMessage(this.buffer.slice());
+        // Transfer ownership of the buffer to avoid per-frame copy overhead
+        // in this real-time audio thread.
+        const frame = this.buffer;
+        this.port.postMessage(frame, [frame.buffer]);
+        this.buffer = new Float32Array(FRAME_SIZE);
         this.offset = 0;
       }
     }

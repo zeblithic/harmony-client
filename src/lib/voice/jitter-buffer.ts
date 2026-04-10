@@ -56,11 +56,8 @@ export class JitterBuffer {
    */
   advance(): Float32Array | null {
     if (this.fillCount < this.depth) {
-      // Still in fill period — consume the slot and advance anyway
+      // Still in fill period — let frames accumulate without consuming them.
       this.fillCount++;
-      const slot = this.playSeq % this.depth;
-      this.slots[slot] = null;
-      this.playSeq = (this.playSeq + 1) & 0xffff;
       return null;
     }
 

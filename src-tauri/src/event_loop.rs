@@ -426,17 +426,15 @@ pub async fn run(
             Some(_req) = follow_rx.recv() => {}
 
             // ── Voice frame relay (frontend → Zenoh) ────────────────
+            // Await directly instead of spawning per-frame tasks — preserves
+            // ordering and applies natural backpressure from Zenoh.
             Some(voice) = voice_rx.recv() => {
                 if voice.frame.len() >= 23 {
                     let node_addr = hex::encode(&voice.frame[7..23]);
                     let key_expr = format!("harmony/voice/{}/{}", voice.channel_id, node_addr);
-                    let session = session.clone();
-                    let payload = voice.frame;
-                    tokio::spawn(async move {
-                        if let Err(e) = session.put(&key_expr, payload).await {
-                            tracing::warn!(%key_expr, err = %e, "voice publish failed");
-                        }
-                    });
+                    if let Err(e) = session.put(&key_expr, voice.frame).await {
+                        tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                    }
                 }
             }
 
@@ -460,7 +458,9 @@ pub async fn run(
                                         tracing::warn!("voice subscriber closed unexpectedly");
                                     }
                                 });
-                                voice_subs.insert(channel_id, handle);
+                                if let Some(old) = voice_subs.insert(channel_id, handle) {
+                                    old.abort();
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(%key_expr, err = %e, "voice subscribe failed");

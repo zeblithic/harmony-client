@@ -92,10 +92,13 @@ describe('VoiceSender', () => {
     expect(ctx.mockInvoke).toHaveBeenCalledTimes(1);
     const [cmd, args] = ctx.mockInvoke.mock.calls[0] as [string, Record<string, unknown>];
     expect(cmd).toBe('send_voice_frame');
-    expect(args.channelId).toBe('chan-abc');
+
+    // Tauri v2 wraps in parameter name — Rust param is `payload`
+    const payload = args.payload as Record<string, unknown>;
+    expect(payload.channelId).toBe('chan-abc');
 
     // frameBytes must be an array
-    const frameBytes = args.frameBytes as number[];
+    const frameBytes = payload.frameBytes as number[];
     expect(Array.isArray(frameBytes)).toBe(true);
 
     // Total length: header (23) + opus payload (40)
@@ -122,7 +125,8 @@ describe('VoiceSender', () => {
     expect(ctx.mockInvoke).toHaveBeenCalledTimes(3);
 
     const sequences = ctx.mockInvoke.mock.calls.map(([, args]) => {
-      const frameBytes = (args as Record<string, unknown>).frameBytes as number[];
+      const payload = (args as Record<string, unknown>).payload as Record<string, unknown>;
+      const frameBytes = payload.frameBytes as number[];
       const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
       return decodeHeader(headerBuf).sequence;
     });
@@ -141,7 +145,8 @@ describe('VoiceSender', () => {
     onFrame(pcm);
 
     const timestamps = ctx.mockInvoke.mock.calls.map(([, args]) => {
-      const frameBytes = (args as Record<string, unknown>).frameBytes as number[];
+      const payload = (args as Record<string, unknown>).payload as Record<string, unknown>;
+      const frameBytes = payload.frameBytes as number[];
       const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
       return decodeHeader(headerBuf).timestamp;
     });
@@ -167,7 +172,8 @@ describe('VoiceSender', () => {
 
     // Count frames with PTT=false
     const pttFalseCount = ctx.mockInvoke.mock.calls.filter(([, args]) => {
-      const frameBytes = (args as Record<string, unknown>).frameBytes as number[];
+      const payload = (args as Record<string, unknown>).payload as Record<string, unknown>;
+      const frameBytes = payload.frameBytes as number[];
       const headerBuf = new Uint8Array(frameBytes.slice(0, HEADER_SIZE));
       return !decodeHeader(headerBuf).pttActive;
     }).length;

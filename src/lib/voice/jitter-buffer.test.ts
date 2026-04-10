@@ -12,7 +12,6 @@ describe('JitterBuffer', () => {
   });
 
   it('is not ready before buffer fill period', () => {
-    // insert some frames but do not advance enough times
     buf.insert(0, new Float32Array(160));
     buf.insert(1, new Float32Array(160));
     // advance fewer than DEPTH times — still in fill period
@@ -29,7 +28,7 @@ describe('JitterBuffer', () => {
     expect(buf.isReady()).toBe(true);
   });
 
-  it('plays frames in sequence order', () => {
+  it('plays frames in sequence order (preserved through fill)', () => {
     const pcm0 = new Float32Array([1, 2, 3]);
     const pcm1 = new Float32Array([4, 5, 6]);
     const pcm2 = new Float32Array([7, 8, 9]);
@@ -40,20 +39,16 @@ describe('JitterBuffer', () => {
     buf.insert(2, pcm2);
     buf.insert(3, pcm3);
 
-    // exhaust fill period — returns null during fill
+    // Fill period returns null — frames are NOT consumed
     for (let i = 0; i < DEPTH; i++) {
-      buf.advance();
+      expect(buf.advance()).toBeNull();
     }
 
-    // Now reads should start at seq 4 (playSeq advanced DEPTH times during fill)
-    // Insert frames for the next round
-    const pcm4 = new Float32Array([13, 14, 15]);
-    const pcm5 = new Float32Array([16, 17, 18]);
-    buf.insert(4, pcm4);
-    buf.insert(5, pcm5);
-
-    expect(buf.advance()).toEqual(pcm4);
-    expect(buf.advance()).toEqual(pcm5);
+    // After fill, frames are preserved and played in order
+    expect(buf.advance()).toEqual(pcm0);
+    expect(buf.advance()).toEqual(pcm1);
+    expect(buf.advance()).toEqual(pcm2);
+    expect(buf.advance()).toEqual(pcm3);
   });
 
   it('returns null for missing frames (silence)', () => {
@@ -66,40 +61,43 @@ describe('JitterBuffer', () => {
   });
 
   it('handles out-of-order arrival', () => {
-    // Advance through fill period first; playSeq is now DEPTH (4)
-    for (let i = 0; i < DEPTH; i++) {
-      buf.advance();
-    }
+    // Insert frames 0–3 out of order during the fill period
+    const pcm0 = new Float32Array([1]);
+    const pcm1 = new Float32Array([2]);
+    const pcm2 = new Float32Array([3]);
+    const pcm3 = new Float32Array([4]);
 
-    // Insert frames DEPTH..DEPTH+3 out of order
-    const pcmA = new Float32Array([1]); // seq DEPTH+1 arrives first
-    const pcmB = new Float32Array([2]); // seq DEPTH arrives second
-    const pcmC = new Float32Array([3]); // seq DEPTH+3 arrives third
-    const pcmD = new Float32Array([4]); // seq DEPTH+2 arrives last
-    buf.insert(DEPTH + 1, pcmA);
-    buf.insert(DEPTH + 0, pcmB);
-    buf.insert(DEPTH + 3, pcmC);
-    buf.insert(DEPTH + 2, pcmD);
+    buf.insert(2, pcm2);
+    buf.insert(0, pcm0);
+    buf.insert(3, pcm3);
+    buf.insert(1, pcm1);
 
-    // advance() should return frames in ascending sequence order regardless of insertion order
-    expect(buf.advance()).toEqual(pcmB); // seq DEPTH
-    expect(buf.advance()).toEqual(pcmA); // seq DEPTH+1
-    expect(buf.advance()).toEqual(pcmD); // seq DEPTH+2
-    expect(buf.advance()).toEqual(pcmC); // seq DEPTH+3
+    // Fill period
+    for (let i = 0; i < DEPTH; i++) buf.advance();
+
+    // Playback returns frames in ascending sequence order
+    expect(buf.advance()).toEqual(pcm0); // seq 0
+    expect(buf.advance()).toEqual(pcm1); // seq 1
+    expect(buf.advance()).toEqual(pcm2); // seq 2
+    expect(buf.advance()).toEqual(pcm3); // seq 3
   });
 
   it('drops late frames (already played past that sequence)', () => {
-    // Advance through fill period — playSeq is now DEPTH (4)
-    for (let i = 0; i < DEPTH; i++) {
-      buf.advance();
-    }
+    // Insert and play through frames 0–3
+    buf.insert(0, new Float32Array([1]));
+    buf.insert(1, new Float32Array([2]));
+    buf.insert(2, new Float32Array([3]));
+    buf.insert(3, new Float32Array([4]));
+
+    for (let i = 0; i < DEPTH; i++) buf.advance(); // fill period
+    for (let i = 0; i < DEPTH; i++) buf.advance(); // play 0–3, playSeq now 4
 
     // Insert a frame at seq=0 which is now in the past
     const stalePcm = new Float32Array([99, 99]);
     buf.insert(0, stalePcm);
 
-    // playSeq is 4; inserting seq=4 with a sentinel value
-    const freshPcm = new Float32Array([1, 2]);
+    // Insert a fresh frame at the current playhead
+    const freshPcm = new Float32Array([5, 6]);
     buf.insert(4, freshPcm);
 
     const result = buf.advance();
@@ -109,13 +107,12 @@ describe('JitterBuffer', () => {
 
   it('handles sequence wraparound at u16 boundary', () => {
     // Wind playSeq to just before the u16 wraparound boundary.
-    // After the fill period (DEPTH advances), playSeq == DEPTH.
-    // We want playSeq == 0xFFFE so frames 0xFFFE, 0xFFFF, 0x0000, 0x0001 wrap around.
-    // Total advances needed: 0xFFFE = fill(DEPTH) + extra(0xFFFE - DEPTH)
+    // Fill period: DEPTH advances, playSeq stays at 0.
+    // Post-fill: each advance increments playSeq by 1.
+    // Target: playSeq == 0xFFFE → need DEPTH (fill) + 0xFFFE (post-fill) advances.
     buf = new JitterBuffer(DEPTH, FRAME_MS);
-    for (let i = 0; i < DEPTH; i++) buf.advance(); // playSeq = DEPTH
-    const extra = (0xFFFE - DEPTH + 0x10000) & 0xFFFF;
-    for (let i = 0; i < extra; i++) buf.advance(); // playSeq = 0xFFFE
+    for (let i = 0; i < DEPTH; i++) buf.advance(); // fill, playSeq stays 0
+    for (let i = 0; i < 0xFFFE; i++) buf.advance(); // post-fill, playSeq → 0xFFFE
 
     // Insert four frames that straddle the 0xFFFF → 0x0000 wraparound
     const pcmA = new Float32Array([10]); // seq 0xFFFE

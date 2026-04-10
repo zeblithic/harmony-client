@@ -25,32 +25,48 @@ export class AudioCapture {
   ): Promise<void> {
     if (this.active) return;
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: false },
-    });
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: false },
+      });
 
-    this.context = createContext
-      ? createContext()
-      : new AudioContext({ sampleRate: 16000 });
+      this.context = createContext
+        ? createContext()
+        : new AudioContext({ sampleRate: 16000 });
 
-    if (!createWorkletNode) {
-      await this.context.audioWorklet.addModule(
-        new URL('./pcm-capture-processor.ts', import.meta.url).href,
-      );
+      if (!createWorkletNode) {
+        await this.context.audioWorklet.addModule(
+          new URL('./pcm-capture-processor.ts', import.meta.url).href,
+        );
+      }
+
+      this.source = this.context.createMediaStreamSource(this.stream);
+
+      this.worklet = createWorkletNode
+        ? createWorkletNode(this.context)
+        : new AudioWorkletNode(this.context, 'pcm-capture-processor');
+
+      this.worklet.port.onmessage = (e: MessageEvent) => {
+        onFrame(e.data as Float32Array);
+      };
+
+      this.source.connect(this.worklet);
+      this.active = true;
+    } catch (err) {
+      // Clean up partially-created resources on failure
+      this.worklet?.disconnect();
+      this.source?.disconnect();
+      this.stream?.getTracks().forEach(t => t.stop());
+      if (this.context) {
+        await this.context.close().catch(() => {});
+      }
+      this.worklet = null;
+      this.source = null;
+      this.stream = null;
+      this.context = null;
+      this.active = false;
+      throw err;
     }
-
-    this.source = this.context.createMediaStreamSource(this.stream);
-
-    this.worklet = createWorkletNode
-      ? createWorkletNode(this.context)
-      : new AudioWorkletNode(this.context, 'pcm-capture-processor');
-
-    this.worklet.port.onmessage = (e: MessageEvent) => {
-      onFrame(e.data as Float32Array);
-    };
-
-    this.source.connect(this.worklet);
-    this.active = true;
   }
 
   async stop(): Promise<void> {

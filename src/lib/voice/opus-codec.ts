@@ -47,8 +47,21 @@ export class OpusCodec {
    * Must be called before encode() or decode().
    */
   async init(sampleRate: number, channels: number): Promise<void> {
+    // Clean up previous instance if re-initializing
+    if (this._codec !== null) {
+      this._codec.delete();
+      this._codec = null;
+    }
+
     this._sampleRate = sampleRate;
     this._channels = channels;
+
+    // opusscript (emscripten) uses Node's Buffer internally.
+    // Ensure a Buffer polyfill is available in the Tauri webview.
+    if (typeof globalThis.Buffer === 'undefined') {
+      const bufferMod = await import('buffer');
+      (globalThis as Record<string, unknown>).Buffer = bufferMod.Buffer;
+    }
 
     const mod = (await import('opusscript')) as OpusScriptModule;
     const OpusScript = mod.default;
