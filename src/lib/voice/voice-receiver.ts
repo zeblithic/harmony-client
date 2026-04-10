@@ -137,13 +137,15 @@ export class VoiceReceiver {
       this.removeSender(senderHex);
     }, IDLE_TIMEOUT_MS);
 
-    // Update frameSize from every incoming frame's codec type so comfort
-    // noise always matches the active codec (handles reactivation of an
-    // existing codec entry after a round-trip switch).
-    state.frameSize = header.codec === 'codec2' ? 160 : 320;
-
-    // Get or create the codec entry for this frame's codec type
+    // Get or create the codec entry for this frame's codec type.
+    // Must happen BEFORE frameSize update so the jitter buffer reset
+    // guard inside getOrCreateCodecEntry can detect the size change.
     const entry = this.getOrCreateCodecEntry(state, header.codec);
+
+    // Update frameSize after codec entry creation so comfort noise
+    // always matches the active codec (handles reactivation of an
+    // existing entry after a round-trip switch like opus→codec2→opus).
+    state.frameSize = header.codec === 'codec2' ? 160 : 320;
 
     if (entry.ready) {
       try {
