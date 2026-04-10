@@ -84,7 +84,13 @@ export class VoiceReceiver {
       // on the new state (which would install a duplicate playback timer).
       const stateRef = state;
       codec.init(16000, 1).then(() => {
-        if (this.senders.get(senderHex) !== stateRef) return; // stale
+        if (this.senders.get(senderHex) !== stateRef) {
+          // Stale closure — sender was removed/recreated during init.
+          // init() allocated a new OpusScript on the Emscripten heap;
+          // destroy it so it doesn't leak.
+          stateRef.codec.destroy();
+          return;
+        }
         stateRef.ready = true;
         for (const pf of stateRef.pendingFrames) {
           try {
