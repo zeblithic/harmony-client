@@ -44,6 +44,7 @@ fn identity_to_blob(identity: &NodeIdentity) -> Zeroizing<Vec<u8>> {
     buf.push(VERSION);
     buf.extend_from_slice(&pq_bytes);
     buf.extend_from_slice(ed_bytes.as_slice());
+    debug_assert_eq!(buf.len(), BLOB_LEN, "identity blob length mismatch");
     buf
 }
 
@@ -105,13 +106,12 @@ impl FileStore {
 
 impl KeyStore for FileStore {
     fn load(&self) -> Result<Option<NodeIdentity>, String> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let buf = Zeroizing::new(
-            std::fs::read(&self.path)
-                .map_err(|e| format!("Failed to read {}: {e}", self.path.display()))?,
-        );
+        let raw = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
+        };
+        let buf = Zeroizing::new(raw);
         let identity = blob_to_identity(&buf)?;
         #[cfg(unix)]
         warn_permissions(&self.path);
