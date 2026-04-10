@@ -1,16 +1,23 @@
 <script lang="ts">
+  import type { CodecType } from '$lib/voice/voice-codec';
+  import CodecToggle from './CodecToggle.svelte';
+
   let {
     active = false,
     processing = false,
     disabled = false,
+    selectedCodec = 'opus' as CodecType,
     onPttStart,
     onPttStop,
+    onCodecChange,
   }: {
     active?: boolean;
     processing?: boolean;
     disabled?: boolean;
+    selectedCodec?: CodecType;
     onPttStart?: () => void;
     onPttStop?: () => void;
+    onCodecChange?: (codec: CodecType) => void;
   } = $props();
 
   // Track which input sources are currently held to prevent one release
@@ -57,28 +64,35 @@
 
 <svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} />
 
-<button
-  type="button"
-  class="ptt-button"
-  class:active
-  class:processing
-  aria-label="Push to talk"
-  onmousedown={() => activate('mouse')}
-  onmouseup={() => deactivate('mouse')}
-  onmouseleave={() => deactivate('mouse')}
-  ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
-  ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
-  ontouchcancel={() => deactivate('touch')}
-  {disabled}
->
-  <span class="ptt-icon" aria-hidden="true">
-    {#if processing}
-      ...
-    {:else}
-      🎤
-    {/if}
-  </span>
-</button>
+<div class="ptt-container">
+  <button
+    type="button"
+    class="ptt-button"
+    class:active
+    class:processing
+    aria-label="Push to talk"
+    onmousedown={() => activate('mouse')}
+    onmouseup={() => deactivate('mouse')}
+    onmouseleave={() => deactivate('mouse')}
+    ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
+    ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
+    ontouchcancel={() => deactivate('touch')}
+    {disabled}
+  >
+    <span class="ptt-icon" aria-hidden="true">
+      {#if processing}
+        ...
+      {:else}
+        🎤
+      {/if}
+    </span>
+  </button>
+  <CodecToggle
+    selected={selectedCodec}
+    disabled={active}
+    {onCodecChange}
+  />
+</div>
 
 <style>
   .ptt-button {
@@ -119,5 +133,12 @@
 
   .ptt-icon {
     pointer-events: none;
+  }
+
+  .ptt-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
   }
 </style>
