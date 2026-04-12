@@ -89,9 +89,10 @@ export class MailService {
     }
   }
 
-  async markRead(cid: string): Promise<void> {
+  async markRead(cid: string, folder?: MailFolderKind): Promise<void> {
+    const targetFolder = folder ?? this.activeFolder;
     if (this.adapter) {
-      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read', folder: this.activeFolder });
+      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read', folder: targetFolder });
     }
     const entry = this.entries.find(e => e.messageCid === cid);
     if (entry && !entry.read) {

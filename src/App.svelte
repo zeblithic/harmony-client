@@ -762,10 +762,11 @@
         selectedCid={selectedMailCid}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
+          const folder = activeMailFolder;
           const detail = await mailService.getMessage(cid);
           if (selectedMailCid !== cid) return; // stale selection
           selectedMailDetail = detail;
-          await mailService.markRead(cid);
+          await mailService.markRead(cid, folder);
         }}
         onFolderChange={async (folder) => {
           activeMailFolder = folder;

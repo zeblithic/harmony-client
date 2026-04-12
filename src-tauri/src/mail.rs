@@ -124,7 +124,7 @@ impl MailManager {
         }
 
         let index_path = data_dir.join("index.json");
-        let index = if index_path.exists() {
+        let mut index: MailIndex = if index_path.exists() {
             match std::fs::read(&index_path) {
                 Ok(bytes) => match serde_json::from_slice(&bytes) {
                     Ok(idx) => idx,
@@ -138,6 +138,14 @@ impl MailManager {
         } else {
             MailIndex::default()
         };
+
+        // Ensure required folders exist even if the persisted index was
+        // edited or written by an older version that omitted some.
+        for name in &["inbox", "sent", "drafts", "trash"] {
+            index.folders.entry(name.to_string()).or_insert_with(|| FolderState {
+                entries: Vec::new(),
+            });
+        }
 
         Self {
             data_dir: data_dir.to_path_buf(),
