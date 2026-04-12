@@ -1,16 +1,20 @@
 <script lang="ts">
   let {
     replyTo = null,
+    initialTo = '',
+    initialSubject = '',
     onSend,
     onCancel,
   }: {
     replyTo: string | null;
+    initialTo?: string;
+    initialSubject?: string;
     onSend?: (to: string[], subject: string, body: string, replyTo: string | null) => void | Promise<void>;
     onCancel?: () => void;
   } = $props();
 
-  let toField = $state('');
-  let subject = $state('');
+  let toField = $state(initialTo);
+  let subject = $state(initialSubject);
   let body = $state('');
   let sending = $state(false);
   let error = $state('');

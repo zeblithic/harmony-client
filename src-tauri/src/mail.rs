@@ -178,10 +178,13 @@ impl MailManager {
             read: false,
         };
 
-        // Store blob
+        // Store blob (atomic: write tmp then rename, matching save_index pattern)
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        std::fs::write(&blob_path, msg_bytes)
+        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, msg_bytes)
             .map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path)
+            .map_err(|e| format!("rename blob: {e}"))?;
 
         // Prepend to inbox (newest first)
         let inbox = self.index.folders.get_mut("inbox").unwrap();
@@ -200,10 +203,13 @@ impl MailManager {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
-        // Store blob
+        // Store blob (atomic: write tmp then rename)
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        std::fs::write(&blob_path, msg_bytes)
+        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, msg_bytes)
             .map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path)
+            .map_err(|e| format!("rename blob: {e}"))?;
 
         // Add to sent folder
         let snippet = truncate_snippet(&msg.subject);

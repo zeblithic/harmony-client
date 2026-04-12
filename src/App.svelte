@@ -202,6 +202,8 @@
   let selectedMailDetail = $state<MailMessageDetail | null>(null);
   let showCompose = $state(false);
   let composeReplyTo = $state<string | null>(null);
+  let composeInitialTo = $state('');
+  let composeInitialSubject = $state('');
   mailService.onChange = () => {
     mailEntries = [...mailService.entries];
     mailCounts = { ...mailService.counts };
@@ -741,6 +743,8 @@
     {#if showCompose}
       <MailCompose
         replyTo={composeReplyTo}
+        initialTo={composeInitialTo}
+        initialSubject={composeInitialSubject}
         onSend={async (to, subject, body, replyTo) => {
           await mailService.send(to, subject, body, replyTo ?? undefined);
           showCompose = false;
@@ -767,7 +771,7 @@
           selectedMailDetail = null;
           await mailService.loadFolder(folder);
         }}
-        onCompose={() => { showCompose = true; composeReplyTo = null; }}
+        onCompose={() => { showCompose = true; composeReplyTo = null; composeInitialTo = ''; composeInitialSubject = ''; }}
         onMarkRead={(cid) => { mailService.markRead(cid).catch(() => {}); }}
         onMoveTrash={(cid) => { mailService.moveToTrash(cid).catch(() => {}); }}
       />
@@ -778,6 +782,9 @@
       message={selectedMailDetail}
       onReply={(_cid, msgId) => {
         composeReplyTo = msgId;
+        composeInitialTo = selectedMailDetail?.senderAddress ?? '';
+        const subj = selectedMailDetail?.subject ?? '';
+        composeInitialSubject = subj.startsWith('Re: ') ? subj : `Re: ${subj}`;
         showCompose = true;
       }}
       onBack={() => { selectedMailCid = null; selectedMailDetail = null; }}
