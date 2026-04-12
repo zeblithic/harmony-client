@@ -444,10 +444,15 @@ impl MailManager {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Reject non-hex CIDs to prevent path traversal via IPC input.
+/// Expected hex length of a BLAKE3 CID (32 bytes = 64 hex characters).
+const CID_HEX_LEN: usize = 64;
+
+/// Reject CIDs that aren't exactly 64 hex characters.
+/// Prevents path traversal (non-hex), and DoS via oversized strings
+/// that would cause large allocations and filesystem path bloat.
 fn validate_hex(s: &str) -> Result<(), String> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid hex CID".to_string());
+    if s.len() != CID_HEX_LEN || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid CID: expected 64 hex characters".to_string());
     }
     Ok(())
 }
@@ -651,12 +656,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
 
+        // Path traversal
         assert!(mgr.get_message("../../../etc/passwd").is_err());
+        // Non-hex characters
         assert!(mgr.get_message("not-hex!").is_err());
+        // Empty
         assert!(mgr.get_message("").is_err());
-        assert!(mgr.mark_read("zzzz", true, None).is_err());
-        assert!(mgr.move_message("a/b", None, "inbox").is_err());
-        assert!(mgr.delete_message("..", None).is_err());
+        // Wrong length (too short)
+        assert!(mgr.mark_read("aabbccdd", true, None).is_err());
+        assert!(mgr.move_message("aabb", None, "inbox").is_err());
+        assert!(mgr.delete_message("ff", None).is_err());
+        // Wrong length (too long — DoS vector)
+        let oversized = "aa".repeat(64); // 128 hex chars instead of 64
+        assert!(mgr.get_message(&oversized).is_err());
     }
 
     #[test]
