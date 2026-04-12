@@ -174,6 +174,9 @@
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'files'}
           aria-label="Files" aria-pressed={appMode === 'files'}
           onclick={() => onModeChange?.('files')}>Files</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mail'}
+          aria-label="Mail" aria-pressed={appMode === 'mail'}
+          onclick={() => onModeChange?.('mail')}>Mail</button>
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'spellbook'}
           aria-label="Spellbook" aria-pressed={appMode === 'spellbook'}
           onclick={() => onModeChange?.('spellbook')}>Spellbook</button>

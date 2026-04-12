@@ -79,6 +79,7 @@ pub async fn run(
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -246,6 +247,27 @@ pub async fn run(
     )
     .await;
 
+    // Subscribe to inbound mail for this node's address.
+    if let Ok(g) = mail_mgr.lock() {
+        let own_hex = g.owner_address_hex();
+        drop(g);
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("harmony/mail/v1/{own_hex}"),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    } else {
+        tracing::error!("mail_mgr mutex poisoned, skipping mail subscription");
+    }
+
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
@@ -347,7 +369,7 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set);
+                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set, &mail_mgr);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -725,6 +747,7 @@ fn emit_frontend_event(
     payload: &[u8],
     hop_distance: Option<u8>,
     followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
@@ -770,6 +793,27 @@ fn emit_frontend_event(
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {
             let _ = app.emit("telemetry-event", &event);
+        }
+    } else if key_expr.starts_with("harmony/mail/v1/") && !key_expr.ends_with("/root") {
+        // Inbound mail delivery — store in MailManager and notify frontend.
+        // NOTE: receive_message performs blocking disk I/O (blob write + index
+        // persist) while holding the mutex. Acceptable for Phase 0 since mail
+        // is infrequent. Phase 1 should offload to spawn_blocking or a
+        // dedicated writer thread to avoid stalling the event loop under burst.
+        let mut mgr = match mail_mgr.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(error = %e, "mail_mgr mutex poisoned");
+                return;
+            }
+        };
+        match mgr.receive_message(payload) {
+            Ok(entry) => {
+                let _ = app.emit("mail-received", &entry);
+            }
+            Err(e) => {
+                tracing::debug!(key_expr, error = %e, "mail receive skipped");
+            }
         }
     }
 }

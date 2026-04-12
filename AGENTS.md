@@ -1,6 +1,6 @@
 # Agent Instructions
 
-This project uses **Linear** for issue tracking via the Linear MCP plugin.
+This project uses **Linear** for issue tracking. Issues are managed via the Linear MCP integration (tools prefixed with `mcp__plugin_linear_linear__`).
 
 ## Non-Interactive Shell Commands
 
@@ -28,60 +28,45 @@ cp -rf source dest          # NOT: cp -r source dest
 
 ## Issue Tracking with Linear
 
-**IMPORTANT**: This project uses **Linear** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other ad-hoc tracking methods.
-
-Use the Linear MCP plugin tools (e.g., `list_issues`, `save_issue`, `get_issue`, `list_teams`) to interact with Linear.
+**IMPORTANT**: This project uses **Linear** for ALL issue tracking. Do NOT use beads (`bd`), markdown TODOs, or other tracking methods.
 
 ### Workflow for AI Agents
 
-1. **Check available work**: Use `list_issues` to find open/in-progress issues
-2. **View details**: Use `get_issue` for full context on a specific issue
+1. **Find work**: Use `mcp__plugin_linear_linear__list_issues` to find assigned/unstarted issues
+2. **Understand context**: Use `mcp__plugin_linear_linear__get_issue` to read issue details
 3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create a new issue in Linear with `save_issue`
-5. **Complete**: Update the issue status in Linear when done
+4. **Discover new work?** Create a linked issue via `mcp__plugin_linear_linear__save_issue`
+5. **Update status**: Move issues through statuses as work progresses via `mcp__plugin_linear_linear__save_issue`
 
 ### Important Rules
 
-- Use Linear for ALL task tracking
+- Use Linear for ALL task tracking (via MCP tools)
 - Check Linear issues before asking "what should I work on?"
-- Do NOT create markdown TODO lists for project tracking
-- Do NOT use bd/beads (legacy system, now read-only)
-
-## Code Changes MUST Go Through Pull Requests
-
-**NEVER push code changes directly to main.** All implementation work goes through feature branches and pull requests with code review.
-
-**MANDATORY WORKFLOW for code changes:**
-
-1. **Create a feature branch** before starting work (e.g., `feat/mail-v1-smtp`)
-2. **Commit to the branch** — not to main
-3. **Push the branch** and create a PR against main
-4. **Code review** — PRs are reviewed by automated code review agents. Use the `/review-pr` skill or `pr-review-toolkit` plugin. Do NOT merge without review.
-5. **Merge after review passes**
-
-The ONLY exception is trivial documentation/guidance updates (like CLAUDE.md or AGENTS.md edits) — those may go directly to main if the user explicitly approves.
+- Do NOT use `bd` (beads) — it is deprecated in this project
+- Do NOT create markdown TODO lists for persistent tracking
+- Do NOT duplicate tracking systems
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until your branch is pushed and a PR is created.
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
 
 **MANDATORY WORKFLOW:**
 
-1. **File issues for remaining work** - Create issues in Linear for anything that needs follow-up
+1. **File issues for remaining work** - Create Linear issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Update Linear issues (close finished work, update in-progress items)
-4. **PUSH BRANCH TO REMOTE AND CREATE PR** - This is MANDATORY:
+3. **Update issue status** - Update Linear issue statuses as appropriate
+4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
-   git push -u origin <your-branch>
-   gh pr create --title "..." --body "..."
+   git pull --rebase
+   git push
+   git status  # MUST show "up to date with origin"
    ```
 5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed, pushed, and PR created
+6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
-- NEVER push directly to main — always use feature branches + PRs
-- Work is NOT complete until your branch is pushed and a PR exists
+- Work is NOT complete until `git push` succeeds
 - NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push the branch
+- NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds

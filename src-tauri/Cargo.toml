@@ -33,6 +33,8 @@ harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = 
 harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-mail = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+blake3 = "1"
 
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
