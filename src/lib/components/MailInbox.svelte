@@ -103,7 +103,7 @@
             <button
               type="button"
               class="action-btn"
-              title="Delete"
+              title="Move to Trash"
               onclick={(e) => { e.stopPropagation(); onMoveTrash?.(entry.messageCid); }}
             >
               &times;

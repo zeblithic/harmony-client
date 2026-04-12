@@ -149,14 +149,15 @@ impl MailManager {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
-        // Dedup by message_id across ALL folders
+        // Dedup by message_id in receive-side folders (inbox, trash, drafts).
+        // Excludes "sent" so self-addressed messages can land in inbox after
+        // store_sent already recorded the same message_id in sent.
         let msg_id_hex = hex::encode(msg.message_id);
-        let already_seen = self
-            .index
-            .folders
-            .values()
+        let already_received = ["inbox", "trash", "drafts"]
+            .into_iter()
+            .filter_map(|name| self.index.folders.get(name))
             .any(|folder| folder.entries.iter().any(|e| e.message_id == msg_id_hex));
-        if already_seen {
+        if already_received {
             return Err("duplicate message".to_string());
         }
 

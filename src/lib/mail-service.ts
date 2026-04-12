@@ -16,10 +16,16 @@ export class MailService {
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private seenCids = new Set<string>();
+  private loadRequestId = 0;
 
   constructor() {
-    this.entries = [...mockMailEntries];
-    this.counts = { ...mockMailCounts };
+    this.entries = mockMailEntries.map((e) => ({ ...e }));
+    this.counts = {
+      inbox: { ...mockMailCounts.inbox },
+      sent: { ...mockMailCounts.sent },
+      drafts: { ...mockMailCounts.drafts },
+      trash: { ...mockMailCounts.trash },
+    };
     for (const e of this.entries) this.seenCids.add(e.messageCid);
   }
 
@@ -48,6 +54,7 @@ export class MailService {
   }
 
   async loadFolder(folder: MailFolderKind, page = 0): Promise<void> {
+    const requestId = ++this.loadRequestId;
     this.activeFolder = folder;
     if (!this.adapter) return;
     try {
@@ -56,6 +63,7 @@ export class MailService {
         page,
         perPage: 50,
       }) as MailEntry[];
+      if (requestId !== this.loadRequestId) return; // stale response
       this.entries = entries;
       this.seenCids.clear();
       for (const e of entries) this.seenCids.add(e.messageCid);
@@ -85,11 +93,7 @@ export class MailService {
 
   async markRead(cid: string): Promise<void> {
     if (this.adapter) {
-      try {
-        await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read' });
-      } catch {
-        // Fall through to local update
-      }
+      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read' });
     }
     const entry = this.entries.find(e => e.messageCid === cid);
     if (entry && !entry.read) {
@@ -102,11 +106,7 @@ export class MailService {
 
   async moveToTrash(cid: string): Promise<void> {
     if (this.adapter) {
-      try {
-        await this.adapter.invoke('update_mail', { messageCid: cid, action: 'move_trash' });
-      } catch {
-        // Fall through to local removal
-      }
+      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'move_trash' });
     }
     const idx = this.entries.findIndex(e => e.messageCid === cid);
     if (idx !== -1) {
