@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -11,6 +11,8 @@
     fileDetailPanel?: Snippet;
     spellbookContent?: Snippet;
     spellbookDetail?: Snippet;
+    mailInbox?: Snippet;
+    mailDetail?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -18,11 +20,20 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
-  {#if mode === 'files' && fileBrowser}
+  {#if mode === 'mail' && mailInbox}
+    <main class="mail-list-area">
+      {@render mailInbox()}
+    </main>
+    {#if !collapsed && mailDetail}
+      <section class="detail-area">
+        {@render mailDetail()}
+      </section>
+    {/if}
+  {:else if mode === 'files' && fileBrowser}
     <main class="files-area">
       {@render fileBrowser()}
     </main>
@@ -147,6 +158,22 @@
   }
   .spellbook-area {
     grid-area: spellbook;
+    background: var(--bg-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .layout.mail-mode {
+    grid-template-columns: var(--nav-width) 1fr 1fr;
+    grid-template-areas: "nav mail-list detail";
+  }
+  .layout.mail-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav mail-list";
+  }
+  .mail-list-area {
+    grid-area: mail-list;
     background: var(--bg-primary);
     overflow-y: auto;
     display: flex;

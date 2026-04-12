@@ -11,6 +11,9 @@
   import ProfileEditor from './lib/components/ProfileEditor.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
+  import MailInbox from './lib/components/MailInbox.svelte';
+  import MailReader from './lib/components/MailReader.svelte';
+  import MailCompose from './lib/components/MailCompose.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import { NotificationService } from './lib/notification-service';
@@ -20,10 +23,11 @@
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
+  import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
+  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
 
@@ -188,6 +192,23 @@
   fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
+
+  const mailService = new MailService();
+  $effect(() => () => mailService.destroy());
+  let mailVersion = $state(0);
+  let mailEntries = $state([...mailService.entries]);
+  let mailCounts = $state({ ...mailService.counts });
+  let activeMailFolder = $state<MailFolderKind>('inbox');
+  let selectedMailCid = $state<string | null>(null);
+  let selectedMailDetail = $state<MailMessageDetail | null>(null);
+  let showCompose = $state(false);
+  let composeReplyTo = $state<string | null>(null);
+  mailService.onChange = () => {
+    mailVersion++;
+    mailEntries = [...mailService.entries];
+    mailCounts = { ...mailService.counts };
+  };
+
   const stq8Service = new Stq8Service(null); // WASM loaded async later
 
   // Declare allMessages before wiring onChange — avoids a temporal dead zone
@@ -209,6 +230,7 @@
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
       };
       await messageService.connectAdapter(adapter);
+      await mailService.connectAdapter(adapter);
       await vineService.connectAdapter(adapter);
       await vineService.loadFollowed();
       await fileManagerService.connectAdapter(adapter);
@@ -712,6 +734,50 @@
   {/snippet}
   {#snippet spellbookDetail()}
     <FlashcardStats stats={flashcardStats} />
+  {/snippet}
+  {#snippet mailInbox()}
+    {#if showCompose}
+      <MailCompose
+        replyTo={composeReplyTo}
+        onSend={(to, subject, body, replyTo) => {
+          mailService.send(to, subject, body, replyTo ?? undefined);
+          showCompose = false;
+          composeReplyTo = null;
+        }}
+        onCancel={() => { showCompose = false; composeReplyTo = null; }}
+      />
+    {:else}
+      <MailInbox
+        entries={mailEntries}
+        activeFolder={activeMailFolder}
+        counts={mailCounts}
+        selectedCid={selectedMailCid}
+        onSelectEmail={async (cid) => {
+          selectedMailCid = cid;
+          selectedMailDetail = await mailService.getMessage(cid);
+          await mailService.markRead(cid);
+        }}
+        onFolderChange={async (folder) => {
+          activeMailFolder = folder;
+          selectedMailCid = null;
+          selectedMailDetail = null;
+          await mailService.loadFolder(folder);
+        }}
+        onCompose={() => { showCompose = true; composeReplyTo = null; }}
+        onMarkRead={(cid) => mailService.markRead(cid)}
+        onMoveTrash={(cid) => mailService.moveToTrash(cid)}
+      />
+    {/if}
+  {/snippet}
+  {#snippet mailDetail()}
+    <MailReader
+      message={selectedMailDetail}
+      onReply={(_cid, msgId) => {
+        composeReplyTo = msgId;
+        showCompose = true;
+      }}
+      onBack={() => { selectedMailCid = null; selectedMailDetail = null; }}
+    />
   {/snippet}
 </Layout>
 

@@ -118,7 +118,40 @@ export interface VineVideo {
   viewed: boolean;
 }
 
-export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook';
+export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail';
+
+// ── Mail Types ────────────────────────────────────────────────────────
+
+export type MailFolderKind = 'inbox' | 'sent' | 'drafts' | 'trash';
+
+export interface MailEntry {
+  messageCid: string;
+  messageId: string;
+  senderAddress: string;
+  timestamp: number;
+  subjectSnippet: string;
+  read: boolean;
+}
+
+export interface MailMessageDetail {
+  messageCid: string;
+  subject: string;
+  body: string;
+  senderAddress: string;
+  recipients: Array<{ address: string; recipientType: string }>;
+  timestamp: number;
+  attachments: Array<{ cid: string; filename: string; mimeType: string; size: number }>;
+  isReply: boolean;
+  isForward: boolean;
+  inReplyTo?: string;
+}
+
+export interface MailFolderCounts {
+  total: number;
+  unread: number;
+}
+
+export type MailCounts = Record<MailFolderKind, MailFolderCounts>;
 
 // ── File Manager Types ──────────────────────────────────────────────
 
