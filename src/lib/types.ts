@@ -135,10 +135,11 @@ export interface MailEntry {
 
 export interface MailMessageDetail {
   messageCid: string;
+  messageId: string;
   subject: string;
   body: string;
   senderAddress: string;
-  recipients: Array<{ address: string; recipientType: string }>;
+  recipients: Array<{ address: string; recipientType: 'to' | 'cc' | 'bcc' }>;
   timestamp: number;
   attachments: Array<{ cid: string; filename: string; mimeType: string; size: number }>;
   isReply: boolean;

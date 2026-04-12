@@ -1330,15 +1330,9 @@ async fn send_mail(
 
     let msg_bytes = msg.to_bytes().map_err(|e| format!("serialize: {e}"))?;
 
-    // Store in sent folder
-    {
-        let mut mgr = mail_mgr.lock().unwrap();
-        mgr.store_sent(&msg_bytes, &msg)?;
-    }
-
-    // Publish to each recipient's Zenoh key
-    for addr_hex in &payload.to {
-        let key_expr = format!("harmony/mail/v1/{addr_hex}");
+    // Publish to each recipient's Zenoh key (canonical lowercase hex)
+    for recipient in &msg.recipients {
+        let key_expr = format!("harmony/mail/v1/{}", hex::encode(recipient.address_hash));
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         publish_tx
             .send(event_loop::PublishRequest {
@@ -1351,6 +1345,12 @@ async fn send_mail(
         reply_rx
             .await
             .map_err(|_| "event loop dropped request".to_string())??;
+    }
+
+    // Store in sent folder only after all publishes succeed
+    {
+        let mut mgr = mail_mgr.lock().unwrap();
+        mgr.store_sent(&msg_bytes, &msg)?;
     }
 
     Ok(())

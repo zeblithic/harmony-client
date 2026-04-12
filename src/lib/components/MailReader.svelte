@@ -44,7 +44,7 @@
       <button
         type="button"
         class="reply-btn"
-        onclick={() => onReply?.(message.messageCid, message.inReplyTo ?? '')}
+        onclick={() => onReply?.(message.messageCid, message.messageId)}
       >
         Reply
       </button>

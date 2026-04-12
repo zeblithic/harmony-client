@@ -79,7 +79,12 @@
           role="button"
           tabindex="0"
           onclick={() => onSelectEmail?.(entry.messageCid)}
-          onkeydown={(e) => { if (e.key === 'Enter') onSelectEmail?.(entry.messageCid); }}
+          onkeydown={(e) => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            if (e.target instanceof HTMLButtonElement) return;
+            e.preventDefault();
+            onSelectEmail?.(entry.messageCid);
+          }}
         >
           <span class="mail-sender">{shortAddr(entry.senderAddress)}</span>
           <span class="mail-subject">{entry.subjectSnippet || '(no subject)'}</span>
@@ -235,7 +240,8 @@
     opacity: 0;
   }
 
-  .mail-row:hover .mail-actions {
+  .mail-row:hover .mail-actions,
+  .mail-row:focus-within .mail-actions {
     opacity: 1;
   }
 

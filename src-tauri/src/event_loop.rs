@@ -247,6 +247,24 @@ pub async fn run(
     )
     .await;
 
+    // Subscribe to inbound mail for this node's address.
+    {
+        let own_hex = mail_mgr.lock().unwrap().owner_address_hex();
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: format!("harmony/mail/v1/{own_hex}"),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    }
+
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));

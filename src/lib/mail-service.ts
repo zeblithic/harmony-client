@@ -32,7 +32,10 @@ export class MailService {
       const entry = event.payload as MailEntry;
       if (this.seenCids.has(entry.messageCid)) return;
       this.seenCids.add(entry.messageCid);
-      this.entries.unshift(entry);
+      // Only prepend to the visible list if we're viewing the inbox
+      if (this.activeFolder === 'inbox') {
+        this.entries.unshift(entry);
+      }
       this.counts.inbox.total += 1;
       this.counts.inbox.unread += 1;
       this.onChange?.();
@@ -114,6 +117,7 @@ export class MailService {
         if (!entry.read) folderCounts.unread = Math.max(0, folderCounts.unread - 1);
       }
       this.counts.trash.total += 1;
+      if (!entry.read) this.counts.trash.unread += 1;
       this.onChange?.();
     }
   }

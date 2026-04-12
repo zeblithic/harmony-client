@@ -5,7 +5,7 @@
     onCancel,
   }: {
     replyTo: string | null;
-    onSend?: (to: string[], subject: string, body: string, replyTo: string | null) => void;
+    onSend?: (to: string[], subject: string, body: string, replyTo: string | null) => void | Promise<void>;
     onCancel?: () => void;
   } = $props();
 
@@ -42,10 +42,12 @@
 
     sending = true;
     try {
-      onSend?.(recipients, subject, body, replyTo);
+      await onSend?.(recipients, subject, body, replyTo);
       toField = '';
       subject = '';
       body = '';
+    } catch (err) {
+      error = err instanceof Error ? err.message : 'Send failed';
     } finally {
       sending = false;
     }

@@ -195,7 +195,6 @@
 
   const mailService = new MailService();
   $effect(() => () => mailService.destroy());
-  let mailVersion = $state(0);
   let mailEntries = $state([...mailService.entries]);
   let mailCounts = $state({ ...mailService.counts });
   let activeMailFolder = $state<MailFolderKind>('inbox');
@@ -204,7 +203,6 @@
   let showCompose = $state(false);
   let composeReplyTo = $state<string | null>(null);
   mailService.onChange = () => {
-    mailVersion++;
     mailEntries = [...mailService.entries];
     mailCounts = { ...mailService.counts };
   };
@@ -739,8 +737,8 @@
     {#if showCompose}
       <MailCompose
         replyTo={composeReplyTo}
-        onSend={(to, subject, body, replyTo) => {
-          mailService.send(to, subject, body, replyTo ?? undefined);
+        onSend={async (to, subject, body, replyTo) => {
+          await mailService.send(to, subject, body, replyTo ?? undefined);
           showCompose = false;
           composeReplyTo = null;
         }}
@@ -754,7 +752,9 @@
         selectedCid={selectedMailCid}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
-          selectedMailDetail = await mailService.getMessage(cid);
+          const detail = await mailService.getMessage(cid);
+          if (selectedMailCid !== cid) return; // stale selection
+          selectedMailDetail = detail;
           await mailService.markRead(cid);
         }}
         onFolderChange={async (folder) => {

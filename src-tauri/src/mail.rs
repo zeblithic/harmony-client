@@ -41,6 +41,7 @@ pub struct FolderCounts {
 #[serde(rename_all = "camelCase")]
 pub struct MailDetail {
     pub message_cid: String,
+    pub message_id: String,
     pub subject: String,
     pub body: String,
     pub sender_address: String,
@@ -148,14 +149,14 @@ impl MailManager {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
-        // Dedup by message_id
+        // Dedup by message_id across ALL folders
         let msg_id_hex = hex::encode(msg.message_id);
-        let inbox = self
+        let already_seen = self
             .index
             .folders
-            .get("inbox")
-            .ok_or("inbox folder missing")?;
-        if inbox.entries.iter().any(|e| e.message_id == msg_id_hex) {
+            .values()
+            .any(|folder| folder.entries.iter().any(|e| e.message_id == msg_id_hex));
+        if already_seen {
             return Err("duplicate message".to_string());
         }
 
@@ -181,7 +182,7 @@ impl MailManager {
         inbox.message_count += 1;
         inbox.unread_count += 1;
 
-        self.save_index();
+        self.save_index()?;
         Ok(entry)
     }
 
@@ -214,7 +215,7 @@ impl MailManager {
         sent.entries.insert(0, entry);
         sent.message_count += 1;
 
-        self.save_index();
+        self.save_index()?;
         Ok(cid_hex)
     }
 
@@ -233,6 +234,7 @@ impl MailManager {
 
     /// Get the full message detail by CID.
     pub fn get_message(&self, cid_hex: &str) -> Result<MailDetail, String> {
+        validate_hex(cid_hex)?;
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
         let bytes = std::fs::read(&blob_path).map_err(|e| format!("read blob: {e}"))?;
         let msg = HarmonyMessage::from_bytes(&bytes).map_err(|e| format!("parse: {e}"))?;
@@ -263,6 +265,7 @@ impl MailManager {
 
         Ok(MailDetail {
             message_cid: cid_hex.to_string(),
+            message_id: hex::encode(msg.message_id),
             subject: msg.subject,
             body: msg.body,
             sender_address: hex::encode(msg.sender_address),
@@ -277,6 +280,7 @@ impl MailManager {
 
     /// Mark a message as read/unread. Returns Ok if found.
     pub fn mark_read(&mut self, cid_hex: &str, read: bool) -> Result<(), String> {
+        validate_hex(cid_hex)?;
         for folder in self.index.folders.values_mut() {
             if let Some(entry) = folder.entries.iter_mut().find(|e| e.message_cid == cid_hex) {
                 if entry.read != read {
@@ -286,7 +290,7 @@ impl MailManager {
                     } else {
                         folder.unread_count += 1;
                     }
-                    self.save_index();
+                    self.save_index()?;
                 }
                 return Ok(());
             }
@@ -327,12 +331,13 @@ impl MailManager {
             dest.unread_count += 1;
         }
 
-        self.save_index();
+        self.save_index()?;
         Ok(())
     }
 
     /// Permanently delete a message (removes blob + entry).
     pub fn delete_message(&mut self, cid_hex: &str) -> Result<(), String> {
+        validate_hex(cid_hex)?;
         for folder in self.index.folders.values_mut() {
             if let Some(pos) = folder.entries.iter().position(|e| e.message_cid == cid_hex) {
                 let entry = folder.entries.remove(pos);
@@ -340,10 +345,17 @@ impl MailManager {
                 if !entry.read {
                     folder.unread_count = folder.unread_count.saturating_sub(1);
                 }
-                // Remove blob file
-                let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-                let _ = std::fs::remove_file(blob_path);
-                self.save_index();
+                // Only remove blob if no other entry still references it
+                let still_referenced = self
+                    .index
+                    .folders
+                    .values()
+                    .any(|f| f.entries.iter().any(|e| e.message_cid == cid_hex));
+                if !still_referenced {
+                    let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+                    let _ = std::fs::remove_file(blob_path);
+                }
+                self.save_index()?;
                 return Ok(());
             }
         }
@@ -374,19 +386,29 @@ impl MailManager {
 
     // ── Private ──────────────────────────────────────────────────────
 
-    /// Atomic save: write to tmp, then rename.
-    fn save_index(&self) {
+    /// Atomic save: write to tmp, then rename. Errors propagate to callers.
+    fn save_index(&self) -> Result<(), String> {
         let index_path = self.data_dir.join("index.json");
         let tmp_path = self.data_dir.join("index.json.tmp");
-        if let Ok(json) = serde_json::to_vec_pretty(&self.index) {
-            if std::fs::write(&tmp_path, &json).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &index_path);
-            }
-        }
+        let json = serde_json::to_vec_pretty(&self.index)
+            .map_err(|e| format!("serialize index: {e}"))?;
+        std::fs::write(&tmp_path, &json)
+            .map_err(|e| format!("write index: {e}"))?;
+        std::fs::rename(&tmp_path, &index_path)
+            .map_err(|e| format!("replace index: {e}"))?;
+        Ok(())
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Reject non-hex CIDs to prevent path traversal via IPC input.
+fn validate_hex(s: &str) -> Result<(), String> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid hex CID".to_string());
+    }
+    Ok(())
+}
 
 /// Truncate subject to MAX_SNIPPET_LEN bytes without splitting UTF-8.
 fn truncate_snippet(subject: &str) -> String {
