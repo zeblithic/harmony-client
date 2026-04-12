@@ -598,7 +598,7 @@
 
 <svelte:window bind:innerWidth />
 
-<Layout {collapsed} {showSettings} mode={appMode}>
+<Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
   {#snippet nav()}
     <NavPanel
       nodes={navNodes}

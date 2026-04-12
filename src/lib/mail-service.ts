@@ -97,7 +97,7 @@ export class MailService {
     const entry = this.entries.find(e => e.messageCid === cid);
     if (entry && !entry.read) {
       entry.read = true;
-      const folderCounts = this.counts[this.activeFolder];
+      const folderCounts = this.counts[targetFolder];
       if (folderCounts) folderCounts.unread = Math.max(0, folderCounts.unread - 1);
       this.onChange?.();
     }

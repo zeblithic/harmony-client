@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -17,6 +17,7 @@
     collapsed?: boolean;
     showSettings?: boolean;
     mode?: AppMode;
+    mailSelected?: boolean;
   } = $props();
 </script>
 
@@ -25,13 +26,19 @@
     {@render nav()}
   </aside>
   {#if mode === 'mail' && mailInbox}
-    <main class="mail-list-area">
-      {@render mailInbox()}
-    </main>
-    {#if !collapsed && mailDetail}
-      <section class="detail-area">
+    {#if collapsed && mailSelected && mailDetail}
+      <main class="mail-list-area">
         {@render mailDetail()}
-      </section>
+      </main>
+    {:else}
+      <main class="mail-list-area">
+        {@render mailInbox()}
+      </main>
+      {#if !collapsed && mailDetail}
+        <section class="detail-area">
+          {@render mailDetail()}
+        </section>
+      {/if}
     {/if}
   {:else if mode === 'files' && fileBrowser}
     <main class="files-area">
