@@ -79,6 +79,7 @@ pub async fn run(
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -347,7 +348,7 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set);
+                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set, &mail_mgr);
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -725,6 +726,7 @@ fn emit_frontend_event(
     payload: &[u8],
     hop_distance: Option<u8>,
     followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
@@ -770,6 +772,17 @@ fn emit_frontend_event(
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {
             let _ = app.emit("telemetry-event", &event);
+        }
+    } else if key_expr.starts_with("harmony/mail/v1/") && !key_expr.ends_with("/root") {
+        // Inbound mail delivery — store in MailManager and notify frontend.
+        let mut mgr = mail_mgr.lock().unwrap();
+        match mgr.receive_message(payload) {
+            Ok(entry) => {
+                let _ = app.emit("mail-received", &entry);
+            }
+            Err(e) => {
+                tracing::debug!(key_expr, error = %e, "mail receive skipped");
+            }
         }
     }
 }

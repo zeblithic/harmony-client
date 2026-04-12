@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter};
 mod event_loop;
 mod follows;
 mod identity;
+mod mail;
 mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
@@ -37,6 +38,8 @@ struct NodeState {
     follow_mgr: Option<follows::FollowManager>,
     /// Shared set of followed addresses (read by the event loop for source tagging).
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Shared mail manager (read/written by event loop on receive, by commands for queries).
+    mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -257,6 +260,10 @@ async fn start_node(
     ));
     let followed_set_clone = followed_set.clone();
 
+    // MailManager will be initialized after identity loading (needs owner address).
+    // Placeholder — set below once we have our_addr_bytes.
+    let mail_mgr: std::sync::Arc<std::sync::Mutex<mail::MailManager>>;
+
     let our_gen = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
 
@@ -271,6 +278,7 @@ async fn start_node(
         let old_voice_channel = guard.voice_channel_tx.take();
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
+        let _old_mail_mgr = guard.mail_mgr.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
@@ -299,6 +307,11 @@ async fn start_node(
         drop(ed25519);
 
         tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
+
+        // Initialize mail manager (needs owner address from identity).
+        mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(
+            mail::MailManager::load(&app_data_dir.join("mail"), our_addr_bytes),
+        ));
 
         let node_addr_for_state = node_addr.clone();
         let config = NodeConfig {
@@ -330,6 +343,8 @@ async fn start_node(
             archive_enabled: false,
             archive_entries: Vec::new(),
             archive_quota: None,
+            archive_ingest_enabled: false,
+            eviction_push_enabled: false,
             s3_enabled: false,
         };
 
@@ -341,6 +356,7 @@ async fn start_node(
 
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
+        let mail_mgr_clone = mail_mgr.clone();
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
             .spawn(move || {
@@ -365,6 +381,7 @@ async fn start_node(
                         voice_rx,
                         voice_channel_rx,
                         followed_set_clone,
+                        mail_mgr_clone,
                     )
                     .await;
                 });
@@ -381,6 +398,7 @@ async fn start_node(
         guard.voice_channel_tx = Some(voice_channel_tx);
         guard.follow_mgr = Some(follow_mgr);
         guard.followed_set = Some(followed_set);
+        guard.mail_mgr = Some(mail_mgr);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
@@ -1214,6 +1232,195 @@ async fn leave_voice_channel(
         .map_err(|_| "event loop not running".to_string())
 }
 
+// ── Mail commands ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMailPayload {
+    to: Vec<String>,
+    subject: String,
+    body: String,
+    reply_to: Option<String>,
+}
+
+#[tauri::command]
+async fn send_mail(
+    payload: SendMailPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    use harmony_mail::message::{
+        HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
+        unique_message_id,
+    };
+
+    if payload.to.is_empty() {
+        return Err("at least one recipient required".to_string());
+    }
+    if payload.subject.is_empty() && payload.body.is_empty() {
+        return Err("subject or body required".to_string());
+    }
+
+    let (publish_tx, node_addr, mail_mgr) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .publish_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let mgr = guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?;
+        (tx, guard.node_addr.clone(), mgr)
+    };
+
+    // Parse sender address
+    let sender_bytes: [u8; 16] = hex::decode(&node_addr)
+        .map_err(|e| format!("bad node_addr: {e}"))?
+        .try_into()
+        .map_err(|_| "node_addr not 16 bytes".to_string())?;
+
+    // Parse in_reply_to
+    let in_reply_to = match &payload.reply_to {
+        Some(hex_str) if !hex_str.is_empty() => {
+            let bytes = hex::decode(hex_str).map_err(|e| format!("bad reply_to: {e}"))?;
+            let arr: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| "reply_to not 16 bytes".to_string())?;
+            Some(arr)
+        }
+        _ => None,
+    };
+
+    // Parse recipients
+    let recipients: Vec<Recipient> = payload
+        .to
+        .iter()
+        .map(|addr_hex| {
+            let bytes = hex::decode(addr_hex)
+                .map_err(|e| format!("bad recipient {addr_hex}: {e}"))?;
+            let arr: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| format!("recipient {addr_hex} not 16 bytes"))?;
+            Ok(Recipient {
+                address_hash: arr,
+                recipient_type: RecipientType::To,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let is_reply = in_reply_to.is_some();
+    let msg = HarmonyMessage {
+        version: 0x01,
+        message_type: MailMessageType::Email,
+        flags: MessageFlags::new(false, is_reply, false),
+        timestamp: now,
+        message_id: unique_message_id(),
+        in_reply_to,
+        sender_address: sender_bytes,
+        recipients,
+        subject: payload.subject,
+        body: payload.body,
+        attachments: vec![],
+    };
+
+    let msg_bytes = msg.to_bytes().map_err(|e| format!("serialize: {e}"))?;
+
+    // Store in sent folder
+    {
+        let mut mgr = mail_mgr.lock().unwrap();
+        mgr.store_sent(&msg_bytes, &msg)?;
+    }
+
+    // Publish to each recipient's Zenoh key
+    for addr_hex in &payload.to {
+        let key_expr = format!("harmony/mail/v1/{addr_hex}");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        publish_tx
+            .send(event_loop::PublishRequest {
+                key_expr,
+                payload: msg_bytes.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "event loop not running".to_string())?;
+        reply_rx
+            .await
+            .map_err(|_| "event loop dropped request".to_string())??;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn list_mail(
+    folder: String,
+    page: usize,
+    per_page: usize,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<mail::EntryRecord>, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr_arc = guard
+        .mail_mgr
+        .as_ref()
+        .ok_or_else(|| "mail not initialized".to_string())?;
+    let mgr = mgr_arc.lock().unwrap();
+    Ok(mgr.list_folder(&folder, page, per_page))
+}
+
+#[tauri::command]
+fn get_mail(
+    message_cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<mail::MailDetail, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr_arc = guard
+        .mail_mgr
+        .as_ref()
+        .ok_or_else(|| "mail not initialized".to_string())?;
+    let mgr = mgr_arc.lock().unwrap();
+    mgr.get_message(&message_cid)
+}
+
+#[tauri::command]
+fn update_mail(
+    message_cid: String,
+    action: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr_arc = guard
+        .mail_mgr
+        .as_ref()
+        .ok_or_else(|| "mail not initialized".to_string())?;
+    let mut mgr = mgr_arc.lock().unwrap();
+    match action.as_str() {
+        "mark_read" => mgr.mark_read(&message_cid, true),
+        "mark_unread" => mgr.mark_read(&message_cid, false),
+        "move_trash" => mgr.move_message(&message_cid, "trash"),
+        "move_inbox" => mgr.move_message(&message_cid, "inbox"),
+        "delete" => mgr.delete_message(&message_cid),
+        _ => Err(format!("unknown action: {action}")),
+    }
+}
+
+#[tauri::command]
+fn get_mail_counts(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<std::collections::HashMap<String, mail::FolderCounts>, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let mgr_arc = guard
+        .mail_mgr
+        .as_ref()
+        .ok_or_else(|| "mail not initialized".to_string())?;
+    let mgr = mgr_arc.lock().unwrap();
+    Ok(mgr.folder_counts())
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -1246,6 +1453,11 @@ pub fn run() {
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,
+            send_mail,
+            list_mail,
+            get_mail,
+            update_mail,
+            get_mail_counts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
