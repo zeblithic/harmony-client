@@ -13,7 +13,6 @@ export class MailService {
   activeFolder: MailFolderKind = 'inbox';
   counts: MailCounts = { inbox: { total: 0, unread: 0 }, sent: { total: 0, unread: 0 }, drafts: { total: 0, unread: 0 }, trash: { total: 0, unread: 0 } };
   onChange?: () => void;
-  ownAddress: string | null = null;
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -51,6 +50,11 @@ export class MailService {
   async loadFolder(folder: MailFolderKind, page = 0): Promise<void> {
     const requestId = ++this.loadRequestId;
     this.activeFolder = folder;
+    // Clear stale entries immediately so the UI doesn't show the previous
+    // folder's data while the new folder loads (or if the load fails).
+    this.entries = [];
+    this.seenCids.clear();
+    this.onChange?.();
     if (!this.adapter) return;
     try {
       const entries = await this.adapter.invoke('list_mail', {

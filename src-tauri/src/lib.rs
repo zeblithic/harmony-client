@@ -1363,12 +1363,11 @@ fn list_mail(
     per_page: usize,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<mail::EntryRecord>, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let mgr_arc = guard
-        .mail_mgr
-        .as_ref()
-        .ok_or_else(|| "mail not initialized".to_string())?;
-    let mgr = mgr_arc.lock().unwrap();
+    let mgr_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+    }; // NodeState lock dropped — disk I/O below doesn't block other commands
+    let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     Ok(mgr.list_folder(&folder, page, per_page))
 }
 
@@ -1377,12 +1376,11 @@ fn get_mail(
     message_cid: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<mail::MailDetail, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let mgr_arc = guard
-        .mail_mgr
-        .as_ref()
-        .ok_or_else(|| "mail not initialized".to_string())?;
-    let mgr = mgr_arc.lock().unwrap();
+    let mgr_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+    };
+    let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     mgr.get_message(&message_cid)
 }
 
@@ -1393,12 +1391,11 @@ fn update_mail(
     folder: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let mgr_arc = guard
-        .mail_mgr
-        .as_ref()
-        .ok_or_else(|| "mail not initialized".to_string())?;
-    let mut mgr = mgr_arc.lock().unwrap();
+    let mgr_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+    };
+    let mut mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     let folder_ref = folder.as_deref();
     match action.as_str() {
         "mark_read" => mgr.mark_read(&message_cid, true, folder_ref),
@@ -1414,12 +1411,11 @@ fn update_mail(
 fn get_mail_counts(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<std::collections::HashMap<String, mail::FolderCounts>, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let mgr_arc = guard
-        .mail_mgr
-        .as_ref()
-        .ok_or_else(|| "mail not initialized".to_string())?;
-    let mgr = mgr_arc.lock().unwrap();
+    let mgr_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+    };
+    let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     Ok(mgr.folder_counts())
 }
 

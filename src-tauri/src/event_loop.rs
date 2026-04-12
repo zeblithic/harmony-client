@@ -249,7 +249,13 @@ pub async fn run(
 
     // Subscribe to inbound mail for this node's address.
     {
-        let own_hex = mail_mgr.lock().unwrap().owner_address_hex();
+        let own_hex = match mail_mgr.lock() {
+            Ok(g) => g.owner_address_hex(),
+            Err(e) => {
+                tracing::error!(error = %e, "mail_mgr mutex poisoned, skipping mail subscription");
+                String::new()
+            }
+        };
         dispatch_action(
             RuntimeAction::Subscribe {
                 key_expr: format!("harmony/mail/v1/{own_hex}"),
@@ -797,7 +803,13 @@ fn emit_frontend_event(
         // persist) while holding the mutex. Acceptable for Phase 0 since mail
         // is infrequent. Phase 1 should offload to spawn_blocking or a
         // dedicated writer thread to avoid stalling the event loop under burst.
-        let mut mgr = mail_mgr.lock().unwrap();
+        let mut mgr = match mail_mgr.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(error = %e, "mail_mgr mutex poisoned");
+                return;
+            }
+        };
         match mgr.receive_message(payload) {
             Ok(entry) => {
                 let _ = app.emit("mail-received", &entry);
