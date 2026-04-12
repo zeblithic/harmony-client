@@ -741,17 +741,19 @@
   {/snippet}
   {#snippet mailInbox()}
     {#if showCompose}
-      <MailCompose
-        replyTo={composeReplyTo}
-        initialTo={composeInitialTo}
-        initialSubject={composeInitialSubject}
-        onSend={async (to, subject, body, replyTo) => {
-          await mailService.send(to, subject, body, replyTo ?? undefined);
-          showCompose = false;
-          composeReplyTo = null;
-        }}
-        onCancel={() => { showCompose = false; composeReplyTo = null; }}
-      />
+      {#key composeReplyTo}
+        <MailCompose
+          replyTo={composeReplyTo}
+          initialTo={composeInitialTo}
+          initialSubject={composeInitialSubject}
+          onSend={async (to, subject, body, replyTo) => {
+            await mailService.send(to, subject, body, replyTo ?? undefined);
+            showCompose = false;
+            composeReplyTo = null;
+          }}
+          onCancel={() => { showCompose = false; composeReplyTo = null; }}
+        />
+      {/key}
     {:else}
       <MailInbox
         entries={mailEntries}
