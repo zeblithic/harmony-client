@@ -16,6 +16,7 @@ export class MailService {
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private seenCids = new Set<string>();
+  private inboxSeenCids = new Set<string>();
   private loadRequestId = 0;
 
   constructor() {
@@ -36,11 +37,14 @@ export class MailService {
     // Listen for incoming mail events from the Rust backend.
     const unlisten = await adapter.listen('mail-received', (event) => {
       const entry = event.payload as MailEntry;
-      if (this.seenCids.has(entry.messageCid)) return;
-      this.seenCids.add(entry.messageCid);
+      // Dedupe against inbox-specific set (not seenCids which tracks the
+      // current folder view and would block self-sends visible in "sent")
+      if (this.inboxSeenCids.has(entry.messageCid)) return;
+      this.inboxSeenCids.add(entry.messageCid);
       // Only prepend to the visible list if we're viewing the inbox
       if (this.activeFolder === 'inbox') {
         this.entries.unshift(entry);
+        this.seenCids.add(entry.messageCid);
       }
       this.counts.inbox.total += 1;
       this.counts.inbox.unread += 1;
@@ -89,6 +93,9 @@ export class MailService {
       payload: { to, subject, body, replyTo: replyTo ?? null },
     });
     await this.refreshCounts();
+    if (this.activeFolder === 'sent') {
+      await this.loadFolder('sent');
+    }
   }
 
   async markRead(cid: string): Promise<void> {

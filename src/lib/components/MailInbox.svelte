@@ -95,6 +95,7 @@
                 type="button"
                 class="action-btn"
                 title="Mark read"
+                aria-label="Mark as read"
                 onclick={(e) => { e.stopPropagation(); onMarkRead?.(entry.messageCid); }}
               >
                 &bull;
@@ -104,6 +105,7 @@
               type="button"
               class="action-btn"
               title="Move to Trash"
+              aria-label="Move to trash"
               onclick={(e) => { e.stopPropagation(); onMoveTrash?.(entry.messageCid); }}
             >
               &times;

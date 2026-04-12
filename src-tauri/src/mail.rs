@@ -126,7 +126,13 @@ impl MailManager {
         let index_path = data_dir.join("index.json");
         let index = if index_path.exists() {
             match std::fs::read(&index_path) {
-                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        tracing::warn!(path = %index_path.display(), error = %e, "corrupt mail index, starting fresh");
+                        MailIndex::default()
+                    }
+                },
                 Err(_) => MailIndex::default(),
             }
         } else {
@@ -593,5 +599,63 @@ mod tests {
         assert_eq!(mgr.folder_counts()["sent"].total, 1);
         let detail = mgr.get_message(&cid).unwrap();
         assert_eq!(detail.subject, "Outbound");
+    }
+
+    #[test]
+    fn self_send_lands_in_both_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+
+        let msg = make_test_message("Self Send", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+
+        // Store in sent first (mimics send_mail flow)
+        let sent_cid = mgr.store_sent(&bytes, &msg).unwrap();
+
+        // Then receive the same message (mimics Zenoh delivery to self)
+        let entry = mgr.receive_message(&bytes).unwrap();
+        assert_eq!(entry.message_cid, sent_cid); // same CID
+
+        assert_eq!(mgr.folder_counts()["sent"].total, 1);
+        assert_eq!(mgr.folder_counts()["inbox"].total, 1);
+        assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
+    }
+
+    #[test]
+    fn invalid_hex_cid_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+
+        assert!(mgr.get_message("../../../etc/passwd").is_err());
+        assert!(mgr.get_message("not-hex!").is_err());
+        assert!(mgr.get_message("").is_err());
+        assert!(mgr.mark_read("zzzz", true).is_err());
+        assert!(mgr.move_message("a/b", "inbox").is_err());
+        assert!(mgr.delete_message("..").is_err());
+    }
+
+    #[test]
+    fn list_folder_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+
+        // Insert 5 messages
+        for i in 0..5u8 {
+            let mut msg = make_test_message(&format!("Msg {i}"), [i + 1; 16]);
+            msg.message_id = [i + 10; 16]; // unique IDs
+            let bytes = msg.to_bytes().unwrap();
+            mgr.receive_message(&bytes).unwrap();
+        }
+
+        // Page of 2: first page has 2 entries, second has 2, third has 1
+        assert_eq!(mgr.list_folder("inbox", 0, 2).len(), 2);
+        assert_eq!(mgr.list_folder("inbox", 1, 2).len(), 2);
+        assert_eq!(mgr.list_folder("inbox", 2, 2).len(), 1);
+        // Past the end returns empty
+        assert_eq!(mgr.list_folder("inbox", 3, 2).len(), 0);
+        // Empty folder
+        assert_eq!(mgr.list_folder("drafts", 0, 50).len(), 0);
+        // Unknown folder
+        assert_eq!(mgr.list_folder("nonexistent", 0, 50).len(), 0);
     }
 }

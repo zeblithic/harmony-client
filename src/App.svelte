@@ -766,8 +766,8 @@
           await mailService.loadFolder(folder);
         }}
         onCompose={() => { showCompose = true; composeReplyTo = null; }}
-        onMarkRead={(cid) => mailService.markRead(cid)}
-        onMoveTrash={(cid) => mailService.moveToTrash(cid)}
+        onMarkRead={(cid) => { mailService.markRead(cid).catch(() => {}); }}
+        onMoveTrash={(cid) => { mailService.moveToTrash(cid).catch(() => {}); }}
       />
     {/if}
   {/snippet}
