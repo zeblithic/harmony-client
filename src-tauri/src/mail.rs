@@ -300,6 +300,7 @@ impl MailManager {
 
     /// Move a message between folders.
     pub fn move_message(&mut self, cid_hex: &str, to_folder: &str) -> Result<(), String> {
+        validate_hex(cid_hex)?;
         if !self.index.folders.contains_key(to_folder) {
             return Err(format!("unknown folder: {to_folder}"));
         }
@@ -338,6 +339,9 @@ impl MailManager {
     /// Permanently delete a message (removes blob + entry).
     pub fn delete_message(&mut self, cid_hex: &str) -> Result<(), String> {
         validate_hex(cid_hex)?;
+
+        // Pass 1: find and remove the entry from its folder
+        let mut found = false;
         for folder in self.index.folders.values_mut() {
             if let Some(pos) = folder.entries.iter().position(|e| e.message_cid == cid_hex) {
                 let entry = folder.entries.remove(pos);
@@ -345,21 +349,27 @@ impl MailManager {
                 if !entry.read {
                     folder.unread_count = folder.unread_count.saturating_sub(1);
                 }
-                // Only remove blob if no other entry still references it
-                let still_referenced = self
-                    .index
-                    .folders
-                    .values()
-                    .any(|f| f.entries.iter().any(|e| e.message_cid == cid_hex));
-                if !still_referenced {
-                    let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-                    let _ = std::fs::remove_file(blob_path);
-                }
-                self.save_index()?;
-                return Ok(());
+                found = true;
+                break;
             }
         }
-        Err("message not found".to_string())
+        if !found {
+            return Err("message not found".to_string());
+        }
+
+        // Pass 2: only remove blob if no remaining entry references this CID
+        let still_referenced = self
+            .index
+            .folders
+            .values()
+            .any(|f| f.entries.iter().any(|e| e.message_cid == cid_hex));
+        if !still_referenced {
+            let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+            let _ = std::fs::remove_file(blob_path);
+        }
+
+        self.save_index()?;
+        Ok(())
     }
 
     /// Get folder counts for all folders.
