@@ -1390,6 +1390,7 @@ fn get_mail(
 fn update_mail(
     message_cid: String,
     action: String,
+    folder: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1398,12 +1399,13 @@ fn update_mail(
         .as_ref()
         .ok_or_else(|| "mail not initialized".to_string())?;
     let mut mgr = mgr_arc.lock().unwrap();
+    let folder_ref = folder.as_deref();
     match action.as_str() {
-        "mark_read" => mgr.mark_read(&message_cid, true),
-        "mark_unread" => mgr.mark_read(&message_cid, false),
-        "move_trash" => mgr.move_message(&message_cid, "trash"),
-        "move_inbox" => mgr.move_message(&message_cid, "inbox"),
-        "delete" => mgr.delete_message(&message_cid),
+        "mark_read" => mgr.mark_read(&message_cid, true, folder_ref),
+        "mark_unread" => mgr.mark_read(&message_cid, false, folder_ref),
+        "move_trash" => mgr.move_message(&message_cid, folder_ref, "trash"),
+        "move_inbox" => mgr.move_message(&message_cid, folder_ref, "inbox"),
+        "delete" => mgr.delete_message(&message_cid, folder_ref),
         _ => Err(format!("unknown action: {action}")),
     }
 }

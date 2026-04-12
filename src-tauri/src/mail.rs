@@ -83,8 +83,6 @@ struct MailIndex {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FolderState {
-    message_count: u32,
-    unread_count: u32,
     entries: Vec<EntryRecord>,
 }
 
@@ -95,8 +93,6 @@ impl Default for MailIndex {
             folders.insert(
                 name.to_string(),
                 FolderState {
-                    message_count: 0,
-                    unread_count: 0,
                     entries: Vec::new(),
                 },
             );
@@ -120,8 +116,12 @@ pub struct MailManager {
 impl MailManager {
     /// Load existing mail state from disk, or create empty.
     pub fn load(data_dir: &Path, owner_address: [u8; ADDRESS_HASH_LEN]) -> Self {
-        let _ = std::fs::create_dir_all(data_dir);
-        let _ = std::fs::create_dir_all(data_dir.join("blobs"));
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(path = %data_dir.display(), error = %e, "failed to create mail dir");
+        }
+        if let Err(e) = std::fs::create_dir_all(data_dir.join("blobs")) {
+            tracing::warn!(path = %data_dir.display(), error = %e, "failed to create mail blobs dir");
+        }
 
         let index_path = data_dir.join("index.json");
         let index = if index_path.exists() {
@@ -186,8 +186,6 @@ impl MailManager {
         // Prepend to inbox (newest first)
         let inbox = self.index.folders.get_mut("inbox").unwrap();
         inbox.entries.insert(0, entry.clone());
-        inbox.message_count += 1;
-        inbox.unread_count += 1;
 
         self.save_index()?;
         Ok(entry)
@@ -220,7 +218,6 @@ impl MailManager {
 
         let sent = self.index.folders.get_mut("sent").unwrap();
         sent.entries.insert(0, entry);
-        sent.message_count += 1;
 
         self.save_index()?;
         Ok(cid_hex)
@@ -285,18 +282,27 @@ impl MailManager {
         })
     }
 
-    /// Mark a message as read/unread. Returns Ok if found.
-    pub fn mark_read(&mut self, cid_hex: &str, read: bool) -> Result<(), String> {
+    /// Mark a message as read/unread.
+    /// When `folder` is provided, targets that specific folder (deterministic
+    /// even when the same CID exists in multiple folders, e.g. self-send).
+    pub fn mark_read(&mut self, cid_hex: &str, read: bool, folder: Option<&str>) -> Result<(), String> {
         validate_hex(cid_hex)?;
-        for folder in self.index.folders.values_mut() {
-            if let Some(entry) = folder.entries.iter_mut().find(|e| e.message_cid == cid_hex) {
+        if let Some(folder_name) = folder {
+            let state = self.index.folders.get_mut(folder_name)
+                .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
+            let entry = state.entries.iter_mut().find(|e| e.message_cid == cid_hex)
+                .ok_or("message not found in folder")?;
+            if entry.read != read {
+                entry.read = read;
+                self.save_index()?;
+            }
+            return Ok(());
+        }
+        // Fallback: search all folders (non-deterministic for duplicate CIDs)
+        for state in self.index.folders.values_mut() {
+            if let Some(entry) = state.entries.iter_mut().find(|e| e.message_cid == cid_hex) {
                 if entry.read != read {
                     entry.read = read;
-                    if read {
-                        folder.unread_count = folder.unread_count.saturating_sub(1);
-                    } else {
-                        folder.unread_count += 1;
-                    }
                     self.save_index()?;
                 }
                 return Ok(());
@@ -306,65 +312,70 @@ impl MailManager {
     }
 
     /// Move a message between folders.
-    pub fn move_message(&mut self, cid_hex: &str, to_folder: &str) -> Result<(), String> {
+    /// When `from_folder` is provided, only searches that folder (deterministic
+    /// for duplicate CIDs across folders, e.g. self-send).
+    pub fn move_message(&mut self, cid_hex: &str, from_folder: Option<&str>, to_folder: &str) -> Result<(), String> {
         validate_hex(cid_hex)?;
         if !self.index.folders.contains_key(to_folder) {
             return Err(format!("unknown folder: {to_folder}"));
         }
 
         // Find and remove from source folder
-        let mut entry = None;
-        let mut source_folder = None;
-        for (name, folder) in self.index.folders.iter_mut() {
-            if let Some(pos) = folder.entries.iter().position(|e| e.message_cid == cid_hex) {
-                entry = Some(folder.entries.remove(pos));
-                folder.message_count = folder.message_count.saturating_sub(1);
-                if !entry.as_ref().unwrap().read {
-                    folder.unread_count = folder.unread_count.saturating_sub(1);
+        let entry = if let Some(folder_name) = from_folder {
+            let state = self.index.folders.get_mut(folder_name)
+                .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
+            let pos = state.entries.iter().position(|e| e.message_cid == cid_hex)
+                .ok_or("message not found in folder")?;
+            state.entries.remove(pos)
+        } else {
+            // Fallback: search all folders
+            let mut found = None;
+            for state in self.index.folders.values_mut() {
+                if let Some(pos) = state.entries.iter().position(|e| e.message_cid == cid_hex) {
+                    found = Some(state.entries.remove(pos));
+                    break;
                 }
-                source_folder = Some(name.clone());
-                break;
             }
-        }
-
-        let entry = entry.ok_or("message not found")?;
-        let _source = source_folder.unwrap();
+            found.ok_or("message not found")?
+        };
 
         // Add to destination
         let dest = self.index.folders.get_mut(to_folder).unwrap();
-        let is_unread = !entry.read;
         dest.entries.insert(0, entry);
-        dest.message_count += 1;
-        if is_unread {
-            dest.unread_count += 1;
-        }
 
         self.save_index()?;
         Ok(())
     }
 
     /// Permanently delete a message (removes blob + entry).
-    pub fn delete_message(&mut self, cid_hex: &str) -> Result<(), String> {
+    /// When `folder` is provided, only searches that folder (deterministic
+    /// for duplicate CIDs across folders).
+    pub fn delete_message(&mut self, cid_hex: &str, folder: Option<&str>) -> Result<(), String> {
         validate_hex(cid_hex)?;
 
-        // Pass 1: find and remove the entry from its folder
-        let mut found = false;
-        for folder in self.index.folders.values_mut() {
-            if let Some(pos) = folder.entries.iter().position(|e| e.message_cid == cid_hex) {
-                let entry = folder.entries.remove(pos);
-                folder.message_count = folder.message_count.saturating_sub(1);
-                if !entry.read {
-                    folder.unread_count = folder.unread_count.saturating_sub(1);
+        // Remove the entry from its folder
+        if let Some(folder_name) = folder {
+            let state = self.index.folders.get_mut(folder_name)
+                .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
+            let pos = state.entries.iter().position(|e| e.message_cid == cid_hex)
+                .ok_or("message not found in folder")?;
+            state.entries.remove(pos);
+        } else {
+            // Fallback: search all folders
+            let mut found = false;
+            for state in self.index.folders.values_mut() {
+                if let Some(pos) = state.entries.iter().position(|e| e.message_cid == cid_hex) {
+                    state.entries.remove(pos);
+                    found = true;
+                    break;
                 }
-                found = true;
-                break;
+            }
+            if !found {
+                return Err("message not found".to_string());
             }
         }
-        if !found {
-            return Err("message not found".to_string());
-        }
 
-        // Pass 2: only remove blob if no remaining entry references this CID
+        // Only remove blob if no remaining entry references this CID
         let still_referenced = self
             .index
             .folders
@@ -379,7 +390,7 @@ impl MailManager {
         Ok(())
     }
 
-    /// Get folder counts for all folders.
+    /// Get folder counts for all folders (derived from entries — always consistent).
     pub fn folder_counts(&self) -> HashMap<String, FolderCounts> {
         self.index
             .folders
@@ -388,8 +399,8 @@ impl MailManager {
                 (
                     name.clone(),
                     FolderCounts {
-                        total: state.message_count,
-                        unread: state.unread_count,
+                        total: state.entries.len() as u32,
+                        unread: state.entries.iter().filter(|e| !e.read).count() as u32,
                     },
                 )
             })
@@ -519,7 +530,7 @@ mod tests {
         let entry = mgr.receive_message(&bytes).unwrap();
 
         assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
-        mgr.mark_read(&entry.message_cid, true).unwrap();
+        mgr.mark_read(&entry.message_cid, true, Some("inbox")).unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].unread, 0);
     }
 
@@ -532,7 +543,7 @@ mod tests {
         let bytes = msg.to_bytes().unwrap();
         let entry = mgr.receive_message(&bytes).unwrap();
 
-        mgr.move_message(&entry.message_cid, "trash").unwrap();
+        mgr.move_message(&entry.message_cid, Some("inbox"), "trash").unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
         assert_eq!(mgr.folder_counts()["trash"].total, 1);
     }
@@ -564,7 +575,7 @@ mod tests {
         let blob_path = dir.path().join("blobs").join(format!("{}.bin", entry.message_cid));
         assert!(blob_path.exists());
 
-        mgr.delete_message(&entry.message_cid).unwrap();
+        mgr.delete_message(&entry.message_cid, Some("inbox")).unwrap();
         assert!(!blob_path.exists());
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
     }
@@ -629,9 +640,9 @@ mod tests {
         assert!(mgr.get_message("../../../etc/passwd").is_err());
         assert!(mgr.get_message("not-hex!").is_err());
         assert!(mgr.get_message("").is_err());
-        assert!(mgr.mark_read("zzzz", true).is_err());
-        assert!(mgr.move_message("a/b", "inbox").is_err());
-        assert!(mgr.delete_message("..").is_err());
+        assert!(mgr.mark_read("zzzz", true, None).is_err());
+        assert!(mgr.move_message("a/b", None, "inbox").is_err());
+        assert!(mgr.delete_message("..", None).is_err());
     }
 
     #[test]
@@ -657,5 +668,63 @@ mod tests {
         assert_eq!(mgr.list_folder("drafts", 0, 50).len(), 0);
         // Unknown folder
         assert_eq!(mgr.list_folder("nonexistent", 0, 50).len(), 0);
+    }
+
+    #[test]
+    fn folder_targeted_mark_read_self_send() {
+        // When same CID exists in inbox + sent (self-send), mark_read with
+        // a folder parameter deterministically targets the correct copy.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(dir.path(), [0xAA; 16]);
+
+        let msg = make_test_message("Self Send", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+
+        // Store in sent first, then receive (mimics send_mail flow)
+        mgr.store_sent(&bytes, &msg).unwrap();
+        let entry = mgr.receive_message(&bytes).unwrap();
+
+        // Inbox copy is unread, sent copy is read
+        assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
+        assert_eq!(mgr.folder_counts()["sent"].unread, 0);
+
+        // Mark inbox copy as read — must not affect sent
+        mgr.mark_read(&entry.message_cid, true, Some("inbox")).unwrap();
+        assert_eq!(mgr.folder_counts()["inbox"].unread, 0);
+        assert_eq!(mgr.folder_counts()["sent"].unread, 0);
+
+        // Move inbox copy to trash — sent copy must remain
+        mgr.move_message(&entry.message_cid, Some("inbox"), "trash").unwrap();
+        assert_eq!(mgr.folder_counts()["inbox"].total, 0);
+        assert_eq!(mgr.folder_counts()["sent"].total, 1);
+        assert_eq!(mgr.folder_counts()["trash"].total, 1);
+
+        // Delete from trash — blob kept because sent still references it
+        mgr.delete_message(&entry.message_cid, Some("trash")).unwrap();
+        assert_eq!(mgr.folder_counts()["trash"].total, 0);
+        // Blob still on disk (sent copy references it)
+        let blob_path = dir.path().join("blobs").join(format!("{}.bin", entry.message_cid));
+        assert!(blob_path.exists());
+
+        // Delete from sent — now blob is removed
+        mgr.delete_message(&entry.message_cid, Some("sent")).unwrap();
+        assert!(!blob_path.exists());
+    }
+
+    #[test]
+    fn folder_counts_derived_from_entries() {
+        // Verify folder_counts() reflects actual entry state, not stored fields.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
+
+        let msg = make_test_message("Derived", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        mgr.receive_message(&bytes).unwrap();
+
+        let counts = mgr.folder_counts();
+        assert_eq!(counts["inbox"].total, 1);
+        assert_eq!(counts["inbox"].unread, 1);
+        assert_eq!(counts["sent"].total, 0);
+        assert_eq!(counts["sent"].unread, 0);
     }
 }

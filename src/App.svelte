@@ -230,7 +230,9 @@
       await messageService.connectAdapter(adapter);
       // Mail connect is isolated — it may fail if the node hasn't started yet
       // (mail_mgr requires identity). Other services must not be blocked.
-      mailService.connectAdapter(adapter).catch(() => {});
+      mailService.connectAdapter(adapter).catch((err) => {
+        console.warn('Mail adapter connect deferred:', err);
+      });
       await vineService.connectAdapter(adapter);
       await vineService.loadFollowed();
       await fileManagerService.connectAdapter(adapter);

@@ -1,10 +1,12 @@
 import type { TauriAdapter } from './zenoh-service';
 import type { MailEntry, MailMessageDetail, MailFolderKind, MailCounts, MailFolderCounts } from './types';
-import { mockMailEntries, mockMailCounts } from './mock-mail-data';
 
 /**
  * Service for managing email via harmony-mail CAS backend.
  * Follows the same pattern as MessageService and VineService.
+ *
+ * Starts empty — real data loads via connectAdapter(). No mock data is
+ * seeded in production; users see "No messages" until the backend connects.
  */
 export class MailService {
   entries: MailEntry[] = [];
@@ -18,17 +20,6 @@ export class MailService {
   private seenCids = new Set<string>();
   private inboxSeenCids = new Set<string>();
   private loadRequestId = 0;
-
-  constructor() {
-    this.entries = mockMailEntries.map((e) => ({ ...e }));
-    this.counts = {
-      inbox: { ...mockMailCounts.inbox },
-      sent: { ...mockMailCounts.sent },
-      drafts: { ...mockMailCounts.drafts },
-      trash: { ...mockMailCounts.trash },
-    };
-    for (const e of this.entries) this.seenCids.add(e.messageCid);
-  }
 
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
@@ -100,7 +91,7 @@ export class MailService {
 
   async markRead(cid: string): Promise<void> {
     if (this.adapter) {
-      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read' });
+      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'mark_read', folder: this.activeFolder });
     }
     const entry = this.entries.find(e => e.messageCid === cid);
     if (entry && !entry.read) {
@@ -113,7 +104,7 @@ export class MailService {
 
   async moveToTrash(cid: string): Promise<void> {
     if (this.adapter) {
-      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'move_trash' });
+      await this.adapter.invoke('update_mail', { messageCid: cid, action: 'move_trash', folder: this.activeFolder });
     }
     const idx = this.entries.findIndex(e => e.messageCid === cid);
     if (idx !== -1) {

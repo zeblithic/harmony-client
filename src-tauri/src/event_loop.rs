@@ -793,6 +793,10 @@ fn emit_frontend_event(
         }
     } else if key_expr.starts_with("harmony/mail/v1/") && !key_expr.ends_with("/root") {
         // Inbound mail delivery — store in MailManager and notify frontend.
+        // NOTE: receive_message performs blocking disk I/O (blob write + index
+        // persist) while holding the mutex. Acceptable for Phase 0 since mail
+        // is infrequent. Phase 1 should offload to spawn_blocking or a
+        // dedicated writer thread to avoid stalling the event loop under burst.
         let mut mgr = mail_mgr.lock().unwrap();
         match mgr.receive_message(payload) {
             Ok(entry) => {
