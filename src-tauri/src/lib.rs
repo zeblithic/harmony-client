@@ -1349,7 +1349,7 @@ async fn send_mail(
 
     // Store in sent folder only after all publishes succeed
     {
-        let mut mgr = mail_mgr.lock().unwrap();
+        let mut mgr = mail_mgr.lock().map_err(|e| format!("mail lock: {e}"))?;
         mgr.store_sent(&msg_bytes, &msg)?;
     }
 

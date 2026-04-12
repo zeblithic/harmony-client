@@ -248,14 +248,9 @@ pub async fn run(
     .await;
 
     // Subscribe to inbound mail for this node's address.
-    {
-        let own_hex = match mail_mgr.lock() {
-            Ok(g) => g.owner_address_hex(),
-            Err(e) => {
-                tracing::error!(error = %e, "mail_mgr mutex poisoned, skipping mail subscription");
-                String::new()
-            }
-        };
+    if let Ok(g) = mail_mgr.lock() {
+        let own_hex = g.owner_address_hex();
+        drop(g);
         dispatch_action(
             RuntimeAction::Subscribe {
                 key_expr: format!("harmony/mail/v1/{own_hex}"),
@@ -269,6 +264,8 @@ pub async fn run(
             &own_zid,
         )
         .await;
+    } else {
+        tracing::error!("mail_mgr mutex poisoned, skipping mail subscription");
     }
 
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
