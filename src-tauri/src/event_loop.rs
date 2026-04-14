@@ -57,6 +57,7 @@ pub async fn run(
     startup_actions: Vec<RuntimeAction>,
     app: AppHandle,
     endpoint: Option<String>,
+    node_addr: String,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
     mut publish_rx: mpsc::Receiver<PublishRequest>,
@@ -205,6 +206,55 @@ pub async fn run(
         &own_zid,
     )
     .await;
+
+    // Subscribe to mailbox root CID updates for this node's address.
+    if !node_addr.is_empty() {
+        let mail_topic = format!("harmony/messages/{node_addr}/inbox");
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: mail_topic.clone(),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+
+        // Catch-up query: fetch current root CID from gateway queryable.
+        let session_clone = session.clone();
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            match session_clone.get(&mail_topic).await {
+                Ok(replies) => {
+                    let deadline = std::time::Duration::from_secs(5);
+                    let _ = tokio::time::timeout(deadline, async {
+                        while let Ok(reply) = replies.recv_async().await {
+                            if let Ok(sample) = reply.result() {
+                                let payload = sample.payload().to_bytes().to_vec();
+                                if payload.len() == 32 {
+                                    let root_hex = hex::encode(&payload);
+                                    let _ = app_clone.emit(
+                                        "mail-root-updated",
+                                        &crate::MailRootUpdate {
+                                            root_cid: root_hex,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "mail catch-up query failed (gateway may not be running)");
+                }
+            }
+        });
+    }
 
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
@@ -608,6 +658,17 @@ fn emit_frontend_event(app: &AppHandle, key_expr: &str, payload: &[u8], hop_dist
     } else if key_expr.starts_with("harmony/announce/") {
         if let Some(announcement) = crate::parse_content_announcement(key_expr, payload) {
             let _ = app.emit("content-announced", &announcement);
+        }
+    } else if key_expr.starts_with("harmony/messages/") && key_expr.ends_with("/inbox") {
+        // Mail root CID update: payload is 32 bytes (raw CID).
+        if payload.len() == 32 {
+            let root_hex = hex::encode(payload);
+            let _ = app.emit(
+                "mail-root-updated",
+                &crate::MailRootUpdate {
+                    root_cid: root_hex,
+                },
+            );
         }
     } else if key_expr.contains("/telemetry/") {
         if let Some(event) = crate::parse_telemetry(payload) {

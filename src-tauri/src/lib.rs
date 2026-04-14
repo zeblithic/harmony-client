@@ -137,6 +137,14 @@ pub struct TelemetryEventPayload {
     pub source: Option<String>,
 }
 
+/// Mail root CID update emitted to the frontend via IPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailRootUpdate {
+    /// Hex-encoded 32-byte root CID.
+    pub root_cid: String,
+}
+
 // ── Parsing helpers (used by event_loop.rs and tests) ────────────────────
 
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
@@ -304,6 +312,7 @@ async fn start_node(
 
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
+        let node_addr_for_loop = node_addr_for_state.clone();
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
             .spawn(move || {
@@ -319,6 +328,7 @@ async fn start_node(
                         startup_actions,
                         app_clone,
                         ep_clone,
+                        node_addr_for_loop,
                         ready_tx,
                         shutdown_rx,
                         publish_rx,
@@ -782,25 +792,40 @@ async fn fetch_content(
 }
 
 /// Get inbox entries by walking the CAS Merkle tree.
+///
+/// `root_cid` is a hex-encoded 32-byte root CID received from the
+/// `mail-root-updated` IPC event.  If provided, it takes precedence over
+/// any value stored in `MailState`.  If `None`, falls back to the cached
+/// `MailState.root_cid` (useful for manual/debug invocations).
 #[tauri::command]
 async fn get_inbox(
+    root_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<mail::InboxEntry>, String> {
-    let (root_cid, cache_dir, fetch_tx) = {
+    let (cid_bytes, cache_dir, fetch_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let root_cid = guard
-            .mail
-            .root_cid
-            .ok_or_else(|| "no mailbox root CID available".to_string())?;
+
+        let cid_bytes: [u8; 32] = if let Some(ref hex_cid) = root_cid {
+            hex::decode(hex_cid)
+                .map_err(|e| format!("invalid root CID hex: {e}"))?
+                .try_into()
+                .map_err(|v: Vec<u8>| format!("root CID wrong length: {} bytes", v.len()))?
+        } else {
+            guard
+                .mail
+                .root_cid
+                .ok_or_else(|| "no mailbox root CID available".to_string())?
+        };
+
         let cache_dir = guard.mail.cache_dir.clone();
         let fetch_tx = guard
             .fetch_tx
             .clone()
             .ok_or_else(|| "not connected".to_string())?;
-        (root_cid, cache_dir, fetch_tx)
+        (cid_bytes, cache_dir, fetch_tx)
     };
 
-    mail::get_inbox_inner(root_cid, &cache_dir, &fetch_tx).await
+    mail::get_inbox_inner(cid_bytes, &cache_dir, &fetch_tx).await
 }
 
 /// Fetch and deserialize a full HarmonyMessage by hex-encoded CID.
