@@ -233,9 +233,10 @@ impl MailManager {
 
     /// Register a header-only inbox entry from a walker-discovered MessageEntry.
     ///
-    /// Folder is set to Inbox unconditionally (Phase 2 walker only descends Inbox).
-    /// Dedup scope: returns `Duplicate` if message_id is already present in
-    /// inbox/trash/drafts (matches existing receive_message dedup window).
+    /// Inserts a `body_state: Pending` entry at position 0 of Inbox (the Phase 2
+    /// walker only descends Inbox). Dedup scope: returns `Duplicate` if
+    /// message_id is already present in inbox/trash/drafts (matches existing
+    /// receive_message dedup window — deliberately excludes sent).
     pub fn register_header_only(
         &mut self,
         entry: harmony_mailbox::mailbox::MessageEntry,
@@ -251,12 +252,17 @@ impl MailManager {
             return Ok(RegisterOutcome::Duplicate);
         }
 
+        // Defense-in-depth: harmony-mailbox enforces its own snippet cap on the
+        // wire, but that constant can drift across version skew. Re-clamp here
+        // so the client-side MAX_SNIPPET_LEN invariant holds regardless.
+        let snippet = truncate_snippet(&entry.subject_snippet);
+
         let record = EntryRecord {
             message_cid: cid_hex.clone(),
             message_id: msg_id_hex,
             sender_address: hex::encode(entry.sender_address),
             timestamp: entry.timestamp,
-            subject_snippet: entry.subject_snippet,
+            subject_snippet: snippet,
             read: entry.read,
             body_state: BodyState::Pending,
         };
