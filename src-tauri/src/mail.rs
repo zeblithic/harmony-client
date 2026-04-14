@@ -273,6 +273,46 @@ impl MailManager {
         Ok(RegisterOutcome::Inserted { cid: cid_hex })
     }
 
+    /// Verify bytes hash to cid_hex, write blob, transition matching
+    /// Pending entries to Local. No-op (returns Ok) if no Pending entry
+    /// matches (e.g., entry already Local from a racing live push).
+    pub fn mark_body_received(&mut self, cid_hex: &str, bytes: &[u8]) -> Result<(), String> {
+        validate_hex(cid_hex)?;
+
+        // Verify bytes hash to the claimed CID.
+        let computed = hex::encode(blake3::hash(bytes).as_bytes());
+        if computed != cid_hex {
+            return Err(format!("hash mismatch: claimed {cid_hex}, computed {computed}"));
+        }
+
+        // Find any matching Pending entry across receive-side folders.
+        let mut found_pending = false;
+        for folder_name in ["inbox", "trash", "drafts"] {
+            let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
+            for entry in folder.entries.iter_mut() {
+                if entry.message_cid == cid_hex && entry.body_state == BodyState::Pending {
+                    entry.body_state = BodyState::Local;
+                    found_pending = true;
+                }
+            }
+        }
+
+        if !found_pending {
+            // No Pending entry to promote — likely already Local from live receive.
+            // Don't write a stale blob.
+            return Ok(());
+        }
+
+        // Write the blob (atomic: tmp + rename).
+        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, bytes).map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+
+        self.save_index()?;
+        Ok(())
+    }
+
     /// Store a sent message (already serialized).
     pub fn store_sent(
         &mut self,
@@ -918,6 +958,76 @@ mod tests {
         assert_eq!(inbox.len(), 0);
         let trash = mgr.list_folder("trash", 0, 100);
         assert_eq!(trash.len(), 1);
+    }
+
+    #[test]
+    fn mark_body_received_promotes_pending_to_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_dir = tmp.path().join("mail");
+        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+
+        // Create a real HarmonyMessage so the bytes parse cleanly.
+        let msg = make_test_message("subject", [0xCC; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let real_cid = blake3::hash(&bytes);
+        let real_cid_hex = hex::encode(real_cid.as_bytes());
+
+        // Register a pending entry whose message_cid matches the real bytes.
+        let entry = MessageEntry {
+            message_cid: *real_cid.as_bytes(),
+            message_id: msg.message_id,
+            sender_address: [0xCC; 16],
+            timestamp: msg.timestamp,
+            read: false,
+            subject_snippet: "subject".to_string(),
+        };
+        mgr.register_header_only(entry).unwrap();
+
+        // Promote it.
+        mgr.mark_body_received(&real_cid_hex, &bytes).unwrap();
+
+        // Inbox entry is now Local.
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        assert_eq!(inbox[0].body_state, BodyState::Local);
+
+        // Blob exists on disk.
+        let blob_path = mail_dir.join("blobs").join(format!("{real_cid_hex}.bin"));
+        assert!(blob_path.exists(), "blob should be written");
+        assert_eq!(std::fs::read(&blob_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mark_body_received_rejects_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_dir = tmp.path().join("mail");
+        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+
+        let claimed_cid_hex = hex::encode([0xDD; 32]);
+        let wrong_bytes = b"not a harmony message";
+
+        let result = mgr.mark_body_received(&claimed_cid_hex, wrong_bytes);
+        assert!(result.is_err(), "should reject bytes that don't hash to the claimed CID");
+    }
+
+    #[test]
+    fn mark_body_received_is_idempotent_for_local_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_dir = tmp.path().join("mail");
+        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+
+        let msg = make_test_message("s", [0xEE; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let cid_hex = hex::encode(blake3::hash(&bytes).as_bytes());
+
+        // Receive once via the live raw path → entry is Local.
+        mgr.receive_message(&bytes).unwrap();
+
+        // mark_body_received should be a no-op (returns Ok).
+        mgr.mark_body_received(&cid_hex, &bytes).unwrap();
+
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].body_state, BodyState::Local);
     }
 
     #[test]
