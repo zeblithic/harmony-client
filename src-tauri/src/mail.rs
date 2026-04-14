@@ -16,6 +16,22 @@ use serde::{Deserialize, Serialize};
 
 // ── Public types (shared with Tauri commands) ────────────────────────
 
+/// Whether a message body blob is locally cached.
+///
+/// `Local` — the HarmonyMessage blob exists at `{data_dir}/mail/blobs/{cid}.bin`.
+///   Created by `receive_message` (live raw push) or `mark_body_received`
+///   (lazy fetch).
+/// `Pending` — a header-only entry registered by the Phase 2 walker. The
+///   inbox entry exists but the body has not yet been fetched. Triggered to
+///   fetch on first `MailReader` open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum BodyState {
+    #[default]
+    Local,
+    Pending,
+}
+
 /// A lightweight entry for inbox listing (mirrors MessageEntry semantics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +42,8 @@ pub struct EntryRecord {
     pub timestamp: u64,
     pub subject_snippet: String,
     pub read: bool,
+    #[serde(default)]
+    pub body_state: BodyState,
 }
 
 /// Folder summary counts.
@@ -51,6 +69,7 @@ pub struct MailDetail {
     pub is_reply: bool,
     pub is_forward: bool,
     pub in_reply_to: Option<String>,
+    pub body_state: BodyState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +203,7 @@ impl MailManager {
             timestamp: msg.timestamp,
             subject_snippet: snippet,
             read: false,
+            body_state: BodyState::Local,
         };
 
         // Store blob (atomic: write tmp then rename, matching save_index pattern)
@@ -228,6 +248,7 @@ impl MailManager {
             timestamp: msg.timestamp,
             subject_snippet: snippet,
             read: true, // Sent messages are always "read"
+            body_state: BodyState::Local,
         };
 
         let sent = self.index.folders.get_mut("sent").unwrap();
@@ -293,6 +314,7 @@ impl MailManager {
             is_reply: msg.flags.is_reply(),
             is_forward: msg.flags.is_forward(),
             in_reply_to: msg.in_reply_to.map(|id| hex::encode(id)),
+            body_state: BodyState::Local,
         })
     }
 
@@ -735,6 +757,40 @@ mod tests {
         // Delete from sent — now blob is removed
         mgr.delete_message(&entry.message_cid, Some("sent")).unwrap();
         assert!(!blob_path.exists());
+    }
+
+    #[test]
+    fn index_loads_old_format_with_local_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_dir = tmp.path().join("mail");
+        std::fs::create_dir_all(&mail_dir).unwrap();
+        std::fs::create_dir_all(mail_dir.join("blobs")).unwrap();
+
+        // Old-format index: no body_state field on entries.
+        let old_json = r#"{
+            "version": 1,
+            "folders": {
+                "inbox": {
+                    "entries": [{
+                        "messageCid": "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee",
+                        "messageId": "00112233445566778899aabbccddeeff",
+                        "senderAddress": "00112233445566778899aabbccddeeff",
+                        "timestamp": 1700000000,
+                        "subjectSnippet": "old entry",
+                        "read": false
+                    }]
+                },
+                "sent": { "entries": [] },
+                "drafts": { "entries": [] },
+                "trash": { "entries": [] }
+            }
+        }"#;
+        std::fs::write(mail_dir.join("index.json"), old_json).unwrap();
+
+        let mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].body_state, BodyState::Local);
     }
 
     #[test]
