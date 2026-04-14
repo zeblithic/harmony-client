@@ -31,6 +31,7 @@ harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = 
 harmony-content = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", branch = "zeb-114-phase2" }
 
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
@@ -39,3 +40,14 @@ ml-dsa = "=0.1.0-rc.7"
 ml-kem = "=0.3.0-rc.0"
 sha3 = "=0.11.0-rc.8"
 keccak = "=0.2.0-rc.2"
+
+[dev-dependencies]
+blake3 = "1"
+
+[patch.'https://github.com/zeblithic/harmony.git']
+harmony-mailbox = { path = "../../harmony/.claude/worktrees/zeb-110-cas-caller/crates/harmony-mailbox" }
+harmony-runtime = { path = "../../harmony/crates/harmony-runtime" }
+harmony-identity = { path = "../../harmony/crates/harmony-identity" }
+harmony-content = { path = "../../harmony/crates/harmony-content" }
+harmony-compute = { path = "../../harmony/crates/harmony-compute" }
+harmony-telemetry = { path = "../../harmony/crates/harmony-telemetry" }

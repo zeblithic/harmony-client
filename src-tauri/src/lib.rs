@@ -10,10 +10,10 @@ use tauri::{AppHandle, Emitter};
 
 mod event_loop;
 mod identity;
+mod mail;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
-#[derive(Default)]
 struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -27,6 +27,22 @@ struct NodeState {
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+    /// Mail state for the client mail receive path.
+    mail: mail::MailState,
+}
+
+impl Default for NodeState {
+    fn default() -> Self {
+        Self {
+            thread: None,
+            shutdown_tx: None,
+            publish_tx: None,
+            fetch_tx: None,
+            generation: 0,
+            node_addr: String::new(),
+            mail: mail::MailState::new(),
+        }
+    }
 }
 
 // ── Data types (shared with frontend via Tauri events) ───────────────────
@@ -276,6 +292,8 @@ async fn start_node(
             archive_entries: Vec::new(),
             archive_quota: None,
             s3_enabled: false,
+            eviction_push_enabled: false,
+            archive_ingest_enabled: false,
         };
 
         // Re-acquire lock and atomically register the new node.
@@ -763,6 +781,47 @@ async fn fetch_content(
         .map_err(|_| "event loop dropped fetch request".to_string())?
 }
 
+/// Get inbox entries by walking the CAS Merkle tree.
+#[tauri::command]
+async fn get_inbox(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<mail::InboxEntry>, String> {
+    let (root_cid, cache_dir, fetch_tx) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let root_cid = guard
+            .mail
+            .root_cid
+            .ok_or_else(|| "no mailbox root CID available".to_string())?;
+        let cache_dir = guard.mail.cache_dir.clone();
+        let fetch_tx = guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        (root_cid, cache_dir, fetch_tx)
+    };
+
+    mail::get_inbox_inner(root_cid, &cache_dir, &fetch_tx).await
+}
+
+/// Fetch and deserialize a full HarmonyMessage by hex-encoded CID.
+#[tauri::command]
+async fn get_mail_message(
+    message_cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<mail::MailMessage, String> {
+    let (cache_dir, fetch_tx) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let cache_dir = guard.mail.cache_dir.clone();
+        let fetch_tx = guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        (cache_dir, fetch_tx)
+    };
+
+    mail::get_mail_message_inner(&message_cid, &cache_dir, &fetch_tx).await
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -786,6 +845,8 @@ pub fn run() {
             unpin_content,
             burn_content,
             fetch_content,
+            get_inbox,
+            get_mail_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");

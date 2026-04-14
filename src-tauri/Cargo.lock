@@ -97,6 +97,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -230,6 +242,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -1687,9 +1708,11 @@ dependencies = [
 name = "harmony-app"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "harmony-compute",
  "harmony-content",
  "harmony-identity",
+ "harmony-mailbox",
  "harmony-runtime",
  "harmony-telemetry",
  "hex",
@@ -1711,7 +1734,6 @@ dependencies = [
 [[package]]
 name = "harmony-athenaeum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "sha2",
 ]
@@ -1719,17 +1741,16 @@ dependencies = [
 [[package]]
 name = "harmony-compute"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-crypto",
  "thiserror 2.0.18",
  "wasmi",
+ "wasmparser 0.228.0",
 ]
 
 [[package]]
 name = "harmony-contacts"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-identity",
  "hashbrown 0.15.5",
@@ -1740,7 +1761,6 @@ dependencies = [
 [[package]]
 name = "harmony-content"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-crypto",
  "harmony-zenoh",
@@ -1755,7 +1775,6 @@ dependencies = [
 [[package]]
 name = "harmony-credential"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -1766,7 +1785,6 @@ dependencies = [
 [[package]]
 name = "harmony-crypto"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "aes",
  "blake3",
@@ -1790,7 +1808,6 @@ dependencies = [
 [[package]]
 name = "harmony-discovery"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -1802,8 +1819,8 @@ dependencies = [
 [[package]]
 name = "harmony-identity"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
+ "argon2",
  "base64 0.22.1",
  "bs58",
  "ed25519-dalek",
@@ -1818,9 +1835,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmony-mailbox"
+version = "0.1.0"
+dependencies = [
+ "harmony-identity",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harmony-memo"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-content",
  "harmony-credential",
@@ -1834,7 +1858,6 @@ dependencies = [
 [[package]]
 name = "harmony-peers"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-contacts",
  "harmony-crypto",
@@ -1845,7 +1868,6 @@ dependencies = [
 [[package]]
 name = "harmony-platform"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
@@ -1855,7 +1877,6 @@ dependencies = [
 [[package]]
 name = "harmony-reticulum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "ed25519-dalek",
  "harmony-crypto",
@@ -1871,7 +1892,6 @@ dependencies = [
 [[package]]
 name = "harmony-runtime"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-athenaeum",
  "harmony-compute",
@@ -1897,12 +1917,10 @@ dependencies = [
 [[package]]
 name = "harmony-speculative"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 
 [[package]]
 name = "harmony-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1911,7 +1929,6 @@ dependencies = [
 [[package]]
 name = "harmony-workflow"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-compute",
  "harmony-crypto",
@@ -1921,7 +1938,6 @@ dependencies = [
 [[package]]
 name = "harmony-zenoh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#acaf8265e6869a968edfbf5a4686bbd6e3ad488b"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -3194,6 +3210,17 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
@@ -6088,7 +6115,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
 dependencies = [
  "bitflags 2.11.0",
+ "hashbrown 0.15.5",
  "indexmap 2.13.0",
+ "semver",
+ "serde",
 ]
 
 [[package]]
