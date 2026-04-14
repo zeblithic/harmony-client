@@ -1248,7 +1248,7 @@ async fn send_mail(
     payload: SendMailPayload,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    use harmony_mail::message::{
+    use harmony_mailbox::message::{
         HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
         unique_message_id,
     };

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use harmony_mail::message::{
+use harmony_mailbox::message::{
     HarmonyMessage, RecipientType, ADDRESS_HASH_LEN,
 };
 use serde::{Deserialize, Serialize};
@@ -474,7 +474,7 @@ fn truncate_snippet(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harmony_mail::message::{
+    use harmony_mailbox::message::{
         unique_message_id, MailMessageType, MessageFlags, Recipient, RecipientType,
     };
 
