@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailContent, settingsPanel, collapsed = false, showSettings = false, mode = 'messages' }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -11,6 +11,7 @@
     fileDetailPanel?: Snippet;
     spellbookContent?: Snippet;
     spellbookDetail?: Snippet;
+    mailContent?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -18,7 +19,7 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailContent}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
@@ -44,6 +45,10 @@
         {@render spellbookDetail()}
       </section>
     {/if}
+  {:else if mode === 'mail' && mailContent}
+    <main class="mail-area">
+      {@render mailContent()}
+    </main>
   {:else}
     <main class="text-area">
       {@render textFeed()}
@@ -149,6 +154,22 @@
     grid-area: spellbook;
     background: var(--bg-primary);
     overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .layout.mail-mode {
+    grid-template-columns: var(--nav-width) 1fr;
+    grid-template-areas: "nav mail";
+  }
+  .layout.mail-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav mail";
+  }
+  .mail-area {
+    grid-area: mail;
+    background: var(--bg-primary);
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }

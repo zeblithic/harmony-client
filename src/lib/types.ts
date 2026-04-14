@@ -118,7 +118,7 @@ export interface VineVideo {
   viewed: boolean;
 }
 
-export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook';
+export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail';
 
 // ── File Manager Types ──────────────────────────────────────────────
 
@@ -210,4 +210,24 @@ export interface FileManagerSettings {
   quotaBytes: number;
   defaultViewMode: FileViewMode;
   confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
+}
+
+// ── Mail Types ──────────────────────────────────────────────────────
+
+export interface InboxEntry {
+  messageCid: string;
+  senderAddress: string;
+  timestamp: number;
+  subjectSnippet: string;
+  read: boolean;
+}
+
+export interface MailMessage {
+  subject: string;
+  body: string;
+  senderAddress: string;
+  timestamp: number;
+  recipients: string[];
+  isReply: boolean;
+  hasAttachments: boolean;
 }

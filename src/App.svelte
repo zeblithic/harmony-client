@@ -22,6 +22,8 @@
   import { MessageService } from './lib/message-service';
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
+  import { MailService } from './lib/mail-service';
+  import MailMode from './lib/components/MailMode.svelte';
   import { AvatarResolver } from './lib/avatar-resolver';
   import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
@@ -155,6 +157,25 @@
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
   messageService.ownDisplayName = myProfile.displayName || 'You';
 
+  const mailService = new MailService();
+  $effect(() => () => mailService.destroy());
+
+  let mailEntries = $state<import('./lib/types').InboxEntry[]>([]);
+  let mailSelectedCid = $state<string | null>(null);
+  let mailSelectedMessage = $state<import('./lib/types').MailMessage | null>(null);
+  let mailLoading = $state(false);
+
+  mailService.onChange = () => {
+    mailEntries = [...mailService.entries];
+    mailSelectedCid = mailService.selectedCid;
+    mailSelectedMessage = mailService.selectedMessage;
+    mailLoading = mailService.loading;
+  };
+
+  function handleMailSelect(cid: string) {
+    mailService.openMessage(cid);
+  }
+
   // Try to wire up real Tauri transport (messages, vines, file manager).
   (async () => {
     try {
@@ -169,6 +190,7 @@
       await fileManagerService.connectAdapter(adapter);
       avatarResolver.connectAdapter(adapter);
       await navService.connectAdapter(adapter);
+      await mailService.connectAdapter(adapter);
       // Fetch our node address so self-sent messages/vines echo back as 'self'/'You'.
       // Try immediately (node may already be connected after hot reload / auto-start),
       // and also listen for future connect events.
@@ -632,6 +654,15 @@
   {/snippet}
   {#snippet spellbookDetail()}
     <FlashcardStats stats={flashcardStats} />
+  {/snippet}
+  {#snippet mailContent()}
+    <MailMode
+      entries={mailEntries}
+      selectedCid={mailSelectedCid}
+      selectedMessage={mailSelectedMessage}
+      loading={mailLoading}
+      onSelect={handleMailSelect}
+    />
   {/snippet}
 </Layout>
 

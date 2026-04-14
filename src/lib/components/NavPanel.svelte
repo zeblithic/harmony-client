@@ -147,6 +147,8 @@
         {/if}
       {:else if appMode === 'spellbook'}
         <!-- Spellbook mode uses its own tab content -->
+      {:else if appMode === 'mail'}
+        <!-- Mail mode uses its own full-width layout -->
       {:else}
         <NavTree
           nodes={filteredNodes}
@@ -177,6 +179,9 @@
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'spellbook'}
           aria-label="Spellbook" aria-pressed={appMode === 'spellbook'}
           onclick={() => onModeChange?.('spellbook')}>Spellbook</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mail'}
+          aria-label="Mail" aria-pressed={appMode === 'mail'}
+          onclick={() => onModeChange?.('mail')}>Mail</button>
       </div>
       <button
         type="button"
