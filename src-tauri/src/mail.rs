@@ -32,6 +32,15 @@ pub enum BodyState {
     Pending,
 }
 
+/// Outcome of a `register_header_only` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// Entry was new; caller should emit a `mail-received` event.
+    Inserted { cid: String },
+    /// A matching message_id already exists in inbox/trash/drafts; no change.
+    Duplicate,
+}
+
 /// A lightweight entry for inbox listing (mirrors MessageEntry semantics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +229,42 @@ impl MailManager {
 
         self.save_index()?;
         Ok(entry)
+    }
+
+    /// Register a header-only inbox entry from a walker-discovered MessageEntry.
+    ///
+    /// Folder is set to Inbox unconditionally (Phase 2 walker only descends Inbox).
+    /// Dedup scope: returns `Duplicate` if message_id is already present in
+    /// inbox/trash/drafts (matches existing receive_message dedup window).
+    pub fn register_header_only(
+        &mut self,
+        entry: harmony_mailbox::mailbox::MessageEntry,
+    ) -> Result<RegisterOutcome, String> {
+        let cid_hex = hex::encode(entry.message_cid);
+        let msg_id_hex = hex::encode(entry.message_id);
+
+        let already_known = ["inbox", "trash", "drafts"]
+            .into_iter()
+            .filter_map(|name| self.index.folders.get(name))
+            .any(|folder| folder.entries.iter().any(|e| e.message_id == msg_id_hex));
+        if already_known {
+            return Ok(RegisterOutcome::Duplicate);
+        }
+
+        let record = EntryRecord {
+            message_cid: cid_hex.clone(),
+            message_id: msg_id_hex,
+            sender_address: hex::encode(entry.sender_address),
+            timestamp: entry.timestamp,
+            subject_snippet: entry.subject_snippet,
+            read: entry.read,
+            body_state: BodyState::Pending,
+        };
+
+        let inbox = self.index.folders.get_mut("inbox").unwrap();
+        inbox.entries.insert(0, record);
+        self.save_index()?;
+        Ok(RegisterOutcome::Inserted { cid: cid_hex })
     }
 
     /// Store a sent message (already serialized).
@@ -496,9 +541,21 @@ fn truncate_snippet(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_mailbox::mailbox::MessageEntry;
     use harmony_mailbox::message::{
         unique_message_id, MailMessageType, MessageFlags, Recipient, RecipientType,
     };
+
+    fn make_message_entry(message_id: [u8; 16], snippet: &str) -> MessageEntry {
+        MessageEntry {
+            message_cid: [0xAA; 32],
+            message_id,
+            sender_address: [0xBB; 16],
+            timestamp: 1700000000,
+            read: false,
+            subject_snippet: snippet.to_string(),
+        }
+    }
 
     fn make_test_message(subject: &str, sender: [u8; 16]) -> HarmonyMessage {
         HarmonyMessage {
@@ -791,6 +848,70 @@ mod tests {
         let inbox = mgr.list_folder("inbox", 0, 100);
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].body_state, BodyState::Local);
+    }
+
+    #[test]
+    fn register_header_only_inserts_pending_inbox_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+
+        let entry = make_message_entry([0x11; 16], "first message");
+        let outcome = mgr.register_header_only(entry).unwrap();
+
+        match outcome {
+            RegisterOutcome::Inserted { ref cid } => {
+                let inbox = mgr.list_folder("inbox", 0, 100);
+                assert_eq!(inbox.len(), 1);
+                assert_eq!(inbox[0].message_cid, *cid);
+                assert_eq!(inbox[0].body_state, BodyState::Pending);
+                assert_eq!(inbox[0].subject_snippet, "first message");
+            }
+            RegisterOutcome::Duplicate => panic!("expected Inserted, got Duplicate"),
+        }
+    }
+
+    #[test]
+    fn register_header_only_returns_duplicate_for_existing_inbox_message_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+
+        // First, register via header-only (creates Pending in inbox).
+        let entry1 = make_message_entry([0x22; 16], "first");
+        mgr.register_header_only(entry1).unwrap();
+
+        // Try to register again with the same message_id.
+        let entry2 = make_message_entry([0x22; 16], "second-attempt");
+        let outcome = mgr.register_header_only(entry2).unwrap();
+        assert!(matches!(outcome, RegisterOutcome::Duplicate));
+
+        // Inbox still has one entry, original snippet preserved.
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject_snippet, "first");
+    }
+
+    #[test]
+    fn register_header_only_dedups_across_inbox_trash_drafts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+
+        // Register, then move to trash.
+        let entry = make_message_entry([0x33; 16], "msg");
+        let outcome = mgr.register_header_only(entry).unwrap();
+        let cid = match outcome {
+            RegisterOutcome::Inserted { cid } => cid,
+            _ => panic!(),
+        };
+        mgr.move_message(&cid, Some("inbox"), "trash").unwrap();
+
+        // Re-attempting the same message_id should return Duplicate (not reappear in inbox).
+        let entry2 = make_message_entry([0x33; 16], "msg");
+        let outcome2 = mgr.register_header_only(entry2).unwrap();
+        assert!(matches!(outcome2, RegisterOutcome::Duplicate));
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 0);
+        let trash = mgr.list_folder("trash", 0, 100);
+        assert_eq!(trash.len(), 1);
     }
 
     #[test]
