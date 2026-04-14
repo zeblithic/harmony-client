@@ -233,7 +233,15 @@ pub enum BodyState {
 
 ```rust
 impl MailManager {
+    /// Insert a header-only inbox entry from a walker-discovered MessageEntry.
+    /// Folder is set to Inbox unconditionally (Phase 2 walker only descends Inbox).
+    /// Dedup scope: returns Duplicate if the message_id is already present in
+    /// inbox/trash/drafts (matches existing receive_message dedup window — a
+    /// message previously moved to trash should not reappear in inbox).
     pub fn register_header_only(&self, entry: MessageEntry) -> Result<RegisterOutcome, MailError>;
+
+    /// Verify bytes hash to cid, write blob, transition matching index entry
+    /// from Pending → Local. No-op if entry already Local.
     pub fn mark_body_received(&self, cid_hex: &str, bytes: &[u8]) -> Result<(), MailError>;
 }
 
@@ -245,7 +253,7 @@ pub enum RegisterOutcome {
 
 ### Modified behavior
 
-- **`receive_message(bytes)`** (existing): if a `Pending` entry for the same `message_id` exists, transitions it to `Local` (writes blob, clears pending flag) instead of treating as duplicate. This is the **race-safety property**: the live raw push and the walker can register the same entry in any order; net result is one `Local` entry.
+- **`receive_message(bytes)`** (existing): if a `Pending` entry for the same `message_id` exists in inbox/trash/drafts, transitions it to `Local` (writes blob, clears pending flag) — preserving its current folder. The previous behavior of "duplicate message_id → no-op" continues to apply when the existing entry is already `Local`. This is the **race-safety property**: the live raw push and the walker can register the same entry in any order; net result is one `Local` entry, and a user's prior trash/drafts placement is not reset to Inbox by the live push.
 
 - **`get_message(cid)`** (existing): unchanged signature. Returns the index entry; for `Pending` entries the returned `MailDetail` has empty body fields. Frontend uses `body_state` to decide whether to call `fetch_mail_body`.
 
