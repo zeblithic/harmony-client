@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::mail::MailManager;
@@ -54,21 +54,21 @@ type InFlightMap = Arc<
     Mutex<HashMap<[u8; CID_LEN], tokio::sync::watch::Receiver<Option<Result<Vec<u8>, String>>>>>,
 >;
 
-pub struct MailSync {
+pub struct MailSync<R: Runtime = tauri::Wry> {
     state: Arc<Mutex<SyncState>>,
     fetch_tx: mpsc::Sender<FetchRequest>,
     mail_mgr: Arc<Mutex<MailManager>>,
     own_addr_hex: String,
-    app: AppHandle,
+    app: AppHandle<R>,
     in_flight_bodies: InFlightMap,
 }
 
-impl MailSync {
+impl<R: Runtime> MailSync<R> {
     pub fn new(
         fetch_tx: mpsc::Sender<FetchRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
         own_addr_hex: String,
-        app: AppHandle,
+        app: AppHandle<R>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(SyncState::Idle {
@@ -129,13 +129,274 @@ impl MailSync {
     }
 
     async fn start_or_queue_walk(self: Arc<Self>, root: [u8; CID_LEN]) {
-        // Full implementation in C7/C9.
-        tracing::debug!(?root, "start_or_queue_walk called (stub — C7/C9 will implement)");
+        // Single-flight: if already walking, queue the new root for later.
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match &mut *state {
+                SyncState::Walking { pending_root, .. } => {
+                    *pending_root = Some(root);
+                    return;
+                }
+                _ => {
+                    *state = SyncState::Walking {
+                        root,
+                        started_at: Instant::now(),
+                        pending_root: None,
+                    };
+                }
+            }
+        }
+
+        let me = Arc::clone(&self);
+        tokio::spawn(async move {
+            me.run_walk_pass(root).await;
+        });
+    }
+
+    /// Fetch a CAS blob via the event_loop's fetch channel. 30-second budget.
+    async fn fetch_cas(&self, cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
+        let cid_hex = hex::encode(cid);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.fetch_tx
+            .send(FetchRequest {
+                cid_hex: cid_hex.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "fetch channel closed".to_string())?;
+        match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("fetch reply channel dropped".to_string()),
+            Err(_) => Err(format!("fetch timeout for {cid_hex}")),
+        }
+    }
+
+    async fn run_walk_pass(self: Arc<Self>, root: [u8; CID_LEN]) {
+        use harmony_mailbox::mailbox::{FolderKind, MailFolder, MailRoot};
+
+        self.emit_status(SyncStatusEvent {
+            state: "syncing",
+            error: None,
+        });
+
+        // Step 1: fetch + parse root.
+        let root_bytes = match self.fetch_cas(root).await {
+            Ok(b) => b,
+            Err(e) => return self.finish_walk_error(format!("root fetch: {e}")),
+        };
+        let mail_root = match MailRoot::from_bytes(&root_bytes) {
+            Ok(r) => r,
+            Err(e) => return self.finish_walk_error(format!("root parse: {e}")),
+        };
+
+        // Step 2: fetch + parse Inbox folder.
+        let folder_cid: [u8; CID_LEN] = *mail_root.folder_cid(FolderKind::Inbox);
+        let folder_bytes = match self.fetch_cas(folder_cid).await {
+            Ok(b) => b,
+            Err(e) => return self.finish_walk_error(format!("folder fetch: {e}")),
+        };
+        let folder = match MailFolder::from_bytes(&folder_bytes) {
+            Ok(f) => f,
+            Err(e) => return self.finish_walk_error(format!("folder parse: {e}")),
+        };
+
+        // Step 3: walk pages (Task C8 implements; stub returns None).
+        let skip_summary = self.walk_pages(&folder.page_cids).await;
+
+        // Step 4: finalize state.
+        self.finish_walk(root, skip_summary);
+    }
+
+    /// Stub for Task C8. Returns Some(summary) if any pages/entries skipped.
+    async fn walk_pages(&self, _page_cids: &[[u8; CID_LEN]]) -> Option<String> {
+        // Implementation in C8.
+        None
+    }
+
+    fn finish_walk_error(self: Arc<Self>, error: String) {
+        let last_walked = match &*self.state.lock().unwrap_or_else(|p| p.into_inner()) {
+            SyncState::Walking { .. } => None,
+            SyncState::Idle { last_walked_root }
+            | SyncState::Error {
+                last_walked_root, ..
+            } => *last_walked_root,
+        };
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Error {
+            last_error: error.clone(),
+            last_walked_root: last_walked,
+        };
+        self.emit_status(SyncStatusEvent {
+            state: "error",
+            error: Some(error),
+        });
+    }
+
+    fn finish_walk(self: Arc<Self>, root: [u8; CID_LEN], skip_summary: Option<String>) {
+        let pending = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let pending = if let SyncState::Walking { pending_root, .. } = &*state {
+                *pending_root
+            } else {
+                None
+            };
+            *state = match skip_summary.clone() {
+                None => SyncState::Idle {
+                    last_walked_root: Some(root),
+                },
+                Some(summary) => SyncState::Error {
+                    last_error: summary,
+                    last_walked_root: Some(root),
+                },
+            };
+            pending
+        };
+
+        // Emit terminal event based on the new state.
+        let event = match skip_summary {
+            None => SyncStatusEvent {
+                state: "idle",
+                error: None,
+            },
+            Some(summary) => SyncStatusEvent {
+                state: "error",
+                error: Some(summary),
+            },
+        };
+        self.emit_status(event);
+
+        // Re-walk if pending root was queued.
+        if let Some(next_root) = pending {
+            let me = Arc::clone(&self);
+            tokio::spawn(async move {
+                me.start_or_queue_walk(next_root).await;
+            });
+        }
     }
 
     fn emit_status(&self, event: SyncStatusEvent) {
         if let Err(e) = self.app.emit("mail-sync-status", &event) {
             tracing::warn!(error = %e, "failed to emit mail-sync-status");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harmony_mailbox::mailbox::{FolderKind, MailRoot};
+
+    /// Test harness: a stub fetch responder backed by a HashMap of CID → bytes.
+    /// Bytes not in the map return NotFound errors.
+    struct StubFetcher {
+        responses: HashMap<[u8; CID_LEN], Vec<u8>>,
+    }
+
+    impl StubFetcher {
+        fn new() -> Self {
+            Self {
+                responses: HashMap::new(),
+            }
+        }
+        fn insert(&mut self, cid: [u8; CID_LEN], bytes: Vec<u8>) {
+            self.responses.insert(cid, bytes);
+        }
+        async fn run(self, mut rx: mpsc::Receiver<FetchRequest>) {
+            while let Some(req) = rx.recv().await {
+                let cid_bytes = hex::decode(&req.cid_hex).unwrap();
+                let cid: [u8; CID_LEN] = cid_bytes.try_into().unwrap();
+                let result = self
+                    .responses
+                    .get(&cid)
+                    .cloned()
+                    .ok_or_else(|| format!("not found: {}", req.cid_hex));
+                let _ = req.reply.send(result);
+            }
+        }
+    }
+
+    /// Build a test MailSync with a mock Tauri AppHandle.
+    fn make_test_mail_sync(
+        fetch_tx: mpsc::Sender<FetchRequest>,
+        mail_mgr: Arc<Mutex<MailManager>>,
+    ) -> Arc<MailSync<tauri::test::MockRuntime>> {
+        let app = tauri::test::mock_app();
+        Arc::new(MailSync::new(
+            fetch_tx,
+            mail_mgr,
+            "00112233445566778899aabbccddeeff".to_string(),
+            app.handle().clone(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn walk_aborts_on_root_fetch_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(16);
+
+        // No responses inserted — root fetch will fail.
+        tokio::spawn(StubFetcher::new().run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        let bad_root = [0xDE; CID_LEN];
+        sync.clone().handle_root_push(&bad_root).await;
+
+        // Allow walker to run.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Inbox empty, state should be Error.
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 0);
+        {
+            let guard = sync.state.lock().unwrap();
+            match &*guard {
+                SyncState::Error { last_error, .. } => {
+                    assert!(
+                        last_error.contains("not found") || last_error.contains("timeout"),
+                        "unexpected error: {last_error}"
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_aborts_on_folder_fetch_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(16);
+
+        // Construct a valid MailRoot pointing at a folder CID we won't serve.
+        let folder_cid = [0xF0; CID_LEN];
+        let root = MailRoot::new_empty([0u8; 16], 1700000000)
+            .with_folder(FolderKind::Inbox, folder_cid, 1700000001);
+        let root_bytes = root.to_bytes();
+        let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
+
+        let mut stub = StubFetcher::new();
+        stub.insert(root_cid, root_bytes);
+        // folder_cid intentionally NOT inserted.
+        tokio::spawn(stub.run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        sync.clone().handle_root_push(&root_cid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        assert_eq!(inbox.len(), 0);
+        {
+            let guard = sync.state.lock().unwrap();
+            match &*guard {
+                SyncState::Error { .. } => {}
+                other => panic!("expected Error, got {other:?}"),
+            }
         }
     }
 }
