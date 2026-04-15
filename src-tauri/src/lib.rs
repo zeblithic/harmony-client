@@ -12,6 +12,7 @@ mod event_loop;
 mod follows;
 mod identity;
 mod mail;
+mod mail_sync;
 mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
