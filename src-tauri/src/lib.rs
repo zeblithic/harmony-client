@@ -1408,6 +1408,87 @@ fn get_mail(
         guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
     };
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
+
+    // Locate the entry across all folders to inspect body_state.
+    // (list_folder with a generous limit; usize::MAX per the C8 emit path.)
+    let entry = ["inbox", "trash", "drafts", "sent"]
+        .iter()
+        .find_map(|f| {
+            mgr.list_folder(f, 0, usize::MAX)
+                .into_iter()
+                .find(|e| e.message_cid == message_cid)
+        });
+
+    // If the entry is Pending, return a stub MailDetail — the blob doesn't
+    // exist on disk yet, so mgr.get_message would fail. Frontend recognizes
+    // body_state=Pending and triggers fetch_mail_body.
+    if let Some(entry) = entry {
+        if entry.body_state == mail::BodyState::Pending {
+            return Ok(mail::MailDetail {
+                message_cid,
+                message_id: entry.message_id,
+                subject: entry.subject_snippet,
+                body: String::new(),
+                sender_address: entry.sender_address,
+                recipients: vec![],
+                timestamp: entry.timestamp,
+                attachments: vec![],
+                is_reply: false,
+                is_forward: false,
+                in_reply_to: None,
+                body_state: mail::BodyState::Pending,
+            });
+        }
+    }
+
+    // Local (or entry missing — let get_message produce the proper error).
+    mgr.get_message(&message_cid)
+}
+
+#[tauri::command]
+async fn refresh_mail(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let sync_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .mail_sync
+            .clone()
+            .ok_or_else(|| "mail_sync not initialized".to_string())?
+    };
+    sync_arc.refresh_now().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn fetch_mail_body(
+    message_cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<mail::MailDetail, String> {
+    let (sync_arc, mgr_arc) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let sync = guard
+            .mail_sync
+            .clone()
+            .ok_or_else(|| "mail_sync not initialized".to_string())?;
+        let mgr = guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?;
+        (sync, mgr)
+    };
+
+    // Decode CID hex → 32-byte array.
+    let cid_bytes = hex::decode(&message_cid).map_err(|e| format!("bad cid hex: {e}"))?;
+    let cid_arr: [u8; 32] = cid_bytes
+        .try_into()
+        .map_err(|_| "cid must be 32 bytes".to_string())?;
+
+    // Trigger lazy fetch (no-op if already Local; writes blob + promotes entry).
+    sync_arc.fetch_body(cid_arr).await?;
+
+    // Now return the fully-Local MailDetail from the manager.
+    let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     mgr.get_message(&message_cid)
 }
 
@@ -1481,6 +1562,8 @@ pub fn run() {
             send_mail,
             list_mail,
             get_mail,
+            refresh_mail,
+            fetch_mail_body,
             update_mail,
             get_mail_counts,
         ])
