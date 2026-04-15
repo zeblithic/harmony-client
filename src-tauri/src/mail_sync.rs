@@ -226,6 +226,10 @@ impl<R: Runtime> MailSync<R> {
         use harmony_mailbox::mailbox::MailPage;
         use tokio::sync::Semaphore;
 
+        // Bounds peak in-flight FetchRequest count (memory + channel pressure),
+        // NOT effective parallelism — the downstream fetcher in event_loop
+        // controls how many CAS fetches actually run concurrently. If that
+        // fetcher is serial, the walk is serial regardless of this bound.
         const MAX_CONCURRENT_PAGES: usize = 8;
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGES));
 
@@ -296,18 +300,32 @@ impl<R: Runtime> MailSync<R> {
         // entry, with the EntryRecord as payload. Emitted AFTER all
         // registrations so we don't surface entries that might turn out to
         // fail later in the same page.
-        for cid in new_entry_cids {
-            let entry = {
-                let mgr = self.mail_mgr.lock().unwrap_or_else(|p| p.into_inner());
-                mgr.list_folder("inbox", 0, 1000)
-                    .into_iter()
-                    .find(|e| e.message_cid == cid)
-                // guard drops here via block scope before `.emit()` below.
-            };
-            if let Some(entry) = entry {
-                if let Err(e) = self.app.emit("mail-received", &entry) {
-                    tracing::warn!(error = %e, "failed to emit mail-received");
-                }
+        //
+        // Delta-only stream: the frontend must seed its inbox view from a
+        // `list_folder`-backed command on mount. If the walker crashes after
+        // save_index but before emit, the entries are persisted but no event
+        // fires on a subsequent re-walk (Duplicate → silent). The UI recovers
+        // from persisted state on next list_folder, not from replayed events.
+        //
+        // Resolve all entries in ONE lock acquisition (O(N)) rather than
+        // re-scanning the inbox per CID (O(N²) and previously capped at 1000
+        // which would silently drop events for large backfills).
+        let new_cid_set: std::collections::HashSet<String> =
+            new_entry_cids.iter().cloned().collect();
+        let entries_to_emit: Vec<crate::mail::EntryRecord> = if new_cid_set.is_empty() {
+            Vec::new()
+        } else {
+            let mgr = self.mail_mgr.lock().unwrap_or_else(|p| p.into_inner());
+            // list_folder returns an owned Vec — safe to drop guard after.
+            mgr.list_folder("inbox", 0, usize::MAX)
+                .into_iter()
+                .filter(|e| new_cid_set.contains(&e.message_cid))
+                .collect()
+            // guard drops here at end of block scope.
+        };
+        for entry in entries_to_emit {
+            if let Err(e) = self.app.emit("mail-received", &entry) {
+                tracing::warn!(error = %e, "failed to emit mail-received");
             }
         }
 
