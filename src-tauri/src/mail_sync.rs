@@ -137,8 +137,16 @@ impl<R: Runtime> MailSync<R> {
             return;
         }
         match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
-            Ok(Ok(Ok(payload))) => {
-                self.handle_startup_query_reply(payload.as_deref()).await;
+            Ok(Ok(Ok(Some(payload)))) => {
+                self.handle_startup_query_reply(Some(&payload)).await;
+            }
+            Ok(Ok(Ok(None))) => {
+                // No responder answered. Distinguish from explicit empty
+                // payload (which means "no mail yet" and is success) so the
+                // user sees a real error and can retry — silent treatment
+                // would look like the inbox is genuinely empty.
+                tracing::warn!("refresh root query: no responder");
+                self.report_refresh_error("no gateway responded to refresh".to_string());
             }
             Ok(Ok(Err(e))) => {
                 tracing::warn!(error = %e, "refresh root query failed");

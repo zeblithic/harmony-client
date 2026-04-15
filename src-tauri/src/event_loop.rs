@@ -315,7 +315,12 @@ pub async fn run(
             let key = own_root_key.clone();
             tokio::spawn(async move {
                 match query_mail_root(&session_clone, &key, "startup").await {
-                    Ok(payload) => sync.handle_startup_query_reply(payload.as_deref()).await,
+                    Ok(Some(payload)) => {
+                        sync.handle_startup_query_reply(Some(&payload)).await
+                    }
+                    Ok(None) => tracing::warn!(
+                        "startup root query: no responder — live push will catch up on next gateway publish"
+                    ),
                     Err(e) => tracing::warn!(error = %e, "startup root query failed"),
                 }
             });
@@ -807,10 +812,16 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
 /// Distinct from `fetch_via_zenoh` because the mail-root protocol treats an
 /// empty reply as a valid sentinel ("no mail for this address yet") whereas
 /// fetch_via_zenoh requires a successful non-empty reply. Returns:
-/// - `Ok(Some(payload))` — reply received, possibly including the empty-bytes
-///   sentinel which the caller (MailSync::handle_startup_query_reply) handles.
-/// - `Ok(None)` — no replies arrived before the stream closed.
+/// - `Ok(Some(payload))` — at least one responder replied. A non-empty payload
+///   is the current root CID; an empty payload is the explicit "no mail yet"
+///   sentinel from the gateway's queryable.
+/// - `Ok(None)` — no responder replied with a non-empty payload AND no
+///   responder replied with the empty-mail sentinel. The caller treats this
+///   as a failed query (e.g., no gateway with this queryable declared).
 /// - `Err(msg)` — the `get` call itself failed or the 10s budget elapsed.
+///
+/// Multiple responders are tolerated via `ConsolidationMode::None`, and a
+/// non-empty reply is preferred over an empty one if both arrive.
 ///
 /// Used by both the cold-start query and the manual refresh path. `op_label`
 /// appears in the timeout message for log disambiguation ("startup" vs
@@ -820,21 +831,34 @@ async fn query_mail_root(
     key: &str,
     op_label: &str,
 ) -> Result<Option<Vec<u8>>, String> {
+    use zenoh::query::ConsolidationMode;
+
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
             let replies = session
                 .get(key)
+                .consolidation(ConsolidationMode::None)
                 .await
                 .map_err(|e| format!("get: {e}"))?;
-            let mut payload: Option<Vec<u8>> = None;
+
+            // Drain all replies. Prefer a non-empty payload (an actual root
+            // CID) over the empty "no mail" sentinel — a misbehaving
+            // responder shouldn't be able to mask a real root with empty.
+            let mut non_empty: Option<Vec<u8>> = None;
+            let mut saw_empty = false;
             while let Ok(reply) = replies.recv_async().await {
                 if let Ok(sample) = reply.result() {
-                    payload = Some(sample.payload().to_bytes().to_vec());
-                    break;
+                    let bytes = sample.payload().to_bytes().to_vec();
+                    if bytes.is_empty() {
+                        saw_empty = true;
+                    } else {
+                        non_empty = Some(bytes);
+                        break;
+                    }
                 }
             }
-            Ok::<_, String>(payload)
+            Ok::<_, String>(non_empty.or(if saw_empty { Some(Vec::new()) } else { None }))
         },
     )
     .await
