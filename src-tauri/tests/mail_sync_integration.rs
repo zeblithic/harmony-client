@@ -171,12 +171,10 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
 
     // Construct MailSync with a mock AppHandle.
     let app = tauri::test::mock_app();
-    let own_addr_hex = hex::encode([0u8; 16]);
     let sync = Arc::new(MailSync::new(
         fetch_tx,
         _refresh_tx.clone(),
         Arc::clone(&mail_mgr),
-        own_addr_hex.clone(),
         app.handle().clone(),
     ));
 

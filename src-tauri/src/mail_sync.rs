@@ -67,7 +67,6 @@ pub struct MailSync<R: Runtime = tauri::Wry> {
     fetch_tx: mpsc::Sender<FetchRequest>,
     refresh_tx: mpsc::Sender<RefreshRequest>,
     mail_mgr: Arc<Mutex<MailManager>>,
-    own_addr_hex: String,
     app: AppHandle<R>,
     in_flight_bodies: InFlightMap,
 }
@@ -77,7 +76,6 @@ impl<R: Runtime> MailSync<R> {
         fetch_tx: mpsc::Sender<FetchRequest>,
         refresh_tx: mpsc::Sender<RefreshRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
-        own_addr_hex: String,
         app: AppHandle<R>,
     ) -> Self {
         Self {
@@ -87,7 +85,6 @@ impl<R: Runtime> MailSync<R> {
             fetch_tx,
             refresh_tx,
             mail_mgr,
-            own_addr_hex,
             app,
             in_flight_bodies: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -106,12 +103,18 @@ impl<R: Runtime> MailSync<R> {
         self.start_or_queue_walk(root).await;
     }
 
-    /// Handle a reply from the cold-start Zenoh `get` query.
-    /// Empty payload means the gateway has no mail for this address yet.
+    /// Handle a reply from the cold-start Zenoh `get` query (or a manual
+    /// refresh, which routes through the same handler).
+    /// - `None` / empty payload → gateway explicitly says "no mail yet".
+    ///   Emit `idle` so any prior `error` from a failed previous attempt
+    ///   gets cleared from the UI.
+    /// - Non-empty 32-byte payload → kick off a walk.
+    /// - Malformed (wrong length) → log; leave state as-is.
     pub async fn handle_startup_query_reply(self: Arc<Self>, payload: Option<&[u8]>) {
         match payload {
             None | Some(b"") => {
-                tracing::info!("startup query: no mail for this address yet");
+                tracing::info!("startup/refresh query: no mail for this address yet");
+                self.clear_error_to_idle();
             }
             Some(bytes) => {
                 if let Ok(root) = <[u8; CID_LEN]>::try_from(bytes) {
@@ -126,6 +129,33 @@ impl<R: Runtime> MailSync<R> {
         }
     }
 
+    /// Transition Error → Idle without disturbing Walking/Idle. Called when
+    /// a refresh proves the gateway is reachable and reports no mail —
+    /// the previous error event no longer reflects truth.
+    fn clear_error_to_idle(self: &Arc<Self>) {
+        let should_emit = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let SyncState::Error {
+                last_walked_root, ..
+            } = &*state
+            {
+                let last = *last_walked_root;
+                *state = SyncState::Idle {
+                    last_walked_root: last,
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if should_emit {
+            self.emit_status(SyncStatusEvent {
+                state: "idle",
+                error: None,
+            });
+        }
+    }
+
     /// Manual refresh trigger from UI. Issues a fresh Zenoh get for the
     /// current root and walks if the gateway has one.
     pub async fn refresh_now(self: Arc<Self>) {
@@ -133,7 +163,7 @@ impl<R: Runtime> MailSync<R> {
         if self.refresh_tx.send(reply_tx).await.is_err() {
             let msg = "refresh channel closed".to_string();
             tracing::warn!("{msg}");
-            self.report_refresh_error(msg);
+            self.report_query_error(msg);
             return;
         }
         match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
@@ -146,27 +176,29 @@ impl<R: Runtime> MailSync<R> {
                 // user sees a real error and can retry — silent treatment
                 // would look like the inbox is genuinely empty.
                 tracing::warn!("refresh root query: no responder");
-                self.report_refresh_error("no gateway responded to refresh".to_string());
+                self.report_query_error("no gateway responded to refresh".to_string());
             }
             Ok(Ok(Err(e))) => {
                 tracing::warn!(error = %e, "refresh root query failed");
-                self.report_refresh_error(format!("refresh failed: {e}"));
+                self.report_query_error(format!("refresh failed: {e}"));
             }
             Ok(Err(_)) => {
                 tracing::warn!("refresh reply channel dropped");
-                self.report_refresh_error("refresh reply dropped".to_string());
+                self.report_query_error("refresh reply dropped".to_string());
             }
             Err(_) => {
                 tracing::warn!("refresh root query timed out (10s)");
-                self.report_refresh_error("refresh timed out (10s)".to_string());
+                self.report_query_error("refresh timed out (10s)".to_string());
             }
         }
     }
 
-    /// Surface a refresh failure to the UI without disturbing the walker
-    /// state machine. Stale Walking/Idle/Error states still describe the
-    /// last walk attempt; a refresh failure is its own event.
-    fn report_refresh_error(self: &Arc<Self>, message: String) {
+    /// Surface a query/refresh failure to the UI without disturbing the
+    /// walker state machine. Stale Walking/Idle/Error states still describe
+    /// the last walk attempt; a query failure is its own informational
+    /// event. Public so the cold-start spawn in `event_loop` can use the
+    /// same channel as `refresh_now`.
+    pub fn report_query_error(self: &Arc<Self>, message: String) {
         self.emit_status(SyncStatusEvent {
             state: "error",
             error: Some(message),
@@ -600,10 +632,16 @@ impl<R: Runtime> MailSync<R> {
             }
             pending
         };
-        self.emit_status(SyncStatusEvent {
-            state: "error",
-            error: Some(error),
-        });
+        // Skip the terminal emit when a queued root is about to drive a
+        // fresh pass — otherwise the UI flickers error → syncing for an
+        // error message that already references the stale failed walk.
+        // The next pass's run_walk_pass will emit "syncing" itself.
+        if next_root.is_none() {
+            self.emit_status(SyncStatusEvent {
+                state: "error",
+                error: Some(error),
+            });
+        }
         next_root
     }
 
@@ -746,7 +784,6 @@ mod tests {
             fetch_tx,
             refresh_tx,
             mail_mgr,
-            "00112233445566778899aabbccddeeff".to_string(),
             app.handle().clone(),
         ))
     }
@@ -1400,6 +1437,40 @@ mod tests {
             inbox.len(),
             1,
             "good_root entry should be registered after bad_root fails; inbox: {inbox:?}"
+        );
+    }
+
+    /// A successful "no mail yet" reply (empty payload) following a prior
+    /// failed walk MUST clear the Error state back to Idle — otherwise the
+    /// UI stays stuck on the warning icon even though the gateway is now
+    /// reachable and reports no mail.
+    #[tokio::test]
+    async fn empty_startup_reply_clears_prior_error_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(8);
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr);
+
+        // Force the walker into Error directly (no active Walking →
+        // finish_walk_error still installs Error and emits status).
+        sync.clone()
+            .finish_walk_error("simulated previous failure".to_string());
+        assert!(matches!(
+            &*sync.state.lock().unwrap(),
+            SyncState::Error { .. }
+        ));
+
+        // Empty reply = gateway explicitly says "no mail yet".
+        sync.clone().handle_startup_query_reply(Some(b"")).await;
+
+        let guard = sync.state.lock().unwrap();
+        assert!(
+            matches!(&*guard, SyncState::Idle { .. }),
+            "expected Idle after empty reply, got {:?}",
+            *guard
         );
     }
 

@@ -318,10 +318,18 @@ pub async fn run(
                     Ok(Some(payload)) => {
                         sync.handle_startup_query_reply(Some(&payload)).await
                     }
-                    Ok(None) => tracing::warn!(
-                        "startup root query: no responder — live push will catch up on next gateway publish"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "startup root query failed"),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "startup root query: no responder — live push will catch up on next gateway publish"
+                        );
+                        sync.report_query_error(
+                            "no gateway responded to startup query".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "startup root query failed");
+                        sync.report_query_error(format!("startup query failed: {e}"));
+                    }
                 }
             });
         }
@@ -812,16 +820,17 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
 /// Distinct from `fetch_via_zenoh` because the mail-root protocol treats an
 /// empty reply as a valid sentinel ("no mail for this address yet") whereas
 /// fetch_via_zenoh requires a successful non-empty reply. Returns:
-/// - `Ok(Some(payload))` — at least one responder replied. A non-empty payload
-///   is the current root CID; an empty payload is the explicit "no mail yet"
-///   sentinel from the gateway's queryable.
-/// - `Ok(None)` — no responder replied with a non-empty payload AND no
-///   responder replied with the empty-mail sentinel. The caller treats this
-///   as a failed query (e.g., no gateway with this queryable declared).
-/// - `Err(msg)` — the `get` call itself failed or the 10s budget elapsed.
+/// - `Ok(Some(payload))` — at least one responder replied successfully. A
+///   non-empty payload is the current root CID; an empty payload is the
+///   explicit "no mail yet" sentinel from the gateway's queryable.
+/// - `Ok(None)` — no responder replied at all. The caller surfaces this as
+///   a failed query (e.g., no gateway with this queryable declared).
+/// - `Err(msg)` — the `get` call itself failed, the 10s budget elapsed, or
+///   every responder returned an error reply (no successful reply seen).
 ///
-/// Multiple responders are tolerated via `ConsolidationMode::None`, and a
-/// non-empty reply is preferred over an empty one if both arrive.
+/// Multiple responders are tolerated via `ConsolidationMode::None`. A
+/// non-empty success reply is preferred over the empty sentinel; either
+/// success outcome is preferred over an error-only outcome.
 ///
 /// Used by both the cold-start query and the manual refresh path. `op_label`
 /// appears in the timeout message for log disambiguation ("startup" vs
@@ -833,6 +842,7 @@ async fn query_mail_root(
 ) -> Result<Option<Vec<u8>>, String> {
     use zenoh::query::ConsolidationMode;
 
+    let label = op_label.to_string();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
@@ -842,23 +852,43 @@ async fn query_mail_root(
                 .await
                 .map_err(|e| format!("get: {e}"))?;
 
-            // Drain all replies. Prefer a non-empty payload (an actual root
-            // CID) over the empty "no mail" sentinel — a misbehaving
-            // responder shouldn't be able to mask a real root with empty.
+            // Drain all replies. Track three outcomes so an all-errors
+            // result doesn't silently collapse into "no responder":
+            //   - non_empty: a real root CID (best — short-circuits)
+            //   - saw_empty: gateway explicitly says "no mail"
+            //   - reply_error: every reply that landed was an Err
             let mut non_empty: Option<Vec<u8>> = None;
             let mut saw_empty = false;
+            let mut reply_error: Option<String> = None;
             while let Ok(reply) = replies.recv_async().await {
-                if let Ok(sample) = reply.result() {
-                    let bytes = sample.payload().to_bytes().to_vec();
-                    if bytes.is_empty() {
-                        saw_empty = true;
-                    } else {
-                        non_empty = Some(bytes);
-                        break;
+                match reply.result() {
+                    Ok(sample) => {
+                        let bytes = sample.payload().to_bytes().to_vec();
+                        if bytes.is_empty() {
+                            saw_empty = true;
+                        } else {
+                            non_empty = Some(bytes);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        // Keep the first error message for the surfaced Err.
+                        reply_error.get_or_insert_with(|| {
+                            String::from_utf8_lossy(&err.payload().to_bytes())
+                                .into_owned()
+                        });
                     }
                 }
             }
-            Ok::<_, String>(non_empty.or(if saw_empty { Some(Vec::new()) } else { None }))
+            if let Some(bytes) = non_empty {
+                Ok(Some(bytes))
+            } else if saw_empty {
+                Ok(Some(Vec::new()))
+            } else if let Some(err) = reply_error {
+                Err(format!("{label} root query reply error: {err}"))
+            } else {
+                Ok(None)
+            }
         },
     )
     .await

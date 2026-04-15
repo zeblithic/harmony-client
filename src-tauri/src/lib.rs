@@ -327,12 +327,10 @@ async fn start_node(
         // Construct MailSync now that identity, mail_mgr, and the refresh
         // channel are all available. Owns a clone of fetch_tx (so commands
         // keep their own sender in AppState) and the sole refresh_tx.
-        let own_addr_hex = hex::encode(our_addr_bytes);
         let mail_sync = std::sync::Arc::new(mail_sync::MailSync::new(
             fetch_tx.clone(),
             mail_refresh_tx,
             std::sync::Arc::clone(&mail_mgr),
-            own_addr_hex,
             app.clone(),
         ));
 

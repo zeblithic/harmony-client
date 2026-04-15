@@ -122,7 +122,6 @@ pub struct MailSync<R: Runtime = tauri::Wry> {
     fetch_tx: mpsc::Sender<FetchRequest>,
     refresh_tx: mpsc::Sender<RefreshRequest>,
     mail_mgr: Arc<Mutex<MailManager>>,
-    own_addr_hex: String,
     app: AppHandle<R>,
     in_flight_bodies: Arc<Mutex<HashMap<[u8; 32], watch::Receiver<Option<Result<Vec<u8>, String>>>>>>,
 }
@@ -132,7 +131,6 @@ impl<R: Runtime> MailSync<R> {
         fetch_tx: mpsc::Sender<FetchRequest>,
         refresh_tx: mpsc::Sender<RefreshRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
-        own_addr_hex: String,
         app: AppHandle<R>,
     ) -> Self;
 
@@ -311,7 +309,6 @@ After Zenoh session is up and `MailSync` is constructed, a one-shot Zenoh `get` 
 `MailSync::new` is called once during Tauri setup, alongside `MailManager`. It receives:
 - A clone of the existing `fetch_tx: mpsc::Sender<FetchRequest>` (from lib.rs:1010)
 - An `Arc<MailManager>` (Tauri-managed state today)
-- The `own_addr_hex` string
 - The Tauri `AppHandle` for emitting events
 
 Stored alongside `MailManager` in Tauri-managed state so commands and event-loop dispatch can both call into it.
