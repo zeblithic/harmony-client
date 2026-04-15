@@ -123,9 +123,86 @@ impl<R: Runtime> MailSync<R> {
     }
 
     /// Lazy body fetch. Called from the fetch_mail_body Tauri command.
-    /// Implementation in C10.
-    pub async fn fetch_body(self: Arc<Self>, _cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
-        Err("fetch_body not yet implemented (Task C10)".to_string())
+    ///
+    /// In-flight dedup: if another caller is already fetching the same CID,
+    /// the second caller awaits the first's result via a shared `watch`
+    /// channel rather than issuing a duplicate outbound fetch.
+    ///
+    /// On success: persists the blob and promotes the Pending entry to Local
+    /// via MailManager::mark_body_received.
+    pub async fn fetch_body(self: Arc<Self>, cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
+        // Check in-flight map: if another caller is fetching this CID,
+        // subscribe to its result stream.
+        let existing = {
+            let map = self
+                .in_flight_bodies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.get(&cid).cloned()
+        };
+        if let Some(mut rx) = existing {
+            // Another fetch is in progress — wait for its result.
+            loop {
+                if let Some(result) = rx.borrow().clone() {
+                    return result;
+                }
+                if rx.changed().await.is_err() {
+                    return Err("in-flight fetch cancelled".to_string());
+                }
+            }
+        }
+
+        // No in-flight fetch: register a watch channel and start the work.
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        {
+            let mut map = self
+                .in_flight_bodies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.insert(cid, rx);
+        }
+
+        // Perform the actual fetch + verification + persistence.
+        let result: Result<Vec<u8>, String> = async {
+            let bytes = self.fetch_cas(cid).await?;
+
+            // BLAKE3 verify: bytes must hash to the claimed CID.
+            let computed = blake3::hash(&bytes);
+            if computed.as_bytes() != &cid {
+                return Err(format!(
+                    "hash mismatch: claimed {}, computed {}",
+                    hex::encode(cid),
+                    hex::encode(computed.as_bytes())
+                ));
+            }
+
+            // Structural validation: bytes must parse as a HarmonyMessage.
+            harmony_mailbox::message::HarmonyMessage::from_bytes(&bytes)
+                .map_err(|e| format!("parse: {e}"))?;
+
+            // Persist via MailManager (writes blob, promotes matching Pending entries).
+            let cid_hex = hex::encode(cid);
+            {
+                let mut mgr = self.mail_mgr.lock().unwrap_or_else(|p| p.into_inner());
+                mgr.mark_body_received(&cid_hex, &bytes)?;
+            }
+
+            Ok(bytes)
+        }
+        .await;
+
+        // Publish the result to all awaiters, then clear the in-flight entry.
+        // Order matters: publish BEFORE remove so any just-arriving callers
+        // that took a clone of the rx still see the completed result.
+        let _ = tx.send(Some(result.clone()));
+        {
+            let mut map = self
+                .in_flight_bodies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.remove(&cid);
+        }
+        result
     }
 
     async fn start_or_queue_walk(self: Arc<Self>, root: [u8; CID_LEN]) {
@@ -422,9 +499,34 @@ impl<R: Runtime> MailSync<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mail::BodyState;
     use harmony_mailbox::mailbox::{
         FolderKind, MailFolder, MailPage, MailRoot, MessageEntry, MAILBOX_VERSION,
     };
+    use harmony_mailbox::message::{
+        unique_message_id, HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
+        ADDRESS_HASH_LEN,
+    };
+
+    // Local copy of the mail.rs test helper since test helpers don't cross module boundaries.
+    fn make_test_harmony_message(subject: &str, sender: [u8; ADDRESS_HASH_LEN]) -> HarmonyMessage {
+        HarmonyMessage {
+            version: 0x01,
+            message_type: MailMessageType::Email,
+            flags: MessageFlags::new(false, false, false),
+            timestamp: 1_744_403_200,
+            message_id: unique_message_id(),
+            in_reply_to: None,
+            sender_address: sender,
+            recipients: vec![Recipient {
+                address_hash: [0xBB; ADDRESS_HASH_LEN],
+                recipient_type: RecipientType::To,
+            }],
+            subject: subject.to_string(),
+            body: "Hello, world!".to_string(),
+            attachments: vec![],
+        }
+    }
 
     /// Test harness: a stub fetch responder backed by a HashMap of CID → bytes.
     /// Bytes not in the map return NotFound errors.
@@ -782,5 +884,129 @@ mod tests {
                 *guard
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_body_returns_bytes_and_marks_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(16);
+
+        // Register a Pending entry for a known CID first.
+        let msg = make_test_harmony_message("subj", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let cid: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let entry = MessageEntry {
+            message_cid: cid,
+            message_id: msg.message_id,
+            sender_address: msg.sender_address,
+            timestamp: msg.timestamp,
+            subject_snippet: "subj".to_string(),
+            read: false,
+        };
+        mail_mgr
+            .lock()
+            .unwrap()
+            .register_header_only(entry)
+            .unwrap();
+
+        let mut stub = StubFetcher::new();
+        stub.insert(cid, bytes.clone());
+        tokio::spawn(stub.run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        let result = sync.clone().fetch_body(cid).await.unwrap();
+        assert_eq!(result, bytes);
+
+        // Entry promoted to Local by mark_body_received.
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        assert_eq!(inbox[0].body_state, BodyState::Local);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_rejects_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(16);
+
+        let claimed_cid: [u8; 32] = [0xDD; 32];
+        let mut stub = StubFetcher::new();
+        stub.insert(claimed_cid, b"wrong bytes that don't hash".to_vec());
+        tokio::spawn(stub.run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        let result = sync.fetch_body(claimed_cid).await;
+        assert!(result.is_err(), "should reject; got {result:?}");
+        assert!(
+            result.unwrap_err().contains("hash"),
+            "error should mention hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_body_dedups_concurrent_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchRequest>(16);
+
+        let msg = make_test_harmony_message("s", [0xCC; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let cid: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+        // Also register a Pending entry so mark_body_received has something to promote.
+        let entry = MessageEntry {
+            message_cid: cid,
+            message_id: msg.message_id,
+            sender_address: msg.sender_address,
+            timestamp: msg.timestamp,
+            subject_snippet: "s".to_string(),
+            read: false,
+        };
+        mail_mgr
+            .lock()
+            .unwrap()
+            .register_header_only(entry)
+            .unwrap();
+
+        // Custom fetcher that counts how many times it was asked.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        let bytes_clone = bytes.clone();
+        tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                // Slow response so the second fetch_body call lands while first is in flight.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = req.reply.send(Ok(bytes_clone.clone()));
+            }
+        });
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr);
+        let h1 = tokio::spawn({
+            let s = sync.clone();
+            async move { s.fetch_body(cid).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let h2 = tokio::spawn({
+            let s = sync.clone();
+            async move { s.fetch_body(cid).await }
+        });
+
+        let r1 = h1.await.unwrap().unwrap();
+        let r2 = h2.await.unwrap().unwrap();
+        assert_eq!(r1, bytes);
+        assert_eq!(r2, bytes);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "should only fetch once");
     }
 }
