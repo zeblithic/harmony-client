@@ -248,6 +248,12 @@ async fn start_node(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    // C12: mail refresh channel. The sender end is dropped immediately —
+    // C13 will wire a real MailSync instance that owns the refresh_tx.
+    // With no senders held, the receiver just yields None and the
+    // corresponding select! arm never fires.
+    let (_mail_refresh_tx, mail_refresh_rx) =
+        tokio::sync::mpsc::channel::<crate::mail_sync::RefreshRequest>(8);
 
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
@@ -385,6 +391,7 @@ async fn start_node(
                         mail_mgr_clone,
                         // C13 will replace None with a real MailSync instance.
                         None,
+                        mail_refresh_rx,
                     )
                     .await;
                 });

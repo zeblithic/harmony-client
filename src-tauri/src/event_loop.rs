@@ -81,6 +81,7 @@ pub async fn run(
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
+    mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -303,6 +304,45 @@ pub async fn run(
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
 
+    // Phase 2: cold-start root query. Pulls current root via Zenoh `get` in
+    // case the gateway last published before this client subscribed. 10s
+    // budget — on failure or timeout, the normal publish-on-next-write
+    // flow still delivers eventually.
+    if let Some(ref sync) = mail_sync {
+        if !own_root_key.is_empty() {
+            let sync = Arc::clone(sync);
+            let session_clone = session.clone();
+            let key = own_root_key.clone();
+            tokio::spawn(async move {
+                let result: Result<Option<Vec<u8>>, String> = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    async {
+                        let replies = session_clone
+                            .get(&key)
+                            .await
+                            .map_err(|e| format!("get: {e}"))?;
+                        let mut payload: Option<Vec<u8>> = None;
+                        while let Ok(reply) = replies.recv_async().await {
+                            if let Ok(sample) = reply.result() {
+                                payload = Some(sample.payload().to_bytes().to_vec());
+                                break;
+                            }
+                        }
+                        Ok::<_, String>(payload)
+                    },
+                )
+                .await
+                .map_err(|_| "startup root query timed out (10s)".to_string())
+                .and_then(|r| r);
+
+                match result {
+                    Ok(payload) => sync.handle_startup_query_reply(payload.as_deref()).await,
+                    Err(e) => tracing::warn!(error = %e, "startup root query failed"),
+                }
+            });
+        }
+    }
+
     // ── Timer (250ms = 4 ticks/sec, same as harmony-node) ────────────
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -451,6 +491,40 @@ pub async fn run(
                     let result = fetch_via_zenoh(&session, &key_expr).await;
                     let _ = req.reply.send(result);
                 });
+            }
+
+            // ── Manual mail refresh from MailSync::refresh_now ──────
+            Some(reply_tx) = refresh_rx.recv() => {
+                // Issue the same get as startup with a 10s budget.
+                if own_root_key.is_empty() {
+                    let _ = reply_tx.send(Err("own_root_key unavailable".to_string()));
+                } else {
+                    let session_clone = session.clone();
+                    let key = own_root_key.clone();
+                    tokio::spawn(async move {
+                        let result: Result<Option<Vec<u8>>, String> = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            async {
+                                let replies = session_clone
+                                    .get(&key)
+                                    .await
+                                    .map_err(|e| format!("get: {e}"))?;
+                                let mut payload: Option<Vec<u8>> = None;
+                                while let Ok(reply) = replies.recv_async().await {
+                                    if let Ok(sample) = reply.result() {
+                                        payload = Some(sample.payload().to_bytes().to_vec());
+                                        break;
+                                    }
+                                }
+                                Ok::<_, String>(payload)
+                            },
+                        )
+                        .await
+                        .map_err(|_| "refresh root query timed out (10s)".to_string())
+                        .and_then(|r| r);
+                        let _ = reply_tx.send(result);
+                    });
+                }
             }
 
             // ── Content-ingest requests from Tauri commands ────────

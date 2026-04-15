@@ -48,6 +48,10 @@ pub struct FetchRequest {
     pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
+/// Request to query the gateway for the current root CID. Reply carries
+/// the raw payload (Some) or None if no mail exists for this address.
+pub type RefreshRequest = oneshot::Sender<Result<Option<Vec<u8>>, String>>;
+
 /// In-flight body-fetch deduplication: multiple concurrent callers
 /// asking for the same CID share one outgoing fetch via `watch`.
 type InFlightMap = Arc<
@@ -57,6 +61,7 @@ type InFlightMap = Arc<
 pub struct MailSync<R: Runtime = tauri::Wry> {
     state: Arc<Mutex<SyncState>>,
     fetch_tx: mpsc::Sender<FetchRequest>,
+    refresh_tx: mpsc::Sender<RefreshRequest>,
     mail_mgr: Arc<Mutex<MailManager>>,
     own_addr_hex: String,
     app: AppHandle<R>,
@@ -66,6 +71,7 @@ pub struct MailSync<R: Runtime = tauri::Wry> {
 impl<R: Runtime> MailSync<R> {
     pub fn new(
         fetch_tx: mpsc::Sender<FetchRequest>,
+        refresh_tx: mpsc::Sender<RefreshRequest>,
         mail_mgr: Arc<Mutex<MailManager>>,
         own_addr_hex: String,
         app: AppHandle<R>,
@@ -75,6 +81,7 @@ impl<R: Runtime> MailSync<R> {
                 last_walked_root: None,
             })),
             fetch_tx,
+            refresh_tx,
             mail_mgr,
             own_addr_hex,
             app,
@@ -115,11 +122,22 @@ impl<R: Runtime> MailSync<R> {
         }
     }
 
-    /// Manual refresh trigger from UI. Re-queries the gateway for the
-    /// current root and walks if it has changed. Implementation in C12.
+    /// Manual refresh trigger from UI. Issues a fresh Zenoh get for the
+    /// current root and walks if the gateway has one.
     pub async fn refresh_now(self: Arc<Self>) {
-        tracing::info!("manual refresh requested — implementation in C12");
-        // TODO(C12): wire actual query path.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.refresh_tx.send(reply_tx).await.is_err() {
+            tracing::warn!("refresh channel closed; cannot refresh");
+            return;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+            Ok(Ok(Ok(payload))) => {
+                self.handle_startup_query_reply(payload.as_deref()).await;
+            }
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "refresh root query failed"),
+            Ok(Err(_)) => tracing::warn!("refresh reply channel dropped"),
+            Err(_) => tracing::warn!("refresh root query timed out (10s)"),
+        }
     }
 
     /// Lazy body fetch. Called from the fetch_mail_body Tauri command.
@@ -589,8 +607,11 @@ mod tests {
         mail_mgr: Arc<Mutex<MailManager>>,
     ) -> Arc<MailSync<tauri::test::MockRuntime>> {
         let app = tauri::test::mock_app();
+        // Throwaway refresh channel — tests don't exercise refresh_now directly.
+        let (refresh_tx, _refresh_rx) = mpsc::channel(1);
         Arc::new(MailSync::new(
             fetch_tx,
+            refresh_tx,
             mail_mgr,
             "00112233445566778899aabbccddeeff".to_string(),
             app.handle().clone(),
