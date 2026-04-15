@@ -2261,6 +2261,8 @@ EOF
 
 The existing filter at line 797 silently drops `/root` events. Phase 2 splits the branch to route them to MailSync.
 
+> **C5 follow-up (I3):** Post-C5, `MailManager::receive_message` returns `Ok(EntryRecord)` for BOTH a fresh insert AND a Pending-to-Local promotion. The existing event_loop handler emits a `mail-received` Tauri event on `Ok`, which would cause a spurious notification/badge bump when a promotion fires for a row the user already saw (from the walker). In this task, distinguish the two cases so promotion does NOT emit `mail-received`. Options: (a) compare inbox state before/after receive_message, (b) refactor `receive_message` to return `ReceiveOutcome::{Inserted, Promoted}(EntryRecord)` — (b) is cleaner but changes the API; pick whichever is less invasive when you wire this.
+
 - [ ] **Step 1: Add MailSync parameter to event_loop**
 
 In `event_loop.rs` near where `mail_mgr` is defined as a parameter / closed-over value (around line 42 / line 265), add `mail_sync` alongside it. The exact wiring depends on existing structure; the event_loop function probably has a struct or signature that needs extending. Concretely:

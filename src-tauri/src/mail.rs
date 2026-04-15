@@ -197,18 +197,48 @@ impl MailManager {
         //   - Pending existing entry → promote (write blob, flip state to Local,
         //     preserve current folder placement — handles user-moved-to-trash).
         //   - No match → fall through to the normal insert path below.
+        //
+        // Coexistence note: if a Local match exists anywhere, we reject even
+        // if other folders contain stale Pending matches for the same
+        // message_id. That indicates a prior bug (register_header_only also
+        // dedups against Local) and is surfaced via the warning log below —
+        // not silently healed.
         let msg_id_hex = hex::encode(msg.message_id);
         let mut has_pending_match = false;
+        let mut has_local_match = false;
         for folder_name in ["inbox", "trash", "drafts"] {
             let Some(folder) = self.index.folders.get(folder_name) else { continue };
             for entry in &folder.entries {
                 if entry.message_id == msg_id_hex {
                     if entry.body_state == BodyState::Local {
-                        return Err("duplicate message".to_string());
+                        has_local_match = true;
+                    } else {
+                        has_pending_match = true;
+                        // Guard against silent bug-hiding: if a Pending entry
+                        // carries a different CID than the just-hashed bytes,
+                        // refuse the promotion rather than silently overwrite.
+                        // Possible causes: walker bug, wire format skew, or
+                        // (cosmically unlikely) BLAKE3 collision — all worth
+                        // surfacing.
+                        if entry.message_cid != cid_hex {
+                            return Err(format!(
+                                "cid mismatch on promotion: pending has {}, computed {}",
+                                entry.message_cid, cid_hex
+                            ));
+                        }
                     }
-                    has_pending_match = true;
                 }
             }
+        }
+        if has_local_match {
+            if has_pending_match {
+                tracing::warn!(
+                    %msg_id_hex,
+                    "receive_message: message_id has both Local and Pending entries — \
+                     rejecting as duplicate; Pending entries left stale (prior bug)"
+                );
+            }
+            return Err("duplicate message".to_string());
         }
 
         if has_pending_match {
@@ -220,14 +250,13 @@ impl MailManager {
             std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
             // Promote all matching Pending entries. Preserve folder placement.
-            // Also refresh message_cid (should already match — defensive).
+            // CID equality already verified in the scan — no need to re-check.
             let mut promoted_entry: Option<EntryRecord> = None;
             for folder_name in ["inbox", "trash", "drafts"] {
                 let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
                 for entry in folder.entries.iter_mut() {
                     if entry.message_id == msg_id_hex && entry.body_state == BodyState::Pending {
                         entry.body_state = BodyState::Local;
-                        entry.message_cid = cid_hex.clone();
                         if promoted_entry.is_none() {
                             promoted_entry = Some(entry.clone());
                         }
@@ -238,7 +267,8 @@ impl MailManager {
             self.save_index()?;
             // Safe unwrap: has_pending_match guaranteed at least one matching
             // Pending entry exists at scan time; no other mutator runs between
-            // scan and promote (single-threaded self borrow).
+            // scan and promote (single-threaded &mut self borrow), and the
+            // promote predicate matches the scan predicate exactly.
             return Ok(promoted_entry.expect("has_pending_match implies at least one promotion"));
         }
 
