@@ -387,6 +387,19 @@ impl MailManager {
         self.save_index()
     }
 
+    /// Find the first entry across all folders whose `message_cid` matches.
+    /// Borrows from the in-memory index (no clone), so callers that only
+    /// need a single field (e.g., `body_state` to decide a routing branch)
+    /// can avoid the O(N) folder copy that `list_folder(..usize::MAX)`
+    /// would do for the same lookup.
+    pub fn entry_by_cid(&self, cid_hex: &str) -> Option<&EntryRecord> {
+        ["inbox", "trash", "drafts", "sent"]
+            .iter()
+            .filter_map(|name| self.index.folders.get(*name))
+            .flat_map(|folder| folder.entries.iter())
+            .find(|e| e.message_cid == cid_hex)
+    }
+
     /// Verify bytes hash to cid_hex, write blob, transition matching
     /// Pending entries to Local. No-op (returns Ok) if no Pending entry
     /// matches (e.g., entry already Local from a racing live push).

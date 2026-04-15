@@ -124,8 +124,28 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
         }
     });
 
-    // Allow queryable registration to propagate.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Bounded readiness probe — replaces a blind 100ms sleep so the test
+    // fails fast on a real propagation issue and doesn't flake when
+    // declare_queryable is slower than expected. Hits the queryable's
+    // wildcard with a probe CID; any reply (success or err) proves the
+    // queryable is discoverable.
+    let probe_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let Ok(replies) = session.get("harmony/content/0/probe").await else {
+            if std::time::Instant::now() >= probe_deadline {
+                panic!("CAS queryable never became reachable within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        if replies.recv_async().await.is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= probe_deadline {
+            panic!("CAS queryable never replied within 5s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // ── Bring up MailSync ──
     let tmp = tempfile::tempdir().unwrap();

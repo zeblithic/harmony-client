@@ -90,17 +90,16 @@ export class MailService {
 
   async getMessage(cid: string): Promise<MailMessageDetail | null> {
     if (!this.adapter) return null;
-    try {
-      const detail = await this.adapter.invoke('get_mail', { messageCid: cid }) as MailMessageDetail;
-      if (detail.bodyState === 'pending') {
-        // Body not yet cached — trigger lazy CAS fetch via MailSync.
-        // Returns the now-Local MailDetail on success.
-        return await this.adapter.invoke('fetch_mail_body', { messageCid: cid }) as MailMessageDetail;
-      }
-      return detail;
-    } catch {
-      return null;
+    // Errors propagate so App.svelte's catch can surface the specific
+    // Rust error (timeout, hash mismatch, etc.) — a swallowed error here
+    // collapses every failure into a generic "not found" in the UI.
+    const detail = await this.adapter.invoke('get_mail', { messageCid: cid }) as MailMessageDetail;
+    if (detail.bodyState === 'pending') {
+      // Body not yet cached — trigger lazy CAS fetch via MailSync.
+      // Returns the now-Local MailDetail on success.
+      return await this.adapter.invoke('fetch_mail_body', { messageCid: cid }) as MailMessageDetail;
     }
+    return detail;
   }
 
   /**

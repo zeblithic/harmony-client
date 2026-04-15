@@ -131,7 +131,7 @@ describe('MailService — Phase 2 sync and lazy body fetch', () => {
     expect(adapter.invoke).toHaveBeenNthCalledWith(2, 'fetch_mail_body', { messageCid: 'cid-pending' });
   });
 
-  it('getMessage returns null on error', async () => {
+  it('getMessage propagates backend errors so callers can show specifics', async () => {
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     await svc.connectAdapter(adapter);
@@ -139,7 +139,6 @@ describe('MailService — Phase 2 sync and lazy body fetch', () => {
     (adapter.invoke as ReturnType<typeof vi.fn>).mockClear();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('backend down'));
 
-    const result = await svc.getMessage('cid-missing');
-    expect(result).toBeNull();
+    await expect(svc.getMessage('cid-missing')).rejects.toThrow('backend down');
   });
 });

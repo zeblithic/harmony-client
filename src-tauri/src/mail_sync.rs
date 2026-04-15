@@ -193,12 +193,36 @@ impl<R: Runtime> MailSync<R> {
         }
     }
 
-    /// Surface a query/refresh failure to the UI without disturbing the
-    /// walker state machine. Stale Walking/Idle/Error states still describe
-    /// the last walk attempt; a query failure is its own informational
-    /// event. Public so the cold-start spawn in `event_loop` can use the
-    /// same channel as `refresh_now`.
+    /// Surface a query/refresh failure to the UI AND record it on the
+    /// walker state machine, so a later successful refresh (which calls
+    /// `clear_error_to_idle`) can detect the prior error and clear it.
+    /// Public so the cold-start spawn in `event_loop` can use the same
+    /// channel as `refresh_now`.
+    ///
+    /// If the walker is mid-`Walking`, the in-flight pass is left alone —
+    /// it will emit its own terminal status when it finishes. Recording
+    /// the error during a Walking pass would also trip `finish_walk`'s
+    /// pending-root accounting. The transient emit is informational; the
+    /// active walk is the source of truth.
     pub fn report_query_error(self: &Arc<Self>, message: String) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match &*state {
+                SyncState::Walking { .. } => {
+                    // Don't overwrite Walking; the active pass owns the state.
+                }
+                SyncState::Idle { last_walked_root }
+                | SyncState::Error {
+                    last_walked_root, ..
+                } => {
+                    let last = *last_walked_root;
+                    *state = SyncState::Error {
+                        last_error: message.clone(),
+                        last_walked_root: last,
+                    };
+                }
+            }
+        }
         self.emit_status(SyncStatusEvent {
             state: "error",
             error: Some(message),
@@ -1437,6 +1461,40 @@ mod tests {
             inbox.len(),
             1,
             "good_root entry should be registered after bad_root fails; inbox: {inbox:?}"
+        );
+    }
+
+    /// `report_query_error` MUST install SyncState::Error (not just emit
+    /// the event) — otherwise a subsequent successful empty reply can't
+    /// recognize that there's an error to clear. Regression test for the
+    /// state/event divergence introduced when the function was first
+    /// wired up.
+    #[tokio::test]
+    async fn report_query_error_installs_error_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(8);
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr);
+
+        sync.report_query_error("startup query failed".to_string());
+
+        match &*sync.state.lock().unwrap() {
+            SyncState::Error { last_error, .. } => {
+                assert_eq!(last_error, "startup query failed");
+            }
+            other => panic!("expected Error after report_query_error, got {other:?}"),
+        }
+
+        // And a follow-up successful empty reply clears it.
+        sync.clone().handle_startup_query_reply(Some(b"")).await;
+        let guard = sync.state.lock().unwrap();
+        assert!(
+            matches!(&*guard, SyncState::Idle { .. }),
+            "expected Idle after empty reply, got {:?}",
+            *guard
         );
     }
 

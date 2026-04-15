@@ -131,6 +131,13 @@ export interface MailEntry {
   timestamp: number;
   subjectSnippet: string;
   read: boolean;
+  /**
+   * 'local' = body cached on disk and ready to render.
+   * 'pending' = walker registered the header from the gateway but the body
+   *   has not been fetched yet; first open will trigger a CAS fetch.
+   * Defaults to 'local' on legacy index.json files (serde default in Rust).
+   */
+  bodyState: 'local' | 'pending';
 }
 
 export interface MailMessageDetail {

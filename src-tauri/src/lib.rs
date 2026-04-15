@@ -192,7 +192,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -214,6 +214,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.voice_channel_tx.take(),
             guard.follow_mgr.take(),
             guard.followed_set.take(),
+            // Drop mail_sync so refresh_mail / fetch_mail_body can't reach
+            // a closed fetch_tx / refresh_tx after stop. Channels are
+            // already gone above; the MailSync handle would just yield
+            // "channel closed" errors until next start.
+            guard.mail_sync.take(),
         )
     };
 
@@ -1407,27 +1412,19 @@ fn get_mail(
     };
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
 
-    // Locate the entry across all folders to inspect body_state.
-    // (list_folder with a generous limit; usize::MAX per the C8 emit path.)
-    let entry = ["inbox", "trash", "drafts", "sent"]
-        .iter()
-        .find_map(|f| {
-            mgr.list_folder(f, 0, usize::MAX)
-                .into_iter()
-                .find(|e| e.message_cid == message_cid)
-        });
-
-    // If the entry is Pending, return a stub MailDetail — the blob doesn't
-    // exist on disk yet, so mgr.get_message would fail. Frontend recognizes
-    // body_state=Pending and triggers fetch_mail_body.
-    if let Some(entry) = entry {
+    // Targeted O(N) scan by reference (no folder clone): only the matching
+    // entry is read, even on a 10k-message inbox. If Pending, return a
+    // stub MailDetail — the blob doesn't exist on disk yet, so
+    // mgr.get_message would fail. Frontend recognizes body_state=Pending
+    // and triggers fetch_mail_body.
+    if let Some(entry) = mgr.entry_by_cid(&message_cid) {
         if entry.body_state == mail::BodyState::Pending {
             return Ok(mail::MailDetail {
-                message_cid,
-                message_id: entry.message_id,
-                subject: entry.subject_snippet,
+                message_cid: message_cid.clone(),
+                message_id: entry.message_id.clone(),
+                subject: entry.subject_snippet.clone(),
                 body: String::new(),
-                sender_address: entry.sender_address,
+                sender_address: entry.sender_address.clone(),
                 recipients: vec![],
                 timestamp: entry.timestamp,
                 attachments: vec![],
