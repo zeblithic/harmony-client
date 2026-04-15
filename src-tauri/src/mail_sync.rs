@@ -153,20 +153,27 @@ impl<R: Runtime> MailSync<R> {
         });
     }
 
-    /// Fetch a CAS blob via the event_loop's fetch channel. 30-second budget.
+    /// Fetch a CAS blob via the event_loop's fetch channel. 30-second budget
+    /// covers both the outbound send (which can block on channel backpressure)
+    /// and the reply — a stalled fetcher must never strand the walker in
+    /// Walking state indefinitely.
     async fn fetch_cas(&self, cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
         let cid_hex = hex::encode(cid);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.fetch_tx
-            .send(FetchRequest {
-                cid_hex: cid_hex.clone(),
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "fetch channel closed".to_string())?;
-        match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("fetch reply channel dropped".to_string()),
+        let work = async {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.fetch_tx
+                .send(FetchRequest {
+                    cid_hex: cid_hex.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| "fetch channel closed".to_string())?;
+            reply_rx
+                .await
+                .map_err(|_| "fetch reply channel dropped".to_string())?
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), work).await {
+            Ok(result) => result,
             Err(_) => Err(format!("fetch timeout for {cid_hex}")),
         }
     }
@@ -214,17 +221,29 @@ impl<R: Runtime> MailSync<R> {
     }
 
     fn finish_walk_error(self: Arc<Self>, error: String) {
-        let last_walked = match &*self.state.lock().unwrap_or_else(|p| p.into_inner()) {
-            SyncState::Walking { .. } => None,
-            SyncState::Idle { last_walked_root }
-            | SyncState::Error {
-                last_walked_root, ..
-            } => *last_walked_root,
-        };
-        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Error {
-            last_error: error.clone(),
-            last_walked_root: last_walked,
-        };
+        // Single locked scope: read prior last_walked_root and install the
+        // new Error state atomically. (Splitting read and write across two
+        // lock acquisitions would be correct but pointlessly gives another
+        // observer a chance to see intermediate state.)
+        //
+        // Known limitation: when prior state is Walking, we lose the pre-walk
+        // last_walked_root (not carried in the Walking variant). Acceptable
+        // for Phase 2 — tracked in ZEB-114 follow-ups; surfaces only once
+        // last_walked_root becomes load-bearing (C12 refresh_now / UI).
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let last_walked = match &*state {
+                SyncState::Walking { .. } => None,
+                SyncState::Idle { last_walked_root }
+                | SyncState::Error {
+                    last_walked_root, ..
+                } => *last_walked_root,
+            };
+            *state = SyncState::Error {
+                last_error: error.clone(),
+                last_walked_root: last_walked,
+            };
+        }
         self.emit_status(SyncStatusEvent {
             state: "error",
             error: Some(error),
