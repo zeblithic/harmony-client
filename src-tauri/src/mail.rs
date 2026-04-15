@@ -191,17 +191,58 @@ impl MailManager {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
-        // Dedup by message_id in receive-side folders (inbox, trash, drafts).
-        // Excludes "sent" so self-addressed messages can land in inbox after
-        // store_sent already recorded the same message_id in sent.
+        // Scan for matching message_id across receive-side folders.
+        // Classify the match (if any):
+        //   - Local existing entry → duplicate, reject.
+        //   - Pending existing entry → promote (write blob, flip state to Local,
+        //     preserve current folder placement — handles user-moved-to-trash).
+        //   - No match → fall through to the normal insert path below.
         let msg_id_hex = hex::encode(msg.message_id);
-        let already_received = ["inbox", "trash", "drafts"]
-            .into_iter()
-            .filter_map(|name| self.index.folders.get(name))
-            .any(|folder| folder.entries.iter().any(|e| e.message_id == msg_id_hex));
-        if already_received {
-            return Err("duplicate message".to_string());
+        let mut has_pending_match = false;
+        for folder_name in ["inbox", "trash", "drafts"] {
+            let Some(folder) = self.index.folders.get(folder_name) else { continue };
+            for entry in &folder.entries {
+                if entry.message_id == msg_id_hex {
+                    if entry.body_state == BodyState::Local {
+                        return Err("duplicate message".to_string());
+                    }
+                    has_pending_match = true;
+                }
+            }
         }
+
+        if has_pending_match {
+            // Write the blob FIRST so the `Local ⇒ blob exists` invariant holds
+            // even if I/O fails mid-promotion. (Atomic: tmp + rename.)
+            let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+            let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+            std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
+            std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+
+            // Promote all matching Pending entries. Preserve folder placement.
+            // Also refresh message_cid (should already match — defensive).
+            let mut promoted_entry: Option<EntryRecord> = None;
+            for folder_name in ["inbox", "trash", "drafts"] {
+                let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
+                for entry in folder.entries.iter_mut() {
+                    if entry.message_id == msg_id_hex && entry.body_state == BodyState::Pending {
+                        entry.body_state = BodyState::Local;
+                        entry.message_cid = cid_hex.clone();
+                        if promoted_entry.is_none() {
+                            promoted_entry = Some(entry.clone());
+                        }
+                    }
+                }
+            }
+
+            self.save_index()?;
+            // Safe unwrap: has_pending_match guaranteed at least one matching
+            // Pending entry exists at scan time; no other mutator runs between
+            // scan and promote (single-threaded self borrow).
+            return Ok(promoted_entry.expect("has_pending_match implies at least one promotion"));
+        }
+
+        // No existing match — fall through to normal insert path.
 
         // Build entry record
         let snippet = truncate_snippet(&msg.subject);
@@ -1078,5 +1119,65 @@ mod tests {
         assert_eq!(counts["inbox"].unread, 1);
         assert_eq!(counts["sent"].total, 0);
         assert_eq!(counts["sent"].unread, 0);
+    }
+
+    #[test]
+    fn receive_message_promotes_pending_to_local_preserving_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_dir = tmp.path().join("mail");
+        let mut mgr = MailManager::load(&mail_dir, [0u8; ADDRESS_HASH_LEN]);
+
+        // Build a real message and compute its real CID from serialized bytes.
+        let msg = make_test_message("race", [0xFF; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let cid = blake3::hash(&bytes);
+        let cid_hex = hex::encode(cid.as_bytes());
+
+        // Walker registered a Pending entry first.
+        let entry = MessageEntry {
+            message_cid: *cid.as_bytes(),
+            message_id: msg.message_id,
+            sender_address: [0xFF; 16],
+            timestamp: msg.timestamp,
+            read: false,
+            subject_snippet: "race".to_string(),
+        };
+        mgr.register_header_only(entry).unwrap();
+
+        // User moved it to trash before the live push arrived.
+        mgr.move_message(&cid_hex, Some("inbox"), "trash").unwrap();
+        assert_eq!(mgr.list_folder("trash", 0, 100)[0].body_state, BodyState::Pending);
+
+        // NOW the live raw push arrives.
+        let result = mgr.receive_message(&bytes);
+
+        // Should NOT error as duplicate; should promote in-place.
+        assert!(result.is_ok(), "receive_message should promote, got: {result:?}");
+
+        // Entry stays in trash (folder preserved), body_state now Local.
+        let inbox = mgr.list_folder("inbox", 0, 100);
+        let trash = mgr.list_folder("trash", 0, 100);
+        assert_eq!(inbox.len(), 0, "should not appear in inbox");
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].body_state, BodyState::Local);
+
+        // Blob written.
+        let blob_path = mail_dir.join("blobs").join(format!("{cid_hex}.bin"));
+        assert!(blob_path.exists());
+    }
+
+    #[test]
+    fn receive_message_still_dedups_when_already_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = MailManager::load(&tmp.path().join("mail"), [0u8; ADDRESS_HASH_LEN]);
+
+        let msg = make_test_message("s", [0xAA; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        mgr.receive_message(&bytes).unwrap();
+
+        // Receiving the same message again should still be rejected as duplicate.
+        let result = mgr.receive_message(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate"));
     }
 }
