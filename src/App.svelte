@@ -197,9 +197,13 @@
   $effect(() => () => mailService.destroy());
   let mailEntries = $state([...mailService.entries]);
   let mailCounts = $state({ ...mailService.counts });
+  let mailSyncState = $state<'idle' | 'syncing' | 'error'>(mailService.syncState);
+  let mailSyncError = $state<string | null>(mailService.syncError);
   let activeMailFolder = $state<MailFolderKind>('inbox');
   let selectedMailCid = $state<string | null>(null);
   let selectedMailDetail = $state<MailMessageDetail | null>(null);
+  let mailDetailLoading = $state(false);
+  let mailDetailError = $state<string | null>(null);
   let showCompose = $state(false);
   let composeReplyTo = $state<string | null>(null);
   let composeInitialTo = $state('');
@@ -207,6 +211,8 @@
   mailService.onChange = () => {
     mailEntries = [...mailService.entries];
     mailCounts = { ...mailService.counts };
+    mailSyncState = mailService.syncState;
+    mailSyncError = mailService.syncError;
   };
 
   const stq8Service = new Stq8Service(null); // WASM loaded async later
@@ -760,18 +766,37 @@
         activeFolder={activeMailFolder}
         counts={mailCounts}
         selectedCid={selectedMailCid}
+        syncState={mailSyncState}
+        syncError={mailSyncError}
+        onRefresh={() => { mailService.refresh().catch(() => {}); }}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
           const folder = activeMailFolder;
-          const detail = await mailService.getMessage(cid);
-          if (selectedMailCid !== cid) return; // stale selection
-          selectedMailDetail = detail;
-          await mailService.markRead(cid, folder);
+          mailDetailLoading = true;
+          mailDetailError = null;
+          selectedMailDetail = null;
+          try {
+            const detail = await mailService.getMessage(cid);
+            if (selectedMailCid !== cid) return; // stale selection
+            selectedMailDetail = detail;
+            mailDetailLoading = false;
+            if (detail) {
+              await mailService.markRead(cid, folder);
+            } else {
+              mailDetailError = 'Message not found or fetch failed';
+            }
+          } catch (e) {
+            if (selectedMailCid !== cid) return;
+            mailDetailLoading = false;
+            mailDetailError = e instanceof Error ? e.message : String(e);
+          }
         }}
         onFolderChange={async (folder) => {
           activeMailFolder = folder;
           selectedMailCid = null;
           selectedMailDetail = null;
+          mailDetailLoading = false;
+          mailDetailError = null;
           await mailService.loadFolder(folder);
         }}
         onCompose={() => { showCompose = true; composeReplyTo = null; composeInitialTo = ''; composeInitialSubject = ''; }}
@@ -783,6 +808,8 @@
   {#snippet mailDetail()}
     <MailReader
       message={selectedMailDetail}
+      loading={mailDetailLoading}
+      error={mailDetailError}
       onReply={(_cid, msgId) => {
         composeReplyTo = msgId;
         composeInitialTo = selectedMailDetail?.senderAddress ?? '';
@@ -790,7 +817,12 @@
         composeInitialSubject = subj.startsWith('Re: ') ? subj : `Re: ${subj}`;
         showCompose = true;
       }}
-      onBack={() => { selectedMailCid = null; selectedMailDetail = null; }}
+      onBack={() => {
+        selectedMailCid = null;
+        selectedMailDetail = null;
+        mailDetailLoading = false;
+        mailDetailError = null;
+      }}
     />
   {/snippet}
 </Layout>
