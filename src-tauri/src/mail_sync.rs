@@ -692,4 +692,95 @@ mod tests {
             other => panic!("expected Error after skip, got {other:?}"),
         };
     }
+
+    #[tokio::test]
+    async fn pending_root_during_walk_runs_after_current_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(32);
+
+        // Build TWO different roots, each with one entry.
+        fn make_tree(seed: u8) -> ([u8; 32], Vec<([u8; 32], Vec<u8>)>) {
+            let entry = MessageEntry {
+                message_cid: [seed; 32],
+                message_id: [seed; 16],
+                sender_address: [0; 16],
+                timestamp: 1_700_000_000 + seed as u64,
+                subject_snippet: format!("seed {seed}"),
+                read: false,
+            };
+            let page = MailPage {
+                version: MAILBOX_VERSION,
+                next_page: None,
+                entries: vec![entry],
+            };
+            let page_bytes = page.to_bytes().unwrap();
+            let page_cid: [u8; 32] = *blake3::hash(&page_bytes).as_bytes();
+
+            let folder = MailFolder {
+                version: MAILBOX_VERSION,
+                message_count: 1,
+                unread_count: 1,
+                page_cids: vec![page_cid],
+            };
+            let folder_bytes = folder.to_bytes().unwrap();
+            let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
+
+            let root = MailRoot::new_empty([0; 16], 1_700_000_000)
+                .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+            let root_bytes = root.to_bytes();
+            let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
+            (
+                root_cid,
+                vec![
+                    (root_cid, root_bytes),
+                    (folder_cid, folder_bytes),
+                    (page_cid, page_bytes),
+                ],
+            )
+        }
+
+        let (root1, blobs1) = make_tree(0xAA);
+        let (root2, blobs2) = make_tree(0xBB);
+
+        let mut stub = StubFetcher::new();
+        for (cid, bytes) in blobs1.into_iter().chain(blobs2.into_iter()) {
+            stub.insert(cid, bytes);
+        }
+        tokio::spawn(stub.run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+
+        // Push root1, then immediately push root2 before root1 walk completes.
+        // The second push must coalesce as pending_root on the Walking state.
+        sync.clone().handle_root_push(&root1).await;
+        sync.clone().handle_root_push(&root2).await;
+
+        // Wait until the walker returns to Idle (both walks complete).
+        wait_for_terminal_state(&sync, std::time::Duration::from_secs(5)).await;
+
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        let message_ids: std::collections::HashSet<String> =
+            inbox.iter().map(|e| e.message_id.clone()).collect();
+        assert!(
+            message_ids.contains(&hex::encode([0xAA; 16])),
+            "root1 entry missing; inbox: {inbox:?}"
+        );
+        assert!(
+            message_ids.contains(&hex::encode([0xBB; 16])),
+            "root2 entry missing; inbox: {inbox:?}"
+        );
+        // After both walks complete, state should be Idle.
+        {
+            let guard = sync.state.lock().unwrap();
+            assert!(
+                matches!(&*guard, SyncState::Idle { .. }),
+                "expected Idle after both walks, got {:?}",
+                *guard
+            );
+        }
+    }
 }
