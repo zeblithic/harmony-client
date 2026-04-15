@@ -808,8 +808,14 @@ fn emit_frontend_event(
             }
         };
         match mgr.receive_message(payload) {
-            Ok(entry) => {
+            Ok(crate::mail::ReceiveOutcome::Inserted(entry)) => {
                 let _ = app.emit("mail-received", &entry);
+            }
+            Ok(crate::mail::ReceiveOutcome::Promoted(_entry)) => {
+                tracing::debug!(
+                    key_expr,
+                    "live push promoted Pending to Local (no emit)"
+                );
             }
             Err(e) => {
                 tracing::debug!(key_expr, error = %e, "mail receive skipped");

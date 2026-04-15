@@ -41,6 +41,22 @@ pub enum RegisterOutcome {
     Duplicate,
 }
 
+/// Outcome of a `receive_message` call.
+///
+/// Intentionally does NOT derive `PartialEq`/`Eq` — `EntryRecord` is not
+/// an equality type, and call sites should match on the variant rather
+/// than compare whole outcomes.
+#[derive(Debug, Clone)]
+pub enum ReceiveOutcome {
+    /// A new entry was inserted; caller should emit `mail-received`.
+    Inserted(EntryRecord),
+    /// An existing Pending entry was promoted to Local; caller should
+    /// NOT emit `mail-received` (the user already sees this row from
+    /// the walker pass that registered it). Callers may still want the
+    /// EntryRecord to update stale views.
+    Promoted(EntryRecord),
+}
+
 /// A lightweight entry for inbox listing (mirrors MessageEntry semantics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,8 +199,13 @@ impl MailManager {
     }
 
     /// Process an inbound message (raw bytes from Zenoh subscription).
-    /// Returns the entry record on success (for frontend notification).
-    pub fn receive_message(&mut self, msg_bytes: &[u8]) -> Result<EntryRecord, String> {
+    ///
+    /// Returns a [`ReceiveOutcome`] distinguishing a fresh insert from a
+    /// Pending→Local promotion. Callers that drive UI notifications should
+    /// emit on `Inserted` only — `Promoted` means the walker already
+    /// surfaced the row to the user via `register_header_only`, so a
+    /// second notification would be spurious.
+    pub fn receive_message(&mut self, msg_bytes: &[u8]) -> Result<ReceiveOutcome, String> {
         let msg = HarmonyMessage::from_bytes(msg_bytes).map_err(|e| format!("parse: {e}"))?;
 
         // Compute CID (BLAKE3 hash of the raw bytes)
@@ -269,7 +290,9 @@ impl MailManager {
             // Pending entry exists at scan time; no other mutator runs between
             // scan and promote (single-threaded &mut self borrow), and the
             // promote predicate matches the scan predicate exactly.
-            return Ok(promoted_entry.expect("has_pending_match implies at least one promotion"));
+            let promoted = promoted_entry
+                .expect("has_pending_match implies at least one promotion");
+            return Ok(ReceiveOutcome::Promoted(promoted));
         }
 
         // No existing match — fall through to normal insert path.
@@ -299,7 +322,7 @@ impl MailManager {
         inbox.entries.insert(0, entry.clone());
 
         self.save_index()?;
-        Ok(entry)
+        Ok(ReceiveOutcome::Inserted(entry))
     }
 
     /// Register a header-only inbox entry from a walker-discovered MessageEntry.
@@ -720,7 +743,9 @@ mod tests {
 
         let msg = make_test_message("Test Subject", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         assert_eq!(entry.subject_snippet, "Test Subject");
         assert!(!entry.read);
@@ -754,7 +779,9 @@ mod tests {
 
         let msg = make_test_message("Read Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
         mgr.mark_read(&entry.message_cid, true, Some("inbox")).unwrap();
@@ -768,7 +795,9 @@ mod tests {
 
         let msg = make_test_message("Move Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         mgr.move_message(&entry.message_cid, Some("inbox"), "trash").unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
@@ -782,7 +811,9 @@ mod tests {
 
         let msg = make_test_message("Detail Test", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         let detail = mgr.get_message(&entry.message_cid).unwrap();
         assert_eq!(detail.subject, "Detail Test");
@@ -797,7 +828,9 @@ mod tests {
 
         let msg = make_test_message("Delete Me", [0xAA; 16]);
         let bytes = msg.to_bytes().unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         let blob_path = dir.path().join("blobs").join(format!("{}.bin", entry.message_cid));
         assert!(blob_path.exists());
@@ -815,7 +848,9 @@ mod tests {
             let mut mgr = MailManager::load(dir.path(), [0xBB; 16]);
             let msg = make_test_message("Persist", [0xAA; 16]);
             let bytes = msg.to_bytes().unwrap();
-            let entry = mgr.receive_message(&bytes).unwrap();
+            let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+                panic!("expected Inserted outcome on fresh receive");
+            };
             cid = entry.message_cid;
         }
         // Reload from disk
@@ -851,7 +886,9 @@ mod tests {
         let sent_cid = mgr.store_sent(&bytes, &msg).unwrap();
 
         // Then receive the same message (mimics Zenoh delivery to self)
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
         assert_eq!(entry.message_cid, sent_cid); // same CID
 
         assert_eq!(mgr.folder_counts()["sent"].total, 1);
@@ -916,7 +953,9 @@ mod tests {
 
         // Store in sent first, then receive (mimics send_mail flow)
         mgr.store_sent(&bytes, &msg).unwrap();
-        let entry = mgr.receive_message(&bytes).unwrap();
+        let ReceiveOutcome::Inserted(entry) = mgr.receive_message(&bytes).unwrap() else {
+            panic!("expected Inserted outcome on fresh receive");
+        };
 
         // Inbox copy is unread, sent copy is read
         assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
@@ -1182,7 +1221,10 @@ mod tests {
         let result = mgr.receive_message(&bytes);
 
         // Should NOT error as duplicate; should promote in-place.
-        assert!(result.is_ok(), "receive_message should promote, got: {result:?}");
+        assert!(
+            matches!(result, Ok(ReceiveOutcome::Promoted(_))),
+            "expected Promoted, got {result:?}"
+        );
 
         // Entry stays in trash (folder preserved), body_state now Local.
         let inbox = mgr.list_folder("inbox", 0, 100);
