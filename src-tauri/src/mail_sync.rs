@@ -341,9 +341,18 @@ impl<R: Runtime> MailSync<R> {
                 SyncState::Walking {
                     root: walking_root,
                     pending_root,
+                    prev_last_walked_root,
                     ..
                 } => {
-                    if walking_root == &root || pending_root.as_ref() == Some(&root) {
+                    // Also dedup against prev_last_walked_root: if we just
+                    // successfully walked this root immediately before the
+                    // current pass, a re-push (e.g., from a different gateway
+                    // peer that hadn't seen the newer root yet) is redundant
+                    // — queueing it would schedule a wasted second pass.
+                    if walking_root == &root
+                        || pending_root.as_ref() == Some(&root)
+                        || prev_last_walked_root.as_ref() == Some(&root)
+                    {
                         return;
                     }
                     *pending_root = Some(root);
@@ -1462,6 +1471,52 @@ mod tests {
             1,
             "good_root entry should be registered after bad_root fails; inbox: {inbox:?}"
         );
+    }
+
+    /// During an active walk, a push for a root that was successfully
+    /// walked _immediately before_ the current pass (carried in
+    /// `prev_last_walked_root`) MUST also be deduped. Without this, a
+    /// secondary gateway peer that hadn't yet seen the newer root would
+    /// schedule a redundant pass after the current one finishes.
+    #[tokio::test]
+    async fn pending_root_dedups_against_prev_last_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(8);
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr);
+
+        let r_old: [u8; CID_LEN] = [0xA1; CID_LEN];
+        let r_active: [u8; CID_LEN] = [0xB2; CID_LEN];
+
+        // Manually install a Walking state with prev_last_walked_root = r_old.
+        // (Bypasses the spawn so we don't race the walker.)
+        {
+            let mut state = sync.state.lock().unwrap();
+            *state = SyncState::Walking {
+                root: r_active,
+                started_at: Instant::now(),
+                pending_root: None,
+                prev_last_walked_root: Some(r_old),
+            };
+        }
+
+        // Re-push r_old (the just-walked root) — should be deduped, not
+        // overwrite pending_root.
+        sync.clone().start_or_queue_walk(r_old).await;
+
+        let guard = sync.state.lock().unwrap();
+        match &*guard {
+            SyncState::Walking { pending_root, .. } => {
+                assert_eq!(
+                    *pending_root, None,
+                    "prev_last_walked_root match should not enqueue a new walk"
+                );
+            }
+            other => panic!("expected Walking unchanged, got {other:?}"),
+        }
     }
 
     /// `report_query_error` MUST install SyncState::Error (not just emit

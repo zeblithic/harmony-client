@@ -128,23 +128,31 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
     // fails fast on a real propagation issue and doesn't flake when
     // declare_queryable is slower than expected. Hits the queryable's
     // wildcard with a probe CID; any reply (success or err) proves the
-    // queryable is discoverable.
+    // queryable is discoverable. Both `session.get` AND `recv_async` are
+    // bounded by the deadline so a hung receiver can't deadlock the test.
     let probe_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
+        let remaining = probe_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("CAS queryable never became reachable within 5s");
+        }
         let Ok(replies) = session.get("harmony/content/0/probe").await else {
-            if std::time::Instant::now() >= probe_deadline {
-                panic!("CAS queryable never became reachable within 5s");
-            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        if replies.recv_async().await.is_ok() {
-            break;
-        }
-        if std::time::Instant::now() >= probe_deadline {
+        let recv_remaining =
+            probe_deadline.saturating_duration_since(std::time::Instant::now());
+        if recv_remaining.is_zero() {
             panic!("CAS queryable never replied within 5s");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        match tokio::time::timeout(recv_remaining, replies.recv_async()).await {
+            Ok(Ok(_)) => break,
+            Ok(Err(_)) => {
+                // Reply stream closed without yielding — try another probe.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => panic!("CAS queryable never replied within 5s"),
+        }
     }
 
     // ── Bring up MailSync ──
