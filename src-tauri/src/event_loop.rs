@@ -314,28 +314,7 @@ pub async fn run(
             let session_clone = session.clone();
             let key = own_root_key.clone();
             tokio::spawn(async move {
-                let result: Result<Option<Vec<u8>>, String> = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    async {
-                        let replies = session_clone
-                            .get(&key)
-                            .await
-                            .map_err(|e| format!("get: {e}"))?;
-                        let mut payload: Option<Vec<u8>> = None;
-                        while let Ok(reply) = replies.recv_async().await {
-                            if let Ok(sample) = reply.result() {
-                                payload = Some(sample.payload().to_bytes().to_vec());
-                                break;
-                            }
-                        }
-                        Ok::<_, String>(payload)
-                    },
-                )
-                .await
-                .map_err(|_| "startup root query timed out (10s)".to_string())
-                .and_then(|r| r);
-
-                match result {
+                match query_mail_root(&session_clone, &key, "startup").await {
                     Ok(payload) => sync.handle_startup_query_reply(payload.as_deref()).await,
                     Err(e) => tracing::warn!(error = %e, "startup root query failed"),
                 }
@@ -495,33 +474,13 @@ pub async fn run(
 
             // ── Manual mail refresh from MailSync::refresh_now ──────
             Some(reply_tx) = refresh_rx.recv() => {
-                // Issue the same get as startup with a 10s budget.
                 if own_root_key.is_empty() {
                     let _ = reply_tx.send(Err("own_root_key unavailable".to_string()));
                 } else {
                     let session_clone = session.clone();
                     let key = own_root_key.clone();
                     tokio::spawn(async move {
-                        let result: Result<Option<Vec<u8>>, String> = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            async {
-                                let replies = session_clone
-                                    .get(&key)
-                                    .await
-                                    .map_err(|e| format!("get: {e}"))?;
-                                let mut payload: Option<Vec<u8>> = None;
-                                while let Ok(reply) = replies.recv_async().await {
-                                    if let Ok(sample) = reply.result() {
-                                        payload = Some(sample.payload().to_bytes().to_vec());
-                                        break;
-                                    }
-                                }
-                                Ok::<_, String>(payload)
-                            },
-                        )
-                        .await
-                        .map_err(|_| "refresh root query timed out (10s)".to_string())
-                        .and_then(|r| r);
+                        let result = query_mail_root(&session_clone, &key, "refresh").await;
                         let _ = reply_tx.send(result);
                     });
                 }
@@ -841,6 +800,46 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
     })
     .await
     .unwrap_or_else(|_| Err(format!("fetch '{key_expr}' timed out after 30s")))
+}
+
+/// Query a mail root key with a 10-second budget.
+///
+/// Distinct from `fetch_via_zenoh` because the mail-root protocol treats an
+/// empty reply as a valid sentinel ("no mail for this address yet") whereas
+/// fetch_via_zenoh requires a successful non-empty reply. Returns:
+/// - `Ok(Some(payload))` — reply received, possibly including the empty-bytes
+///   sentinel which the caller (MailSync::handle_startup_query_reply) handles.
+/// - `Ok(None)` — no replies arrived before the stream closed.
+/// - `Err(msg)` — the `get` call itself failed or the 10s budget elapsed.
+///
+/// Used by both the cold-start query and the manual refresh path. `op_label`
+/// appears in the timeout message for log disambiguation ("startup" vs
+/// "refresh").
+async fn query_mail_root(
+    session: &zenoh::Session,
+    key: &str,
+    op_label: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let replies = session
+                .get(key)
+                .await
+                .map_err(|e| format!("get: {e}"))?;
+            let mut payload: Option<Vec<u8>> = None;
+            while let Ok(reply) = replies.recv_async().await {
+                if let Ok(sample) = reply.result() {
+                    payload = Some(sample.payload().to_bytes().to_vec());
+                    break;
+                }
+            }
+            Ok::<_, String>(payload)
+        },
+    )
+    .await
+    .map_err(|_| format!("{op_label} root query timed out (10s)"))
+    .and_then(|r| r)
 }
 
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
