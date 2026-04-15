@@ -11,8 +11,8 @@ use tauri::{AppHandle, Emitter};
 mod event_loop;
 mod follows;
 mod identity;
-mod mail;
-mod mail_sync;
+pub mod mail;
+pub mod mail_sync;
 mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
