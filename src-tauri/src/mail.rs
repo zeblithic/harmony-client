@@ -285,29 +285,41 @@ impl MailManager {
             return Err(format!("hash mismatch: claimed {cid_hex}, computed {computed}"));
         }
 
-        // Find any matching Pending entry across receive-side folders.
-        let mut found_pending = false;
+        // Pre-scan immutably: is there anything to promote? If not, return
+        // before any filesystem side effects — live receive_message already
+        // handled it, writing a stale blob would be wasted I/O.
+        //
+        // Note: multiple matches across folders are possible (e.g., a stale
+        // Pending in trash and a fresh Pending in inbox referencing the same
+        // body). All matches will be promoted — they all reference the same
+        // blob, so making every reference resolvable is intentional.
+        let has_pending = ["inbox", "trash", "drafts"]
+            .iter()
+            .filter_map(|name| self.index.folders.get(*name))
+            .flat_map(|folder| folder.entries.iter())
+            .any(|e| e.message_cid == cid_hex && e.body_state == BodyState::Pending);
+
+        if !has_pending {
+            return Ok(());
+        }
+
+        // Write the blob BEFORE mutating in-memory state, so the invariant
+        // `state == Local ⇒ blob exists on disk` holds even if I/O fails
+        // mid-way. (Atomic: tmp + rename.)
+        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
+        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, bytes).map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
+
+        // Blob is durable; now flip every matching Pending entry to Local.
         for folder_name in ["inbox", "trash", "drafts"] {
             let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
             for entry in folder.entries.iter_mut() {
                 if entry.message_cid == cid_hex && entry.body_state == BodyState::Pending {
                     entry.body_state = BodyState::Local;
-                    found_pending = true;
                 }
             }
         }
-
-        if !found_pending {
-            // No Pending entry to promote — likely already Local from live receive.
-            // Don't write a stale blob.
-            return Ok(());
-        }
-
-        // Write the blob (atomic: tmp + rename).
-        let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, bytes).map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
         self.save_index()?;
         Ok(())
@@ -1007,6 +1019,15 @@ mod tests {
 
         let result = mgr.mark_body_received(&claimed_cid_hex, wrong_bytes);
         assert!(result.is_err(), "should reject bytes that don't hash to the claimed CID");
+
+        // Rejection must not leak any filesystem side effects.
+        let blob_path = mail_dir.join("blobs").join(format!("{claimed_cid_hex}.bin"));
+        assert!(
+            !blob_path.exists(),
+            "rejected bytes must not produce a blob file"
+        );
+        let tmp_blob = mail_dir.join("blobs").join(format!("{claimed_cid_hex}.bin.tmp"));
+        assert!(!tmp_blob.exists(), "rejected bytes must not leave a tmp file");
     }
 
     #[test]
@@ -1022,8 +1043,20 @@ mod tests {
         // Receive once via the live raw path → entry is Local.
         mgr.receive_message(&bytes).unwrap();
 
+        // Delete the blob the no-op path must not re-write it to prove that
+        // it's truly a no-op (not silently doing work).
+        let blob_path = mail_dir.join("blobs").join(format!("{cid_hex}.bin"));
+        std::fs::remove_file(&blob_path).unwrap();
+
         // mark_body_received should be a no-op (returns Ok).
         mgr.mark_body_received(&cid_hex, &bytes).unwrap();
+
+        // Blob was NOT re-written — this is the contract: don't touch the
+        // filesystem when there's no Pending entry to promote.
+        assert!(
+            !blob_path.exists(),
+            "no-op path must not re-write the blob"
+        );
 
         let inbox = mgr.list_folder("inbox", 0, 100);
         assert_eq!(inbox.len(), 1);
