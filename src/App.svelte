@@ -780,15 +780,21 @@
             if (selectedMailCid !== cid) return; // stale selection
             selectedMailDetail = detail;
             mailDetailLoading = false;
-            if (detail) {
-              await mailService.markRead(cid, folder);
-            } else {
+            if (!detail) {
               mailDetailError = 'Message not found or fetch failed';
             }
           } catch (e) {
             if (selectedMailCid !== cid) return;
             mailDetailLoading = false;
             mailDetailError = e instanceof Error ? e.message : String(e);
+            return;
+          }
+          // markRead is fire-and-forget: a read-status update failure must
+          // not replace a successfully loaded message with an error view.
+          if (selectedMailDetail) {
+            mailService.markRead(cid, folder).catch((err) => {
+              console.warn('markRead failed:', err);
+            });
           }
         }}
         onFolderChange={async (folder) => {

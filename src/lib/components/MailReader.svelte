@@ -40,6 +40,9 @@
 <div class="mail-reader">
   {#if loading}
     <div class="reader-loading">
+      <button type="button" class="back-btn" onclick={() => onBack?.()}>
+        &larr; Back
+      </button>
       <span class="reader-spinner" aria-label="Loading">⟳</span>
       <span>Loading message…</span>
     </div>

@@ -72,15 +72,14 @@
       {#if syncState === 'syncing'}
         <span class="sync-spinner" title="Syncing mailbox…" aria-label="Syncing">⟳</span>
       {:else if syncState === 'error'}
-        <button
-          type="button"
+        <span
           class="sync-error-icon"
           title={syncError ?? 'Sync error'}
+          role="img"
           aria-label={syncError ?? 'Sync error'}
-          onclick={() => { /* could show a toast; for now, tooltip is enough */ }}
         >
           ⚠
-        </button>
+        </span>
       {/if}
       <button
         type="button"
@@ -307,12 +306,9 @@
     to { transform: rotate(360deg); }
   }
   .sync-error-icon {
-    background: none;
-    border: none;
     color: #c66;
-    cursor: pointer;
+    cursor: help;
     font-size: 0.95rem;
-    padding: 0;
   }
   .sync-refresh-btn {
     background: transparent;
