@@ -117,43 +117,61 @@ The walker descends into only `folder_cids[0]` (Inbox). Slots 1/2/3 (Sent/Drafts
 ### Public API
 
 ```rust
-pub struct MailSync {
+pub struct MailSync<R: Runtime = tauri::Wry> {
     state: Arc<Mutex<SyncState>>,
     fetch_tx: mpsc::Sender<FetchRequest>,
-    mail_mgr: Arc<MailManager>,
+    refresh_tx: mpsc::Sender<RefreshRequest>,
+    mail_mgr: Arc<Mutex<MailManager>>,
     own_addr_hex: String,
-    app: AppHandle,
-    in_flight_bodies: Arc<Mutex<HashMap<[u8; 32], Shared<Result<Vec<u8>, String>>>>>,
+    app: AppHandle<R>,
+    in_flight_bodies: Arc<Mutex<HashMap<[u8; 32], watch::Receiver<Option<Result<Vec<u8>, String>>>>>>,
 }
 
-impl MailSync {
+impl<R: Runtime> MailSync<R> {
     pub fn new(
         fetch_tx: mpsc::Sender<FetchRequest>,
-        mail_mgr: Arc<MailManager>,
+        refresh_tx: mpsc::Sender<RefreshRequest>,
+        mail_mgr: Arc<Mutex<MailManager>>,
         own_addr_hex: String,
-        app: AppHandle,
+        app: AppHandle<R>,
     ) -> Self;
 
-    pub async fn handle_root_push(&self, payload: &[u8]);
-    pub async fn handle_startup_query_reply(&self, payload: Option<&[u8]>);
-    pub async fn refresh_now(&self);
-    pub async fn fetch_body(&self, cid: [u8; 32]) -> Result<Vec<u8>, String>;
+    pub async fn handle_root_push(self: Arc<Self>, payload: &[u8]);
+    pub async fn handle_startup_query_reply(self: Arc<Self>, payload: Option<&[u8]>);
+    pub async fn refresh_now(self: Arc<Self>);
+    pub async fn fetch_body(self: Arc<Self>, cid: [u8; 32]) -> Result<Vec<u8>, String>;
 }
 ```
+
+The `MailSync<R>` type parameter exists so tests can instantiate against
+`tauri::test::MockRuntime`; production callers use the default `Wry`. The
+in-flight body map shares results via `watch::Receiver` rather than
+`Shared` so the primary fetcher's `tx` can publish a single `Some(result)`
+to all subscribers atomically.
 
 ### State machine
 
 ```rust
 enum SyncState {
     Idle { last_walked_root: Option<[u8; 32]> },
-    Walking { root: [u8; 32], started_at: Instant, pending_root: Option<[u8; 32]> },
+    Walking {
+        root: [u8; 32],
+        started_at: Instant,
+        pending_root: Option<[u8; 32]>,
+        // The last_walked_root carried into Walking — preserved so a strict
+        // failure can transition to Error without losing the previous
+        // successful root.
+        prev_last_walked_root: Option<[u8; 32]>,
+    },
     Error { last_error: String, last_walked_root: Option<[u8; 32]> },
 }
 ```
 
-**Single-flight semantics:** when a new root push arrives during an active walk, the walker stores it as `pending_root` and re-enters the walk loop after the current pass completes. Avoids thrashing under bursty deliveries.
+**Single-flight semantics:** when a new root push arrives during an active walk, the walker stores it as `pending_root` and the current pass's `finish_walk`/`finish_walk_error` transitions directly to a new `Walking` for the queued root under the same lock — the surrounding `run_walk_loop` then continues iterating. Inline dispatch avoids the `tokio::spawn` race where a newer root push could overtake an older queued one.
 
-The `std::sync::Mutex` is held only for state transitions, never across `.await`. Walker pass runs as a spawned tokio task.
+**Duplicate suppression:** `start_or_queue_walk` skips no-op walks when the incoming root equals the active `Walking::root`, the queued `pending_root`, or (for `Idle` only) the most recent `last_walked_root` — so the cold-start `get` reply plus the first live `/root` push for the same CID don't double-walk.
+
+The `std::sync::Mutex` is held only for state transitions, never across `.await`. Walk loop runs as a single spawned tokio task that drives back-to-back passes inline.
 
 ### Walk algorithm (one pass)
 
