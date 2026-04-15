@@ -80,6 +80,7 @@ pub async fn run(
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
+    mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -247,13 +248,32 @@ pub async fn run(
     )
     .await;
 
-    // Subscribe to inbound mail for this node's address.
-    if let Ok(g) = mail_mgr.lock() {
-        let own_hex = g.owner_address_hex();
-        drop(g);
+    // Subscribe to inbound mail for this node's address, plus the /root
+    // pointer that the Phase 2 MailSync walker consumes. Both keys are
+    // hoisted to the loop scope so the emit_frontend_event filter can
+    // dispatch exact-match by string comparison.
+    //
+    // Poison fallback: empty strings, guarded with `!key.is_empty()` in
+    // the filter. Subscriptions are skipped rather than panicking —
+    // mail functionality degrades but the rest of the node stays alive.
+    let (own_mail_key, own_root_key) = match mail_mgr.lock() {
+        Ok(g) => {
+            let own_hex = g.owner_address_hex();
+            drop(g);
+            (
+                format!("harmony/mail/v1/{own_hex}"),
+                format!("harmony/mail/v1/{own_hex}/root"),
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "mail_mgr mutex poisoned at startup; mail subs disabled");
+            (String::new(), String::new())
+        }
+    };
+    if !own_mail_key.is_empty() {
         dispatch_action(
             RuntimeAction::Subscribe {
-                key_expr: format!("harmony/mail/v1/{own_hex}"),
+                key_expr: own_mail_key.clone(),
             },
             &session,
             &zenoh_tx,
@@ -264,8 +284,19 @@ pub async fn run(
             &own_zid,
         )
         .await;
-    } else {
-        tracing::error!("mail_mgr mutex poisoned, skipping mail subscription");
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: own_root_key.clone(),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
     }
 
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
@@ -369,7 +400,17 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set, &mail_mgr);
+                        emit_frontend_event(
+                            &app,
+                            &key_expr,
+                            &payload,
+                            hop_distance,
+                            &followed_set,
+                            &mail_mgr,
+                            &own_mail_key,
+                            &own_root_key,
+                            mail_sync.as_ref(),
+                        );
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -741,6 +782,7 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
+#[allow(clippy::too_many_arguments)]
 fn emit_frontend_event(
     app: &AppHandle,
     key_expr: &str,
@@ -748,6 +790,9 @@ fn emit_frontend_event(
     hop_distance: Option<u8>,
     followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
+    own_mail_key: &str,
+    own_root_key: &str,
+    mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
@@ -794,12 +839,30 @@ fn emit_frontend_event(
         if let Some(event) = crate::parse_telemetry(payload) {
             let _ = app.emit("telemetry-event", &event);
         }
-    } else if key_expr.starts_with("harmony/mail/v1/") && !key_expr.ends_with("/root") {
+    } else if !own_root_key.is_empty() && key_expr == own_root_key {
+        // Phase 2: root CID push for this node's mailbox. Forward to
+        // MailSync which re-walks the tree and registers header-only
+        // entries for any new descendants. Spawn so the event loop
+        // keeps pumping while the walker runs.
+        if let Some(sync) = mail_sync {
+            let sync = Arc::clone(sync);
+            let payload = payload.to_vec();
+            tokio::spawn(async move {
+                sync.handle_root_push(&payload).await;
+            });
+        } else {
+            tracing::debug!("got root push but mail_sync not initialized; ignoring");
+        }
+    } else if !own_mail_key.is_empty() && key_expr == own_mail_key {
         // Inbound mail delivery — store in MailManager and notify frontend.
         // NOTE: receive_message performs blocking disk I/O (blob write + index
         // persist) while holding the mutex. Acceptable for Phase 0 since mail
         // is infrequent. Phase 1 should offload to spawn_blocking or a
         // dedicated writer thread to avoid stalling the event loop under burst.
+        //
+        // Emit `mail-received` only on a fresh Insert. A Promoted outcome
+        // means the walker already surfaced this row via register_header_only,
+        // so re-emitting would duplicate the notification the user already saw.
         let mut mgr = match mail_mgr.lock() {
             Ok(g) => g,
             Err(e) => {

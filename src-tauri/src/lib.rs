@@ -383,6 +383,8 @@ async fn start_node(
                         voice_channel_rx,
                         followed_set_clone,
                         mail_mgr_clone,
+                        // C13 will replace None with a real MailSync instance.
+                        None,
                     )
                     .await;
                 });
