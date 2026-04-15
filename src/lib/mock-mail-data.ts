@@ -12,6 +12,7 @@ export const mockMailEntries: MailEntry[] = [
     timestamp: Math.floor((now - 2 * hour) / 1000),
     subjectSnippet: 'Welcome to Harmony Mail',
     read: false,
+    bodyState: 'local',
   },
   {
     messageCid: 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3',
@@ -20,6 +21,7 @@ export const mockMailEntries: MailEntry[] = [
     timestamp: Math.floor((now - 1 * day) / 1000),
     subjectSnippet: 'Meeting notes from Tuesday',
     read: false,
+    bodyState: 'local',
   },
   {
     messageCid: 'c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
@@ -28,6 +30,7 @@ export const mockMailEntries: MailEntry[] = [
     timestamp: Math.floor((now - 3 * day) / 1000),
     subjectSnippet: 'Re: Distributed systems architecture',
     read: true,
+    bodyState: 'local',
   },
   {
     messageCid: 'd4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5',
@@ -36,6 +39,7 @@ export const mockMailEntries: MailEntry[] = [
     timestamp: Math.floor((now - 5 * day) / 1000),
     subjectSnippet: 'Zenoh mesh sync results',
     read: true,
+    bodyState: 'local',
   },
   {
     messageCid: 'e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6',
@@ -44,6 +48,7 @@ export const mockMailEntries: MailEntry[] = [
     timestamp: Math.floor((now - 7 * day) / 1000),
     subjectSnippet: 'Invitation: Harmony dev sync',
     read: true,
+    bodyState: 'local',
   },
 ];
 

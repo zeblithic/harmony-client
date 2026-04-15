@@ -11,7 +11,8 @@ use tauri::{AppHandle, Emitter};
 mod event_loop;
 mod follows;
 mod identity;
-mod mail;
+pub mod mail;
+pub mod mail_sync;
 mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
@@ -40,6 +41,9 @@ struct NodeState {
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Shared mail manager (read/written by event loop on receive, by commands for queries).
     mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
+    /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
+    /// commands (refresh_mail, fetch_mail_body) can reach it.
+    mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -188,7 +192,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -210,6 +214,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.voice_channel_tx.take(),
             guard.follow_mgr.take(),
             guard.followed_set.take(),
+            // Drop mail_sync so refresh_mail / fetch_mail_body can't reach
+            // a closed fetch_tx / refresh_tx after stop. Channels are
+            // already gone above; the MailSync handle would just yield
+            // "channel closed" errors until next start.
+            guard.mail_sync.take(),
         )
     };
 
@@ -247,6 +256,12 @@ async fn start_node(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    // Mail refresh channel. MailSync (constructed below once identity is
+    // loaded) owns the sender; the event loop's select! arm services
+    // RefreshRequests by issuing a Zenoh get against the gateway's
+    // mail-root queryable.
+    let (mail_refresh_tx, mail_refresh_rx) =
+        tokio::sync::mpsc::channel::<crate::mail_sync::RefreshRequest>(8);
 
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
@@ -279,6 +294,7 @@ async fn start_node(
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
+        let _old_mail_sync = guard.mail_sync.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
@@ -311,6 +327,16 @@ async fn start_node(
         // Initialize mail manager (needs owner address from identity).
         mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(
             mail::MailManager::load(&app_data_dir.join("mail"), our_addr_bytes),
+        ));
+
+        // Construct MailSync now that identity, mail_mgr, and the refresh
+        // channel are all available. Owns a clone of fetch_tx (so commands
+        // keep their own sender in AppState) and the sole refresh_tx.
+        let mail_sync = std::sync::Arc::new(mail_sync::MailSync::new(
+            fetch_tx.clone(),
+            mail_refresh_tx,
+            std::sync::Arc::clone(&mail_mgr),
+            app.clone(),
         ));
 
         let node_addr_for_state = node_addr.clone();
@@ -357,6 +383,7 @@ async fn start_node(
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
+        let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
             .spawn(move || {
@@ -382,6 +409,8 @@ async fn start_node(
                         voice_channel_rx,
                         followed_set_clone,
                         mail_mgr_clone,
+                        Some(mail_sync_for_loop),
+                        mail_refresh_rx,
                     )
                     .await;
                 });
@@ -399,6 +428,7 @@ async fn start_node(
         guard.follow_mgr = Some(follow_mgr);
         guard.followed_set = Some(followed_set);
         guard.mail_mgr = Some(mail_mgr);
+        guard.mail_sync = Some(mail_sync);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
@@ -1381,6 +1411,79 @@ fn get_mail(
         guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
     };
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
+
+    // Targeted O(N) scan by reference (no folder clone): only the matching
+    // entry is read, even on a 10k-message inbox. If Pending, return a
+    // stub MailDetail — the blob doesn't exist on disk yet, so
+    // mgr.get_message would fail. Frontend recognizes body_state=Pending
+    // and triggers fetch_mail_body.
+    if let Some(entry) = mgr.entry_by_cid(&message_cid) {
+        if entry.body_state == mail::BodyState::Pending {
+            return Ok(mail::MailDetail {
+                message_cid: message_cid.clone(),
+                message_id: entry.message_id.clone(),
+                subject: entry.subject_snippet.clone(),
+                body: String::new(),
+                sender_address: entry.sender_address.clone(),
+                recipients: vec![],
+                timestamp: entry.timestamp,
+                attachments: vec![],
+                is_reply: false,
+                is_forward: false,
+                in_reply_to: None,
+                body_state: mail::BodyState::Pending,
+            });
+        }
+    }
+
+    // Local (or entry missing — let get_message produce the proper error).
+    mgr.get_message(&message_cid)
+}
+
+#[tauri::command]
+async fn refresh_mail(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let sync_arc = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .mail_sync
+            .clone()
+            .ok_or_else(|| "mail_sync not initialized".to_string())?
+    };
+    sync_arc.refresh_now().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn fetch_mail_body(
+    message_cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<mail::MailDetail, String> {
+    let (sync_arc, mgr_arc) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let sync = guard
+            .mail_sync
+            .clone()
+            .ok_or_else(|| "mail_sync not initialized".to_string())?;
+        let mgr = guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?;
+        (sync, mgr)
+    };
+
+    // Decode CID hex → 32-byte array.
+    let cid_bytes = hex::decode(&message_cid).map_err(|e| format!("bad cid hex: {e}"))?;
+    let cid_arr: [u8; 32] = cid_bytes
+        .try_into()
+        .map_err(|_| "cid must be 32 bytes".to_string())?;
+
+    // Trigger lazy fetch (no-op if already Local; writes blob + promotes entry).
+    sync_arc.fetch_body(cid_arr).await?;
+
+    // Now return the fully-Local MailDetail from the manager.
+    let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     mgr.get_message(&message_cid)
 }
 
@@ -1454,6 +1557,8 @@ pub fn run() {
             send_mail,
             list_mail,
             get_mail,
+            refresh_mail,
+            fetch_mail_body,
             update_mail,
             get_mail_counts,
         ])

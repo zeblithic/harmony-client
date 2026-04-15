@@ -12,6 +12,8 @@ export class MailService {
   entries: MailEntry[] = [];
   activeFolder: MailFolderKind = 'inbox';
   counts: MailCounts = { inbox: { total: 0, unread: 0 }, sent: { total: 0, unread: 0 }, drafts: { total: 0, unread: 0 }, trash: { total: 0, unread: 0 } };
+  syncState: 'idle' | 'syncing' | 'error' = 'idle';
+  syncError: string | null = null;
   onChange?: () => void;
 
   private adapter: TauriAdapter | null = null;
@@ -41,6 +43,19 @@ export class MailService {
       this.onChange?.();
     });
     this.unlisteners.push(unlisten);
+
+    // Listen for walker/sync state updates.
+    const syncUnlisten = await adapter.listen('mail-sync-status', (event) => {
+      const payload = event.payload as { state: string; error?: string };
+      const newState = payload.state as 'idle' | 'syncing' | 'error';
+      const newError = payload.error ?? null;
+      if (this.syncState !== newState || this.syncError !== newError) {
+        this.syncState = newState;
+        this.syncError = newError;
+        this.onChange?.();
+      }
+    });
+    this.unlisteners.push(syncUnlisten);
 
     // Load initial state from backend.
     await this.refreshCounts();
@@ -75,10 +90,32 @@ export class MailService {
 
   async getMessage(cid: string): Promise<MailMessageDetail | null> {
     if (!this.adapter) return null;
+    // Errors propagate so App.svelte's catch can surface the specific
+    // Rust error (timeout, hash mismatch, etc.) — a swallowed error here
+    // collapses every failure into a generic "not found" in the UI.
+    const detail = await this.adapter.invoke('get_mail', { messageCid: cid }) as MailMessageDetail;
+    if (detail.bodyState === 'pending') {
+      // Body not yet cached — trigger lazy CAS fetch via MailSync.
+      // Returns the now-Local MailDetail on success.
+      return await this.adapter.invoke('fetch_mail_body', { messageCid: cid }) as MailMessageDetail;
+    }
+    return detail;
+  }
+
+  /**
+   * Manually trigger a mailbox re-sync. Calls into the Rust MailSync
+   * refresh_now path, which re-queries the gateway for the current
+   * root CID and walks if it has changed.
+   */
+  async refresh(): Promise<void> {
+    if (!this.adapter) return;
     try {
-      return await this.adapter.invoke('get_mail', { messageCid: cid }) as MailMessageDetail;
-    } catch {
-      return null;
+      await this.adapter.invoke('refresh_mail', {});
+    } catch (err) {
+      // Surface via syncState/syncError; the mail-sync-status listener
+      // will handle most error reporting. Log here for diagnostics.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('refresh_mail failed:', msg);
     }
   }
 

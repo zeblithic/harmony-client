@@ -3,10 +3,14 @@
 
   let {
     message = null,
+    loading = false,
+    error = null,
     onReply,
     onBack,
   }: {
     message: MailMessageDetail | null;
+    loading?: boolean;
+    error?: string | null;
     onReply?: (messageCid: string, messageId: string) => void;
     onBack?: () => void;
   } = $props();
@@ -34,7 +38,23 @@
 </script>
 
 <div class="mail-reader">
-  {#if !message}
+  {#if loading}
+    <div class="reader-loading">
+      <button type="button" class="back-btn" onclick={() => onBack?.()}>
+        &larr; Back
+      </button>
+      <span class="reader-spinner" aria-label="Loading">⟳</span>
+      <span>Loading message…</span>
+    </div>
+  {:else if error}
+    <div class="reader-error">
+      <p>Failed to load message:</p>
+      <pre class="error-msg">{error}</pre>
+      <button type="button" class="back-btn" onclick={() => onBack?.()}>
+        &larr; Back
+      </button>
+    </div>
+  {:else if !message}
     <div class="empty-state">Select a message to read</div>
   {:else}
     <div class="reader-toolbar">
@@ -193,5 +213,39 @@
 
   .att-size {
     color: var(--text-secondary, #888);
+  }
+
+  .reader-loading,
+  .reader-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 0.5rem;
+    padding: 1rem;
+    color: var(--text-secondary, #888);
+  }
+
+  .reader-spinner {
+    display: inline-block;
+    animation: reader-spin 1.5s linear infinite;
+    font-size: 1.25rem;
+  }
+  @keyframes reader-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .reader-error .error-msg {
+    background: rgba(200, 60, 60, 0.08);
+    border: 1px solid rgba(200, 60, 60, 0.3);
+    border-radius: 4px;
+    padding: 0.5rem;
+    font-size: 0.8125rem;
+    color: #c66;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-width: 40rem;
   }
 </style>

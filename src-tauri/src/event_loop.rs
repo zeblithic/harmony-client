@@ -80,6 +80,8 @@ pub async fn run(
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
+    mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
+    mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -247,13 +249,32 @@ pub async fn run(
     )
     .await;
 
-    // Subscribe to inbound mail for this node's address.
-    if let Ok(g) = mail_mgr.lock() {
-        let own_hex = g.owner_address_hex();
-        drop(g);
+    // Subscribe to inbound mail for this node's address, plus the /root
+    // pointer that the Phase 2 MailSync walker consumes. Both keys are
+    // hoisted to the loop scope so the emit_frontend_event filter can
+    // dispatch exact-match by string comparison.
+    //
+    // Poison fallback: empty strings, guarded with `!key.is_empty()` in
+    // the filter. Subscriptions are skipped rather than panicking —
+    // mail functionality degrades but the rest of the node stays alive.
+    let (own_mail_key, own_root_key) = match mail_mgr.lock() {
+        Ok(g) => {
+            let own_hex = g.owner_address_hex();
+            drop(g);
+            (
+                format!("harmony/mail/v1/{own_hex}"),
+                format!("harmony/mail/v1/{own_hex}/root"),
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "mail_mgr mutex poisoned at startup; mail subs disabled");
+            (String::new(), String::new())
+        }
+    };
+    if !own_mail_key.is_empty() {
         dispatch_action(
             RuntimeAction::Subscribe {
-                key_expr: format!("harmony/mail/v1/{own_hex}"),
+                key_expr: own_mail_key.clone(),
             },
             &session,
             &zenoh_tx,
@@ -264,13 +285,55 @@ pub async fn run(
             &own_zid,
         )
         .await;
-    } else {
-        tracing::error!("mail_mgr mutex poisoned, skipping mail subscription");
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: own_root_key.clone(),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
     }
 
     // Signal the caller that startup fully succeeded — UDP bound, Zenoh
     // session open, all queryables and subscribers declared.
     let _ = ready_tx.send(Ok(()));
+
+    // Phase 2: cold-start root query. Pulls current root via Zenoh `get` in
+    // case the gateway last published before this client subscribed. 10s
+    // budget — on failure or timeout, the normal publish-on-next-write
+    // flow still delivers eventually.
+    if let Some(ref sync) = mail_sync {
+        if !own_root_key.is_empty() {
+            let sync = Arc::clone(sync);
+            let session_clone = session.clone();
+            let key = own_root_key.clone();
+            tokio::spawn(async move {
+                match query_mail_root(&session_clone, &key, "startup").await {
+                    Ok(Some(payload)) => {
+                        sync.handle_startup_query_reply(Some(&payload)).await
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "startup root query: no responder — live push will catch up on next gateway publish"
+                        );
+                        sync.report_query_error(
+                            "no gateway responded to startup query".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "startup root query failed");
+                        sync.report_query_error(format!("startup query failed: {e}"));
+                    }
+                }
+            });
+        }
+    }
 
     // ── Timer (250ms = 4 ticks/sec, same as harmony-node) ────────────
     let mut timer = tokio::time::interval(Duration::from_millis(250));
@@ -369,7 +432,17 @@ pub async fn run(
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
-                        emit_frontend_event(&app, &key_expr, &payload, hop_distance, &followed_set, &mail_mgr);
+                        emit_frontend_event(
+                            &app,
+                            &key_expr,
+                            &payload,
+                            hop_distance,
+                            &followed_set,
+                            &mail_mgr,
+                            &own_mail_key,
+                            &own_root_key,
+                            mail_sync.as_ref(),
+                        );
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
                             payload,
@@ -410,6 +483,20 @@ pub async fn run(
                     let result = fetch_via_zenoh(&session, &key_expr).await;
                     let _ = req.reply.send(result);
                 });
+            }
+
+            // ── Manual mail refresh from MailSync::refresh_now ──────
+            Some(reply_tx) = refresh_rx.recv() => {
+                if own_root_key.is_empty() {
+                    let _ = reply_tx.send(Err("own_root_key unavailable".to_string()));
+                } else {
+                    let session_clone = session.clone();
+                    let key = own_root_key.clone();
+                    tokio::spawn(async move {
+                        let result = query_mail_root(&session_clone, &key, "refresh").await;
+                        let _ = reply_tx.send(result);
+                    });
+                }
             }
 
             // ── Content-ingest requests from Tauri commands ────────
@@ -728,6 +815,87 @@ async fn fetch_via_zenoh(session: &zenoh::Session, key_expr: &str) -> Result<Vec
     .unwrap_or_else(|_| Err(format!("fetch '{key_expr}' timed out after 30s")))
 }
 
+/// Query a mail root key with a 10-second budget.
+///
+/// Distinct from `fetch_via_zenoh` because the mail-root protocol treats an
+/// empty reply as a valid sentinel ("no mail for this address yet") whereas
+/// fetch_via_zenoh requires a successful non-empty reply. Returns:
+/// - `Ok(Some(payload))` — at least one responder replied successfully. A
+///   non-empty payload is the current root CID; an empty payload is the
+///   explicit "no mail yet" sentinel from the gateway's queryable.
+/// - `Ok(None)` — no responder replied at all. The caller surfaces this as
+///   a failed query (e.g., no gateway with this queryable declared).
+/// - `Err(msg)` — the `get` call itself failed, the 10s budget elapsed, or
+///   every responder returned an error reply (no successful reply seen).
+///
+/// Multiple responders are tolerated via `ConsolidationMode::None`. A
+/// non-empty success reply is preferred over the empty sentinel; either
+/// success outcome is preferred over an error-only outcome.
+///
+/// Used by both the cold-start query and the manual refresh path. `op_label`
+/// appears in the timeout message for log disambiguation ("startup" vs
+/// "refresh").
+async fn query_mail_root(
+    session: &zenoh::Session,
+    key: &str,
+    op_label: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    use zenoh::query::ConsolidationMode;
+
+    let label = op_label.to_string();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let replies = session
+                .get(key)
+                .consolidation(ConsolidationMode::None)
+                .await
+                .map_err(|e| format!("get: {e}"))?;
+
+            // Drain all replies. Track three outcomes so an all-errors
+            // result doesn't silently collapse into "no responder":
+            //   - non_empty: a real root CID (best — short-circuits)
+            //   - saw_empty: gateway explicitly says "no mail"
+            //   - reply_error: every reply that landed was an Err
+            let mut non_empty: Option<Vec<u8>> = None;
+            let mut saw_empty = false;
+            let mut reply_error: Option<String> = None;
+            while let Ok(reply) = replies.recv_async().await {
+                match reply.result() {
+                    Ok(sample) => {
+                        let bytes = sample.payload().to_bytes().to_vec();
+                        if bytes.is_empty() {
+                            saw_empty = true;
+                        } else {
+                            non_empty = Some(bytes);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        // Keep the first error message for the surfaced Err.
+                        reply_error.get_or_insert_with(|| {
+                            String::from_utf8_lossy(&err.payload().to_bytes())
+                                .into_owned()
+                        });
+                    }
+                }
+            }
+            if let Some(bytes) = non_empty {
+                Ok(Some(bytes))
+            } else if saw_empty {
+                Ok(Some(Vec::new()))
+            } else if let Some(err) = reply_error {
+                Err(format!("{label} root query reply error: {err}"))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .map_err(|_| format!("{op_label} root query timed out (10s)"))
+    .and_then(|r| r)
+}
+
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
 fn emit_session_lost(app: &AppHandle, reason: &str) {
     let _ = app.emit(
@@ -741,6 +909,7 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
+#[allow(clippy::too_many_arguments)]
 fn emit_frontend_event(
     app: &AppHandle,
     key_expr: &str,
@@ -748,6 +917,9 @@ fn emit_frontend_event(
     hop_distance: Option<u8>,
     followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
+    own_mail_key: &str,
+    own_root_key: &str,
+    mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
@@ -794,12 +966,30 @@ fn emit_frontend_event(
         if let Some(event) = crate::parse_telemetry(payload) {
             let _ = app.emit("telemetry-event", &event);
         }
-    } else if key_expr.starts_with("harmony/mail/v1/") && !key_expr.ends_with("/root") {
+    } else if !own_root_key.is_empty() && key_expr == own_root_key {
+        // Phase 2: root CID push for this node's mailbox. Forward to
+        // MailSync which re-walks the tree and registers header-only
+        // entries for any new descendants. Spawn so the event loop
+        // keeps pumping while the walker runs.
+        if let Some(sync) = mail_sync {
+            let sync = Arc::clone(sync);
+            let payload = payload.to_vec();
+            tokio::spawn(async move {
+                sync.handle_root_push(&payload).await;
+            });
+        } else {
+            tracing::debug!("got root push but mail_sync not initialized; ignoring");
+        }
+    } else if !own_mail_key.is_empty() && key_expr == own_mail_key {
         // Inbound mail delivery — store in MailManager and notify frontend.
         // NOTE: receive_message performs blocking disk I/O (blob write + index
         // persist) while holding the mutex. Acceptable for Phase 0 since mail
         // is infrequent. Phase 1 should offload to spawn_blocking or a
         // dedicated writer thread to avoid stalling the event loop under burst.
+        //
+        // Emit `mail-received` only on a fresh Insert. A Promoted outcome
+        // means the walker already surfaced this row via register_header_only,
+        // so re-emitting would duplicate the notification the user already saw.
         let mut mgr = match mail_mgr.lock() {
             Ok(g) => g,
             Err(e) => {
@@ -808,8 +998,14 @@ fn emit_frontend_event(
             }
         };
         match mgr.receive_message(payload) {
-            Ok(entry) => {
+            Ok(crate::mail::ReceiveOutcome::Inserted(entry)) => {
                 let _ = app.emit("mail-received", &entry);
+            }
+            Ok(crate::mail::ReceiveOutcome::Promoted(_entry)) => {
+                tracing::debug!(
+                    key_expr,
+                    "live push promoted Pending to Local (no emit)"
+                );
             }
             Err(e) => {
                 tracing::debug!(key_expr, error = %e, "mail receive skipped");

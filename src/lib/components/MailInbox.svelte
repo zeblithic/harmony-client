@@ -6,6 +6,9 @@
     activeFolder = 'inbox',
     counts = { inbox: { total: 0, unread: 0 }, sent: { total: 0, unread: 0 }, drafts: { total: 0, unread: 0 }, trash: { total: 0, unread: 0 } },
     selectedCid = null,
+    syncState = 'idle',
+    syncError = null,
+    onRefresh,
     onSelectEmail,
     onFolderChange,
     onCompose,
@@ -16,6 +19,9 @@
     activeFolder: MailFolderKind;
     counts: MailCounts;
     selectedCid: string | null;
+    syncState?: 'idle' | 'syncing' | 'error';
+    syncError?: string | null;
+    onRefresh?: () => void;
     onSelectEmail?: (cid: string) => void;
     onFolderChange?: (folder: MailFolderKind) => void;
     onCompose?: () => void;
@@ -61,6 +67,29 @@
           {/if}
         </button>
       {/each}
+    </div>
+    <div class="sync-controls">
+      {#if syncState === 'syncing'}
+        <span class="sync-spinner" title="Syncing mailbox…" aria-label="Syncing">⟳</span>
+      {:else if syncState === 'error'}
+        <span
+          class="sync-error-icon"
+          title={syncError ?? 'Sync error'}
+          role="img"
+          aria-label={syncError ?? 'Sync error'}
+        >
+          ⚠
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="sync-refresh-btn"
+        onclick={() => onRefresh?.()}
+        title="Refresh mailbox"
+        aria-label="Refresh mailbox"
+      >
+        ⟳
+      </button>
     </div>
     <button type="button" class="compose-btn" onclick={() => onCompose?.()}>
       Compose
@@ -258,5 +287,40 @@
 
   .action-btn:hover {
     color: var(--text-primary, #eee);
+  }
+
+  .sync-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-left: 0.5rem;
+  }
+  .sync-spinner {
+    display: inline-block;
+    animation: mail-sync-spin 1.5s linear infinite;
+    color: var(--text-secondary, #888);
+    font-size: 0.9rem;
+  }
+  @keyframes mail-sync-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  .sync-error-icon {
+    color: #c66;
+    cursor: help;
+    font-size: 0.95rem;
+  }
+  .sync-refresh-btn {
+    background: transparent;
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    color: var(--text-secondary, #888);
+    cursor: pointer;
+    padding: 0.125rem 0.4rem;
+    font-size: 0.8125rem;
+  }
+  .sync-refresh-btn:hover {
+    background: var(--hover-bg, rgba(255, 255, 255, 0.05));
+    color: var(--text-primary, #ddd);
   }
 </style>
