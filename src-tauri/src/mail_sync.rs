@@ -130,18 +130,39 @@ impl<R: Runtime> MailSync<R> {
     ///
     /// On success: persists the blob and promotes the Pending entry to Local
     /// via MailManager::mark_body_received.
+    ///
+    /// Cancellation: if the primary's future is dropped mid-fetch, an RAII
+    /// drop guard removes the in-flight entry so subsequent callers start a
+    /// fresh fetch rather than subscribe to a dead channel. (Subscribers
+    /// already awaiting the dropped `tx` will wake via `rx.changed()`
+    /// returning `Err` and surface "in-flight fetch cancelled" — they do NOT
+    /// hang, but they also don't auto-retry; the next explicit call does.)
     pub async fn fetch_body(self: Arc<Self>, cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
-        // Check in-flight map: if another caller is fetching this CID,
-        // subscribe to its result stream.
-        let existing = {
-            let map = self
+        // Atomic check-or-register under a single lock to close the TOCTOU
+        // window: without this, two concurrent first-callers could both
+        // observe an empty map, both insert their own watch channels
+        // (second overwrites first), and both issue duplicate outbound
+        // fetches — violating the dedup contract this test suite asserts.
+        enum Role {
+            Subscriber(tokio::sync::watch::Receiver<Option<Result<Vec<u8>, String>>>),
+            Primary(tokio::sync::watch::Sender<Option<Result<Vec<u8>, String>>>),
+        }
+        let role = {
+            let mut map = self
                 .in_flight_bodies
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            map.get(&cid).cloned()
+            if let Some(rx) = map.get(&cid).cloned() {
+                Role::Subscriber(rx)
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                map.insert(cid, rx);
+                Role::Primary(tx)
+            }
+            // Lock drops at end of block, before any .await.
         };
-        if let Some(mut rx) = existing {
-            // Another fetch is in progress — wait for its result.
+
+        if let Role::Subscriber(mut rx) = role {
             loop {
                 if let Some(result) = rx.borrow().clone() {
                     return result;
@@ -151,16 +172,26 @@ impl<R: Runtime> MailSync<R> {
                 }
             }
         }
+        let Role::Primary(tx) = role else { unreachable!() };
 
-        // No in-flight fetch: register a watch channel and start the work.
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        {
-            let mut map = self
-                .in_flight_bodies
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            map.insert(cid, rx);
+        // RAII guard: removes the in-flight entry when this function returns
+        // OR is dropped mid-fetch (cancellation). Ensures a cancelled primary
+        // never strands its CID in the map indefinitely.
+        struct InFlightGuard<'a> {
+            map: &'a InFlightMap,
+            cid: [u8; CID_LEN],
         }
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut m) = self.map.lock() {
+                    m.remove(&self.cid);
+                }
+            }
+        }
+        let _guard = InFlightGuard {
+            map: &self.in_flight_bodies,
+            cid,
+        };
 
         // Perform the actual fetch + verification + persistence.
         let result: Result<Vec<u8>, String> = async {
@@ -191,17 +222,12 @@ impl<R: Runtime> MailSync<R> {
         }
         .await;
 
-        // Publish the result to all awaiters, then clear the in-flight entry.
-        // Order matters: publish BEFORE remove so any just-arriving callers
-        // that took a clone of the rx still see the completed result.
+        // Publish the result to all subscribers. The drop guard clears the
+        // map entry AFTER this function returns (drop order: guard runs
+        // before tx). A late subscriber that clones the rx between publish
+        // and guard-drop sees Some(result) on the first borrow() and
+        // returns without awaiting — correct.
         let _ = tx.send(Some(result.clone()));
-        {
-            let mut map = self
-                .in_flight_bodies
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            map.remove(&cid);
-        }
         result
     }
 
@@ -944,8 +970,8 @@ mod tests {
         let result = sync.fetch_body(claimed_cid).await;
         assert!(result.is_err(), "should reject; got {result:?}");
         assert!(
-            result.unwrap_err().contains("hash"),
-            "error should mention hash"
+            result.unwrap_err().contains("hash mismatch"),
+            "error should mention hash mismatch"
         );
     }
 
@@ -1008,5 +1034,79 @@ mod tests {
         assert_eq!(r1, bytes);
         assert_eq!(r2, bytes);
         assert_eq!(count.load(Ordering::SeqCst), 1, "should only fetch once");
+    }
+
+    /// Regression test for the cancellation-leak hazard (C10 review I-2):
+    /// if the primary's future is dropped mid-fetch, the in-flight map entry
+    /// MUST be cleared so subsequent callers can start a fresh fetch rather
+    /// than be stuck subscribing to a dead channel forever.
+    #[tokio::test]
+    async fn fetch_body_cancellation_clears_in_flight_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchRequest>(16);
+
+        let msg = make_test_harmony_message("cancel", [0xEE; 16]);
+        let bytes = msg.to_bytes().unwrap();
+        let cid: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let entry = MessageEntry {
+            message_cid: cid,
+            message_id: msg.message_id,
+            sender_address: msg.sender_address,
+            timestamp: msg.timestamp,
+            subject_snippet: "cancel".to_string(),
+            read: false,
+        };
+        mail_mgr
+            .lock()
+            .unwrap()
+            .register_header_only(entry)
+            .unwrap();
+
+        // Slow fetcher counts invocations.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        let bytes_clone = bytes.clone();
+        tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = req.reply.send(Ok(bytes_clone.clone()));
+            }
+        });
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+
+        // Start a fetch and then cancel it mid-flight by aborting the task.
+        let h1 = tokio::spawn({
+            let s = sync.clone();
+            async move { s.fetch_body(cid).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        h1.abort();
+        // Give the drop guard a moment to run.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Second call must succeed: a stranded map entry would cause it to
+        // subscribe to the dead tx, get rx.changed().await Err, and fail.
+        let r2 = sync.clone().fetch_body(cid).await;
+        assert!(
+            r2.is_ok(),
+            "post-cancel fetch should start fresh, got {r2:?}"
+        );
+        assert_eq!(r2.unwrap(), bytes);
+
+        // The counter should now be at least 2: the aborted fetch started
+        // the fetcher once, and the post-cancel fetch_body started it again.
+        let n = count.load(Ordering::SeqCst);
+        assert!(
+            n >= 2,
+            "expected ≥2 outbound fetches after cancel-then-retry, got {n}"
+        );
     }
 }
