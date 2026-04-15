@@ -145,6 +145,7 @@ export interface MailMessageDetail {
   isReply: boolean;
   isForward: boolean;
   inReplyTo?: string;
+  bodyState: 'local' | 'pending';
 }
 
 export interface MailFolderCounts {
