@@ -335,6 +335,21 @@ impl MailManager {
         &mut self,
         entry: harmony_mailbox::mailbox::MessageEntry,
     ) -> Result<RegisterOutcome, String> {
+        let outcome = self.register_header_only_no_persist(entry)?;
+        if matches!(outcome, RegisterOutcome::Inserted { .. }) {
+            self.save_index()?;
+        }
+        Ok(outcome)
+    }
+
+    /// Like `register_header_only` but skips persistence — callers MUST invoke
+    /// [`flush_index`] after a batch to durably commit the entries. Walkers
+    /// use this on cold-start backfill so one disk write covers a full page
+    /// (or full walk) instead of one per entry.
+    pub fn register_header_only_no_persist(
+        &mut self,
+        entry: harmony_mailbox::mailbox::MessageEntry,
+    ) -> Result<RegisterOutcome, String> {
         let cid_hex = hex::encode(entry.message_cid);
         let msg_id_hex = hex::encode(entry.message_id);
 
@@ -363,8 +378,13 @@ impl MailManager {
 
         let inbox = self.index.folders.get_mut("inbox").unwrap();
         inbox.entries.insert(0, record);
-        self.save_index()?;
         Ok(RegisterOutcome::Inserted { cid: cid_hex })
+    }
+
+    /// Persist the in-memory index. Pair with `register_header_only_no_persist`
+    /// after a batch of header inserts.
+    pub fn flush_index(&self) -> Result<(), String> {
+        self.save_index()
     }
 
     /// Verify bytes hash to cid_hex, write blob, transition matching

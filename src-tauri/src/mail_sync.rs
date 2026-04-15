@@ -34,6 +34,11 @@ enum SyncState {
         root: [u8; CID_LEN],
         started_at: Instant,
         pending_root: Option<[u8; CID_LEN]>,
+        /// The `last_walked_root` value at the moment the Idle/Error → Walking
+        /// transition happened. Carried so a strict-failure (`finish_walk_error`)
+        /// transitioning back out of Walking can preserve the previous
+        /// successful root rather than dropping it on the floor.
+        prev_last_walked_root: Option<[u8; CID_LEN]>,
     },
     Error {
         last_error: String,
@@ -126,17 +131,38 @@ impl<R: Runtime> MailSync<R> {
     pub async fn refresh_now(self: Arc<Self>) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.refresh_tx.send(reply_tx).await.is_err() {
-            tracing::warn!("refresh channel closed; cannot refresh");
+            let msg = "refresh channel closed".to_string();
+            tracing::warn!("{msg}");
+            self.report_refresh_error(msg);
             return;
         }
         match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
             Ok(Ok(Ok(payload))) => {
                 self.handle_startup_query_reply(payload.as_deref()).await;
             }
-            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "refresh root query failed"),
-            Ok(Err(_)) => tracing::warn!("refresh reply channel dropped"),
-            Err(_) => tracing::warn!("refresh root query timed out (10s)"),
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(error = %e, "refresh root query failed");
+                self.report_refresh_error(format!("refresh failed: {e}"));
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("refresh reply channel dropped");
+                self.report_refresh_error("refresh reply dropped".to_string());
+            }
+            Err(_) => {
+                tracing::warn!("refresh root query timed out (10s)");
+                self.report_refresh_error("refresh timed out (10s)".to_string());
+            }
         }
+    }
+
+    /// Surface a refresh failure to the UI without disturbing the walker
+    /// state machine. Stale Walking/Idle/Error states still describe the
+    /// last walk attempt; a refresh failure is its own event.
+    fn report_refresh_error(self: &Arc<Self>, message: String) {
+        self.emit_status(SyncStatusEvent {
+            state: "error",
+            error: Some(message),
+        });
     }
 
     /// Lazy body fetch. Called from the fetch_mail_body Tauri command.
@@ -200,9 +226,11 @@ impl<R: Runtime> MailSync<R> {
         }
         impl Drop for InFlightGuard<'_> {
             fn drop(&mut self) {
-                if let Ok(mut m) = self.map.lock() {
-                    m.remove(&self.cid);
-                }
+                // Recover from poison so cancellation cleanup still runs even
+                // if a previous holder panicked. Matches the lock recovery
+                // pattern used elsewhere in this module.
+                let mut m = self.map.lock().unwrap_or_else(|p| p.into_inner());
+                m.remove(&self.cid);
             }
         }
         let _guard = InFlightGuard {
@@ -210,19 +238,10 @@ impl<R: Runtime> MailSync<R> {
             cid,
         };
 
-        // Perform the actual fetch + verification + persistence.
+        // Perform the actual fetch (BLAKE3-verified by fetch_cas) + parse
+        // + persist.
         let result: Result<Vec<u8>, String> = async {
             let bytes = self.fetch_cas(cid).await?;
-
-            // BLAKE3 verify: bytes must hash to the claimed CID.
-            let computed = blake3::hash(&bytes);
-            if computed.as_bytes() != &cid {
-                return Err(format!(
-                    "hash mismatch: claimed {}, computed {}",
-                    hex::encode(cid),
-                    hex::encode(computed.as_bytes())
-                ));
-            }
 
             // Structural validation: bytes must parse as a HarmonyMessage.
             harmony_mailbox::message::HarmonyMessage::from_bytes(&bytes)
@@ -250,33 +269,85 @@ impl<R: Runtime> MailSync<R> {
 
     async fn start_or_queue_walk(self: Arc<Self>, root: [u8; CID_LEN]) {
         // Single-flight: if already walking, queue the new root for later.
-        {
+        // Skip duplicates against the active root, the queued pending root,
+        // and (for Idle only) the most recent successfully-walked root.
+        let should_spawn = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             match &mut *state {
-                SyncState::Walking { pending_root, .. } => {
+                SyncState::Walking {
+                    root: walking_root,
+                    pending_root,
+                    ..
+                } => {
+                    if walking_root == &root || pending_root.as_ref() == Some(&root) {
+                        return;
+                    }
                     *pending_root = Some(root);
-                    return;
+                    false
                 }
-                _ => {
+                SyncState::Idle { last_walked_root } => {
+                    if last_walked_root.as_ref() == Some(&root) {
+                        // Already on this root — no work needed.
+                        return;
+                    }
+                    let prev = *last_walked_root;
                     *state = SyncState::Walking {
                         root,
                         started_at: Instant::now(),
                         pending_root: None,
+                        prev_last_walked_root: prev,
                     };
+                    true
+                }
+                SyncState::Error {
+                    last_walked_root, ..
+                } => {
+                    // Don't dedup on Error: a retry is exactly what the user
+                    // wants. Carry the prior last_walked_root forward so a
+                    // subsequent failure can preserve it.
+                    let prev = *last_walked_root;
+                    *state = SyncState::Walking {
+                        root,
+                        started_at: Instant::now(),
+                        pending_root: None,
+                        prev_last_walked_root: prev,
+                    };
+                    true
                 }
             }
-        }
+        };
 
-        let me = Arc::clone(&self);
-        tokio::spawn(async move {
-            me.run_walk_pass(root).await;
-        });
+        if should_spawn {
+            let me = Arc::clone(&self);
+            tokio::spawn(async move {
+                me.run_walk_loop(root).await;
+            });
+        }
     }
 
-    /// Fetch a CAS blob via the event_loop's fetch channel. 30-second budget
-    /// covers both the outbound send (which can block on channel backpressure)
+    /// Drives walk passes back-to-back inside a single spawned task. Each
+    /// pass either terminates (returns None) or hands off the queued
+    /// `pending_root` to the next iteration. Looping inline avoids the
+    /// `tokio::spawn` race where a newer push could overtake an older
+    /// queued root and leave `last_walked_root` pointing at stale state.
+    async fn run_walk_loop(self: Arc<Self>, mut root: [u8; CID_LEN]) {
+        loop {
+            match self.clone().run_walk_pass(root).await {
+                Some(next) => root = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Fetch a CAS blob via the event_loop's fetch channel and verify the
+    /// returned bytes hash to the requested CID. 30-second budget covers
+    /// both the outbound send (which can block on channel backpressure)
     /// and the reply — a stalled fetcher must never strand the walker in
     /// Walking state indefinitely.
+    ///
+    /// The hash check is centralized here so every CAS read (root, folder,
+    /// page, body) is integrity-verified — without it a misbehaving or
+    /// stale responder could steer the walker down the wrong tree.
     async fn fetch_cas(&self, cid: [u8; CID_LEN]) -> Result<Vec<u8>, String> {
         let cid_hex = hex::encode(cid);
         let work = async {
@@ -292,13 +363,24 @@ impl<R: Runtime> MailSync<R> {
                 .await
                 .map_err(|_| "fetch reply channel dropped".to_string())?
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(30), work).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("fetch timeout for {cid_hex}")),
+        let bytes = match tokio::time::timeout(std::time::Duration::from_secs(30), work).await {
+            Ok(result) => result?,
+            Err(_) => return Err(format!("fetch timeout for {cid_hex}")),
+        };
+        let computed = blake3::hash(&bytes);
+        if computed.as_bytes() != &cid {
+            return Err(format!(
+                "hash mismatch: claimed {cid_hex}, computed {}",
+                hex::encode(computed.as_bytes())
+            ));
         }
+        Ok(bytes)
     }
 
-    async fn run_walk_pass(self: Arc<Self>, root: [u8; CID_LEN]) {
+    /// One full walk pass. Returns `Some(next_root)` when a queued
+    /// `pending_root` needs another pass, or `None` when the walker
+    /// should park.
+    async fn run_walk_pass(self: Arc<Self>, root: [u8; CID_LEN]) -> Option<[u8; CID_LEN]> {
         use harmony_mailbox::mailbox::{FolderKind, MailFolder, MailRoot};
 
         self.emit_status(SyncStatusEvent {
@@ -327,21 +409,28 @@ impl<R: Runtime> MailSync<R> {
             Err(e) => return self.finish_walk_error(format!("folder parse: {e}")),
         };
 
-        // Step 3: walk pages (Task C8 implements; stub returns None).
-        let skip_summary = self.walk_pages(&folder.page_cids).await;
-
-        // Step 4: finalize state.
-        self.finish_walk(root, skip_summary);
+        // Step 3: walk pages. Local persistence failures are treated as
+        // fatal (they leave in-memory state inconsistent); remote
+        // page fetch/parse failures are skipped per the hybrid policy.
+        match self.walk_pages(&folder.page_cids).await {
+            Ok(skip_summary) => self.finish_walk(root, skip_summary),
+            Err(fatal) => self.finish_walk_error(fatal),
+        }
     }
 
     /// Walk the page CID list, fetching up to `MAX_CONCURRENT_PAGES` pages in
     /// parallel, parsing each, and registering every entry as header-only.
     ///
-    /// Hybrid error policy (Q7): page fetch and parse failures are logged
-    /// and that page is skipped — other pages continue. Returns
-    /// `Some(summary)` when any page or entry was skipped so the caller can
-    /// finalize in Error state.
-    async fn walk_pages(&self, page_cids: &[[u8; CID_LEN]]) -> Option<String> {
+    /// Hybrid error policy: page fetch and parse failures are logged and the
+    /// page is skipped (returned as `Ok(Some(skip_summary))`). Local
+    /// persistence failures (`register_header_only_no_persist`, `flush_index`)
+    /// are fatal — they leave in-memory state inconsistent — and bubble up
+    /// as `Err`.
+    ///
+    /// Page entries are registered in REVERSE wire order so the inbox's
+    /// newest-first invariant (insert at index 0) ends up matching the
+    /// gateway's newest-first ordering of pages and within-page entries.
+    async fn walk_pages(&self, page_cids: &[[u8; CID_LEN]]) -> Result<Option<String>, String> {
         use futures::future::join_all;
         use harmony_mailbox::mailbox::MailPage;
         use tokio::sync::Semaphore;
@@ -353,7 +442,8 @@ impl<R: Runtime> MailSync<R> {
         const MAX_CONCURRENT_PAGES: usize = 8;
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGES));
 
-        // Fetch all pages in parallel (bounded by semaphore).
+        // Fetch all pages in parallel (bounded by semaphore). fetch_cas
+        // BLAKE3-verifies every blob before returning bytes.
         let fetch_results: Vec<(String, Result<Vec<u8>, String>)> =
             join_all(page_cids.iter().map(|cid| {
                 let cid = *cid;
@@ -367,10 +457,10 @@ impl<R: Runtime> MailSync<R> {
             }))
             .await;
 
-        // Parse each page, register entries, collecting skips.
+        // Parse pages in wire order, capturing skip stats. Successful pages
+        // are buffered for reverse-order registration below.
         let mut skipped_pages: Vec<String> = Vec::new();
-        let mut skipped_entries: usize = 0;
-        let mut new_entry_cids: Vec<String> = Vec::new();
+        let mut parsed_pages: Vec<MailPage> = Vec::with_capacity(page_cids.len());
 
         for (page_cid_hex, fetch_result) in fetch_results {
             let bytes = match fetch_result {
@@ -385,8 +475,8 @@ impl<R: Runtime> MailSync<R> {
                     continue;
                 }
             };
-            let page = match MailPage::from_bytes(&bytes) {
-                Ok(p) => p,
+            match MailPage::from_bytes(&bytes) {
+                Ok(p) => parsed_pages.push(p),
                 Err(e) => {
                     tracing::warn!(
                         page_cid = %page_cid_hex,
@@ -394,38 +484,46 @@ impl<R: Runtime> MailSync<R> {
                         "page parse failed; skipping"
                     );
                     skipped_pages.push(page_cid_hex);
-                    continue;
-                }
-            };
-            for entry in page.entries {
-                // Inner scope: std::sync::Mutex guard does NOT cross .await.
-                // register_header_only is synchronous and the guard drops at
-                // the end of this iteration before the next loop turn.
-                let mut mgr = self.mail_mgr.lock().unwrap_or_else(|p| p.into_inner());
-                match mgr.register_header_only(entry) {
-                    Ok(crate::mail::RegisterOutcome::Inserted { cid }) => {
-                        new_entry_cids.push(cid);
-                    }
-                    Ok(crate::mail::RegisterOutcome::Duplicate) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "register_header_only failed; skipping entry");
-                        skipped_entries += 1;
-                    }
                 }
             }
         }
 
+        // Register entries in REVERSE wire order under a single lock, then
+        // flush index once. This keeps display ordering newest-first (each
+        // insert(0) on top of an oldest-first build) and amortizes disk I/O
+        // — one save_index per walk instead of one per entry.
+        let mut new_entry_cids: Vec<String> = Vec::new();
+        {
+            let mut mgr = self.mail_mgr.lock().unwrap_or_else(|p| p.into_inner());
+            for page in parsed_pages.into_iter().rev() {
+                for entry in page.entries.into_iter().rev() {
+                    match mgr.register_header_only_no_persist(entry) {
+                        Ok(crate::mail::RegisterOutcome::Inserted { cid }) => {
+                            new_entry_cids.push(cid);
+                        }
+                        Ok(crate::mail::RegisterOutcome::Duplicate) => {}
+                        Err(e) => {
+                            // Local error — index may be inconsistent. Abort
+                            // the walk so we don't silently lose entries.
+                            return Err(format!("register header: {e}"));
+                        }
+                    }
+                }
+            }
+            mgr.flush_index().map_err(|e| format!("flush index: {e}"))?;
+        }
+
         // Emit per-new-entry Tauri events so the frontend updates its inbox.
         // Matches Phase 0 receive_message pattern: one event per newly-inserted
-        // entry, with the EntryRecord as payload. Emitted AFTER all
-        // registrations so we don't surface entries that might turn out to
-        // fail later in the same page.
+        // entry, with the EntryRecord as payload. Emitted AFTER flush so
+        // crash-recovery from disk matches what we surfaced over the channel.
         //
         // Delta-only stream: the frontend must seed its inbox view from a
-        // `list_folder`-backed command on mount. If the walker crashes after
-        // save_index but before emit, the entries are persisted but no event
-        // fires on a subsequent re-walk (Duplicate → silent). The UI recovers
-        // from persisted state on next list_folder, not from replayed events.
+        // `list_folder`-backed command on mount. If the walker crashes
+        // between flush and emit, the entries are persisted but no event
+        // fires on a subsequent re-walk (Duplicate → silent). The UI
+        // recovers from persisted state on next list_folder, not from
+        // replayed events.
         //
         // Resolve all entries in ONE lock acquisition (O(N)) rather than
         // re-scanning the inbox per CID (O(N²) and previously capped at 1000
@@ -449,87 +547,115 @@ impl<R: Runtime> MailSync<R> {
             }
         }
 
-        if skipped_pages.is_empty() && skipped_entries == 0 {
-            None
+        if skipped_pages.is_empty() {
+            Ok(None)
         } else {
-            Some(format!(
-                "skipped {} page(s), {} entr(y/ies)",
-                skipped_pages.len(),
-                skipped_entries
-            ))
+            Ok(Some(format!("skipped {} page(s)", skipped_pages.len())))
         }
     }
 
-    fn finish_walk_error(self: Arc<Self>, error: String) {
-        // Single locked scope: read prior last_walked_root and install the
-        // new Error state atomically. (Splitting read and write across two
-        // lock acquisitions would be correct but pointlessly gives another
-        // observer a chance to see intermediate state.)
-        //
-        // Known limitation: when prior state is Walking, we lose the pre-walk
-        // last_walked_root (not carried in the Walking variant). Acceptable
-        // for Phase 2 — tracked in ZEB-114 follow-ups; surfaces only once
-        // last_walked_root becomes load-bearing (C12 refresh_now / UI).
-        {
+    /// Single locked scope: read prior `last_walked_root`/`pending_root`,
+    /// then install the new state atomically. If a `pending_root` was
+    /// queued during the failed walk, transition directly to a fresh
+    /// Walking state for that root and return it — the caller's loop will
+    /// pick it up as the next pass. Otherwise fall through to Error and
+    /// return None.
+    fn finish_walk_error(self: Arc<Self>, error: String) -> Option<[u8; CID_LEN]> {
+        let next_root = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            let last_walked = match &*state {
-                SyncState::Walking { .. } => None,
+            let (carried_last_walked, pending) = match &*state {
+                SyncState::Walking {
+                    pending_root,
+                    prev_last_walked_root,
+                    ..
+                } => (*prev_last_walked_root, *pending_root),
                 SyncState::Idle { last_walked_root }
                 | SyncState::Error {
                     last_walked_root, ..
-                } => *last_walked_root,
+                } => (*last_walked_root, None),
             };
-            *state = SyncState::Error {
-                last_error: error.clone(),
-                last_walked_root: last_walked,
-            };
-        }
+            match pending {
+                Some(next) => {
+                    *state = SyncState::Walking {
+                        root: next,
+                        started_at: Instant::now(),
+                        pending_root: None,
+                        prev_last_walked_root: carried_last_walked,
+                    };
+                }
+                None => {
+                    *state = SyncState::Error {
+                        last_error: error.clone(),
+                        last_walked_root: carried_last_walked,
+                    };
+                }
+            }
+            pending
+        };
         self.emit_status(SyncStatusEvent {
             state: "error",
             error: Some(error),
         });
+        next_root
     }
 
-    fn finish_walk(self: Arc<Self>, root: [u8; CID_LEN], skip_summary: Option<String>) {
-        let pending = {
+    fn finish_walk(
+        self: Arc<Self>,
+        root: [u8; CID_LEN],
+        skip_summary: Option<String>,
+    ) -> Option<[u8; CID_LEN]> {
+        let next_root = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let pending = if let SyncState::Walking { pending_root, .. } = &*state {
                 *pending_root
             } else {
                 None
             };
-            *state = match skip_summary.clone() {
-                None => SyncState::Idle {
-                    last_walked_root: Some(root),
-                },
-                Some(summary) => SyncState::Error {
-                    last_error: summary,
-                    last_walked_root: Some(root),
-                },
-            };
+            match pending {
+                Some(next) => {
+                    // Promote queued root to active inline — same lock,
+                    // no `tokio::spawn` race window where a newer push
+                    // could overtake.
+                    *state = SyncState::Walking {
+                        root: next,
+                        started_at: Instant::now(),
+                        pending_root: None,
+                        prev_last_walked_root: Some(root),
+                    };
+                }
+                None => {
+                    *state = match skip_summary.clone() {
+                        None => SyncState::Idle {
+                            last_walked_root: Some(root),
+                        },
+                        Some(summary) => SyncState::Error {
+                            last_error: summary,
+                            last_walked_root: Some(root),
+                        },
+                    };
+                }
+            }
             pending
         };
 
-        // Emit terminal event based on the new state.
-        let event = match skip_summary {
-            None => SyncStatusEvent {
-                state: "idle",
-                error: None,
-            },
-            Some(summary) => SyncStatusEvent {
-                state: "error",
-                error: Some(summary),
-            },
-        };
-        self.emit_status(event);
-
-        // Re-walk if pending root was queued.
-        if let Some(next_root) = pending {
-            let me = Arc::clone(&self);
-            tokio::spawn(async move {
-                me.start_or_queue_walk(next_root).await;
-            });
+        // Only emit a terminal event when this pass actually parks the
+        // walker. If a pending root was queued, the next pass will emit
+        // its own "syncing" — skipping this avoids an idle→syncing flicker.
+        if next_root.is_none() {
+            let event = match skip_summary {
+                None => SyncStatusEvent {
+                    state: "idle",
+                    error: None,
+                },
+                Some(summary) => SyncStatusEvent {
+                    state: "error",
+                    error: Some(summary),
+                },
+            };
+            self.emit_status(event);
         }
+
+        next_root
     }
 
     fn emit_status(&self, event: SyncStatusEvent) {
@@ -1056,10 +1182,10 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1, "should only fetch once");
     }
 
-    /// Regression test for the cancellation-leak hazard (C10 review I-2):
-    /// if the primary's future is dropped mid-fetch, the in-flight map entry
-    /// MUST be cleared so subsequent callers can start a fresh fetch rather
-    /// than be stuck subscribing to a dead channel forever.
+    /// Regression test for the cancellation-leak hazard: if the primary's
+    /// future is dropped mid-fetch, the in-flight map entry MUST be cleared
+    /// so subsequent callers can start a fresh fetch rather than be stuck
+    /// subscribing to a dead channel forever.
     #[tokio::test]
     async fn fetch_body_cancellation_clears_in_flight_entry() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1127,6 +1253,212 @@ mod tests {
         assert!(
             n >= 2,
             "expected ≥2 outbound fetches after cancel-then-retry, got {n}"
+        );
+    }
+
+    /// Builds a one-entry mailbox tree keyed by `seed`. Returns the root CID
+    /// and every CAS blob the walker will need to reach the entry.
+    fn make_one_entry_tree(seed: u8) -> ([u8; 32], Vec<([u8; 32], Vec<u8>)>) {
+        let entry = MessageEntry {
+            message_cid: [seed; 32],
+            message_id: [seed; 16],
+            sender_address: [0; 16],
+            timestamp: 1_700_000_000 + seed as u64,
+            subject_snippet: format!("seed {seed}"),
+            read: false,
+        };
+        let page = MailPage {
+            version: MAILBOX_VERSION,
+            next_page: None,
+            entries: vec![entry],
+        };
+        let page_bytes = page.to_bytes().unwrap();
+        let page_cid: [u8; 32] = *blake3::hash(&page_bytes).as_bytes();
+
+        let folder = MailFolder {
+            version: MAILBOX_VERSION,
+            message_count: 1,
+            unread_count: 1,
+            page_cids: vec![page_cid],
+        };
+        let folder_bytes = folder.to_bytes().unwrap();
+        let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
+
+        let root = MailRoot::new_empty([0; 16], 1_700_000_000)
+            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root_bytes = root.to_bytes();
+        let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
+        (
+            root_cid,
+            vec![
+                (root_cid, root_bytes),
+                (folder_cid, folder_bytes),
+                (page_cid, page_bytes),
+            ],
+        )
+    }
+
+    /// A duplicate of the most-recently-walked root (or active root, or
+    /// queued root) must NOT trigger a second walk pass. Without this,
+    /// the cold-start `get` reply plus the first live `/root` push for the
+    /// same CID would cause the walker to re-traverse the entire tree.
+    #[tokio::test]
+    async fn duplicate_root_after_idle_does_not_rewalk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchRequest>(32);
+
+        let (root_cid, blobs) = make_one_entry_tree(0xAA);
+        let map: HashMap<[u8; 32], Vec<u8>> = blobs.into_iter().collect();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                let cid_bytes = hex::decode(&req.cid_hex).unwrap();
+                let cid: [u8; 32] = cid_bytes.try_into().unwrap();
+                let _ = req
+                    .reply
+                    .send(map.get(&cid).cloned().ok_or_else(|| "nf".into()));
+            }
+        });
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        sync.clone().handle_root_push(&root_cid).await;
+        wait_for_terminal_state(&sync, std::time::Duration::from_secs(2)).await;
+        let after_first = count.load(Ordering::SeqCst);
+
+        // Re-push the same root. Should be deduped.
+        sync.clone().handle_root_push(&root_cid).await;
+        // Give any (incorrectly) spawned walk a chance to issue fetches.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after_second = count.load(Ordering::SeqCst);
+
+        assert_eq!(
+            after_first, after_second,
+            "duplicate root push should not re-fetch any blobs"
+        );
+    }
+
+    /// If a strict failure (root/folder fetch/parse) happens while a newer
+    /// `pending_root` is queued, that newer root MUST be picked up on the
+    /// next pass — the failed walk's transition to Error must not silently
+    /// drop the queued root.
+    #[tokio::test]
+    async fn pending_root_runs_after_strict_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchRequest>(32);
+
+        // Tree 1: root_cid maps to NO blob (root fetch will fail).
+        let bad_root: [u8; 32] = [0xDE; 32];
+
+        // Tree 2: a fully-served valid tree.
+        let (good_root, good_blobs) = make_one_entry_tree(0xBB);
+        let map: HashMap<[u8; 32], Vec<u8>> = good_blobs.into_iter().collect();
+
+        // Slow fetcher so the second push lands while the first walk's
+        // initial root fetch is still in flight.
+        tokio::spawn(async move {
+            while let Some(req) = fetch_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let cid_bytes = hex::decode(&req.cid_hex).unwrap();
+                let cid: [u8; 32] = cid_bytes.try_into().unwrap();
+                let _ = req
+                    .reply
+                    .send(map.get(&cid).cloned().ok_or_else(|| "nf".into()));
+            }
+        });
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        sync.clone().handle_root_push(&bad_root).await;
+        // Give the walker a moment to enter Walking on bad_root before the
+        // second push so good_root coalesces as pending_root.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        sync.clone().handle_root_push(&good_root).await;
+
+        wait_for_terminal_state(&sync, std::time::Duration::from_secs(5)).await;
+
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        assert_eq!(
+            inbox.len(),
+            1,
+            "good_root entry should be registered after bad_root fails; inbox: {inbox:?}"
+        );
+    }
+
+    /// Walker iterates pages and within-page entries in REVERSE wire order
+    /// so the inbox's newest-first invariant (insert at index 0) preserves
+    /// the gateway's intended ordering. Failure mode without the reverse:
+    /// the oldest entry ends up at the top of the inbox.
+    #[tokio::test]
+    async fn walk_preserves_newest_first_wire_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mail_mgr = Arc::new(Mutex::new(MailManager::load(
+            &tmp.path().join("mail"),
+            [0u8; 16],
+        )));
+        let (fetch_tx, fetch_rx) = mpsc::channel(32);
+
+        // Wire: page entries[0] is newest. Build [newest, mid, oldest].
+        let entries: Vec<MessageEntry> = (0..3)
+            .rev()
+            .map(|i| MessageEntry {
+                message_cid: [i as u8; 32],
+                message_id: [i as u8; 16],
+                sender_address: [0; 16],
+                timestamp: 1_700_000_000 + i as u64,
+                subject_snippet: format!("entry {i}"),
+                read: false,
+            })
+            .collect();
+        // entries now = [i=2 (newest), i=1, i=0 (oldest)]
+
+        let page = MailPage {
+            version: MAILBOX_VERSION,
+            next_page: None,
+            entries,
+        };
+        let page_bytes = page.to_bytes().unwrap();
+        let page_cid: [u8; 32] = *blake3::hash(&page_bytes).as_bytes();
+        let folder = MailFolder {
+            version: MAILBOX_VERSION,
+            message_count: 3,
+            unread_count: 3,
+            page_cids: vec![page_cid],
+        };
+        let folder_bytes = folder.to_bytes().unwrap();
+        let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
+        let root = MailRoot::new_empty([0; 16], 1_700_000_000)
+            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root_bytes = root.to_bytes();
+        let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
+
+        let mut stub = StubFetcher::new();
+        stub.insert(root_cid, root_bytes);
+        stub.insert(folder_cid, folder_bytes);
+        stub.insert(page_cid, page_bytes);
+        tokio::spawn(stub.run(fetch_rx));
+
+        let sync = make_test_mail_sync(fetch_tx, mail_mgr.clone());
+        sync.clone().handle_root_push(&root_cid).await;
+        wait_for_terminal_state(&sync, std::time::Duration::from_secs(2)).await;
+
+        let inbox = mail_mgr.lock().unwrap().list_folder("inbox", 0, 100);
+        let ids: Vec<String> = inbox.iter().map(|e| e.message_id.clone()).collect();
+        // Display order should match wire order: newest (i=2) at index 0.
+        assert_eq!(
+            ids,
+            vec![hex::encode([2u8; 16]), hex::encode([1u8; 16]), hex::encode([0u8; 16])],
+            "inbox should preserve newest-first wire order"
         );
     }
 }
