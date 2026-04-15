@@ -41,12 +41,11 @@ enum SyncState {
     },
 }
 
-/// Request to fetch a CAS blob from the gateway. Mirrors the existing
-/// FetchRequest pattern used by event_loop's fetch_rx channel.
-pub struct FetchRequest {
-    pub cid_hex: String,
-    pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
-}
+/// Request to fetch a CAS blob from the gateway. Re-exported from
+/// `event_loop` so lib.rs can clone the same `fetch_tx` Sender into
+/// both the event loop (which owns the receiver) and MailSync (which
+/// produces requests during walker traversal and lazy body fetch).
+pub use crate::event_loop::FetchRequest;
 
 /// Request to query the gateway for the current root CID. Reply carries
 /// the raw payload (Some) or None if no mail exists for this address.

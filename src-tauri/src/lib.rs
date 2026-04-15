@@ -41,6 +41,9 @@ struct NodeState {
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Shared mail manager (read/written by event loop on receive, by commands for queries).
     mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
+    /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
+    /// commands (refresh_mail, fetch_mail_body) can reach it.
+    mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
@@ -248,11 +251,11 @@ async fn start_node(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
-    // C12: mail refresh channel. The sender end is dropped immediately —
-    // C13 will wire a real MailSync instance that owns the refresh_tx.
-    // With no senders held, the receiver just yields None and the
-    // corresponding select! arm never fires.
-    let (_mail_refresh_tx, mail_refresh_rx) =
+    // Mail refresh channel. MailSync (constructed below once identity is
+    // loaded) owns the sender; the event loop's select! arm services
+    // RefreshRequests by issuing a Zenoh get against the gateway's
+    // mail-root queryable.
+    let (mail_refresh_tx, mail_refresh_rx) =
         tokio::sync::mpsc::channel::<crate::mail_sync::RefreshRequest>(8);
 
     // Load the follow list from disk and create the shared followed set.
@@ -286,6 +289,7 @@ async fn start_node(
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
+        let _old_mail_sync = guard.mail_sync.take();
         drop(guard);
         drop(old_publish);
         drop(old_fetch);
@@ -318,6 +322,18 @@ async fn start_node(
         // Initialize mail manager (needs owner address from identity).
         mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(
             mail::MailManager::load(&app_data_dir.join("mail"), our_addr_bytes),
+        ));
+
+        // Construct MailSync now that identity, mail_mgr, and the refresh
+        // channel are all available. Owns a clone of fetch_tx (so commands
+        // keep their own sender in AppState) and the sole refresh_tx.
+        let own_addr_hex = hex::encode(our_addr_bytes);
+        let mail_sync = std::sync::Arc::new(mail_sync::MailSync::new(
+            fetch_tx.clone(),
+            mail_refresh_tx,
+            std::sync::Arc::clone(&mail_mgr),
+            own_addr_hex,
+            app.clone(),
         ));
 
         let node_addr_for_state = node_addr.clone();
@@ -364,6 +380,7 @@ async fn start_node(
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
+        let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
             .spawn(move || {
@@ -389,8 +406,7 @@ async fn start_node(
                         voice_channel_rx,
                         followed_set_clone,
                         mail_mgr_clone,
-                        // C13 will replace None with a real MailSync instance.
-                        None,
+                        Some(mail_sync_for_loop),
                         mail_refresh_rx,
                     )
                     .await;
@@ -409,6 +425,7 @@ async fn start_node(
         guard.follow_mgr = Some(follow_mgr);
         guard.followed_set = Some(followed_set);
         guard.mail_mgr = Some(mail_mgr);
+        guard.mail_sync = Some(mail_sync);
         guard.node_addr = node_addr_for_state;
         guard.generation
     };
