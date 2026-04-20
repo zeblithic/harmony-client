@@ -11,7 +11,7 @@
     "moduleResolution": "bundler",
     "baseUrl": ".",
     "paths": {
-      "harmony-stq8": ["../harmony-stq8/stq8-web/pkg/stq8_web"]
+      "harmony-stq8": ["src/lib/stq8-stub"]
     },
     "strict": true,
     "noUnusedLocals": true,
