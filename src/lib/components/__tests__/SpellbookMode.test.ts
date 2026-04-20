@@ -5,12 +5,20 @@ import SpellbookMode from '../SpellbookMode.svelte';
 function createMockService() {
   return {
     isReady: vi.fn().mockReturnValue(true),
+    isCalibrated: vi.fn().mockReturnValue(false),
     getLevelInfo: vi.fn().mockReturnValue({
       total_bytes: 1, bytes_per_row: 1, num_rows: 1, total_bits: 8,
     }),
     generateChallenge: vi.fn().mockReturnValue({
       level: 'Novice', data: [0x42], rows: [[0x42]],
     }),
+    validateRow: vi.fn().mockReturnValue({ matched: true, expected: [], heard: [] }),
+    processPcm: vi.fn().mockReturnValue({ syllables: [] }),
+    addCalibrationSample: vi.fn(),
+    finalizeCalibration: vi.fn(),
+    exportProfile: vi.fn().mockReturnValue('{}'),
+    importProfile: vi.fn(),
+    setCreatedEpochSecs: vi.fn(),
   };
 }
 

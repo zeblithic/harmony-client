@@ -51,4 +51,28 @@ export class WasmPipeline {
   static level_info(_level: number): string {
     throw new Error(STUB_ERROR);
   }
+
+  add_calibration_sample(_syllable_index: number, _pcm: Float32Array): void {
+    throw new Error(STUB_ERROR);
+  }
+
+  finalize_calibration(): void {
+    throw new Error(STUB_ERROR);
+  }
+
+  is_calibrated(): boolean {
+    return false;
+  }
+
+  export_profile(): string {
+    throw new Error(STUB_ERROR);
+  }
+
+  import_profile(_json: string): void {
+    throw new Error(STUB_ERROR);
+  }
+
+  set_created_epoch_secs(_secs: bigint): void {
+    throw new Error(STUB_ERROR);
+  }
 }
