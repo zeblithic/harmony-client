@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type {
     FlashcardLevel,
     Challenge,
@@ -40,7 +41,9 @@
   let rowStates = $state<RowState[]>([]);
   let pttActive = $state(false);
   let showHint = $state(false);
-  let stats = $state(initialStats);
+  // initialStats seeds session state once; subsequent updates are driven
+  // locally and flushed back through onStatsUpdate.
+  let stats = $state(untrack(() => initialStats));
   // Accumulated active PTT time (ms) for the current card, excluding off-air gaps.
   let cardActiveMs = $state(0);
   let pttSegmentStart = $state<number | null>(null);

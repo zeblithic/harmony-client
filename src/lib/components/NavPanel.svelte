@@ -43,10 +43,14 @@
     onManageBuddies?: () => void;
   } = $props();
 
-  let navNodes = $state<NavNode[]>(nodes);
+  // Local mirror of the nodes prop: user interactions (toggle/display/sort)
+  // mutate navNodes directly, so we can't use $derived here. $effect.pre runs
+  // synchronously before the DOM commit, so navNodes is populated on first
+  // render and re-synced whenever the prop changes.
+  let navNodes = $state<NavNode[]>([]);
   let searchQuery = $state('');
 
-  $effect(() => {
+  $effect.pre(() => {
     navNodes = [...nodes];
   });
 

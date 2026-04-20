@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { Profile } from '../types';
   import Avatar from './Avatar.svelte';
 
@@ -13,8 +14,8 @@
   // Local edit state — initialized from props once. Not re-synced on prop
   // changes because the user is actively editing. If future network sync
   // updates the profile while the editor is open, add a $effect to re-sync.
-  let displayName = $state(profile.displayName);
-  let statusText = $state(profile.statusText ?? '');
+  let displayName = $state(untrack(() => profile.displayName));
+  let statusText = $state(untrack(() => profile.statusText ?? ''));
   let saved = $state(false);
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
 

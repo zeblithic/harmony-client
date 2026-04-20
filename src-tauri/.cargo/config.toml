@@ -1,0 +1,23 @@
+# Windows: bump the PE image default thread stack to 8 MiB.
+#
+# Debug builds produce very large async state machines; Zenoh 1.x spins up
+# its own internal tokio runtime whose worker threads overflow the default
+# 2 MiB stack during session setup (STATUS_STACK_OVERFLOW / 0xc00000fd).
+# See ZEB-149.
+#
+# `/STACK:...` is MSVC linker syntax — only apply on the MSVC toolchain.
+# Bare `cfg(windows)` would break `windows-gnu` builds because lld/ld.bfd
+# don't accept MSVC-style linker options.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# Rust std's thread::min_stack() reads RUST_MIN_STACK at runtime (default
+# 2 MiB). Belt-and-suspenders for `cargo run` / `tauri dev` launches —
+# this doesn't reach release binaries run directly (Cargo's [env] only
+# applies to subprocesses Cargo spawns). The authoritative fix for
+# *our* Tokio workers is `.thread_stack_size()` on the runtime builder
+# in src-tauri/src/lib.rs; this [env] entry is a best-effort safety net
+# for Zenoh's *internal* runtime (whose workers we can't configure)
+# during dev. `force = true` ensures this wins over any pre-set value.
+[env]
+RUST_MIN_STACK = { value = "8388608", force = true }

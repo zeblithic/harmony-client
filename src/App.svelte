@@ -41,8 +41,8 @@
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
-    messageService.ownDisplayName = profile.displayName || 'You';
-    vineService.ownDisplayName = profile.displayName || 'You';
+    // messageService.ownDisplayName / vineService.ownDisplayName are kept
+    // in sync by a `$effect` later in the script (single source of truth).
     // Publish to network if Tauri is available.
     // Uses direct invoke rather than ZenohService.publishProfile() because
     // ZenohService lives in NetworkApp (not accessible here). Both paths
@@ -81,7 +81,6 @@
     followedAddresses = new Set(vineService.followedAddresses);
     vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
   };
-  vineService.ownDisplayName = myProfile.displayName || 'You';
 
   function handleMarkVineViewed(id: string) {
     vineService.markViewed(id);
@@ -224,7 +223,13 @@
   // Wire onChange so both online (Zenoh echo) and offline (local append)
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
-  messageService.ownDisplayName = myProfile.displayName || 'You';
+
+  // Keep the display name on both services in sync with profile edits.
+  $effect(() => {
+    const name = myProfile.displayName || 'You';
+    vineService.ownDisplayName = name;
+    messageService.ownDisplayName = name;
+  });
 
   // Try to wire up real Tauri transport (messages, vines, file manager).
   (async () => {
@@ -235,6 +240,16 @@
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
       };
+      // Boot the harmony node in standalone mode (no upstream endpoint) so
+      // identity loads and mail_mgr is ready before adapters wire up. The
+      // Network view's Connect flow can later re-invoke start_node with an
+      // endpoint to join a gateway. Failures here are non-fatal — adapters
+      // will continue with mock data if the runtime refuses to start.
+      try {
+        await invoke('start_node', { endpoint: null });
+      } catch (err) {
+        console.warn('Auto-start harmony node failed:', err);
+      }
       await messageService.connectAdapter(adapter);
       // Mail connect is isolated — it may fail if the node hasn't started yet
       // (mail_mgr requires identity). Other services must not be blocked.
@@ -264,9 +279,29 @@
         } catch { /* node not ready yet */ }
       }
       await fetchOwnAddress();
+      // Re-hydrate backend-dependent state when Zenoh reports connected.
+      // On initial boot, mail_mgr / follow list may not be ready yet
+      // (e.g. if auto-start_node failed or raced), so the first round of
+      // refreshCounts / loadFolder / loadFollowed returns empty. When a
+      // later Connect (from the Network view) succeeds and fires
+      // `zenoh-status: connected`, we re-read so the UI catches up.
+      // MailService.connectAdapter has already registered event listeners;
+      // we only re-run the idempotent data-fetch calls here — nothing
+      // double-registers. Errors are non-fatal (individual services
+      // already tolerate "not connected" / "mail not initialized").
+      async function reloadBackendState() {
+        await Promise.allSettled([
+          mailService.refreshCounts(),
+          mailService.loadFolder(mailService.activeFolder),
+          vineService.loadFollowed(),
+        ]);
+      }
       const unlistenStatus = await listen('zenoh-status', async (event) => {
         const status = (event as { payload: { status: string } }).payload;
-        if (status.status === 'connected') await fetchOwnAddress();
+        if (status.status === 'connected') {
+          await fetchOwnAddress();
+          await reloadBackendState();
+        }
       });
       // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
       // all ownAddress fields). All four services are destroyed on unmount;

@@ -1,0 +1,9 @@
+{
+  "identifier": "network-viz",
+  "description": "Capabilities for the network visualization child window. Intentionally omits `core:webview:allow-create-webview-window` (least privilege) — only the `main` window is allowed to spawn child windows.",
+  "windows": ["network-viz"],
+  "permissions": [
+    "core:default",
+    "dialog:default"
+  ]
+}
