@@ -321,14 +321,26 @@
       // `zenoh-status: connected`, we re-read so the UI catches up.
       // MailService.connectAdapter has already registered event listeners;
       // we only re-run the idempotent data-fetch calls here — nothing
-      // double-registers. Errors are non-fatal (individual services
-      // already tolerate "not connected" / "mail not initialized").
+      // double-registers.
+      //
+      // Each service internally swallows *expected* errors (missing
+      // adapter, "not connected", "mail not initialized"), so rejections
+      // that bubble up here are unexpected — log them at warn level with
+      // the service tag, matching the ZEB-148 convention. Rejections
+      // don't block the other refreshes (allSettled) since the UI should
+      // catch up whatever it can.
       async function reloadBackendState() {
-        await Promise.allSettled([
-          mailService.refreshCounts(),
-          mailService.loadFolder(mailService.activeFolder),
-          vineService.loadFollowed(),
-        ]);
+        const tasks = [
+          ['mail.refreshCounts', mailService.refreshCounts()],
+          ['mail.loadFolder', mailService.loadFolder(mailService.activeFolder)],
+          ['vine.loadFollowed', vineService.loadFollowed()],
+        ] as const;
+        const results = await Promise.allSettled(tasks.map(([, p]) => p));
+        for (const [i, result] of results.entries()) {
+          if (result.status === 'rejected') {
+            console.warn(`[harmony-client] ${tasks[i][0]} failed after reconnect:`, result.reason);
+          }
+        }
       }
       const unlistenStatus = await listen('zenoh-status', async (event) => {
         const status = (event as { payload: { status: string } }).payload;
