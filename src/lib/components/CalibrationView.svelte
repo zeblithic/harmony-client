@@ -43,14 +43,17 @@
   type Phase = 'intro' | 'requesting' | 'recording' | 'finalizing' | 'done' | 'error';
   let phase = $state<Phase>(isCalibrated ? 'done' : 'intro');
 
-  // Initial $state capture is a snapshot — if the parent's isCalibrated flips
-  // true after we mount (async WASM init, then profile import, while the user
-  // happened to be sitting on the Calibrate tab), we also need to advance the
-  // phase to 'done'. Only advance from 'intro' so we don't clobber an
-  // in-progress recording/finalizing flow or an error surface the user should
-  // still see.
+  // The auto-advance effect below is a *boot-time* convenience — it catches
+  // the case where the user happened to land on the Calibrate tab before
+  // async WASM init + profile import flipped the parent's `isCalibrated`
+  // from false to true. Once the user explicitly starts a recalibration,
+  // the state machine here is authoritative and the effect must not
+  // second-guess it; otherwise `handleRecalibrate()` setting `phase='intro'`
+  // while `isCalibrated` is still true would instantly bounce back to
+  // `done`, making Recalibrate a no-op.
+  let suppressAutoDone = $state(false);
   $effect(() => {
-    if (isCalibrated && phase === 'intro') {
+    if (!suppressAutoDone && isCalibrated && phase === 'intro') {
       phase = 'done';
     }
   });
@@ -58,11 +61,44 @@
   let isHolding = $state(false);
   let errorMsg = $state('');
   let lastSampleWasShort = $state(false);
-  // True after a successful saveProfile() in this session's flow. False when
-  // localStorage wasn't available or setItem rejected (quota / SecurityError
-  // in restricted contexts). Gates the "Your voice profile is saved" copy in
-  // the done phase so we don't lie to the user about persistence.
-  let profilePersisted = $state(true);
+
+  // The done-phase copy has three legitimate variants that the UI needs to
+  // disambiguate: "saved" (storage is consistent with the live classifier),
+  // "save-failed-fallback" (this session's write failed but a previous
+  // profile still lives in storage — reload will recover to the old
+  // calibration), and "save-failed-no-fallback" (this session's write
+  // failed and there's nothing in storage — reload will wipe calibration
+  // entirely).
+  //
+  // A plain boolean can't express this because it conflates remount
+  // scenarios (fresh mount, no save attempted here, but storage may or may
+  // not hold something) with the active-save-attempt scenario. Instead we
+  // track:
+  //   - `didAttemptSave`: did *this mount* run finishCalibration's save?
+  //   - `sessionSaveSucceeded`: if so, did it succeed?
+  //   - `hadFallbackBefore`: snapshot of whether storage had a profile
+  //     *before* this session's save attempt — needed to distinguish
+  //     save-failed-fallback from save-failed-no-fallback.
+  //
+  // If `didAttemptSave` is false (e.g. we remounted after a tab switch),
+  // the derivation falls back to a fresh `loadProfile()` check — so the
+  // message survives tab navigation even though the component unmounts.
+  let didAttemptSave = $state(false);
+  let sessionSaveSucceeded = $state(false);
+  let hadFallbackBefore = $state(false);
+
+  type DoneMessage = 'saved' | 'save-failed-fallback' | 'save-failed-no-fallback';
+  let doneMessage = $derived.by<DoneMessage>(() => {
+    if (didAttemptSave) {
+      if (sessionSaveSucceeded) return 'saved';
+      return hadFallbackBefore ? 'save-failed-fallback' : 'save-failed-no-fallback';
+    }
+    // Remount path: no save happened this mount, but storage may still hold
+    // a profile from a previous mount or a boot-time import. Treat presence
+    // as "saved" (something will load on next reload), absence as the
+    // no-fallback warning.
+    return profileStorage.loadProfile() !== null ? 'saved' : 'save-failed-no-fallback';
+  });
 
   let audioCapture: AudioCapture | null = null;
   let recordingBuffer: Float32Array[] = [];
@@ -136,7 +172,13 @@
       stq8Service.finalizeCalibration();
       stq8Service.setCreatedEpochSecs(BigInt(Math.floor(Date.now() / 1000)));
       const profileJson = stq8Service.exportProfile();
-      profilePersisted = profileStorage.saveProfile(profileJson);
+      // Snapshot the fallback state *before* the overwrite attempt so we can
+      // distinguish "save-failed-no-fallback" (no old profile to fall back
+      // to) from "save-failed-fallback" (old profile still loadable on
+      // reload) in the done-phase copy.
+      hadFallbackBefore = profileStorage.loadProfile() !== null;
+      sessionSaveSucceeded = profileStorage.saveProfile(profileJson);
+      didAttemptSave = true;
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
       phase = 'error';
@@ -170,11 +212,18 @@
     // mic permission or bails mid-flow, we want the previous working profile
     // still in localStorage so the next boot reloads it. saveProfile() in
     // finishCalibration() overwrites atomically when the new flow succeeds.
+    //
+    // suppressAutoDone gates the boot-time auto-advance $effect — without it
+    // the effect would instantly bounce phase back to 'done' because
+    // isCalibrated is still true (old classifier hasn't been discarded).
+    suppressAutoDone = true;
     phase = 'intro';
     currentIndex = 0;
     errorMsg = '';
     lastSampleWasShort = false;
-    profilePersisted = true;
+    didAttemptSave = false;
+    sessionSaveSucceeded = false;
+    hadFallbackBefore = false;
   }
 
   // On unmount — stop capture so the mic indicator clears and browser
@@ -253,12 +302,17 @@
   {:else if phase === 'done'}
     <div class="done-ui">
       <h2>Calibrated ✓</h2>
-      {#if profilePersisted}
+      {#if doneMessage === 'saved'}
         <p>Your voice profile is saved. Head to the Practice tab to try it out.</p>
+      {:else if doneMessage === 'save-failed-fallback'}
+        <p class="persistence-warning" role="alert">
+          Couldn't update your saved profile — your previous calibration is still on disk and will load on the next reload.
+          Check the console for details (common causes: quota exceeded, disabled storage).
+        </p>
       {:else}
         <p class="persistence-warning" role="alert">
-          Calibration works for this session, but your profile couldn't be saved — you'll need to re-calibrate on the next reload.
-          Check the console for details (common causes: storage disabled, quota exceeded, private-browsing context).
+          Calibration works for this session, but no profile is persisted — you'll need to re-calibrate on the next reload.
+          Check the console for details (common causes: storage disabled, private-browsing context).
         </p>
       {/if}
       <button type="button" class="secondary" onclick={handleRecalibrate}>Recalibrate</button>

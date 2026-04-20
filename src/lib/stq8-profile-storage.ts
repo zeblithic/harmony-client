@@ -54,7 +54,17 @@ export function saveProfile(json: string): boolean {
   }
 }
 
-/** Wipe the stored profile (used by "Recalibrate" flow). */
+/**
+ * Forcibly remove the stored profile.
+ *
+ * Used by App.svelte's boot-time corrupt-profile recovery path — if
+ * `importProfile` rejects a stored blob as malformed, we clear it so the
+ * next boot doesn't re-hit the same poison. **Not** called from the
+ * Recalibrate UX flow: recalibration leaves the old profile in place until
+ * `saveProfile` atomically overwrites on successful finalize, so a
+ * permission denial or mid-flow bail doesn't strand the user without a
+ * calibration.
+ */
 export function clearProfile(): void {
   if (!hasLocalStorage()) return;
   try {
