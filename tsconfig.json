@@ -9,6 +9,10 @@
     "isolatedModules": true,
     "moduleDetection": "force",
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "harmony-stq8": ["src/lib/stq8-stub"]
+    },
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
