@@ -12,6 +12,7 @@
   import ConnectionBar from './lib/components/ConnectionBar.svelte';
   import { discoveredToNetworkNode, pruneRingBufferCache, filterStaleNodes } from './lib/zenoh-utils';
   import { loadProfile } from './lib/profile-service';
+  import { isTauri } from './lib/tauri-env';
 
   let service = new MockNetworkDataService();
   let nodes = $state<NetworkNode[]>([...service.nodes]);
@@ -33,7 +34,16 @@
   // Detect Tauri environment and create real ZenohService.
   // Uses a `destroyed` flag to handle the race where the component
   // unmounts before the async init resolves — prevents listener leaks.
+  //
+  // Environment check first: if we're not in Tauri, mock data stays.
+  // Past that check, init failure is a real bug (service constructor
+  // threw, adapter.listen rejected, etc.) — surface it with a warning
+  // rather than silently falling through to mock data.
   async function initZenohService() {
+    if (!isTauri()) {
+      console.info('[network-viz] Tauri not detected — ZenohService disabled, using mock data');
+      return;
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const { listen } = await import('@tauri-apps/api/event');
@@ -57,10 +67,9 @@
       } else {
         zenohService = svc;
       }
-    } catch {
-      // Not in Tauri or init failed — zenohService stays null, stubs used
+    } catch (err) {
+      console.warn('[network-viz] ZenohService init failed:', err);
       zenohService = null;
-      console.log('Tauri not available — Zenoh connection disabled');
     }
   }
 
@@ -94,11 +103,17 @@
 
   function handleConnect(endpoint: string) {
     if (zenohService) {
-      // ZenohService.connect() calls onChange → syncZenohState immediately
-      zenohService.connect(endpoint).catch(() => {});
+      // ZenohService.connect() calls onChange → syncZenohState immediately.
+      // If the backend invoke fails, ZenohService already surfaces the
+      // error via `errorMessage` (feeds into `zenohError` through
+      // syncZenohState). We log here as well so the console carries
+      // diagnostic detail beyond what the status bar shows.
+      zenohService.connect(endpoint).catch((err) => {
+        console.warn('[network-viz] zenoh connect failed:', err);
+      });
     } else {
       zenohStatus = 'connecting';
-      console.log('Zenoh connect requested (no Tauri):', endpoint);
+      console.log('[network-viz] Zenoh connect requested (no Tauri):', endpoint);
       setTimeout(() => {
         if (zenohStatus === 'connecting') zenohStatus = 'disconnected';
       }, 2000);
@@ -111,7 +126,9 @@
     discoveredCount = 0;
     zenohError = undefined;
     if (zenohService) {
-      zenohService.disconnect().catch(() => {});
+      zenohService.disconnect().catch((err) => {
+        console.warn('[network-viz] zenoh disconnect failed:', err);
+      });
     }
   }
 
