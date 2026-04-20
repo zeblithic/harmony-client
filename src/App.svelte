@@ -243,99 +243,110 @@
       console.info('[harmony-client] Tauri not detected — services using mock data');
       return;
     }
-    const { invoke } = await import('@tauri-apps/api/core');
-    const { listen } = await import('@tauri-apps/api/event');
-    const adapter = {
-      invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
-      listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
-    };
-
-    // Per-service connect wrapper: logs failures with the adapter name but
-    // doesn't cascade — a broken MessageService shouldn't kill VineService.
-    // zenoh-status re-hydration (below) covers later-connect recovery.
-    async function tryConnect(name: string, p: Promise<unknown>): Promise<void> {
-      try {
-        await p;
-      } catch (err) {
-        console.warn(`[harmony-client] ${name} adapter connect failed:`, err);
-      }
-    }
-
-    // Boot the harmony node in standalone mode (no upstream endpoint) so
-    // identity loads and mail_mgr is ready before adapters wire up. The
-    // Network view's Connect flow can later re-invoke start_node with an
-    // endpoint to join a gateway.
+    // Everything past the env check is inside Tauri, so any failure here
+    // (failed dynamic import, rejected listen() registration, anything
+    // not already guarded by tryConnect) is a real bug. Surface it with
+    // the standard tag instead of letting it become an unhandled
+    // rejection that stops init silently.
     try {
-      await invoke('start_node', { endpoint: null });
-    } catch (err) {
-      console.warn('[harmony-client] auto-start_node failed:', err);
-    }
+      const { invoke } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+      const adapter = {
+        invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
+        listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
+      };
 
-    await tryConnect('message', messageService.connectAdapter(adapter));
-    // Mail connect may fail if mail_mgr isn't ready yet (race with
-    // start_node); non-blocking so other services proceed. The
-    // zenoh-status handler below re-hydrates mail state on reconnect.
-    tryConnect('mail', mailService.connectAdapter(adapter));
-    await tryConnect('vine', vineService.connectAdapter(adapter));
-    await tryConnect('vine.loadFollowed', vineService.loadFollowed());
-    await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
-    avatarResolver.connectAdapter(adapter);
-    resolveVideoFn = async (cid: string) => {
-      const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
-      const mime = detectVideoMime(bytes);
-      const blob = new Blob([new Uint8Array(bytes)], { type: mime });
-      return URL.createObjectURL(blob);
-    };
-    await tryConnect('nav', navService.connectAdapter(adapter));
+      // Per-service connect wrapper: logs failures with the adapter name but
+      // doesn't cascade — a broken MessageService shouldn't kill VineService.
+      // zenoh-status re-hydration (below) covers later-connect recovery.
+      async function tryConnect(name: string, p: Promise<unknown>): Promise<void> {
+        try {
+          await p;
+        } catch (err) {
+          console.warn(`[harmony-client] ${name} adapter connect failed:`, err);
+        }
+      }
 
-    // Fetch our node address so self-sent messages/vines echo back as
-    // 'self'/'You'. Try immediately (node may already be connected after
-    // hot reload / auto-start), and also retry on later zenoh-status
-    // events.
-    async function fetchOwnAddress() {
+      // Boot the harmony node in standalone mode (no upstream endpoint) so
+      // identity loads and mail_mgr is ready before adapters wire up. The
+      // Network view's Connect flow can later re-invoke start_node with an
+      // endpoint to join a gateway.
       try {
-        const addr = await invoke('get_node_addr') as string;
-        messageService.ownAddress = addr;
-        vineService.ownAddress = addr;
-        navService.ownAddress = addr;
+        await invoke('start_node', { endpoint: null });
       } catch (err) {
-        // Expected while start_node is still racing with boot; the
-        // zenoh-status listener below retries on 'connected'. Logged at
-        // debug so it's discoverable but doesn't pollute the normal log.
-        console.debug('[harmony-client] get_node_addr not yet available:', err);
+        console.warn('[harmony-client] auto-start_node failed:', err);
       }
-    }
-    await fetchOwnAddress();
 
-    // Re-hydrate backend-dependent state when Zenoh reports connected.
-    // On initial boot, mail_mgr / follow list may not be ready yet (e.g.
-    // if auto-start_node failed or raced), so the first round of
-    // refreshCounts / loadFolder / loadFollowed returns empty. When a
-    // later Connect (from the Network view) succeeds and fires
-    // `zenoh-status: connected`, we re-read so the UI catches up.
-    // MailService.connectAdapter has already registered event listeners;
-    // we only re-run the idempotent data-fetch calls here — nothing
-    // double-registers. Errors are non-fatal (individual services
-    // already tolerate "not connected" / "mail not initialized").
-    async function reloadBackendState() {
-      await Promise.allSettled([
-        mailService.refreshCounts(),
-        mailService.loadFolder(mailService.activeFolder),
-        vineService.loadFollowed(),
-      ]);
-    }
-    const unlistenStatus = await listen('zenoh-status', async (event) => {
-      const status = (event as { payload: { status: string } }).payload;
-      if (status.status === 'connected') {
-        await fetchOwnAddress();
-        await reloadBackendState();
+      await tryConnect('message', messageService.connectAdapter(adapter));
+      // Mail connect may fail if mail_mgr isn't ready yet (race with
+      // start_node); non-blocking so other services proceed. The
+      // zenoh-status handler below re-hydrates mail state on reconnect.
+      tryConnect('mail', mailService.connectAdapter(adapter));
+      await tryConnect('vine', vineService.connectAdapter(adapter));
+      await tryConnect('vine.loadFollowed', vineService.loadFollowed());
+      await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
+      avatarResolver.connectAdapter(adapter);
+      resolveVideoFn = async (cid: string) => {
+        const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
+        const mime = detectVideoMime(bytes);
+        const blob = new Blob([new Uint8Array(bytes)], { type: mime });
+        return URL.createObjectURL(blob);
+      };
+      await tryConnect('nav', navService.connectAdapter(adapter));
+
+      // Fetch our node address so self-sent messages/vines echo back as
+      // 'self'/'You'. Try immediately (node may already be connected after
+      // hot reload / auto-start), and also retry on later zenoh-status
+      // events.
+      async function fetchOwnAddress() {
+        try {
+          const addr = await invoke('get_node_addr') as string;
+          messageService.ownAddress = addr;
+          vineService.ownAddress = addr;
+          navService.ownAddress = addr;
+        } catch (err) {
+          // Expected while start_node is still racing with boot; the
+          // zenoh-status listener below retries on 'connected'. Logged at
+          // debug so it's discoverable but doesn't pollute the normal log.
+          console.debug('[harmony-client] get_node_addr not yet available:', err);
+        }
       }
-    });
-    // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
-    // all ownAddress fields). All four services are destroyed on unmount;
-    // cleanup order is irrelevant since no service depends on another's
-    // teardown. Registered on fileManagerService arbitrarily.
-    fileManagerService.addUnlisten(unlistenStatus as unknown as () => void);
+      await fetchOwnAddress();
+
+      // Re-hydrate backend-dependent state when Zenoh reports connected.
+      // On initial boot, mail_mgr / follow list may not be ready yet (e.g.
+      // if auto-start_node failed or raced), so the first round of
+      // refreshCounts / loadFolder / loadFollowed returns empty. When a
+      // later Connect (from the Network view) succeeds and fires
+      // `zenoh-status: connected`, we re-read so the UI catches up.
+      // MailService.connectAdapter has already registered event listeners;
+      // we only re-run the idempotent data-fetch calls here — nothing
+      // double-registers. Errors are non-fatal (individual services
+      // already tolerate "not connected" / "mail not initialized").
+      async function reloadBackendState() {
+        await Promise.allSettled([
+          mailService.refreshCounts(),
+          mailService.loadFolder(mailService.activeFolder),
+          vineService.loadFollowed(),
+        ]);
+      }
+      const unlistenStatus = await listen('zenoh-status', async (event) => {
+        const status = (event as { payload: { status: string } }).payload;
+        if (status.status === 'connected') {
+          await fetchOwnAddress();
+          await reloadBackendState();
+        }
+      });
+      // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
+      // all ownAddress fields). All four services are destroyed on unmount;
+      // cleanup order is irrelevant since no service depends on another's
+      // teardown. Registered on fileManagerService arbitrarily.
+      // listen() returns UnlistenFn (= () => void), matching addUnlisten's
+      // signature directly — no cast needed.
+      fileManagerService.addUnlisten(unlistenStatus);
+    } catch (err) {
+      console.warn('[harmony-client] Tauri init failed:', err);
+    }
   })();
   let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
