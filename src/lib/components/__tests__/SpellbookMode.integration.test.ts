@@ -20,6 +20,7 @@ afterEach(cleanup);
 function createMockStq8(ready = true) {
   const service = {
     isReady: vi.fn(() => ready),
+    isCalibrated: vi.fn(() => false),
     getLevelInfo: vi.fn((l: FlashcardLevel) => ({
       total_bytes: [2, 4, 8, 16, 32][l],
       bytes_per_row: [2, 2, 4, 4, 8][l],
@@ -31,6 +32,13 @@ function createMockStq8(ready = true) {
       data: [0xab, 0xcd],
       rows: [[0xab, 0xcd]],
     })),
+    validateRow: vi.fn(() => ({ matched: true, expected: [], heard: [] })),
+    processPcm: vi.fn(() => ({ syllables: [] })),
+    addCalibrationSample: vi.fn(),
+    finalizeCalibration: vi.fn(),
+    exportProfile: vi.fn(() => '{}'),
+    importProfile: vi.fn(),
+    setCreatedEpochSecs: vi.fn(),
   };
   return service;
 }

@@ -19,6 +19,7 @@
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
+  import * as stq8ProfileStorage from './lib/stq8-profile-storage';
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
@@ -234,9 +235,10 @@
       const pipeline = new wasm.WasmPipeline();
       // wasm-bindgen emits static class methods for Rust fns without
       // `&self` (generate_challenge, validate_row, level_info, format_*)
-      // and prototype methods for fns with `&self` / `&mut self` (process).
-      // Stq8Service's WasmPipelineApi flattens both onto one adapter so
-      // the service stays unaware of the split.
+      // and prototype methods for fns with `&self` / `&mut self`
+      // (process + calibration/profile). Stq8Service's WasmPipelineApi
+      // flattens both onto one adapter so the service stays unaware of
+      // the split.
       stq8Service = new Stq8Service({
         generate_challenge: wasm.WasmPipeline.generate_challenge,
         validate_row: wasm.WasmPipeline.validate_row,
@@ -244,7 +246,27 @@
         format_flat_q8: wasm.WasmPipeline.format_flat_q8,
         level_info: wasm.WasmPipeline.level_info,
         process: (pcm) => pipeline.process(pcm),
+        add_calibration_sample: (idx, pcm) => pipeline.add_calibration_sample(idx, pcm),
+        finalize_calibration: () => pipeline.finalize_calibration(),
+        is_calibrated: () => pipeline.is_calibrated(),
+        export_profile: () => pipeline.export_profile(),
+        import_profile: (json) => pipeline.import_profile(json),
+        set_created_epoch_secs: (secs) => pipeline.set_created_epoch_secs(secs),
       });
+      // Restore a previously-saved voice profile so the user doesn't
+      // have to re-run the 16-syllable calibration on every reload.
+      // import_profile throws on corrupted / schema-mismatch JSON; in
+      // that case we clear and drop back to the uncalibrated state
+      // rather than leave poisoned storage around forever.
+      const savedProfile = stq8ProfileStorage.loadProfile();
+      if (savedProfile !== null) {
+        try {
+          stq8Service.importProfile(savedProfile);
+        } catch (err) {
+          console.warn('[harmony-client] stq8 saved profile rejected, clearing:', err);
+          stq8ProfileStorage.clearProfile();
+        }
+      }
     } catch (err) {
       console.info('[harmony-client] stq8 WASM not loaded — Spellbook stays in placeholder mode. Build it with `scripts/build-wasm.sh` in the sibling harmony-stq8 clone.', err);
     }

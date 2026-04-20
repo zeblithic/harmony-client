@@ -75,7 +75,11 @@ export class AudioCapture {
     this.worklet?.disconnect();
     this.source?.disconnect();
     this.stream?.getTracks().forEach(t => t.stop());
-    await this.context?.close();
+    // AudioContext.close() can reject (double-close races, already-closed state,
+    // policy errors). Swallow it — the rest of this cleanup still matters, and
+    // the caller has no useful recovery besides "move on". Mirrors the
+    // defensive .catch(() => {}) in start()'s own cleanup path above.
+    await this.context?.close().catch(() => {});
     this.worklet = null;
     this.source = null;
     this.stream = null;

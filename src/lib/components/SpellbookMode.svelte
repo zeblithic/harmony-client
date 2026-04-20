@@ -1,23 +1,34 @@
 <script lang="ts">
-  import type { FlashcardLevel, SessionStats, Challenge, ExpressMode } from '../flashcard-types';
+  import type { FlashcardLevel, SessionStats, ExpressMode } from '../flashcard-types';
+  import type { Stq8ServiceLike } from '../stq8-service';
   import { LEVELS, LEVEL_NAMES, EXPRESS_MODES, EXPRESS_MODE_LABELS, initialSessionStats } from '../flashcard-types';
   import SpellList from './SpellList.svelte';
   import FlashcardView from './FlashcardView.svelte';
+  import CalibrationView from './CalibrationView.svelte';
 
   let {
     stq8Service,
     onStatsUpdate,
   }: {
-    stq8Service: {
-      isReady(): boolean;
-      getLevelInfo(l: FlashcardLevel): { total_bytes: number; bytes_per_row: number; num_rows: number; total_bits: number };
-      generateChallenge(l: FlashcardLevel): Challenge;
-    };
+    stq8Service: Stq8ServiceLike;
     onStatsUpdate?: (stats: SessionStats) => void;
   } = $props();
 
-  type SpellbookTab = 'spells' | 'practice';
+  type SpellbookTab = 'spells' | 'practice' | 'calibrate';
   let activeTab = $state<SpellbookTab>('practice');
+  // Tracked as local $state so the Calibrate tab's completion handler and
+  // the tab-label suffix re-render immediately, without needing the parent
+  // to swap out the stq8Service reference just to signal a calibration
+  // change.
+  let calibrated = $state(stq8Service.isCalibrated());
+  function handleCalibrated() {
+    calibrated = true;
+  }
+  // Re-sync if the parent swaps the service (e.g. WASM finishes loading
+  // after this component already mounted with a null-backed service).
+  $effect(() => {
+    calibrated = stq8Service.isCalibrated();
+  });
   let level = $state<FlashcardLevel>(0);
   let expressMode = $state<ExpressMode>('off');
   // Preserved across tab switches — FlashcardView remounts with this state
@@ -59,6 +70,17 @@
         class:active={activeTab === 'practice'}
         onclick={() => { activeTab = 'practice'; }}
       >Practice</button>
+      <button
+        type="button"
+        role="tab"
+        id="tab-calibrate"
+        aria-label={calibrated ? 'Calibrate (completed)' : 'Calibrate'}
+        aria-selected={activeTab === 'calibrate'}
+        aria-controls="tabpanel-spellbook"
+        class="tab-btn"
+        class:active={activeTab === 'calibrate'}
+        onclick={() => { activeTab = 'calibrate'; }}
+      >Calibrate{calibrated ? ' ✓' : ''}</button>
     </div>
 
     {#if activeTab === 'practice'}
@@ -87,16 +109,31 @@
     {/if}
   </header>
 
-  <div class="spellbook-content" role="tabpanel" id="tabpanel-spellbook" aria-labelledby={activeTab === 'spells' ? 'tab-spells' : 'tab-practice'}>
+  <div
+    class="spellbook-content"
+    role="tabpanel"
+    id="tabpanel-spellbook"
+    aria-labelledby={
+      activeTab === 'spells' ? 'tab-spells'
+      : activeTab === 'practice' ? 'tab-practice'
+      : 'tab-calibrate'
+    }
+  >
     {#if activeTab === 'spells'}
       <SpellList />
-    {:else}
+    {:else if activeTab === 'practice'}
       <FlashcardView
         {level}
         {expressMode}
         {stq8Service}
         initialStats={lastStats}
         onStatsUpdate={handleStatsUpdate}
+      />
+    {:else}
+      <CalibrationView
+        {stq8Service}
+        isCalibrated={calibrated}
+        onCalibrated={handleCalibrated}
       />
     {/if}
   </div>
