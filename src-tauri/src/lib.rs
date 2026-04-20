@@ -394,8 +394,17 @@ async fn start_node(
                 // ZRuntime::block_in_place, which panics on a current-thread
                 // scheduler. A single-worker multi-thread runtime is the
                 // minimum Zenoh supports.
+                //
+                // `.thread_stack_size(8 MiB)` covers Tokio's own worker
+                // threads independently of RUST_MIN_STACK — important
+                // because Cargo's `[env]` block in .cargo/config.toml only
+                // propagates to binaries Cargo launches (e.g. cargo run /
+                // tauri dev), not to release binaries run directly. Without
+                // this call, a `tauri build` artifact would silently regress
+                // to the 2 MiB default on Windows.
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
+                    .thread_stack_size(8 * 1024 * 1024)
                     .enable_all()
                     .build()
                     .expect("failed to create tokio runtime for harmony-runtime");

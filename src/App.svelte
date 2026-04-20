@@ -41,8 +41,8 @@
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
-    messageService.ownDisplayName = profile.displayName || 'You';
-    vineService.ownDisplayName = profile.displayName || 'You';
+    // messageService.ownDisplayName / vineService.ownDisplayName are kept
+    // in sync by a `$effect` later in the script (single source of truth).
     // Publish to network if Tauri is available.
     // Uses direct invoke rather than ZenohService.publishProfile() because
     // ZenohService lives in NetworkApp (not accessible here). Both paths
@@ -279,9 +279,29 @@
         } catch { /* node not ready yet */ }
       }
       await fetchOwnAddress();
+      // Re-hydrate backend-dependent state when Zenoh reports connected.
+      // On initial boot, mail_mgr / follow list may not be ready yet
+      // (e.g. if auto-start_node failed or raced), so the first round of
+      // refreshCounts / loadFolder / loadFollowed returns empty. When a
+      // later Connect (from the Network view) succeeds and fires
+      // `zenoh-status: connected`, we re-read so the UI catches up.
+      // MailService.connectAdapter has already registered event listeners;
+      // we only re-run the idempotent data-fetch calls here — nothing
+      // double-registers. Errors are non-fatal (individual services
+      // already tolerate "not connected" / "mail not initialized").
+      async function reloadBackendState() {
+        await Promise.allSettled([
+          mailService.refreshCounts(),
+          mailService.loadFolder(mailService.activeFolder),
+          vineService.loadFollowed(),
+        ]);
+      }
       const unlistenStatus = await listen('zenoh-status', async (event) => {
         const status = (event as { payload: { status: string } }).payload;
-        if (status.status === 'connected') await fetchOwnAddress();
+        if (status.status === 'connected') {
+          await fetchOwnAddress();
+          await reloadBackendState();
+        }
       });
       // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
       // all ownAddress fields). All four services are destroyed on unmount;
