@@ -2,6 +2,7 @@
   import type { Stq8ServiceLike } from '../stq8-service';
   import { AudioCapture } from '../voice/audio-capture';
   import * as profileStorage from '../stq8-profile-storage';
+  import { calibrationSaveState, type SaveOutcome } from '../stq8-calibration-state.svelte';
 
   // Syllable order matches Syllable::from_nibble in stq8-core:
   //   0='O, 1='U, 2='E, 3='I, 4=JO, 5=JU, ..., 15=VI
@@ -62,41 +63,22 @@
   let errorMsg = $state('');
   let lastSampleWasShort = $state(false);
 
-  // The done-phase copy has three legitimate variants that the UI needs to
-  // disambiguate: "saved" (storage is consistent with the live classifier),
-  // "save-failed-fallback" (this session's write failed but a previous
-  // profile still lives in storage — reload will recover to the old
-  // calibration), and "save-failed-no-fallback" (this session's write
-  // failed and there's nothing in storage — reload will wipe calibration
-  // entirely).
+  // The done-phase copy has three legitimate variants: "saved" (storage
+  // matches the live classifier), "save-failed-fallback" (this session's
+  // write failed but a previous profile still lives in storage — reload
+  // will recover to the old calibration), and "save-failed-no-fallback"
+  // (this session's write failed and there's nothing in storage — reload
+  // will wipe calibration entirely).
   //
-  // A plain boolean can't express this because it conflates remount
-  // scenarios (fresh mount, no save attempted here, but storage may or may
-  // not hold something) with the active-save-attempt scenario. Instead we
-  // track:
-  //   - `didAttemptSave`: did *this mount* run finishCalibration's save?
-  //   - `sessionSaveSucceeded`: if so, did it succeed?
-  //   - `hadFallbackBefore`: snapshot of whether storage had a profile
-  //     *before* this session's save attempt — needed to distinguish
-  //     save-failed-fallback from save-failed-no-fallback.
-  //
-  // If `didAttemptSave` is false (e.g. we remounted after a tab switch),
-  // the derivation falls back to a fresh `loadProfile()` check — so the
-  // message survives tab navigation even though the component unmounts.
-  let didAttemptSave = $state(false);
-  let sessionSaveSucceeded = $state(false);
-  let hadFallbackBefore = $state(false);
-
-  type DoneMessage = 'saved' | 'save-failed-fallback' | 'save-failed-no-fallback';
-  let doneMessage = $derived.by<DoneMessage>(() => {
-    if (didAttemptSave) {
-      if (sessionSaveSucceeded) return 'saved';
-      return hadFallbackBefore ? 'save-failed-fallback' : 'save-failed-no-fallback';
+  // The outcome is tracked in module-level state (stq8-calibration-state)
+  // so a tab-switch remount doesn't collapse the fallback-only case back
+  // to 'saved' (which would mislead about what reload loads). If no save
+  // has completed yet this session — typical of a boot-time "already
+  // calibrated" remount — fall back to a `loadProfile()` presence check.
+  let doneMessage = $derived.by<SaveOutcome>(() => {
+    if (calibrationSaveState.lastOutcome !== null) {
+      return calibrationSaveState.lastOutcome;
     }
-    // Remount path: no save happened this mount, but storage may still hold
-    // a profile from a previous mount or a boot-time import. Treat presence
-    // as "saved" (something will load on next reload), absence as the
-    // no-fallback warning.
     return profileStorage.loadProfile() !== null ? 'saved' : 'save-failed-no-fallback';
   });
 
@@ -190,21 +172,27 @@
 
       // Snapshot fallback state *before* the overwrite attempt so a save
       // failure can distinguish "save-failed-fallback" (old profile still
-      // loadable on reload) from "save-failed-no-fallback" (nothing to fall
-      // back to).
-      hadFallbackBefore = profileStorage.loadProfile() !== null;
-      didAttemptSave = true;
+      // loadable on reload) from "save-failed-no-fallback" (nothing to
+      // fall back to).
+      const hadFallback = profileStorage.loadProfile() !== null;
+      let saved: boolean;
       try {
         const profileJson = stq8Service.exportProfile();
-        sessionSaveSucceeded = profileStorage.saveProfile(profileJson);
+        saved = profileStorage.saveProfile(profileJson);
       } catch (err) {
         // Export can throw across the WASM boundary; saveProfile returns
         // boolean and won't. Either way this is session-only — the in-memory
         // classifier still works, so land in 'done' with the appropriate
         // warning rather than rolling back to an error screen.
         console.warn('[harmony-client] stq8 calibration: profile export failed:', err);
-        sessionSaveSucceeded = false;
+        saved = false;
       }
+      // Persist the outcome in module-level state so it survives component
+      // remount (tab switch back to Calibrate) — a per-instance derivation
+      // would lose the fallback-only distinction on remount.
+      calibrationSaveState.lastOutcome = saved
+        ? 'saved'
+        : (hadFallback ? 'save-failed-fallback' : 'save-failed-no-fallback');
       phase = 'done';
     } finally {
       // Capture always stops, even if an unexpected early return or throw
@@ -245,9 +233,11 @@
     currentIndex = 0;
     errorMsg = '';
     lastSampleWasShort = false;
-    didAttemptSave = false;
-    sessionSaveSucceeded = false;
-    hadFallbackBefore = false;
+    // Deliberately don't touch calibrationSaveState.lastOutcome — its
+    // semantic is "last completed save's outcome," and Recalibrate has
+    // not yet completed (or failed) a save. The previous outcome still
+    // accurately describes what reload would load until a new finish
+    // overwrites it.
   }
 
   // On unmount — stop capture so the mic indicator clears and browser

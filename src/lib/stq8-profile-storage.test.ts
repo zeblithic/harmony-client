@@ -56,6 +56,27 @@ describe('stq8-profile-storage', () => {
     expect(warnSpy).toHaveBeenCalled();
   });
 
+  it('saveProfile logs a warning when localStorage is unavailable', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Simulate a browser that throws SecurityError on the localStorage
+    // getter (some private-browsing contexts, sandboxed iframes).
+    const originalDescriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get: () => { throw new Error('SecurityError'); },
+    });
+    try {
+      expect(saveProfile('{"x":1}')).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('localStorage unavailable'),
+      );
+    } finally {
+      if (originalDescriptor) {
+        Object.defineProperty(window, 'localStorage', originalDescriptor);
+      }
+    }
+  });
+
   it('clearProfile swallows removeItem errors', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {

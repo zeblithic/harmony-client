@@ -44,7 +44,14 @@ export function loadProfile(): string | null {
  * boot.
  */
 export function saveProfile(json: string): boolean {
-  if (!hasLocalStorage()) return false;
+  if (!hasLocalStorage()) {
+    // Log here (rather than in callers) so every `false` return has a
+    // console trace — loadProfile can be silent because "no profile" is a
+    // normal state, but a silent save failure leaves a user's calibration
+    // stranded with no breadcrumb.
+    console.warn('[harmony-client] failed to persist stq8 profile: localStorage unavailable');
+    return false;
+  }
   try {
     localStorage.setItem(STORAGE_KEY, json);
     return true;
