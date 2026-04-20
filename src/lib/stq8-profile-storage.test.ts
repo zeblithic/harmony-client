@@ -16,7 +16,7 @@ describe('stq8-profile-storage', () => {
 
   it('saveProfile then loadProfile round-trips the exact string', () => {
     const profile = '{"centroids":{"0":[1,2,3]},"created":1700000000}';
-    saveProfile(profile);
+    expect(saveProfile(profile)).toBe(true);
     expect(loadProfile()).toBe(profile);
   });
 
@@ -47,12 +47,12 @@ describe('stq8-profile-storage', () => {
     expect(loadProfile()).toBeNull();
   });
 
-  it('saveProfile swallows setItem errors and logs a warning', () => {
+  it('saveProfile returns false and logs a warning when setItem throws', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
       throw new Error('QuotaExceededError');
     });
-    expect(() => saveProfile('{"x":1}')).not.toThrow();
+    expect(saveProfile('{"x":1}')).toBe(false);
     expect(warnSpy).toHaveBeenCalled();
   });
 

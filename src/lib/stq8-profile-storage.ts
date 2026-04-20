@@ -34,13 +34,23 @@ export function loadProfile(): string | null {
   }
 }
 
-/** Persist the profile JSON. Silent no-op if storage is unavailable. */
-export function saveProfile(json: string): void {
-  if (!hasLocalStorage()) return;
+/**
+ * Persist the profile JSON. Returns true on success; false when storage is
+ * unavailable or setItem rejects (quota exceeded, SecurityError, etc.).
+ *
+ * Callers that surface a "Calibrated ✓" state should check this — an
+ * in-memory-calibrated pipeline whose profile wasn't persisted will be lost
+ * on reload, and the user deserves to know instead of being surprised next
+ * boot.
+ */
+export function saveProfile(json: string): boolean {
+  if (!hasLocalStorage()) return false;
   try {
     localStorage.setItem(STORAGE_KEY, json);
+    return true;
   } catch (err) {
     console.warn('[harmony-client] failed to persist stq8 profile:', err);
+    return false;
   }
 }
 

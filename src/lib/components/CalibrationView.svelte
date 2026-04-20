@@ -58,6 +58,11 @@
   let isHolding = $state(false);
   let errorMsg = $state('');
   let lastSampleWasShort = $state(false);
+  // True after a successful saveProfile() in this session's flow. False when
+  // localStorage wasn't available or setItem rejected (quota / SecurityError
+  // in restricted contexts). Gates the "Your voice profile is saved" copy in
+  // the done phase so we don't lie to the user about persistence.
+  let profilePersisted = $state(true);
 
   let audioCapture: AudioCapture | null = null;
   let recordingBuffer: Float32Array[] = [];
@@ -131,7 +136,7 @@
       stq8Service.finalizeCalibration();
       stq8Service.setCreatedEpochSecs(BigInt(Math.floor(Date.now() / 1000)));
       const profileJson = stq8Service.exportProfile();
-      profileStorage.saveProfile(profileJson);
+      profilePersisted = profileStorage.saveProfile(profileJson);
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
       phase = 'error';
@@ -169,6 +174,7 @@
     currentIndex = 0;
     errorMsg = '';
     lastSampleWasShort = false;
+    profilePersisted = true;
   }
 
   // On unmount — stop capture so the mic indicator clears and browser
@@ -247,7 +253,14 @@
   {:else if phase === 'done'}
     <div class="done-ui">
       <h2>Calibrated ✓</h2>
-      <p>Your voice profile is saved. Head to the Practice tab to try it out.</p>
+      {#if profilePersisted}
+        <p>Your voice profile is saved. Head to the Practice tab to try it out.</p>
+      {:else}
+        <p class="persistence-warning" role="alert">
+          Calibration works for this session, but your profile couldn't be saved — you'll need to re-calibrate on the next reload.
+          Check the console for details (common causes: storage disabled, quota exceeded, private-browsing context).
+        </p>
+      {/if}
       <button type="button" class="secondary" onclick={handleRecalibrate}>Recalibrate</button>
     </div>
   {:else if phase === 'error'}
@@ -390,6 +403,12 @@
   .error-msg {
     color: var(--text-danger, #ed4245);
     max-width: 480px;
+  }
+
+  .persistence-warning {
+    color: var(--text-warning, #f0b232);
+    max-width: 480px;
+    text-align: center;
   }
 
   button.primary, button.secondary {
