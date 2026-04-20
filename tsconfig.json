@@ -9,6 +9,10 @@
     "isolatedModules": true,
     "moduleDetection": "force",
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "paths": {
+      "harmony-stq8": ["../harmony-stq8/stq8-web/pkg/stq8_web"]
+    },
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

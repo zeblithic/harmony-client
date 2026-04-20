@@ -215,7 +215,40 @@
     mailSyncError = mailService.syncError;
   };
 
-  const stq8Service = new Stq8Service(null); // WASM loaded async later
+  // Start with the null-backed service so FlashcardView shows its "Loading
+  // Q8 engine..." placeholder. initStq8Service() swaps in a real instance
+  // once the wasm-bindgen module resolves; reassigning a $state-tracked
+  // reference is what propagates through SpellbookMode's props down to
+  // FlashcardView's `{#if !stq8Service.isReady()}` guard.
+  //
+  // `harmony-stq8` is a Vite alias to the sibling `../harmony-stq8/stq8-web/pkg/`
+  // directory, produced by `scripts/build-wasm.sh` in that repo. Missing
+  // alias target (fresh clone without the sibling, or before first build)
+  // logs a friendly message and leaves Spellbook in placeholder mode —
+  // everything else still works. See vite.config.ts for the alias setup.
+  let stq8Service = $state(new Stq8Service(null));
+  (async () => {
+    try {
+      const wasm = await import('harmony-stq8');
+      await wasm.default();
+      const pipeline = new wasm.WasmPipeline();
+      // wasm-bindgen emits static class methods for Rust fns without
+      // `&self` (generate_challenge, validate_row, level_info, format_*)
+      // and prototype methods for fns with `&self` / `&mut self` (process).
+      // Stq8Service's WasmPipelineApi flattens both onto one adapter so
+      // the service stays unaware of the split.
+      stq8Service = new Stq8Service({
+        generate_challenge: wasm.WasmPipeline.generate_challenge,
+        validate_row: wasm.WasmPipeline.validate_row,
+        format_box_q8: wasm.WasmPipeline.format_box_q8,
+        format_flat_q8: wasm.WasmPipeline.format_flat_q8,
+        level_info: wasm.WasmPipeline.level_info,
+        process: (pcm) => pipeline.process(pcm),
+      });
+    } catch (err) {
+      console.info('[harmony-client] stq8 WASM not loaded — Spellbook stays in placeholder mode. Build it with `scripts/build-wasm.sh` in the sibling harmony-stq8 clone.', err);
+    }
+  })();
 
   // Declare allMessages before wiring onChange — avoids a temporal dead zone
   // if onChange were ever triggered synchronously during init.
