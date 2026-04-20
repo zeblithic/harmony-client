@@ -386,8 +386,16 @@ async fn start_node(
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
+            // Windows debug builds overflow the default ~2 MiB stack inside
+            // Zenoh session setup; match the 8 MiB used throughout identity.rs.
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                // Zenoh's `.wait()` (used by its `IntoFuture` impl) calls
+                // ZRuntime::block_in_place, which panics on a current-thread
+                // scheduler. A single-worker multi-thread runtime is the
+                // minimum Zenoh supports.
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
                     .enable_all()
                     .build()
                     .expect("failed to create tokio runtime for harmony-runtime");

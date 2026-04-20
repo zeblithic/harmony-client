@@ -1,0 +1,16 @@
+# Windows: bump the PE image default thread stack to 8 MiB.
+#
+# Debug builds produce very large async state machines; Zenoh 1.x spins up
+# its own internal tokio runtime whose worker threads overflow the default
+# 2 MiB stack during session setup (STATUS_STACK_OVERFLOW / 0xc00000fd).
+# See ZEB-149.
+[target.'cfg(windows)']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# Rust std's thread::min_stack() reads RUST_MIN_STACK at runtime (default
+# 2 MiB). Tokio workers spawned via thread::Builder with no explicit
+# stack_size inherit this — including the workers inside Zenoh's own
+# internal runtime, which we can't configure directly. `force = true`
+# ensures this wins over any pre-set value in the shell.
+[env]
+RUST_MIN_STACK = { value = "8388608", force = true }

@@ -81,7 +81,6 @@
     followedAddresses = new Set(vineService.followedAddresses);
     vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
   };
-  vineService.ownDisplayName = myProfile.displayName || 'You';
 
   function handleMarkVineViewed(id: string) {
     vineService.markViewed(id);
@@ -224,7 +223,13 @@
   // Wire onChange so both online (Zenoh echo) and offline (local append)
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
-  messageService.ownDisplayName = myProfile.displayName || 'You';
+
+  // Keep the display name on both services in sync with profile edits.
+  $effect(() => {
+    const name = myProfile.displayName || 'You';
+    vineService.ownDisplayName = name;
+    messageService.ownDisplayName = name;
+  });
 
   // Try to wire up real Tauri transport (messages, vines, file manager).
   (async () => {
@@ -235,6 +240,16 @@
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
       };
+      // Boot the harmony node in standalone mode (no upstream endpoint) so
+      // identity loads and mail_mgr is ready before adapters wire up. The
+      // Network view's Connect flow can later re-invoke start_node with an
+      // endpoint to join a gateway. Failures here are non-fatal — adapters
+      // will continue with mock data if the runtime refuses to start.
+      try {
+        await invoke('start_node', { endpoint: null });
+      } catch (err) {
+        console.warn('Auto-start harmony node failed:', err);
+      }
       await messageService.connectAdapter(adapter);
       // Mail connect is isolated — it may fail if the node hasn't started yet
       // (mail_mgr requires identity). Other services must not be blocked.

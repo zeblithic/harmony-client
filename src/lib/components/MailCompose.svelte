@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
+
   let {
     replyTo = null,
     initialTo = '',
@@ -13,8 +15,9 @@
     onCancel?: () => void;
   } = $props();
 
-  let toField = $state(initialTo);
-  let subject = $state(initialSubject);
+  // Compose fields are one-shot seeded from props; user edits them locally.
+  let toField = $state(untrack(() => initialTo));
+  let subject = $state(untrack(() => initialSubject));
   let body = $state('');
   let sending = $state(false);
   let error = $state('');

@@ -1,9 +1,10 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for the main window",
-  "windows": ["main"],
+  "description": "Default capabilities for the main window and the network visualization child window",
+  "windows": ["main", "network-viz"],
   "permissions": [
     "core:default",
+    "core:webview:allow-create-webview-window",
     "dialog:default"
   ]
 }
