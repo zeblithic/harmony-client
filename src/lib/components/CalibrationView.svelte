@@ -169,25 +169,49 @@
   async function finishCalibration() {
     phase = 'finalizing';
     try {
-      stq8Service.finalizeCalibration();
-      stq8Service.setCreatedEpochSecs(BigInt(Math.floor(Date.now() / 1000)));
-      const profileJson = stq8Service.exportProfile();
-      // Snapshot the fallback state *before* the overwrite attempt so we can
-      // distinguish "save-failed-no-fallback" (no old profile to fall back
-      // to) from "save-failed-fallback" (old profile still loadable on
-      // reload) in the done-phase copy.
+      // Commit boundary: once finalizeCalibration() + setCreatedEpochSecs()
+      // succeed, the in-memory classifier is genuinely calibrated. A failure
+      // *here* means calibration itself failed — surface the error, leave the
+      // parent's `isCalibrated` alone.
+      try {
+        stq8Service.finalizeCalibration();
+        stq8Service.setCreatedEpochSecs(BigInt(Math.floor(Date.now() / 1000)));
+      } catch (err) {
+        errorMsg = err instanceof Error ? err.message : String(err);
+        phase = 'error';
+        return;
+      }
+
+      // Classifier is live — sync the parent *before* attempting persistence
+      // so the UI reflects reality even if export/save blow up on the way
+      // out. Otherwise a throw from exportProfile() strands the parent with
+      // isCalibrated=false while the classifier is fully usable in memory.
+      onCalibrated();
+
+      // Snapshot fallback state *before* the overwrite attempt so a save
+      // failure can distinguish "save-failed-fallback" (old profile still
+      // loadable on reload) from "save-failed-no-fallback" (nothing to fall
+      // back to).
       hadFallbackBefore = profileStorage.loadProfile() !== null;
-      sessionSaveSucceeded = profileStorage.saveProfile(profileJson);
       didAttemptSave = true;
-    } catch (err) {
-      errorMsg = err instanceof Error ? err.message : String(err);
-      phase = 'error';
+      try {
+        const profileJson = stq8Service.exportProfile();
+        sessionSaveSucceeded = profileStorage.saveProfile(profileJson);
+      } catch (err) {
+        // Export can throw across the WASM boundary; saveProfile returns
+        // boolean and won't. Either way this is session-only — the in-memory
+        // classifier still works, so land in 'done' with the appropriate
+        // warning rather than rolling back to an error screen.
+        console.warn('[harmony-client] stq8 calibration: profile export failed:', err);
+        sessionSaveSucceeded = false;
+      }
+      phase = 'done';
+    } finally {
+      // Capture always stops, even if an unexpected early return or throw
+      // slips past the branches above. Previously duplicated on each path;
+      // finally makes it an invariant instead of a discipline.
       await stopCapture();
-      return;
     }
-    await stopCapture();
-    phase = 'done';
-    onCalibrated();
   }
 
   async function stopCapture() {
