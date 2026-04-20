@@ -74,7 +74,7 @@
         type="button"
         role="tab"
         id="tab-calibrate"
-        aria-label="Calibrate"
+        aria-label={calibrated ? 'Calibrate (completed)' : 'Calibrate'}
         aria-selected={activeTab === 'calibrate'}
         aria-controls="tabpanel-spellbook"
         class="tab-btn"

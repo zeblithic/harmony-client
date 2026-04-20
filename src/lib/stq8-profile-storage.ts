@@ -11,8 +11,17 @@
 
 const STORAGE_KEY = 'harmony.stq8.profile';
 
+// `typeof localStorage` is a property read that runs through a host getter,
+// so in restricted contexts (private browsing in some browsers, cross-origin
+// sandboxed iframes, disabled site data) it can throw SecurityError rather
+// than simply returning 'undefined'. Probe inside try/catch so every helper
+// below can rely on this returning cleanly.
 function hasLocalStorage(): boolean {
-  return typeof localStorage !== 'undefined';
+  try {
+    return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+  } catch {
+    return false;
+  }
 }
 
 /** Returns the stored profile JSON, or null if none present / storage unavailable. */

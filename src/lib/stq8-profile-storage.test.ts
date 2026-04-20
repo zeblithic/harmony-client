@@ -1,9 +1,13 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { loadProfile, saveProfile, clearProfile } from './stq8-profile-storage';
 
 describe('stq8-profile-storage', () => {
   beforeEach(() => {
     localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('loadProfile returns null when nothing is stored', () => {
@@ -30,5 +34,34 @@ describe('stq8-profile-storage', () => {
 
   it('clearProfile on empty storage does not throw', () => {
     expect(() => clearProfile()).not.toThrow();
+  });
+
+  // Edge cases for restricted-storage scenarios (quota exceeded, private
+  // browsing, SecurityError on getter access). We mock at the prototype so
+  // the helpers exercise the same call sites the runtime would hit.
+
+  it('loadProfile returns null when getItem throws', () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('SecurityError');
+    });
+    expect(loadProfile()).toBeNull();
+  });
+
+  it('saveProfile swallows setItem errors and logs a warning', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+    expect(() => saveProfile('{"x":1}')).not.toThrow();
+    expect(warnSpy).toHaveBeenCalled();
+  });
+
+  it('clearProfile swallows removeItem errors', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+      throw new Error('SecurityError');
+    });
+    expect(() => clearProfile()).not.toThrow();
+    expect(warnSpy).toHaveBeenCalled();
   });
 });

@@ -42,6 +42,18 @@
 
   type Phase = 'intro' | 'requesting' | 'recording' | 'finalizing' | 'done' | 'error';
   let phase = $state<Phase>(isCalibrated ? 'done' : 'intro');
+
+  // Initial $state capture is a snapshot — if the parent's isCalibrated flips
+  // true after we mount (async WASM init, then profile import, while the user
+  // happened to be sitting on the Calibrate tab), we also need to advance the
+  // phase to 'done'. Only advance from 'intro' so we don't clobber an
+  // in-progress recording/finalizing flow or an error surface the user should
+  // still see.
+  $effect(() => {
+    if (isCalibrated && phase === 'intro') {
+      phase = 'done';
+    }
+  });
   let currentIndex = $state(0);
   let isHolding = $state(false);
   let errorMsg = $state('');
@@ -133,7 +145,15 @@
 
   async function stopCapture() {
     if (audioCapture) {
-      await audioCapture.stop();
+      // AudioCapture.stop() is already non-throwing at the source, but belt-
+      // and-suspenders: if anything here ever throws in the future, we don't
+      // want to strand the UI in 'finalizing' or bubble an unhandled rejection
+      // up through unmount cleanup.
+      try {
+        await audioCapture.stop();
+      } catch (err) {
+        console.warn('[harmony-client] stq8 calibration: audio stop failed:', err);
+      }
       audioCapture = null;
     }
     isHolding = false;
@@ -141,7 +161,10 @@
   }
 
   function handleRecalibrate() {
-    profileStorage.clearProfile();
+    // Deliberately DON'T clear the persisted profile here. If the user denies
+    // mic permission or bails mid-flow, we want the previous working profile
+    // still in localStorage so the next boot reloads it. saveProfile() in
+    // finishCalibration() overwrites atomically when the new flow succeeds.
     phase = 'intro';
     currentIndex = 0;
     errorMsg = '';
@@ -195,12 +218,26 @@
         class="record-button"
         class:active={isHolding}
         aria-label="Hold to record {currentSyllable.name}"
+        aria-pressed={isHolding}
         onmousedown={handleRecordStart}
         onmouseup={handleRecordStop}
         onmouseleave={handleRecordStop}
         ontouchstart={(e) => { e.preventDefault(); handleRecordStart(); }}
         ontouchend={(e) => { e.preventDefault(); void handleRecordStop(); }}
         ontouchcancel={() => { void handleRecordStop(); }}
+        onkeydown={(e) => {
+          if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) {
+            e.preventDefault();
+            handleRecordStart();
+          }
+        }}
+        onkeyup={(e) => {
+          if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            void handleRecordStop();
+          }
+        }}
+        onblur={() => { void handleRecordStop(); }}
       >
         <span aria-hidden="true">🎤</span>
       </button>
