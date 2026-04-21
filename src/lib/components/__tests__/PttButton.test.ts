@@ -220,6 +220,27 @@ describe('PttButton', () => {
     expect(onPttStop).toHaveBeenCalledOnce();
   });
 
+  it('does not fire onPttStop when cursor drifts off button mid-hold', async () => {
+    // Release is the commit point: dragging the cursor off the button must
+    // NOT end PTT. The window-level mouseup handler catches the actual
+    // release anywhere on the page, so onmouseleave would only serve to
+    // cut the hold short on pointer drift — which is a UX bug, not a safety
+    // net. Guard against a regression that reintroduces onmouseleave.
+    const onPttStart = vi.fn();
+    const onPttStop = vi.fn();
+    render(PttButton, { props: { active: false, onPttStart, onPttStop } });
+    const btn = screen.getByRole('button', { name: /push to talk/i });
+
+    await fireEvent.mouseDown(btn);
+    expect(onPttStart).toHaveBeenCalledOnce();
+
+    await fireEvent.mouseLeave(btn);
+    expect(onPttStop).not.toHaveBeenCalled();
+
+    await fireEvent.mouseUp(window);
+    expect(onPttStop).toHaveBeenCalledOnce();
+  });
+
   it('fires onPttStop via window mouseup when disabled blocks button mouseup', async () => {
     // Real-browser simulation: Chrome M120+, Safari 17+, Firefox 124+ all
     // filter mouseup on disabled form controls per the HTML spec, so the

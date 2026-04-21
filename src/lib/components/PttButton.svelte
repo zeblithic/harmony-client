@@ -95,7 +95,6 @@
     aria-label="Push to talk"
     onmousedown={() => activate('mouse')}
     onmouseup={() => deactivate('mouse')}
-    onmouseleave={() => deactivate('mouse')}
     ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
     ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
     ontouchcancel={() => deactivate('touch')}
