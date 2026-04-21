@@ -72,9 +72,19 @@
     // deactivate() already handles the case where keyboard was never activated.
     deactivate('keyboard');
   }
+
+  function handleMouseUp() {
+    // Window-level mouse release. Modern browsers (Chrome M120+, Safari 17+,
+    // Firefox 124+) block mouseup/click on disabled form controls per HTML
+    // spec, so if `disabled` flipped true during a held press, the button's
+    // own onmouseup never fires — listening on window bypasses that filter.
+    // Also fires for any page-wide mouseup when the user wasn't holding PTT,
+    // but deactivate()'s has('mouse') check makes that a no-op.
+    deactivate('mouse');
+  }
 </script>
 
-<svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} />
+<svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} onmouseup={handleMouseUp} />
 
 <div class="ptt-container">
   <button
