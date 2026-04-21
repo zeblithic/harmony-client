@@ -32,7 +32,13 @@
   }
 
   function deactivate(source: string) {
-    if (disabled) return;
+    // Intentionally NOT guarded by `disabled`: a release must always
+    // unwind state for an input that was previously activated. If
+    // `disabled` flips true mid-hold (e.g., calibration lost, permission
+    // revoked, rate limit tripped), the parent still needs onPttStop to
+    // fire or its `pttActive` stays stuck true forever. The has() check
+    // below already rejects releases for sources that were never
+    // activated in the first place.
     if (!activeInputs.has(source)) return;
     activeInputs.delete(source);
     if (activeInputs.size === 0) onPttStop?.();
@@ -58,15 +64,27 @@
   }
 
   function handleKeyUp(e: KeyboardEvent) {
-    if (e.code !== 'Space' || disabled) return;
+    if (e.code !== 'Space') return;
     // No form-control guard here — if keyboard was activated, it must deactivate
-    // even if focus moved to a form control before release. The has() guard in
+    // even if focus moved to a form control before release. No `disabled` guard
+    // either, for the same reason as deactivate(): a release of an input that
+    // was previously activated must always unwind. The has() guard in
     // deactivate() already handles the case where keyboard was never activated.
     deactivate('keyboard');
   }
+
+  function handleMouseUp() {
+    // Window-level mouse release. Modern browsers (Chrome M120+, Safari 17+,
+    // Firefox 124+) block mouseup/click on disabled form controls per HTML
+    // spec, so if `disabled` flipped true during a held press, the button's
+    // own onmouseup never fires — listening on window bypasses that filter.
+    // Also fires for any page-wide mouseup when the user wasn't holding PTT,
+    // but deactivate()'s has('mouse') check makes that a no-op.
+    deactivate('mouse');
+  }
 </script>
 
-<svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} />
+<svelte:window onkeydown={handleKeyDown} onkeyup={handleKeyUp} onmouseup={handleMouseUp} />
 
 <div class="ptt-container">
   <button
@@ -77,7 +95,6 @@
     aria-label="Push to talk"
     onmousedown={() => activate('mouse')}
     onmouseup={() => deactivate('mouse')}
-    onmouseleave={() => deactivate('mouse')}
     ontouchstart={(e) => { e.preventDefault(); activate('touch'); }}
     ontouchend={(e) => { e.preventDefault(); deactivate('touch'); }}
     ontouchcancel={() => deactivate('touch')}

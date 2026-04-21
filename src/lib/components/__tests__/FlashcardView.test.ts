@@ -5,6 +5,7 @@ import FlashcardView from '../FlashcardView.svelte';
 function createMockService() {
   return {
     isReady: vi.fn().mockReturnValue(true),
+    isCalibrated: vi.fn().mockReturnValue(true),
     getLevelInfo: vi.fn().mockReturnValue({
       total_bytes: 2,
       bytes_per_row: 2,
@@ -16,6 +17,13 @@ function createMockService() {
       data: [0x00, 0xff],
       rows: [[0x00, 0xff]],
     }),
+    validateRow: vi.fn().mockReturnValue({ matched: true, expected: [], heard: [] }),
+    processPcm: vi.fn().mockReturnValue({ syllables: [] }),
+    addCalibrationSample: vi.fn(),
+    finalizeCalibration: vi.fn(),
+    exportProfile: vi.fn().mockReturnValue('{}'),
+    importProfile: vi.fn(),
+    setCreatedEpochSecs: vi.fn(),
   };
 }
 
@@ -70,5 +78,35 @@ describe('FlashcardView', () => {
       },
     });
     expect(screen.getByRole('button', { name: /hint/i })).toBeTruthy();
+  });
+
+  it('disables PTT and shows calibrate hint when not calibrated', () => {
+    const mockService = createMockService();
+    mockService.isCalibrated.mockReturnValue(false);
+    render(FlashcardView, {
+      props: {
+        level: 1,
+        expressMode: 'off',
+        stq8Service: mockService,
+        onStatsUpdate: vi.fn(),
+      },
+    });
+    const ptt = screen.getByRole('button', { name: /push to talk/i });
+    expect((ptt as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/calibrate your voice/i)).toBeTruthy();
+  });
+
+  it('enables PTT and hides calibrate hint when calibrated', () => {
+    render(FlashcardView, {
+      props: {
+        level: 1,
+        expressMode: 'off',
+        stq8Service: createMockService(),
+        onStatsUpdate: vi.fn(),
+      },
+    });
+    const ptt = screen.getByRole('button', { name: /push to talk/i });
+    expect((ptt as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/calibrate your voice/i)).toBeNull();
   });
 });

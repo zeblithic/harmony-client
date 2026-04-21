@@ -9,6 +9,8 @@
   } from '../flashcard-types';
   import { initialSessionStats } from '../flashcard-types';
   import { evaluateBytes } from '../express-lane';
+  import type { Stq8ServiceLike } from '../stq8-service';
+  import { AudioCapture } from '../voice/audio-capture';
   import FlashcardGrid from './FlashcardGrid.svelte';
   import HintBar from './HintBar.svelte';
   import PttButton from './PttButton.svelte';
@@ -22,16 +24,7 @@
   }: {
     level: FlashcardLevel;
     expressMode: ExpressMode;
-    stq8Service: {
-      isReady(): boolean;
-      getLevelInfo(l: FlashcardLevel): {
-        total_bytes: number;
-        bytes_per_row: number;
-        num_rows: number;
-        total_bits: number;
-      };
-      generateChallenge(l: FlashcardLevel): Challenge;
-    };
+    stq8Service: Stq8ServiceLike;
     initialStats?: SessionStats;
     onStatsUpdate: (stats: SessionStats) => void;
   } = $props();
@@ -47,6 +40,60 @@
   // Accumulated active PTT time (ms) for the current card, excluding off-air gaps.
   let cardActiveMs = $state(0);
   let pttSegmentStart = $state<number | null>(null);
+
+  // Voice capture — lazy-started on first PTT press. One AudioCapture
+  // instance lives for the lifetime of this component; onFrame buffers
+  // raw PCM only while `pttActive` is true, and every PTT release flushes
+  // the accumulated buffer through `processPcm` to get classifier output.
+  let audioCapture: AudioCapture | null = null;
+  let pcmBuffer: Float32Array[] = [];
+  let captureError = $state('');
+
+  // Serialize concurrent ensureCapture() calls. Without this, rapid
+  // press/release cycles before the first getUserMedia resolves can
+  // start multiple AudioCapture instances — the second overwrites
+  // audioCapture and orphans the first with an open mic that cleanup
+  // can't reach. captureStart pins the in-flight promise so subsequent
+  // callers await the same result instead of kicking off another start.
+  let captureStart: Promise<void> | null = null;
+  // destroyed lets a pending start know the component has unmounted. If
+  // start() resolves after cleanup ran, we stop the capture immediately
+  // rather than assigning it to the now-unmounted component — otherwise
+  // the mic stays live forever because cleanup saw audioCapture=null.
+  let destroyed = false;
+
+  function onPcmFrame(pcm: Float32Array): void {
+    if (pttActive) pcmBuffer.push(pcm);
+  }
+
+  function ensureCapture(): Promise<void> {
+    if (audioCapture) return Promise.resolve();
+    if (captureStart) return captureStart;
+    const capture = new AudioCapture();
+    captureStart = (async () => {
+      try {
+        await capture.start(onPcmFrame);
+        if (destroyed) {
+          // Unmounted while start was pending — release the mic now.
+          // cleanup couldn't reach it because audioCapture was still null.
+          await capture.stop();
+          return;
+        }
+        audioCapture = capture;
+        captureError = '';
+      } catch (err) {
+        // Permission denied, no mic, AudioContext construction failure, etc.
+        // Leave `audioCapture` null so the next PTT press will retry; surface
+        // a short message in the UI so the user knows why nothing's landing.
+        if (destroyed) return;
+        captureError = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] flashcard PTT: capture start failed:', err);
+      } finally {
+        captureStart = null;
+      }
+    })();
+    return captureStart;
+  }
 
   // Generate challenge when level changes (or on mount, since previousLevel starts null).
   // previousLevel is set inside newChallenge() AFTER the ready check passes, so if the
@@ -69,9 +116,15 @@
     pttSegmentStart = pttActive ? Date.now() : null;
   }
 
-  function handlePttStart() {
+  async function handlePttStart() {
+    pcmBuffer = [];
     pttActive = true;
     pttSegmentStart = Date.now();
+    // Kick off capture on first press. Subsequent presses reuse the
+    // running instance; onPcmFrame's pttActive gate handles framing.
+    // If the user releases before start() resolves, the buffer stays
+    // empty and handlePttStop falls through to the cancel path.
+    await ensureCapture();
   }
 
   function handlePttStop() {
@@ -81,12 +134,48 @@
       cardActiveMs += Date.now() - pttSegmentStart;
       pttSegmentStart = null;
     }
-    // Release PTT = cancel current row (banked rows kept)
+
+    const nibbles = flushAndClassify();
+    if (nibbles && nibbles.length > 0) {
+      // Classifier heard something — let the existing row-completion
+      // logic handle pass/fail/combo. handleRowComplete already deals
+      // with red-flash-and-reset on mismatch and combo bookkeeping on
+      // success, so we don't need to duplicate any of that here.
+      handleRowComplete(nibbles);
+      return;
+    }
+
+    // No PCM captured (capture still starting up, or empty hold), or
+    // classifier returned no syllables, or processPcm threw. Fall back
+    // to the pre-Slice-3 behavior: cancel the in-progress row and break
+    // the combo streak. Design spec: "without PTT release or timeout".
     rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
-    // PTT release breaks the combo streak (design spec: "without PTT release or timeout")
     if (stats.combo > 0) {
       stats = { ...stats, combo: 0 };
       onStatsUpdate(stats);
+    }
+  }
+
+  function flushAndClassify(): number[] | null {
+    const buffered = pcmBuffer;
+    pcmBuffer = [];
+    if (buffered.length === 0) return null;
+
+    let totalLen = 0;
+    for (const f of buffered) totalLen += f.length;
+    const pcm = new Float32Array(totalLen);
+    let off = 0;
+    for (const f of buffered) {
+      pcm.set(f, off);
+      off += f.length;
+    }
+
+    try {
+      const result = stq8Service.processPcm(pcm);
+      return result.syllables.map(s => s.nibble);
+    } catch (err) {
+      console.warn('[harmony-client] flashcard PTT: processPcm failed:', err);
+      return null;
     }
   }
 
@@ -167,6 +256,22 @@
     newChallenge();
   }
 
+  // Release the mic when this component unmounts (tab switch out of
+  // Practice, or navigation away from Spellbook). If a capture start is
+  // still in flight when we unmount, the `destroyed` flag tells the
+  // pending IIFE inside ensureCapture to stop the capture itself once
+  // start() resolves — cleanup here can only reach already-assigned
+  // captures, so the destroyed-flag path is the only way to guarantee
+  // no orphaned mic.
+  $effect(() => () => {
+    destroyed = true;
+    const c = audioCapture;
+    audioCapture = null;
+    pttActive = false;
+    pcmBuffer = [];
+    if (c) void c.stop();
+  });
+
   // Flat text for active row hint
   let hintText = $derived.by(() => {
     if (!challenge || !challenge.rows[activeRowIndex]) return '';
@@ -219,9 +324,15 @@
     <div class="ptt-container">
       <PttButton
         active={pttActive}
+        disabled={!stq8Service.isCalibrated()}
         onPttStart={handlePttStart}
         onPttStop={handlePttStop}
       />
+      {#if !stq8Service.isCalibrated()}
+        <p class="ptt-hint">Calibrate your voice on the Calibrate tab to enable Practice.</p>
+      {:else if captureError}
+        <p class="ptt-hint error" role="alert">Microphone: {captureError}</p>
+      {/if}
     </div>
   </div>
 {/if}
@@ -274,7 +385,21 @@
 
   .ptt-container {
     display: flex;
-    justify-content: center;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     padding: 16px 0;
+  }
+
+  .ptt-hint {
+    margin: 0;
+    color: var(--text-muted, #949ba4);
+    font-size: 0.8125rem;
+    text-align: center;
+    max-width: 420px;
+  }
+
+  .ptt-hint.error {
+    color: var(--text-warning, #f0b232);
   }
 </style>
