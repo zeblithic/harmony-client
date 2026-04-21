@@ -151,4 +151,38 @@ describe('PttButton', () => {
       expect(radio.getAttribute('aria-disabled')).toBe('true');
     }
   });
+
+  it('still fires onPttStop on mouseup when disabled flips true mid-hold', async () => {
+    // Regression guard: if a parent toggles `disabled` (e.g., calibration
+    // lost, permission revoked) during a press, release must still
+    // unwind state or the parent's pttActive sticks true forever.
+    const onPttStart = vi.fn();
+    const onPttStop = vi.fn();
+    const { rerender } = render(PttButton, {
+      props: { active: false, disabled: false, onPttStart, onPttStop },
+    });
+    const btn = screen.getByRole('button', { name: /push to talk/i });
+    await fireEvent.mouseDown(btn);
+    expect(onPttStart).toHaveBeenCalledOnce();
+
+    await rerender({ active: true, disabled: true, onPttStart, onPttStop });
+
+    await fireEvent.mouseUp(btn);
+    expect(onPttStop).toHaveBeenCalledOnce();
+  });
+
+  it('still fires onPttStop on spacebar keyup when disabled flips true mid-hold', async () => {
+    const onPttStart = vi.fn();
+    const onPttStop = vi.fn();
+    const { rerender } = render(PttButton, {
+      props: { active: false, disabled: false, onPttStart, onPttStop },
+    });
+    await fireEvent.keyDown(window, { code: 'Space' });
+    expect(onPttStart).toHaveBeenCalledOnce();
+
+    await rerender({ active: true, disabled: true, onPttStart, onPttStop });
+
+    await fireEvent.keyUp(window, { code: 'Space' });
+    expect(onPttStop).toHaveBeenCalledOnce();
+  });
 });

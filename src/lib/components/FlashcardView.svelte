@@ -49,24 +49,50 @@
   let pcmBuffer: Float32Array[] = [];
   let captureError = $state('');
 
+  // Serialize concurrent ensureCapture() calls. Without this, rapid
+  // press/release cycles before the first getUserMedia resolves can
+  // start multiple AudioCapture instances — the second overwrites
+  // audioCapture and orphans the first with an open mic that cleanup
+  // can't reach. captureStart pins the in-flight promise so subsequent
+  // callers await the same result instead of kicking off another start.
+  let captureStart: Promise<void> | null = null;
+  // destroyed lets a pending start know the component has unmounted. If
+  // start() resolves after cleanup ran, we stop the capture immediately
+  // rather than assigning it to the now-unmounted component — otherwise
+  // the mic stays live forever because cleanup saw audioCapture=null.
+  let destroyed = false;
+
   function onPcmFrame(pcm: Float32Array): void {
     if (pttActive) pcmBuffer.push(pcm);
   }
 
-  async function ensureCapture(): Promise<void> {
-    if (audioCapture) return;
+  function ensureCapture(): Promise<void> {
+    if (audioCapture) return Promise.resolve();
+    if (captureStart) return captureStart;
     const capture = new AudioCapture();
-    try {
-      await capture.start(onPcmFrame);
-      audioCapture = capture;
-      captureError = '';
-    } catch (err) {
-      // Permission denied, no mic, AudioContext construction failure, etc.
-      // Leave `audioCapture` null so the next PTT press will retry; surface
-      // a short message in the UI so the user knows why nothing's landing.
-      captureError = err instanceof Error ? err.message : String(err);
-      console.warn('[harmony-client] flashcard PTT: capture start failed:', err);
-    }
+    captureStart = (async () => {
+      try {
+        await capture.start(onPcmFrame);
+        if (destroyed) {
+          // Unmounted while start was pending — release the mic now.
+          // cleanup couldn't reach it because audioCapture was still null.
+          await capture.stop();
+          return;
+        }
+        audioCapture = capture;
+        captureError = '';
+      } catch (err) {
+        // Permission denied, no mic, AudioContext construction failure, etc.
+        // Leave `audioCapture` null so the next PTT press will retry; surface
+        // a short message in the UI so the user knows why nothing's landing.
+        if (destroyed) return;
+        captureError = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] flashcard PTT: capture start failed:', err);
+      } finally {
+        captureStart = null;
+      }
+    })();
+    return captureStart;
   }
 
   // Generate challenge when level changes (or on mount, since previousLevel starts null).
@@ -231,10 +257,14 @@
   }
 
   // Release the mic when this component unmounts (tab switch out of
-  // Practice, or navigation away from Spellbook). AudioCapture.stop()
-  // is safe to call on a never-started instance and internally handles
-  // already-stopped state.
+  // Practice, or navigation away from Spellbook). If a capture start is
+  // still in flight when we unmount, the `destroyed` flag tells the
+  // pending IIFE inside ensureCapture to stop the capture itself once
+  // start() resolves — cleanup here can only reach already-assigned
+  // captures, so the destroyed-flag path is the only way to guarantee
+  // no orphaned mic.
   $effect(() => () => {
+    destroyed = true;
     const c = audioCapture;
     audioCapture = null;
     pttActive = false;

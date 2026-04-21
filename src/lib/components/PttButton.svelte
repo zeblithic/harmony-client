@@ -32,7 +32,13 @@
   }
 
   function deactivate(source: string) {
-    if (disabled) return;
+    // Intentionally NOT guarded by `disabled`: a release must always
+    // unwind state for an input that was previously activated. If
+    // `disabled` flips true mid-hold (e.g., calibration lost, permission
+    // revoked, rate limit tripped), the parent still needs onPttStop to
+    // fire or its `pttActive` stays stuck true forever. The has() check
+    // below already rejects releases for sources that were never
+    // activated in the first place.
     if (!activeInputs.has(source)) return;
     activeInputs.delete(source);
     if (activeInputs.size === 0) onPttStop?.();
@@ -58,9 +64,11 @@
   }
 
   function handleKeyUp(e: KeyboardEvent) {
-    if (e.code !== 'Space' || disabled) return;
+    if (e.code !== 'Space') return;
     // No form-control guard here — if keyboard was activated, it must deactivate
-    // even if focus moved to a form control before release. The has() guard in
+    // even if focus moved to a form control before release. No `disabled` guard
+    // either, for the same reason as deactivate(): a release of an input that
+    // was previously activated must always unwind. The has() guard in
     // deactivate() already handles the case where keyboard was never activated.
     deactivate('keyboard');
   }
