@@ -1452,24 +1452,15 @@ async fn ingest_content(
     let meta = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    if meta.len() > harmony_content::cid::MAX_PAYLOAD_SIZE as u64 {
-        return Err(format!(
-            "file too large ({} bytes, max {})",
-            meta.len(),
-            harmony_content::cid::MAX_PAYLOAD_SIZE,
-        ));
-    }
+    // Size-dispatch: reject above cap, chunk above MAX_PAYLOAD_SIZE,
+    // otherwise single-book fast path.
+    let dispatch = ingest_dispatch(meta.len())?;
+
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     let size_bytes = bytes.len() as u64;
 
-    // 3. Compute CID (single-book, public+durable, blake3 hash).
-    let cid = ContentId::for_book(&bytes, ContentFlags::default())
-        .map_err(|e| format!("CID error: {e:?}"))?;
-    let cid_hex = hex::encode(cid.to_bytes());
-
-    // 4. Store in the runtime via the ingest channel.
     let ingest_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -1477,20 +1468,58 @@ async fn ingest_content(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    ingest_tx
-        .send(event_loop::IngestRequest {
-            cid_hex: cid_hex.clone(),
-            data: bytes,
+
+    // Send one (cid_hex, data) pair through the ingest channel and await its ack.
+    async fn send_one(
+        tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+        cid_hex: String,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(event_loop::IngestRequest {
+            cid_hex,
+            data,
             reply: reply_tx,
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped ingest request".to_string())??;
+        reply_rx
+            .await
+            .map_err(|_| "event loop dropped ingest request".to_string())??;
+        Ok(())
+    }
 
-    // Record sidecar metadata so `list_content` can surface this entry.
+    let root_cid_bytes: [u8; 32] = match dispatch {
+        IngestDispatch::Single => {
+            let cid = ContentId::for_book(&bytes, ContentFlags::default())
+                .map_err(|e| format!("CID error: {e:?}"))?;
+            let cid_hex = hex::encode(cid.to_bytes());
+            send_one(&ingest_tx, cid_hex, bytes).await?;
+            cid.to_bytes()
+        }
+        IngestDispatch::Chunked => {
+            let (leaves, bundle_payload, root) = chunk_and_bundle(&bytes)?;
+            // Ingest every leaf in order.
+            for (leaf_cid, leaf_bytes) in &leaves {
+                send_one(
+                    &ingest_tx,
+                    hex::encode(leaf_cid.to_bytes()),
+                    leaf_bytes.to_vec(),
+                )
+                .await?;
+            }
+            // Ingest the bundle itself.
+            send_one(
+                &ingest_tx,
+                hex::encode(root.to_bytes()),
+                bundle_payload,
+            )
+            .await?;
+            root.to_bytes()
+        }
+    };
+
+    // Record sidecar metadata so list_content can surface this entry.
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
@@ -1499,11 +1528,10 @@ async fn ingest_content(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let cid_bytes: [u8; 32] = cid.to_bytes();
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.insert(content_index::ContentIndexEntry {
-            cid: cid_bytes,
+            cid: root_cid_bytes,
             file_name: file_name.clone(),
             size_bytes,
             stored_at_ms,
@@ -1515,7 +1543,7 @@ async fn ingest_content(
     }
 
     Ok(IngestResult {
-        cid: cid_hex,
+        cid: hex::encode(root_cid_bytes),
         file_name,
         size_bytes,
     })
