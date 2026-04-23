@@ -88,6 +88,23 @@ impl ContentIndex {
     }
 
     fn save(&self) {
+        // Guard against the default/uninitialised state: NodeState::default()
+        // constructs a ContentIndex with an empty data_dir before start_node
+        // loads the real one. In that state `self.path` resolves to the
+        // bare filename "content-index.json", which would land in the
+        // process's current working directory. A properly-initialised path
+        // always has a non-empty parent; we use that as the liveness check.
+        let path_is_bare = self
+            .path
+            .parent()
+            .map_or(true, |p| p.as_os_str().is_empty());
+        if path_is_bare {
+            tracing::warn!(
+                "content-index save called before start_node initialised the sidecar path; \
+                 dropping write (mutation lost)"
+            );
+            return;
+        }
         let file = IndexFile {
             version: FILE_VERSION,
             entries: self.entries.values().cloned().collect(),
@@ -331,6 +348,17 @@ mod tests {
         let with_missing =
             idx.set_replication_tier(&[a.cid, [0xAA; 32]], ReplicationTier::Minimal);
         assert_eq!(with_missing, 1);
+    }
+
+    #[test]
+    fn save_is_noop_on_empty_path() {
+        // NodeState::default() constructs a ContentIndex with an empty
+        // path. Ensure mutations on that degenerate state don't
+        // accidentally write content-index.json into CWD.
+        let mut idx = ContentIndex::load(Path::new(""));
+        assert!(idx.insert(sample_entry([0xFE; 32])));
+        // No file should have been created in CWD.
+        assert!(!Path::new("content-index.json").exists());
     }
 
     #[test]
