@@ -969,6 +969,102 @@ fn emit_session_lost<R: Runtime>(app: &AppHandle<R>, reason: &str) {
     );
 }
 
+use harmony_content::book::BookStore;
+use harmony_content::bundle;
+use harmony_content::cache::ContentStore;
+use harmony_content::cid::{CidType, ContentId};
+
+/// Walk every CID in the tree rooted at `cid`, reading bundle payloads from
+/// the local content store. Returns root + every descendant in DFS order.
+///
+/// Bundle payloads not in the store are silently skipped — their subtrees
+/// are unreachable and the caller's verb can't act on them anyway. A
+/// malformed bundle payload is treated the same: log-worthy but not fatal.
+pub(crate) fn collect_descendants<S: BookStore>(
+    store: &ContentStore<S>,
+    cid: ContentId,
+) -> Vec<ContentId> {
+    let mut out = Vec::new();
+    let mut stack = vec![cid];
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if matches!(id.cid_type(), CidType::Bundle(_)) {
+            if let Some(bytes) = store.get(&id) {
+                if let Ok(children) = bundle::parse_bundle(bytes) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod descendants_tests {
+    use super::collect_descendants;
+    use harmony_content::book::BookStore;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cache::ContentStore;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::book::MemoryBookStore;
+
+    fn new_store() -> ContentStore<MemoryBookStore> {
+        ContentStore::new(MemoryBookStore::new(), 1024)
+    }
+
+    #[test]
+    fn returns_just_the_root_for_a_leaf() {
+        let mut store = new_store();
+        let leaf = store
+            .insert_with_flags(b"hello", ContentFlags::default())
+            .unwrap();
+
+        let all = collect_descendants(&store, leaf);
+        assert_eq!(all, vec![leaf]);
+    }
+
+    #[test]
+    fn walks_a_flat_bundle() {
+        let mut store = new_store();
+        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
+        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
+        let c = store.insert_with_flags(b"ccc", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        store.store(root, payload);
+
+        let all = collect_descendants(&store, root);
+        // Order is unspecified; compare as sets.
+        use std::collections::HashSet;
+        let got: HashSet<ContentId> = all.into_iter().collect();
+        let expected: HashSet<ContentId> = [root, a, b, c].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn skips_subtrees_whose_bundle_payload_is_missing() {
+        let mut store = new_store();
+        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
+        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b);
+        let (_payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        // Deliberately DO NOT store the bundle payload.
+
+        let all = collect_descendants(&store, root);
+        // Walker should still include the root itself; children are
+        // unreachable and therefore silently skipped.
+        assert_eq!(all, vec![root]);
+    }
+}
+
 /// Bridge Zenoh subscription messages to Tauri frontend events.
 #[allow(clippy::too_many_arguments)]
 fn emit_frontend_event<R: Runtime>(
