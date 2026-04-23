@@ -984,14 +984,32 @@ pub(crate) fn collect_descendants<S: BookStore>(
     store: &ContentStore<S>,
     cid: ContentId,
 ) -> Vec<ContentId> {
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
     let mut out = Vec::new();
-    let mut stack = vec![cid];
-    while let Some(id) = stack.pop() {
+    let mut stack: Vec<(ContentId, u8)> = vec![(cid, 0)];
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            tracing::warn!(
+                cid_depth = depth,
+                max = MAX_BUNDLE_DEPTH,
+                "collect_descendants aborting subtree past MAX_BUNDLE_DEPTH; data is corrupt"
+            );
+            continue;
+        }
         out.push(id);
         if matches!(id.cid_type(), CidType::Bundle(_)) {
             if let Some(bytes) = store.get(&id) {
-                if let Ok(children) = bundle::parse_bundle(bytes) {
-                    stack.extend(children.iter().copied());
+                match bundle::parse_bundle(bytes) {
+                    Ok(children) => {
+                        for child in children.iter().copied() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        err = ?e,
+                        "malformed bundle payload; subtree skipped"
+                    ),
                 }
             }
         }
