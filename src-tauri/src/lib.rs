@@ -16,6 +16,44 @@ pub mod mail;
 pub mod mail_sync;
 pub mod voice;
 
+// ── Chunked ingest (ZEB-154) ──────────────────────────────────────────────
+
+/// Maximum bytes supported by the v1 flat-bundle chunked-ingest path.
+///
+/// = MAX_BUNDLE_ENTRIES × MAX_PAYLOAD_SIZE ≈ 32 GiB. Files larger than this
+/// need nested bundles, which land with folder/directory support (ZEB-156
+/// et al). A flat-bundle-only v1 is intentional; see
+/// docs/specs/2026-04-23-chunked-ingest-design.md (Q1).
+pub const FLAT_BUNDLE_MAX: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
+    * (harmony_content::cid::MAX_PAYLOAD_SIZE as u64);
+
+/// Dispatch decision for `ingest_content`, derived purely from file size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestDispatch {
+    /// File fits in a single `for_book` CID — use the existing path.
+    Single,
+    /// File is larger than `MAX_PAYLOAD_SIZE` and must be chunked through
+    /// the FastCDC chunker into a root bundle.
+    Chunked,
+}
+
+/// Classify a file size into an ingest strategy, or return an error message
+/// suitable for surfacing to the frontend if the file exceeds the v1 cap.
+pub fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
+    if size > FLAT_BUNDLE_MAX {
+        return Err(format!(
+            "file too large ({} bytes). v1 flat-bundle cap is {} bytes (~32 GiB). \
+             Support for larger files lands with folder/nested-bundle support.",
+            size, FLAT_BUNDLE_MAX
+        ));
+    }
+    if size as usize > harmony_content::cid::MAX_PAYLOAD_SIZE {
+        Ok(IngestDispatch::Chunked)
+    } else {
+        Ok(IngestDispatch::Single)
+    }
+}
+
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
 struct NodeState {
@@ -2252,5 +2290,51 @@ mod tests {
         assert!(parse_content_announcement("harmony/announce/<script>", &payload).is_none());
         assert!(parse_content_announcement("harmony/announce/xyz!", &payload).is_none());
         assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
+    }
+}
+
+#[cfg(test)]
+mod chunked_ingest_tests {
+    use super::*;
+    use harmony_content::bundle::MAX_BUNDLE_ENTRIES;
+    use harmony_content::cid::MAX_PAYLOAD_SIZE;
+
+    #[test]
+    fn ingest_dispatch_picks_single_for_small_sizes() {
+        assert!(matches!(
+            ingest_dispatch(0).unwrap(),
+            IngestDispatch::Single
+        ));
+        assert!(matches!(
+            ingest_dispatch(MAX_PAYLOAD_SIZE as u64).unwrap(),
+            IngestDispatch::Single
+        ));
+    }
+
+    #[test]
+    fn ingest_dispatch_picks_chunked_above_single_book_ceiling() {
+        assert!(matches!(
+            ingest_dispatch(MAX_PAYLOAD_SIZE as u64 + 1).unwrap(),
+            IngestDispatch::Chunked
+        ));
+    }
+
+    #[test]
+    fn ingest_dispatch_rejects_above_flat_bundle_cap() {
+        let too_big = FLAT_BUNDLE_MAX + 1;
+        let err = ingest_dispatch(too_big).unwrap_err();
+        assert!(err.contains("file too large"), "got: {err}");
+        assert!(err.contains("32 GiB") || err.contains("flat-bundle"),
+                "message should explain the cap origin, got: {err}");
+    }
+
+    #[test]
+    fn flat_bundle_max_matches_spec() {
+        // Sanity-check the constant so a refactor of the underlying
+        // harmony-content limits surfaces here.
+        assert_eq!(
+            FLAT_BUNDLE_MAX,
+            (MAX_BUNDLE_ENTRIES as u64) * (MAX_PAYLOAD_SIZE as u64)
+        );
     }
 }
