@@ -1530,7 +1530,7 @@ async fn ingest_content(
         .unwrap_or(0);
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.insert(content_index::ContentIndexEntry {
+        let inserted = idx.insert(content_index::ContentIndexEntry {
             cid: root_cid_bytes,
             file_name: file_name.clone(),
             size_bytes,
@@ -1540,6 +1540,14 @@ async fn ingest_content(
             licensed: false,
             archived: false,
         });
+        if !inserted {
+            tracing::debug!(
+                cid = %hex::encode(root_cid_bytes),
+                file_name = %file_name,
+                "ingest_content: duplicate CID; sidecar entry unchanged \
+                 (file_name/stored_at_ms retain their original values)"
+            );
+        }
     }
 
     Ok(IngestResult {
