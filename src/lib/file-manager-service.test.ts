@@ -211,14 +211,17 @@ describe('FileManagerService', () => {
     expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { cid: 'cid-video-lecture' });
   });
 
-  it('exportToDevice invokes export_content with cid and file name', async () => {
+  it('exportToDevice invokes export_content with cid as filename when item not in real list', async () => {
+    // After connectAdapter, the mock list_content returns no items, so the
+    // service has an empty privateContent. exportToDevice falls back to the
+    // CID as the filename for items not present in the real list.
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
     await svc.exportToDevice(['cid-design-doc']);
     expect(adapter.invoke).toHaveBeenCalledWith('export_content', {
       cid: 'cid-design-doc',
-      fileName: 'mesh-design.md',
+      fileName: 'cid-design-doc',
     });
   });
 
@@ -269,8 +272,8 @@ describe('FileManagerService', () => {
   it('deduplicates announced CIDs', async () => {
     const svc = new FileManagerService();
     const { adapter, emit } = createMockAdapter();
-    svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn(); // reset after connect so we count only post-connect calls
     emit('content-announced', { cid: 'dup1', sizeBytes: 100 } satisfies ContentAnnouncementEvent);
     emit('content-announced', { cid: 'dup1', sizeBytes: 200 } satisfies ContentAnnouncementEvent);
     expect(svc.announcedCids.get('dup1')!.sizeBytes).toBe(100); // first wins
@@ -280,8 +283,8 @@ describe('FileManagerService', () => {
   it('calls onChange on new content announcement', async () => {
     const svc = new FileManagerService();
     const { adapter, emit } = createMockAdapter();
-    svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn(); // reset after connect so we count only post-connect calls
     emit('content-announced', { cid: 'new1', sizeBytes: 512 } satisfies ContentAnnouncementEvent);
     expect(svc.onChange).toHaveBeenCalledOnce();
   });

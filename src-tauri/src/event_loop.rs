@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -42,6 +42,32 @@ pub struct IngestRequest {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+/// Content-verb requests sent from Tauri commands into the event loop.
+///
+/// The event loop mutates the runtime's cache (pin/unpin) and snapshots
+/// pinned state in response. Sidecar-only mutations (archive, replication
+/// tier) are NOT routed through this channel — they run directly against
+/// the `Arc<Mutex<ContentIndex>>` from the Tauri command handler.
+pub enum ContentVerbRequest {
+    Pin {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    Unpin {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    Burn {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Snapshot the set of currently-pinned CIDs in the runtime cache.
+    /// Used by `list_content` to fill the `pinned` field per entry.
+    PinnedSet {
+        reply: oneshot::Sender<std::collections::HashSet<[u8; 32]>>,
+    },
+}
+
 /// A follow/unfollow request sent from the Tauri command thread into the event loop.
 pub enum FollowRequest {
     Follow { address: String },
@@ -65,22 +91,23 @@ enum ZenohEvent {
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
 /// all initialized, or `Err(msg)` if any startup step fails.
 /// Returns when shutdown signal fires.
-pub async fn run(
+pub async fn run<R: Runtime>(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
-    app: AppHandle,
+    app: AppHandle<R>,
     endpoint: Option<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
     mut publish_rx: mpsc::Receiver<PublishRequest>,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
+    mut content_verb_rx: mpsc::Receiver<ContentVerbRequest>,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
-    mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
+    mail_sync: Option<Arc<crate::mail_sync::MailSync<R>>>,
     mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
@@ -527,6 +554,40 @@ pub async fn run(
                 }
             }
 
+            // ── Content-verb requests (pin/unpin/burn/snapshot) ────
+            Some(req) = content_verb_rx.recv() => {
+                use harmony_content::cid::ContentId;
+                match req {
+                    ContentVerbRequest::Pin { cid, reply } => {
+                        let id = ContentId::from_bytes(cid);
+                        let ok = runtime.pin_content(id);
+                        let _ = reply.send(Ok(ok));
+                    }
+                    ContentVerbRequest::Unpin { cid, reply } => {
+                        let id = ContentId::from_bytes(cid);
+                        runtime.unpin_content(&id);
+                        let _ = reply.send(Ok(true));
+                    }
+                    ContentVerbRequest::Burn { cid, reply } => {
+                        // Burn on a RAM-only client = unpin so the cache
+                        // can evict naturally. The sidecar-removal side
+                        // of burn runs in the Tauri command handler.
+                        let id = ContentId::from_bytes(cid);
+                        runtime.unpin_content(&id);
+                        let _ = reply.send(Ok(true));
+                    }
+                    ContentVerbRequest::PinnedSet { reply } => {
+                        let cache = runtime.storage_tier().cache();
+                        let pinned: std::collections::HashSet<[u8; 32]> = cache
+                            .iter_admitted()
+                            .filter(|id| cache.is_pinned(id))
+                            .map(|id| id.to_bytes())
+                            .collect();
+                        let _ = reply.send(pinned);
+                    }
+                }
+            }
+
             // Follow/unfollow updates are applied to followed_set directly
             // by the Tauri command handlers. When per-creator Zenoh
             // subscriptions are added (once the publish path includes
@@ -619,13 +680,13 @@ pub async fn run(
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
-async fn dispatch_action(
+async fn dispatch_action<R: Runtime>(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
 ) {
@@ -897,7 +958,7 @@ async fn query_mail_root(
 }
 
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
-fn emit_session_lost(app: &AppHandle, reason: &str) {
+fn emit_session_lost<R: Runtime>(app: &AppHandle<R>, reason: &str) {
     let _ = app.emit(
         "zenoh-status",
         &crate::ZenohStatus {
@@ -910,8 +971,8 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
 #[allow(clippy::too_many_arguments)]
-fn emit_frontend_event(
-    app: &AppHandle,
+fn emit_frontend_event<R: Runtime>(
+    app: &AppHandle<R>,
     key_expr: &str,
     payload: &[u8],
     hop_distance: Option<u8>,
@@ -919,7 +980,7 @@ fn emit_frontend_event(
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     own_mail_key: &str,
     own_root_key: &str,
-    mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
+    mail_sync: Option<&Arc<crate::mail_sync::MailSync<R>>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {

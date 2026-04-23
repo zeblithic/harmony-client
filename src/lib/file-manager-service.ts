@@ -32,6 +32,19 @@ interface IngestResult {
   sizeBytes: number;
 }
 
+/** Wire format for entries returned by the list_content Tauri command. */
+interface ContentItemWire {
+  cid: string;
+  name: string;
+  sizeBytes: number;
+  storedAt: number;
+  sensitivity: 'private' | 'confidential' | 'public';
+  replicationTier: ReplicationTier;
+  pinned: boolean;
+  licensed: boolean;
+  archived: boolean;
+}
+
 const MUSIC_EXTS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus', 'wma'];
 const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'];
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'ico', 'tiff'];
@@ -47,6 +60,27 @@ export function inferCategory(fileName: string): ContentCategory {
   if (SOFTWARE_EXTS.includes(ext)) return 'software';
   if (DATASET_EXTS.includes(ext)) return 'dataset';
   return 'text';
+}
+
+function wireToContentItem(wire: ContentItemWire): ContentItem {
+  return {
+    cid: wire.cid,
+    name: wire.name,
+    category: inferCategory(wire.name),
+    sensitivity: wire.sensitivity,
+    sizeBytes: wire.sizeBytes,
+    storedAt: wire.storedAt,
+    lastAccessed: wire.storedAt,
+    accessCount: 0,
+    stalenessScore: 0,
+    replicationTier: wire.replicationTier,
+    replicaCount: 1,
+    pinned: wire.pinned,
+    licensed: wire.licensed,
+    archived: wire.archived,
+    parentCid: null,
+    isFolder: false,
+  };
 }
 
 export class FileManagerService {
@@ -82,20 +116,40 @@ export class FileManagerService {
   /** Connect a Tauri adapter and start listening for content announcements. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return; // already wired; prevent duplicate listeners
+
+    // Do the full bootstrap (list + listener registration) before committing
+    // `this.adapter`. If either step fails the service stays disconnected so
+    // a later retry isn't blocked by the guard above.
+    let raw: ContentItemWire[] | null | undefined;
+    let unlisten: () => void;
+    try {
+      raw = (await adapter.invoke('list_content')) as ContentItemWire[] | null | undefined;
+      unlisten = await adapter.listen(
+        'content-announced',
+        (event) => {
+          const wire = event.payload as ContentAnnouncementEvent;
+          if (this.announcedCids.has(wire.cid)) return;
+          this.announcedCids = new Map([
+            ...this.announcedCids,
+            [wire.cid, { sizeBytes: wire.sizeBytes, firstSeen: Date.now() }],
+          ]);
+          this.onChange?.();
+        },
+      );
+    } catch (err) {
+      // Leave this.adapter null so the caller (or a retry path) can try again.
+      throw err;
+    }
+
     this.adapter = adapter;
-    const unlisten = await adapter.listen(
-      'content-announced',
-      (event) => {
-        const wire = event.payload as ContentAnnouncementEvent;
-        if (this.announcedCids.has(wire.cid)) return;
-        this.announcedCids = new Map([
-          ...this.announcedCids,
-          [wire.cid, { sizeBytes: wire.sizeBytes, firstSeen: Date.now() }],
-        ]);
-        this.onChange?.();
-      },
-    );
+    // Per ZEB-146, the file-manager UI must never mix mocks with real state
+    // once the backend adapter is connected. Archived items stay in the
+    // sidecar but are hidden from the active list (spec: archive = UI-hide).
+    this.privateContent = Array.isArray(raw)
+      ? raw.filter((w) => !w.archived).map(wireToContentItem)
+      : [];
     this.unlisteners.push(unlisten);
+    this.onChange?.();
   }
 
   /** Returns private content. With no args returns a copy of all; with parentCid filters by parent. */
@@ -163,26 +217,47 @@ export class FileManagerService {
   }
 
   /** Permanently removes content items and frees their quota. */
-  burn(cids: string[]): void {
-    const cidSet = new Set(cids);
-    this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
-    if (this.adapter) {
-      for (const cid of cids) {
-        this.adapter.invoke('burn_content', { cid }).catch(() => {});
-      }
+  async burn(cids: string[]): Promise<void> {
+    if (!this.adapter) {
+      // Offline-only path: still mutate local state so tests/Storybook work.
+      const cidSet = new Set(cids);
+      this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+      this.onChange?.();
+      return;
     }
+    const results = await Promise.allSettled(
+      cids.map((cid) => this.adapter!.invoke('burn_content', { cid })),
+    );
+    const succeeded = new Set(
+      cids.filter((_, i) => {
+        const r = results[i];
+        return r.status === 'fulfilled' && r.value === true;
+      }),
+    );
+    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
+    this.onChange?.();
   }
 
   /** Move content to cold storage (archive tier). Items are removed from
    *  the active file list and the backend is notified to migrate the data. */
-  archive(cids: string[]): void {
-    const cidSet = new Set(cids);
-    this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
-    if (this.adapter) {
-      for (const cid of cids) {
-        this.adapter.invoke('archive_content', { cid }).catch(() => {});
-      }
+  async archive(cids: string[]): Promise<void> {
+    if (!this.adapter) {
+      const cidSet = new Set(cids);
+      this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+      this.onChange?.();
+      return;
     }
+    const results = await Promise.allSettled(
+      cids.map((cid) => this.adapter!.invoke('archive_content', { cid })),
+    );
+    const succeeded = new Set(
+      cids.filter((_, i) => {
+        const r = results[i];
+        return r.status === 'fulfilled' && r.value === true;
+      }),
+    );
+    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
+    this.onChange?.();
   }
 
   /** Moves content from private to published with durable publish mode. */
@@ -196,31 +271,52 @@ export class FileManagerService {
   }
 
   /** Sets the pinned flag on a content item. */
-  pin(cid: string): void {
+  async pin(cid: string): Promise<void> {
+    if (!this.adapter) {
+      // Offline-only path: mutate local state for Storybook/test contexts.
+      const item = this.privateContent.find((i) => i.cid === cid);
+      if (item) item.pinned = true;
+      this.onChange?.();
+      return;
+    }
+    const ok = (await this.adapter.invoke('pin_content', { cid })) as boolean;
+    if (ok === false) {
+      throw new Error('pin quota exhausted');
+    }
     const item = this.privateContent.find((i) => i.cid === cid);
     if (item) item.pinned = true;
-    if (this.adapter) {
-      this.adapter.invoke('pin_content', { cid }).catch(() => {});
-    }
+    this.onChange?.();
   }
 
   /** Clears the pinned flag on a content item. */
-  unpin(cid: string): void {
+  async unpin(cid: string): Promise<void> {
+    if (!this.adapter) {
+      const item = this.privateContent.find((i) => i.cid === cid);
+      if (item) item.pinned = false;
+      this.onChange?.();
+      return;
+    }
+    await this.adapter.invoke('unpin_content', { cid });
     const item = this.privateContent.find((i) => i.cid === cid);
     if (item) item.pinned = false;
-    if (this.adapter) {
-      this.adapter.invoke('unpin_content', { cid }).catch(() => {});
-    }
+    this.onChange?.();
   }
 
   /** Updates the replication tier for specified items. */
-  setReplicationTier(cids: string[], tier: ReplicationTier): void {
+  async setReplicationTier(cids: string[], tier: ReplicationTier): Promise<void> {
+    // Wait for the sidecar write before publishing the change locally; if the
+    // backend rejects, callers see the rejection and the UI stays consistent
+    // with what's persisted.
+    if (this.adapter) {
+      await this.adapter.invoke('set_replication_tier', { cids, tier });
+    }
     const cidSet = new Set(cids);
     for (const item of this.privateContent) {
       if (cidSet.has(item.cid)) {
         item.replicationTier = tier;
       }
     }
+    this.onChange?.();
   }
 
   /** Export content to the local filesystem via a native save dialog.
@@ -256,6 +352,7 @@ export class FileManagerService {
       replicaCount: 1,
       pinned: false,
       licensed: false,
+      archived: false,
       parentCid: parentCid ?? null,
       isFolder: false,
     };

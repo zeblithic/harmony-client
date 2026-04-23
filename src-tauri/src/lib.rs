@@ -8,16 +8,16 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-mod event_loop;
+pub mod content_index;
+pub mod event_loop;
 mod follows;
 mod identity;
 pub mod mail;
 pub mod mail_sync;
-mod voice;
+pub mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
-#[derive(Default)]
 struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -29,6 +29,8 @@ struct NodeState {
     fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
     /// Channel for routing content-ingest requests through the event loop.
     ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
+    /// Channel for routing content verb (pin/unpin/burn) requests through the event loop.
+    content_verb_tx: Option<tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     /// Channel for routing follow/unfollow requests through the event loop.
     follow_tx: Option<tokio::sync::mpsc::Sender<event_loop::FollowRequest>>,
     /// Channel for sending outbound voice frames to the event loop.
@@ -44,10 +46,37 @@ struct NodeState {
     /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
     /// commands (refresh_mail, fetch_mail_body) can reach it.
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
+    /// Disk-backed content index (pin/replication metadata).
+    content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+}
+
+impl Default for NodeState {
+    fn default() -> Self {
+        Self {
+            thread: None,
+            shutdown_tx: None,
+            publish_tx: None,
+            fetch_tx: None,
+            ingest_tx: None,
+            content_verb_tx: None,
+            follow_tx: None,
+            voice_tx: None,
+            voice_channel_tx: None,
+            follow_mgr: None,
+            followed_set: None,
+            mail_mgr: None,
+            mail_sync: None,
+            content_index: std::sync::Arc::new(std::sync::Mutex::new(
+                content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            generation: 0,
+            node_addr: String::new(),
+        }
+    }
 }
 
 // ── Data types (shared with frontend via Tauri events) ───────────────────
@@ -192,7 +221,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, content_verb_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -209,6 +238,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.publish_tx.take(),
             guard.fetch_tx.take(),
             guard.ingest_tx.take(),
+            guard.content_verb_tx.take(),
             guard.follow_tx.take(),
             guard.voice_tx.take(),
             guard.voice_channel_tx.take(),
@@ -226,6 +256,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
+    drop(content_verb_tx);
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
@@ -256,6 +287,8 @@ async fn start_node(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    let (content_verb_tx, content_verb_rx) =
+        tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(32);
     // Mail refresh channel. MailSync (constructed below once identity is
     // loaded) owns the sender; the event loop's select! arm services
     // RefreshRequests by issuing a Zenoh get against the gateway's
@@ -273,6 +306,9 @@ async fn start_node(
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
     ));
+    let content_index = std::sync::Arc::new(std::sync::Mutex::new(
+        content_index::ContentIndex::load(&app_data_dir),
+    ));
     let followed_set_clone = followed_set.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
@@ -288,6 +324,7 @@ async fn start_node(
         let old_publish = guard.publish_tx.take();
         let old_fetch = guard.fetch_tx.take();
         let old_ingest = guard.ingest_tx.take();
+        let old_content_verb = guard.content_verb_tx.take();
         let old_follow = guard.follow_tx.take();
         let old_voice = guard.voice_tx.take();
         let old_voice_channel = guard.voice_channel_tx.take();
@@ -299,6 +336,7 @@ async fn start_node(
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
+        drop(old_content_verb);
         drop(old_follow);
         drop(old_voice);
         drop(old_voice_channel);
@@ -421,6 +459,7 @@ async fn start_node(
                         publish_rx,
                         fetch_rx,
                         ingest_rx,
+                        content_verb_rx,
                         follow_rx,
                         voice_rx,
                         voice_channel_rx,
@@ -439,6 +478,8 @@ async fn start_node(
         guard.publish_tx = Some(publish_tx);
         guard.fetch_tx = Some(fetch_tx);
         guard.ingest_tx = Some(ingest_tx);
+        guard.content_verb_tx = Some(content_verb_tx);
+        guard.content_index = content_index;
         guard.follow_tx = Some(follow_tx);
         guard.voice_tx = Some(voice_tx);
         guard.voice_channel_tx = Some(voice_channel_tx);
@@ -981,6 +1022,47 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
     })
 }
 
+/// Wire format returned by `list_content` — one entry per self-ingested
+/// file the client is aware of. Joins sidecar metadata with the runtime
+/// cache's pinned state snapshot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentItemWire {
+    pub cid: String,              // hex
+    pub name: String,
+    pub size_bytes: u64,
+    pub stored_at: u64,           // ms since epoch
+    pub sensitivity: String,      // "private" | "confidential" | "public"
+    pub replication_tier: String, // "minimal" | "default" | "durable"
+    pub pinned: bool,
+    pub licensed: bool,
+    pub archived: bool,
+}
+
+fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
+    match s {
+        content_index::Sensitivity::Private => "private",
+        content_index::Sensitivity::Confidential => "confidential",
+        content_index::Sensitivity::Public => "public",
+    }
+}
+
+fn replication_tier_wire(t: content_index::ReplicationTier) -> &'static str {
+    match t {
+        content_index::ReplicationTier::Expendable => "expendable",
+        content_index::ReplicationTier::Light => "light",
+        content_index::ReplicationTier::Default => "default",
+        content_index::ReplicationTier::High => "high",
+        content_index::ReplicationTier::Ultra => "ultra",
+    }
+}
+
+fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(cid_hex).map_err(|_| "invalid cid hex".to_string())?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| "cid must be 32 bytes".to_string())
+}
+
 /// Result returned to the frontend after a successful file ingest.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -991,37 +1073,191 @@ pub struct IngestResult {
 }
 
 #[tauri::command]
-fn list_content() -> Vec<serde_json::Value> {
-    // Future (bead fkz): query runtime's cache + disk index via query channel.
-    Vec::new()
+async fn list_content(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<ContentItemWire>, String> {
+    // 1. Snapshot pinned CIDs from the runtime cache.
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let pinned_set = reply_rx
+        .await
+        .map_err(|_| "event loop dropped snapshot request".to_string())?;
+
+    // 2. Join sidecar entries with pinned state and shape the wire.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let mut entries: Vec<ContentItemWire> = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.entries()
+            .map(|e| ContentItemWire {
+                cid: hex::encode(e.cid),
+                name: e.file_name.clone(),
+                size_bytes: e.size_bytes,
+                stored_at: e.stored_at_ms,
+                sensitivity: sensitivity_wire(e.sensitivity).to_string(),
+                replication_tier: replication_tier_wire(e.replication_tier).to_string(),
+                pinned: pinned_set.contains(&e.cid),
+                licensed: e.licensed,
+                archived: e.archived,
+            })
+            .collect()
+    };
+    // `ContentIndex::entries()` iterates a HashMap, so order is not
+    // deterministic. Sort by stored_at descending (newest first) so the
+    // File Manager UI sees a stable list across renders.
+    entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
+    Ok(entries)
 }
 
 #[tauri::command]
-fn pin_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send pin request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn pin_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Pin {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped pin request".to_string())?
 }
 
 #[tauri::command]
-fn unpin_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send unpin request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn unpin_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Unpin {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped unpin request".to_string())?
 }
 
 #[tauri::command]
-fn burn_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send delete request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn burn_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+
+    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Burn {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped burn request".to_string())??;
+
+    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the
+    //    entry (so the frontend knows whether the burn actually removed
+    //    something or was a no-op on an already-unknown CID).
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let removed = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.remove(&cid_bytes)
+    };
+    Ok(removed)
 }
 
 #[tauri::command]
-fn archive_content(cid: String) -> Result<bool, String> {
-    // Future: send archive (cold-storage move) request to runtime.
-    let _ = cid;
-    Ok(true)
+async fn archive_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let flipped = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_archived(&cid_bytes, true)
+    };
+    Ok(flipped)
+}
+
+#[tauri::command]
+async fn set_replication_tier(
+    cids: Vec<String>,
+    tier: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<u32, String> {
+    let parsed_tier = match tier.as_str() {
+        "expendable" => content_index::ReplicationTier::Expendable,
+        "light" => content_index::ReplicationTier::Light,
+        "default" => content_index::ReplicationTier::Default,
+        "high" => content_index::ReplicationTier::High,
+        "ultra" => content_index::ReplicationTier::Ultra,
+        other => return Err(format!("unknown replication tier: {other}")),
+    };
+    let mut parsed_cids: Vec<[u8; 32]> = Vec::with_capacity(cids.len());
+    for c in &cids {
+        parsed_cids.push(parse_cid_hex(c)?);
+    }
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let updated = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_replication_tier(&parsed_cids, parsed_tier)
+    };
+    Ok(updated as u32)
 }
 
 /// Export content to the local filesystem via a save dialog.
@@ -1160,6 +1396,30 @@ async fn ingest_content(
     reply_rx
         .await
         .map_err(|_| "event loop dropped ingest request".to_string())??;
+
+    // Record sidecar metadata so `list_content` can surface this entry.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cid_bytes: [u8; 32] = cid.to_bytes();
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.insert(content_index::ContentIndexEntry {
+            cid: cid_bytes,
+            file_name: file_name.clone(),
+            size_bytes,
+            stored_at_ms,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+        });
+    }
 
     Ok(IngestResult {
         cid: cid_hex,
@@ -1565,6 +1825,7 @@ pub fn run() {
             unpin_content,
             burn_content,
             archive_content,
+            set_replication_tier,
             fetch_content,
             export_content,
             ingest_content,

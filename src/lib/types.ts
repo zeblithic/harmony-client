@@ -197,6 +197,9 @@ export interface ContentItem {
   replicaCount: number;
   pinned: boolean;
   licensed: boolean;
+  /** Hidden from the active File Manager list when true. Optional so mock
+   *  fixtures can omit it; absent === not archived. */
+  archived?: boolean;
   parentCid: string | null;
   isFolder: boolean;
 }

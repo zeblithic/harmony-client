@@ -464,18 +464,26 @@
     showCleanup = false;
   }
 
-  function handleFileBurn() {
+  async function handleFileBurn() {
     if (!selectedFileCid) return;
-    fileManagerService.burn([selectedFileCid]);
-    fileManagerVersion++;
-    selectedFileCid = null;
+    try {
+      await fileManagerService.burn([selectedFileCid]);
+      fileManagerVersion++;
+      selectedFileCid = null;
+    } catch (err) {
+      console.error('File burn failed:', err);
+    }
   }
 
-  function handleFileArchive() {
+  async function handleFileArchive() {
     if (!selectedFileCid) return;
-    fileManagerService.archive([selectedFileCid]);
-    fileManagerVersion++;
-    selectedFileCid = null;
+    try {
+      await fileManagerService.archive([selectedFileCid]);
+      fileManagerVersion++;
+      selectedFileCid = null;
+    } catch (err) {
+      console.error('File archive failed:', err);
+    }
   }
 
   function handleFilePublish(cid: string) {
@@ -490,16 +498,26 @@
     selectedFileCid = null;
   }
 
-  function handleFilePin() {
+  async function handleFilePin() {
     if (!selectedFileCid) return;
-    fileManagerService.pin(selectedFileCid);
-    fileManagerVersion++;
+    try {
+      await fileManagerService.pin(selectedFileCid);
+      fileManagerVersion++;
+    } catch (err) {
+      // Most common failure: pin quota exhausted. Surface via console for now;
+      // a proper toast/error channel is tracked separately.
+      console.error('File pin failed:', err);
+    }
   }
 
-  function handleFileUnpin() {
+  async function handleFileUnpin() {
     if (!selectedFileCid) return;
-    fileManagerService.unpin(selectedFileCid);
-    fileManagerVersion++;
+    try {
+      await fileManagerService.unpin(selectedFileCid);
+      fileManagerVersion++;
+    } catch (err) {
+      console.error('File unpin failed:', err);
+    }
   }
 
   async function handleFileExport() {
@@ -511,10 +529,14 @@
     }
   }
 
-  function handleFileTierChange(tier: ReplicationTier) {
+  async function handleFileTierChange(tier: ReplicationTier) {
     if (!selectedFileCid) return;
-    fileManagerService.setReplicationTier([selectedFileCid], tier);
-    fileManagerVersion++;
+    try {
+      await fileManagerService.setReplicationTier([selectedFileCid], tier);
+      fileManagerVersion++;
+    } catch (err) {
+      console.error('Replication-tier update failed:', err);
+    }
   }
 
   async function handleFileUploadClick() {
@@ -533,31 +555,43 @@
     showCleanup = !showCleanup;
   }
 
-  function handleCleanupAction(cid: string, action: string) {
-    if (action === 'burn') fileManagerService.burn([cid]);
-    else if (action === 'archive') fileManagerService.archive([cid]);
-    else if (action === 'release') fileManagerService.release([cid]);
-    else if (action === 'publish') fileManagerService.publish([cid]);
-    else if (action === 'pin') fileManagerService.pin(cid);
-    fileManagerVersion++;
-    if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
-      selectedFileCid = null;
+  async function handleCleanupAction(cid: string, action: string) {
+    try {
+      if (action === 'burn') await fileManagerService.burn([cid]);
+      else if (action === 'archive') await fileManagerService.archive([cid]);
+      else if (action === 'release') fileManagerService.release([cid]);
+      else if (action === 'publish') fileManagerService.publish([cid]);
+      else if (action === 'pin') await fileManagerService.pin(cid);
+      fileManagerVersion++;
+      if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
+        selectedFileCid = null;
+      }
+    } catch (err) {
+      console.error(`Cleanup ${action} failed:`, err);
     }
   }
 
-  function handleBulkBurn(cids: string[]) {
-    fileManagerService.burn(cids);
-    fileManagerVersion++;
-    if (selectedFileCid && cids.includes(selectedFileCid)) {
-      selectedFileCid = null;
+  async function handleBulkBurn(cids: string[]) {
+    try {
+      await fileManagerService.burn(cids);
+      fileManagerVersion++;
+      if (selectedFileCid && cids.includes(selectedFileCid)) {
+        selectedFileCid = null;
+      }
+    } catch (err) {
+      console.error('Bulk burn failed:', err);
     }
   }
 
-  function handleBulkArchive(cids: string[]) {
-    fileManagerService.archive(cids);
-    fileManagerVersion++;
-    if (selectedFileCid && cids.includes(selectedFileCid)) {
-      selectedFileCid = null;
+  async function handleBulkArchive(cids: string[]) {
+    try {
+      await fileManagerService.archive(cids);
+      fileManagerVersion++;
+      if (selectedFileCid && cids.includes(selectedFileCid)) {
+        selectedFileCid = null;
+      }
+    } catch (err) {
+      console.error('Bulk archive failed:', err);
     }
   }
 
