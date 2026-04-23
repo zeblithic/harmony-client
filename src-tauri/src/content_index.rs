@@ -12,6 +12,11 @@
 //! - Runtime cache is authoritative for pinned state (pin is an eviction
 //!   concept the cache owns).
 
+// Dormant until Task B3 wires up mutations (insert/remove/set_archived/
+// set_replication_tier) and Task B6+ adds the Tauri command callers.
+// Remove this allow once those callers exist.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -90,7 +95,7 @@ impl ContentIndex {
         let json = match serde_json::to_vec_pretty(&file) {
             Ok(j) => j,
             Err(e) => {
-                tracing::error!(err = %e, "content-index serialize failed");
+                tracing::warn!(err = %e, "content-index serialize failed; changes not persisted");
                 return;
             }
         };
@@ -103,8 +108,12 @@ impl ContentIndex {
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&tmp_path, &json).is_ok() {
-            let _ = std::fs::rename(&tmp_path, &self.path);
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            tracing::warn!(err = %e, "content-index write failed; changes not persisted");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            tracing::warn!(err = %e, "content-index rename failed; tmp file may be stale");
         }
     }
 }
