@@ -77,7 +77,7 @@ Progress events can land in a focused PR once 100+ MB uploads are common.
 
 ## Architecture overview
 
-```
+```text
 ingest a large file:
   chunks = chunker::chunk_all(bytes, DEFAULT_CONFIG)    # 256K / 512K / ~1M
   leaf_cids = [ContentId::for_book(&bytes[range], flags) for each range]
@@ -100,7 +100,7 @@ Pin/unpin/burn cascade: event-loop verb handlers walk the bundle tree locally
 via the runtime's content store (`runtime.storage_tier().cache()`), applying
 the verb to every descendant.
 
-Single-blob fast path preserved: files with `len < MAX_PAYLOAD_SIZE` take the
+Single-blob fast path preserved: files with `len <= MAX_PAYLOAD_SIZE` take the
 existing ZEB-146 single-CID path with no chunking overhead.
 
 ## Ingest path
@@ -140,12 +140,14 @@ if bytes.len() <= MAX_PAYLOAD_SIZE {
      `ingest_tx` channel; `.await` the reply.
    - Append `cid` to `leaf_cids`.
 3. Build the bundle:
-   - ```
-     let mut builder = BundleBuilder::new();
-     for cid in &leaf_cids { builder.add(*cid); }
-     let (bundle_payload, root_cid) =
-         builder.build_with_flags(ContentFlags::default())?;
-     ```
+
+   ```rust
+   let mut builder = BundleBuilder::new();
+   for cid in &leaf_cids { builder.add(*cid); }
+   let (bundle_payload, root_cid) =
+       builder.build_with_flags(ContentFlags::default())?;
+   ```
+
 4. One more `IngestRequest` for the bundle.
 5. Sidecar insert: `ContentIndexEntry { cid: root_cid.to_bytes(),
    size_bytes: total_size, .. }`.
@@ -318,7 +320,7 @@ from ZEB-146's review-feedback pass) covers the user-visible surface.
 **Rust integration test** (extend
 `src-tauri/tests/content_index_integration.rs`):
 
-5. **Chunked ingest → pinned-set → pin cascade → fetch recursion → burn
+1. **Chunked ingest → pinned-set → pin cascade → fetch recursion → burn
    cascade** round-trip, analogous to the existing
    `ingest_list_pin_burn_roundtrip` but with a 3 MiB synthetic buffer
    (guaranteed to chunk into 3–6 leaves). Steps:
@@ -331,7 +333,7 @@ from ZEB-146's review-feedback pass) covers the user-visible surface.
      Zenoh-dependent paths via the port-in-use graceful skip), assert
      reassembled bytes match the original.
    - `Burn { root }`, assert `PinnedSet` empty, assert sidecar removal.
-6. **Inherits ZEB-146's port-in-use graceful skip** so the test is
+2. **Inherits ZEB-146's port-in-use graceful skip** so the test is
    CI-stable.
 
 **Non-goals in this PR's tests:**
