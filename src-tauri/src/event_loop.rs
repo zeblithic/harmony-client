@@ -107,7 +107,7 @@ pub async fn run<R: Runtime>(
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
-    mail_sync: Option<Arc<crate::mail_sync::MailSync>>,
+    mail_sync: Option<Arc<crate::mail_sync::MailSync<R>>>,
     mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
@@ -980,7 +980,7 @@ fn emit_frontend_event<R: Runtime>(
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     own_mail_key: &str,
     own_root_key: &str,
-    mail_sync: Option<&Arc<crate::mail_sync::MailSync>>,
+    mail_sync: Option<&Arc<crate::mail_sync::MailSync<R>>>,
 ) {
     if key_expr.starts_with("harmony/compute/capacity/") {
         if let Some(mut update) = crate::parse_capacity(key_expr, payload) {
