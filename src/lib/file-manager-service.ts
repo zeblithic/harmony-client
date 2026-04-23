@@ -77,6 +77,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     replicaCount: 1,
     pinned: wire.pinned,
     licensed: wire.licensed,
+    archived: wire.archived,
     parentCid: null,
     isFolder: false,
   };
@@ -115,28 +116,40 @@ export class FileManagerService {
   /** Connect a Tauri adapter and start listening for content announcements. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return; // already wired; prevent duplicate listeners
+
+    // Do the full bootstrap (list + listener registration) before committing
+    // `this.adapter`. If either step fails the service stays disconnected so
+    // a later retry isn't blocked by the guard above.
+    let raw: ContentItemWire[] | null | undefined;
+    let unlisten: () => void;
+    try {
+      raw = (await adapter.invoke('list_content')) as ContentItemWire[] | null | undefined;
+      unlisten = await adapter.listen(
+        'content-announced',
+        (event) => {
+          const wire = event.payload as ContentAnnouncementEvent;
+          if (this.announcedCids.has(wire.cid)) return;
+          this.announcedCids = new Map([
+            ...this.announcedCids,
+            [wire.cid, { sizeBytes: wire.sizeBytes, firstSeen: Date.now() }],
+          ]);
+          this.onChange?.();
+        },
+      );
+    } catch (err) {
+      // Leave this.adapter null so the caller (or a retry path) can try again.
+      throw err;
+    }
+
     this.adapter = adapter;
-
-    // Fetch the real content list and clear mocks unconditionally — even if
-    // empty. Per ZEB-146, the file-manager UI must never mix mocks with real
-    // state once the backend adapter is connected.
-    const raw = (await adapter.invoke('list_content')) as ContentItemWire[] | null | undefined;
-    this.privateContent = Array.isArray(raw) ? raw.map(wireToContentItem) : [];
-    this.onChange?.();
-
-    const unlisten = await adapter.listen(
-      'content-announced',
-      (event) => {
-        const wire = event.payload as ContentAnnouncementEvent;
-        if (this.announcedCids.has(wire.cid)) return;
-        this.announcedCids = new Map([
-          ...this.announcedCids,
-          [wire.cid, { sizeBytes: wire.sizeBytes, firstSeen: Date.now() }],
-        ]);
-        this.onChange?.();
-      },
-    );
+    // Per ZEB-146, the file-manager UI must never mix mocks with real state
+    // once the backend adapter is connected. Archived items stay in the
+    // sidecar but are hidden from the active list (spec: archive = UI-hide).
+    this.privateContent = Array.isArray(raw)
+      ? raw.filter((w) => !w.archived).map(wireToContentItem)
+      : [];
     this.unlisteners.push(unlisten);
+    this.onChange?.();
   }
 
   /** Returns private content. With no args returns a copy of all; with parentCid filters by parent. */
@@ -216,7 +229,10 @@ export class FileManagerService {
       cids.map((cid) => this.adapter!.invoke('burn_content', { cid })),
     );
     const succeeded = new Set(
-      cids.filter((_, i) => results[i].status === 'fulfilled'),
+      cids.filter((_, i) => {
+        const r = results[i];
+        return r.status === 'fulfilled' && r.value === true;
+      }),
     );
     this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
     this.onChange?.();
@@ -235,7 +251,10 @@ export class FileManagerService {
       cids.map((cid) => this.adapter!.invoke('archive_content', { cid })),
     );
     const succeeded = new Set(
-      cids.filter((_, i) => results[i].status === 'fulfilled'),
+      cids.filter((_, i) => {
+        const r = results[i];
+        return r.status === 'fulfilled' && r.value === true;
+      }),
     );
     this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
     this.onChange?.();
@@ -285,7 +304,12 @@ export class FileManagerService {
 
   /** Updates the replication tier for specified items. */
   async setReplicationTier(cids: string[], tier: ReplicationTier): Promise<void> {
-    // Mutate local state first so the UI is immediately responsive.
+    // Wait for the sidecar write before publishing the change locally; if the
+    // backend rejects, callers see the rejection and the UI stays consistent
+    // with what's persisted.
+    if (this.adapter) {
+      await this.adapter.invoke('set_replication_tier', { cids, tier });
+    }
     const cidSet = new Set(cids);
     for (const item of this.privateContent) {
       if (cidSet.has(item.cid)) {
@@ -293,9 +317,6 @@ export class FileManagerService {
       }
     }
     this.onChange?.();
-    if (this.adapter) {
-      await this.adapter.invoke('set_replication_tier', { cids, tier });
-    }
   }
 
   /** Export content to the local filesystem via a native save dialog.
@@ -331,6 +352,7 @@ export class FileManagerService {
       replicaCount: 1,
       pinned: false,
       licensed: false,
+      archived: false,
       parentCid: parentCid ?? null,
       isFolder: false,
     };
