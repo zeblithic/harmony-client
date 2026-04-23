@@ -372,10 +372,13 @@ this lands:
 ## Dependency ordering
 
 This PR cannot compile until `harmony` exposes
-`NodeRuntime::storage_tier()` / `_mut()`. Two branches in sequence:
+`NodeRuntime::storage_tier()` / `_mut()`. Two branches in sequence, both
+tracked under ZEB-146 (the accessor work is load-bearing for this issue,
+not a separable initiative):
 
 1. **harmony PR** — add accessors to `NodeRuntime`, with a short test. Tiny;
-   can likely land same-day. File a Linear issue for tracking.
+   can likely land same-day. PR title should reference ZEB-146 as the
+   motivating issue.
 2. **harmony-client PR (this spec)** — bump the `harmony` git dep to the
    merged commit, then land the `content_index.rs` + verb channel +
    command + frontend changes together.
