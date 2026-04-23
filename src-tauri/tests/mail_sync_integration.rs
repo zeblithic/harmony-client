@@ -75,7 +75,9 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
 
     let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
         .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-    let root_bytes = root.to_bytes().unwrap();
+    let root_bytes = root
+        .to_bytes()
+        .expect("test fixture root encodes at MAILBOX_VERSION");
     let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
 
     // ── Bring up an in-process Zenoh session ──
