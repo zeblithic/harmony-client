@@ -20,12 +20,19 @@ pub mod voice;
 
 /// Maximum bytes supported by the v1 flat-bundle chunked-ingest path.
 ///
-/// = MAX_BUNDLE_ENTRIES × MAX_PAYLOAD_SIZE ≈ 32 GiB. Files larger than this
-/// need nested bundles, which land with folder/directory support (ZEB-156
-/// et al). A flat-bundle-only v1 is intentional; see
+/// Derived from the chunker's **minimum** chunk size — not the payload
+/// maximum — because FastCDC with `ChunkerConfig::DEFAULT` emits at most
+/// `ceil(N / min_chunk)` chunks. Using `min_chunk` guarantees the leaf
+/// count can never exceed `MAX_BUNDLE_ENTRIES`, so `BundleBuilder` never
+/// fails with a confusing "bundle full" error just below the true cap.
+///
+/// With the current defaults (MAX_BUNDLE_ENTRIES ≈ 32 767, min_chunk =
+/// 256 KiB) this lands at ~8 GiB. Files larger than this need nested
+/// bundles, which land with folder/directory support (ZEB-156 et al).
+/// A flat-bundle-only v1 is intentional; see
 /// docs/specs/2026-04-23-chunked-ingest-design.md (Q1).
 pub(crate) const FLAT_BUNDLE_MAX: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
-    * (harmony_content::cid::MAX_PAYLOAD_SIZE as u64);
+    * (harmony_content::chunker::ChunkerConfig::DEFAULT.min_chunk as u64);
 
 /// Dispatch decision for `ingest_content`, derived purely from file size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,12 +49,12 @@ pub(crate) enum IngestDispatch {
 pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
     if size > FLAT_BUNDLE_MAX {
         return Err(format!(
-            "file too large ({} bytes). v1 flat-bundle cap is {} bytes (~32 GiB). \
+            "file too large ({} bytes). v1 flat-bundle cap is {} bytes (~8 GiB). \
              Support for larger files lands with folder/nested-bundle support.",
             size, FLAT_BUNDLE_MAX
         ));
     }
-    if size as usize > harmony_content::cid::MAX_PAYLOAD_SIZE {
+    if size > harmony_content::cid::MAX_PAYLOAD_SIZE as u64 {
         Ok(IngestDispatch::Chunked)
     } else {
         Ok(IngestDispatch::Single)
@@ -1452,14 +1459,21 @@ async fn ingest_content(
     let meta = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    // Size-dispatch: reject above cap, chunk above MAX_PAYLOAD_SIZE,
-    // otherwise single-book fast path.
-    let dispatch = ingest_dispatch(meta.len())?;
+    // Early reject above the flat-bundle cap, before reading the file into
+    // memory. Dispatch is recomputed from actual bytes below in case the
+    // file changes size between this stat and the read that follows.
+    ingest_dispatch(meta.len())?;
 
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     let size_bytes = bytes.len() as u64;
+    // Final dispatch decision from the bytes actually read. This closes the
+    // TOCTOU window between metadata() and read(): if the file grew past the
+    // cap we reject cleanly, and if it shrank below MAX_PAYLOAD_SIZE we take
+    // the single-book fast path instead of tripping chunk_and_bundle's
+    // precondition guard.
+    let dispatch = ingest_dispatch(size_bytes)?;
 
     let ingest_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -2415,8 +2429,17 @@ mod chunked_ingest_tests {
         let too_big = FLAT_BUNDLE_MAX + 1;
         let err = ingest_dispatch(too_big).unwrap_err();
         assert!(err.contains("file too large"), "got: {err}");
-        assert!(err.contains("32 GiB") || err.contains("flat-bundle"),
+        assert!(err.contains("flat-bundle"),
                 "message should explain the cap origin, got: {err}");
+    }
+
+    #[test]
+    fn ingest_dispatch_rejects_u64_max() {
+        // Guard against accidental reintroduction of a `size as usize`
+        // comparison — on 32-bit targets that would wrap and misclassify
+        // multi-GiB sizes as Single.
+        let err = ingest_dispatch(u64::MAX).unwrap_err();
+        assert!(err.contains("file too large"), "got: {err}");
     }
 
     #[test]
@@ -2431,10 +2454,13 @@ mod chunked_ingest_tests {
     #[test]
     fn flat_bundle_max_matches_spec() {
         // Sanity-check the constant so a refactor of the underlying
-        // harmony-content limits surfaces here.
+        // harmony-content limits surfaces here. The cap uses the chunker's
+        // min_chunk (not MAX_PAYLOAD_SIZE) so the leaf count can never
+        // exceed MAX_BUNDLE_ENTRIES.
         assert_eq!(
             FLAT_BUNDLE_MAX,
-            (MAX_BUNDLE_ENTRIES as u64) * (MAX_PAYLOAD_SIZE as u64)
+            (MAX_BUNDLE_ENTRIES as u64)
+                * (harmony_content::chunker::ChunkerConfig::DEFAULT.min_chunk as u64)
         );
     }
 
