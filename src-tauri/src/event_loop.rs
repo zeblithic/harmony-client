@@ -1026,12 +1026,16 @@ pub(crate) fn collect_descendants<S: BookStore>(
 ///
 /// Depth-capped at `MAX_BUNDLE_DEPTH` for defensive safety — the write side
 /// already enforces this, so legitimate trees never trip the guard.
+///
+/// Returns `Err` — rather than logging and skipping — on depth overflow or
+/// a malformed bundle payload, in contrast to `collect_descendants`. Fetch
+/// reassembly cannot produce a correct result with any subtree missing.
 pub(crate) async fn fetch_recursive<F, Fut>(
-    mut fetch_one: F,
+    fetch_one: F,
     root: ContentId,
 ) -> Result<Vec<u8>, String>
 where
-    F: FnMut(ContentId) -> Fut,
+    F: Fn(ContentId) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
     use harmony_content::cid::MAX_BUNDLE_DEPTH;
