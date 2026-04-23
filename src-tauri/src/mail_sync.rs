@@ -869,7 +869,7 @@ mod tests {
         let folder_cid = [0xF0; CID_LEN];
         let root = MailRoot::new_empty([0u8; 16], 1700000000)
             .with_folder(FolderKind::Inbox, folder_cid, 1700000001);
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes().unwrap();
         let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
 
         let mut stub = StubFetcher::new();
@@ -934,7 +934,6 @@ mod tests {
 
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries,
         };
         let page_bytes = page.to_bytes().unwrap();
@@ -951,7 +950,7 @@ mod tests {
 
         let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
             .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes().unwrap();
         let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
 
         let mut stub = StubFetcher::new();
@@ -999,7 +998,6 @@ mod tests {
         };
         let page1 = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries: vec![entry1],
         };
         let page1_bytes = page1.to_bytes().unwrap();
@@ -1018,7 +1016,7 @@ mod tests {
 
         let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
             .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes().unwrap();
         let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
 
         let mut stub = StubFetcher::new();
@@ -1066,8 +1064,7 @@ mod tests {
             };
             let page = MailPage {
                 version: MAILBOX_VERSION,
-                next_page: None,
-                entries: vec![entry],
+                    entries: vec![entry],
             };
             let page_bytes = page.to_bytes().unwrap();
             let page_cid: [u8; 32] = *blake3::hash(&page_bytes).as_bytes();
@@ -1083,7 +1080,7 @@ mod tests {
 
             let root = MailRoot::new_empty([0; 16], 1_700_000_000)
                 .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-            let root_bytes = root.to_bytes();
+            let root_bytes = root.to_bytes().unwrap();
             let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
             (
                 root_cid,
@@ -1347,7 +1344,6 @@ mod tests {
         };
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries: vec![entry],
         };
         let page_bytes = page.to_bytes().unwrap();
@@ -1364,7 +1360,7 @@ mod tests {
 
         let root = MailRoot::new_empty([0; 16], 1_700_000_000)
             .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes().unwrap();
         let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
         (
             root_cid,
@@ -1616,7 +1612,6 @@ mod tests {
 
         let page = MailPage {
             version: MAILBOX_VERSION,
-            next_page: None,
             entries,
         };
         let page_bytes = page.to_bytes().unwrap();
@@ -1631,7 +1626,7 @@ mod tests {
         let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
         let root = MailRoot::new_empty([0; 16], 1_700_000_000)
             .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
-        let root_bytes = root.to_bytes();
+        let root_bytes = root.to_bytes().unwrap();
         let root_cid: [u8; 32] = *blake3::hash(&root_bytes).as_bytes();
 
         let mut stub = StubFetcher::new();
