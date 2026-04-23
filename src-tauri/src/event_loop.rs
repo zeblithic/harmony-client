@@ -503,11 +503,34 @@ pub async fn run<R: Runtime>(
 
             // ── Content-fetch requests from Tauri commands ──────────
             Some(req) = fetch_rx.recv() => {
-                let prefix = req.cid_hex.get(1..2).unwrap_or("");
-                let key_expr = format!("harmony/content/{prefix}/{}", req.cid_hex);
                 let session = session.clone();
+                let cid_hex = req.cid_hex;
                 tokio::spawn(async move {
-                    let result = fetch_via_zenoh(&session, &key_expr).await;
+                    // Parse hex → 32-byte CID. Reply with an error if malformed.
+                    let cid_bytes = match hex::decode(&cid_hex)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    {
+                        Some(b) => b,
+                        None => {
+                            let _ = req.reply.send(Err(format!("invalid CID hex: {cid_hex}")));
+                            return;
+                        }
+                    };
+                    let root = ContentId::from_bytes(cid_bytes);
+
+                    // Closure that does one Zenoh GET for a single CID.
+                    let fetch_one = move |cid: ContentId| {
+                        let session = session.clone();
+                        async move {
+                            let cid_hex = hex::encode(cid.to_bytes());
+                            let prefix = cid_hex.get(1..2).unwrap_or("");
+                            let key = format!("harmony/content/{prefix}/{cid_hex}");
+                            fetch_via_zenoh(&session, &key).await
+                        }
+                    };
+
+                    let result = fetch_recursive(fetch_one, root).await;
                     let _ = req.reply.send(result);
                 });
             }
