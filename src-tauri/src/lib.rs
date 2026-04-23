@@ -8,13 +8,13 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-mod content_index;
-mod event_loop;
+pub mod content_index;
+pub mod event_loop;
 mod follows;
 mod identity;
 pub mod mail;
 pub mod mail_sync;
-mod voice;
+pub mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 

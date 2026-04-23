@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use harmony_content::book::MemoryBookStore;
 use harmony_runtime::{NodeRuntime, RuntimeAction, RuntimeEvent};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -91,10 +91,10 @@ enum ZenohEvent {
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
 /// all initialized, or `Err(msg)` if any startup step fails.
 /// Returns when shutdown signal fires.
-pub async fn run(
+pub async fn run<R: Runtime>(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
-    app: AppHandle,
+    app: AppHandle<R>,
     endpoint: Option<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut shutdown: watch::Receiver<bool>,
@@ -680,13 +680,13 @@ pub async fn run(
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
-async fn dispatch_action(
+async fn dispatch_action<R: Runtime>(
     action: RuntimeAction,
     session: &zenoh::Session,
     zenoh_tx: &mpsc::Sender<ZenohEvent>,
     udp: &UdpSocket,
     broadcast_addr: &SocketAddr,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     closing: &Arc<AtomicBool>,
     own_zid: &str,
 ) {
@@ -958,7 +958,7 @@ async fn query_mail_root(
 }
 
 /// Emit zenoh-status error when a Zenoh session appears to have been lost.
-fn emit_session_lost(app: &AppHandle, reason: &str) {
+fn emit_session_lost<R: Runtime>(app: &AppHandle<R>, reason: &str) {
     let _ = app.emit(
         "zenoh-status",
         &crate::ZenohStatus {
@@ -971,8 +971,8 @@ fn emit_session_lost(app: &AppHandle, reason: &str) {
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
 #[allow(clippy::too_many_arguments)]
-fn emit_frontend_event(
-    app: &AppHandle,
+fn emit_frontend_event<R: Runtime>(
+    app: &AppHandle<R>,
     key_expr: &str,
     payload: &[u8],
     hop_distance: Option<u8>,
