@@ -42,6 +42,32 @@ pub struct IngestRequest {
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
+/// Content-verb requests sent from Tauri commands into the event loop.
+///
+/// The event loop mutates the runtime's cache (pin/unpin) and snapshots
+/// pinned state in response. Sidecar-only mutations (archive, replication
+/// tier) are NOT routed through this channel — they run directly against
+/// the `Arc<Mutex<ContentIndex>>` from the Tauri command handler.
+pub enum ContentVerbRequest {
+    Pin {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    Unpin {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    Burn {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Snapshot the set of currently-pinned CIDs in the runtime cache.
+    /// Used by `list_content` to fill the `pinned` field per entry.
+    PinnedSet {
+        reply: oneshot::Sender<std::collections::HashSet<[u8; 32]>>,
+    },
+}
+
 /// A follow/unfollow request sent from the Tauri command thread into the event loop.
 pub enum FollowRequest {
     Follow { address: String },
@@ -75,6 +101,7 @@ pub async fn run(
     mut publish_rx: mpsc::Receiver<PublishRequest>,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
+    mut content_verb_rx: mpsc::Receiver<ContentVerbRequest>,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
@@ -524,6 +551,40 @@ pub async fn run(
                         ).await;
                     }
                     let _ = req.reply.send(Ok(()));
+                }
+            }
+
+            // ── Content-verb requests (pin/unpin/burn/snapshot) ────
+            Some(req) = content_verb_rx.recv() => {
+                use harmony_content::cid::ContentId;
+                match req {
+                    ContentVerbRequest::Pin { cid, reply } => {
+                        let id = ContentId::from_bytes(cid);
+                        let ok = runtime.pin_content(id);
+                        let _ = reply.send(Ok(ok));
+                    }
+                    ContentVerbRequest::Unpin { cid, reply } => {
+                        let id = ContentId::from_bytes(cid);
+                        runtime.unpin_content(&id);
+                        let _ = reply.send(Ok(true));
+                    }
+                    ContentVerbRequest::Burn { cid, reply } => {
+                        // Burn on a RAM-only client = unpin so the cache
+                        // can evict naturally. The sidecar-removal side
+                        // of burn runs in the Tauri command handler.
+                        let id = ContentId::from_bytes(cid);
+                        runtime.unpin_content(&id);
+                        let _ = reply.send(Ok(true));
+                    }
+                    ContentVerbRequest::PinnedSet { reply } => {
+                        let cache = runtime.storage_tier().cache();
+                        let pinned: std::collections::HashSet<[u8; 32]> = cache
+                            .iter_admitted()
+                            .filter(|id| cache.is_pinned(id))
+                            .map(|id| id.to_bytes())
+                            .collect();
+                        let _ = reply.send(pinned);
+                    }
                 }
             }
 
