@@ -1393,6 +1393,30 @@ async fn ingest_content(
         .await
         .map_err(|_| "event loop dropped ingest request".to_string())??;
 
+    // Record sidecar metadata so `list_content` can surface this entry.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cid_bytes: [u8; 32] = cid.to_bytes();
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.insert(content_index::ContentIndexEntry {
+            cid: cid_bytes,
+            file_name: file_name.clone(),
+            size_bytes,
+            stored_at_ms,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+        });
+    }
+
     Ok(IngestResult {
         cid: cid_hex,
         file_name,

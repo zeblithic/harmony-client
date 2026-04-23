@@ -12,11 +12,6 @@
 //! - Runtime cache is authoritative for pinned state (pin is an eviction
 //!   concept the cache owns).
 
-// Dormant until Task B3 wires up mutations (insert/remove/set_archived/
-// set_replication_tier) and Task B6+ adds the Tauri command callers.
-// Remove this allow once those callers exist.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
