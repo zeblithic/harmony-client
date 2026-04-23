@@ -742,12 +742,12 @@ Find the ingest handler arm (search for `Some(req) = ingest_rx.recv()`). Directl
                 match req {
                     ContentVerbRequest::Pin { cid, reply } => {
                         let id = ContentId::from_bytes(cid);
-                        let ok = runtime.storage_tier_mut().pin(id);
+                        let ok = runtime.pin_content(id);
                         let _ = reply.send(Ok(ok));
                     }
                     ContentVerbRequest::Unpin { cid, reply } => {
                         let id = ContentId::from_bytes(cid);
-                        runtime.storage_tier_mut().unpin(&id);
+                        runtime.unpin_content(&id);
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::Burn { cid, reply } => {
@@ -755,7 +755,7 @@ Find the ingest handler arm (search for `Some(req) = ingest_rx.recv()`). Directl
                         // can evict naturally. The sidecar-removal side
                         // of burn runs in the Tauri command handler.
                         let id = ContentId::from_bytes(cid);
-                        runtime.storage_tier_mut().unpin(&id);
+                        runtime.unpin_content(&id);
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::PinnedSet { reply } => {
