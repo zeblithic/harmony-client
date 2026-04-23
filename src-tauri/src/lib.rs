@@ -18,7 +18,6 @@ mod voice;
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
-#[derive(Default)]
 struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -30,6 +29,8 @@ struct NodeState {
     fetch_tx: Option<tokio::sync::mpsc::Sender<event_loop::FetchRequest>>,
     /// Channel for routing content-ingest requests through the event loop.
     ingest_tx: Option<tokio::sync::mpsc::Sender<event_loop::IngestRequest>>,
+    /// Channel for routing content verb (pin/unpin/burn) requests through the event loop.
+    content_verb_tx: Option<tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>>,
     /// Channel for routing follow/unfollow requests through the event loop.
     follow_tx: Option<tokio::sync::mpsc::Sender<event_loop::FollowRequest>>,
     /// Channel for sending outbound voice frames to the event loop.
@@ -45,10 +46,37 @@ struct NodeState {
     /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
     /// commands (refresh_mail, fetch_mail_body) can reach it.
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
+    /// Disk-backed content index (pin/replication metadata).
+    content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     /// Monotonic connection generation (prevents stale stop_node races).
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+}
+
+impl Default for NodeState {
+    fn default() -> Self {
+        Self {
+            thread: None,
+            shutdown_tx: None,
+            publish_tx: None,
+            fetch_tx: None,
+            ingest_tx: None,
+            content_verb_tx: None,
+            follow_tx: None,
+            voice_tx: None,
+            voice_channel_tx: None,
+            follow_mgr: None,
+            followed_set: None,
+            mail_mgr: None,
+            mail_sync: None,
+            content_index: std::sync::Arc::new(std::sync::Mutex::new(
+                content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            generation: 0,
+            node_addr: String::new(),
+        }
+    }
 }
 
 // ── Data types (shared with frontend via Tauri events) ───────────────────
@@ -193,7 +221,7 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
+    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, content_verb_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -210,6 +238,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.publish_tx.take(),
             guard.fetch_tx.take(),
             guard.ingest_tx.take(),
+            guard.content_verb_tx.take(),
             guard.follow_tx.take(),
             guard.voice_tx.take(),
             guard.voice_channel_tx.take(),
@@ -227,6 +256,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
+    drop(content_verb_tx);
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
@@ -257,6 +287,8 @@ async fn start_node(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    let (content_verb_tx, content_verb_rx) =
+        tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(32);
     // Mail refresh channel. MailSync (constructed below once identity is
     // loaded) owns the sender; the event loop's select! arm services
     // RefreshRequests by issuing a Zenoh get against the gateway's
@@ -274,6 +306,9 @@ async fn start_node(
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
     ));
+    let content_index = std::sync::Arc::new(std::sync::Mutex::new(
+        content_index::ContentIndex::load(&app_data_dir),
+    ));
     let followed_set_clone = followed_set.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
@@ -289,6 +324,7 @@ async fn start_node(
         let old_publish = guard.publish_tx.take();
         let old_fetch = guard.fetch_tx.take();
         let old_ingest = guard.ingest_tx.take();
+        let old_content_verb = guard.content_verb_tx.take();
         let old_follow = guard.follow_tx.take();
         let old_voice = guard.voice_tx.take();
         let old_voice_channel = guard.voice_channel_tx.take();
@@ -300,6 +336,7 @@ async fn start_node(
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
+        drop(old_content_verb);
         drop(old_follow);
         drop(old_voice);
         drop(old_voice_channel);
@@ -422,6 +459,7 @@ async fn start_node(
                         publish_rx,
                         fetch_rx,
                         ingest_rx,
+                        content_verb_rx,
                         follow_rx,
                         voice_rx,
                         voice_channel_rx,
@@ -440,6 +478,8 @@ async fn start_node(
         guard.publish_tx = Some(publish_tx);
         guard.fetch_tx = Some(fetch_tx);
         guard.ingest_tx = Some(ingest_tx);
+        guard.content_verb_tx = Some(content_verb_tx);
+        guard.content_index = content_index;
         guard.follow_tx = Some(follow_tx);
         guard.voice_tx = Some(voice_tx);
         guard.voice_channel_tx = Some(voice_channel_tx);
