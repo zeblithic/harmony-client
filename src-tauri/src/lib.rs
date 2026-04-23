@@ -1172,17 +1172,88 @@ async fn unpin_content(
 }
 
 #[tauri::command]
-fn burn_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send delete request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn burn_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+
+    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Burn {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let _ = reply_rx
+        .await
+        .map_err(|_| "event loop dropped burn request".to_string())?;
+
+    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the
+    //    entry (so the frontend knows whether the burn actually removed
+    //    something or was a no-op on an already-unknown CID).
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let removed = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.remove(&cid_bytes)
+    };
+    Ok(removed)
 }
 
 #[tauri::command]
-fn archive_content(cid: String) -> Result<bool, String> {
-    // Future: send archive (cold-storage move) request to runtime.
-    let _ = cid;
-    Ok(true)
+async fn archive_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let flipped = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_archived(&cid_bytes, true)
+    };
+    Ok(flipped)
+}
+
+#[tauri::command]
+async fn set_replication_tier(
+    cids: Vec<String>,
+    tier: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<u32, String> {
+    let parsed_tier = match tier.as_str() {
+        "minimal" => content_index::ReplicationTier::Minimal,
+        "default" => content_index::ReplicationTier::Default,
+        "durable" => content_index::ReplicationTier::Durable,
+        other => return Err(format!("unknown replication tier: {other}")),
+    };
+    let mut parsed_cids: Vec<[u8; 32]> = Vec::with_capacity(cids.len());
+    for c in &cids {
+        parsed_cids.push(parse_cid_hex(c)?);
+    }
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let updated = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_replication_tier(&parsed_cids, parsed_tier)
+    };
+    Ok(updated as u32)
 }
 
 /// Export content to the local filesystem via a save dialog.
@@ -1726,6 +1797,7 @@ pub fn run() {
             unpin_content,
             burn_content,
             archive_content,
+            set_replication_tier,
             fetch_content,
             export_content,
             ingest_content,
