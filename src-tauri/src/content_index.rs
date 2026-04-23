@@ -116,6 +116,72 @@ impl ContentIndex {
             tracing::warn!(err = %e, "content-index rename failed; tmp file may be stale");
         }
     }
+
+    /// Insert a new entry. Returns `true` if added, `false` if the CID
+    /// was already present (no mutation in that case). Callers that want
+    /// overwrite semantics should remove first.
+    pub fn insert(&mut self, entry: ContentIndexEntry) -> bool {
+        if self.entries.contains_key(&entry.cid) {
+            return false;
+        }
+        self.entries.insert(entry.cid, entry);
+        self.save();
+        true
+    }
+
+    /// Remove an entry by CID. Returns `true` if present before the call.
+    pub fn remove(&mut self, cid: &[u8; 32]) -> bool {
+        let removed = self.entries.remove(cid).is_some();
+        if removed {
+            self.save();
+        }
+        removed
+    }
+
+    /// Flip the `archived` flag. Returns `true` if the flag changed;
+    /// `false` if already at the target state or the CID is unknown.
+    pub fn set_archived(&mut self, cid: &[u8; 32], archived: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(cid) else {
+            return false;
+        };
+        if entry.archived == archived {
+            return false;
+        }
+        entry.archived = archived;
+        self.save();
+        true
+    }
+
+    /// Set replication tier on a batch. Returns the count of entries
+    /// whose tier actually changed (missing or already-at-tier entries
+    /// are skipped silently).
+    pub fn set_replication_tier(
+        &mut self,
+        cids: &[[u8; 32]],
+        tier: ReplicationTier,
+    ) -> usize {
+        let mut changed = 0;
+        for cid in cids {
+            if let Some(entry) = self.entries.get_mut(cid) {
+                if entry.replication_tier != tier {
+                    entry.replication_tier = tier;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.save();
+        }
+        changed
+    }
+
+    pub fn get(&self, cid: &[u8; 32]) -> Option<&ContentIndexEntry> {
+        self.entries.get(cid)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &ContentIndexEntry> {
+        self.entries.values()
+    }
 }
 
 mod hex_cid {
@@ -191,5 +257,89 @@ mod tests {
         .unwrap();
         let idx = ContentIndex::load(dir.path());
         assert!(idx.entries.is_empty());
+    }
+
+    #[test]
+    fn insert_adds_entry_and_returns_true() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xBB; 32]);
+        assert!(idx.insert(entry.clone()));
+        assert_eq!(idx.get(&entry.cid), Some(&entry));
+    }
+
+    #[test]
+    fn insert_duplicate_cid_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xCC; 32]);
+        assert!(idx.insert(entry.clone()));
+        assert!(!idx.insert(entry));
+    }
+
+    #[test]
+    fn remove_returns_true_when_present_false_otherwise() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xDD; 32]);
+        idx.insert(entry.clone());
+        assert!(idx.remove(&entry.cid));
+        assert!(!idx.remove(&entry.cid));
+    }
+
+    #[test]
+    fn set_archived_flips_flag_and_reports_change() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xEE; 32]);
+        idx.insert(entry.clone());
+
+        assert!(idx.set_archived(&entry.cid, true));  // flipped
+        assert!(idx.get(&entry.cid).unwrap().archived);
+        assert!(!idx.set_archived(&entry.cid, true)); // idempotent
+    }
+
+    #[test]
+    fn set_archived_missing_cid_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        assert!(!idx.set_archived(&[0xFF; 32], true));
+    }
+
+    #[test]
+    fn set_replication_tier_counts_updated_entries() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let a = sample_entry([0x01; 32]);
+        let b = sample_entry([0x02; 32]);
+        idx.insert(a.clone());
+        idx.insert(b.clone());
+
+        // Both are Default; bumping to Durable should update 2.
+        let updated = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Durable);
+        assert_eq!(updated, 2);
+
+        // Same call again: tier already Durable, so 0 updated.
+        let again = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Durable);
+        assert_eq!(again, 0);
+
+        // Missing CID is skipped, not an error.
+        let with_missing =
+            idx.set_replication_tier(&[a.cid, [0xAA; 32]], ReplicationTier::Minimal);
+        assert_eq!(with_missing, 1);
+    }
+
+    #[test]
+    fn save_persists_mutations() {
+        let dir = tempdir().unwrap();
+        {
+            let mut idx = ContentIndex::load(dir.path());
+            idx.insert(sample_entry([0xA1; 32]));
+            idx.insert(sample_entry([0xA2; 32]));
+            idx.remove(&[0xA1; 32]);
+        }
+        let reloaded = ContentIndex::load(dir.path());
+        assert_eq!(reloaded.entries.len(), 1);
+        assert!(reloaded.get(&[0xA2; 32]).is_some());
     }
 }
