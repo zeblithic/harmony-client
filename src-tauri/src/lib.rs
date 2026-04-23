@@ -64,7 +64,7 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 ///
 /// Expects `bytes.len() > MAX_PAYLOAD_SIZE` — for smaller inputs use the
 /// existing single-book path.
-pub(crate) fn chunk_and_bundle(
+pub fn chunk_and_bundle(
     bytes: &[u8],
 ) -> Result<
     (
