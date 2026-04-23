@@ -76,7 +76,16 @@ pub(crate) fn chunk_and_bundle(
 > {
     use harmony_content::bundle::BundleBuilder;
     use harmony_content::chunker::{chunk_all, ChunkerConfig};
-    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::cid::{ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
+
+    if bytes.len() <= MAX_PAYLOAD_SIZE {
+        return Err(format!(
+            "chunk_and_bundle requires input larger than MAX_PAYLOAD_SIZE ({} bytes); \
+             got {} bytes — use the single-book path instead",
+            MAX_PAYLOAD_SIZE,
+            bytes.len()
+        ));
+    }
 
     let ranges = chunk_all(bytes, &ChunkerConfig::DEFAULT)
         .map_err(|e| format!("chunker error: {e:?}"))?;
@@ -2448,5 +2457,21 @@ mod chunked_ingest_tests {
             let recomputed = ContentId::for_book(data, ContentFlags::default()).unwrap();
             assert_eq!(*leaf_cid, recomputed);
         }
+    }
+
+    #[test]
+    fn chunk_and_bundle_rejects_single_book_sized_input() {
+        // MAX_PAYLOAD_SIZE is the single-book ceiling; chunk_and_bundle
+        // must reject inputs that should have gone through the single-book path.
+        let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE);
+        let err = chunk_and_bundle(&bytes).unwrap_err();
+        assert!(err.contains("single-book"), "got: {err}");
+    }
+
+    #[test]
+    fn chunk_and_bundle_accepts_exactly_max_payload_plus_one() {
+        // The smallest valid input: MAX_PAYLOAD_SIZE + 1 bytes.
+        let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE + 1);
+        chunk_and_bundle(&bytes).expect("must succeed at the minimum valid size");
     }
 }
