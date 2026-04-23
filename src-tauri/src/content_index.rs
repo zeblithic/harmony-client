@@ -65,7 +65,17 @@ pub struct ContentIndex {
 impl ContentIndex {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(INDEX_FILE);
-        let entries = Self::read_file(&path).unwrap_or_default();
+        // Symmetric with save(): if data_dir is empty, `path` is the bare
+        // filename "content-index.json" and would resolve to CWD. Don't read
+        // a stray CWD sidecar into the default/uninitialised state.
+        let path_is_bare = path
+            .parent()
+            .map_or(true, |p| p.as_os_str().is_empty());
+        let entries = if path_is_bare {
+            HashMap::new()
+        } else {
+            Self::read_file(&path).unwrap_or_default()
+        };
         ContentIndex { path, entries }
     }
 
@@ -102,9 +112,14 @@ impl ContentIndex {
             );
             return;
         }
+        // Sort by CID for deterministic on-disk ordering; HashMap iteration
+        // order would otherwise churn the file on every save and make diffs
+        // (and future snapshotting) noisy.
+        let mut sorted: Vec<ContentIndexEntry> = self.entries.values().cloned().collect();
+        sorted.sort_by_key(|e| e.cid);
         let file = IndexFile {
             version: FILE_VERSION,
-            entries: self.entries.values().cloned().collect(),
+            entries: sorted,
         };
         let json = match serde_json::to_vec_pretty(&file) {
             Ok(j) => j,

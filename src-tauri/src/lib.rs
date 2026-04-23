@@ -1196,9 +1196,9 @@ async fn burn_content(
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
-    let _ = reply_rx
+    reply_rx
         .await
-        .map_err(|_| "event loop dropped burn request".to_string())?;
+        .map_err(|_| "event loop dropped burn request".to_string())??;
 
     // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the
     //    entry (so the frontend knows whether the burn actually removed

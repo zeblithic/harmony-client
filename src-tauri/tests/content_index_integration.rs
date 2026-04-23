@@ -137,10 +137,24 @@ async fn ingest_list_pin_burn_roundtrip() {
         })
         .expect("spawn runtime thread");
 
-    // The event loop may fail to bind UDP (port in use on CI) or open Zenoh,
-    // but content-verb and ingest requests flow through the select loop regardless.
-    // Treat any ready result (Ok or Err) as acceptable for this test.
-    let _ = ready_rx.await;
+    // Require the event loop to report ready before we start exercising its
+    // channels. If startup fails the receivers are dropped and subsequent
+    // `.send(...).unwrap()` calls would panic with a confusing "channel
+    // closed" error — surface a clear message here instead.
+    //
+    // Port-in-use is the one case we skip rather than fail: when a Harmony
+    // app is already running on the dev machine the UDP port 4242 is busy,
+    // which is an environmental race, not a test regression. CI runs clean,
+    // so this skip doesn't hide real failures.
+    match ready_rx.await {
+        Ok(Ok(())) => {} // proceed
+        Ok(Err(e)) if e.contains("Address already in use") => {
+            eprintln!("skipping test: {e}");
+            return;
+        }
+        Ok(Err(e)) => panic!("event loop failed to start: {e}"),
+        Err(_) => panic!("event loop dropped ready signal"),
+    }
 
     // ── Step 1: ingest via the IngestRequest channel ──────────────────────
     let (ack_tx, ack_rx) = oneshot::channel();
