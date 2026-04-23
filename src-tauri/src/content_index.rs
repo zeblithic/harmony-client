@@ -175,10 +175,14 @@ impl ContentIndex {
         changed
     }
 
+    /// Look up a single entry by CID.
     pub fn get(&self, cid: &[u8; 32]) -> Option<&ContentIndexEntry> {
         self.entries.get(cid)
     }
 
+    /// Iterate over all entries. **Order is not guaranteed** (HashMap-backed).
+    /// Callers that surface results to users must sort — for example, by
+    /// `stored_at_ms` descending in the File Manager list view.
     pub fn entries(&self) -> impl Iterator<Item = &ContentIndexEntry> {
         self.entries.values()
     }
@@ -337,9 +341,20 @@ mod tests {
             idx.insert(sample_entry([0xA1; 32]));
             idx.insert(sample_entry([0xA2; 32]));
             idx.remove(&[0xA1; 32]);
+            assert!(idx.set_archived(&[0xA2; 32], true));
+            assert_eq!(
+                idx.set_replication_tier(&[[0xA2; 32]], ReplicationTier::Durable),
+                1
+            );
         }
         let reloaded = ContentIndex::load(dir.path());
         assert_eq!(reloaded.entries.len(), 1);
-        assert!(reloaded.get(&[0xA2; 32]).is_some());
+        let entry = reloaded.get(&[0xA2; 32]).expect("A2 persisted");
+        assert!(entry.archived, "archived flag persisted");
+        assert_eq!(
+            entry.replication_tier,
+            ReplicationTier::Durable,
+            "tier mutation persisted"
+        );
     }
 }

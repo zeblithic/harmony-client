@@ -952,7 +952,7 @@ async fn list_content(
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
     };
-    let entries: Vec<ContentItemWire> = {
+    let mut entries: Vec<ContentItemWire> = {
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.entries()
             .map(|e| ContentItemWire {
@@ -968,6 +968,10 @@ async fn list_content(
             })
             .collect()
     };
+    // `ContentIndex::entries()` iterates a HashMap, so order is not
+    // deterministic. Sort by stored_at descending (newest first) so the
+    // File Manager UI sees a stable list across renders.
+    entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
     Ok(entries)
 }
 ```
