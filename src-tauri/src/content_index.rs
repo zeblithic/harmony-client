@@ -31,9 +31,11 @@ pub enum Sensitivity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplicationTier {
-    Minimal,
+    Expendable,
+    Light,
     Default,
-    Durable,
+    High,
+    Ultra,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,17 +333,17 @@ mod tests {
         idx.insert(a.clone());
         idx.insert(b.clone());
 
-        // Both are Default; bumping to Durable should update 2.
-        let updated = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Durable);
+        // Both are Default; bumping to Ultra should update 2.
+        let updated = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Ultra);
         assert_eq!(updated, 2);
 
-        // Same call again: tier already Durable, so 0 updated.
-        let again = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Durable);
+        // Same call again: tier already Ultra, so 0 updated.
+        let again = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Ultra);
         assert_eq!(again, 0);
 
         // Missing CID is skipped, not an error.
         let with_missing =
-            idx.set_replication_tier(&[a.cid, [0xAA; 32]], ReplicationTier::Minimal);
+            idx.set_replication_tier(&[a.cid, [0xAA; 32]], ReplicationTier::Expendable);
         assert_eq!(with_missing, 1);
     }
 
@@ -366,7 +368,7 @@ mod tests {
             idx.remove(&[0xA1; 32]);
             assert!(idx.set_archived(&[0xA2; 32], true));
             assert_eq!(
-                idx.set_replication_tier(&[[0xA2; 32]], ReplicationTier::Durable),
+                idx.set_replication_tier(&[[0xA2; 32]], ReplicationTier::Ultra),
                 1
             );
         }
@@ -376,7 +378,7 @@ mod tests {
         assert!(entry.archived, "archived flag persisted");
         assert_eq!(
             entry.replication_tier,
-            ReplicationTier::Durable,
+            ReplicationTier::Ultra,
             "tier mutation persisted"
         );
     }

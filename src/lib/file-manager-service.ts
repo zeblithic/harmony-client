@@ -39,17 +39,10 @@ interface ContentItemWire {
   sizeBytes: number;
   storedAt: number;
   sensitivity: 'private' | 'confidential' | 'public';
-  replicationTier: 'minimal' | 'default' | 'durable';
+  replicationTier: ReplicationTier;
   pinned: boolean;
   licensed: boolean;
   archived: boolean;
-}
-
-/** Maps the Rust wire replication tier to the UI ReplicationTier. */
-function wireReplicationTier(wire: ContentItemWire['replicationTier']): ReplicationTier {
-  if (wire === 'minimal') return 'expendable';
-  if (wire === 'durable') return 'high';
-  return 'default';
 }
 
 const MUSIC_EXTS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus', 'wma'];
@@ -80,7 +73,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     lastAccessed: wire.storedAt,
     accessCount: 0,
     stalenessScore: 0,
-    replicationTier: wireReplicationTier(wire.replicationTier),
+    replicationTier: wire.replicationTier,
     replicaCount: 1,
     pinned: wire.pinned,
     licensed: wire.licensed,

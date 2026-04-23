@@ -1049,9 +1049,11 @@ fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
 
 fn replication_tier_wire(t: content_index::ReplicationTier) -> &'static str {
     match t {
-        content_index::ReplicationTier::Minimal => "minimal",
+        content_index::ReplicationTier::Expendable => "expendable",
+        content_index::ReplicationTier::Light => "light",
         content_index::ReplicationTier::Default => "default",
-        content_index::ReplicationTier::Durable => "durable",
+        content_index::ReplicationTier::High => "high",
+        content_index::ReplicationTier::Ultra => "ultra",
     }
 }
 
@@ -1236,9 +1238,11 @@ async fn set_replication_tier(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<u32, String> {
     let parsed_tier = match tier.as_str() {
-        "minimal" => content_index::ReplicationTier::Minimal,
+        "expendable" => content_index::ReplicationTier::Expendable,
+        "light" => content_index::ReplicationTier::Light,
         "default" => content_index::ReplicationTier::Default,
-        "durable" => content_index::ReplicationTier::Durable,
+        "high" => content_index::ReplicationTier::High,
+        "ultra" => content_index::ReplicationTier::Ultra,
         other => return Err(format!("unknown replication tier: {other}")),
     };
     let mut parsed_cids: Vec<[u8; 32]> = Vec::with_capacity(cids.len());
