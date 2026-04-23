@@ -8,6 +8,7 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+mod content_index;
 mod event_loop;
 mod follows;
 mod identity;
