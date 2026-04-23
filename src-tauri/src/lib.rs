@@ -24,12 +24,12 @@ pub mod voice;
 /// need nested bundles, which land with folder/directory support (ZEB-156
 /// et al). A flat-bundle-only v1 is intentional; see
 /// docs/specs/2026-04-23-chunked-ingest-design.md (Q1).
-pub const FLAT_BUNDLE_MAX: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
+pub(crate) const FLAT_BUNDLE_MAX: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
     * (harmony_content::cid::MAX_PAYLOAD_SIZE as u64);
 
 /// Dispatch decision for `ingest_content`, derived purely from file size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestDispatch {
+pub(crate) enum IngestDispatch {
     /// File fits in a single `for_book` CID — use the existing path.
     Single,
     /// File is larger than `MAX_PAYLOAD_SIZE` and must be chunked through
@@ -39,7 +39,7 @@ pub enum IngestDispatch {
 
 /// Classify a file size into an ingest strategy, or return an error message
 /// suitable for surfacing to the frontend if the file exceeds the v1 cap.
-pub fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
+pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
     if size > FLAT_BUNDLE_MAX {
         return Err(format!(
             "file too large ({} bytes). v1 flat-bundle cap is {} bytes (~32 GiB). \
@@ -2326,6 +2326,15 @@ mod chunked_ingest_tests {
         assert!(err.contains("file too large"), "got: {err}");
         assert!(err.contains("32 GiB") || err.contains("flat-bundle"),
                 "message should explain the cap origin, got: {err}");
+    }
+
+    #[test]
+    fn ingest_dispatch_accepts_exactly_flat_bundle_max() {
+        // FLAT_BUNDLE_MAX is the last accepted byte count (condition is strict >).
+        assert!(matches!(
+            ingest_dispatch(FLAT_BUNDLE_MAX).unwrap(),
+            IngestDispatch::Chunked
+        ));
     }
 
     #[test]
