@@ -464,16 +464,16 @@
     showCleanup = false;
   }
 
-  function handleFileBurn() {
+  async function handleFileBurn() {
     if (!selectedFileCid) return;
-    fileManagerService.burn([selectedFileCid]);
+    await fileManagerService.burn([selectedFileCid]);
     fileManagerVersion++;
     selectedFileCid = null;
   }
 
-  function handleFileArchive() {
+  async function handleFileArchive() {
     if (!selectedFileCid) return;
-    fileManagerService.archive([selectedFileCid]);
+    await fileManagerService.archive([selectedFileCid]);
     fileManagerVersion++;
     selectedFileCid = null;
   }
@@ -490,15 +490,15 @@
     selectedFileCid = null;
   }
 
-  function handleFilePin() {
+  async function handleFilePin() {
     if (!selectedFileCid) return;
-    fileManagerService.pin(selectedFileCid);
+    await fileManagerService.pin(selectedFileCid);
     fileManagerVersion++;
   }
 
-  function handleFileUnpin() {
+  async function handleFileUnpin() {
     if (!selectedFileCid) return;
-    fileManagerService.unpin(selectedFileCid);
+    await fileManagerService.unpin(selectedFileCid);
     fileManagerVersion++;
   }
 
@@ -511,9 +511,9 @@
     }
   }
 
-  function handleFileTierChange(tier: ReplicationTier) {
+  async function handleFileTierChange(tier: ReplicationTier) {
     if (!selectedFileCid) return;
-    fileManagerService.setReplicationTier([selectedFileCid], tier);
+    await fileManagerService.setReplicationTier([selectedFileCid], tier);
     fileManagerVersion++;
   }
 
@@ -533,28 +533,28 @@
     showCleanup = !showCleanup;
   }
 
-  function handleCleanupAction(cid: string, action: string) {
-    if (action === 'burn') fileManagerService.burn([cid]);
-    else if (action === 'archive') fileManagerService.archive([cid]);
+  async function handleCleanupAction(cid: string, action: string) {
+    if (action === 'burn') await fileManagerService.burn([cid]);
+    else if (action === 'archive') await fileManagerService.archive([cid]);
     else if (action === 'release') fileManagerService.release([cid]);
     else if (action === 'publish') fileManagerService.publish([cid]);
-    else if (action === 'pin') fileManagerService.pin(cid);
+    else if (action === 'pin') await fileManagerService.pin(cid);
     fileManagerVersion++;
     if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
       selectedFileCid = null;
     }
   }
 
-  function handleBulkBurn(cids: string[]) {
-    fileManagerService.burn(cids);
+  async function handleBulkBurn(cids: string[]) {
+    await fileManagerService.burn(cids);
     fileManagerVersion++;
     if (selectedFileCid && cids.includes(selectedFileCid)) {
       selectedFileCid = null;
     }
   }
 
-  function handleBulkArchive(cids: string[]) {
-    fileManagerService.archive(cids);
+  async function handleBulkArchive(cids: string[]) {
+    await fileManagerService.archive(cids);
     fileManagerVersion++;
     if (selectedFileCid && cids.includes(selectedFileCid)) {
       selectedFileCid = null;
