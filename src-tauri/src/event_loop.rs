@@ -1017,6 +1017,48 @@ pub(crate) fn collect_descendants<S: BookStore>(
     out
 }
 
+/// Fetch the bytes of a content tree by repeatedly calling `fetch_one` per
+/// CID and concatenating leaf payloads in bundle-child order.
+///
+/// Iterative (not async-recursive) to avoid `Pin<Box<dyn Future>>` friction.
+/// The order-preserving DFS is "push children in reverse, pop in child
+/// order" — so for a bundle `[L1, L2, L3]` we emit bytes `L1 || L2 || L3`.
+///
+/// Depth-capped at `MAX_BUNDLE_DEPTH` for defensive safety — the write side
+/// already enforces this, so legitimate trees never trip the guard.
+pub(crate) async fn fetch_recursive<F, Fut>(
+    mut fetch_one: F,
+    root: ContentId,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(ContentId) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
+    let mut out = Vec::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
+
+    while let Some((cid, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            return Err(format!(
+                "bundle depth {depth} exceeds MAX_BUNDLE_DEPTH {MAX_BUNDLE_DEPTH}"
+            ));
+        }
+        let bytes = fetch_one(cid).await?;
+        if matches!(cid.cid_type(), CidType::Bundle(_)) {
+            let children = bundle::parse_bundle(&bytes)
+                .map_err(|e| format!("malformed bundle: {e:?}"))?;
+            for child in children.iter().rev() {
+                stack.push((*child, depth + 1));
+            }
+        } else {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod descendants_tests {
     use super::collect_descendants;
@@ -1080,6 +1122,86 @@ mod descendants_tests {
         // Walker should still include the root itself; children are
         // unreachable and therefore silently skipped.
         assert_eq!(all, vec![root]);
+    }
+}
+
+#[cfg(test)]
+mod fetch_recursive_tests {
+    use super::fetch_recursive;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn leaf_only_fetch_returns_single_payload() {
+        let leaf = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(leaf, b"hello".to_vec());
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let got = fetch_recursive(fetcher, leaf).await.unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_concatenates_children_in_order() {
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let c_bytes = b"ccccc".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+        let c = ContentId::for_book(&c_bytes, ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes.clone());
+        store.insert(b, b_bytes.clone());
+        store.insert(c, c_bytes.clone());
+        store.insert(root, payload);
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let got = fetch_recursive(fetcher, root).await.unwrap();
+        let mut expected = a_bytes;
+        expected.extend_from_slice(&b_bytes);
+        expected.extend_from_slice(&c_bytes);
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn missing_leaf_propagates_error() {
+        let a = ContentId::for_book(b"aaa", ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        // Deliberately omit `b`.
+        store.insert(a, b"aaa".to_vec());
+        store.insert(root, payload);
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let err = fetch_recursive(fetcher, root).await.unwrap_err();
+        assert!(err.contains("missing cid"), "got: {err}");
     }
 }
 
