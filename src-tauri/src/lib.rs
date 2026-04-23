@@ -54,6 +54,52 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
     }
 }
 
+/// Chunk `bytes` via FastCDC and assemble the resulting leaf CIDs into a
+/// flat bundle. Returns the ordered leaf (CID, slice) pairs, the raw bundle
+/// payload, and the root bundle CID.
+///
+/// The caller is responsible for driving each `(cid, bytes)` pair through
+/// the runtime's ingest channel in order, and for one final ingest of the
+/// bundle payload under the root CID.
+///
+/// Expects `bytes.len() > MAX_PAYLOAD_SIZE` — for smaller inputs use the
+/// existing single-book path.
+pub(crate) fn chunk_and_bundle(
+    bytes: &[u8],
+) -> Result<
+    (
+        Vec<(harmony_content::cid::ContentId, &[u8])>,
+        Vec<u8>,
+        harmony_content::cid::ContentId,
+    ),
+    String,
+> {
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::chunker::{chunk_all, ChunkerConfig};
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    let ranges = chunk_all(bytes, &ChunkerConfig::DEFAULT)
+        .map_err(|e| format!("chunker error: {e:?}"))?;
+
+    let mut leaves: Vec<(ContentId, &[u8])> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let chunk = &bytes[range];
+        let cid = ContentId::for_book(chunk, ContentFlags::default())
+            .map_err(|e| format!("leaf CID error: {e:?}"))?;
+        leaves.push((cid, chunk));
+    }
+
+    let mut builder = BundleBuilder::new();
+    for (cid, _) in &leaves {
+        builder.add(*cid);
+    }
+    let (bundle_payload, root) = builder
+        .build_with_flags(ContentFlags::default())
+        .map_err(|e| format!("bundle build error: {e:?}"))?;
+
+    Ok((leaves, bundle_payload, root))
+}
+
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
 struct NodeState {
@@ -2345,5 +2391,62 @@ mod chunked_ingest_tests {
             FLAT_BUNDLE_MAX,
             (MAX_BUNDLE_ENTRIES as u64) * (MAX_PAYLOAD_SIZE as u64)
         );
+    }
+
+    use harmony_content::bundle;
+    use harmony_content::cid::{CidType, ContentFlags, ContentId};
+
+    fn synthetic_bytes(len: usize) -> Vec<u8> {
+        // Deterministic, non-trivially-compressible content — cycle through
+        // a small prime to force the chunker to find real cut points.
+        (0..len).map(|i| ((i * 37) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn chunk_and_bundle_produces_bundle_root_over_leaf_cids() {
+        let bytes = synthetic_bytes(3 * 1024 * 1024); // 3 MiB
+        let (leaves, bundle_payload, root) =
+            chunk_and_bundle(&bytes).expect("chunking must succeed");
+
+        // Bundle root has CidType::Bundle(depth) with depth >= 1.
+        match root.cid_type() {
+            CidType::Bundle(d) => assert!(d >= 1, "root depth should be >= 1"),
+            other => panic!("expected bundle, got {other:?}"),
+        }
+
+        // Every leaf is a book CID.
+        for (leaf_cid, _data) in &leaves {
+            assert_eq!(
+                leaf_cid.cid_type(),
+                CidType::Book,
+                "leaves must be books"
+            );
+        }
+
+        // The bundle payload parses back to exactly those leaf CIDs in order.
+        let parsed = bundle::parse_bundle(&bundle_payload)
+            .expect("bundle payload must parse");
+        let expected: Vec<ContentId> = leaves.iter().map(|(c, _)| *c).collect();
+        assert_eq!(parsed.to_vec(), expected);
+    }
+
+    #[test]
+    fn chunk_and_bundle_leaf_bytes_sum_to_input() {
+        let bytes = synthetic_bytes(3 * 1024 * 1024);
+        let (leaves, _bundle_payload, _root) = chunk_and_bundle(&bytes).unwrap();
+        let total: usize = leaves.iter().map(|(_, d)| d.len()).sum();
+        assert_eq!(total, bytes.len(), "leaves must cover the full input exactly");
+        let reassembled: Vec<u8> = leaves.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+        assert_eq!(reassembled, bytes, "leaves in order must equal original");
+    }
+
+    #[test]
+    fn chunk_and_bundle_leaf_cid_matches_for_book_of_its_bytes() {
+        let bytes = synthetic_bytes(3 * 1024 * 1024);
+        let (leaves, _bundle_payload, _root) = chunk_and_bundle(&bytes).unwrap();
+        for (leaf_cid, data) in &leaves {
+            let recomputed = ContentId::for_book(data, ContentFlags::default()).unwrap();
+            assert_eq!(*leaf_cid, recomputed);
+        }
     }
 }
