@@ -559,21 +559,33 @@ pub async fn run<R: Runtime>(
                 use harmony_content::cid::ContentId;
                 match req {
                     ContentVerbRequest::Pin { cid, reply } => {
-                        let id = ContentId::from_bytes(cid);
-                        let ok = runtime.pin_content(id);
-                        let _ = reply.send(Ok(ok));
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        let mut any_failed = false;
+                        for id in all {
+                            if !runtime.pin_content(id) {
+                                any_failed = true;
+                            }
+                        }
+                        let _ = reply.send(Ok(!any_failed));
                     }
                     ContentVerbRequest::Unpin { cid, reply } => {
-                        let id = ContentId::from_bytes(cid);
-                        runtime.unpin_content(&id);
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        for id in all {
+                            runtime.unpin_content(&id);
+                        }
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::Burn { cid, reply } => {
-                        // Burn on a RAM-only client = unpin so the cache
-                        // can evict naturally. The sidecar-removal side
-                        // of burn runs in the Tauri command handler.
-                        let id = ContentId::from_bytes(cid);
-                        runtime.unpin_content(&id);
+                        // Burn on a RAM-only client cascades the runtime-side
+                        // unpin; the sidecar-removal side of burn continues to
+                        // happen in the Tauri command handler.
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        for id in all {
+                            runtime.unpin_content(&id);
+                        }
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::PinnedSet { reply } => {
