@@ -1022,6 +1022,45 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
     })
 }
 
+/// Wire format returned by `list_content` — one entry per self-ingested
+/// file the client is aware of. Joins sidecar metadata with the runtime
+/// cache's pinned state snapshot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentItemWire {
+    pub cid: String,              // hex
+    pub name: String,
+    pub size_bytes: u64,
+    pub stored_at: u64,           // ms since epoch
+    pub sensitivity: String,      // "private" | "confidential" | "public"
+    pub replication_tier: String, // "minimal" | "default" | "durable"
+    pub pinned: bool,
+    pub licensed: bool,
+    pub archived: bool,
+}
+
+fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
+    match s {
+        content_index::Sensitivity::Private => "private",
+        content_index::Sensitivity::Confidential => "confidential",
+        content_index::Sensitivity::Public => "public",
+    }
+}
+
+fn replication_tier_wire(t: content_index::ReplicationTier) -> &'static str {
+    match t {
+        content_index::ReplicationTier::Minimal => "minimal",
+        content_index::ReplicationTier::Default => "default",
+        content_index::ReplicationTier::Durable => "durable",
+    }
+}
+
+fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(cid_hex).map_err(|_| "invalid cid hex".to_string())?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| "cid must be 32 bytes".to_string())
+}
+
 /// Result returned to the frontend after a successful file ingest.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1032,23 +1071,104 @@ pub struct IngestResult {
 }
 
 #[tauri::command]
-fn list_content() -> Vec<serde_json::Value> {
-    // Future (bead fkz): query runtime's cache + disk index via query channel.
-    Vec::new()
+async fn list_content(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<ContentItemWire>, String> {
+    // 1. Snapshot pinned CIDs from the runtime cache.
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let pinned_set = reply_rx
+        .await
+        .map_err(|_| "event loop dropped snapshot request".to_string())?;
+
+    // 2. Join sidecar entries with pinned state and shape the wire.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let mut entries: Vec<ContentItemWire> = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.entries()
+            .map(|e| ContentItemWire {
+                cid: hex::encode(e.cid),
+                name: e.file_name.clone(),
+                size_bytes: e.size_bytes,
+                stored_at: e.stored_at_ms,
+                sensitivity: sensitivity_wire(e.sensitivity).to_string(),
+                replication_tier: replication_tier_wire(e.replication_tier).to_string(),
+                pinned: pinned_set.contains(&e.cid),
+                licensed: e.licensed,
+                archived: e.archived,
+            })
+            .collect()
+    };
+    // `ContentIndex::entries()` iterates a HashMap, so order is not
+    // deterministic. Sort by stored_at descending (newest first) so the
+    // File Manager UI sees a stable list across renders.
+    entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
+    Ok(entries)
 }
 
 #[tauri::command]
-fn pin_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send pin request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn pin_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Pin {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped pin request".to_string())?
 }
 
 #[tauri::command]
-fn unpin_content(cid: String) -> Result<bool, String> {
-    // Future (bead fkz): send unpin request to runtime via query channel.
-    let _ = cid;
-    Ok(true)
+async fn unpin_content(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cid_bytes = parse_cid_hex(&cid)?;
+    let verb_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Unpin {
+            cid: cid_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped unpin request".to_string())?
 }
 
 #[tauri::command]
