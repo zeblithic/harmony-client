@@ -1249,25 +1249,21 @@ async fn pin_content(
     // ZEB-155: persist pin intent on the sidecar BEFORE dispatching the
     // runtime verb. If the event loop is gone or the runtime-side fails,
     // the durable side still records what the user wanted. Sidecar writes
-    // are best-effort (tracing::warn on failure, matching set_archived /
-    // set_replication_tier) — a disk-write error drops the intent but
-    // still takes effect this session.
-    let index = {
+    // are best-effort — ContentIndex::save already tracing::warn's on
+    // disk-write errors, so failures surface via logs.
+    let (index, verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
+        let verb_tx = guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?;
+        (guard.content_index.clone(), verb_tx)
     };
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.set_pinned(&cid_bytes, true);
     }
 
-    let verb_tx = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
-    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Pin {
@@ -1292,22 +1288,19 @@ async fn unpin_content(
     // unpin. Mirror of pin_content's ordering — durable side stays
     // consistent with the user's click across a crash between the
     // sidecar write and the verb dispatch.
-    let index = {
+    let (index, verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
+        let verb_tx = guard
+            .content_verb_tx
+            .clone()
+            .ok_or_else(|| "runtime unavailable".to_string())?;
+        (guard.content_index.clone(), verb_tx)
     };
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.set_pinned(&cid_bytes, false);
     }
 
-    let verb_tx = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
-    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Unpin {
@@ -1325,8 +1318,8 @@ async fn unpin_content(
 ///
 /// ZEB-155: removing the sidecar entry implicitly drops any persisted
 /// pin intent — no explicit `set_pinned(false)` needed, because there's
-/// no entry left to hold a flag on. The runtime-side Burn arm in the
-/// event loop also removes the CID from pin_intent (see event_loop.rs).
+/// no entry left to hold a flag on. (Task 4 will add a runtime-side
+/// pin-intent set that the Burn arm also clears on dispatch.)
 #[tauri::command]
 async fn burn_content(
     cid: String,
