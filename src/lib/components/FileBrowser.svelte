@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { FileViewMode, ContentSection, CleanupRecommendation, ContentCategory, ReplicationTier } from '../types';
+  import type { FileViewMode, ContentSection, ContentCategory, ReplicationTier, ContentItem } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
@@ -56,14 +56,34 @@
     serviceVersion?: number;
   } = $props();
 
+  // Live folder contents fetched from the backend when navigating into a folder.
+  // Null means "not yet fetched" (while navigating); an empty array means the
+  // folder exists but is empty. Used only when currentFolderCid != null.
+  let folderItems = $state<ContentItem[] | null>(null);
+
+  // Whenever currentFolderCid changes, fetch the live folder contents from the
+  // backend (Option A: async $effect). Falls back to [] if no adapter is wired.
+  $effect(() => {
+    const cid = currentFolderCid;
+    if (!cid) {
+      folderItems = null;
+      return;
+    }
+    folderItems = null; // reset while fetching
+    service.listFolderContents(cid).then((result) => {
+      // Guard: only update if we're still in the same folder
+      if (currentFolderCid === cid) {
+        folderItems = result;
+      }
+    });
+  });
+
   let publishedItems = $derived.by(() => {
     void serviceVersion;
     return service.getPublishedContent();
   });
 
-  let items = $derived.by(() => {
-    void serviceVersion; // trigger reactivity
-    let contents = service.getContents(currentFolderCid);
+  function applyFiltersAndSort(contents: ContentItem[]): ContentItem[] {
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       contents = contents.filter((i) => i.name.toLowerCase().includes(q));
@@ -96,6 +116,19 @@
       if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
+  }
+
+  // When inside a folder:
+  //   - If folderItems is non-null (backend fetch completed), use that.
+  //   - If folderItems is null (fetching in progress or no adapter), fall back
+  //     to the cached service data so tests/Storybook see content immediately.
+  // When at root, always use the cached service data.
+  let items = $derived.by(() => {
+    void serviceVersion;
+    if (currentFolderCid !== null) {
+      return applyFiltersAndSort(folderItems ?? service.getContents(currentFolderCid));
+    }
+    return applyFiltersAndSort(service.getContents(null));
   });
 
   let quota = $derived.by(() => {
@@ -108,6 +141,9 @@
     return service.getCleanupRecommendations();
   });
 
+  // Build the breadcrumb path. For root, only "My Content" appears.
+  // For a folder, walk up from root using the cached service data (which
+  // includes folders returned by connectAdapter / refetchRoot).
   let breadcrumbPath = $derived.by(() => {
     void serviceVersion;
     const path: Array<{ cid: string | null; name: string }> = [
@@ -131,6 +167,16 @@
     return path;
   });
 
+  // The stack of ancestor CIDs from root down to the current folder's parent.
+  // Used by createFolder so the backend can cascade the CID update up the tree.
+  let breadcrumbStack = $derived.by(() => {
+    // breadcrumbPath[0] is always the root sentinel (cid: null); skip it.
+    // The remaining segments are actual folder CIDs.
+    return breadcrumbPath
+      .slice(1)
+      .map((seg) => seg.cid as string);
+  });
+
   function handleItemClick(cid: string) {
     const item = items.find((i) => i.cid === cid);
     if (item?.isFolder) {
@@ -138,6 +184,18 @@
       return;
     }
     onItemClick(cid);
+  }
+
+  async function handleNewFolder() {
+    const name = window.prompt('Folder name:');
+    if (!name || !name.trim()) return;
+    await service.createFolder(name.trim(), breadcrumbStack);
+    // If we're inside a folder, refetch live contents so the new sub-folder
+    // appears immediately (createFolder already called refetchRoot for the
+    // cached root listing).
+    if (currentFolderCid) {
+      folderItems = await service.listFolderContents(currentFolderCid);
+    }
   }
 </script>
 
@@ -149,6 +207,7 @@
     {onSearchChange}
     {onUploadClick}
     {onCleanupClick}
+    onNewFolderClick={handleNewFolder}
     {showCleanup}
     {section}
     {onSectionChange}

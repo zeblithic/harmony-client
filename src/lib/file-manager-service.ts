@@ -43,6 +43,8 @@ interface ContentItemWire {
   pinned: boolean;
   licensed: boolean;
   archived: boolean;
+  /** Source-of-truth node type from the backend. */
+  kind: 'leaf' | 'folder';
 }
 
 const MUSIC_EXTS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus', 'wma'];
@@ -63,6 +65,9 @@ export function inferCategory(fileName: string): ContentCategory {
 }
 
 function wireToContentItem(wire: ContentItemWire): ContentItem {
+  // `kind` is the source of truth on the wire; `isFolder` is a derived
+  // client-side convenience kept for back-compat with existing
+  // filter/sort predicates in FileBrowser and FileList.
   return {
     cid: wire.cid,
     name: wire.name,
@@ -79,7 +84,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     licensed: wire.licensed,
     archived: wire.archived,
     parentCid: null,
-    isFolder: false,
+    isFolder: wire.kind === 'folder',
   };
 }
 
@@ -123,7 +128,7 @@ export class FileManagerService {
     let raw: ContentItemWire[] | null | undefined;
     let unlisten: () => void;
     try {
-      raw = (await adapter.invoke('list_content')) as ContentItemWire[] | null | undefined;
+      raw = (await adapter.invoke('list_content', { folderCid: null })) as ContentItemWire[] | null | undefined;
       unlisten = await adapter.listen(
         'content-announced',
         (event) => {
@@ -360,6 +365,45 @@ export class FileManagerService {
     return item;
   }
 
+  /**
+   * Load the contents of a specific folder via the backend's
+   * list_content(folder_cid) path. Returns the live contents WITHOUT
+   * caching — callers are responsible for binding to state.
+   */
+  async listFolderContents(folderCid: string): Promise<ContentItem[]> {
+    if (!this.adapter) return [];
+    const raw = (await this.adapter.invoke('list_content', { folderCid })) as
+      | ContentItemWire[]
+      | null
+      | undefined;
+    return Array.isArray(raw)
+      ? raw.filter((w) => !w.archived).map(wireToContentItem)
+      : [];
+  }
+
+  /**
+   * Create a new folder via the backend. parentPath is empty for root
+   * creation; otherwise it's the stack of ancestor CIDs from top-level
+   * root down to immediate parent.
+   *
+   * Returns the new folder's CID (for root creation) or the new top-level
+   * root CID (for nested creation — the ancestor cascade changes the root).
+   *
+   * Refetches the root listing and emits onChange. Callers navigating
+   * inside a folder at the time of creation should also refetch the
+   * folder contents.
+   */
+  async createFolder(name: string, parentPath: string[]): Promise<string> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    const newCid = (await this.adapter.invoke('create_folder', {
+      name,
+      parentPath,
+    })) as string;
+    // Refetch the root listing and emit change so the UI refreshes.
+    await this.refetchRoot();
+    return newCid;
+  }
+
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */
   addUnlisten(fn: () => void): void {
     this.unlisteners.push(fn);
@@ -371,6 +415,18 @@ export class FileManagerService {
   }
 
   // ── Private helpers ─────────────────────────────────────────────────
+
+  private async refetchRoot(): Promise<void> {
+    if (!this.adapter) return;
+    const raw = (await this.adapter.invoke('list_content', { folderCid: null })) as
+      | ContentItemWire[]
+      | null
+      | undefined;
+    this.privateContent = Array.isArray(raw)
+      ? raw.filter((w) => !w.archived).map(wireToContentItem)
+      : [];
+    this.onChange?.();
+  }
 
   private moveToPublished(cids: string[], publishMode: 'durable' | 'ephemeral'): void {
     const cidSet = new Set(cids);
