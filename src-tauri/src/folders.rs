@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::content_index::ContentKind;
 
+/// Only manifest version this build can read/write. Parse sites MUST reject
+/// other versions via `parse_manifest` rather than hand-deserializing, so a
+/// future v2 manifest can't be silently rewritten with v1 semantics.
+pub const MANIFEST_VERSION: u32 = 1;
+
 /// Outer wrapper so the `folder_manifest` key acts as a self-identifier:
 /// a reader with only the bundle bytes can disambiguate a folder from any
 /// other kind of bundle by attempting to decode child-0's payload as this
@@ -69,7 +74,7 @@ pub fn build_folder(
 ) -> Result<BuiltFolder, String> {
     let manifest = FolderManifest {
         folder_manifest: ManifestBody {
-            version: 1,
+            version: MANIFEST_VERSION,
             entries: children.to_vec(),
         },
     };
@@ -94,6 +99,23 @@ pub fn build_folder(
         bundle_bytes,
         bundle_cid,
     })
+}
+
+/// Deserialize a folder manifest from bytes and reject unsupported versions.
+/// This is the ONLY approved entry point into `FolderManifest` from raw
+/// wire/cache bytes — direct `serde_json::from_slice::<FolderManifest>(...)`
+/// bypasses the version gate and risks silently rewriting a future v2
+/// manifest with v1 semantics.
+pub fn parse_manifest(bytes: &[u8]) -> Result<FolderManifest, String> {
+    let manifest: FolderManifest =
+        serde_json::from_slice(bytes).map_err(|e| format!("manifest parse: {e}"))?;
+    if manifest.folder_manifest.version != MANIFEST_VERSION {
+        return Err(format!(
+            "unsupported folder_manifest version: {} (this build supports {})",
+            manifest.folder_manifest.version, MANIFEST_VERSION
+        ));
+    }
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -196,5 +218,35 @@ mod tests {
         assert_eq!(parsed.folder_manifest.entries.len(), 2);
         assert_eq!(parsed.folder_manifest.entries[0].cid, [0x11; 32]);
         assert_eq!(parsed.folder_manifest.entries[1].kind, ContentKind::Folder);
+    }
+
+    #[test]
+    fn parse_manifest_accepts_current_version() {
+        let built = build_folder("", &[]).expect("build");
+        let parsed = parse_manifest(&built.manifest_bytes).expect("v1 parses");
+        assert_eq!(parsed.folder_manifest.version, MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn parse_manifest_rejects_future_version() {
+        // Hand-craft a v2 manifest by serializing a FolderManifest with version=2.
+        let future = FolderManifest {
+            folder_manifest: ManifestBody {
+                version: 2,
+                entries: vec![],
+            },
+        };
+        let bytes = serde_json::to_vec(&future).expect("serialize");
+        let err = parse_manifest(&bytes).expect_err("v2 must be rejected");
+        assert!(
+            err.contains("unsupported folder_manifest version: 2"),
+            "expected version-reject message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_rejects_malformed_bytes() {
+        let err = parse_manifest(b"not json").expect_err("garbage must be rejected");
+        assert!(err.starts_with("manifest parse:"), "got: {err}");
     }
 }

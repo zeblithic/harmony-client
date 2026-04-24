@@ -111,6 +111,14 @@
   // navigation — i.e. when cid actually changes.
   let lastFetchedCid: string | null = null;
 
+  // Monotonic token for in-flight listFolderContents calls. Rapid
+  // serviceVersion bumps can queue multiple fetches for the same cid; the
+  // cid-equality guard alone isn't enough because an older fetch can still
+  // resolve last and clobber a newer snapshot. Every effect run bumps this
+  // token, and each .then() only commits if its captured token is still the
+  // latest — older resolutions are discarded.
+  let folderFetchSeq = 0;
+
   // Whenever currentFolderCid OR serviceVersion changes, fetch live folder
   // contents from the backend. The serviceVersion dependency catches
   // pin/unpin/burn/archive/tier mutations on items inside the current folder,
@@ -118,6 +126,7 @@
   $effect(() => {
     void serviceVersion; // re-fetch on cache mutation
     const cid = currentFolderCid;
+    const mySeq = ++folderFetchSeq;
     if (!cid) {
       folderItems = null;
       lastFetchedCid = null;
@@ -131,8 +140,10 @@
       lastFetchedCid = cid;
     }
     service.listFolderContents(cid).then((result) => {
-      // Guard: only update if we're still in the same folder
-      if (currentFolderCid === cid) {
+      // Guards: still in the same folder AND this is the newest fetch.
+      // Without the seq check an older resolution could overwrite a newer
+      // snapshot after a rapid mutation burst.
+      if (currentFolderCid === cid && mySeq === folderFetchSeq) {
         folderItems = result;
       }
     });

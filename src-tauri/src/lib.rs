@@ -1349,9 +1349,7 @@ pub async fn list_folder(
         .map_err(|_| "event loop dropped read request".to_string())?
         .ok_or_else(|| "manifest book not in cache".to_string())?;
 
-    let manifest: crate::folders::FolderManifest =
-        serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| format!("manifest parse: {e}"))?;
+    let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
 
     // Consistency check: manifest entry CIDs must match bundle child-1..N.
     let bundle_children_after_manifest: Vec<[u8; 32]> = child_cids
@@ -1797,6 +1795,14 @@ async fn create_folder(
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<String, String> {
+    // Defence-in-depth: the UI already trims and rejects blank names, but
+    // the IPC surface is callable by anything with a Tauri handle. An empty
+    // or whitespace-only label would produce folders that are hard to
+    // distinguish in listings and breadcrumbs, so reject at the boundary.
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("folder name cannot be empty".to_string());
+    }
     if parent_path.is_empty() {
         return create_folder_at_root(name, state).await;
     }
@@ -1961,8 +1967,8 @@ async fn create_folder_nested(
         let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
             .await?
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
-        let mut manifest: folders::FolderManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| format!("ancestor manifest parse: {e}"))?;
+        let mut manifest = folders::parse_manifest(&manifest_bytes)
+            .map_err(|e| format!("ancestor {e}"))?;
 
         if is_deepest {
             manifest
@@ -2017,14 +2023,16 @@ async fn create_folder_nested(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // Read the pre-rekey pin state AND perform the rekey under a single lock
+    // acquisition: a concurrent pin_content/unpin_content landing between the
+    // read and the rekey would otherwise leave had_pin disagreeing with what
+    // the sidecar just persisted, so the subsequent runtime Pin/Unpin dispatch
+    // below would fight the intervening toggle.
     let had_pin = {
-        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.get(&root_old).map(|e| e.pinned).unwrap_or(false)
-    };
-    {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let had_pin = idx.get(&root_old).map(|e| e.pinned).unwrap_or(false);
         match idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms) {
-            Ok(()) => {}
+            Ok(()) => had_pin,
             Err(content_index::RekeyError::OldMissing) => {
                 return Err(
                     "top-level folder not in sidecar — nothing to rekey".to_string(),
@@ -2038,7 +2046,7 @@ async fn create_folder_nested(
                 );
             }
         }
-    }
+    };
 
     // 4. Drain the deferred ingests now that the sidecar is committed.
     // If the event loop dies mid-drain, we end up with a sidecar pointer
