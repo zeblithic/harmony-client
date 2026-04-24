@@ -503,11 +503,34 @@ pub async fn run<R: Runtime>(
 
             // ── Content-fetch requests from Tauri commands ──────────
             Some(req) = fetch_rx.recv() => {
-                let prefix = req.cid_hex.get(1..2).unwrap_or("");
-                let key_expr = format!("harmony/content/{prefix}/{}", req.cid_hex);
                 let session = session.clone();
+                let cid_hex = req.cid_hex;
                 tokio::spawn(async move {
-                    let result = fetch_via_zenoh(&session, &key_expr).await;
+                    // Parse hex → 32-byte CID. Reply with an error if malformed.
+                    let cid_bytes = match hex::decode(&cid_hex)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    {
+                        Some(b) => b,
+                        None => {
+                            let _ = req.reply.send(Err(format!("invalid CID hex: {cid_hex}")));
+                            return;
+                        }
+                    };
+                    let root = ContentId::from_bytes(cid_bytes);
+
+                    // Closure that does one Zenoh GET for a single CID.
+                    let fetch_one = move |cid: ContentId| {
+                        let session = session.clone();
+                        async move {
+                            let cid_hex = hex::encode(cid.to_bytes());
+                            let prefix = cid_hex.get(1..2).unwrap_or("");
+                            let key = format!("harmony/content/{prefix}/{cid_hex}");
+                            fetch_via_zenoh(&session, &key).await
+                        }
+                    };
+
+                    let result = fetch_recursive(fetch_one, root).await;
                     let _ = req.reply.send(result);
                 });
             }
@@ -559,21 +582,33 @@ pub async fn run<R: Runtime>(
                 use harmony_content::cid::ContentId;
                 match req {
                     ContentVerbRequest::Pin { cid, reply } => {
-                        let id = ContentId::from_bytes(cid);
-                        let ok = runtime.pin_content(id);
-                        let _ = reply.send(Ok(ok));
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        let mut any_failed = false;
+                        for id in all {
+                            if !runtime.pin_content(id) {
+                                any_failed = true;
+                            }
+                        }
+                        let _ = reply.send(Ok(!any_failed));
                     }
                     ContentVerbRequest::Unpin { cid, reply } => {
-                        let id = ContentId::from_bytes(cid);
-                        runtime.unpin_content(&id);
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        for id in all {
+                            runtime.unpin_content(&id);
+                        }
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::Burn { cid, reply } => {
-                        // Burn on a RAM-only client = unpin so the cache
-                        // can evict naturally. The sidecar-removal side
-                        // of burn runs in the Tauri command handler.
-                        let id = ContentId::from_bytes(cid);
-                        runtime.unpin_content(&id);
+                        // Burn on a RAM-only client cascades the runtime-side
+                        // unpin; the sidecar-removal side of burn continues to
+                        // happen in the Tauri command handler.
+                        let root = ContentId::from_bytes(cid);
+                        let all = collect_descendants(runtime.storage_tier().cache(), root);
+                        for id in all {
+                            runtime.unpin_content(&id);
+                        }
                         let _ = reply.send(Ok(true));
                     }
                     ContentVerbRequest::PinnedSet { reply } => {
@@ -967,6 +1002,246 @@ fn emit_session_lost<R: Runtime>(app: &AppHandle<R>, reason: &str) {
             error: Some(format!("session lost: {reason}")),
         },
     );
+}
+
+use harmony_content::book::BookStore;
+use harmony_content::bundle;
+use harmony_content::cache::ContentStore;
+use harmony_content::cid::{CidType, ContentId};
+
+/// Walk every CID in the tree rooted at `cid`, reading bundle payloads from
+/// the local content store. Returns root + every descendant in DFS order.
+///
+/// Bundle payloads not in the store are silently skipped — their subtrees
+/// are unreachable and the caller's verb can't act on them anyway. A
+/// malformed bundle payload is treated the same: log-worthy but not fatal.
+pub(crate) fn collect_descendants<S: BookStore>(
+    store: &ContentStore<S>,
+    cid: ContentId,
+) -> Vec<ContentId> {
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
+    let mut out = Vec::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(cid, 0)];
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            tracing::warn!(
+                cid_depth = depth,
+                max = MAX_BUNDLE_DEPTH,
+                "collect_descendants aborting subtree past MAX_BUNDLE_DEPTH; data is corrupt"
+            );
+            continue;
+        }
+        out.push(id);
+        if matches!(id.cid_type(), CidType::Bundle(_)) {
+            if let Some(bytes) = store.get(&id) {
+                match bundle::parse_bundle(bytes) {
+                    Ok(children) => {
+                        for child in children.iter().copied() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        err = ?e,
+                        "malformed bundle payload; subtree skipped"
+                    ),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fetch the bytes of a content tree by repeatedly calling `fetch_one` per
+/// CID and concatenating leaf payloads in bundle-child order.
+///
+/// Iterative (not async-recursive) to avoid `Pin<Box<dyn Future>>` friction.
+/// The order-preserving DFS is "push children in reverse, pop in child
+/// order" — so for a bundle `[L1, L2, L3]` we emit bytes `L1 || L2 || L3`.
+///
+/// Depth-capped at `MAX_BUNDLE_DEPTH` for defensive safety — the write side
+/// already enforces this, so legitimate trees never trip the guard.
+///
+/// Returns `Err` — rather than logging and skipping — on depth overflow or
+/// a malformed bundle payload, in contrast to `collect_descendants`. Fetch
+/// reassembly cannot produce a correct result with any subtree missing.
+pub(crate) async fn fetch_recursive<F, Fut>(
+    fetch_one: F,
+    root: ContentId,
+) -> Result<Vec<u8>, String>
+where
+    F: Fn(ContentId) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    use harmony_content::cid::MAX_BUNDLE_DEPTH;
+
+    let mut out = Vec::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
+
+    while let Some((cid, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            return Err(format!(
+                "bundle depth {depth} exceeds MAX_BUNDLE_DEPTH {MAX_BUNDLE_DEPTH}"
+            ));
+        }
+        let bytes = fetch_one(cid).await?;
+        if matches!(cid.cid_type(), CidType::Bundle(_)) {
+            let children = bundle::parse_bundle(&bytes)
+                .map_err(|e| format!("malformed bundle: {e:?}"))?;
+            for child in children.iter().rev() {
+                stack.push((*child, depth + 1));
+            }
+        } else {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod descendants_tests {
+    use super::collect_descendants;
+    use harmony_content::book::BookStore;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cache::ContentStore;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::book::MemoryBookStore;
+
+    fn new_store() -> ContentStore<MemoryBookStore> {
+        ContentStore::new(MemoryBookStore::new(), 1024)
+    }
+
+    #[test]
+    fn returns_just_the_root_for_a_leaf() {
+        let mut store = new_store();
+        let leaf = store
+            .insert_with_flags(b"hello", ContentFlags::default())
+            .unwrap();
+
+        let all = collect_descendants(&store, leaf);
+        assert_eq!(all, vec![leaf]);
+    }
+
+    #[test]
+    fn walks_a_flat_bundle() {
+        let mut store = new_store();
+        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
+        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
+        let c = store.insert_with_flags(b"ccc", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        store.store(root, payload);
+
+        let all = collect_descendants(&store, root);
+        // Order is unspecified; compare as sets.
+        use std::collections::HashSet;
+        let got: HashSet<ContentId> = all.into_iter().collect();
+        let expected: HashSet<ContentId> = [root, a, b, c].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn skips_subtrees_whose_bundle_payload_is_missing() {
+        let mut store = new_store();
+        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
+        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b);
+        let (_payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        // Deliberately DO NOT store the bundle payload.
+
+        let all = collect_descendants(&store, root);
+        // Walker should still include the root itself; children are
+        // unreachable and therefore silently skipped.
+        assert_eq!(all, vec![root]);
+    }
+}
+
+#[cfg(test)]
+mod fetch_recursive_tests {
+    use super::fetch_recursive;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn leaf_only_fetch_returns_single_payload() {
+        let leaf = ContentId::for_book(b"hello", ContentFlags::default()).unwrap();
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(leaf, b"hello".to_vec());
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let got = fetch_recursive(fetcher, leaf).await.unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_concatenates_children_in_order() {
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let c_bytes = b"ccccc".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+        let c = ContentId::for_book(&c_bytes, ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes.clone());
+        store.insert(b, b_bytes.clone());
+        store.insert(c, c_bytes.clone());
+        store.insert(root, payload);
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let got = fetch_recursive(fetcher, root).await.unwrap();
+        let mut expected = a_bytes;
+        expected.extend_from_slice(&b_bytes);
+        expected.extend_from_slice(&c_bytes);
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn missing_leaf_propagates_error() {
+        let a = ContentId::for_book(b"aaa", ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b);
+        let (payload, root) = builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        // Deliberately omit `b`.
+        store.insert(a, b"aaa".to_vec());
+        store.insert(root, payload);
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let err = fetch_recursive(fetcher, root).await.unwrap_err();
+        assert!(err.contains("missing cid"), "got: {err}");
+    }
 }
 
 /// Bridge Zenoh subscription messages to Tauri frontend events.
