@@ -1841,9 +1841,17 @@ async fn create_folder_at_root(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // ZEB-158 slice 1 corner case: every empty folder produces the same
+    // bundle CID (the manifest is byte-identical: {"folder_manifest":
+    // {"version":1,"entries":[]}}). Under the current CID-keyed sidecar,
+    // a second empty folder collides with the first. Rather than silently
+    // fail, surface a specific error so the user can either rename the
+    // existing folder or add content to differentiate the new one. The
+    // architectural fix (sidecar entries keyed by an opaque id so multiple
+    // entries can share a CID, symlink-style) is tracked separately.
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.insert(content_index::ContentIndexEntry {
+        let inserted = idx.insert(content_index::ContentIndexEntry {
             cid: built.bundle_cid.to_bytes(),
             file_name: name,
             size_bytes: built.bundle_bytes.len() as u64,
@@ -1855,6 +1863,13 @@ async fn create_folder_at_root(
             pinned: false,
             kind: content_index::ContentKind::Folder,
         });
+        if !inserted {
+            return Err(
+                "a folder with identical contents already exists; \
+                 add content to it before creating another empty folder"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(hex::encode(built.bundle_cid.to_bytes()))
@@ -2008,6 +2023,13 @@ async fn create_folder_nested(
     }
 
     // 4. Event-loop pin sync: unpin old, pin new (if old had pin intent).
+    //
+    // The replies here are best-effort: the sidecar has already committed
+    // the rekey, so a failure here is a runtime/cache desync rather than a
+    // user-visible regression. Log so the desync is at least diagnosable
+    // — silent swallow would let "sidecar says pinned, runtime isn't"
+    // happen invisibly. The fetch-completion hook (ZEB-155 + ZEB-159)
+    // re-converges on the next fetch of the new root.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Unpin {
@@ -2016,7 +2038,18 @@ async fn create_folder_nested(
         })
         .await
         .map_err(|_| "event loop not running".to_string())?;
-    let _ = reply_rx.await;
+    match reply_rx.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            old_cid = %hex::encode(root_old),
+            err = %e,
+            "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
+        ),
+        Err(_) => tracing::warn!(
+            old_cid = %hex::encode(root_old),
+            "create_folder_nested: event loop dropped unpin reply",
+        ),
+    }
     if had_pin {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         verb_tx
@@ -2026,7 +2059,18 @@ async fn create_folder_nested(
             })
             .await
             .map_err(|_| "event loop not running".to_string())?;
-        let _ = reply_rx.await;
+        match reply_rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                new_cid = %hex::encode(prev_new_cid),
+                err = %e,
+                "create_folder_nested: runtime pin of new root failed; sidecar pin intent will repin on next fetch",
+            ),
+            Err(_) => tracing::warn!(
+                new_cid = %hex::encode(prev_new_cid),
+                "create_folder_nested: event loop dropped pin reply",
+            ),
+        }
     }
 
     Ok(hex::encode(prev_new_cid))
