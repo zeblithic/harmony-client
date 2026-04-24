@@ -1233,6 +1233,7 @@ fn joined_pinned(
 
 #[tauri::command]
 async fn list_content(
+    folder_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
     // 1. Snapshot pinned CIDs from the runtime cache.
@@ -1252,7 +1253,16 @@ async fn list_content(
         .await
         .map_err(|_| "event loop dropped snapshot request".to_string())?;
 
-    // 2. Join sidecar entries with pinned state and shape the wire.
+    match folder_cid {
+        None => list_root(state, &pinned_set),
+        Some(hex) => list_folder(hex, verb_tx, &pinned_set).await,
+    }
+}
+
+pub(crate) fn list_root(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    pinned_set: &std::collections::HashSet<[u8; 32]>,
+) -> Result<Vec<ContentItemWire>, String> {
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
@@ -1267,18 +1277,123 @@ async fn list_content(
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: joined_pinned(e, &pinned_set),
+                pinned: joined_pinned(e, pinned_set),
                 licensed: e.licensed,
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
             })
             .collect()
     };
-    // `ContentIndex::entries()` iterates a HashMap, so order is not
-    // deterministic. Sort by stored_at descending (newest first) so the
-    // File Manager UI sees a stable list across renders.
+    // HashMap iter is non-deterministic; sort newest-first for stable UI.
     entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
     Ok(entries)
+}
+
+pub async fn list_folder(
+    folder_cid_hex: String,
+    verb_tx: tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    pinned_set: &std::collections::HashSet<[u8; 32]>,
+) -> Result<Vec<ContentItemWire>, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    let folder_cid = parse_cid_hex(&folder_cid_hex)?;
+
+    // Fetch the folder's bundle bytes from the runtime cache.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::ReadBytes {
+            cid: folder_cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let bundle_bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped read request".to_string())?;
+    let bundle_bytes = match bundle_bytes {
+        Some(b) => b,
+        None => {
+            // Folder not in cache — likely evicted or never admitted.
+            // Return empty (UI shows empty folder); ZEB-159 will add
+            // transparent re-fetch in a follow-up.
+            tracing::debug!(
+                folder_cid = %folder_cid_hex,
+                "list_folder: bundle not in cache; returning empty",
+            );
+            return Ok(vec![]);
+        }
+    };
+
+    // Parse bundle child CIDs; child-0 is the manifest book.
+    let child_cids: Vec<[u8; 32]> = parse_bundle(&bundle_bytes)
+        .map_err(|e| format!("malformed folder bundle: {e:?}"))?
+        .iter()
+        .map(|c| c.to_bytes())
+        .collect();
+    let manifest_cid: [u8; 32] = child_cids
+        .first()
+        .copied()
+        .ok_or_else(|| "folder bundle has no children".to_string())?;
+
+    // Read the manifest book bytes.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::ReadBytes {
+            cid: manifest_cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let manifest_bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped read request".to_string())?
+        .ok_or_else(|| "manifest book not in cache".to_string())?;
+
+    let manifest: crate::folders::FolderManifest =
+        serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| format!("manifest parse: {e}"))?;
+
+    // Consistency check: manifest entry CIDs must match bundle child-1..N.
+    let bundle_children_after_manifest: Vec<[u8; 32]> = child_cids
+        .iter()
+        .skip(1)
+        .copied()
+        .collect();
+    if manifest.folder_manifest.entries.len() != bundle_children_after_manifest.len() {
+        return Err(format!(
+            "manifest/bundle mismatch: manifest has {} entries, bundle has {} children after manifest",
+            manifest.folder_manifest.entries.len(),
+            bundle_children_after_manifest.len()
+        ));
+    }
+    for (i, entry) in manifest.folder_manifest.entries.iter().enumerate() {
+        if entry.cid != bundle_children_after_manifest[i] {
+            return Err(format!(
+                "manifest/bundle cid mismatch at index {i}",
+            ));
+        }
+    }
+
+    // Synthesize wire rows. Nested items have no sidecar: size_bytes/stored_at
+    // are unavailable (reported 0), sensitivity/replication_tier default,
+    // licensed/archived false. Pinned joins the runtime's pinned_set.
+    Ok(manifest
+        .folder_manifest
+        .entries
+        .into_iter()
+        .map(|e| ContentItemWire {
+            cid: hex::encode(e.cid),
+            name: e.name,
+            size_bytes: 0,
+            stored_at: 0,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: pinned_set.contains(&e.cid),
+            licensed: false,
+            archived: false,
+            kind: kind_wire(e.kind).to_string(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2493,6 +2608,19 @@ mod tests {
         assert!(parse_content_announcement("harmony/announce/<script>", &payload).is_none());
         assert!(parse_content_announcement("harmony/announce/xyz!", &payload).is_none());
         assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
+    }
+
+    #[test]
+    fn list_folder_rejects_non_manifest_child_0() {
+        use crate::folders::FolderManifest;
+
+        // A bundle whose child-0 book payload is NOT a folder manifest
+        // (e.g., plain UTF-8 "not a manifest" or chunked-file sentinel bytes).
+        // Simulated here at the parse level — the full wiring test is the
+        // integration test malformed_manifest_returns_error.
+        let payload = b"definitely not a manifest";
+        let parse_result: Result<FolderManifest, _> = serde_json::from_slice(payload);
+        assert!(parse_result.is_err(), "bad JSON must not parse as FolderManifest");
     }
 }
 
