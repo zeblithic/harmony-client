@@ -1825,10 +1825,11 @@ async fn create_folder_at_root(
         built.manifest_bytes,
     )
     .await?;
+    let bundle_size = built.bundle_bytes.len() as u64;
     send_ingest(
         &ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
-        built.bundle_bytes.clone(),
+        built.bundle_bytes,
     )
     .await?;
 
@@ -1854,7 +1855,7 @@ async fn create_folder_at_root(
         let inserted = idx.insert(content_index::ContentIndexEntry {
             cid: built.bundle_cid.to_bytes(),
             file_name: name,
-            size_bytes: built.bundle_bytes.len() as u64,
+            size_bytes: bundle_size,
             stored_at_ms,
             sensitivity: content_index::Sensitivity::Private,
             replication_tier: content_index::ReplicationTier::Default,

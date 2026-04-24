@@ -105,6 +105,12 @@
     });
   });
 
+  // Track the most recently fetched folder CID so that version bumps
+  // (pin/unpin/burn/archive/tier mutations) re-fetch in the background
+  // without clearing the visible list. Clearing is reserved for real
+  // navigation — i.e. when cid actually changes.
+  let lastFetchedCid: string | null = null;
+
   // Whenever currentFolderCid OR serviceVersion changes, fetch live folder
   // contents from the backend. The serviceVersion dependency catches
   // pin/unpin/burn/archive/tier mutations on items inside the current folder,
@@ -114,9 +120,16 @@
     const cid = currentFolderCid;
     if (!cid) {
       folderItems = null;
+      lastFetchedCid = null;
       return;
     }
-    folderItems = null; // reset while fetching
+    // Only clear the visible list when entering a new folder. On
+    // serviceVersion bumps (same cid), keep the old list until the new
+    // one arrives to avoid flashing empty state on every mutation.
+    if (cid !== lastFetchedCid) {
+      folderItems = null;
+      lastFetchedCid = cid;
+    }
     service.listFolderContents(cid).then((result) => {
       // Guard: only update if we're still in the same folder
       if (currentFolderCid === cid) {
