@@ -372,13 +372,22 @@ export class FileManagerService {
    */
   async listFolderContents(folderCid: string): Promise<ContentItem[]> {
     if (!this.adapter) return [];
-    const raw = (await this.adapter.invoke('list_content', { folderCid })) as
-      | ContentItemWire[]
-      | null
-      | undefined;
-    return Array.isArray(raw)
-      ? raw.filter((w) => !w.archived).map(wireToContentItem)
-      : [];
+    // Errors here can be legitimate (folder evicted, malformed manifest,
+    // adapter dropped). Return [] so callers don't have to handle async
+    // rejection paths individually — a missing folder is functionally
+    // equivalent to an empty one for navigation purposes.
+    try {
+      const raw = (await this.adapter.invoke('list_content', { folderCid })) as
+        | ContentItemWire[]
+        | null
+        | undefined;
+      return Array.isArray(raw)
+        ? raw.filter((w) => !w.archived).map(wireToContentItem)
+        : [];
+    } catch (err) {
+      console.error('listFolderContents failed:', err);
+      return [];
+    }
   }
 
   /**

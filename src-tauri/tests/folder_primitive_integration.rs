@@ -90,7 +90,7 @@ fn create_nested_folder_updates_top_level_root_cid() {
         photos_v2.bundle_bytes.len() as u64,
         /* new_stored_at_ms */ 2,
     );
-    assert!(rekeyed, "rekey succeeds");
+    assert!(rekeyed.is_ok(), "rekey succeeds");
 
     let after = idx
         .get(&photos_v2.bundle_cid.to_bytes())
@@ -120,6 +120,8 @@ struct TestHarness {
     pub verb_tx: mpsc::Sender<ContentVerbRequest>,
     /// Kept alive so the event loop keeps running; dropped to shut down.
     _shutdown_tx: watch::Sender<bool>,
+    /// Tempdir kept alive for the runtime's lifetime; cleaned up on drop.
+    _tmp: tempfile::TempDir,
 }
 
 impl Drop for TestHarness {
@@ -249,13 +251,13 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
         Err(_) => panic!("event loop dropped ready signal"),
     }
 
-    // Keep tmp alive for the lifetime of the harness.
-    std::mem::forget(tmp);
-
+    // Move tempdir into the harness so it's cleaned up on Drop instead
+    // of leaking via std::mem::forget (caught by PR #55 review).
     Some(TestHarness {
         ingest_tx,
         verb_tx,
         _shutdown_tx: shutdown_tx,
+        _tmp: tmp,
     })
 }
 

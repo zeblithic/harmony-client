@@ -97,6 +97,17 @@ pub struct ContentIndex {
     entries: HashMap<[u8; 32], ContentIndexEntry>,
 }
 
+/// Errors returned by [`ContentIndex::rekey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyError {
+    /// The `old` CID wasn't in the index — nothing to rekey.
+    OldMissing,
+    /// The `new` CID is already present (and differs from `old`); the
+    /// rekey would overwrite an unrelated entry. Caller should surface
+    /// a "identical contents already exists" message.
+    Collision,
+}
+
 impl ContentIndex {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join(INDEX_FILE);
@@ -223,24 +234,35 @@ impl ContentIndex {
     /// `create_folder`, future move/rename operations). One save() for
     /// the whole replacement — remove-then-insert would give two.
     ///
-    /// Returns `true` if rekeyed; `false` if the old CID wasn't in the
-    /// index.
+    /// Refuses on collision: if `new` is already present in the index
+    /// (and `new != *old`), the call is a no-op and returns
+    /// `Err(RekeyError::Collision)`. Without this guard, the inner
+    /// `HashMap::insert` would silently overwrite the existing entry
+    /// under `new`, dropping a different user-visible row. The collision
+    /// happens for real under content-addressing: nested folder
+    /// mutations can produce a CID that already names another sidecar
+    /// root (two distinct paths converging on identical bundle
+    /// contents). Symlink-style multiple-entries-per-CID is tracked in
+    /// ZEB-164.
     pub fn rekey(
         &mut self,
         old: &[u8; 32],
         new: [u8; 32],
         new_size_bytes: u64,
         new_stored_at_ms: u64,
-    ) -> bool {
+    ) -> Result<(), RekeyError> {
+        if old != &new && self.entries.contains_key(&new) {
+            return Err(RekeyError::Collision);
+        }
         let Some(mut entry) = self.entries.remove(old) else {
-            return false;
+            return Err(RekeyError::OldMissing);
         };
         entry.cid = new;
         entry.size_bytes = new_size_bytes;
         entry.stored_at_ms = new_stored_at_ms;
         self.entries.insert(new, entry);
         self.save();
-        true
+        Ok(())
     }
 
     /// Flip the `pinned` flag. Returns `true` if the flag changed;
@@ -567,13 +589,13 @@ mod tests {
         entry.archived = false;
         idx.insert(entry.clone());
 
-        let ok = idx.rekey(
+        let result = idx.rekey(
             &[0x01; 32],
             [0x02; 32],
             /* new_size_bytes */ 999,
             /* new_stored_at_ms */ 1234,
         );
-        assert!(ok, "rekey must succeed when old key exists");
+        assert!(result.is_ok(), "rekey must succeed when old key exists");
 
         assert!(idx.get(&[0x01; 32]).is_none(), "old key removed");
         let after = idx.get(&[0x02; 32]).expect("new key present");
@@ -583,8 +605,53 @@ mod tests {
         assert_eq!(after.size_bytes, 999, "size_bytes updated");
         assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
 
-        // Non-existent old key returns false.
-        assert!(!idx.rekey(&[0xFF; 32], [0xEE; 32], 0, 0));
+        // Non-existent old key returns OldMissing.
+        assert_eq!(
+            idx.rekey(&[0xFF; 32], [0xEE; 32], 0, 0),
+            Err(RekeyError::OldMissing),
+        );
+    }
+
+    #[test]
+    fn rekey_refuses_collision_instead_of_overwriting() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        // Two distinct entries: keeper at 0xAA, victim-target at 0xBB.
+        let mut keeper = sample_entry([0xAA; 32]);
+        keeper.file_name = "Keeper".into();
+        idx.insert(keeper);
+
+        let mut other = sample_entry([0xBB; 32]);
+        other.file_name = "OtherRoot".into();
+        idx.insert(other);
+
+        // Try to rekey OtherRoot from 0xBB → 0xAA. Without the collision
+        // guard this would clobber Keeper. With it we get a Collision
+        // error and both entries remain intact.
+        let result = idx.rekey(&[0xBB; 32], [0xAA; 32], 0, 0);
+        assert_eq!(result, Err(RekeyError::Collision));
+
+        // Both entries still present and unchanged.
+        assert_eq!(idx.get(&[0xAA; 32]).unwrap().file_name, "Keeper");
+        assert_eq!(idx.get(&[0xBB; 32]).unwrap().file_name, "OtherRoot");
+    }
+
+    #[test]
+    fn rekey_old_equals_new_is_a_self_update_not_a_collision() {
+        // rekey(old=X, new=X) should be allowed — it's a metadata refresh
+        // (size_bytes / stored_at_ms only). The collision guard checks
+        // `old != &new` before refusing, so this path is not blocked.
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xCC; 32]);
+        idx.insert(entry);
+
+        let result = idx.rekey(&[0xCC; 32], [0xCC; 32], 12345, 67890);
+        assert!(result.is_ok());
+        let after = idx.get(&[0xCC; 32]).expect("entry still present");
+        assert_eq!(after.size_bytes, 12345);
+        assert_eq!(after.stored_at_ms, 67890);
     }
 
     #[test]

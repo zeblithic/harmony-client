@@ -1907,17 +1907,20 @@ async fn create_folder_nested(
     };
 
     // 1. Build the new empty sub-folder. Ingest its manifest + bundle.
+    // Capture cid + size before moving the byte vectors into send_ingest.
     let new_child = folders::build_folder(&name, &[])?;
+    let new_child_bundle_cid = new_child.bundle_cid;
+    let new_child_bundle_size = new_child.bundle_bytes.len() as u64;
     send_ingest(
         &ingest_tx,
         hex::encode(new_child.manifest_cid.to_bytes()),
-        new_child.manifest_bytes.clone(),
+        new_child.manifest_bytes,
     )
     .await?;
     send_ingest(
         &ingest_tx,
-        hex::encode(new_child.bundle_cid.to_bytes()),
-        new_child.bundle_bytes.clone(),
+        hex::encode(new_child_bundle_cid.to_bytes()),
+        new_child.bundle_bytes,
     )
     .await?;
 
@@ -1925,8 +1928,8 @@ async fn create_folder_nested(
     //    prev_old_cid = the ancestor's old CID (as given in parent_path).
     //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
     let mut prev_old_cid = immediate_parent_cid;
-    let mut prev_new_cid = new_child.bundle_cid.to_bytes();
-    let mut last_bundle_size: u64 = new_child.bundle_bytes.len() as u64;
+    let mut prev_new_cid = new_child_bundle_cid.to_bytes();
+    let mut last_bundle_size: u64 = new_child_bundle_size;
 
     // First iteration: APPEND at the immediate parent.
     // Higher iterations: REPLACE the entry pointing to prev_old_cid.
@@ -1982,10 +1985,13 @@ async fn create_folder_nested(
         }
 
         // Rebuild manifest book + bundle with updated entries.
+        // Capture cid + size before moving the byte vectors into send_ingest.
         let rebuilt = folders::build_folder(
             /* display name not used by manifest; empty is fine */ "",
             &manifest.folder_manifest.entries,
         )?;
+        let rebuilt_bundle_cid = rebuilt.bundle_cid;
+        let rebuilt_bundle_size = rebuilt.bundle_bytes.len() as u64;
         send_ingest(
             &ingest_tx,
             hex::encode(rebuilt.manifest_cid.to_bytes()),
@@ -1994,14 +2000,14 @@ async fn create_folder_nested(
         .await?;
         send_ingest(
             &ingest_tx,
-            hex::encode(rebuilt.bundle_cid.to_bytes()),
-            rebuilt.bundle_bytes.clone(),
+            hex::encode(rebuilt_bundle_cid.to_bytes()),
+            rebuilt.bundle_bytes,
         )
         .await?;
 
         prev_old_cid = anc_cid;
-        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
-        prev_new_cid = rebuilt.bundle_cid.to_bytes();
+        last_bundle_size = rebuilt_bundle_size;
+        prev_new_cid = rebuilt_bundle_cid.to_bytes();
     }
 
     // 3. Rekey the top-level sidecar entry.
@@ -2016,9 +2022,20 @@ async fn create_folder_nested(
     };
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let ok = idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms);
-        if !ok {
-            return Err("top-level folder not in sidecar — nothing to rekey".to_string());
+        match idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err(
+                    "top-level folder not in sidecar — nothing to rekey".to_string(),
+                );
+            }
+            Err(content_index::RekeyError::Collision) => {
+                return Err(
+                    "the new folder's contents collide with an existing top-level entry; \
+                     rename the existing one or differentiate the new one before retrying"
+                        .to_string(),
+                );
+            }
         }
     }
 

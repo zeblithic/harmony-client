@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { FileViewMode, ContentSection, ContentCategory, ReplicationTier, ContentItem } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import { tierTarget } from '../file-utils';
@@ -60,6 +61,49 @@
   // Null means "not yet fetched" (while navigating); an empty array means the
   // folder exists but is empty. Used only when currentFolderCid != null.
   let folderItems = $state<ContentItem[] | null>(null);
+
+  // Explicit navigation stack of {cid, name} from root sentinel down to the
+  // current folder. Maintained locally because nested folder rows are not in
+  // the sidecar (Option Y) and cannot be walked via parentCid. handleItemClick
+  // stashes the (cid, name) before calling onNavigateFolder so the $effect
+  // below can extend the stack with a real name. Truncates on back-navigation
+  // (clicking a breadcrumb), resets when currentFolderCid → null.
+  let navStack = $state<Array<{ cid: string; name: string }>>([]);
+  let pendingNav: { cid: string; name: string } | null = null;
+
+  // Sync navStack with currentFolderCid (driven by the parent component).
+  // The effect's only reactive dependency is currentFolderCid; navStack /
+  // pendingNav / items are read inside untrack() so writes to navStack
+  // don't trigger an infinite re-run loop.
+  $effect(() => {
+    const cid = currentFolderCid;
+    untrack(() => {
+      if (cid === null) {
+        navStack = [];
+        pendingNav = null;
+        return;
+      }
+      // Back navigation: cid is already somewhere in the stack → truncate.
+      const idx = navStack.findIndex((seg) => seg.cid === cid);
+      if (idx >= 0) {
+        navStack = navStack.slice(0, idx + 1);
+        pendingNav = null;
+        return;
+      }
+      // Forward navigation: prefer the (cid, name) stashed at click time.
+      if (pendingNav && pendingNav.cid === cid) {
+        navStack = [...navStack, pendingNav];
+        pendingNav = null;
+        return;
+      }
+      // Programmatic jump (no click stash): try to look up the name from
+      // current items, then root-level items, then fall back to a placeholder.
+      const item =
+        items.find((i) => i.cid === cid) ??
+        service.getContents().find((i) => i.cid === cid);
+      navStack = [...navStack, { cid, name: item?.name ?? '(folder)' }];
+    });
+  });
 
   // Whenever currentFolderCid changes, fetch the live folder contents from the
   // backend (Option A: async $effect). Falls back to [] if no adapter is wired.
@@ -141,45 +185,22 @@
     return service.getCleanupRecommendations();
   });
 
-  // Build the breadcrumb path. For root, only "My Content" appears.
-  // For a folder, walk up from root using the cached service data (which
-  // includes folders returned by connectAdapter / refetchRoot).
-  let breadcrumbPath = $derived.by(() => {
-    void serviceVersion;
-    const path: Array<{ cid: string | null; name: string }> = [
-      { cid: null, name: 'My Content' },
-    ];
-    if (currentFolderCid) {
-      const allContent = service.getContents();
-      // Walk up the parent chain to build the full ancestor path
-      const ancestors: Array<{ cid: string; name: string }> = [];
-      let cid: string | null = currentFolderCid;
-      const seen = new Set<string>();
-      while (cid && !seen.has(cid)) {
-        seen.add(cid);
-        const folder = allContent.find((i) => i.cid === cid);
-        if (!folder) break;
-        ancestors.unshift({ cid: folder.cid, name: folder.name });
-        cid = folder.parentCid;
-      }
-      path.push(...ancestors);
-    }
-    return path;
-  });
+  // Breadcrumb path = root sentinel + the explicit nav stack. No sidecar
+  // walk: nested folder rows aren't persisted (Option Y) so parentCid can't
+  // reconstruct the chain reliably.
+  let breadcrumbPath = $derived.by<Array<{ cid: string | null; name: string }>>(
+    () => [{ cid: null, name: 'My Content' }, ...navStack],
+  );
 
   // The stack of ancestor CIDs from root down to the current folder's parent.
   // Used by createFolder so the backend can cascade the CID update up the tree.
-  let breadcrumbStack = $derived.by(() => {
-    // breadcrumbPath[0] is always the root sentinel (cid: null); skip it.
-    // The remaining segments are actual folder CIDs.
-    return breadcrumbPath
-      .slice(1)
-      .map((seg) => seg.cid as string);
-  });
+  let breadcrumbStack = $derived.by<string[]>(() => navStack.map((seg) => seg.cid));
 
   function handleItemClick(cid: string) {
     const item = items.find((i) => i.cid === cid);
     if (item?.isFolder) {
+      // Stash (cid, name) for the navStack $effect to consume on the next tick.
+      pendingNav = { cid: item.cid, name: item.name };
       onNavigateFolder(item.cid);
       return;
     }
@@ -189,12 +210,25 @@
   async function handleNewFolder() {
     const name = window.prompt('Folder name:');
     if (!name || !name.trim()) return;
-    await service.createFolder(name.trim(), breadcrumbStack);
-    // If we're inside a folder, refetch live contents so the new sub-folder
-    // appears immediately (createFolder already called refetchRoot for the
-    // cached root listing).
+
+    try {
+      await service.createFolder(name.trim(), breadcrumbStack);
+    } catch (err) {
+      // Surface known backend errors to the user; identical-contents
+      // collisions and similar are returned as plain Err strings.
+      const msg = err instanceof Error ? err.message : String(err);
+      window.alert(`Could not create folder: ${msg}`);
+      return;
+    }
+
+    // Nested create: the backend's ancestor cascade rewrites every CID
+    // along the path including currentFolderCid, so refetching the same
+    // CID would just re-read the now-stale bundle. Until ZEB-164 lands a
+    // stable sidecar identity, navigate back to the root view — the new
+    // folder appears in the root's refreshed listing (createFolder already
+    // called refetchRoot internally) and the user can re-enter the path.
     if (currentFolderCid) {
-      folderItems = await service.listFolderContents(currentFolderCid);
+      onNavigateFolder(null);
     }
   }
 </script>

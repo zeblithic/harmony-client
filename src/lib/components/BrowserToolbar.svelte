@@ -71,7 +71,9 @@
           onclick={() => onViewModeChange('grid')}
         >⊞</button>
         <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
-        <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
+        {#if onNewFolderClick}
+          <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
+        {/if}
       {/if}
       <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
     {/if}
