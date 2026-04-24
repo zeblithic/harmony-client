@@ -597,6 +597,12 @@ pub async fn run<R: Runtime>(
                     ContentVerbRequest::Pin { cid, reply } => {
                         // ZEB-155: record intent in the event-loop cache so
                         // fetch-completion can auto-repin after a resurrect.
+                        //
+                        // This may contain CIDs not in the sidecar (e.g. a
+                        // pin on a cached DM attachment for which no
+                        // sidecar entry exists). That drift self-heals on
+                        // the next start_node, which rebuilds pin_intent
+                        // from the sidecar — sidecar remains authoritative.
                         pin_intent.insert(cid);
                         let root = ContentId::from_bytes(cid);
                         let all = collect_descendants(runtime.storage_tier().cache(), root);
@@ -649,6 +655,15 @@ pub async fn run<R: Runtime>(
             // Spawned fetch tasks send on fetch_completion_tx after
             // fetch_recursive returns Ok. If pin_intent contains the
             // root, re-run the pin cascade now that bytes are resident.
+            //
+            // NOTE: today's fetch_rx path does NOT admit fetched bytes
+            // into ContentStore — it returns them to the Tauri caller.
+            // So in production this cascade walks an empty cache for the
+            // fetched CID and pin_content is a no-op. The hook is
+            // architecturally correct and test-proven in isolation (see
+            // fetch_complete_arm_pins_root_in_intent), but its practical
+            // reach depends on ZEB-159, which will wire fetch success
+            // to cache admission.
             Some(root_bytes) = fetch_completion_rx.recv() => {
                 if pin_intent.contains(&root_bytes) {
                     let root = ContentId::from_bytes(root_bytes);

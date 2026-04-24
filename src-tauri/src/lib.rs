@@ -1341,8 +1341,8 @@ async fn unpin_content(
 ///
 /// ZEB-155: removing the sidecar entry implicitly drops any persisted
 /// pin intent — no explicit `set_pinned(false)` needed, because there's
-/// no entry left to hold a flag on. (Task 4 will add a runtime-side
-/// pin-intent set that the Burn arm also clears on dispatch.)
+/// no entry left to hold a flag on. The event-loop Burn arm also clears
+/// the CID from the in-memory `pin_intent` set so the two stay in sync.
 #[tauri::command]
 async fn burn_content(
     cid: String,
@@ -1350,14 +1350,19 @@ async fn burn_content(
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
 
-    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
-    let verb_tx = {
+    // ZEB-155: snapshot both handles under a single NodeState lock, matching
+    // pin_content / unpin_content. Fail fast if the runtime is gone — no
+    // point removing the sidecar entry if we can't also clear the cache.
+    let (index, verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let verb_tx = guard
             .content_verb_tx
             .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
+            .ok_or_else(|| "runtime unavailable".to_string())?;
+        (guard.content_index.clone(), verb_tx)
     };
+
+    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Burn {
@@ -1370,13 +1375,9 @@ async fn burn_content(
         .await
         .map_err(|_| "event loop dropped burn request".to_string())??;
 
-    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the
-    //    entry (so the frontend knows whether the burn actually removed
-    //    something or was a no-op on an already-unknown CID).
-    let index = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
-    };
+    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the entry
+    //    (so the frontend knows whether the burn actually removed something
+    //    or was a no-op on an already-unknown CID).
     let removed = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.remove(&cid_bytes)
