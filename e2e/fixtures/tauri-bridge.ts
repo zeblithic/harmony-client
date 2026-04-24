@@ -1,11 +1,38 @@
 import { test as base, chromium, type Browser, type Page } from '@playwright/test';
 
 const DEFAULT_CDP_ENDPOINT = 'http://localhost:9222';
-const VITE_ORIGIN = 'http://localhost:5173';
+const DEFAULT_VITE_ORIGIN = 'http://localhost:5173';
+const VITE_ORIGIN = process.env.VITE_ORIGIN ?? DEFAULT_VITE_ORIGIN;
+
 // Child windows (currently just network-viz) are also served from the Vite
 // origin, so matching by origin alone isn't enough to identify the root app
-// page — we must filter child window paths out.
+// page — we must filter child window pathnames out.
 const CHILD_WINDOW_PATHS = ['/src/network.html'];
+export const NETWORK_VIZ_PATH = '/src/network.html';
+
+/**
+ * Compare a WebView2 page URL against a pathname using strict URL parsing.
+ * Substring/includes matching can false-match on fragments and query strings
+ * (e.g. `#anchor=/src/network.html`) — always parse first, then compare
+ * `origin` and `pathname` exactly.
+ */
+function pageHasExactPath(pageUrl: string, pathname: string): boolean {
+  try {
+    const u = new URL(pageUrl);
+    return u.origin === VITE_ORIGIN && u.pathname === pathname;
+  } catch {
+    return false; // about:blank, chrome-error://, etc. during boot
+  }
+}
+
+function isMainPage(pageUrl: string): boolean {
+  try {
+    const u = new URL(pageUrl);
+    return u.origin === VITE_ORIGIN && !CHILD_WINDOW_PATHS.includes(u.pathname);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Poll the CDP browser for the main app page: the root Vite target whose
@@ -13,21 +40,18 @@ const CHILD_WINDOW_PATHS = ['/src/network.html'];
  * network-viz) are on the same origin, so a naive origin match picks the
  * wrong page when a child window is already open.
  *
- * The webview briefly loads `about:blank` before Svelte mounts (see
- * `project_playwright_tauri_bridge.md`), so callers must never assume
- * `browser.contexts()[0].pages()[0]` is the target.
+ * The webview briefly loads `about:blank` before Svelte mounts, so callers
+ * must never assume `browser.contexts()[0].pages()[0]` is the target.
  */
 async function findViteMainPage(
   browser: Browser,
   timeoutMs: number,
 ): Promise<Page> {
   const deadline = Date.now() + timeoutMs;
-  const isMain = (url: string) =>
-    url.startsWith(VITE_ORIGIN) && !CHILD_WINDOW_PATHS.some((p) => url.includes(p));
   while (Date.now() < deadline) {
     for (const ctx of browser.contexts()) {
       for (const page of ctx.pages()) {
-        if (isMain(page.mainFrame().url())) return page;
+        if (isMainPage(page.mainFrame().url())) return page;
       }
     }
     await new Promise((r) => setTimeout(r, 200));
@@ -36,6 +60,43 @@ async function findViteMainPage(
     `Timed out after ${timeoutMs}ms waiting for the main page on ${VITE_ORIGIN}. ` +
       `Is \`tauri dev\` running with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222?`,
   );
+}
+
+/**
+ * Poll the CDP browser for a page whose main-frame URL has exactly the given
+ * pathname (and the Vite origin). Shared across specs for child-window
+ * discovery; don't re-define per spec.
+ */
+export async function findPageByPath(
+  browser: Browser,
+  pathname: string,
+  timeoutMs: number,
+): Promise<Page> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const ctx of browser.contexts()) {
+      for (const page of ctx.pages()) {
+        if (pageHasExactPath(page.mainFrame().url(), pathname)) return page;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms waiting for a page with path ${pathname}`);
+}
+
+/**
+ * Count pages whose main-frame URL has exactly the given pathname. Useful for
+ * "did this click spawn a new window?" assertions where you need a before/after
+ * delta, since CDP publishes new targets asynchronously.
+ */
+export function countPagesByPath(browser: Browser, pathname: string): number {
+  let count = 0;
+  for (const ctx of browser.contexts()) {
+    for (const page of ctx.pages()) {
+      if (pageHasExactPath(page.mainFrame().url(), pathname)) count++;
+    }
+  }
+  return count;
 }
 
 /**
@@ -124,12 +185,12 @@ type TestFixtures = {
 
 /**
  * Test fixture augmented with a live CDP connection. Tests receive a `mainPage`
- * already confirmed to be on the Vite origin.
+ * already confirmed to be on the Vite origin, with the Tauri bridge attached.
  *
  * Teardown deliberately does NOT call `browser.close()`: on a CDP-attached
- * WebView2, Playwright forwards `Browser.close`, which terminates the Tauri
- * host process (observed exit `0xcfffffff`). We let the node worker exit and
- * rely on the WebSocket dying with it. See project_playwright_tauri_bridge.md.
+ * WebView2, Playwright forwards `Browser.close` to the host, which terminates
+ * the Tauri process (observed exit `0xcfffffff`). The node worker's own exit
+ * drops the WebSocket, which is enough cleanup.
  */
 export const test = base.extend<TestFixtures, WorkerFixtures>({
   cdpBrowser: [

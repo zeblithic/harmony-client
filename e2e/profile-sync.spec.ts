@@ -23,6 +23,11 @@ const SETTINGS_BUTTON = 'Notification settings';
 const NAME_INPUT = 'Display name';
 const SAVE_BUTTON = 'Save';
 const PROFILE_KEY = 'harmony-profile';
+// loadProfile() in src/lib/profile-service.ts defaults displayName to this
+// when the stored profile is absent or the field is missing — use it as a
+// deterministic restore target so cleanup doesn't depend on what was there
+// before the test started.
+const DEFAULT_DISPLAY_NAME = 'Anonymous';
 const TEST_NAME = `E2E Test ${Date.now().toString(36)}`;
 
 async function openSettings(page: Page): Promise<void> {
@@ -39,22 +44,34 @@ async function closeSettings(page: Page): Promise<void> {
   await expect(nameInput).not.toBeVisible({ timeout: 5_000 });
 }
 
+/**
+ * Read the persisted displayName, defensively: returns `null` if storage is
+ * empty, if the entry is not valid JSON, or if the parsed value's displayName
+ * isn't a string. Callers must not `.fill()` a non-string into the input.
+ */
+async function readPersistedDisplayName(page: Page): Promise<string | null> {
+  return page.evaluate((key: string): string | null => {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { displayName?: unknown };
+      return typeof parsed.displayName === 'string' ? parsed.displayName : null;
+    } catch {
+      return null;
+    }
+  }, PROFILE_KEY);
+}
+
 test.describe('profile sync', () => {
   test('displayName persists and re-hydrates on settings reopen [ZEB-148]', async ({
     mainPage,
   }) => {
     await waitForNodeReady(mainPage);
 
-    // Snapshot the original name so we can restore it at the end.
-    const original = await mainPage.evaluate((key: string) => {
-      const raw = localStorage.getItem(key);
-      if (!raw) return null;
-      try {
-        return JSON.parse(raw).displayName as string;
-      } catch {
-        return null;
-      }
-    }, PROFILE_KEY);
+    // Snapshot the original name so we can restore it at the end. If storage
+    // is empty or malformed, fall back to the app's own default — cleanup
+    // MUST be deterministic, since we're about to mutate persistent state.
+    const original = (await readPersistedDisplayName(mainPage)) ?? DEFAULT_DISPLAY_NAME;
 
     try {
       await openSettings(mainPage);
@@ -65,11 +82,7 @@ test.describe('profile sync', () => {
       await expect(mainPage.getByText('Profile saved')).toBeVisible({ timeout: 3_000 });
 
       // Persistence signal.
-      const persisted = await mainPage.evaluate((key: string) => {
-        const raw = localStorage.getItem(key);
-        return raw ? (JSON.parse(raw).displayName as string) : null;
-      }, PROFILE_KEY);
-      expect(persisted).toBe(TEST_NAME);
+      expect(await readPersistedDisplayName(mainPage)).toBe(TEST_NAME);
 
       // Reactivity signal: close+reopen. ProfileEditor untracks its initial
       // displayName from the `profile` prop, so a stale prop would show the
@@ -78,13 +91,15 @@ test.describe('profile sync', () => {
       await openSettings(mainPage);
       await expect(mainPage.getByLabel(NAME_INPUT)).toHaveValue(TEST_NAME);
     } finally {
-      // Restore the pre-test name so consecutive runs aren't order-dependent.
-      if (original !== null) {
-        await openSettings(mainPage);
-        await mainPage.getByLabel(NAME_INPUT).fill(original);
-        await mainPage.getByRole('button', { name: SAVE_BUTTON }).click();
-        await expect(mainPage.getByText('Profile saved')).toBeVisible({ timeout: 3_000 });
-      }
+      // Always restore to a known value — even if the assertions above
+      // threw, we don't want to leave TEST_NAME in localStorage polluting
+      // the next run.
+      await openSettings(mainPage).catch(() => {});
+      await mainPage.getByLabel(NAME_INPUT).fill(original).catch(() => {});
+      await mainPage
+        .getByRole('button', { name: SAVE_BUTTON })
+        .click()
+        .catch(() => {});
     }
   });
 });

@@ -71,7 +71,7 @@ with `CDP_ENDPOINT=http://host:port` if needed.
 [zeb-148]: https://linear.app/zeblith/issue/ZEB-148
 [zeb-149]: https://linear.app/zeblith/issue/ZEB-149
 
-## Gotchas (codified from painful experience — see also `project_playwright_tauri_bridge.md`)
+## Gotchas (codified from painful experience)
 
 - **Never call `browser.close()` on a CDP-attached WebView2.** Playwright
   forwards `Browser.close`, which terminates the Tauri process (observed exit

@@ -1,30 +1,18 @@
 import type { Browser, Page } from '@playwright/test';
-import { test, expect, invoke, waitForTauriBridge, waitForNodeReady } from './fixtures/tauri-bridge';
-
-const NETWORK_VIZ_PATH = '/src/network.html';
-
-async function findPageByPath(
-  browser: Browser,
-  pathname: string,
-  timeoutMs: number,
-): Promise<Page> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const ctx of browser.contexts()) {
-      for (const page of ctx.pages()) {
-        if (page.mainFrame().url().includes(pathname)) return page;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for a page with path ${pathname}`);
-}
+import {
+  test,
+  expect,
+  invoke,
+  waitForTauriBridge,
+  waitForNodeReady,
+  findPageByPath,
+  countPagesByPath,
+  NETWORK_VIZ_PATH,
+} from './fixtures/tauri-bridge';
 
 async function ensureNetworkVizOpen(mainPage: Page, browser: Browser): Promise<Page> {
   await waitForNodeReady(mainPage);
-  const already = browser
-    .contexts()
-    .some((c) => c.pages().some((p) => p.mainFrame().url().includes(NETWORK_VIZ_PATH)));
+  const already = countPagesByPath(browser, NETWORK_VIZ_PATH) > 0;
   if (!already) {
     await mainPage.getByRole('button', { name: 'Open network visualization' }).click();
   }

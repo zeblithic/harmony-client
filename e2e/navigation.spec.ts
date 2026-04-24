@@ -1,29 +1,28 @@
-import type { Page } from '@playwright/test';
-import { test, expect, invoke, waitForTauriBridge, waitForNodeReady } from './fixtures/tauri-bridge';
-
-const NETWORK_VIZ_PATH = '/src/network.html';
+import type { Browser, Page } from '@playwright/test';
+import {
+  test,
+  expect,
+  invoke,
+  waitForTauriBridge,
+  waitForNodeReady,
+  findPageByPath,
+  countPagesByPath,
+  NETWORK_VIZ_PATH,
+} from './fixtures/tauri-bridge';
 
 /**
- * Poll the browser for a page whose main frame URL ends with the given
- * pathname. Handles the race where Tauri has opened the window but CDP
- * hasn't published the new target yet.
+ * Open the network-viz window (or re-discover it if already open) and return
+ * its Playwright page. Factored out so every nav/zenoh test agrees on the
+ * polling timeout and the bridge-ready contract.
  */
-async function findPageByPath(
-  browser: import('@playwright/test').Browser,
-  pathname: string,
-  timeoutMs: number,
-): Promise<Page> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    for (const ctx of browser.contexts()) {
-      for (const page of ctx.pages()) {
-        const url = page.mainFrame().url();
-        if (url.includes(pathname)) return page;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 200));
+async function getOrOpenNetworkViz(mainPage: Page, browser: Browser): Promise<Page> {
+  const alreadyOpen = countPagesByPath(browser, NETWORK_VIZ_PATH) > 0;
+  if (!alreadyOpen) {
+    await mainPage.getByRole('button', { name: 'Open network visualization' }).click();
   }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for a page with path ${pathname}`);
+  const viz = await findPageByPath(browser, NETWORK_VIZ_PATH, 10_000);
+  await waitForTauriBridge(viz);
+  return viz;
 }
 
 test.describe('navigation', () => {
@@ -33,18 +32,15 @@ test.describe('navigation', () => {
   }) => {
     await waitForNodeReady(mainPage);
 
-    const vizExists = () =>
-      cdpBrowser
-        .contexts()
-        .some((c) => c.pages().some((p) => p.mainFrame().url().includes(NETWORK_VIZ_PATH)));
-
     // Regression guard for ZEB-144: before the capability fix the click
-    // silently failed at the capability layer — the button looked wired but
-    // nothing happened. We don't care whether this call spawns a fresh window
-    // or focuses an existing one (NavPanel handles both), only that after
-    // the click the viz page exists.
+    // silently failed at the capability layer. We don't care whether this
+    // spawns a fresh window or focuses an existing one (NavPanel handles
+    // both) — only that after the click the viz page exists and its bridge
+    // resolves.
     await mainPage.getByRole('button', { name: 'Open network visualization' }).click();
-    await expect.poll(vizExists, { timeout: 10_000 }).toBe(true);
+    await expect
+      .poll(() => countPagesByPath(cdpBrowser, NETWORK_VIZ_PATH), { timeout: 10_000 })
+      .toBeGreaterThan(0);
 
     const vizPage = await findPageByPath(cdpBrowser, NETWORK_VIZ_PATH, 10_000);
     await waitForTauriBridge(vizPage);
@@ -53,15 +49,7 @@ test.describe('navigation', () => {
 
   test('network-viz page has working Tauri bridge', async ({ mainPage, cdpBrowser }) => {
     await waitForNodeReady(mainPage);
-    const alreadyOpen = cdpBrowser
-      .contexts()
-      .some((c) => c.pages().some((p) => p.mainFrame().url().includes(NETWORK_VIZ_PATH)));
-    if (!alreadyOpen) {
-      await mainPage.getByRole('button', { name: 'Open network visualization' }).click();
-    }
-
-    const vizPage = await findPageByPath(cdpBrowser, NETWORK_VIZ_PATH, 10_000);
-    await waitForTauriBridge(vizPage);
+    const vizPage = await getOrOpenNetworkViz(mainPage, cdpBrowser);
 
     // Reuse waitForNodeReady against the viz page — confirms that invoke()
     // round-trips from the child window, not just the main window.
@@ -74,29 +62,33 @@ test.describe('navigation', () => {
     cdpBrowser,
   }) => {
     await waitForNodeReady(mainPage);
-    const alreadyOpen = cdpBrowser
-      .contexts()
-      .some((c) => c.pages().some((p) => p.mainFrame().url().includes(NETWORK_VIZ_PATH)));
-    if (!alreadyOpen) {
-      await mainPage.getByRole('button', { name: 'Open network visualization' }).click();
-    }
-
-    const vizPage = await findPageByPath(cdpBrowser, NETWORK_VIZ_PATH, 10_000);
-    await waitForTauriBridge(vizPage);
+    const vizPage = await getOrOpenNetworkViz(mainPage, cdpBrowser);
 
     // network-viz capability deliberately omits core:webview:allow-create-webview-window.
-    // Attempting to spawn another window from it must error, not succeed silently.
+    // The regression guard is the security *property* ("child cannot spawn
+    // further children"), not the exact error wording — wording could change
+    // across Tauri/plugin versions while enforcement stays correct. Assert
+    // both (a) the call was rejected and (b) no extra page materialized.
+    const bogusLabel = `must-not-open-${Date.now().toString(36)}`;
+    const pagesBefore = countPagesByPath(cdpBrowser, NETWORK_VIZ_PATH);
+
     let rejected = false;
-    let errMsg = '';
     try {
       await invoke(vizPage, 'plugin:webview|create_webview_window', {
-        options: { label: 'must-not-open', url: '/src/network.html' },
+        options: { label: bogusLabel, url: NETWORK_VIZ_PATH },
       });
-    } catch (err) {
+    } catch {
       rejected = true;
-      errMsg = String(err);
     }
-    expect(rejected, `create_webview_window should have been rejected from network-viz`).toBe(true);
-    expect(errMsg.toLowerCase()).toContain('not allowed');
+    expect(
+      rejected,
+      'create_webview_window should have been rejected from network-viz',
+    ).toBe(true);
+
+    // If the capability layer ever regressed and accepted the call, a new
+    // target would appear. Poll briefly to avoid a race where CDP publishes
+    // the new page slightly after the invoke resolves/rejects.
+    await vizPage.waitForTimeout(500);
+    expect(countPagesByPath(cdpBrowser, NETWORK_VIZ_PATH)).toBe(pagesBefore);
   });
 });
