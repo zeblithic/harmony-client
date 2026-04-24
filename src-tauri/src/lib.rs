@@ -71,6 +71,13 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 ///
 /// Expects `bytes.len() > MAX_PAYLOAD_SIZE` — for smaller inputs use the
 /// existing single-book path.
+///
+/// Visibility is `pub` rather than `pub(crate)` so the integration tests
+/// under `src-tauri/tests/` can drive the chunk + bundle construction
+/// directly. `pub(crate)` would hide the symbol from the external test
+/// crate and break `content_index_integration::chunked_ingest_pin_cascade_
+/// fetch_burn_roundtrip`. Treat this as crate-internal — no external
+/// consumers are expected.
 pub fn chunk_and_bundle(
     bytes: &[u8],
 ) -> Result<
