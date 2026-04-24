@@ -518,3 +518,38 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         assert!(idx.remove(&root_cid.to_bytes()));
     }
 }
+
+/// ZEB-155: verify that calling `set_pinned(true)` persists across a
+/// load/reload cycle. This is the minimum regression test that the
+/// pin_content command must preserve when Step 4 wires set_pinned into
+/// the command body. The full end-to-end Tauri-command path is covered
+/// by frontend manual QA; this test fixes the data-layer contract.
+#[test]
+fn pin_intent_survives_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cid = [0xC1u8; 32];
+
+    {
+        let mut idx = ContentIndex::load(tmp.path());
+        idx.insert(ContentIndexEntry {
+            cid,
+            file_name: "persist-me.bin".into(),
+            size_bytes: 100,
+            stored_at_ms: 1_700_000_000_000,
+            sensitivity: Sensitivity::Private,
+            replication_tier: ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+        });
+        assert!(idx.set_pinned(&cid, true), "initial flip should report change");
+    }
+
+    // Reload — simulates app restart.
+    let reloaded = ContentIndex::load(tmp.path());
+    let entry = reloaded.get(&cid).expect("entry must persist");
+    assert!(
+        entry.pinned,
+        "pinned intent must survive reload (this is the ZEB-155 bug fix)"
+    );
+}

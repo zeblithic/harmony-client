@@ -1245,6 +1245,22 @@ async fn pin_content(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
+
+    // ZEB-155: persist pin intent on the sidecar BEFORE dispatching the
+    // runtime verb. If the event loop is gone or the runtime-side fails,
+    // the durable side still records what the user wanted. Sidecar writes
+    // are best-effort (tracing::warn on failure, matching set_archived /
+    // set_replication_tier) — a disk-write error drops the intent but
+    // still takes effect this session.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_pinned(&cid_bytes, true);
+    }
+
     let verb_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -1271,6 +1287,20 @@ async fn unpin_content(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
+
+    // ZEB-155: clear sidecar intent first, then dispatch the runtime
+    // unpin. Mirror of pin_content's ordering — durable side stays
+    // consistent with the user's click across a crash between the
+    // sidecar write and the verb dispatch.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_pinned(&cid_bytes, false);
+    }
+
     let verb_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -1291,6 +1321,12 @@ async fn unpin_content(
         .map_err(|_| "event loop dropped unpin request".to_string())?
 }
 
+/// Burn a CID: unpin runtime-side, then remove the sidecar entry.
+///
+/// ZEB-155: removing the sidecar entry implicitly drops any persisted
+/// pin intent — no explicit `set_pinned(false)` needed, because there's
+/// no entry left to hold a flag on. The runtime-side Burn arm in the
+/// event loop also removes the CID from pin_intent (see event_loop.rs).
 #[tauri::command]
 async fn burn_content(
     cid: String,
