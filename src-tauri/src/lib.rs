@@ -1464,6 +1464,12 @@ async fn ingest_content(
     // file changes size between this stat and the read that follows.
     ingest_dispatch(meta.len())?;
 
+    // OOM caveat: this materializes the full file in RAM before chunking.
+    // Acceptable for v1 (FLAT_BUNDLE_MAX is ~8 GiB and realistic uploads
+    // are far smaller) but a near-cap file would consume ~8 GiB of heap.
+    // Streaming ingest pairs with the disk-backed storage tier — see the
+    // spec's out-of-scope section. If you raise FLAT_BUNDLE_MAX without
+    // landing streaming first, you are asking for OOMs.
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;

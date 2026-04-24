@@ -311,7 +311,7 @@ Keeping them separate is clearer than a generic walker abstraction.
 | `chunker::chunk_all` error | Propagate with prefix. Shouldn't happen with `DEFAULT` config. |
 | `ContentId::for_book` error on a leaf | Propagate, abort. Already-ingested leaves stay in cache unpinned, W-TinyLFU reclaims. |
 | `IngestRequest` reply `Err` for a leaf | Propagate, abort. No sidecar entry written. |
-| `BundleBuilder::build_with_flags` error | Propagate. In flat-only v1 this only trips on `leaf_cids.len() > MAX_BUNDLE_ENTRIES`, which is exactly the `FLAT_BUNDLE_MAX` guard — defense-in-depth. |
+| `BundleBuilder::build_with_flags` error | Propagate. In flat-only v1 this only trips on `leaf_cids.len() > MAX_BUNDLE_ENTRIES`, which is enforced by the `FLAT_BUNDLE_MAX` guard — defense-in-depth. |
 | `IngestRequest` reply `Err` for the bundle | Propagate. Leaves are orphaned in the cache (unpinned, no sidecar ref); W-TinyLFU reclaims. |
 | `collect_descendants` can't read a bundle payload | Silent skip. Verb succeeds for reachable CIDs. |
 | Fetch-side `parse_bundle` error | Propagate as `"malformed bundle"`. Stops recursion. |
@@ -413,6 +413,12 @@ from ZEB-146's review-feedback pass) covers the user-visible surface.
 - **[ZEB-156](https://linear.app/zeblith/issue/ZEB-156): root-pin-set cascade
   semantics** — the "correct" answer for pin/unpin/burn once leaves are
   shared across roots. Lands with folders.
+- **[ZEB-157](https://linear.app/zeblith/issue/ZEB-157): best-effort rollback
+  for partial chunked ingest failures** — if a leaf or bundle ingest fails
+  mid-sequence, already-ingested leaves sit as orphans in the runtime cache
+  until W-TinyLFU reclaims them. Cheap rollback (issue `Burn` for already-
+  ingested leaves on error) is a focused follow-up; not a correctness
+  problem, just cache hygiene.
 - **Progress reporting** during multi-chunk ingest. Trivial to add once the
   protocol is stable.
 - **Parallel chunk ingest / fetch** — v1 is serial. Worth revisiting if
