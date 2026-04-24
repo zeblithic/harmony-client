@@ -7,10 +7,12 @@
 //! RAM-only cache doesn't know about.
 //!
 //! Authority split:
-//! - Sidecar is authoritative for membership and size_bytes (CIDs are
-//!   immutable, so size never drifts from the ingest-time value).
-//! - Runtime cache is authoritative for pinned state (pin is an eviction
-//!   concept the cache owns).
+//! - Sidecar is authoritative for membership, size_bytes, and pin *intent*
+//!   (CIDs are immutable, so size never drifts from the ingest-time value;
+//!   intent is what the user asked for and must survive restart).
+//! - Runtime cache is authoritative for pin *effect* — the active eviction
+//!   protection. `list_content` OR-joins the two sources at display time;
+//!   see `ContentIndexEntry.pinned` for the full shape.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
