@@ -6,13 +6,16 @@
     RowState,
     SessionStats,
     ExpressMode,
+    ByteResult,
   } from '../flashcard-types';
   import { initialSessionStats } from '../flashcard-types';
-  import { evaluateBytes } from '../express-lane';
+  import { evaluateBytes, failingNibbleInRedByte } from '../express-lane';
+  import { formatFlatBytes, findFirstNibbleDiff } from '../q8-flat';
   import type { Stq8ServiceLike } from '../stq8-service';
   import { AudioCapture } from '../voice/audio-capture';
   import FlashcardGrid from './FlashcardGrid.svelte';
   import HintBar from './HintBar.svelte';
+  import MismatchDisplay from './MismatchDisplay.svelte';
   import PttButton from './PttButton.svelte';
 
   let {
@@ -29,6 +32,16 @@
     onStatsUpdate: (stats: SessionStats) => void;
   } = $props();
 
+  // Tick cadence for mid-hold classification. 300 ms is short enough to
+  // feel live at the ~250–400 ms speaking pace of a Q8 syllable and long
+  // enough to amortize the processPcm call cost over several AudioWorklet
+  // frames.
+  const TICK_INTERVAL_MS = 300;
+  // Momentum timeout (flashcard-design.md §PTT Rules): if 2 s pass without
+  // a successfully classified syllable advancing position, the row resets
+  // while PTT stays held.
+  const MOMENTUM_TIMEOUT_MS = 2000;
+
   let challenge = $state<Challenge | null>(null);
   let activeRowIndex = $state(0);
   let rowStates = $state<RowState[]>([]);
@@ -43,11 +56,41 @@
 
   // Voice capture — lazy-started on first PTT press. One AudioCapture
   // instance lives for the lifetime of this component; onFrame buffers
-  // raw PCM only while `pttActive` is true, and every PTT release flushes
-  // the accumulated buffer through `processPcm` to get classifier output.
+  // raw PCM only while `pttActive` is true. A periodic tick drains that
+  // buffer through processPcm so the classifier runs continuously across
+  // the hold rather than only on release.
   let audioCapture: AudioCapture | null = null;
+  // Frames captured since the last processTick drain. processTick swaps
+  // this out atomically on each tick (push and swap both run on the main
+  // thread, so no lock needed).
   let pcmBuffer: Float32Array[] = [];
   let captureError = $state('');
+
+  // Mid-hold classification state. heardNibbles accumulates classified
+  // syllables for the current row attempt; lastEvaluatedByteCount pins
+  // the boundary already checked against the expected row so we don't
+  // re-evaluate every tick.
+  let heardNibbles = $state<number[]>([]);
+  let lastEvaluatedByteCount = 0;
+  // Timestamp of the last syllable classified (any new syllable counts
+  // as position advancement for the momentum timer). null when no hold
+  // is active.
+  let lastAdvanceAt: number | null = null;
+  let tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Pending handle for the 300 ms red-flash cleanup scheduled in
+  // handleRowMismatch. Held so a subsequent mismatch on the same row
+  // can cancel the previous cleanup before scheduling a fresh one —
+  // otherwise the old setTimeout's closure would fire on the new
+  // red-flash rowState and wipe it prematurely.
+  let redFlashClear: ReturnType<typeof setTimeout> | null = null;
+  // Mismatch feedback for the MismatchDisplay component. Set whenever a
+  // byte-boundary check finds a red, cleared on successful row advance
+  // or on next PTT press.
+  let mismatch = $state<{
+    expectedBytes: number[];
+    heardNibbles: number[];
+    firstDiffNibbleIdx: number;
+  } | null>(null);
 
   // Serialize concurrent ensureCapture() calls. Without this, rapid
   // press/release cycles before the first getUserMedia resolves can
@@ -117,132 +160,339 @@
   }
 
   async function handlePttStart() {
-    pcmBuffer = [];
+    resetAttempt();
+    mismatch = null;
     pttActive = true;
-    pttSegmentStart = Date.now();
-    // Kick off capture on first press. Subsequent presses reuse the
-    // running instance; onPcmFrame's pttActive gate handles framing.
-    // If the user releases before start() resolves, the buffer stays
-    // empty and handlePttStop falls through to the cancel path.
     await ensureCapture();
+    // Re-check state after the await: PttButton fires onPttStart synchronously
+    // without awaiting, so handlePttStop (or unmount) can run between the
+    // sync prelude above and this resumption. Starting a setInterval after
+    // release would leave an orphan tick that eventually fires
+    // handleRowTimeout and resets combo. Likewise, starting a tick on a
+    // destroyed component leaks the timer.
+    //
+    // `audioCapture` is also checked because ensureCapture swallows start
+    // failures (permission denied, no device, AudioContext error) and
+    // leaves the field null while the returned promise still resolves
+    // normally. Arming the tick without a live mic would treat the
+    // resulting silence as a momentum timeout after 2 s and zero combo
+    // on a user who never actually had capture running.
+    if (destroyed || !pttActive || !audioCapture) return;
+    // Seed timers AFTER capture is actually live. If the first-use
+    // permission prompt or AudioContext construction took >2 s, an
+    // earlier-seeded lastAdvanceAt would trip the first tick's timeout
+    // check immediately — a phantom timeout for a mic the user hadn't
+    // even granted yet. pttSegmentStart is moved here too so the "active
+    // PTT time" metric only counts time on a live mic.
+    pttSegmentStart = Date.now();
+    lastAdvanceAt = Date.now();
+    startTick();
   }
 
   function handlePttStop() {
     pttActive = false;
-    // Bank active time from this PTT segment
+    stopTick();
+    // Defensive: even if a late-resolving ensureCapture still manages to
+    // call startTick() after this (shouldn't happen post-guard, but
+    // belt-and-suspenders), a null lastAdvanceAt makes checkTimeout a no-op.
+    lastAdvanceAt = null;
+    // Bank active time from this PTT segment.
     if (pttSegmentStart !== null) {
       cardActiveMs += Date.now() - pttSegmentStart;
       pttSegmentStart = null;
     }
+    // Snapshot pre-flush state so the final flush can't confuse a successful
+    // card completion with an abandoned attempt. If the flush completes a
+    // card, heardNibbles retains the carry nibbles for the new card's row 0
+    // — interpreting that carry as "the user abandoned a row mid-attempt"
+    // would undo the combo increment handleCardComplete just published.
+    //
+    // Mismatch state (mismatch !== null) is also carved out: design says
+    // "No penalty on wrong answers", which must apply even when release
+    // lands inside the 300 ms red-flash window or the final flush itself
+    // triggered a mismatch. Treating the red-flash rowState or the in-
+    // flush mismatch path as an abandonable partial attempt would break
+    // combo on exactly the scenarios the no-penalty rule exists to
+    // cover. Only heardNibbles — classified syllables with no mismatch
+    // in play — counts as a partial attempt for combo-reset purposes.
+    const preFlushActiveRow = activeRowIndex;
+    const preFlushHadAttempt = heardNibbles.length > 0;
+    const mismatchBeforeFlush = mismatch !== null;
+    const preFlushCardsCompleted = stats.cardsCompleted;
 
-    const nibbles = flushAndClassify();
-    if (nibbles && nibbles.length > 0) {
-      // Classifier heard something — let the existing row-completion
-      // logic handle pass/fail/combo. handleRowComplete already deals
-      // with red-flash-and-reset on mismatch and combo bookkeeping on
-      // success, so we don't need to duplicate any of that here.
-      handleRowComplete(nibbles);
+    // Final flush: any frames captured between the last tick and release
+    // still flow through processPcm. A row completion or mismatch discovered
+    // in the flush uses the same handlers as a mid-hold tick.
+    processTick({ finalFlush: true });
+
+    const cardCompletedDuringFlush = stats.cardsCompleted > preFlushCardsCompleted;
+    const mismatchAfterFlush = mismatch !== null;
+    // Attempts that first appear in the flush itself also count: a short
+    // hold that never got a mid-hold tick can still have its initial
+    // syllables classified by this one flush call. Without the post-flush
+    // check, those attempts slip past the combo-reset and get silently
+    // discarded by resetAttempt() below.
+    const postFlushHadAttempt = heardNibbles.length > 0;
+    // Release-cancels-row per spec: "Release PTT = cancel current row." Only
+    // fires when the user was genuinely mid-attempt (pre- or during-flush
+    // classified syllables), no card completion rescued by the flush, and
+    // no mismatch in play on either side of the flush. Filter by
+    // preFlushActiveRow because the flush may have advanced activeRowIndex.
+    if (
+      (preFlushHadAttempt || postFlushHadAttempt) &&
+      !cardCompletedDuringFlush &&
+      !mismatchBeforeFlush &&
+      !mismatchAfterFlush
+    ) {
+      rowStates = rowStates.filter(
+        (s) => s.rowIndex !== preFlushActiveRow || s.completed,
+      );
+      if (stats.combo > 0) {
+        stats = { ...stats, combo: 0 };
+        onStatsUpdate(stats);
+      }
+    }
+    resetAttempt();
+  }
+
+  function resetAttempt() {
+    pcmBuffer = [];
+    heardNibbles = [];
+    lastEvaluatedByteCount = 0;
+  }
+
+  function startTick() {
+    stopTick();
+    tickTimer = setInterval(() => processTick({ finalFlush: false }), TICK_INTERVAL_MS);
+  }
+
+  function stopTick() {
+    if (tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+  }
+
+  function processTick(opts: { finalFlush: boolean }): void {
+    const frames = pcmBuffer;
+    pcmBuffer = [];
+
+    if (frames.length === 0) {
+      if (!opts.finalFlush) checkTimeout();
       return;
     }
 
-    // No PCM captured (capture still starting up, or empty hold), or
-    // classifier returned no syllables, or processPcm threw. Fall back
-    // to the pre-Slice-3 behavior: cancel the in-progress row and break
-    // the combo streak. Design spec: "without PTT release or timeout".
-    rowStates = rowStates.filter(s => s.rowIndex !== activeRowIndex || s.completed);
+    // Concat new frames into one Float32Array for a single processPcm call.
+    let totalLen = 0;
+    for (const f of frames) totalLen += f.length;
+    const pcm = new Float32Array(totalLen);
+    let off = 0;
+    for (const f of frames) {
+      pcm.set(f, off);
+      off += f.length;
+    }
+
+    let newNibbles: number[];
+    try {
+      const result = stq8Service.processPcm(pcm);
+      newNibbles = result.syllables.map((s) => s.nibble);
+    } catch (err) {
+      console.warn('[harmony-client] flashcard PTT: processPcm failed:', err);
+      if (!opts.finalFlush) checkTimeout();
+      return;
+    }
+
+    if (newNibbles.length === 0) {
+      if (!opts.finalFlush) checkTimeout();
+      return;
+    }
+
+    // Any new syllable counts as advancement for the momentum timer —
+    // partial-byte progress (an odd-length heardNibbles) is still a syllable
+    // classified, not a no-op.
+    heardNibbles = [...heardNibbles, ...newNibbles];
+    lastAdvanceAt = Date.now();
+    evaluateProgress();
+    if (!opts.finalFlush) checkTimeout();
+  }
+
+  function evaluateProgress(): void {
+    // Loop consumes heardNibbles across row boundaries when a single
+    // utterance covers multiple rows (common on Novice/Apprentice). Each
+    // iteration either detects a mismatch (returns), consumes a full row
+    // and continues against the next row, or hits a partial-row boundary
+    // and returns to await more classifier output.
+    while (challenge) {
+      const row = challenge.rows[activeRowIndex];
+      if (!row) return;
+      const completeByteCount = Math.floor(heardNibbles.length / 2);
+      if (completeByteCount <= lastEvaluatedByteCount) return;
+
+      // Byte-boundary evaluation: only check bytes we haven't already
+      // accepted. evaluateBytes over a partial row returns red for any
+      // byte that fails strict or express matching — that's our mismatch
+      // trigger.
+      const partialRow = row.slice(0, completeByteCount);
+      const partialHeard = heardNibbles.slice(0, completeByteCount * 2);
+      const { results, hasRed } = evaluateBytes(
+        partialRow,
+        partialHeard,
+        expressMode,
+      );
+      if (hasRed) {
+        handleRowMismatch(row, [...heardNibbles], results);
+        return;
+      }
+      lastEvaluatedByteCount = completeByteCount;
+
+      const expectedNibbleCount = row.length * 2;
+      if (heardNibbles.length < expectedNibbleCount) return;
+
+      // Full row classified — bank it. Any heard nibbles past the row
+      // length carry over to the next row so a fast multi-row utterance
+      // isn't truncated at boundaries.
+      completeCurrentRow(row, results);
+    }
+  }
+
+  function completeCurrentRow(row: number[], results: ByteResult[]) {
+    if (!challenge) return;
+    const expectedNibbleCount = row.length * 2;
+    const carry = heardNibbles.slice(expectedNibbleCount);
+
+    const newRowState: RowState = {
+      rowIndex: activeRowIndex,
+      byteResults: results,
+      completed: true,
+    };
+    rowStates = [
+      ...rowStates.filter((s) => s.rowIndex !== activeRowIndex),
+      newRowState,
+    ];
+
+    heardNibbles = carry;
+    lastEvaluatedByteCount = 0;
+    lastAdvanceAt = Date.now();
+    mismatch = null;
+
+    if (activeRowIndex >= challenge.rows.length - 1) {
+      handleCardComplete();
+      // newChallenge() has reset activeRowIndex=0 and rowStates=[]. The
+      // evaluateProgress loop continues with `carry` against the new card.
+    } else {
+      activeRowIndex++;
+    }
+  }
+
+  function handleRowMismatch(
+    row: number[],
+    heardSnapshot: number[],
+    results: ByteResult[],
+  ) {
+    // Brief red flash on the grid (same visual as pre-Slice-4). Any
+    // pending cleanup from a previous mismatch on any row must be
+    // canceled first — otherwise its closure would fire 300 ms after
+    // THAT mismatch and strip the new red-flash rowState on the same
+    // row (mid-hold ticks are 300 ms apart, so back-to-back mismatches
+    // land exactly at the stale timeout's deadline).
+    if (redFlashClear !== null) clearTimeout(redFlashClear);
+    const failedRowIndex = activeRowIndex;
+    rowStates = [
+      ...rowStates.filter((s) => s.rowIndex !== failedRowIndex),
+      { rowIndex: failedRowIndex, byteResults: results, completed: false },
+    ];
+    redFlashClear = setTimeout(() => {
+      rowStates = rowStates.filter(
+        (s) => s.rowIndex !== failedRowIndex || s.completed,
+      );
+      redFlashClear = null;
+    }, 300);
+
+    // Caret points at the first truly-failing nibble in the first red byte.
+    // In strict mode this coincides with the first strict diff, but in
+    // express mode a leading byte may strictly differ yet still be
+    // accepted as yellow — the caret must point at what actually failed,
+    // not at an express-accepted divergence. handleRowMismatch is only
+    // called when hasRed=true, so findIndex should return >= 0; the
+    // findFirstNibbleDiff fallback exists only as a safety net.
+    const firstRedByteIdx = results.findIndex((r) => r === 'red');
+    const firstDiffNibbleIdx =
+      firstRedByteIdx >= 0
+        ? firstRedByteIdx * 2 +
+          failingNibbleInRedByte(
+            row[firstRedByteIdx],
+            heardSnapshot[firstRedByteIdx * 2],
+            heardSnapshot[firstRedByteIdx * 2 + 1],
+            expressMode,
+          )
+        : findFirstNibbleDiff(row, heardSnapshot);
+
+    mismatch = {
+      expectedBytes: row,
+      heardNibbles: heardSnapshot,
+      firstDiffNibbleIdx,
+    };
+
+    // Reset for retry. No combo penalty — design: "No penalty on wrong answers."
+    heardNibbles = [];
+    lastEvaluatedByteCount = 0;
+    lastAdvanceAt = Date.now();
+  }
+
+  function handleRowTimeout() {
+    const failedRowIndex = activeRowIndex;
+    rowStates = rowStates.filter(
+      (s) => s.rowIndex !== failedRowIndex || s.completed,
+    );
+    heardNibbles = [];
+    lastEvaluatedByteCount = 0;
+    lastAdvanceAt = Date.now();
+    mismatch = null;
+
+    // Timeout breaks combo per spec: "consecutive cards passed without
+    // PTT release or timeout".
     if (stats.combo > 0) {
       stats = { ...stats, combo: 0 };
       onStatsUpdate(stats);
     }
   }
 
-  function flushAndClassify(): number[] | null {
-    const buffered = pcmBuffer;
-    pcmBuffer = [];
-    if (buffered.length === 0) return null;
-
-    let totalLen = 0;
-    for (const f of buffered) totalLen += f.length;
-    const pcm = new Float32Array(totalLen);
-    let off = 0;
-    for (const f of buffered) {
-      pcm.set(f, off);
-      off += f.length;
-    }
-
-    try {
-      const result = stq8Service.processPcm(pcm);
-      return result.syllables.map(s => s.nibble);
-    } catch (err) {
-      console.warn('[harmony-client] flashcard PTT: processPcm failed:', err);
-      return null;
-    }
-  }
-
-  function handleRowComplete(heardNibbles: number[]) {
-    if (!challenge) return;
-    const row = challenge.rows[activeRowIndex];
-    if (!row) return;
-
-    const { results, hasRed } = evaluateBytes(
-      row, heardNibbles, expressMode,
-    );
-
-    if (hasRed) {
-      // Brief red flash, then reset row
-      const failedRowIndex = activeRowIndex;
-      rowStates = [
-        ...rowStates.filter(s => s.rowIndex !== failedRowIndex),
-        { rowIndex: failedRowIndex, byteResults: results, completed: false },
-      ];
-      setTimeout(() => {
-        rowStates = rowStates.filter(s => s.rowIndex !== failedRowIndex || s.completed);
-      }, 300);
-      stats = { ...stats, combo: 0 };
-      onStatsUpdate(stats);
-      return;
-    }
-
-    // Row passed — bank it
-    const newRowState = { rowIndex: activeRowIndex, byteResults: results, completed: true };
-    rowStates = [
-      ...rowStates.filter(s => s.rowIndex !== activeRowIndex),
-      newRowState,
-    ];
-
-    // Check if card is complete
-    if (activeRowIndex >= challenge.rows.length - 1) {
-      handleCardComplete();
-    } else {
-      activeRowIndex++;
+  function checkTimeout(): void {
+    if (lastAdvanceAt === null) return;
+    if (Date.now() - lastAdvanceAt >= MOMENTUM_TIMEOUT_MS) {
+      handleRowTimeout();
     }
   }
 
   function handleCardComplete() {
     // Total active PTT time: accumulated segments + current segment (if PTT still held)
-    const elapsed = cardActiveMs + (pttSegmentStart !== null ? Date.now() - pttSegmentStart : 0);
+    const elapsed =
+      cardActiveMs +
+      (pttSegmentStart !== null ? Date.now() - pttSegmentStart : 0);
 
     // Sum credited bits from all completed rows (including the last row,
     // which was already pushed to rowStates before this call).
     let totalBits = 0;
     for (const rs of rowStates) {
       if (rs.completed) {
-        totalBits += rs.byteResults.filter(r => r === 'green').length * 8
-          + rs.byteResults.filter(r => r === 'yellow').length * 4;
+        totalBits +=
+          rs.byteResults.filter((r) => r === 'green').length * 8 +
+          rs.byteResults.filter((r) => r === 'yellow').length * 4;
       }
     }
 
-    const hasYellow = rowStates.some(s =>
-      s.byteResults.some(r => r === 'yellow')
+    const hasYellow = rowStates.some((s) =>
+      s.byteResults.some((r) => r === 'yellow'),
     );
 
     const newStats: SessionStats = {
       cardsCompleted: stats.cardsCompleted + 1,
       perfectCards: stats.perfectCards + (hasYellow ? 0 : 1),
       expressCards: stats.expressCards + (hasYellow ? 1 : 0),
-      bestTimeMs: stats.bestTimeMs === null
-        ? elapsed
-        : Math.min(stats.bestTimeMs, elapsed),
+      bestTimeMs:
+        stats.bestTimeMs === null
+          ? elapsed
+          : Math.min(stats.bestTimeMs, elapsed),
       totalTimeMs: stats.totalTimeMs + elapsed,
       previousTimeMs: elapsed,
       combo: stats.combo + 1,
@@ -265,6 +515,11 @@
   // no orphaned mic.
   $effect(() => () => {
     destroyed = true;
+    stopTick();
+    if (redFlashClear !== null) {
+      clearTimeout(redFlashClear);
+      redFlashClear = null;
+    }
     const c = audioCapture;
     audioCapture = null;
     pttActive = false;
@@ -275,18 +530,7 @@
   // Flat text for active row hint
   let hintText = $derived.by(() => {
     if (!challenge || !challenge.rows[activeRowIndex]) return '';
-    const FLAT_CONSONANTS = ["'", 'J', 'K', 'V'];
-    const FLAT_VOWELS = ['O', 'U', 'E', 'I'];
-    const row = challenge.rows[activeRowIndex];
-    return row
-      .map((byte) => {
-        const high = (byte >> 4) & 0x0f;
-        const low = byte & 0x0f;
-        const s1 = FLAT_CONSONANTS[(high >> 2) & 3] + FLAT_VOWELS[high & 3];
-        const s2 = FLAT_CONSONANTS[(low >> 2) & 3] + FLAT_VOWELS[low & 3];
-        return s1 + s2;
-      })
-      .join(' ');
+    return formatFlatBytes(challenge.rows[activeRowIndex]);
   });
 </script>
 
@@ -304,6 +548,16 @@
         {level}
       />
     </div>
+
+    {#if mismatch}
+      <div class="mismatch-slot">
+        <MismatchDisplay
+          expectedBytes={mismatch.expectedBytes}
+          heardNibbles={mismatch.heardNibbles}
+          firstDiffNibbleIdx={mismatch.firstDiffNibbleIdx}
+        />
+      </div>
+    {/if}
 
     <div class="controls">
       <button
@@ -358,6 +612,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .mismatch-slot {
+    display: flex;
+    justify-content: center;
+    padding: 4px 0;
   }
 
   .controls {

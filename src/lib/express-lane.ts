@@ -8,7 +8,7 @@ import { consonantIndex, vowelIndex } from './q8-utils';
  * A nibble passes if its consonant matches (consonant/both mode)
  * or its vowel matches (vowel/both mode).
  */
-function nibbleExpressMatch(
+export function nibbleExpressMatch(
   expected: number,
   heard: number,
   mode: ExpressMode,
@@ -20,6 +20,36 @@ function nibbleExpressMatch(
     if (vowelIndex(expected) === vowelIndex(heard)) return true;
   }
   return false;
+}
+
+/**
+ * Within a red byte, return the index of the nibble that's actually
+ * failing: one that differs strictly AND doesn't pass express matching
+ * in the current mode. Returns 0 if the high nibble is the failure
+ * point, 1 if only the low nibble fails.
+ *
+ * Needed because a red byte in express mode can have one nibble that
+ * strictly differs but express-matches (accepted) and another that
+ * actually fails. The mismatch display's caret should point at the
+ * failure, not the accepted divergence — pointing at the accepted
+ * nibble would be misleading feedback.
+ *
+ * Caller must have already verified the byte is red (i.e., at least
+ * one nibble strictly differs and doesn't express-match). If neither
+ * nibble is failing, this returns 1 as a sentinel.
+ */
+export function failingNibbleInRedByte(
+  expectedByte: number,
+  heardHigh: number,
+  heardLow: number,
+  mode: ExpressMode,
+): 0 | 1 {
+  const expHigh = (expectedByte >> 4) & 0xf;
+  const highStrictDiffers = heardHigh !== expHigh;
+  const highFailsExpress =
+    mode === 'off' || !nibbleExpressMatch(expHigh, heardHigh, mode);
+  if (highStrictDiffers && highFailsExpress) return 0;
+  return 1;
 }
 
 /**
