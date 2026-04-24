@@ -70,15 +70,16 @@ test.describe('zenoh connect', () => {
 
   test('status flips to Connected within 10s', async ({ mainPage, cdpBrowser }) => {
     const viz = await ensureNetworkVizOpen(mainPage, cdpBrowser);
+    // Force disconnected so this test actually proves the *transition*. Without
+    // the reset, a leftover Connected state from zenoh #1 would let us skip
+    // the click and pass on the existing status — vacuous on rerun.
+    await resetToDisconnected(viz);
 
+    await viz.getByLabel('Zenoh endpoint').fill('tcp/127.0.0.1:7447');
     // `exact: true` is critical — default substring match would also pick up
     // the "Disconnect" button, which isn't visible when we're not connected
     // but has the same "Connect" substring.
-    const connectBtn = viz.getByRole('button', { name: 'Connect', exact: true });
-    if (await connectBtn.isVisible().catch(() => false)) {
-      await viz.getByLabel('Zenoh endpoint').fill('tcp/127.0.0.1:7447');
-      await connectBtn.click();
-    }
+    await viz.getByRole('button', { name: 'Connect', exact: true }).click();
 
     // The connection status indicator is a `role="status"` with its aria-label
     // mirroring the `statusLabel` derivation (Disconnected | Connecting... |

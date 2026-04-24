@@ -87,8 +87,8 @@ override *both*:
 
 - **Don't grab `browser.contexts()[0].pages()[0]` blindly.** The webview briefly
   hosts `about:blank` before Svelte mounts. The fixture polls for a page whose
-  main frame is on `http://localhost:5173` — callers never need to handle that
-  race themselves.
+  main frame is on `VITE_ORIGIN` (default `http://localhost:5173`) — callers
+  never need to handle that race themselves.
 
 - **If the Tauri process dies mid-test, restart both terminals.** The CDP
   handle goes stale; a dangling Playwright connection will error with "Target
@@ -111,10 +111,11 @@ override *both*:
 
 ## Troubleshooting
 
-- *"Timed out waiting for a page on http://localhost:5173"* — Terminal 1 isn't
-  running, or `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` wasn't set before
-  `tauri dev` launched. Verify `curl http://localhost:9222/json/list` returns
-  a target.
+- *"Timed out waiting for a page on $VITE_ORIGIN"* — Terminal 1 isn't running,
+  or `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` wasn't set before `tauri dev`
+  launched, or `VITE_ORIGIN` is overridden but Vite is on a different port.
+  Verify `curl $CDP_ENDPOINT/json/list` returns a target whose `url` starts
+  with `$VITE_ORIGIN`.
 - *"Node did not report a hex identity within 20000ms"* — the backend is slow
   or wedged. Give the first boot a full minute on cold clone, then rerun.
   Subsequent runs are faster (identity is persisted).

@@ -23,11 +23,6 @@ const SETTINGS_BUTTON = 'Notification settings';
 const NAME_INPUT = 'Display name';
 const SAVE_BUTTON = 'Save';
 const PROFILE_KEY = 'harmony-profile';
-// loadProfile() in src/lib/profile-service.ts defaults displayName to this
-// when the stored profile is absent or the field is missing — use it as a
-// deterministic restore target so cleanup doesn't depend on what was there
-// before the test started.
-const DEFAULT_DISPLAY_NAME = 'Anonymous';
 const TEST_NAME = `E2E Test ${Date.now().toString(36)}`;
 
 async function openSettings(page: Page): Promise<void> {
@@ -62,16 +57,41 @@ async function readPersistedDisplayName(page: Page): Promise<string | null> {
   }, PROFILE_KEY);
 }
 
+/**
+ * Snapshot the raw `harmony-profile` localStorage value (or `null` if absent).
+ * We deliberately preserve the *raw* string — not just the parsed displayName
+ * — so cleanup can put back the exact pre-test state, including the original
+ * absence (vs. a default-shaped profile), original malformation if any, and
+ * any sibling fields beyond `displayName`. Restoring a synthesized
+ * `{displayName: "Anonymous"}` would mask first-run / malformed-profile
+ * behavior for later specs in the same `tauri dev` session.
+ */
+async function snapshotProfileEntry(page: Page): Promise<string | null> {
+  return page.evaluate((key: string): string | null => localStorage.getItem(key), PROFILE_KEY);
+}
+
+/**
+ * Restore the `harmony-profile` entry to whatever was captured by
+ * `snapshotProfileEntry`. Bypasses the UI (which only knows how to write
+ * displayName) so we can faithfully restore absence and other fields.
+ */
+async function restoreProfileEntry(page: Page, raw: string | null): Promise<void> {
+  await page.evaluate(
+    ({ key, raw }) => {
+      if (raw === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, raw);
+    },
+    { key: PROFILE_KEY, raw },
+  );
+}
+
 test.describe('profile sync', () => {
   test('displayName persists and re-hydrates on settings reopen [ZEB-148]', async ({
     mainPage,
   }) => {
     await waitForNodeReady(mainPage);
 
-    // Snapshot the original name so we can restore it at the end. If storage
-    // is empty or malformed, fall back to the app's own default — cleanup
-    // MUST be deterministic, since we're about to mutate persistent state.
-    const original = (await readPersistedDisplayName(mainPage)) ?? DEFAULT_DISPLAY_NAME;
+    const originalRaw = await snapshotProfileEntry(mainPage);
 
     try {
       await openSettings(mainPage);
@@ -91,17 +111,13 @@ test.describe('profile sync', () => {
       await openSettings(mainPage);
       await expect(mainPage.getByLabel(NAME_INPUT)).toHaveValue(TEST_NAME);
     } finally {
-      // Restore to a known value, and verify the restore actually landed.
-      // Cleanup failure is signal, not noise: a dirty `harmony-profile` key
-      // pollutes every subsequent run and every later spec in this session.
-      // If the test body above also failed, Playwright's trace/report still
-      // surfaces both errors distinctly — we don't need to swallow here.
-      await openSettings(mainPage);
-      await mainPage.getByLabel(NAME_INPUT).fill(original);
-      await mainPage.getByRole('button', { name: SAVE_BUTTON }).click();
+      // Restore the exact raw entry. Cleanup failure is signal, not noise: a
+      // dirty `harmony-profile` key pollutes every subsequent run and every
+      // later spec in this session. Errors are not swallowed.
+      await restoreProfileEntry(mainPage, originalRaw);
       await expect
-        .poll(() => readPersistedDisplayName(mainPage), { timeout: 5_000 })
-        .toBe(original);
+        .poll(() => snapshotProfileEntry(mainPage), { timeout: 5_000 })
+        .toBe(originalRaw);
     }
   });
 });

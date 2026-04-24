@@ -28,27 +28,34 @@ async function getOrOpenNetworkViz(mainPage: Page, browser: Browser): Promise<Pa
 /**
  * Close any open network-viz window so the next click must actually spawn a
  * fresh one. Without this, a prior spec's leftover window would make the
- * ZEB-144 regression guard vacuous: the count-after assertion would pass even
- * if the button did nothing at all.
+ * ZEB-144 regression guard vacuous: the count-after assertion would pass
+ * even if the button did nothing at all.
  *
- * Invokes Tauri's `plugin:window|close` with the explicit `network-viz`
- * label — the same underlying command `WebviewWindow.close()` uses (see
- * `@tauri-apps/api/window.js`). We can't just dynamic-import that module
- * inside `page.evaluate` because bare-specifier resolution only works
- * through Vite, not in a raw eval context.
+ * Invokes `e2e_close_window` — a `#[cfg(debug_assertions)]`-gated Tauri
+ * command in `src-tauri/src/lib.rs` that closes a child window by label and
+ * is hard-coded to only accept `network-viz`. We deliberately do NOT use
+ * `plugin:window|close` from the main webview, because that would require
+ * adding `core:window:allow-close` to the production capability, expanding
+ * the main window's attack surface for a test-only need (any JS in main
+ * could then close any window, including itself). Routing through a
+ * debug-only Rust command keeps production caps untouched and is stripped
+ * from release binaries entirely.
  *
- * Raw CDP `page.close()` would NOT work here: it kills the webview target
- * but leaves Tauri's Rust-side window registry pointing at a ghost, so the
- * next button click calls `setFocus()` on a dead window and silently no-ops.
- * Routing through the window plugin goes through `WindowEvent::Destroyed`
- * and drops the label cleanly.
+ * Raw CDP `page.close()` would also NOT work: it destroys the webview
+ * target but leaves Tauri's Rust-side window registry pointing at a ghost,
+ * so the next button click calls `setFocus()` on a dead window and silently
+ * no-ops. The Rust command uses `WebviewWindow::close()` which routes
+ * through `WindowEvent::Destroyed` and drops the label cleanly.
+ *
+ * Failures are NOT swallowed. If `e2e_close_window` is missing (release
+ * build, registration regressed, label rule changed) we want the test to
+ * fail loudly — silent fallthrough would re-introduce the very vacuous-pass
+ * we're guarding against. Short-circuit when there's nothing to close so
+ * "no viz exists" doesn't get conflated with "command failed".
  */
 async function closeAllNetworkVizPages(browser: Browser, mainPage: Page): Promise<void> {
-  // Invoke `plugin:window|close` with the child's label to remove it from
-  // Tauri's window registry. "window not found" on a fresh boot is fine —
-  // there's nothing to close. This requires `core:window:allow-close` on the
-  // main window's capability (granted in capabilities/default.json).
-  await invoke(mainPage, 'plugin:window|close', { label: 'network-viz' }).catch(() => {});
+  if (countPagesByPath(browser, NETWORK_VIZ_PATH) === 0) return;
+  await invoke(mainPage, 'e2e_close_window', { label: 'network-viz' });
   await expect
     .poll(() => countPagesByPath(browser, NETWORK_VIZ_PATH), { timeout: 5_000 })
     .toBe(0);
