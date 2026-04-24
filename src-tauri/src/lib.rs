@@ -2028,6 +2028,30 @@ fn get_mail_counts(
     Ok(mgr.folder_counts())
 }
 
+// ── E2E test helpers (debug builds only) ────────────────────────────────
+
+/// Close a child window by label. Used by the Playwright E2E suite to reset
+/// the network-viz window between runs — without this, a leftover viz from
+/// the previous run makes the ZEB-144 "Open network visualization" regression
+/// guard pass vacuously on reruns.
+///
+/// Restricted to the `network-viz` label so a stray dev-build IPC call can't
+/// take down the main window. Stripped from release binaries entirely via
+/// `#[cfg(debug_assertions)]` and the matching conditional registration in
+/// `run()` below.
+#[cfg(debug_assertions)]
+#[tauri::command]
+async fn e2e_close_window(app: AppHandle, label: String) -> Result<(), String> {
+    use tauri::Manager;
+    if label != "network-viz" {
+        return Err(format!("e2e_close_window: label '{label}' not allowed"));
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
@@ -2068,6 +2092,8 @@ pub fn run() {
             fetch_mail_body,
             update_mail,
             get_mail_counts,
+            #[cfg(debug_assertions)]
+            e2e_close_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
