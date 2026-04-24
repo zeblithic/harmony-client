@@ -1179,6 +1179,17 @@ pub struct IngestResult {
     pub size_bytes: u64,
 }
 
+/// ZEB-155: resolve the `pinned` flag for a single wire entry by
+/// OR-joining the sidecar's persisted intent with the runtime cache's
+/// currently-pinned set. Extracted so unit tests can exercise the join
+/// logic without a live Tauri state.
+fn joined_pinned(
+    entry: &content_index::ContentIndexEntry,
+    runtime_pinned: &std::collections::HashSet<[u8; 32]>,
+) -> bool {
+    entry.pinned || runtime_pinned.contains(&entry.cid)
+}
+
 #[tauri::command]
 async fn list_content(
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -1215,7 +1226,7 @@ async fn list_content(
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: pinned_set.contains(&e.cid),
+                pinned: joined_pinned(e, &pinned_set),
                 licensed: e.licensed,
                 archived: e.archived,
             })
@@ -2549,5 +2560,55 @@ mod chunked_ingest_tests {
         // The smallest valid input: MAX_PAYLOAD_SIZE + 1 bytes.
         let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE + 1);
         chunk_and_bundle(&bytes).expect("must succeed at the minimum valid size");
+    }
+}
+
+#[cfg(test)]
+mod pin_persistence_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sidecar_entry(cid: [u8; 32], pinned: bool) -> content_index::ContentIndexEntry {
+        content_index::ContentIndexEntry {
+            cid,
+            file_name: "t.txt".into(),
+            size_bytes: 0,
+            stored_at_ms: 0,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned,
+        }
+    }
+
+    #[test]
+    fn joined_pinned_true_when_only_intent_is_set() {
+        let entry = sidecar_entry([0x11; 32], true);
+        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_true_when_only_runtime_effect_is_set() {
+        let entry = sidecar_entry([0x22; 32], false);
+        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        runtime_pinned.insert([0x22; 32]);
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_true_when_both_agree() {
+        let entry = sidecar_entry([0x33; 32], true);
+        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        runtime_pinned.insert([0x33; 32]);
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_false_when_neither_says_so() {
+        let entry = sidecar_entry([0x44; 32], false);
+        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        assert!(!joined_pinned(&entry, &runtime_pinned));
     }
 }
