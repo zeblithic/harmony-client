@@ -101,3 +101,458 @@ fn create_nested_folder_updates_top_level_root_cid() {
     assert!(idx.get(&photos_v1.bundle_cid.to_bytes()).is_none(),
         "old entry removed");
 }
+
+// ── Task 7: Event-loop harness tests ────────────────────────────────────────
+
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
+use harmony_content::book::MemoryBookStore;
+use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
+use harmony_compute::InstructionBudget;
+use harmony_runtime::{NodeConfig, NodeRuntime};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// All channel ends the outer test needs to drive the event loop.
+struct TestHarness {
+    pub ingest_tx: mpsc::Sender<IngestRequest>,
+    pub verb_tx: mpsc::Sender<ContentVerbRequest>,
+    /// Kept alive so the event loop keeps running; dropped to shut down.
+    _shutdown_tx: watch::Sender<bool>,
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // Ignore send error — event loop may have already exited.
+        let _ = self._shutdown_tx.send(true);
+    }
+}
+
+/// Spawn a fresh NodeRuntime on its own OS thread with its own tokio runtime,
+/// exactly matching the content_index_integration.rs harness pattern. Returns
+/// `Some(harness)` once the event loop signals ready, or `None` if the UDP
+/// port 4242 is already in use (another Harmony instance is running on the
+/// dev machine). Tests check the `None` case and return early (skipped).
+async fn spawn_test_runtime() -> Option<TestHarness> {
+    let tmp = tempfile::tempdir().unwrap();
+    let app_data_dir = tmp.path().to_path_buf();
+
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestRequest>(4);
+    let (verb_tx, content_verb_rx) = mpsc::channel::<ContentVerbRequest>(16);
+    let (_publish_tx, publish_rx) = mpsc::channel(4);
+    let (_fetch_tx, fetch_rx) = mpsc::channel(4);
+    let (_follow_tx, follow_rx) = mpsc::channel(4);
+    let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
+    let (_voice_ch_tx, voice_ch_rx) =
+        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) =
+        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let followed_set = Arc::new(Mutex::new(
+        std::collections::HashSet::<String>::default(),
+    ));
+    let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
+        &app_data_dir.join("mail"),
+        [0u8; 16],
+    )));
+
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let config = NodeConfig {
+        storage_budget: StorageBudget {
+            cache_capacity: 512,
+            max_pinned_bytes: 50_000_000,
+        },
+        compute_budget: InstructionBudget { fuel: 100_000 },
+        schedule: Default::default(),
+        content_policy: ContentPolicy::default(),
+        filter_broadcast_config: FilterBroadcastConfig {
+            mutation_threshold: 10,
+            max_interval_ticks: 40,
+            expected_items: 512,
+            fp_rate: 0.001,
+        },
+        node_addr: "0000000000000000000000000000000000000000".to_string(),
+        local_identity_hash: [0u8; 16],
+        local_pq_identity_hash: [0u8; 16],
+        local_dsa_pubkey: vec![],
+        local_kem_pubkey: vec![],
+        reticulum_identity_bytes: None,
+        inference_gguf_cid: None,
+        inference_tokenizer_cid: None,
+        engram_manifest_cid: None,
+        disk_enabled: false,
+        disk_entries: Vec::new(),
+        disk_quota: None,
+        archive_enabled: false,
+        archive_entries: Vec::new(),
+        archive_quota: None,
+        archive_ingest_enabled: false,
+        eviction_push_enabled: false,
+        s3_enabled: false,
+    };
+
+    let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
+    let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+    thread::Builder::new()
+        .name("harmony-runtime-folder-test".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("tokio runtime for folder test event loop");
+            rt.block_on(async move {
+                let (runtime, startup_actions) =
+                    NodeRuntime::new(config, MemoryBookStore::new());
+                harmony_app::event_loop::run(
+                    runtime,
+                    startup_actions,
+                    app_handle,
+                    None,
+                    ready_tx,
+                    shutdown_rx,
+                    publish_rx,
+                    fetch_rx,
+                    ingest_rx,
+                    content_verb_rx,
+                    follow_rx,
+                    voice_rx,
+                    voice_ch_rx,
+                    followed_set,
+                    mail_mgr,
+                    None,
+                    refresh_rx,
+                    pin_intent,
+                    fetch_completion_tx,
+                    fetch_completion_rx,
+                )
+                .await;
+            });
+        })
+        .expect("spawn runtime thread");
+
+    match ready_rx.await {
+        Ok(Ok(())) => {} // proceed
+        Ok(Err(e)) if e.contains("Address already in use") => {
+            eprintln!("skipping test: {e}");
+            return None;
+        }
+        Ok(Err(e)) => panic!("event loop failed to start: {e}"),
+        Err(_) => panic!("event loop dropped ready signal"),
+    }
+
+    // Keep tmp alive for the lifetime of the harness.
+    std::mem::forget(tmp);
+
+    Some(TestHarness {
+        ingest_tx,
+        verb_tx,
+        _shutdown_tx: shutdown_tx,
+    })
+}
+
+// ── Test 1: pin_folder_cascades_to_nested_leaf ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_folder_cascades_to_nested_leaf() {
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    let leaf_bytes = b"hello world".to_vec();
+    let leaf_cid = ContentId::for_book(&leaf_bytes, ContentFlags::default()).unwrap();
+    let folder = folders::build_folder(
+        "FolderWithLeaf",
+        &[folders::ManifestEntry {
+            cid: leaf_cid.to_bytes(),
+            name: "hello.txt".into(),
+            kind: ContentKind::Leaf,
+        }],
+    )
+    .expect("build folder");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(leaf_cid.to_bytes()), leaf_bytes)
+        .await
+        .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.manifest_cid.to_bytes()),
+        folder.manifest_bytes,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.bundle_cid.to_bytes()),
+        folder.bundle_bytes,
+    )
+    .await
+    .unwrap();
+
+    // Pin the folder root.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    harness
+        .verb_tx
+        .send(ContentVerbRequest::Pin {
+            cid: folder.bundle_cid.to_bytes(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply_rx.await.unwrap().unwrap(), true);
+
+    // Inspect the pinned set — cascade should include all three CIDs.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    harness
+        .verb_tx
+        .send(ContentVerbRequest::PinnedSet { reply: reply_tx })
+        .await
+        .unwrap();
+    let pinned = reply_rx.await.unwrap();
+
+    assert!(
+        pinned.contains(&folder.bundle_cid.to_bytes()),
+        "folder pinned"
+    );
+    assert!(
+        pinned.contains(&folder.manifest_cid.to_bytes()),
+        "manifest pinned via cascade"
+    );
+    assert!(
+        pinned.contains(&leaf_cid.to_bytes()),
+        "leaf pinned via cascade"
+    );
+}
+
+// ── Test 2: pin_intent_survives_restart_for_folder ────────────────────────
+
+#[test]
+fn pin_intent_survives_restart_for_folder() {
+    let dir = tempdir().unwrap();
+
+    {
+        let mut idx = ContentIndex::load(dir.path());
+        let built = folders::build_folder("Pinned", &[]).expect("build");
+        idx.insert(ContentIndexEntry {
+            cid: built.bundle_cid.to_bytes(),
+            file_name: "Pinned".into(),
+            size_bytes: built.bundle_bytes.len() as u64,
+            stored_at_ms: 1,
+            sensitivity: Sensitivity::Private,
+            replication_tier: ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: true,
+            kind: ContentKind::Folder,
+        });
+    }
+
+    let idx = ContentIndex::load(dir.path());
+    let entry = idx
+        .entries()
+        .find(|e| e.kind == ContentKind::Folder)
+        .expect("folder entry persisted");
+    assert_eq!(entry.file_name, "Pinned");
+    assert!(entry.pinned, "pin intent survives reload");
+}
+
+// ── Test 3: list_folder_end_to_end_with_two_children ─────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_folder_end_to_end_with_two_children() {
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    let bytes_a = b"alpha".to_vec();
+    let bytes_b = b"beta".to_vec();
+    let cid_a = ContentId::for_book(&bytes_a, ContentFlags::default()).unwrap();
+    let cid_b = ContentId::for_book(&bytes_b, ContentFlags::default()).unwrap();
+    let folder = folders::build_folder(
+        "TwoChildren",
+        &[
+            folders::ManifestEntry {
+                cid: cid_a.to_bytes(),
+                name: "a.txt".into(),
+                kind: ContentKind::Leaf,
+            },
+            folders::ManifestEntry {
+                cid: cid_b.to_bytes(),
+                name: "b.txt".into(),
+                kind: ContentKind::Leaf,
+            },
+        ],
+    )
+    .expect("build");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid_a.to_bytes()), bytes_a)
+        .await
+        .unwrap();
+    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(cid_b.to_bytes()), bytes_b)
+        .await
+        .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.manifest_cid.to_bytes()),
+        folder.manifest_bytes,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.bundle_cid.to_bytes()),
+        folder.bundle_bytes,
+    )
+    .await
+    .unwrap();
+
+    let empty_pinned = std::collections::HashSet::new();
+    let rows = harmony_app::list_folder(
+        hex::encode(folder.bundle_cid.to_bytes()),
+        harness.verb_tx.clone(),
+        &empty_pinned,
+    )
+    .await
+    .expect("list_folder succeeds");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].name, "a.txt");
+    assert_eq!(rows[0].kind, "leaf");
+    assert_eq!(rows[0].cid, hex::encode(cid_a.to_bytes()));
+    assert_eq!(rows[1].name, "b.txt");
+    assert!(!rows[0].pinned);
+    assert!(!rows[1].pinned);
+}
+
+// ── Test 4: list_folder_empty_returns_empty_vec ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_folder_empty_returns_empty_vec() {
+    let folder = folders::build_folder("Empty", &[]).expect("build");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.manifest_cid.to_bytes()),
+        folder.manifest_bytes,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(folder.bundle_cid.to_bytes()),
+        folder.bundle_bytes,
+    )
+    .await
+    .unwrap();
+
+    let empty_pinned = std::collections::HashSet::new();
+    let rows = harmony_app::list_folder(
+        hex::encode(folder.bundle_cid.to_bytes()),
+        harness.verb_tx.clone(),
+        &empty_pinned,
+    )
+    .await
+    .expect("list_folder succeeds on empty folder");
+
+    assert!(rows.is_empty(), "empty folder returns empty Vec");
+}
+
+// ── Test 5: list_folder_not_in_cache_returns_empty ────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_folder_not_in_cache_returns_empty() {
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    let random_cid_hex = hex::encode([0x42u8; 32]);
+    let empty_pinned = std::collections::HashSet::new();
+    let rows = harmony_app::list_folder(
+        random_cid_hex,
+        harness.verb_tx.clone(),
+        &empty_pinned,
+    )
+    .await
+    .expect("not-in-cache returns Ok(empty), not Err");
+
+    assert!(rows.is_empty(), "cold cache returns empty, not an error");
+}
+
+// ── Test 6: list_folder_malformed_manifest_returns_error ─────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_folder_malformed_manifest_returns_error() {
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    let bad_manifest = b"definitely not a folder manifest".to_vec();
+    let bad_manifest_cid =
+        ContentId::for_book(&bad_manifest, ContentFlags::default()).unwrap();
+    let leaf_bytes = b"leaf".to_vec();
+    let leaf_cid = ContentId::for_book(&leaf_bytes, ContentFlags::default()).unwrap();
+
+    let mut builder = BundleBuilder::new();
+    builder.add(bad_manifest_cid);
+    builder.add(leaf_cid);
+    let (bundle_bytes, bundle_cid) = builder
+        .build_with_flags(ContentFlags::default())
+        .unwrap();
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(leaf_cid.to_bytes()),
+        leaf_bytes,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(bad_manifest_cid.to_bytes()),
+        bad_manifest,
+    )
+    .await
+    .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(bundle_cid.to_bytes()),
+        bundle_bytes,
+    )
+    .await
+    .unwrap();
+
+    let empty_pinned = std::collections::HashSet::new();
+    let err = harmony_app::list_folder(
+        hex::encode(bundle_cid.to_bytes()),
+        harness.verb_tx.clone(),
+        &empty_pinned,
+    )
+    .await
+    .expect_err("malformed manifest must surface an error, not an empty Vec");
+
+    assert!(
+        err.contains("manifest parse"),
+        "error mentions manifest parse: {err}"
+    );
+}
