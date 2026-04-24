@@ -21,8 +21,10 @@
 
   // Caret column: each Q8-FLAT word is 4 chars + 1 trailing space (byteIdx * 5),
   // each nibble within a word is 2 chars (syllableIdx * 2). Offset by label width.
+  // Null when there's no diff — the caret row is omitted entirely in that case
+  // so a perfect match can never render a misleading ^^ at column 0.
   let caretPrefix = $derived.by(() => {
-    if (firstDiffNibbleIdx < 0) return '';
+    if (firstDiffNibbleIdx < 0) return null;
     const byteIdx = Math.floor(firstDiffNibbleIdx / 2);
     const syllableIdx = firstDiffNibbleIdx % 2;
     return ' '.repeat(LABEL_WIDTH + byteIdx * 5 + syllableIdx * 2);
@@ -30,9 +32,14 @@
 </script>
 
 <div class="mismatch" role="status" aria-live="polite" data-testid="mismatch-display">
-  <pre aria-label="Mismatch feedback">Expected: {expectedLine}
+  {#if caretPrefix !== null}
+    <pre aria-label="Mismatch feedback">Expected: {expectedLine}
 Heard:    {heardLine}
 {caretPrefix}^^</pre>
+  {:else}
+    <pre aria-label="Mismatch feedback">Expected: {expectedLine}
+Heard:    {heardLine}</pre>
+  {/if}
 </div>
 
 <style>

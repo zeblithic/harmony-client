@@ -62,6 +62,25 @@ describe('MismatchDisplay', () => {
     expect(heard).toBe("Heard:    KU'E KE??");
   });
 
+  it('omits the caret line when firstDiffNibbleIdx is -1 (no divergence)', () => {
+    // Regression for Qodo/CodeRabbit/CodeAnt PR #49 finding: the template
+    // always rendered `{caretPrefix}^^`, which meant a caret would appear
+    // at column 0 when caretPrefix is empty. In the component's intended
+    // usage FlashcardView gates rendering on a non-null mismatch, but the
+    // component shouldn't lie about a mismatch that doesn't exist.
+    render(MismatchDisplay, {
+      props: {
+        expectedBytes: [0x92],
+        heardNibbles: [0x9, 0x2],
+        firstDiffNibbleIdx: -1,
+      },
+    });
+    const lines = getLines();
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe("Expected: KU'E");
+    expect(lines[1]).toBe("Heard:    KU'E");
+  });
+
   it('exposes role=status with aria-live=polite for screen readers', () => {
     render(MismatchDisplay, {
       props: {

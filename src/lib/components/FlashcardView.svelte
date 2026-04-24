@@ -160,29 +160,52 @@
     pttSegmentStart = Date.now();
     lastAdvanceAt = Date.now();
     await ensureCapture();
+    // Re-check state after the await: PttButton fires onPttStart synchronously
+    // without awaiting, so handlePttStop (or unmount) can run between the
+    // sync prelude above and this resumption. Starting a setInterval after
+    // release would leave an orphan tick that eventually fires
+    // handleRowTimeout and resets combo. Likewise, starting a tick on a
+    // destroyed component leaks the timer.
+    if (destroyed || !pttActive) return;
     startTick();
   }
 
   function handlePttStop() {
     pttActive = false;
     stopTick();
+    // Defensive: even if a late-resolving ensureCapture still manages to
+    // call startTick() after this (shouldn't happen post-guard, but
+    // belt-and-suspenders), a null lastAdvanceAt makes checkTimeout a no-op.
+    lastAdvanceAt = null;
     // Bank active time from this PTT segment.
     if (pttSegmentStart !== null) {
       cardActiveMs += Date.now() - pttSegmentStart;
       pttSegmentStart = null;
     }
+    // Snapshot pre-flush state so the final flush can't confuse a successful
+    // card completion with an abandoned attempt. If the flush completes a
+    // card, heardNibbles retains the carry nibbles for the new card's row 0
+    // — interpreting that carry as "the user abandoned a row mid-attempt"
+    // would undo the combo increment handleCardComplete just published.
+    const preFlushActiveRow = activeRowIndex;
+    const preFlushHadAttempt =
+      heardNibbles.length > 0 ||
+      rowStates.some((s) => s.rowIndex === preFlushActiveRow && !s.completed);
+    const preFlushCardsCompleted = stats.cardsCompleted;
+
     // Final flush: any frames captured between the last tick and release
     // still flow through processPcm. A row completion or mismatch discovered
     // in the flush uses the same handlers as a mid-hold tick.
     processTick({ finalFlush: true });
-    // If a partial row attempt was in progress when the user released,
-    // cancel it and reset combo per spec: "Release PTT = cancel current row."
-    const hadAttempt =
-      heardNibbles.length > 0 ||
-      rowStates.some((s) => s.rowIndex === activeRowIndex && !s.completed);
-    if (hadAttempt) {
+
+    const cardCompletedDuringFlush = stats.cardsCompleted > preFlushCardsCompleted;
+    // Release-cancels-row per spec: "Release PTT = cancel current row." Only
+    // fires when the user was mid-attempt AND the flush couldn't rescue it
+    // into a card completion. Filter by preFlushActiveRow because the flush
+    // may have advanced activeRowIndex out from under us.
+    if (preFlushHadAttempt && !cardCompletedDuringFlush) {
       rowStates = rowStates.filter(
-        (s) => s.rowIndex !== activeRowIndex || s.completed,
+        (s) => s.rowIndex !== preFlushActiveRow || s.completed,
       );
       if (stats.combo > 0) {
         stats = { ...stats, combo: 0 };

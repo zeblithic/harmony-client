@@ -5,7 +5,12 @@ import FlashcardView from '../FlashcardView.svelte';
 // AudioCapture depends on Web Audio + getUserMedia, neither of which exist
 // in jsdom. Mock the module and expose the last-registered onFrame callback
 // so the mid-hold tests can push synthetic PCM frames through processTick.
+// The mock also exposes a pendingStart handle — by default start() resolves
+// immediately, but tests can flip `autoResolveStart = false` to hold the
+// promise and exercise press/release ordering around the await.
 let capturedOnFrame: ((pcm: Float32Array) => void) | null = null;
+let pendingStart: { resolve: () => void } | null = null;
+let autoResolveStart = true;
 
 vi.mock('../../voice/audio-capture', () => {
   return {
@@ -13,8 +18,12 @@ vi.mock('../../voice/audio-capture', () => {
       isActive() {
         return true;
       }
-      async start(onFrame: (pcm: Float32Array) => void) {
+      start(onFrame: (pcm: Float32Array) => void): Promise<void> {
         capturedOnFrame = onFrame;
+        return new Promise((resolve) => {
+          pendingStart = { resolve };
+          if (autoResolveStart) resolve();
+        });
       }
       async stop() {
         capturedOnFrame = null;
@@ -144,6 +153,8 @@ describe('FlashcardView', () => {
     beforeEach(() => {
       vi.useFakeTimers();
       capturedOnFrame = null;
+      pendingStart = null;
+      autoResolveStart = true;
     });
 
     afterEach(() => {
@@ -308,6 +319,104 @@ describe('FlashcardView', () => {
 
       const resetCall = onStatsUpdate.mock.calls.find(([s]) => s.combo === 0);
       expect(resetCall).toBeTruthy();
+    });
+
+    it('does not start the mid-hold tick if PTT is released before ensureCapture resolves', async () => {
+      // Regression for the race flagged by Qodo/CodeAnt/Cursor Bugbot on
+      // PR #49: PttButton fires onPttStart synchronously, so handlePttStop
+      // can run between the sync prelude of handlePttStart and its post-
+      // await startTick(). Without the pttActive guard after await, a late-
+      // resolving ensureCapture would start an orphan setInterval that
+      // fires handleRowTimeout at 2 s and zeroes the user's combo for no
+      // reason.
+      autoResolveStart = false;
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]],
+      });
+      mockService.processPcm.mockReturnValue({ syllables: [] });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          initialStats: {
+            cardsCompleted: 2,
+            perfectCards: 2,
+            expressCards: 0,
+            bestTimeMs: 400,
+            totalTimeMs: 800,
+            previousTimeMs: 400,
+            combo: 2,
+            totalCreditedBits: 16,
+          },
+          onStatsUpdate,
+        },
+      });
+
+      const btn = screen.getByRole('button', { name: /push to talk/i });
+      await fireEvent.mouseDown(btn);
+      // Release before start() resolves. handlePttStop sets pttActive=false
+      // and lastAdvanceAt=null; the awaited continuation in handlePttStart
+      // must see pttActive=false and skip startTick entirely.
+      await fireEvent.mouseUp(btn);
+      pendingStart!.resolve();
+      pendingStart = null;
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Advance past the 2 s momentum window. A stale tick would fire
+      // processTick here (calling processPcm) and, on an empty buffer,
+      // call checkTimeout → handleRowTimeout → publish combo=0.
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(mockService.processPcm).not.toHaveBeenCalled();
+      expect(onStatsUpdate).not.toHaveBeenCalled();
+    });
+
+    it('preserves combo when the release flush completes a card with overshoot nibbles', async () => {
+      // Regression for Cursor Bugbot's "carry nibbles break combo" finding:
+      // when the final flush itself completes a card, heardNibbles retains
+      // the carry for the next card's row 0. The hadAttempt check must
+      // consult pre-flush state so that post-flush carry (from the just-
+      // completed card) doesn't undo handleCardComplete's combo increment.
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]],
+      });
+      // 4 syllables: [0x0,0x0] completes card 1, [0xc,0xc] are overshoot.
+      mockService.processPcm.mockReturnValue({
+        syllables: [
+          syllable(0x0),
+          syllable(0x0),
+          syllable(0xc),
+          syllable(0xc),
+        ],
+      });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          onStatsUpdate,
+        },
+      });
+
+      const btn = await pressPtt();
+      // Feed a frame but do not advance timers — the tick never fires
+      // mid-hold, so the flush on release is what completes the card.
+      capturedOnFrame!(pcmFrame());
+      await fireEvent.mouseUp(btn);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const lastCall = onStatsUpdate.mock.calls.at(-1)?.[0];
+      expect(lastCall?.cardsCompleted).toBe(1);
+      expect(lastCall?.combo).toBe(1);
     });
 
     it('cancels an unfinished row and resets combo on release', async () => {
