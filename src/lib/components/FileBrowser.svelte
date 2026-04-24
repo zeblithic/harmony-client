@@ -105,9 +105,12 @@
     });
   });
 
-  // Whenever currentFolderCid changes, fetch the live folder contents from the
-  // backend (Option A: async $effect). Falls back to [] if no adapter is wired.
+  // Whenever currentFolderCid OR serviceVersion changes, fetch live folder
+  // contents from the backend. The serviceVersion dependency catches
+  // pin/unpin/burn/archive/tier mutations on items inside the current folder,
+  // which bump the service's version counter but don't change currentFolderCid.
   $effect(() => {
+    void serviceVersion; // re-fetch on cache mutation
     const cid = currentFolderCid;
     if (!cid) {
       folderItems = null;
@@ -128,6 +131,12 @@
   });
 
   function applyFiltersAndSort(contents: ContentItem[]): ContentItem[] {
+    // Defensive copy: callers may pass folderItems (a $state proxy) directly
+    // when no filter is applied, and our trailing .sort() would otherwise
+    // mutate the proxy in-place inside a $derived.by — Svelte 5 flags this
+    // as a reactivity cycle. Copying once here is cheaper than copying inside
+    // every filter branch.
+    contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       contents = contents.filter((i) => i.name.toLowerCase().includes(q));

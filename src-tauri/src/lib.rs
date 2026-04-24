@@ -1906,37 +1906,41 @@ async fn create_folder_nested(
         )
     };
 
-    // 1. Build the new empty sub-folder. Ingest its manifest + bundle.
-    // Capture cid + size before moving the byte vectors into send_ingest.
+    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so that
+    // a downstream collision/OldMissing failure during rekey doesn't leave
+    // orphan bytes in the runtime cache (which could be announced over Zenoh
+    // and waste capacity for content no sidecar entry will ever reference).
     let new_child = folders::build_folder(&name, &[])?;
     let new_child_bundle_cid = new_child.bundle_cid;
-    let new_child_bundle_size = new_child.bundle_bytes.len() as u64;
-    send_ingest(
-        &ingest_tx,
+
+    // (cid_hex, bytes) pairs to ingest after rekey succeeds.
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    pending_ingests.push((
         hex::encode(new_child.manifest_cid.to_bytes()),
         new_child.manifest_bytes,
-    )
-    .await?;
-    send_ingest(
-        &ingest_tx,
+    ));
+    pending_ingests.push((
         hex::encode(new_child_bundle_cid.to_bytes()),
         new_child.bundle_bytes,
-    )
-    .await?;
+    ));
 
-    // 2. Bottom-up walk: rebuild each ancestor.
+    // 2. Bottom-up walk: rebuild each ancestor LOCALLY (read-only verb
+    // requests), accumulating into pending_ingests.
     //    prev_old_cid = the ancestor's old CID (as given in parent_path).
     //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
     let mut prev_old_cid = immediate_parent_cid;
     let mut prev_new_cid = new_child_bundle_cid.to_bytes();
-    let mut last_bundle_size: u64 = new_child_bundle_size;
+    let mut last_bundle_size: u64 = pending_ingests
+        .last()
+        .map(|(_, b)| b.len() as u64)
+        .unwrap_or(0);
 
     // First iteration: APPEND at the immediate parent.
     // Higher iterations: REPLACE the entry pointing to prev_old_cid.
     for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
         let is_deepest = i == path_cids.len() - 1;
 
-        // Fetch the ancestor's bundle bytes.
+        // Fetch the ancestor's bundle bytes (read-only).
         let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
             .await?
             .ok_or_else(|| {
@@ -1947,13 +1951,13 @@ async fn create_folder_nested(
             })?;
         let anc_children = parse_bundle(&anc_bundle)
             .map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
-        let manifest_cid_id = anc_children
+        let manifest_cid = anc_children
             .first()
             .copied()
             .ok_or_else(|| "ancestor bundle has no children".to_string())?;
 
-        // Read the ancestor's manifest book.
-        let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid_id.to_bytes())
+        // Read the ancestor's manifest book (read-only).
+        let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
             .await?
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
         let mut manifest: folders::FolderManifest = serde_json::from_slice(&manifest_bytes)
@@ -1984,33 +1988,29 @@ async fn create_folder_nested(
             manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
         }
 
-        // Rebuild manifest book + bundle with updated entries.
-        // Capture cid + size before moving the byte vectors into send_ingest.
+        // Rebuild manifest book + bundle with updated entries; queue both
+        // for ingest (deferred until after rekey succeeds).
         let rebuilt = folders::build_folder(
             /* display name not used by manifest; empty is fine */ "",
             &manifest.folder_manifest.entries,
         )?;
         let rebuilt_bundle_cid = rebuilt.bundle_cid;
-        let rebuilt_bundle_size = rebuilt.bundle_bytes.len() as u64;
-        send_ingest(
-            &ingest_tx,
+        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
+        pending_ingests.push((
             hex::encode(rebuilt.manifest_cid.to_bytes()),
             rebuilt.manifest_bytes,
-        )
-        .await?;
-        send_ingest(
-            &ingest_tx,
+        ));
+        pending_ingests.push((
             hex::encode(rebuilt_bundle_cid.to_bytes()),
             rebuilt.bundle_bytes,
-        )
-        .await?;
+        ));
 
         prev_old_cid = anc_cid;
-        last_bundle_size = rebuilt_bundle_size;
         prev_new_cid = rebuilt_bundle_cid.to_bytes();
     }
 
-    // 3. Rekey the top-level sidecar entry.
+    // 3. Rekey the top-level sidecar entry FIRST. If this fails (collision
+    // or old-missing), no ingests have happened — no orphan bytes.
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2039,7 +2039,15 @@ async fn create_folder_nested(
         }
     }
 
-    // 4. Event-loop pin sync: unpin old, pin new (if old had pin intent).
+    // 4. Drain the deferred ingests now that the sidecar is committed.
+    // If the event loop dies mid-drain, we end up with a sidecar pointer
+    // to a CID whose bytes aren't fully resident — recoverable on next
+    // fetch via ZEB-155's fetch-completion hook (gated on ZEB-159).
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // 5. Event-loop pin sync: unpin old, pin new (if old had pin intent).
     //
     // The replies here are best-effort: the sidecar has already committed
     // the rekey, so a failure here is a runtime/cache desync rather than a

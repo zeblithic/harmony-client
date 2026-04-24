@@ -408,8 +408,18 @@ export class FileManagerService {
       name,
       parentPath,
     })) as string;
-    // Refetch the root listing and emit change so the UI refreshes.
-    await this.refetchRoot();
+    // Refetch is best-effort: the folder is already created on the backend
+    // by the time we get here, so a refresh failure shouldn't surface as
+    // "create failed" to the user. The next list_content call (or a manual
+    // refresh) will pick up the new entry.
+    try {
+      await this.refetchRoot();
+    } catch (err) {
+      console.warn(
+        'createFolder: refetchRoot failed (folder was created); UI may show stale list:',
+        err,
+      );
+    }
     return newCid;
   }
 
