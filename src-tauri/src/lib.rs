@@ -1797,11 +1797,10 @@ async fn create_folder(
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<String, String> {
-    if !parent_path.is_empty() {
-        // Nested case implemented in Task 6 below.
-        return Err("nested folder creation not yet implemented".to_string());
+    if parent_path.is_empty() {
+        return create_folder_at_root(name, state).await;
     }
-    create_folder_at_root(name, state).await
+    create_folder_nested(name, parent_path, state).await
 }
 
 async fn create_folder_at_root(
@@ -1859,6 +1858,195 @@ async fn create_folder_at_root(
     }
 
     Ok(hex::encode(built.bundle_cid.to_bytes()))
+}
+
+async fn create_folder_nested(
+    name: String,
+    parent_path: Vec<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    // Parse all path CIDs up-front; fail fast on malformed input.
+    let path_cids: Vec<[u8; 32]> = parent_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+    let root_old = *path_cids.first().expect("non-empty by guard above");
+    let immediate_parent_cid = *path_cids.last().expect("non-empty");
+
+    // Snapshot handles.
+    let (ingest_tx, verb_tx, index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .content_verb_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
+    };
+
+    // 1. Build the new empty sub-folder. Ingest its manifest + bundle.
+    let new_child = folders::build_folder(&name, &[])?;
+    send_ingest(
+        &ingest_tx,
+        hex::encode(new_child.manifest_cid.to_bytes()),
+        new_child.manifest_bytes.clone(),
+    )
+    .await?;
+    send_ingest(
+        &ingest_tx,
+        hex::encode(new_child.bundle_cid.to_bytes()),
+        new_child.bundle_bytes.clone(),
+    )
+    .await?;
+
+    // 2. Bottom-up walk: rebuild each ancestor.
+    //    prev_old_cid = the ancestor's old CID (as given in parent_path).
+    //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
+    let mut prev_old_cid = immediate_parent_cid;
+    let mut prev_new_cid = new_child.bundle_cid.to_bytes();
+    let mut last_bundle_size: u64 = new_child.bundle_bytes.len() as u64;
+
+    // First iteration: APPEND at the immediate parent.
+    // Higher iterations: REPLACE the entry pointing to prev_old_cid.
+    for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
+        let is_deepest = i == path_cids.len() - 1;
+
+        // Fetch the ancestor's bundle bytes.
+        let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} not in cache; cannot rebuild parent chain",
+                    hex::encode(anc_cid)
+                )
+            })?;
+        let anc_children = parse_bundle(&anc_bundle)
+            .map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
+        let manifest_cid_id = anc_children
+            .first()
+            .copied()
+            .ok_or_else(|| "ancestor bundle has no children".to_string())?;
+
+        // Read the ancestor's manifest book.
+        let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid_id.to_bytes())
+            .await?
+            .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
+        let mut manifest: folders::FolderManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| format!("ancestor manifest parse: {e}"))?;
+
+        if is_deepest {
+            manifest
+                .folder_manifest
+                .entries
+                .push(folders::ManifestEntry {
+                    cid: prev_new_cid,
+                    name: name.clone(),
+                    kind: content_index::ContentKind::Folder,
+                });
+        } else {
+            let target_idx = manifest
+                .folder_manifest
+                .entries
+                .iter()
+                .position(|e| e.cid == prev_old_cid)
+                .ok_or_else(|| {
+                    format!(
+                        "ancestor {} has no entry pointing to child {}",
+                        hex::encode(anc_cid),
+                        hex::encode(prev_old_cid)
+                    )
+                })?;
+            manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
+        }
+
+        // Rebuild manifest book + bundle with updated entries.
+        let rebuilt = folders::build_folder(
+            /* display name not used by manifest; empty is fine */ "",
+            &manifest.folder_manifest.entries,
+        )?;
+        send_ingest(
+            &ingest_tx,
+            hex::encode(rebuilt.manifest_cid.to_bytes()),
+            rebuilt.manifest_bytes,
+        )
+        .await?;
+        send_ingest(
+            &ingest_tx,
+            hex::encode(rebuilt.bundle_cid.to_bytes()),
+            rebuilt.bundle_bytes.clone(),
+        )
+        .await?;
+
+        prev_old_cid = anc_cid;
+        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
+        prev_new_cid = rebuilt.bundle_cid.to_bytes();
+    }
+
+    // 3. Rekey the top-level sidecar entry.
+    let new_bundle_size = last_bundle_size;
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let had_pin = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.get(&root_old).map(|e| e.pinned).unwrap_or(false)
+    };
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let ok = idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms);
+        if !ok {
+            return Err("top-level folder not in sidecar — nothing to rekey".to_string());
+        }
+    }
+
+    // 4. Event-loop pin sync: unpin old, pin new (if old had pin intent).
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::Unpin {
+            cid: root_old,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    let _ = reply_rx.await;
+    if had_pin {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        verb_tx
+            .send(event_loop::ContentVerbRequest::Pin {
+                cid: prev_new_cid,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| "event loop not running".to_string())?;
+        let _ = reply_rx.await;
+    }
+
+    Ok(hex::encode(prev_new_cid))
+}
+
+async fn read_cached_bytes(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    cid: [u8; 32],
+) -> Result<Option<Vec<u8>>, String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::ReadBytes {
+            cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped read request".to_string())
 }
 
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().

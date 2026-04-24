@@ -216,6 +216,33 @@ impl ContentIndex {
         true
     }
 
+    /// ZEB-158 slice 1: atomically replace an entry's CID while
+    /// preserving user-state fields (file_name, sensitivity,
+    /// replication_tier, licensed, archived, pinned, kind). Used when a
+    /// folder mutation produces a new top-level root CID (nested
+    /// `create_folder`, future move/rename operations). One save() for
+    /// the whole replacement — remove-then-insert would give two.
+    ///
+    /// Returns `true` if rekeyed; `false` if the old CID wasn't in the
+    /// index.
+    pub fn rekey(
+        &mut self,
+        old: &[u8; 32],
+        new: [u8; 32],
+        new_size_bytes: u64,
+        new_stored_at_ms: u64,
+    ) -> bool {
+        let Some(mut entry) = self.entries.remove(old) else {
+            return false;
+        };
+        entry.cid = new;
+        entry.size_bytes = new_size_bytes;
+        entry.stored_at_ms = new_stored_at_ms;
+        self.entries.insert(new, entry);
+        self.save();
+        true
+    }
+
     /// Flip the `pinned` flag. Returns `true` if the flag changed;
     /// `false` if already at the target state or the CID is unknown.
     pub fn set_pinned(&mut self, cid: &[u8; 32], pinned: bool) -> bool {
@@ -526,6 +553,38 @@ mod tests {
         let got = reloaded.get(&entry.cid).expect("round-trips");
         assert_eq!(got.kind, ContentKind::Folder);
         assert_eq!(got.file_name, "Photos");
+    }
+
+    #[test]
+    fn rekey_atomically_replaces_cid_and_preserves_user_state() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let mut entry = sample_entry([0x01; 32]);
+        entry.file_name = "Folder".into();
+        entry.kind = ContentKind::Folder;
+        entry.pinned = true;
+        entry.archived = false;
+        idx.insert(entry.clone());
+
+        let ok = idx.rekey(
+            &[0x01; 32],
+            [0x02; 32],
+            /* new_size_bytes */ 999,
+            /* new_stored_at_ms */ 1234,
+        );
+        assert!(ok, "rekey must succeed when old key exists");
+
+        assert!(idx.get(&[0x01; 32]).is_none(), "old key removed");
+        let after = idx.get(&[0x02; 32]).expect("new key present");
+        assert_eq!(after.file_name, "Folder", "file_name carried forward");
+        assert_eq!(after.kind, ContentKind::Folder, "kind carried forward");
+        assert!(after.pinned, "pinned carried forward");
+        assert_eq!(after.size_bytes, 999, "size_bytes updated");
+        assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
+
+        // Non-existent old key returns false.
+        assert!(!idx.rekey(&[0xFF; 32], [0xEE; 32], 0, 0));
     }
 
     #[test]
