@@ -186,6 +186,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 replication_tier: ReplicationTier::Default,
                 licensed: false,
                 archived: false,
+                pinned: false,
             }),
             "first insert should return true"
         );
@@ -433,6 +434,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
             replication_tier: ReplicationTier::Default,
             licensed: false,
             archived: false,
+            pinned: false,
         }));
     }
 

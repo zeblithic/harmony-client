@@ -49,6 +49,17 @@ pub struct ContentIndexEntry {
     pub replication_tier: ReplicationTier,
     pub licensed: bool,
     pub archived: bool,
+    /// ZEB-155: persisted pin intent. True when the user has asked for
+    /// this content to remain pinned across restarts. The runtime cache's
+    /// `PinnedSet` is still authoritative for active eviction protection —
+    /// this field is "the user wants this pinned whenever bytes are
+    /// resident," joined with the runtime set at list_content time.
+    ///
+    /// `#[serde(default)]` makes pre-ZEB-155 sidecars readable: legacy
+    /// entries deserialize with pinned=false (correct — they weren't
+    /// pinned at their last save, since the field didn't exist).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -181,6 +192,20 @@ impl ContentIndex {
         true
     }
 
+    /// Flip the `pinned` flag. Returns `true` if the flag changed;
+    /// `false` if already at the target state or the CID is unknown.
+    pub fn set_pinned(&mut self, cid: &[u8; 32], pinned: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(cid) else {
+            return false;
+        };
+        if entry.pinned == pinned {
+            return false;
+        }
+        entry.pinned = pinned;
+        self.save();
+        true
+    }
+
     /// Set replication tier on a batch. Returns the count of entries
     /// whose tier actually changed (missing or already-at-tier entries
     /// are skipped silently).
@@ -248,6 +273,7 @@ mod tests {
             replication_tier: ReplicationTier::Default,
             licensed: false,
             archived: false,
+            pinned: false,
         }
     }
 
@@ -396,5 +422,70 @@ mod tests {
             ReplicationTier::Ultra,
             "tier mutation persisted"
         );
+    }
+
+    #[test]
+    fn set_pinned_flips_flag_and_reports_change() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xB1; 32]);
+        idx.insert(entry.clone());
+
+        assert!(idx.set_pinned(&entry.cid, true));  // flipped
+        assert!(idx.get(&entry.cid).unwrap().pinned);
+        assert!(!idx.set_pinned(&entry.cid, true)); // idempotent, no change
+        assert!(idx.set_pinned(&entry.cid, false)); // flipped back
+        assert!(!idx.get(&entry.cid).unwrap().pinned);
+    }
+
+    #[test]
+    fn set_pinned_missing_cid_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        assert!(!idx.set_pinned(&[0xB2; 32], true));
+    }
+
+    #[test]
+    fn save_persists_pin_mutations() {
+        let dir = tempdir().unwrap();
+        {
+            let mut idx = ContentIndex::load(dir.path());
+            idx.insert(sample_entry([0xB3; 32]));
+            assert!(idx.set_pinned(&[0xB3; 32], true));
+        }
+        let reloaded = ContentIndex::load(dir.path());
+        assert!(
+            reloaded.get(&[0xB3; 32]).expect("B3 persisted").pinned,
+            "pinned flag must survive save/load"
+        );
+    }
+
+    #[test]
+    fn legacy_sidecar_without_pinned_field_loads_as_unpinned() {
+        // Simulate a pre-ZEB-155 sidecar: version 1, entries with every field
+        // EXCEPT pinned. `#[serde(default)]` on the new field must make this
+        // deserialize cleanly with pinned=false.
+        let dir = tempdir().unwrap();
+        let legacy_json = br#"{
+            "version": 1,
+            "entries": [
+                {
+                    "cid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "file_name": "legacy.txt",
+                    "size_bytes": 10,
+                    "stored_at_ms": 1700000000000,
+                    "sensitivity": "private",
+                    "replication_tier": "default",
+                    "licensed": false,
+                    "archived": false
+                }
+            ]
+        }"#;
+        std::fs::write(dir.path().join(INDEX_FILE), legacy_json).unwrap();
+
+        let idx = ContentIndex::load(dir.path());
+        let entry = idx.get(&[0xAA; 32]).expect("legacy entry must load");
+        assert!(!entry.pinned, "legacy entries must read as pinned=false");
+        assert_eq!(entry.file_name, "legacy.txt");
     }
 }

@@ -1566,6 +1566,7 @@ async fn ingest_content(
             replication_tier: content_index::ReplicationTier::Default,
             licensed: false,
             archived: false,
+            pinned: false,
         });
         if !inserted {
             tracing::debug!(
