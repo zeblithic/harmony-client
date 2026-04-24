@@ -129,21 +129,36 @@ One line. No new Tauri command, no wire-format change (`ContentItemWire.pinned` 
 
 ### Fetch-completion replay hook
 
-Inside `event_loop.rs`'s `fetch_rx` arm, after a successful `fetch_recursive`:
+Two arms in `event_loop.rs`'s `select!`: the existing `fetch_rx` arm spawns a task that replies to the caller first, then best-effort signals a completion channel. A dedicated `fetch_completion_rx` arm consumes those signals and runs the repin cascade.
 
 ```rust
+// Pseudocode — the real fetch_rx arm does more handshaking; the
+// essentials are that it replies to the Tauri caller BEFORE the
+// try_send so a full completion channel cannot stall the reply.
 Some(req) = fetch_rx.recv() => {
     let root = /* parse req.cid_hex */;
-    let result = fetch_recursive(|id| fetch_one(id), root).await;
-    if result.is_ok() && pin_intent.contains(&root.to_bytes()) {
+    let completion_tx = fetch_completion_tx.clone();
+    tokio::spawn(async move {
+        let result = fetch_recursive(|id| fetch_one(id), root).await;
+        let is_ok = result.is_ok();
+        let _ = req.reply.send(result);
+        if is_ok {
+            // try_send: reply correctness must not depend on channel capacity.
+            let _ = completion_tx.try_send(root.to_bytes());
+        }
+    });
+}
+
+Some(root_bytes) = fetch_completion_rx.recv() => {
+    if pin_intent.contains(&root_bytes) {
         // Bytes are now resident (fetch_recursive walked the full bundle
         // into the cache). The pin cascade is guaranteed to find them.
+        let root = ContentId::from_bytes(root_bytes);
         let all = collect_descendants(runtime.storage_tier().cache(), root);
         for id in all {
             runtime.pin_content(id);
         }
     }
-    let _ = req.reply.send(result);
 }
 ```
 
