@@ -40,6 +40,22 @@ pub enum ReplicationTier {
     Ultra,
 }
 
+/// ZEB-158 slice 1: distinguishes user-visible content kinds at the sidecar
+/// level. Leaves are ingested files (books or chunked-file bundles); folders
+/// are bundles whose child-0 is a manifest book (see
+/// `src-tauri/src/folders.rs` and `docs/specs/2026-04-24-folder-primitive-design.md`).
+///
+/// The default variant is `Leaf` so `#[serde(default)]` on the `kind` field
+/// lets pre-ZEB-158 sidecar entries deserialize correctly (they were all
+/// leaves at the time of their last save).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentKind {
+    #[default]
+    Leaf,
+    Folder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIndexEntry {
     #[serde(with = "hex_cid")]
@@ -62,6 +78,12 @@ pub struct ContentIndexEntry {
     /// pinned at their last save, since the field didn't exist).
     #[serde(default)]
     pub pinned: bool,
+    /// ZEB-158 slice 1: distinguishes leaf files from folder bundles at the
+    /// sidecar level. Default `Leaf` with `#[serde(default)]` keeps pre-slice-1
+    /// sidecars readable — legacy entries were all leaves by construction,
+    /// because folders didn't exist before slice 1.
+    #[serde(default)]
+    pub kind: ContentKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -276,6 +298,7 @@ mod tests {
             licensed: false,
             archived: false,
             pinned: false,
+            kind: ContentKind::Leaf,
         }
     }
 
@@ -460,6 +483,49 @@ mod tests {
             reloaded.get(&[0xB3; 32]).expect("B3 persisted").pinned,
             "pinned flag must survive save/load"
         );
+    }
+
+    #[test]
+    fn kind_defaults_to_leaf_on_legacy_sidecar() {
+        let dir = tempdir().unwrap();
+        // v1 sidecar from before ZEB-158 slice 1 — no `kind` field.
+        let legacy = br#"{
+            "version": 1,
+            "entries": [{
+                "cid": "aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00",
+                "file_name": "legacy.txt",
+                "size_bytes": 42,
+                "stored_at_ms": 1700000000000,
+                "sensitivity": "private",
+                "replication_tier": "default",
+                "licensed": false,
+                "archived": false,
+                "pinned": false
+            }]
+        }"#;
+        std::fs::write(dir.path().join(INDEX_FILE), legacy).unwrap();
+
+        let idx = ContentIndex::load(dir.path());
+        let entry = idx
+            .entries()
+            .next()
+            .expect("legacy entry must load");
+        assert_eq!(entry.kind, ContentKind::Leaf);
+    }
+
+    #[test]
+    fn save_persists_kind_field() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let mut entry = sample_entry([0xF0; 32]);
+        entry.file_name = "Photos".into();
+        entry.kind = ContentKind::Folder;
+        idx.insert(entry.clone());
+
+        let reloaded = ContentIndex::load(dir.path());
+        let got = reloaded.get(&entry.cid).expect("round-trips");
+        assert_eq!(got.kind, ContentKind::Folder);
+        assert_eq!(got.file_name, "Photos");
     }
 
     #[test]

@@ -1639,6 +1639,7 @@ async fn ingest_content(
             licensed: false,
             archived: false,
             pinned: false,
+            kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
             tracing::debug!(
@@ -2640,6 +2641,7 @@ mod pin_persistence_tests {
             licensed: false,
             archived: false,
             pinned,
+            kind: content_index::ContentKind::Leaf,
         }
     }
 
