@@ -174,24 +174,35 @@ tells `parse_subscription_event` how to route.
 unchanged.
 
 ```rust
-async fn fetch_recursive(session: &Session, cid: ContentId) -> Result<Vec<u8>, String> {
-    // Mirror the existing fetch_rx key construction: one-hex-char
-    // sharding prefix + full CID hex.
-    let cid_hex = hex::encode(cid.to_bytes());
-    let prefix = cid_hex.get(1..2).unwrap_or("");
-    let key = format!("harmony/content/{prefix}/{cid_hex}");
-    let bytes = fetch_via_zenoh(session, &key).await?;
-    if matches!(cid.cid_type(), CidType::Bundle(_)) {
-        let children = bundle::parse_bundle(&bytes)
-            .map_err(|e| format!("malformed bundle: {e:?}"))?;
-        let mut out = Vec::new();
-        for child in children {
-            out.extend_from_slice(&fetch_recursive(session, *child).await?);
+async fn fetch_recursive(session: &Session, root: ContentId) -> Result<Vec<u8>, String> {
+    // Iterative DFS with explicit depth tracking — Rust async recursion is
+    // awkward, and the depth counter lets us bound the walk defensively.
+    let mut out = Vec::new();
+    let mut stack: Vec<(ContentId, u8)> = vec![(root, 0)];
+    while let Some((cid, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            return Err(format!(
+                "bundle depth {depth} exceeds MAX_BUNDLE_DEPTH {MAX_BUNDLE_DEPTH}"
+            ));
         }
-        Ok(out)
-    } else {
-        Ok(bytes)
+        // Same fetch_rx key construction: one-hex-char sharding prefix + full CID hex.
+        let cid_hex = hex::encode(cid.to_bytes());
+        let prefix = cid_hex.get(1..2).unwrap_or("");
+        let key = format!("harmony/content/{prefix}/{cid_hex}");
+        let bytes = fetch_via_zenoh(session, &key).await?;
+        if matches!(cid.cid_type(), CidType::Bundle(_)) {
+            let children = bundle::parse_bundle(&bytes)
+                .map_err(|e| format!("malformed bundle: {e:?}"))?;
+            // Push reversed so the pop order matches the bundle's child order
+            // — concatenation produces the original byte stream.
+            for child in children.iter().rev() {
+                stack.push((*child, depth + 1));
+            }
+        } else {
+            out.extend_from_slice(&bytes);
+        }
     }
+    Ok(out)
 }
 ```
 
@@ -230,15 +241,31 @@ single pass.
 /// CID in the tree rooted at `cid` (including cid itself) in unspecified
 /// order. Bundle payloads not in cache are silently skipped — their
 /// descendants can't be acted on but that's strictly no-op.
+///
+/// Asymmetric with `fetch_recursive` on purpose: a malformed or over-deep
+/// subtree here logs + skips so the verb still succeeds for every
+/// reachable CID, whereas fetch errors because reassembly needs every byte.
 fn collect_descendants(cache: &ContentStore, cid: ContentId) -> Vec<ContentId> {
     let mut out = Vec::new();
-    let mut stack = vec![cid];
-    while let Some(id) = stack.pop() {
+    let mut stack: Vec<(ContentId, u8)> = vec![(cid, 0)];
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_BUNDLE_DEPTH {
+            tracing::warn!(
+                cid_depth = depth, max = MAX_BUNDLE_DEPTH,
+                "collect_descendants aborting subtree past MAX_BUNDLE_DEPTH; data is corrupt"
+            );
+            continue;
+        }
         out.push(id);
         if matches!(id.cid_type(), CidType::Bundle(_)) {
             if let Some(bytes) = cache.get(&id) {
-                if let Ok(children) = bundle::parse_bundle(bytes) {
-                    stack.extend(children.iter().copied());
+                match bundle::parse_bundle(bytes) {
+                    Ok(children) => {
+                        for child in children.iter().copied() {
+                            stack.push((child, depth + 1));
+                        }
+                    }
+                    Err(e) => tracing::warn!(err = ?e, "malformed bundle payload; subtree skipped"),
                 }
             }
         }
