@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 pub mod content_index;
 pub mod event_loop;
+pub mod folders;
 mod follows;
 mod identity;
 pub mod mail;

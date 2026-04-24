@@ -266,7 +266,7 @@ impl ContentIndex {
     }
 }
 
-mod hex_cid {
+pub(crate) mod hex_cid {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(cid: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
