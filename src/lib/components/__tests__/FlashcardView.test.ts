@@ -11,6 +11,7 @@ import FlashcardView from '../FlashcardView.svelte';
 let capturedOnFrame: ((pcm: Float32Array) => void) | null = null;
 let pendingStart: { resolve: () => void } | null = null;
 let autoResolveStart = true;
+let rejectStart = false;
 
 vi.mock('../../voice/audio-capture', () => {
   return {
@@ -20,6 +21,9 @@ vi.mock('../../voice/audio-capture', () => {
       }
       start(onFrame: (pcm: Float32Array) => void): Promise<void> {
         capturedOnFrame = onFrame;
+        if (rejectStart) {
+          return Promise.reject(new Error('mock: getUserMedia denied'));
+        }
         return new Promise((resolve) => {
           pendingStart = { resolve };
           if (autoResolveStart) resolve();
@@ -155,6 +159,7 @@ describe('FlashcardView', () => {
       capturedOnFrame = null;
       pendingStart = null;
       autoResolveStart = true;
+      rejectStart = false;
     });
 
     afterEach(() => {
@@ -374,6 +379,157 @@ describe('FlashcardView', () => {
 
       expect(mockService.processPcm).not.toHaveBeenCalled();
       expect(onStatsUpdate).not.toHaveBeenCalled();
+    });
+
+    it('does not start the mid-hold tick when ensureCapture fails', async () => {
+      // Regression for CodeRabbit PR #49 finding: ensureCapture swallows
+      // getUserMedia/AudioContext errors (logs + sets captureError) and
+      // returns normally with audioCapture still null. Before the guard
+      // widening, handlePttStart still called startTick after the await,
+      // so a user who denied mic access would silently hold PTT for 2 s
+      // and then see their combo zeroed by a handleRowTimeout fired on
+      // empty buffers — a phantom timeout for a mic that never came up.
+      rejectStart = true;
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]],
+      });
+      mockService.processPcm.mockReturnValue({ syllables: [] });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          initialStats: {
+            cardsCompleted: 5,
+            perfectCards: 5,
+            expressCards: 0,
+            bestTimeMs: 300,
+            totalTimeMs: 1500,
+            previousTimeMs: 300,
+            combo: 5,
+            totalCreditedBits: 40,
+          },
+          onStatsUpdate,
+        },
+      });
+
+      const btn = screen.getByRole('button', { name: /push to talk/i });
+      await fireEvent.mouseDown(btn);
+      // ensureCapture catches the rejection and resolves normally; its
+      // continuation in handlePttStart then sees audioCapture=null and
+      // must skip startTick. Flush microtasks so the rejection + catch
+      // path runs fully.
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Advance past the momentum window. A ticker would fire
+      // handleRowTimeout here and publish a combo=0 stats update.
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(mockService.processPcm).not.toHaveBeenCalled();
+      expect(onStatsUpdate).not.toHaveBeenCalled();
+    });
+
+    it('preserves combo when PTT is released within the mid-hold mismatch window', async () => {
+      // Regression for CodeRabbit PR #49 finding: the 300 ms red-flash
+      // rowState from a mid-hold mismatch persists across release, and
+      // the previous hadAttempt check (heardNibbles OR rowStates.!completed)
+      // treated it as an abandoned attempt on release. Per the design
+      // rule "No penalty on wrong answers", a release that coincides
+      // with mismatch state should not cost the user their combo — the
+      // mistake + quick release is exactly the shape the no-penalty
+      // rule exists to forgive.
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]], // expected nibbles [0, 0]
+      });
+      // Heard wildly wrong nibbles → mid-hold mismatch fires.
+      mockService.processPcm.mockReturnValue({
+        syllables: [syllable(0xf), syllable(0xf)],
+      });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          initialStats: {
+            cardsCompleted: 4,
+            perfectCards: 4,
+            expressCards: 0,
+            bestTimeMs: 300,
+            totalTimeMs: 1200,
+            previousTimeMs: 300,
+            combo: 4,
+            totalCreditedBits: 32,
+          },
+          onStatsUpdate,
+        },
+      });
+
+      const btn = await pressPtt();
+      capturedOnFrame!(pcmFrame());
+      await vi.advanceTimersByTimeAsync(300);
+      // Mismatch fired — MismatchDisplay is up, red flash is on the grid.
+      expect(screen.getByRole('status')).toBeTruthy();
+
+      // Release inside the 300 ms red-flash window.
+      await fireEvent.mouseUp(btn);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const resetCall = onStatsUpdate.mock.calls.find(([s]) => s.combo === 0);
+      expect(resetCall).toBeFalsy();
+    });
+
+    it('points the mismatch caret at the first red byte in express mode, skipping yellow bytes', async () => {
+      // Regression for Cursor Bugbot PR #49 finding: in express mode an
+      // earlier byte can strictly differ but pass express matching
+      // (yellow/accepted), while a later byte is the true red failure.
+      // findFirstNibbleDiff alone would point at the yellow byte's
+      // differing nibble — misleading feedback. The caret must land on
+      // the first RED byte's failing nibble instead.
+      const mockService = createMockService();
+      // Two-byte Apprentice row so byte 0 and byte 1 can differ independently.
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Apprentice',
+        data: [0x01, 0x02],
+        rows: [[0x01, 0x02]],
+      });
+      // Heard nibbles:
+      //   byte 0: (0,1) → (0, 5). Nibble 1 strictly differs: exp U (1),
+      //           heard JU (5). In 'vowel' mode vowels match → yellow.
+      //   byte 1: (0,2) → (0, 7). Nibble 3 strictly differs: exp E (2),
+      //           heard JI (7). Vowels differ (E vs I) → red.
+      // The caret should land on the low nibble of byte 1 (index 3), not
+      // on nibble 1 of the yellow byte.
+      mockService.processPcm.mockReturnValue({
+        syllables: [syllable(0), syllable(5), syllable(0), syllable(7)],
+      });
+      render(FlashcardView, {
+        props: {
+          level: 1,
+          expressMode: 'vowel',
+          stq8Service: mockService,
+          onStatsUpdate: vi.fn(),
+        },
+      });
+
+      await pressPtt();
+      capturedOnFrame!(pcmFrame());
+      await vi.advanceTimersByTimeAsync(300);
+
+      // Inspect the caret column via MismatchDisplay's rendered text. The
+      // caret column for nibble 3 is LABEL_WIDTH(10) + byteIdx(1)*5 +
+      // syllableIdx(1)*2 = 17. Strict-first-diff would have placed it at
+      // column 10 + 0*5 + 1*2 = 12.
+      const pre = screen.getByLabelText(/mismatch feedback/i);
+      const caretLine = pre.textContent?.split('\n').at(-1) ?? '';
+      expect(caretLine).toBe(' '.repeat(17) + '^^');
     });
 
     it('preserves combo when the release flush completes a card with overshoot nibbles', async () => {

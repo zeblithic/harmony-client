@@ -9,7 +9,7 @@
     ByteResult,
   } from '../flashcard-types';
   import { initialSessionStats } from '../flashcard-types';
-  import { evaluateBytes } from '../express-lane';
+  import { evaluateBytes, failingNibbleInRedByte } from '../express-lane';
   import { formatFlatBytes, findFirstNibbleDiff } from '../q8-flat';
   import type { Stq8ServiceLike } from '../stq8-service';
   import { AudioCapture } from '../voice/audio-capture';
@@ -166,7 +166,14 @@
     // release would leave an orphan tick that eventually fires
     // handleRowTimeout and resets combo. Likewise, starting a tick on a
     // destroyed component leaks the timer.
-    if (destroyed || !pttActive) return;
+    //
+    // `audioCapture` is also checked because ensureCapture swallows start
+    // failures (permission denied, no device, AudioContext error) and
+    // leaves the field null while the returned promise still resolves
+    // normally. Arming the tick without a live mic would treat the
+    // resulting silence as a momentum timeout after 2 s and zero combo
+    // on a user who never actually had capture running.
+    if (destroyed || !pttActive || !audioCapture) return;
     startTick();
   }
 
@@ -187,10 +194,18 @@
     // card, heardNibbles retains the carry nibbles for the new card's row 0
     // — interpreting that carry as "the user abandoned a row mid-attempt"
     // would undo the combo increment handleCardComplete just published.
+    //
+    // Mismatch state (mismatch !== null) is also carved out: design says
+    // "No penalty on wrong answers", which must apply even when release
+    // lands inside the 300 ms red-flash window or the final flush itself
+    // triggered a mismatch. Treating the red-flash rowState or the in-
+    // flush mismatch path as an abandonable partial attempt would break
+    // combo on exactly the scenarios the no-penalty rule exists to
+    // cover. Only heardNibbles — classified syllables with no mismatch
+    // in play — counts as a partial attempt for combo-reset purposes.
     const preFlushActiveRow = activeRowIndex;
-    const preFlushHadAttempt =
-      heardNibbles.length > 0 ||
-      rowStates.some((s) => s.rowIndex === preFlushActiveRow && !s.completed);
+    const preFlushHadAttempt = heardNibbles.length > 0;
+    const mismatchBeforeFlush = mismatch !== null;
     const preFlushCardsCompleted = stats.cardsCompleted;
 
     // Final flush: any frames captured between the last tick and release
@@ -199,11 +214,18 @@
     processTick({ finalFlush: true });
 
     const cardCompletedDuringFlush = stats.cardsCompleted > preFlushCardsCompleted;
+    const mismatchAfterFlush = mismatch !== null;
     // Release-cancels-row per spec: "Release PTT = cancel current row." Only
-    // fires when the user was mid-attempt AND the flush couldn't rescue it
-    // into a card completion. Filter by preFlushActiveRow because the flush
-    // may have advanced activeRowIndex out from under us.
-    if (preFlushHadAttempt && !cardCompletedDuringFlush) {
+    // fires when the user was genuinely mid-attempt: classified syllables in
+    // flight, no card completion rescued by the flush, and no mismatch in
+    // play (either before or produced by the flush). Filter by
+    // preFlushActiveRow because the flush may have advanced activeRowIndex.
+    if (
+      preFlushHadAttempt &&
+      !cardCompletedDuringFlush &&
+      !mismatchBeforeFlush &&
+      !mismatchAfterFlush
+    ) {
       rowStates = rowStates.filter(
         (s) => s.rowIndex !== preFlushActiveRow || s.completed,
       );
@@ -361,10 +383,29 @@
       );
     }, 300);
 
+    // Caret points at the first truly-failing nibble in the first red byte.
+    // In strict mode this coincides with the first strict diff, but in
+    // express mode a leading byte may strictly differ yet still be
+    // accepted as yellow — the caret must point at what actually failed,
+    // not at an express-accepted divergence. handleRowMismatch is only
+    // called when hasRed=true, so findIndex should return >= 0; the
+    // findFirstNibbleDiff fallback exists only as a safety net.
+    const firstRedByteIdx = results.findIndex((r) => r === 'red');
+    const firstDiffNibbleIdx =
+      firstRedByteIdx >= 0
+        ? firstRedByteIdx * 2 +
+          failingNibbleInRedByte(
+            row[firstRedByteIdx],
+            heardSnapshot[firstRedByteIdx * 2],
+            heardSnapshot[firstRedByteIdx * 2 + 1],
+            expressMode,
+          )
+        : findFirstNibbleDiff(row, heardSnapshot);
+
     mismatch = {
       expectedBytes: row,
       heardNibbles: heardSnapshot,
-      firstDiffNibbleIdx: findFirstNibbleDiff(row, heardSnapshot),
+      firstDiffNibbleIdx,
     };
 
     // Reset for retry. No combo penalty — design: "No penalty on wrong answers."

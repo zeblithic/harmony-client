@@ -1,6 +1,6 @@
 // src/lib/express-lane.test.ts
 import { describe, it, expect } from 'vitest';
-import { evaluateBytes } from './express-lane';
+import { evaluateBytes, failingNibbleInRedByte } from './express-lane';
 
 describe('evaluateBytes', () => {
   // --- Core matching ---
@@ -121,5 +121,32 @@ describe('evaluateBytes', () => {
     // In "both" mode, each nibble passes independently (one via consonant, one via vowel)
     const { results } = evaluateBytes([0x00], [1, 4], 'both');
     expect(results).toEqual(['yellow']);
+  });
+});
+
+describe('failingNibbleInRedByte', () => {
+  it('returns 0 when the high nibble differs strictly in express-off mode', () => {
+    // Byte 0x92, heard [0xa, 0x2]: high differs, low exact. Off mode → high fails.
+    expect(failingNibbleInRedByte(0x92, 0xa, 0x2, 'off')).toBe(0);
+  });
+
+  it('returns 1 when only the low nibble differs strictly in express-off mode', () => {
+    expect(failingNibbleInRedByte(0x92, 0x9, 0x3, 'off')).toBe(1);
+  });
+
+  it('points at the low nibble when the high nibble express-matches but the low does not (vowel mode)', () => {
+    // Expected byte 0x12: high=1 (cons=0 ', vowel=1 U), low=2 (cons=0 ', vowel=2 E).
+    // Heard high=0x5 (cons=1 J, vowel=1 U): strict diff, vowel matches → express-accepted.
+    // Heard low=0x3 (cons=0 ', vowel=3 I): strict diff, vowel differs → true failure.
+    // Caret should point at the low nibble (idx 1 within the byte), not the high.
+    expect(failingNibbleInRedByte(0x12, 0x5, 0x3, 'vowel')).toBe(1);
+  });
+
+  it('points at the high nibble when only the high truly fails in consonant mode', () => {
+    // Expected byte 0x48: high=4 (cons=1 J, vowel=0 O), low=8 (cons=2 K, vowel=0 O).
+    // Heard high=0x80 (cons=2 K, vowel=0 O): cons differs (1 vs 2), vowel matches.
+    // consonant mode → high fails (consonant differs, no match via consonant rule).
+    // Heard low=0x8 (exact).
+    expect(failingNibbleInRedByte(0x48, 0x8, 0x8, 'consonant')).toBe(0);
   });
 });
