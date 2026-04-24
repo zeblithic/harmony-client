@@ -1163,7 +1163,8 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
 
 /// Wire format returned by `list_content` — one entry per self-ingested
 /// file the client is aware of. Joins sidecar metadata with the runtime
-/// cache's pinned state snapshot.
+/// cache's pinned state snapshot. ZEB-158 slice 1 adds `kind` to
+/// distinguish leaf files from folder bundles.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentItemWire {
@@ -1176,6 +1177,7 @@ pub struct ContentItemWire {
     pub pinned: bool,
     pub licensed: bool,
     pub archived: bool,
+    pub kind: String,             // ZEB-158: "leaf" | "folder"
 }
 
 fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
@@ -1193,6 +1195,13 @@ fn replication_tier_wire(t: content_index::ReplicationTier) -> &'static str {
         content_index::ReplicationTier::Default => "default",
         content_index::ReplicationTier::High => "high",
         content_index::ReplicationTier::Ultra => "ultra",
+    }
+}
+
+fn kind_wire(k: content_index::ContentKind) -> &'static str {
+    match k {
+        content_index::ContentKind::Leaf => "leaf",
+        content_index::ContentKind::Folder => "folder",
     }
 }
 
@@ -1261,6 +1270,7 @@ async fn list_content(
                 pinned: joined_pinned(e, &pinned_set),
                 licensed: e.licensed,
                 archived: e.archived,
+                kind: kind_wire(e.kind).to_string(),
             })
             .collect()
     };
@@ -2644,6 +2654,25 @@ mod pin_persistence_tests {
             pinned,
             kind: content_index::ContentKind::Leaf,
         }
+    }
+
+    #[test]
+    fn content_item_wire_serializes_kind_field() {
+        let wire = ContentItemWire {
+            cid: "aa".repeat(32),
+            name: "Photos".into(),
+            size_bytes: 32,
+            stored_at: 1,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: false,
+            licensed: false,
+            archived: false,
+            kind: "folder".into(),
+        };
+        let json = serde_json::to_string(&wire).expect("serialize");
+        // camelCase rename_all is already on ContentItemWire; kind is a plain field.
+        assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
     }
 
     #[test]

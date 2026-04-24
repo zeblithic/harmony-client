@@ -66,6 +66,19 @@ pub enum ContentVerbRequest {
     PinnedSet {
         reply: oneshot::Sender<std::collections::HashSet<[u8; 32]>>,
     },
+    /// ZEB-158 slice 1: read raw bytes for a CID out of the runtime
+    /// cache. Used by `list_content(folder_cid=Some)` in src-tauri/src/lib.rs
+    /// to parse a folder bundle's manifest without needing direct access
+    /// to the `!Send` NodeRuntime.
+    ///
+    /// Returns `None` if the CID is not admitted in the cache. Callers
+    /// surface "folder not in cache" diagnostics instead of errors so a
+    /// legitimately-evicted folder is distinguishable from a malformed
+    /// request.
+    ReadBytes {
+        cid: [u8; 32],
+        reply: oneshot::Sender<Option<Vec<u8>>>,
+    },
 }
 
 /// A follow/unfollow request sent from the Tauri command thread into the event loop.
@@ -652,6 +665,11 @@ pub async fn run<R: Runtime>(
                             .map(|id| id.to_bytes())
                             .collect();
                         let _ = reply.send(pinned);
+                    }
+                    ContentVerbRequest::ReadBytes { cid, reply } => {
+                        let id = ContentId::from_bytes(cid);
+                        let bytes = runtime.storage_tier().cache().get(&id).map(|b| b.to_vec());
+                        let _ = reply.send(bytes);
                     }
                 }
             }
@@ -1297,6 +1315,27 @@ mod fetch_recursive_tests {
 
         let err = fetch_recursive(fetcher, root).await.unwrap_err();
         assert!(err.contains("missing cid"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod content_verb_tests {
+    use super::ContentVerbRequest;
+
+    #[test]
+    fn read_bytes_verb_variant_is_constructible() {
+        let (reply_tx, _reply_rx) =
+            tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+        let req = ContentVerbRequest::ReadBytes {
+            cid: [0x7Au8; 32],
+            reply: reply_tx,
+        };
+        match req {
+            ContentVerbRequest::ReadBytes { cid, .. } => {
+                assert_eq!(cid, [0x7Au8; 32]);
+            }
+            _ => panic!("matched wrong variant"),
+        }
     }
 }
 
