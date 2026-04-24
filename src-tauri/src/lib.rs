@@ -1269,24 +1269,27 @@ async fn pin_content(
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
 
-    // ZEB-155: persist pin intent on the sidecar BEFORE dispatching the
-    // runtime verb. If the event loop is gone or the runtime-side fails,
-    // the durable side still records what the user wanted. Sidecar writes
-    // are best-effort — ContentIndex::save already tracing::warn's on
-    // disk-write errors, so failures surface via logs.
-    let (index, verb_tx) = {
+    // ZEB-155: persist pin intent on the sidecar BEFORE the runtime verb.
+    // Durability bias — if the runtime is gone (stop_node in flight, event
+    // loop torn down) the user's click still lands on disk and is restored
+    // on next start_node. Sidecar writes are best-effort: ContentIndex::save
+    // already tracing::warn's on disk-write errors.
+    //
+    // `content_verb_tx` is cloned as Option to AVOID gating the sidecar
+    // write on runtime availability — the spec mandates sidecar-first even
+    // when we know we can't dispatch. We unwrap the Option AFTER the
+    // sidecar write so the durable side is consistent with the user's click
+    // regardless of the runtime outcome.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let verb_tx = guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?;
-        (guard.content_index.clone(), verb_tx)
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.set_pinned(&cid_bytes, true);
     }
 
+    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Pin {
@@ -1309,21 +1312,18 @@ async fn unpin_content(
 
     // ZEB-155: clear sidecar intent first, then dispatch the runtime
     // unpin. Mirror of pin_content's ordering — durable side stays
-    // consistent with the user's click across a crash between the
-    // sidecar write and the verb dispatch.
-    let (index, verb_tx) = {
+    // consistent with the user's click even when the runtime is gone
+    // (content_verb_tx is None). See pin_content for the full rationale.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let verb_tx = guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?;
-        (guard.content_index.clone(), verb_tx)
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.set_pinned(&cid_bytes, false);
     }
 
+    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Unpin {

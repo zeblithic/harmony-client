@@ -537,14 +537,19 @@ pub async fn run<R: Runtime>(
                     };
 
                     let result = fetch_recursive(fetch_one, root).await;
-                    // ZEB-155: ping the completion channel on success so
-                    // the main loop can consult pin_intent and re-pin.
-                    // Fire-and-forget: send failure means the event loop
-                    // is shutting down, which is fine.
-                    if result.is_ok() {
-                        let _ = completion_tx.send(cid_bytes).await;
-                    }
+                    // ZEB-155: reply to the fetch caller FIRST so a full
+                    // completion channel never delays the fetch reply.
+                    // Then best-effort-notify via try_send. If the
+                    // completion channel is full (rare — main loop drain
+                    // is O(1) per select pass), we lose this chance to
+                    // auto-repin; the next user action or next start_node
+                    // reconverges. try_send also returns Err on closed,
+                    // which is fine (event loop shutting down).
+                    let is_ok = result.is_ok();
                     let _ = req.reply.send(result);
+                    if is_ok {
+                        let _ = completion_tx.try_send(cid_bytes);
+                    }
                 });
             }
 

@@ -147,9 +147,11 @@ Some(req) = fetch_rx.recv() => {
 }
 ```
 
-**Correctness argument:**
+**Correctness argument (post-ZEB-159):**
 
-* `fetch_recursive` only returns `Ok` after every descendant is materialised in the cache. `collect_descendants` therefore sees a fully-populated tree — the ZEB-146 "cache empty → Pin is a no-op" failure mode is structurally absent here.
+The hook is architecturally correct and test-proven in isolation (given admitted bytes + seeded intent, repin fires), but its practical reach in the current client is gated by [ZEB-159](https://linear.app/zeblith/issue/ZEB-159). Today's `fetch_rx` arm returns fetched bytes to the Tauri caller without admitting them into `ContentStore` — so in production, `collect_descendants` walks an empty cache for the fetched CID and `runtime.pin_content` is a no-op. When ZEB-159 wires fetch success to cache admission, the correctness argument below holds end-to-end.
+
+* Once ZEB-159 lands, `fetch_recursive` returning `Ok` implies every descendant is materialised in the cache. `collect_descendants` then sees a fully-populated tree — the ZEB-146 "cache empty → Pin is a no-op" failure mode becomes structurally absent.
 * `runtime.pin_content(id)` is idempotent. Re-issuing on a fetch of an already-pinned root is a no-op, not a correctness hazard.
 * `pin_intent` is a snapshot of sidecar truth, refreshed at `start_node` and kept in sync by the Pin/Unpin/Burn arms. No cross-thread synchronization needed — the event loop owns it exclusively.
 
