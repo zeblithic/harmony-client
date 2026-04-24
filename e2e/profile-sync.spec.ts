@@ -91,15 +91,17 @@ test.describe('profile sync', () => {
       await openSettings(mainPage);
       await expect(mainPage.getByLabel(NAME_INPUT)).toHaveValue(TEST_NAME);
     } finally {
-      // Always restore to a known value — even if the assertions above
-      // threw, we don't want to leave TEST_NAME in localStorage polluting
-      // the next run.
-      await openSettings(mainPage).catch(() => {});
-      await mainPage.getByLabel(NAME_INPUT).fill(original).catch(() => {});
-      await mainPage
-        .getByRole('button', { name: SAVE_BUTTON })
-        .click()
-        .catch(() => {});
+      // Restore to a known value, and verify the restore actually landed.
+      // Cleanup failure is signal, not noise: a dirty `harmony-profile` key
+      // pollutes every subsequent run and every later spec in this session.
+      // If the test body above also failed, Playwright's trace/report still
+      // surfaces both errors distinctly — we don't need to swallow here.
+      await openSettings(mainPage);
+      await mainPage.getByLabel(NAME_INPUT).fill(original);
+      await mainPage.getByRole('button', { name: SAVE_BUTTON }).click();
+      await expect
+        .poll(() => readPersistedDisplayName(mainPage), { timeout: 5_000 })
+        .toBe(original);
     }
   });
 });

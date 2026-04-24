@@ -99,15 +99,19 @@ test.describe('zenoh connect', () => {
       await viz.waitForTimeout(3_000);
     }
 
-    // All three invocations from the issue's spec.
-    const addr = await invoke<string>(mainPage, 'get_node_addr');
+    // Probe IPC on the *viz* page — that's the context where Connect ran, so
+    // that's the bridge that could have been damaged. Custom harmony commands
+    // are registered via `generate_handler!` and are globally callable from
+    // any webview; the network-viz capability only restricts `core:*` /
+    // webview-spawn, not our own commands.
+    const addr = await invoke<string>(viz, 'get_node_addr');
     expect(addr).toMatch(/^[0-9a-f]{32}$/i);
 
-    const followed = await invoke<unknown[]>(mainPage, 'list_followed');
+    const followed = await invoke<unknown[]>(viz, 'list_followed');
     expect(Array.isArray(followed)).toBe(true);
 
     const counts = await invoke<Record<string, { total: number; unread: number }>>(
-      mainPage,
+      viz,
       'get_mail_counts',
     );
     expect(counts).toHaveProperty('inbox');

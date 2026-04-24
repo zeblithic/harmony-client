@@ -45,8 +45,8 @@ Quick sanity check that CDP is live:
 curl http://localhost:9222/json/list
 ```
 
-You should see at least one target whose `url` starts with
-`http://localhost:5173/`.
+You should see at least one target whose `url` starts with the Vite origin
+(`http://localhost:5173/` by default, or whatever you've set `VITE_ORIGIN` to).
 
 ### Terminal 2 — the suite
 
@@ -54,8 +54,15 @@ You should see at least one target whose `url` starts with
 npm run test:e2e
 ```
 
-This runs all specs once against the live webview. Override the CDP endpoint
-with `CDP_ENDPOINT=http://host:port` if needed.
+This runs all specs once against the live webview. Both endpoints are
+overridable via environment variables — the fixture keys page discovery off
+the Vite origin, so if your dev server isn't on the default port you must
+override *both*:
+
+| Variable | Default | What it controls |
+|----------|---------|------------------|
+| `CDP_ENDPOINT` | `http://localhost:9222` | Chromium-DevTools-Protocol port WebView2 was launched with |
+| `VITE_ORIGIN` | `http://localhost:5173` | Origin used to filter CDP targets for the main app page |
 
 ## What's covered
 
