@@ -532,6 +532,151 @@ describe('FlashcardView', () => {
       expect(caretLine).toBe(' '.repeat(17) + '^^');
     });
 
+    it('seeds the momentum timer after capture is live so slow ensureCapture does not trigger phantom timeout', async () => {
+      // Regression for CodeRabbit PR #49 follow-up: lastAdvanceAt was
+      // previously seeded before `await ensureCapture()`. If the first-
+      // use permission prompt or AudioContext construction took longer
+      // than 2 s, the first post-capture tick would immediately trip
+      // handleRowTimeout against a stale-by-3-seconds baseline and
+      // zero the user's combo before they'd made a sound.
+      autoResolveStart = false;
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]],
+      });
+      mockService.processPcm.mockReturnValue({ syllables: [] });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          initialStats: {
+            cardsCompleted: 3,
+            perfectCards: 3,
+            expressCards: 0,
+            bestTimeMs: 300,
+            totalTimeMs: 900,
+            previousTimeMs: 300,
+            combo: 3,
+            totalCreditedBits: 24,
+          },
+          onStatsUpdate,
+        },
+      });
+
+      const btn = screen.getByRole('button', { name: /push to talk/i });
+      await fireEvent.mouseDown(btn);
+      // Simulate a slow permission prompt — 3 s with no capture.
+      await vi.advanceTimersByTimeAsync(3000);
+      // Capture finally comes up.
+      pendingStart!.resolve();
+      pendingStart = null;
+      await vi.advanceTimersByTimeAsync(0);
+
+      // First tick post-capture at +300 ms. With the pre-fix timing the
+      // tick would see Date.now() - lastAdvanceAt >= 2 s and fire
+      // handleRowTimeout, publishing combo=0.
+      await vi.advanceTimersByTimeAsync(300);
+
+      const resetCall = onStatsUpdate.mock.calls.find(([s]) => s.combo === 0);
+      expect(resetCall).toBeFalsy();
+    });
+
+    it('resets combo when a partial attempt first appears during the release flush', async () => {
+      // Regression for CodeRabbit PR #49 follow-up: if a short hold
+      // releases before any mid-hold tick fires, the release's final
+      // flush is the first (and only) processPcm call. Partial syllables
+      // it produces were being ignored by the pre-flush-only hadAttempt
+      // check, so combo failed to reset despite the row being abandoned.
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Apprentice',
+        data: [0x00, 0x00],
+        rows: [[0x00, 0x00]], // 4 nibbles expected
+      });
+      // Flush classifies 1 partial nibble — doesn't complete a byte,
+      // doesn't trigger mismatch, doesn't complete the card.
+      mockService.processPcm.mockReturnValue({
+        syllables: [syllable(0x0)],
+      });
+      const onStatsUpdate = vi.fn();
+      render(FlashcardView, {
+        props: {
+          level: 1,
+          expressMode: 'off',
+          stq8Service: mockService,
+          initialStats: {
+            cardsCompleted: 2,
+            perfectCards: 2,
+            expressCards: 0,
+            bestTimeMs: 400,
+            totalTimeMs: 800,
+            previousTimeMs: 400,
+            combo: 2,
+            totalCreditedBits: 16,
+          },
+          onStatsUpdate,
+        },
+      });
+
+      const btn = await pressPtt();
+      capturedOnFrame!(pcmFrame());
+      // Release without advancing the tick timer — the flush is the
+      // only processPcm call.
+      await fireEvent.mouseUp(btn);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const resetCall = onStatsUpdate.mock.calls.find(([s]) => s.combo === 0);
+      expect(resetCall).toBeTruthy();
+    });
+
+    it('preserves the new red-flash row state when a second mismatch fires 300 ms after the first', async () => {
+      // Regression for Cursor Bugbot PR #49 finding: handleRowMismatch's
+      // setTimeout captures failedRowIndex and unconditionally filters
+      // !completed rowStates 300 ms later. Mid-hold ticks are 300 ms
+      // apart, so two consecutive wrong-syllable ticks produce back-
+      // to-back mismatches whose stale-timeout fires at the exact moment
+      // the new red-flash rowState is mounted — stripping it instantly.
+      const mockService = createMockService();
+      mockService.generateChallenge.mockReturnValue({
+        level: 'Novice',
+        data: [0x00],
+        rows: [[0x00]],
+      });
+      // Every tick produces the same wrong syllables → another mismatch.
+      mockService.processPcm.mockReturnValue({
+        syllables: [syllable(0xf), syllable(0xf)],
+      });
+      render(FlashcardView, {
+        props: {
+          level: 0,
+          expressMode: 'off',
+          stq8Service: mockService,
+          onStatsUpdate: vi.fn(),
+        },
+      });
+
+      await pressPtt();
+      // Tick 1 at +300 ms — first mismatch, red flash, setTimeout for +600 ms.
+      capturedOnFrame!(pcmFrame());
+      await vi.advanceTimersByTimeAsync(300);
+      // Tick 2 at +600 ms — second mismatch, new red flash. Without the
+      // fix, the first mismatch's setTimeout would also fire at +600 ms
+      // and wipe the new flash.
+      capturedOnFrame!(pcmFrame());
+      await vi.advanceTimersByTimeAsync(300);
+
+      // At least one byte-cell should still be rendered with the `red`
+      // class (the new mismatch's red flash).
+      const redCells = screen
+        .queryAllByTestId('byte-cell')
+        .filter((el) => el.classList.contains('red'));
+      expect(redCells.length).toBeGreaterThan(0);
+    });
+
     it('preserves combo when the release flush completes a card with overshoot nibbles', async () => {
       // Regression for Cursor Bugbot's "carry nibbles break combo" finding:
       // when the final flush itself completes a card, heardNibbles retains

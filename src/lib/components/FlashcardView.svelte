@@ -77,6 +77,12 @@
   // is active.
   let lastAdvanceAt: number | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Pending handle for the 300 ms red-flash cleanup scheduled in
+  // handleRowMismatch. Held so a subsequent mismatch on the same row
+  // can cancel the previous cleanup before scheduling a fresh one —
+  // otherwise the old setTimeout's closure would fire on the new
+  // red-flash rowState and wipe it prematurely.
+  let redFlashClear: ReturnType<typeof setTimeout> | null = null;
   // Mismatch feedback for the MismatchDisplay component. Set whenever a
   // byte-boundary check finds a red, cleared on successful row advance
   // or on next PTT press.
@@ -157,8 +163,6 @@
     resetAttempt();
     mismatch = null;
     pttActive = true;
-    pttSegmentStart = Date.now();
-    lastAdvanceAt = Date.now();
     await ensureCapture();
     // Re-check state after the await: PttButton fires onPttStart synchronously
     // without awaiting, so handlePttStop (or unmount) can run between the
@@ -174,6 +178,14 @@
     // resulting silence as a momentum timeout after 2 s and zero combo
     // on a user who never actually had capture running.
     if (destroyed || !pttActive || !audioCapture) return;
+    // Seed timers AFTER capture is actually live. If the first-use
+    // permission prompt or AudioContext construction took >2 s, an
+    // earlier-seeded lastAdvanceAt would trip the first tick's timeout
+    // check immediately — a phantom timeout for a mic the user hadn't
+    // even granted yet. pttSegmentStart is moved here too so the "active
+    // PTT time" metric only counts time on a live mic.
+    pttSegmentStart = Date.now();
+    lastAdvanceAt = Date.now();
     startTick();
   }
 
@@ -215,13 +227,19 @@
 
     const cardCompletedDuringFlush = stats.cardsCompleted > preFlushCardsCompleted;
     const mismatchAfterFlush = mismatch !== null;
+    // Attempts that first appear in the flush itself also count: a short
+    // hold that never got a mid-hold tick can still have its initial
+    // syllables classified by this one flush call. Without the post-flush
+    // check, those attempts slip past the combo-reset and get silently
+    // discarded by resetAttempt() below.
+    const postFlushHadAttempt = heardNibbles.length > 0;
     // Release-cancels-row per spec: "Release PTT = cancel current row." Only
-    // fires when the user was genuinely mid-attempt: classified syllables in
-    // flight, no card completion rescued by the flush, and no mismatch in
-    // play (either before or produced by the flush). Filter by
+    // fires when the user was genuinely mid-attempt (pre- or during-flush
+    // classified syllables), no card completion rescued by the flush, and
+    // no mismatch in play on either side of the flush. Filter by
     // preFlushActiveRow because the flush may have advanced activeRowIndex.
     if (
-      preFlushHadAttempt &&
+      (preFlushHadAttempt || postFlushHadAttempt) &&
       !cardCompletedDuringFlush &&
       !mismatchBeforeFlush &&
       !mismatchAfterFlush
@@ -371,16 +389,23 @@
     heardSnapshot: number[],
     results: ByteResult[],
   ) {
-    // Brief red flash on the grid (same visual as pre-Slice-4).
+    // Brief red flash on the grid (same visual as pre-Slice-4). Any
+    // pending cleanup from a previous mismatch on any row must be
+    // canceled first — otherwise its closure would fire 300 ms after
+    // THAT mismatch and strip the new red-flash rowState on the same
+    // row (mid-hold ticks are 300 ms apart, so back-to-back mismatches
+    // land exactly at the stale timeout's deadline).
+    if (redFlashClear !== null) clearTimeout(redFlashClear);
     const failedRowIndex = activeRowIndex;
     rowStates = [
       ...rowStates.filter((s) => s.rowIndex !== failedRowIndex),
       { rowIndex: failedRowIndex, byteResults: results, completed: false },
     ];
-    setTimeout(() => {
+    redFlashClear = setTimeout(() => {
       rowStates = rowStates.filter(
         (s) => s.rowIndex !== failedRowIndex || s.completed,
       );
+      redFlashClear = null;
     }, 300);
 
     // Caret points at the first truly-failing nibble in the first red byte.
@@ -491,6 +516,10 @@
   $effect(() => () => {
     destroyed = true;
     stopTick();
+    if (redFlashClear !== null) {
+      clearTimeout(redFlashClear);
+      redFlashClear = null;
+    }
     const c = audioCapture;
     audioCapture = null;
     pttActive = false;
