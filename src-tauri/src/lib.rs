@@ -413,9 +413,12 @@ async fn start_node(
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
     ));
-    let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-        content_index::ContentIndex::load(&app_data_dir),
-    ));
+    // ZEB-155: fetch-completion channel. Both halves are owned by
+    // start_node so the spawned fetch task (in event_loop) can clone the
+    // tx, while the main loop consumes from the rx.
+    let (fetch_completion_tx, fetch_completion_rx) =
+        tokio::sync::mpsc::channel::<[u8; 32]>(32);
+
     let followed_set_clone = followed_set.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
@@ -525,6 +528,31 @@ async fn start_node(
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation += 1;
 
+        // ZEB-155: load the sidecar NOW — after stop_handles has
+        // quiesced the previous node and under the state lock — so any
+        // pin_content / unpin_content / burn_content that raced with
+        // the stop path has already durably written to disk. Concurrent
+        // command handlers are blocked on state.lock(), so they cannot
+        // slip a write between this load and the Arc install below.
+        //
+        // A narrower window remains: a mutation command that cloned
+        // the OLD Arc before stop_handles and is still mid-set_pinned
+        // when the NEW Arc is installed will orphan its disk write
+        // (the next NEW-Arc save() overwrites). That end-to-end
+        // serialization is ZEB-160's territory.
+        let content_index = std::sync::Arc::new(std::sync::Mutex::new(
+            content_index::ContentIndex::load(&app_data_dir),
+        ));
+        let pin_intent: std::collections::HashSet<[u8; 32]> = {
+            let idx = content_index
+                .lock()
+                .map_err(|e| format!("content_index lock on startup: {e}"))?;
+            idx.entries()
+                .filter(|e| e.pinned)
+                .map(|e| e.cid)
+                .collect()
+        };
+
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
@@ -574,6 +602,9 @@ async fn start_node(
                         mail_mgr_clone,
                         Some(mail_sync_for_loop),
                         mail_refresh_rx,
+                        pin_intent,
+                        fetch_completion_tx,
+                        fetch_completion_rx,
                     )
                     .await;
                 });
@@ -1179,6 +1210,17 @@ pub struct IngestResult {
     pub size_bytes: u64,
 }
 
+/// ZEB-155: resolve the `pinned` flag for a single wire entry by
+/// OR-joining the sidecar's persisted intent with the runtime cache's
+/// currently-pinned set. Extracted so unit tests can exercise the join
+/// logic without a live Tauri state.
+fn joined_pinned(
+    entry: &content_index::ContentIndexEntry,
+    runtime_pinned: &std::collections::HashSet<[u8; 32]>,
+) -> bool {
+    entry.pinned || runtime_pinned.contains(&entry.cid)
+}
+
 #[tauri::command]
 async fn list_content(
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -1215,7 +1257,7 @@ async fn list_content(
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: pinned_set.contains(&e.cid),
+                pinned: joined_pinned(e, &pinned_set),
                 licensed: e.licensed,
                 archived: e.archived,
             })
@@ -1234,13 +1276,28 @@ async fn pin_content(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
-    let verb_tx = {
+
+    // ZEB-155: persist pin intent on the sidecar BEFORE the runtime verb.
+    // Durability bias — if the runtime is gone (stop_node in flight, event
+    // loop torn down) the user's click still lands on disk and is restored
+    // on next start_node. Sidecar writes are best-effort: ContentIndex::save
+    // already tracing::warn's on disk-write errors.
+    //
+    // `content_verb_tx` is cloned as Option to AVOID gating the sidecar
+    // write on runtime availability — the spec mandates sidecar-first even
+    // when we know we can't dispatch. We unwrap the Option AFTER the
+    // sidecar write so the durable side is consistent with the user's click
+    // regardless of the runtime outcome.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_pinned(&cid_bytes, true);
+    }
+
+    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Pin {
@@ -1260,13 +1317,21 @@ async fn unpin_content(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
-    let verb_tx = {
+
+    // ZEB-155: clear sidecar intent first, then dispatch the runtime
+    // unpin. Mirror of pin_content's ordering — durable side stays
+    // consistent with the user's click even when the runtime is gone
+    // (content_verb_tx is None). See pin_content for the full rationale.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.set_pinned(&cid_bytes, false);
+    }
+
+    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Unpin {
@@ -1280,6 +1345,12 @@ async fn unpin_content(
         .map_err(|_| "event loop dropped unpin request".to_string())?
 }
 
+/// Burn a CID: unpin runtime-side, then remove the sidecar entry.
+///
+/// ZEB-155: removing the sidecar entry implicitly drops any persisted
+/// pin intent — no explicit `set_pinned(false)` needed, because there's
+/// no entry left to hold a flag on. The event-loop Burn arm also clears
+/// the CID from the in-memory `pin_intent` set so the two stay in sync.
 #[tauri::command]
 async fn burn_content(
     cid: String,
@@ -1287,14 +1358,19 @@ async fn burn_content(
 ) -> Result<bool, String> {
     let cid_bytes = parse_cid_hex(&cid)?;
 
-    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
-    let verb_tx = {
+    // ZEB-155: snapshot both handles under a single NodeState lock, matching
+    // pin_content / unpin_content. Fail fast if the runtime is gone — no
+    // point removing the sidecar entry if we can't also clear the cache.
+    let (index, verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let verb_tx = guard
             .content_verb_tx
             .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
+            .ok_or_else(|| "runtime unavailable".to_string())?;
+        (guard.content_index.clone(), verb_tx)
     };
+
+    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     verb_tx
         .send(event_loop::ContentVerbRequest::Burn {
@@ -1307,13 +1383,9 @@ async fn burn_content(
         .await
         .map_err(|_| "event loop dropped burn request".to_string())??;
 
-    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the
-    //    entry (so the frontend knows whether the burn actually removed
-    //    something or was a no-op on an already-unknown CID).
-    let index = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
-    };
+    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the entry
+    //    (so the frontend knows whether the burn actually removed something
+    //    or was a no-op on an already-unknown CID).
     let removed = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.remove(&cid_bytes)
@@ -1566,6 +1638,7 @@ async fn ingest_content(
             replication_tier: content_index::ReplicationTier::Default,
             licensed: false,
             archived: false,
+            pinned: false,
         });
         if !inserted {
             tracing::debug!(
@@ -2548,5 +2621,55 @@ mod chunked_ingest_tests {
         // The smallest valid input: MAX_PAYLOAD_SIZE + 1 bytes.
         let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE + 1);
         chunk_and_bundle(&bytes).expect("must succeed at the minimum valid size");
+    }
+}
+
+#[cfg(test)]
+mod pin_persistence_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sidecar_entry(cid: [u8; 32], pinned: bool) -> content_index::ContentIndexEntry {
+        content_index::ContentIndexEntry {
+            cid,
+            file_name: "t.txt".into(),
+            size_bytes: 0,
+            stored_at_ms: 0,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned,
+        }
+    }
+
+    #[test]
+    fn joined_pinned_true_when_only_intent_is_set() {
+        let entry = sidecar_entry([0x11; 32], true);
+        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_true_when_only_runtime_effect_is_set() {
+        let entry = sidecar_entry([0x22; 32], false);
+        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        runtime_pinned.insert([0x22; 32]);
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_true_when_both_agree() {
+        let entry = sidecar_entry([0x33; 32], true);
+        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        runtime_pinned.insert([0x33; 32]);
+        assert!(joined_pinned(&entry, &runtime_pinned));
+    }
+
+    #[test]
+    fn joined_pinned_false_when_neither_says_so() {
+        let entry = sidecar_entry([0x44; 32], false);
+        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
+        assert!(!joined_pinned(&entry, &runtime_pinned));
     }
 }
