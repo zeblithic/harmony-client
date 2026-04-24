@@ -416,6 +416,26 @@ async fn start_node(
     let content_index = std::sync::Arc::new(std::sync::Mutex::new(
         content_index::ContentIndex::load(&app_data_dir),
     ));
+
+    // ZEB-155: seed the event loop's pin_intent set from the sidecar so
+    // a fetch after restart can re-pin restored intent. Built here under
+    // the content_index lock, then moved by-value into run_event_loop.
+    let pin_intent: std::collections::HashSet<[u8; 32]> = {
+        let idx = content_index
+            .lock()
+            .map_err(|e| format!("content_index lock on startup: {e}"))?;
+        idx.entries()
+            .filter(|e| e.pinned)
+            .map(|e| e.cid)
+            .collect()
+    };
+
+    // ZEB-155: fetch-completion channel. Both halves are owned by
+    // start_node so the spawned fetch task (in event_loop) can clone the
+    // tx, while the main loop consumes from the rx.
+    let (fetch_completion_tx, fetch_completion_rx) =
+        tokio::sync::mpsc::channel::<[u8; 32]>(32);
+
     let followed_set_clone = followed_set.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
@@ -574,6 +594,9 @@ async fn start_node(
                         mail_mgr_clone,
                         Some(mail_sync_for_loop),
                         mail_refresh_rx,
+                        pin_intent,
+                        fetch_completion_tx,
+                        fetch_completion_rx,
                     )
                     .await;
                 });

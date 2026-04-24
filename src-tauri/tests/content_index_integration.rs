@@ -97,6 +97,12 @@ async fn ingest_list_pin_burn_roundtrip() {
         s3_enabled: false,
     };
 
+    // ZEB-155: event_loop::run now takes pin_intent + fetch_completion
+    // channel halves. This test doesn't exercise pin persistence, so an
+    // empty set and a drain-only channel are sufficient.
+    let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
+    let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
     // NodeRuntime<MemoryBookStore> is !Send, so it must be constructed
     // INSIDE the dedicated OS thread — exactly how lib.rs::start_node does it.
     thread::Builder::new()
@@ -131,6 +137,9 @@ async fn ingest_list_pin_burn_roundtrip() {
                     mail_mgr,
                     None,  // mail_sync — not exercised in this test
                     refresh_rx,
+                    pin_intent,
+                    fetch_completion_tx,
+                    fetch_completion_rx,
                 )
                 .await;
             });
@@ -330,6 +339,12 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         s3_enabled: false,
     };
 
+    // ZEB-155: event_loop::run now takes pin_intent + fetch_completion
+    // channel halves. This test doesn't exercise pin persistence, so an
+    // empty set and a drain-only channel are sufficient.
+    let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
+    let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
     thread::Builder::new()
         .name("harmony-runtime-test-chunked".to_string())
         .stack_size(8 * 1024 * 1024)
@@ -361,6 +376,9 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     mail_mgr,
                     None,
                     refresh_rx,
+                    pin_intent,
+                    fetch_completion_tx,
+                    fetch_completion_rx,
                 )
                 .await;
             });
@@ -552,4 +570,192 @@ fn pin_intent_survives_reload() {
         entry.pinned,
         "pinned intent must survive reload (this is the ZEB-155 bug fix)"
     );
+}
+
+/// ZEB-155: when the fetch-completion arm receives a root CID that's in
+/// pin_intent, the cascade pins the root (and any descendants) in the
+/// runtime cache. Injected via a test-owned fetch_completion_tx clone so
+/// we don't need a real peer to answer a fetch_rx request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_complete_arm_pins_root_in_intent() {
+    use std::collections::HashSet;
+
+    let bytes = b"zeb-155 fetch-complete repin fixture".to_vec();
+    let cid = ContentId::for_book(&bytes, ContentFlags::default())
+        .expect("fixture CID");
+    let cid_bytes: [u8; 32] = cid.to_bytes();
+    let cid_hex = hex::encode(cid_bytes);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let app_data_dir = tmp.path().to_path_buf();
+
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestRequest>(4);
+    let (content_verb_tx, content_verb_rx) = mpsc::channel::<ContentVerbRequest>(16);
+    let (_publish_tx, publish_rx) = mpsc::channel(4);
+    let (_fetch_tx, fetch_rx) = mpsc::channel(4);
+    let (_follow_tx, follow_rx) = mpsc::channel(4);
+    let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
+    let (_voice_ch_tx, voice_ch_rx) =
+        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) =
+        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // ZEB-155: the fetch-completion channel. Test keeps its own clone of
+    // the sender so it can inject the completion signal synthetically.
+    let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(8);
+    let fetch_completion_tx_for_test = fetch_completion_tx.clone();
+
+    let followed_set = Arc::new(Mutex::new(
+        std::collections::HashSet::<String>::default(),
+    ));
+    let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
+        &app_data_dir.join("mail"),
+        [0u8; 16],
+    )));
+
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let config = NodeConfig {
+        storage_budget: StorageBudget {
+            cache_capacity: 512,
+            max_pinned_bytes: 50_000_000,
+        },
+        compute_budget: InstructionBudget { fuel: 100_000 },
+        schedule: Default::default(),
+        content_policy: ContentPolicy::default(),
+        filter_broadcast_config: FilterBroadcastConfig {
+            mutation_threshold: 10,
+            max_interval_ticks: 40,
+            expected_items: 512,
+            fp_rate: 0.001,
+        },
+        node_addr: "0000000000000000000000000000000000000000".to_string(),
+        local_identity_hash: [0u8; 16],
+        local_pq_identity_hash: [0u8; 16],
+        local_dsa_pubkey: vec![],
+        local_kem_pubkey: vec![],
+        reticulum_identity_bytes: None,
+        inference_gguf_cid: None,
+        inference_tokenizer_cid: None,
+        engram_manifest_cid: None,
+        disk_enabled: false,
+        disk_entries: Vec::new(),
+        disk_quota: None,
+        archive_enabled: false,
+        archive_entries: Vec::new(),
+        archive_quota: None,
+        archive_ingest_enabled: false,
+        eviction_push_enabled: false,
+        s3_enabled: false,
+    };
+
+    // Seed pin_intent with our CID so the completion arm will recognize it.
+    let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+    pin_intent.insert(cid_bytes);
+
+    thread::Builder::new()
+        .name("harmony-runtime-zeb155".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async move {
+                let (runtime, startup_actions) =
+                    NodeRuntime::new(config, MemoryBookStore::new());
+                harmony_app::event_loop::run(
+                    runtime,
+                    startup_actions,
+                    app_handle,
+                    None,
+                    ready_tx,
+                    shutdown_rx,
+                    publish_rx,
+                    fetch_rx,
+                    ingest_rx,
+                    content_verb_rx,
+                    follow_rx,
+                    voice_rx,
+                    voice_ch_rx,
+                    followed_set,
+                    mail_mgr,
+                    None,
+                    refresh_rx,
+                    pin_intent,
+                    fetch_completion_tx,
+                    fetch_completion_rx,
+                )
+                .await;
+            });
+        })
+        .expect("spawn runtime thread");
+
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.contains("Address already in use") => {
+            eprintln!("skipping test: {e}");
+            return;
+        }
+        Ok(Err(e)) => panic!("event loop failed to start: {e}"),
+        Err(_) => panic!("event loop dropped ready signal"),
+    }
+
+    // Admit bytes for the CID by ingesting. Required because collect_descendants
+    // walks the cache; pin_content is a no-op on an unadmitted CID.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    ingest_tx
+        .send(IngestRequest {
+            cid_hex: cid_hex.clone(),
+            data: bytes.clone(),
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    ack_rx.await.unwrap().expect("ingest succeeded");
+
+    // Baseline: the CID is admitted but unpinned (fresh ingest doesn't pin).
+    let (snap_tx, snap_rx) = oneshot::channel();
+    content_verb_tx
+        .send(ContentVerbRequest::PinnedSet { reply: snap_tx })
+        .await
+        .unwrap();
+    assert!(
+        !snap_rx.await.unwrap().contains(&cid_bytes),
+        "baseline: fresh ingest should not be pinned",
+    );
+
+    // Inject the completion signal. The main-loop arm will consult
+    // pin_intent, find our CID, and run the cascade.
+    fetch_completion_tx_for_test.send(cid_bytes).await.unwrap();
+
+    // Poll PinnedSet until the cascade lands, or time out. The completion
+    // arm and the snapshot arm are both serviced by the same select loop,
+    // so we can't race them in principle, but tokio scheduling can still
+    // interleave replies.
+    let mut attempts = 0;
+    loop {
+        let (snap_tx, snap_rx) = oneshot::channel();
+        content_verb_tx
+            .send(ContentVerbRequest::PinnedSet { reply: snap_tx })
+            .await
+            .unwrap();
+        if snap_rx.await.unwrap().contains(&cid_bytes) {
+            break; // success
+        }
+        attempts += 1;
+        if attempts > 20 {
+            panic!(
+                "fetch-completion arm did not pin the CID within ~1s \
+                 (20 × 50ms); pin_intent containing the CID should \
+                 trigger the cascade on completion signal",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

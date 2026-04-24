@@ -109,6 +109,9 @@ pub async fn run<R: Runtime>(
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     mail_sync: Option<Arc<crate::mail_sync::MailSync<R>>>,
     mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
+    mut pin_intent: std::collections::HashSet<[u8; 32]>,
+    fetch_completion_tx: mpsc::Sender<[u8; 32]>,
+    mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -505,6 +508,9 @@ pub async fn run<R: Runtime>(
             Some(req) = fetch_rx.recv() => {
                 let session = session.clone();
                 let cid_hex = req.cid_hex;
+                // ZEB-155: clone the completion sender so the spawned
+                // task can notify the main loop after a successful fetch.
+                let completion_tx = fetch_completion_tx.clone();
                 tokio::spawn(async move {
                     // Parse hex → 32-byte CID. Reply with an error if malformed.
                     let cid_bytes = match hex::decode(&cid_hex)
@@ -531,6 +537,13 @@ pub async fn run<R: Runtime>(
                     };
 
                     let result = fetch_recursive(fetch_one, root).await;
+                    // ZEB-155: ping the completion channel on success so
+                    // the main loop can consult pin_intent and re-pin.
+                    // Fire-and-forget: send failure means the event loop
+                    // is shutting down, which is fine.
+                    if result.is_ok() {
+                        let _ = completion_tx.send(cid_bytes).await;
+                    }
                     let _ = req.reply.send(result);
                 });
             }
@@ -582,6 +595,9 @@ pub async fn run<R: Runtime>(
                 use harmony_content::cid::ContentId;
                 match req {
                     ContentVerbRequest::Pin { cid, reply } => {
+                        // ZEB-155: record intent in the event-loop cache so
+                        // fetch-completion can auto-repin after a resurrect.
+                        pin_intent.insert(cid);
                         let root = ContentId::from_bytes(cid);
                         let all = collect_descendants(runtime.storage_tier().cache(), root);
                         let mut any_failed = false;
@@ -593,6 +609,8 @@ pub async fn run<R: Runtime>(
                         let _ = reply.send(Ok(!any_failed));
                     }
                     ContentVerbRequest::Unpin { cid, reply } => {
+                        // ZEB-155: clear intent so a later fetch doesn't re-pin.
+                        pin_intent.remove(&cid);
                         let root = ContentId::from_bytes(cid);
                         let all = collect_descendants(runtime.storage_tier().cache(), root);
                         for id in all {
@@ -604,6 +622,10 @@ pub async fn run<R: Runtime>(
                         // Burn on a RAM-only client cascades the runtime-side
                         // unpin; the sidecar-removal side of burn continues to
                         // happen in the Tauri command handler.
+                        // ZEB-155: also drop any persisted intent (the Tauri
+                        // command removes the sidecar entry, but this keeps
+                        // the in-memory set consistent if the orders diverge).
+                        pin_intent.remove(&cid);
                         let root = ContentId::from_bytes(cid);
                         let all = collect_descendants(runtime.storage_tier().cache(), root);
                         for id in all {
@@ -619,6 +641,20 @@ pub async fn run<R: Runtime>(
                             .map(|id| id.to_bytes())
                             .collect();
                         let _ = reply.send(pinned);
+                    }
+                }
+            }
+
+            // ── Fetch-completion replay hook (ZEB-155) ─────────────
+            // Spawned fetch tasks send on fetch_completion_tx after
+            // fetch_recursive returns Ok. If pin_intent contains the
+            // root, re-run the pin cascade now that bytes are resident.
+            Some(root_bytes) = fetch_completion_rx.recv() => {
+                if pin_intent.contains(&root_bytes) {
+                    let root = ContentId::from_bytes(root_bytes);
+                    let all = collect_descendants(runtime.storage_tier().cache(), root);
+                    for id in all {
+                        runtime.pin_content(id);
                     }
                 }
             }
