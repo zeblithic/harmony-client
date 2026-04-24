@@ -17,6 +17,10 @@ pub struct FolderManifest {
     pub folder_manifest: ManifestBody,
 }
 
+/// The `entries` slice is in bundle order: `entries[i].cid` must equal
+/// the bundle's `child[i+1]` for all `i`. `build_folder` guarantees this
+/// by construction; callers parsing a manifest from raw bytes must validate
+/// the invariant before trusting the entry list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestBody {
     pub version: u32,
@@ -150,7 +154,10 @@ mod tests {
     #[test]
     fn build_empty_folder() {
         let built = build_folder("", &[]).expect("build succeeds");
-        // Empty folder's bundle bytes are exactly the 32-byte manifest CID.
+        // BundleBuilder's wire format is raw concatenated CIDs with no framing
+        // header — see harmony-content/src/bundle.rs build_with_flags. An empty
+        // folder's bundle therefore equals its single child (the manifest CID)
+        // verbatim.
         assert_eq!(built.bundle_bytes.len(), 32);
         assert_eq!(&built.bundle_bytes[..], &built.manifest_cid.to_bytes()[..]);
         // Manifest must itself be a parseable empty folder manifest.
@@ -176,7 +183,8 @@ mod tests {
         ];
         let built = build_folder("parent", &children).expect("build");
 
-        // Bundle bytes = concat(manifest_cid, child_0_cid, child_1_cid) = 96 bytes.
+        // Bundle wire format: raw concatenated 32-byte CIDs, no header — see
+        // harmony-content/src/bundle.rs. Layout is [manifest_cid, child_0, child_1].
         assert_eq!(built.bundle_bytes.len(), 96);
         assert_eq!(&built.bundle_bytes[0..32], &built.manifest_cid.to_bytes()[..]);
         assert_eq!(&built.bundle_bytes[32..64], &[0x11u8; 32]);
