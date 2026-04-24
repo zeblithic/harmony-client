@@ -1694,39 +1694,19 @@ async fn ingest_content(
             .ok_or_else(|| "not connected".to_string())?
     };
 
-    // Send one (cid_hex, data) pair through the ingest channel and await its ack.
-    async fn send_one(
-        tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
-        cid_hex: String,
-        data: Vec<u8>,
-    ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        tx.send(event_loop::IngestRequest {
-            cid_hex,
-            data,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-        reply_rx
-            .await
-            .map_err(|_| "event loop dropped ingest request".to_string())??;
-        Ok(())
-    }
-
     let root_cid_bytes: [u8; 32] = match dispatch {
         IngestDispatch::Single => {
             let cid = ContentId::for_book(&bytes, ContentFlags::default())
                 .map_err(|e| format!("CID error: {e:?}"))?;
             let cid_hex = hex::encode(cid.to_bytes());
-            send_one(&ingest_tx, cid_hex, bytes).await?;
+            send_ingest(&ingest_tx, cid_hex, bytes).await?;
             cid.to_bytes()
         }
         IngestDispatch::Chunked => {
             let (leaves, bundle_payload, root) = chunk_and_bundle(&bytes)?;
             // Ingest every leaf in order.
             for (leaf_cid, leaf_bytes) in &leaves {
-                send_one(
+                send_ingest(
                     &ingest_tx,
                     hex::encode(leaf_cid.to_bytes()),
                     leaf_bytes.to_vec(),
@@ -1734,7 +1714,7 @@ async fn ingest_content(
                 .await?;
             }
             // Ingest the bundle itself.
-            send_one(
+            send_ingest(
                 &ingest_tx,
                 hex::encode(root.to_bytes()),
                 bundle_payload,
@@ -1782,6 +1762,103 @@ async fn ingest_content(
         file_name,
         size_bytes,
     })
+}
+
+/// Send one (cid_hex, data) pair through the ingest channel and await its ack.
+///
+/// Shared by `ingest_content` and `create_folder` so both commands go
+/// through a single implementation (DRY; no behavior change).
+pub async fn send_ingest(
+    tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    cid_hex: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(event_loop::IngestRequest {
+        cid_hex,
+        data,
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped ingest request".to_string())??;
+    Ok(())
+}
+
+/// ZEB-158 slice 1: create a new folder at the root or inside an existing
+/// folder. Empty `parent_path` means root; non-empty means a walk from
+/// top-level root (index 0) down to immediate parent (last element).
+/// Nested creation is implemented in a follow-up step.
+#[tauri::command]
+async fn create_folder(
+    name: String,
+    parent_path: Vec<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    if !parent_path.is_empty() {
+        // Nested case implemented in Task 6 below.
+        return Err("nested folder creation not yet implemented".to_string());
+    }
+    create_folder_at_root(name, state).await
+}
+
+async fn create_folder_at_root(
+    name: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    // Build the (empty) manifest + bundle.
+    let built = folders::build_folder(&name, &[])?;
+
+    // Ingest manifest book + bundle through the event loop.
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    send_ingest(
+        &ingest_tx,
+        hex::encode(built.manifest_cid.to_bytes()),
+        built.manifest_bytes,
+    )
+    .await?;
+    send_ingest(
+        &ingest_tx,
+        hex::encode(built.bundle_cid.to_bytes()),
+        built.bundle_bytes.clone(),
+    )
+    .await?;
+
+    // Insert sidecar entry for the top-level root.
+    let index = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_index.clone()
+    };
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.insert(content_index::ContentIndexEntry {
+            cid: built.bundle_cid.to_bytes(),
+            file_name: name,
+            size_bytes: built.bundle_bytes.len() as u64,
+            stored_at_ms,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Folder,
+        });
+    }
+
+    Ok(hex::encode(built.bundle_cid.to_bytes()))
 }
 
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().
@@ -2185,6 +2262,7 @@ pub fn run() {
             fetch_content,
             export_content,
             ingest_content,
+            create_folder,
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,
