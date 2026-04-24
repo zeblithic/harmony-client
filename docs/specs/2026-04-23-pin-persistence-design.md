@@ -19,7 +19,7 @@ Four scope questions shaped this during brainstorming:
 
 1. **Where does persisted intent live?** → **Field on the existing sidecar entry.** A new `pinned: bool` field on `ContentIndexEntry`. Using `#[serde(default)]` keeps v1 sidecars readable — old entries deserialize cleanly with `pinned: false`, which is correct (they weren't pinned at their last save). No version bump, no data migration. Because the sidecar only ever holds user-ingested root CIDs (never leaves), the set of sidecar entries with `pinned: true` is a root-pin-set by construction — the same shape [ZEB-156](https://linear.app/zeblith/issue/ZEB-156) will later make explicit.
 
-2. **What does startup replay look like?** → **Display-layer join + fetch-completion hook.** Two pieces: (a) `list_content` changes its `pinned` computation from `runtime.contains(cid)` to `sidecar.pinned || runtime.contains(cid)` — restores the pin badge unconditionally from intent, even when bytes aren't resident. (b) On successful `fetch_recursive` completion, if the fetched root carries sidecar pin intent, re-issue `Pin(root)` through the existing verb channel so the runtime's cascade protects the now-resident bytes.
+2. **What does startup replay look like?** → **Display-layer join + fetch-completion hook.** Two pieces: (a) `list_content` changes its `pinned` computation from `runtime.contains(cid)` to `sidecar.pinned || runtime.contains(cid)` — restores the pin badge unconditionally from intent, even when bytes aren't resident. (b) A dedicated fetch-completion arm in `event_loop.rs` observes successful `fetch_recursive` completions: if the fetched root carries sidecar pin intent, it collects descendants from the runtime cache and calls `runtime.pin_content` directly for each so the runtime's cascade protects the now-resident bytes. This is not re-issued through the `ContentVerbRequest::Pin` verb channel — it's its own `select!` arm fed by a completion channel the fetch task writes to after replying to the Tauri caller.
 
 3. **Eager startup re-pin into the runtime cache?** → **No.** The cache is empty at startup. `runtime.pin_content(cid)` on a non-admitted CID is a no-op (`iter_admitted()` is empty, so there's nothing to pin). Eager replay would do no useful work in the RAM-only world; it only becomes meaningful once durable byte storage lands, and at that point it's a separate concern.
 
@@ -194,13 +194,13 @@ Pass `pin_intent` into the event loop alongside the existing channels. The event
 
 ### Unit tests (`lib.rs`)
 
-5. `list_content_shows_pinned_when_only_intent_is_set` — sidecar has an entry with `pinned: true`; runtime `PinnedSet` is empty. Wire shows `pinned: true`.
-6. `list_content_shows_pinned_when_only_runtime_effect_is_set` — sidecar has `pinned: false`; runtime `PinnedSet` contains the CID. Wire shows `pinned: true` (inverse direction).
+1. `list_content_shows_pinned_when_only_intent_is_set` — sidecar has an entry with `pinned: true`; runtime `PinnedSet` is empty. Wire shows `pinned: true`.
+2. `list_content_shows_pinned_when_only_runtime_effect_is_set` — sidecar has `pinned: false`; runtime `PinnedSet` contains the CID. Wire shows `pinned: true` (inverse direction).
 
 ### Integration test (`src-tauri/tests/content_index_integration.rs`)
 
-7. `pin_intent_survives_restart` — ingest a file via the existing test harness, pin it, drop the node, reload the sidecar, verify the reloaded entry has `pinned: true` and `list_content` shows `pinned: true`.
-8. `fetch_complete_repins_on_intent` — the full B-path test. Construct a sidecar with `pinned: true` on a root CID, simulate `fetch_recursive` landing bytes in the runtime cache, drive a `fetch` request through the event loop, verify the runtime `PinnedSet` now contains the root (and its descendants, if multi-chunk) without any user pin action.
+1. `pin_intent_survives_restart` — ingest a file via the existing test harness, pin it, drop the node, reload the sidecar, verify the reloaded entry has `pinned: true` and `list_content` shows `pinned: true`.
+2. `fetch_complete_repins_on_intent` — the full B-path test. Construct a sidecar with `pinned: true` on a root CID, simulate `fetch_recursive` landing bytes in the runtime cache, drive a `fetch` request through the event loop, verify the runtime `PinnedSet` now contains the root (and its descendants, if multi-chunk) without any user pin action.
 
 Integration tests use `pub` items only — consistent with ZEB-154's integration-test pattern. Any helper that needs to be reached from the external test crate must be `pub`, not `pub(crate)`.
 

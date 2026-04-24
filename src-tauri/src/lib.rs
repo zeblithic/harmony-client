@@ -413,23 +413,6 @@ async fn start_node(
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
         follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
     ));
-    let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-        content_index::ContentIndex::load(&app_data_dir),
-    ));
-
-    // ZEB-155: seed the event loop's pin_intent set from the sidecar so
-    // a fetch after restart can re-pin restored intent. Built here under
-    // the content_index lock, then moved by-value into run_event_loop.
-    let pin_intent: std::collections::HashSet<[u8; 32]> = {
-        let idx = content_index
-            .lock()
-            .map_err(|e| format!("content_index lock on startup: {e}"))?;
-        idx.entries()
-            .filter(|e| e.pinned)
-            .map(|e| e.cid)
-            .collect()
-    };
-
     // ZEB-155: fetch-completion channel. Both halves are owned by
     // start_node so the spawned fetch task (in event_loop) can clone the
     // tx, while the main loop consumes from the rx.
@@ -544,6 +527,31 @@ async fn start_node(
         // cancel an in-flight startup via shutdown_tx.
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation += 1;
+
+        // ZEB-155: load the sidecar NOW — after stop_handles has
+        // quiesced the previous node and under the state lock — so any
+        // pin_content / unpin_content / burn_content that raced with
+        // the stop path has already durably written to disk. Concurrent
+        // command handlers are blocked on state.lock(), so they cannot
+        // slip a write between this load and the Arc install below.
+        //
+        // A narrower window remains: a mutation command that cloned
+        // the OLD Arc before stop_handles and is still mid-set_pinned
+        // when the NEW Arc is installed will orphan its disk write
+        // (the next NEW-Arc save() overwrites). That end-to-end
+        // serialization is ZEB-160's territory.
+        let content_index = std::sync::Arc::new(std::sync::Mutex::new(
+            content_index::ContentIndex::load(&app_data_dir),
+        ));
+        let pin_intent: std::collections::HashSet<[u8; 32]> = {
+            let idx = content_index
+                .lock()
+                .map_err(|e| format!("content_index lock on startup: {e}"))?;
+            idx.entries()
+                .filter(|e| e.pinned)
+                .map(|e| e.cid)
+                .collect()
+        };
 
         let ep_clone = endpoint.clone();
         let app_clone = app.clone();
