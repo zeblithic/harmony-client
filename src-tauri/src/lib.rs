@@ -1442,18 +1442,39 @@ async fn unpin_content(
         return Ok(true); // sidecar updated; another entry still pins
     };
 
-    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Unpin {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped unpin request".to_string())?
+    // Sidecar already committed. Runtime Unpin is best-effort: if the
+    // event loop is gone, we have a stale pin_intent that self-corrects
+    // on the next start_node pin-restore sweep. Log, don't propagate —
+    // matches burn_content's RuntimeAction::Unpin branch and the
+    // create_folder_nested post-rekey pattern.
+    if let Some(verb_tx) = maybe_verb_tx {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Unpin {
+                cid: cid_bytes,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    err = %e,
+                    "unpin_content: runtime unpin failed; pin_intent may be stale",
+                ),
+                Err(_) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    "unpin_content: event loop dropped unpin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                cid = %hex::encode(cid_bytes),
+                "unpin_content: event loop closed before unpin send; pin_intent may be stale",
+            ),
+        }
+    }
+    Ok(true)
 }
 
 /// Burn a sidecar entry. With ZEB-164's symlink-style sidecar, burn is
