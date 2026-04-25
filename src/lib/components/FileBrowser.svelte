@@ -74,8 +74,14 @@
   // stashes the (cid, name) before calling onNavigateFolder so the $effect
   // below can extend the stack with a real name. Truncates on back-navigation
   // (clicking a breadcrumb), resets when currentFolderCid → null.
-  let navStack = $state<Array<{ cid: string; name: string }>>([]);
-  let pendingNav: { cid: string; name: string } | null = null;
+  // Explicit navigation stack from root sentinel down to the current
+  // folder. Each segment carries cid (for content-addressed bundle
+  // lookups during refetch and breadcrumb display) and an optional
+  // sidecarId — only present on the FIRST segment after the sentinel,
+  // which is the top-level sidecar entry. Nested segments (manifest-
+  // derived rows below the top-level root) have no sidecar of their own.
+  let navStack = $state<Array<{ cid: string; name: string; sidecarId?: string }>>([]);
+  let pendingNav: { cid: string; name: string; sidecarId?: string } | null = null;
 
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
@@ -102,12 +108,20 @@
         pendingNav = null;
         return;
       }
-      // Programmatic jump (no click stash): try to look up the name from
-      // current items, then root-level items, then fall back to a placeholder.
+      // Programmatic jump (no click stash): try to look up the name and
+      // sidecarId from current items, then root-level items, then fall
+      // back to a placeholder.
       const item =
         items.find((i) => i.cid === cid) ??
         service.getContents().find((i) => i.cid === cid);
-      navStack = [...navStack, { cid, name: item?.name ?? '(folder)' }];
+      navStack = [
+        ...navStack,
+        {
+          cid,
+          name: item?.name ?? '(folder)',
+          sidecarId: item?.sidecarId || undefined,
+        },
+      ];
     });
   });
 
@@ -258,8 +272,16 @@
   function handleItemClick(cid: string) {
     const item = items.find((i) => i.cid === cid);
     if (item?.isFolder) {
-      // Stash (cid, name) for the navStack $effect to consume on the next tick.
-      pendingNav = { cid: item.cid, name: item.name };
+      // Stash for the navStack $effect. sidecarId is only set when the
+      // click came from the root listing (entries there have a sidecar
+      // entry); manifest-derived rows pass empty sidecarId, which we
+      // store as undefined so navStack[0]'s sidecarId is "the top-level
+      // root's id, if available".
+      pendingNav = {
+        cid: item.cid,
+        name: item.name,
+        sidecarId: item.sidecarId || undefined,
+      };
       onNavigateFolder(item.cid);
       return;
     }
@@ -271,32 +293,32 @@
     if (!name || !name.trim()) return;
 
     // Capture pre-create state. breadcrumbStack drives whether this is a
-    // nested create (non-empty → ancestor cascade rewrites every CID up
-    // the path) or a root create (empty → leaves existing entries
-    // untouched). Read before the await so a concurrent navigation
-    // doesn't change which branch we take. Using the path itself rather
-    // than `currentFolderCid` makes the intent ("did the cascade run?")
-    // explicit and decoupled from the breadcrumb derivation.
+    // nested create. parentSidecarId is the top-level root's id (the
+    // sidecar entry that owns the cascade) — present iff breadcrumbStack
+    // is non-empty (at root, parent_sidecar_id is null).
     const wasNestedCreate = breadcrumbStack.length > 0;
+    const parentSidecarId = wasNestedCreate
+      ? navStack[0]?.sidecarId ?? null
+      : null;
+
+    if (wasNestedCreate && !parentSidecarId) {
+      // Nested create requires a top-level sidecar id. If we don't have
+      // one (e.g., user navigated by URL/programmatic jump before the
+      // first list_content settled), bail with a user-visible error.
+      window.alert(
+        'Could not create folder: missing top-level folder identity. Try navigating to root and back, then retry.',
+      );
+      return;
+    }
 
     try {
-      await service.createFolder(name.trim(), breadcrumbStack);
+      await service.createFolder(name.trim(), parentSidecarId, breadcrumbStack);
     } catch (err) {
-      // Surface known backend errors to the user; identical-contents
-      // collisions and similar are returned as plain Err strings.
       const msg = err instanceof Error ? err.message : String(err);
       window.alert(`Could not create folder: ${msg}`);
       return;
     }
 
-    // Nested create only: the ancestor cascade rewrites every CID along
-    // the path including currentFolderCid, so refetching the same CID
-    // would just re-read the now-stale bundle. Until ZEB-164 lands a
-    // stable sidecar identity, navigate back to the root view — the new
-    // folder appears in the root's refreshed listing (createFolder
-    // already called refetchRoot internally) and the user can re-enter
-    // the path. A root-level create touches no ancestor CIDs, so we
-    // leave the user where they were.
     if (wasNestedCreate) {
       onNavigateFolder(null);
     }
