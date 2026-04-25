@@ -49,6 +49,13 @@ impl SidecarId {
     pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
         Uuid::parse_str(s).map(Self)
     }
+
+    /// Underlying 16-byte UUID representation. Used for allocation-free
+    /// deterministic ordering on disk; do not depend on this being a
+    /// stable hash for cross-version comparisons.
+    pub fn as_bytes(&self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
 }
 
 impl std::fmt::Display for SidecarId {
@@ -203,7 +210,7 @@ impl ContentIndex {
         // iteration order would otherwise churn the file on every save and
         // make diffs (and future snapshotting) noisy.
         let mut sorted: Vec<ContentIndexEntry> = self.entries.values().cloned().collect();
-        sorted.sort_by_key(|e| e.sidecar_id.to_string());
+        sorted.sort_unstable_by_key(|e| e.sidecar_id.as_bytes());
         let file = IndexFile {
             version: FILE_VERSION,
             entries: sorted,
@@ -643,6 +650,10 @@ mod tests {
         entry.file_name = "Folder".into();
         entry.kind = ContentKind::Folder;
         entry.pinned = true;
+        entry.sensitivity = Sensitivity::Confidential;
+        entry.replication_tier = ReplicationTier::Ultra;
+        entry.licensed = true;
+        entry.archived = true;
         let id = entry.sidecar_id;
         idx.insert(entry);
 
@@ -651,12 +662,22 @@ mod tests {
 
         let after = idx.get(&id).expect("entry still present under same sidecar_id");
         assert_eq!(after.cid, [0x02; 32], "cid updated");
-        assert_eq!(after.file_name, "Folder", "file_name carried forward");
-        assert_eq!(after.kind, ContentKind::Folder, "kind carried forward");
-        assert!(after.pinned, "pinned carried forward");
         assert_eq!(after.size_bytes, 999, "size_bytes updated");
         assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
+        // All seven user-state fields preserved.
+        assert_eq!(after.file_name, "Folder");
+        assert_eq!(after.kind, ContentKind::Folder);
+        assert!(after.pinned);
+        assert_eq!(after.sensitivity, Sensitivity::Confidential);
+        assert_eq!(after.replication_tier, ReplicationTier::Ultra);
+        assert!(after.licensed);
+        assert!(after.archived);
+    }
 
+    #[test]
+    fn rekey_missing_id_returns_old_missing() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
         let bogus = SidecarId::new();
         assert_eq!(idx.rekey(&bogus, [0xEE; 32], 0, 0), Err(RekeyError::OldMissing));
     }
