@@ -39,13 +39,6 @@
     return pruned;
   });
 
-  // Keep cid-keyed set for backward compat with consumers that still need cids
-  // (release/publish are content-addressed operations).
-  let validSelectedCids = $derived.by(() => {
-    const validRecs = recommendations.filter(r => validSelectedSidecarIds.has(r.sidecarId));
-    return new Set(validRecs.map(r => r.cid));
-  });
-
   let allSelected = $derived(
     recommendations.length > 0 && validSelectedSidecarIds.size === recommendations.length
   );
@@ -151,7 +144,7 @@
       <p class="empty-message">No cleanup recommendations — your storage looks good.</p>
     {:else}
       <div class="recommendations-list" role="list">
-        {#each recommendations as rec (rec.sidecarId || rec.cid)}
+        {#each recommendations as rec (rec.sidecarId)}
           <div role="listitem">
             <RecommendationCard
               recommendation={rec}

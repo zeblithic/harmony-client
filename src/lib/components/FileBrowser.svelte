@@ -1,6 +1,13 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { FileViewMode, ContentSection, ContentCategory, ReplicationTier, ContentItem } from '../types';
+  import type {
+    FileViewMode,
+    ContentSection,
+    ContentCategory,
+    ReplicationTier,
+    ContentItem,
+    CleanupRecommendation,
+  } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
@@ -51,9 +58,9 @@
     onSectionChange: (section: ContentSection) => void;
     onUploadClick: () => void;
     onCleanupClick: () => void;
-    onCleanupAction?: (rec: import('../types').CleanupRecommendation, action: string) => void;
-    onBulkBurn?: (recs: import('../types').CleanupRecommendation[]) => void;
-    onBulkArchive?: (recs: import('../types').CleanupRecommendation[]) => void;
+    onCleanupAction?: (rec: CleanupRecommendation, action: string) => void;
+    onBulkBurn?: (recs: CleanupRecommendation[]) => void;
+    onBulkArchive?: (recs: CleanupRecommendation[]) => void;
     onBulkRelease?: (cids: string[]) => void;
     onBulkPublish?: (cids: string[]) => void;
     serviceVersion?: number;

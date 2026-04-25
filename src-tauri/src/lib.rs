@@ -1258,40 +1258,36 @@ async fn list_content(
     folder_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
-    // 1. Snapshot pinned CIDs from the runtime cache.
-    let verb_tx = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
-    };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    let pinned_set = reply_rx
-        .await
-        .map_err(|_| "event loop dropped snapshot request".to_string())?;
-
+    // Root listings read entry.pinned directly from the sidecar (the runtime
+    // pin_intent OR-join keeps that flag authoritative), so they don't need
+    // the runtime's pinned-CID snapshot. Only fetch it for folder listings,
+    // where manifest-derived rows have no sidecar entry to consult.
     match folder_cid {
-        None => list_root(state, &pinned_set),
-        Some(hex) => list_folder(hex, verb_tx, &pinned_set).await,
+        None => list_root(state),
+        Some(hex) => {
+            let verb_tx = {
+                let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+                guard
+                    .content_verb_tx
+                    .clone()
+                    .ok_or_else(|| "runtime unavailable".to_string())?
+            };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            verb_tx
+                .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
+                .await
+                .map_err(|_| "event loop not running".to_string())?;
+            let pinned_set = reply_rx
+                .await
+                .map_err(|_| "event loop dropped snapshot request".to_string())?;
+            list_folder(hex, verb_tx, &pinned_set).await
+        }
     }
 }
 
 pub(crate) fn list_root(
     state: tauri::State<'_, Mutex<NodeState>>,
-    pinned_set: &std::collections::HashSet<[u8; 32]>,
 ) -> Result<Vec<ContentItemWire>, String> {
-    // pinned_set is kept in the signature for interface stability with
-    // list_folder (which still consults it for manifest-derived rows).
-    // Top-level rows expose entry.pinned directly — every command that
-    // touches pin state maintains the runtime pin_intent OR-join, so the
-    // sidecar's own flag is the authoritative per-row signal.
-    let _ = pinned_set;
-
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
@@ -2260,7 +2256,10 @@ async fn create_folder_nested(
     }
 
     Ok(CreateFolderResult {
-        sidecar_id: parent_sidecar_id, // unchanged — same identity, new cid
+        // Identity unchanged, but emit the canonical lowercase-hyphenated form
+        // (via SidecarId::Display) instead of echoing the caller's raw input —
+        // every other endpoint that returns a sidecar_id wire field does the same.
+        sidecar_id: parent_id.to_string(),
         cid: hex::encode(prev_new_cid),
     })
 }

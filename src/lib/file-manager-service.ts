@@ -215,15 +215,15 @@ export class FileManagerService {
    *  TODO: Re-evaluate recommendation reasons dynamically (e.g., drop 'over-replicated'
    *  after tier change) once real replication backends are wired in. */
   getCleanupRecommendations(): CleanupRecommendation[] {
-    const activeCids = new Map(this.privateContent.map((i) => [i.cid, i]));
+    // Key by sidecarId, not cid: with symlink-style sidecars, multiple entries
+    // can share a CID, so a CID-keyed Map collapses them to "whichever the
+    // iterator visited last" and would route the action to the wrong entry.
+    const activeBySidecar = new Map(this.privateContent.map((i) => [i.sidecarId, i]));
     return this.cleanupRecommendations
-      .filter((r) => activeCids.has(r.cid))
+      .filter((r) => activeBySidecar.has(r.sidecarId))
       .map((r) => ({
         ...r,
-        sensitivity: activeCids.get(r.cid)!.sensitivity,
-        // ZEB-164: attach sidecarId so action handlers can route sidecar
-        // mutations without a CID re-lookup (non-deterministic on shared CIDs).
-        sidecarId: activeCids.get(r.cid)!.sidecarId,
+        sensitivity: activeBySidecar.get(r.sidecarId)!.sensitivity,
       }))
       .sort((a, b) => b.confidence - a.confidence);
   }
