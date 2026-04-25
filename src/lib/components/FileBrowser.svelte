@@ -82,6 +82,10 @@
   // top-level sidecar entry. Nested segments (manifest-derived rows below
   // the top-level root) have no sidecar of their own.
   let navStack = $state<Array<{ cid: string; name: string; sidecarId?: string }>>([]);
+  // Plain let (not $state): written only inside untrack(), read only in
+  // event handlers. No reactive consumer exists, so $state would add
+  // overhead without benefit and would invite confusion about its
+  // lifecycle.
   let pendingNav: { cid: string; name: string; sidecarId?: string } | null = null;
 
   // Sync navStack with currentFolderCid (driven by the parent component).
@@ -307,7 +311,7 @@
       // one (e.g., user navigated by URL/programmatic jump before the
       // first list_content settled), bail with a user-visible error.
       window.alert(
-        'Could not create folder: missing top-level folder identity. Try navigating to root and back, then retry.',
+        'Could not create folder: folder identity not yet loaded. Click "My Content" in the breadcrumb to return to root, then navigate back into this folder and retry.',
       );
       return;
     }
