@@ -2136,15 +2136,18 @@ async fn create_folder_nested(
         }
     }
 
-    // NOTE on concurrency: this verification + the rekey at step 3 are
-    // not atomic. Between them we yield across multiple await points
-    // (read_cached_bytes per ancestor). A concurrent create_folder_nested
-    // on the same parent_sidecar_id would rekey under us; the
-    // OldMissing-only guard at step 3 catches the case where the entry
-    // is removed but not the case where it is rekeyed to a different
-    // CID. The UI serialises per-folder mutations, so this race is not
-    // observable in practice; a backend-enforced optimistic lock (CAS
-    // rekey) is deferred to ZEB-162 or a follow-on.
+    // The verification above and the rekey below are non-atomic — we
+    // yield across multiple await points (ancestor reads, then
+    // pending_ingests drain). A concurrent create_folder_nested on the
+    // same parent_sidecar_id could land its rekey between our verify
+    // and our rekey, so we pass root_old as the expected_old_cid to
+    // ContentIndex::rekey: if the entry's current CID has shifted,
+    // rekey returns RekeyError::Conflict instead of silently
+    // overwriting the concurrent winner. The UI serializes per-folder
+    // mutations so this is rarely hit in practice, but the
+    // ingest-before-rekey reorder widened the verify→rekey window
+    // from "ancestor reads" to "drain pending_ingests" — wide enough
+    // that the CAS guard is now load-bearing rather than defensive.
 
     // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so
     // that a downstream OldMissing during rekey doesn't leave orphan
@@ -2269,17 +2272,37 @@ async fn create_folder_nested(
         send_ingest(&ingest_tx, cid_hex, bytes).await?;
     }
 
-    // 4. Rekey the top-level sidecar entry. With ZEB-164 the
-    // CID-collision branch is gone — multiple entries sharing a CID is
-    // legal. Only OldMissing remains.
+    // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
+    // as the expected current CID. With ZEB-164 the CID-collision
+    // branch is gone — multiple entries sharing a CID is legal —
+    // so OldMissing and Conflict are the only failure modes.
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        match idx.rekey(&parent_id, prev_new_cid, new_bundle_size, stored_at_ms) {
+        match idx.rekey(
+            &parent_id,
+            root_old,
+            prev_new_cid,
+            new_bundle_size,
+            stored_at_ms,
+        ) {
             Ok(()) => {}
             Err(content_index::RekeyError::OldMissing) => {
                 return Err(
                     "parent_sidecar_id removed mid-flight — nothing to rekey".to_string(),
                 );
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                // A concurrent rekey on the same parent_sidecar_id
+                // landed between our verify and our rekey. The new
+                // bundle bytes we just ingested are orphans — W-TinyLFU
+                // will evict them under cache pressure. Surface the
+                // actual current CID so future retry logic could
+                // rebuild from it; for now the user re-issues the
+                // create from the refreshed UI state.
+                return Err(format!(
+                    "concurrent rekey on parent_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
             }
         }
     }

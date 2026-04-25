@@ -154,6 +154,15 @@ pub struct ContentIndex {
 pub enum RekeyError {
     /// The given `sidecar_id` doesn't refer to any known entry.
     OldMissing,
+    /// The entry exists but its current CID doesn't match the
+    /// `expected_old_cid` the caller passed — a concurrent rekey
+    /// landed first. The caller's view of the chain is stale; any
+    /// retry would need to rebuild ancestors from `actual` rather
+    /// than the CID it walked. Surfaces the CAS-style guard added
+    /// after the create_folder_nested ingest reorder widened the
+    /// verify→rekey window from "ancestor reads" to "drain
+    /// pending_ingests."
+    Conflict { actual: [u8; 32] },
 }
 
 impl ContentIndex {
@@ -280,12 +289,19 @@ impl ContentIndex {
     /// root CID (nested `create_folder`, future move/rename). One save()
     /// for the whole replacement.
     ///
+    /// CAS-style: caller passes `expected_old_cid`; rekey fails with
+    /// `Conflict { actual }` if the entry's current CID doesn't match,
+    /// preventing lost-update when two concurrent mutations rebuild
+    /// from the same old tree but the second one's verify→rekey
+    /// gap straddles the first one's commit.
+    ///
     /// ZEB-164 retired `RekeyError::Collision`: under the symlink-style
     /// model, the new CID already being used by another entry is not an
     /// error — entries are identified by `sidecar_id`, not CID.
     pub fn rekey(
         &mut self,
         id: &SidecarId,
+        expected_old_cid: [u8; 32],
         new_cid: [u8; 32],
         new_size_bytes: u64,
         new_stored_at_ms: u64,
@@ -293,6 +309,9 @@ impl ContentIndex {
         let Some(entry) = self.entries.get_mut(id) else {
             return Err(RekeyError::OldMissing);
         };
+        if entry.cid != expected_old_cid {
+            return Err(RekeyError::Conflict { actual: entry.cid });
+        }
         entry.cid = new_cid;
         entry.size_bytes = new_size_bytes;
         entry.stored_at_ms = new_stored_at_ms;
@@ -657,7 +676,7 @@ mod tests {
         let id = entry.sidecar_id;
         idx.insert(entry);
 
-        let result = idx.rekey(&id, [0x02; 32], 999, 1234);
+        let result = idx.rekey(&id, [0x01; 32], [0x02; 32], 999, 1234);
         assert!(result.is_ok());
 
         let after = idx.get(&id).expect("entry still present under same sidecar_id");
@@ -679,7 +698,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let bogus = SidecarId::new();
-        assert_eq!(idx.rekey(&bogus, [0xEE; 32], 0, 0), Err(RekeyError::OldMissing));
+        // OldMissing fires before the expected_old_cid check.
+        assert_eq!(idx.rekey(&bogus, [0x00; 32], [0xEE; 32], 0, 0), Err(RekeyError::OldMissing));
     }
 
     #[test]
@@ -690,7 +710,8 @@ mod tests {
         let id = entry.sidecar_id;
         idx.insert(entry);
 
-        let result = idx.rekey(&id, [0xCC; 32], 12345, 67890);
+        // Self-update: expected_old_cid == new_cid == current cid.
+        let result = idx.rekey(&id, [0xCC; 32], [0xCC; 32], 12345, 67890);
         assert!(result.is_ok());
         let after = idx.get(&id).expect("entry still present");
         assert_eq!(after.size_bytes, 12345);
@@ -773,11 +794,33 @@ mod tests {
         idx.insert(keeper);
         idx.insert(other);
 
-        let result = idx.rekey(&other_id, [0xAA; 32], 0, 0);
+        // other's current cid is [0xBB; 32]; rekey to [0xAA; 32] (which keeper already has).
+        let result = idx.rekey(&other_id, [0xBB; 32], [0xAA; 32], 0, 0);
         assert!(result.is_ok());
 
         assert_eq!(idx.get(&keeper_id).unwrap().cid, [0xAA; 32]);
         assert_eq!(idx.get(&other_id).unwrap().cid, [0xAA; 32]);
+    }
+
+    #[test]
+    fn rekey_with_stale_expected_cid_returns_conflict() {
+        // CAS guard: if a concurrent rekey landed first, the entry's
+        // current CID won't match what the caller walked from. Surface
+        // the actual CID so a future retry path could rebuild from it.
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let entry = sample_entry([0xAA; 32]);
+        let id = entry.sidecar_id;
+        idx.insert(entry);
+
+        // Caller thinks current cid is [0xBB; 32], but it's actually [0xAA; 32].
+        let result = idx.rekey(&id, [0xBB; 32], [0xCC; 32], 0, 0);
+        assert_eq!(result, Err(RekeyError::Conflict { actual: [0xAA; 32] }));
+
+        // Entry must be unchanged.
+        let after = idx.get(&id).expect("entry still present");
+        assert_eq!(after.cid, [0xAA; 32], "Conflict must not mutate the entry");
     }
 
     #[test]
