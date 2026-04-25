@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 pub mod content_index;
 pub mod event_loop;
+pub mod folders;
 mod follows;
 mod identity;
 pub mod mail;
@@ -1162,7 +1163,8 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
 
 /// Wire format returned by `list_content` — one entry per self-ingested
 /// file the client is aware of. Joins sidecar metadata with the runtime
-/// cache's pinned state snapshot.
+/// cache's pinned state snapshot. ZEB-158 slice 1 adds `kind` to
+/// distinguish leaf files from folder bundles.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentItemWire {
@@ -1171,10 +1173,11 @@ pub struct ContentItemWire {
     pub size_bytes: u64,
     pub stored_at: u64,           // ms since epoch
     pub sensitivity: String,      // "private" | "confidential" | "public"
-    pub replication_tier: String, // "minimal" | "default" | "durable"
+    pub replication_tier: String, // "expendable" | "light" | "default" | "high" | "ultra"
     pub pinned: bool,
     pub licensed: bool,
     pub archived: bool,
+    pub kind: String,             // ZEB-158: "leaf" | "folder"
 }
 
 fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
@@ -1192,6 +1195,13 @@ fn replication_tier_wire(t: content_index::ReplicationTier) -> &'static str {
         content_index::ReplicationTier::Default => "default",
         content_index::ReplicationTier::High => "high",
         content_index::ReplicationTier::Ultra => "ultra",
+    }
+}
+
+fn kind_wire(k: content_index::ContentKind) -> &'static str {
+    match k {
+        content_index::ContentKind::Leaf => "leaf",
+        content_index::ContentKind::Folder => "folder",
     }
 }
 
@@ -1223,6 +1233,7 @@ fn joined_pinned(
 
 #[tauri::command]
 async fn list_content(
+    folder_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
     // 1. Snapshot pinned CIDs from the runtime cache.
@@ -1242,7 +1253,16 @@ async fn list_content(
         .await
         .map_err(|_| "event loop dropped snapshot request".to_string())?;
 
-    // 2. Join sidecar entries with pinned state and shape the wire.
+    match folder_cid {
+        None => list_root(state, &pinned_set),
+        Some(hex) => list_folder(hex, verb_tx, &pinned_set).await,
+    }
+}
+
+pub(crate) fn list_root(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    pinned_set: &std::collections::HashSet<[u8; 32]>,
+) -> Result<Vec<ContentItemWire>, String> {
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
@@ -1257,17 +1277,81 @@ async fn list_content(
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: joined_pinned(e, &pinned_set),
+                pinned: joined_pinned(e, pinned_set),
                 licensed: e.licensed,
                 archived: e.archived,
+                kind: kind_wire(e.kind).to_string(),
             })
             .collect()
     };
-    // `ContentIndex::entries()` iterates a HashMap, so order is not
-    // deterministic. Sort by stored_at descending (newest first) so the
-    // File Manager UI sees a stable list across renders.
+    // HashMap iter is non-deterministic; sort newest-first for stable UI.
     entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
     Ok(entries)
+}
+
+pub async fn list_folder(
+    folder_cid_hex: String,
+    verb_tx: tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    pinned_set: &std::collections::HashSet<[u8; 32]>,
+) -> Result<Vec<ContentItemWire>, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    let folder_cid = parse_cid_hex(&folder_cid_hex)?;
+
+    // Fetch the folder's bundle bytes from the runtime cache.
+    let bundle_bytes = match read_cached_bytes(&verb_tx, folder_cid).await? {
+        Some(b) => b,
+        None => {
+            // Folder not in cache — likely evicted or never admitted.
+            // Return empty (UI shows empty folder); ZEB-159 will add
+            // transparent re-fetch in a follow-up.
+            tracing::debug!(
+                folder_cid = %folder_cid_hex,
+                "list_folder: bundle not in cache; returning empty",
+            );
+            return Ok(vec![]);
+        }
+    };
+
+    // Parse bundle child CIDs; child-0 is the manifest book.
+    let child_cids: Vec<[u8; 32]> = parse_bundle(&bundle_bytes)
+        .map_err(|e| format!("malformed folder bundle: {e:?}"))?
+        .iter()
+        .map(|c| c.to_bytes())
+        .collect();
+    let manifest_cid: [u8; 32] = child_cids
+        .first()
+        .copied()
+        .ok_or_else(|| "folder bundle has no children".to_string())?;
+
+    // Read the manifest book bytes.
+    let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid)
+        .await?
+        .ok_or_else(|| "manifest book not in cache".to_string())?;
+
+    let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
+    crate::folders::validate_manifest_matches_bundle(&manifest, &child_cids)?;
+
+    // Synthesize wire rows. Nested items have no sidecar: size_bytes/stored_at
+    // are unavailable (reported 0), sensitivity/replication_tier default,
+    // licensed/archived false. Pinned joins the runtime's pinned_set.
+    Ok(manifest
+        .folder_manifest
+        .entries
+        .into_iter()
+        .map(|e| ContentItemWire {
+            cid: hex::encode(e.cid),
+            name: e.name,
+            size_bytes: 0,
+            stored_at: 0,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: pinned_set.contains(&e.cid),
+            licensed: false,
+            archived: false,
+            kind: kind_wire(e.kind).to_string(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1568,39 +1652,19 @@ async fn ingest_content(
             .ok_or_else(|| "not connected".to_string())?
     };
 
-    // Send one (cid_hex, data) pair through the ingest channel and await its ack.
-    async fn send_one(
-        tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
-        cid_hex: String,
-        data: Vec<u8>,
-    ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        tx.send(event_loop::IngestRequest {
-            cid_hex,
-            data,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-        reply_rx
-            .await
-            .map_err(|_| "event loop dropped ingest request".to_string())??;
-        Ok(())
-    }
-
     let root_cid_bytes: [u8; 32] = match dispatch {
         IngestDispatch::Single => {
             let cid = ContentId::for_book(&bytes, ContentFlags::default())
                 .map_err(|e| format!("CID error: {e:?}"))?;
             let cid_hex = hex::encode(cid.to_bytes());
-            send_one(&ingest_tx, cid_hex, bytes).await?;
+            send_ingest(&ingest_tx, cid_hex, bytes).await?;
             cid.to_bytes()
         }
         IngestDispatch::Chunked => {
             let (leaves, bundle_payload, root) = chunk_and_bundle(&bytes)?;
             // Ingest every leaf in order.
             for (leaf_cid, leaf_bytes) in &leaves {
-                send_one(
+                send_ingest(
                     &ingest_tx,
                     hex::encode(leaf_cid.to_bytes()),
                     leaf_bytes.to_vec(),
@@ -1608,7 +1672,7 @@ async fn ingest_content(
                 .await?;
             }
             // Ingest the bundle itself.
-            send_one(
+            send_ingest(
                 &ingest_tx,
                 hex::encode(root.to_bytes()),
                 bundle_payload,
@@ -1639,6 +1703,7 @@ async fn ingest_content(
             licensed: false,
             archived: false,
             pinned: false,
+            kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
             tracing::debug!(
@@ -1655,6 +1720,421 @@ async fn ingest_content(
         file_name,
         size_bytes,
     })
+}
+
+/// Send one (cid_hex, data) pair through the ingest channel and await its ack.
+///
+/// Shared by `ingest_content` and `create_folder` so both commands go
+/// through a single implementation (DRY; no behavior change).
+pub async fn send_ingest(
+    tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    cid_hex: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(event_loop::IngestRequest {
+        cid_hex,
+        data,
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped ingest request".to_string())??;
+    Ok(())
+}
+
+/// ZEB-158 slice 1: create a new folder at the root or inside an existing
+/// folder. Empty `parent_path` means root; non-empty means a walk from
+/// top-level root (index 0) down to immediate parent (last element).
+/// Nested creation is implemented in a follow-up step.
+#[tauri::command]
+async fn create_folder(
+    name: String,
+    parent_path: Vec<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    // Defence-in-depth: the UI already trims and rejects blank names, but
+    // the IPC surface is callable by anything with a Tauri handle. An empty
+    // or whitespace-only label would produce folders that are hard to
+    // distinguish in listings and breadcrumbs, so reject at the boundary.
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("folder name cannot be empty".to_string());
+    }
+    if parent_path.is_empty() {
+        return create_folder_at_root(name, state).await;
+    }
+    create_folder_nested(name, parent_path, state).await
+}
+
+async fn create_folder_at_root(
+    name: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    // Build the (empty) manifest + bundle locally. No runtime state
+    // mutated yet — we can still bail cleanly on collision.
+    let built = folders::build_folder(&name, &[])?;
+
+    // Snapshot handles up-front so a collision check can fail fast without
+    // touching the ingest channel.
+    let (ingest_tx, index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
+    };
+    let bundle_size = built.bundle_bytes.len() as u64;
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // ZEB-158 slice 1 corner case: every empty folder produces the same
+    // bundle CID (the manifest is byte-identical: {"folder_manifest":
+    // {"version":1,"entries":[]}}). Under the current CID-keyed sidecar,
+    // a second empty folder collides with the first. We reserve the
+    // sidecar slot FIRST so a collision bails out without publishing
+    // orphan manifest/bundle bytes to the runtime. The architectural fix
+    // (sidecar entries keyed by an opaque id so multiple entries can share
+    // a CID, symlink-style) is tracked separately.
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let inserted = idx.insert(content_index::ContentIndexEntry {
+            cid: built.bundle_cid.to_bytes(),
+            file_name: name,
+            size_bytes: bundle_size,
+            stored_at_ms,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Folder,
+        });
+        if !inserted {
+            return Err(
+                "a folder with identical contents already exists; \
+                 add content to it before creating another empty folder"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Slot reserved — now publish the bytes. ZEB-155's fetch-completion
+    // recovery hook is gated on ZEB-159 (not yet implemented), so an
+    // orphan sidecar entry would be unrecoverable until the user manually
+    // burned it. Roll back the reservation on any ingest failure so the
+    // sidecar never points at bytes that don't exist. Best-effort: if the
+    // mutex is poisoned during rollback we leave the orphan, but that
+    // failure mode is strictly worse than the common case (transient
+    // event-loop drop) which we DO recover from.
+    let bundle_cid_bytes = built.bundle_cid.to_bytes();
+    if let Err(e) = send_ingest(
+        &ingest_tx,
+        hex::encode(built.manifest_cid.to_bytes()),
+        built.manifest_bytes,
+    )
+    .await
+    {
+        if let Ok(mut idx) = index.lock() {
+            idx.remove(&bundle_cid_bytes);
+        }
+        return Err(e);
+    }
+    if let Err(e) = send_ingest(
+        &ingest_tx,
+        hex::encode(bundle_cid_bytes),
+        built.bundle_bytes,
+    )
+    .await
+    {
+        if let Ok(mut idx) = index.lock() {
+            idx.remove(&bundle_cid_bytes);
+        }
+        return Err(e);
+    }
+
+    Ok(hex::encode(bundle_cid_bytes))
+}
+
+async fn create_folder_nested(
+    name: String,
+    parent_path: Vec<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    // Parse all path CIDs up-front; fail fast on malformed input.
+    let path_cids: Vec<[u8; 32]> = parent_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+    let root_old = *path_cids.first().expect("non-empty by guard above");
+    let immediate_parent_cid = *path_cids.last().expect("non-empty");
+
+    // Snapshot handles.
+    let (ingest_tx, verb_tx, index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .content_verb_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
+    };
+
+    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so that
+    // a downstream collision/OldMissing failure during rekey doesn't leave
+    // orphan bytes in the runtime cache (which could be announced over Zenoh
+    // and waste capacity for content no sidecar entry will ever reference).
+    let new_child = folders::build_folder(&name, &[])?;
+    let new_child_bundle_cid = new_child.bundle_cid;
+
+    // (cid_hex, bytes) pairs to ingest after rekey succeeds.
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    pending_ingests.push((
+        hex::encode(new_child.manifest_cid.to_bytes()),
+        new_child.manifest_bytes,
+    ));
+    pending_ingests.push((
+        hex::encode(new_child_bundle_cid.to_bytes()),
+        new_child.bundle_bytes,
+    ));
+
+    // 2. Bottom-up walk: rebuild each ancestor LOCALLY (read-only verb
+    // requests), accumulating into pending_ingests.
+    //    prev_old_cid = the ancestor's old CID (as given in parent_path).
+    //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
+    let mut prev_old_cid = immediate_parent_cid;
+    let mut prev_new_cid = new_child_bundle_cid.to_bytes();
+    let mut last_bundle_size: u64 = pending_ingests
+        .last()
+        .map(|(_, b)| b.len() as u64)
+        .unwrap_or(0);
+
+    // First iteration: APPEND at the immediate parent.
+    // Higher iterations: REPLACE the entry pointing to prev_old_cid.
+    for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
+        let is_deepest = i == path_cids.len() - 1;
+
+        // Fetch the ancestor's bundle bytes (read-only).
+        let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} not in cache; cannot rebuild parent chain",
+                    hex::encode(anc_cid)
+                )
+            })?;
+        let anc_child_ids = parse_bundle(&anc_bundle)
+            .map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
+        let manifest_cid = anc_child_ids
+            .first()
+            .copied()
+            .ok_or_else(|| "ancestor bundle has no children".to_string())?;
+        // Collect bundle children as raw [u8; 32] for the manifest/bundle
+        // consistency check below.
+        let anc_children: Vec<[u8; 32]> =
+            anc_child_ids.iter().map(|c| c.to_bytes()).collect();
+
+        // Read the ancestor's manifest book (read-only).
+        let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
+            .await?
+            .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
+        let mut manifest = folders::parse_manifest(&manifest_bytes)
+            .map_err(|e| format!("ancestor {e}"))?;
+        // Defend against a malformed ancestor rewriting the tree with
+        // phantom children: refuse to mutate unless manifest entries and
+        // bundle child slots agree.
+        folders::validate_manifest_matches_bundle(&manifest, &anc_children)
+            .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
+
+        if is_deepest {
+            manifest
+                .folder_manifest
+                .entries
+                .push(folders::ManifestEntry {
+                    cid: prev_new_cid,
+                    name: name.clone(),
+                    kind: content_index::ContentKind::Folder,
+                });
+        } else {
+            let target_idx = manifest
+                .folder_manifest
+                .entries
+                .iter()
+                .position(|e| e.cid == prev_old_cid)
+                .ok_or_else(|| {
+                    format!(
+                        "ancestor {} has no entry pointing to child {}",
+                        hex::encode(anc_cid),
+                        hex::encode(prev_old_cid)
+                    )
+                })?;
+            manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
+        }
+
+        // Rebuild manifest book + bundle with updated entries; queue both
+        // for ingest (deferred until after rekey succeeds).
+        let rebuilt = folders::build_folder(
+            /* display name not used by manifest; empty is fine */ "",
+            &manifest.folder_manifest.entries,
+        )?;
+        let rebuilt_bundle_cid = rebuilt.bundle_cid;
+        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
+        pending_ingests.push((
+            hex::encode(rebuilt.manifest_cid.to_bytes()),
+            rebuilt.manifest_bytes,
+        ));
+        pending_ingests.push((
+            hex::encode(rebuilt_bundle_cid.to_bytes()),
+            rebuilt.bundle_bytes,
+        ));
+
+        prev_old_cid = anc_cid;
+        prev_new_cid = rebuilt_bundle_cid.to_bytes();
+    }
+
+    // 3. Rekey the top-level sidecar entry FIRST. If this fails (collision
+    // or old-missing), no ingests have happened — no orphan bytes.
+    let new_bundle_size = last_bundle_size;
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Read the pre-rekey pin state AND perform the rekey under a single lock
+    // acquisition: a concurrent pin_content/unpin_content landing between the
+    // read and the rekey would otherwise leave had_pin disagreeing with what
+    // the sidecar just persisted, so the subsequent runtime Pin/Unpin dispatch
+    // below would fight the intervening toggle.
+    let had_pin = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let had_pin = idx.get(&root_old).map(|e| e.pinned).unwrap_or(false);
+        match idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms) {
+            Ok(()) => had_pin,
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err(
+                    "top-level folder not in sidecar — nothing to rekey".to_string(),
+                );
+            }
+            Err(content_index::RekeyError::Collision) => {
+                return Err(
+                    "the new folder's contents collide with an existing top-level entry; \
+                     rename the existing one or differentiate the new one before retrying"
+                        .to_string(),
+                );
+            }
+        }
+    };
+
+    // 4. Drain the deferred ingests now that the sidecar is committed.
+    // If the event loop dies mid-drain, we end up with a sidecar pointer
+    // (the new top-level root CID) referencing a chain whose bytes are
+    // partially resident at best. ZEB-155's fetch-completion recovery
+    // hook is gated on ZEB-159 (not yet implemented), so the user is
+    // left with a folder whose nested contents fail to load until they
+    // manually burn the root. A proper rekey-rollback (mirroring
+    // create_folder_at_root's sidecar.remove) requires snapshotting the
+    // pre-rekey size + stored_at and reversing the rekey on failure;
+    // tracked separately so the moderate complexity isn't bundled into
+    // the slice 1 PR. See ZEB-167.
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // 5. Event-loop pin sync: unpin old, pin new (if old had pin intent).
+    //
+    // The whole step is best-effort: the sidecar has already committed
+    // the rekey, so any failure here — channel send, reply, or remote
+    // error — is a runtime/cache desync rather than a user-visible
+    // regression. Log so the desync is diagnosable (silent swallow would
+    // let "sidecar says pinned, runtime isn't" happen invisibly) but do
+    // not propagate, otherwise the user sees "event loop not running"
+    // on a folder that was fully created and persisted. The fetch-
+    // completion hook (ZEB-155 + ZEB-159) re-converges on the next fetch
+    // of the new root.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    match verb_tx
+        .send(event_loop::ContentVerbRequest::Unpin {
+            cid: root_old,
+            reply: reply_tx,
+        })
+        .await
+    {
+        Ok(()) => match reply_rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                old_cid = %hex::encode(root_old),
+                err = %e,
+                "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
+            ),
+            Err(_) => tracing::warn!(
+                old_cid = %hex::encode(root_old),
+                "create_folder_nested: event loop dropped unpin reply",
+            ),
+        },
+        Err(_) => tracing::warn!(
+            old_cid = %hex::encode(root_old),
+            "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
+        ),
+    }
+    if had_pin {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Pin {
+                cid: prev_new_cid,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    new_cid = %hex::encode(prev_new_cid),
+                    err = %e,
+                    "create_folder_nested: runtime pin of new root failed; sidecar pin intent will repin on next fetch",
+                ),
+                Err(_) => tracing::warn!(
+                    new_cid = %hex::encode(prev_new_cid),
+                    "create_folder_nested: event loop dropped pin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                new_cid = %hex::encode(prev_new_cid),
+                "create_folder_nested: event loop closed before pin send; sidecar pin intent will repin on next fetch",
+            ),
+        }
+    }
+
+    Ok(hex::encode(prev_new_cid))
+}
+
+async fn read_cached_bytes(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    cid: [u8; 32],
+) -> Result<Option<Vec<u8>>, String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    verb_tx
+        .send(event_loop::ContentVerbRequest::ReadBytes {
+            cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "event loop dropped read request".to_string())
 }
 
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().
@@ -2082,6 +2562,7 @@ pub fn run() {
             fetch_content,
             export_content,
             ingest_content,
+            create_folder,
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,
@@ -2508,6 +2989,19 @@ mod tests {
         assert!(parse_content_announcement("harmony/announce/xyz!", &payload).is_none());
         assert!(parse_content_announcement("harmony/announce/hello world", &payload).is_none());
     }
+
+    #[test]
+    fn list_folder_rejects_non_manifest_child_0() {
+        use crate::folders::FolderManifest;
+
+        // A bundle whose child-0 book payload is NOT a folder manifest
+        // (e.g., plain UTF-8 "not a manifest" or chunked-file sentinel bytes).
+        // Simulated here at the parse level — the full wiring test is the
+        // integration test malformed_manifest_returns_error.
+        let payload = b"definitely not a manifest";
+        let parse_result: Result<FolderManifest, _> = serde_json::from_slice(payload);
+        assert!(parse_result.is_err(), "bad JSON must not parse as FolderManifest");
+    }
 }
 
 #[cfg(test)]
@@ -2666,7 +3160,27 @@ mod pin_persistence_tests {
             licensed: false,
             archived: false,
             pinned,
+            kind: content_index::ContentKind::Leaf,
         }
+    }
+
+    #[test]
+    fn content_item_wire_serializes_kind_field() {
+        let wire = ContentItemWire {
+            cid: "aa".repeat(32),
+            name: "Photos".into(),
+            size_bytes: 32,
+            stored_at: 1,
+            sensitivity: "private".into(),
+            replication_tier: "default".into(),
+            pinned: false,
+            licensed: false,
+            archived: false,
+            kind: "folder".into(),
+        };
+        let json = serde_json::to_string(&wire).expect("serialize");
+        // camelCase rename_all is already on ContentItemWire; kind is a plain field.
+        assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
     }
 
     #[test]

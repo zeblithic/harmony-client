@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use harmony_app::content_index::{
-    ContentIndex, ContentIndexEntry, ReplicationTier, Sensitivity,
+    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity,
 };
 use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
 use harmony_content::book::MemoryBookStore;
@@ -196,6 +196,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 licensed: false,
                 archived: false,
                 pinned: false,
+                kind: ContentKind::Leaf,
             }),
             "first insert should return true"
         );
@@ -453,6 +454,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
             licensed: false,
             archived: false,
             pinned: false,
+            kind: ContentKind::Leaf,
         }));
     }
 
@@ -559,6 +561,7 @@ fn pin_intent_survives_reload() {
             licensed: false,
             archived: false,
             pinned: false,
+            kind: ContentKind::Leaf,
         });
         assert!(idx.set_pinned(&cid, true), "initial flip should report change");
     }

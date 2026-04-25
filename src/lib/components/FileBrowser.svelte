@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { FileViewMode, ContentSection, CleanupRecommendation, ContentCategory, ReplicationTier } from '../types';
+  import { untrack } from 'svelte';
+  import type { FileViewMode, ContentSection, ContentCategory, ReplicationTier, ContentItem } from '../types';
   import { FileManagerService } from '../file-manager-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
@@ -56,14 +57,128 @@
     serviceVersion?: number;
   } = $props();
 
+  // Live folder contents fetched from the backend, paired with the cid
+  // they were fetched for. Tagging by cid lets the items derived reject
+  // stale data during the gap between currentFolderCid changing and the
+  // fetch effect kicking off — without the tag, a fresh render between
+  // those two events would briefly paint the previous folder's items in
+  // the new folder's view.
+  //
+  // Null means "no fetch result for the current folder is in hand". An
+  // empty items array means the folder exists but is empty.
+  let folderItems = $state<{ cid: string; items: ContentItem[] } | null>(null);
+
+  // Explicit navigation stack of {cid, name} from root sentinel down to the
+  // current folder. Maintained locally because nested folder rows are not in
+  // the sidecar (Option Y) and cannot be walked via parentCid. handleItemClick
+  // stashes the (cid, name) before calling onNavigateFolder so the $effect
+  // below can extend the stack with a real name. Truncates on back-navigation
+  // (clicking a breadcrumb), resets when currentFolderCid → null.
+  let navStack = $state<Array<{ cid: string; name: string }>>([]);
+  let pendingNav: { cid: string; name: string } | null = null;
+
+  // Sync navStack with currentFolderCid (driven by the parent component).
+  // The effect's only reactive dependency is currentFolderCid; navStack /
+  // pendingNav / items are read inside untrack() so writes to navStack
+  // don't trigger an infinite re-run loop.
+  $effect(() => {
+    const cid = currentFolderCid;
+    untrack(() => {
+      if (cid === null) {
+        navStack = [];
+        pendingNav = null;
+        return;
+      }
+      // Back navigation: cid is already somewhere in the stack → truncate.
+      const idx = navStack.findIndex((seg) => seg.cid === cid);
+      if (idx >= 0) {
+        navStack = navStack.slice(0, idx + 1);
+        pendingNav = null;
+        return;
+      }
+      // Forward navigation: prefer the (cid, name) stashed at click time.
+      if (pendingNav && pendingNav.cid === cid) {
+        navStack = [...navStack, pendingNav];
+        pendingNav = null;
+        return;
+      }
+      // Programmatic jump (no click stash): try to look up the name from
+      // current items, then root-level items, then fall back to a placeholder.
+      const item =
+        items.find((i) => i.cid === cid) ??
+        service.getContents().find((i) => i.cid === cid);
+      navStack = [...navStack, { cid, name: item?.name ?? '(folder)' }];
+    });
+  });
+
+  // Monotonic token for in-flight listFolderContents calls. Rapid
+  // serviceVersion bumps can queue multiple fetches for the same cid; the
+  // cid-equality guard alone isn't enough because an older fetch can still
+  // resolve last and clobber a newer snapshot. Every effect run bumps this
+  // token, and each .then() only commits if its captured token is still the
+  // latest — older resolutions are discarded.
+  let folderFetchSeq = 0;
+
+  // Whenever currentFolderCid OR serviceVersion changes, fetch live folder
+  // contents from the backend. The serviceVersion dependency catches
+  // pin/unpin/burn/archive/tier mutations on items inside the current folder,
+  // which bump the service's version counter but don't change currentFolderCid.
+  //
+  // We deliberately do NOT clear folderItems on cid change here: clearing
+  // would only happen in the post-render $effect, leaving the pre-effect
+  // render painting the previous folder's items into the new folder's
+  // view. Instead, the items derived guards on folderItems.cid ===
+  // currentFolderCid; a mismatched tag is treated as "no data yet" and
+  // the fallback fires. On serviceVersion bumps (same cid), the visible
+  // list stays put until the re-fetch resolves.
+  $effect(() => {
+    void serviceVersion; // re-fetch on cache mutation
+    const cid = currentFolderCid;
+    const mySeq = ++folderFetchSeq;
+    if (!cid) {
+      folderItems = null;
+      return;
+    }
+    service
+      .listFolderContents(cid)
+      .then((result) => {
+        // Guards: still in the same folder AND this is the newest fetch.
+        // Without the seq check an older resolution could overwrite a newer
+        // snapshot after a rapid mutation burst.
+        if (currentFolderCid === cid && mySeq === folderFetchSeq) {
+          folderItems = { cid, items: result };
+        }
+      })
+      .catch((err) => {
+        // The service no longer swallows backend errors (malformed manifest,
+        // consistency-check failures, event-loop drop). Surface them to the
+        // user so a corrupted folder doesn't look indistinguishable from an
+        // empty one, and clear the list so stale contents don't mislead.
+        // Everything (state, log, alert) is gated on the same staleness
+        // check so a rapid navigate-away doesn't pop a blocking alert
+        // about a folder the user is no longer viewing — the error is
+        // not actionable from elsewhere in the tree.
+        if (currentFolderCid === cid && mySeq === folderFetchSeq) {
+          folderItems = { cid, items: [] };
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('listFolderContents failed:', err);
+          window.alert(`Could not load folder: ${msg}`);
+        }
+      });
+  });
+
   let publishedItems = $derived.by(() => {
     void serviceVersion;
     return service.getPublishedContent();
   });
 
-  let items = $derived.by(() => {
-    void serviceVersion; // trigger reactivity
-    let contents = service.getContents(currentFolderCid);
+  function applyFiltersAndSort(contents: ContentItem[]): ContentItem[] {
+    // Defensive copy: callers may pass folderItems.items (a $state proxy)
+    // directly when no filter is applied, and our trailing .sort() would
+    // otherwise mutate the proxy in-place inside a $derived.by — Svelte 5
+    // flags this as a reactivity cycle. Copying once here is cheaper than
+    // copying inside every filter branch.
+    contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       contents = contents.filter((i) => i.name.toLowerCase().includes(q));
@@ -96,6 +211,27 @@
       if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
+  }
+
+  // When inside a folder:
+  //   - If folderItems is tagged with the current cid (backend fetch
+  //     resolved for THIS folder), use its items.
+  //   - Otherwise (no fetch yet, or folderItems still tagged with the
+  //     previous folder's cid because we just navigated and the fetch
+  //     effect hasn't kicked in), fall back to the cached service data.
+  //     For real adapters this returns [] during the brief inter-folder
+  //     gap (better than flashing the prior folder's contents); for
+  //     tests/Storybook with mock data populated by parentCid it returns
+  //     the expected children synchronously.
+  // When at root, always use the cached service data.
+  let items = $derived.by(() => {
+    void serviceVersion;
+    if (currentFolderCid !== null) {
+      const matching =
+        folderItems?.cid === currentFolderCid ? folderItems.items : null;
+      return applyFiltersAndSort(matching ?? service.getContents(currentFolderCid));
+    }
+    return applyFiltersAndSort(service.getContents(null));
   });
 
   let quota = $derived.by(() => {
@@ -108,36 +244,62 @@
     return service.getCleanupRecommendations();
   });
 
-  let breadcrumbPath = $derived.by(() => {
-    void serviceVersion;
-    const path: Array<{ cid: string | null; name: string }> = [
-      { cid: null, name: 'My Content' },
-    ];
-    if (currentFolderCid) {
-      const allContent = service.getContents();
-      // Walk up the parent chain to build the full ancestor path
-      const ancestors: Array<{ cid: string; name: string }> = [];
-      let cid: string | null = currentFolderCid;
-      const seen = new Set<string>();
-      while (cid && !seen.has(cid)) {
-        seen.add(cid);
-        const folder = allContent.find((i) => i.cid === cid);
-        if (!folder) break;
-        ancestors.unshift({ cid: folder.cid, name: folder.name });
-        cid = folder.parentCid;
-      }
-      path.push(...ancestors);
-    }
-    return path;
-  });
+  // Breadcrumb path = root sentinel + the explicit nav stack. No sidecar
+  // walk: nested folder rows aren't persisted (Option Y) so parentCid can't
+  // reconstruct the chain reliably.
+  let breadcrumbPath = $derived.by<Array<{ cid: string | null; name: string }>>(
+    () => [{ cid: null, name: 'My Content' }, ...navStack],
+  );
+
+  // The stack of ancestor CIDs from root down to the current folder's parent.
+  // Used by createFolder so the backend can cascade the CID update up the tree.
+  let breadcrumbStack = $derived.by<string[]>(() => navStack.map((seg) => seg.cid));
 
   function handleItemClick(cid: string) {
     const item = items.find((i) => i.cid === cid);
     if (item?.isFolder) {
+      // Stash (cid, name) for the navStack $effect to consume on the next tick.
+      pendingNav = { cid: item.cid, name: item.name };
       onNavigateFolder(item.cid);
       return;
     }
     onItemClick(cid);
+  }
+
+  async function handleNewFolder() {
+    const name = window.prompt('Folder name:');
+    if (!name || !name.trim()) return;
+
+    // Capture pre-create state. breadcrumbStack drives whether this is a
+    // nested create (non-empty → ancestor cascade rewrites every CID up
+    // the path) or a root create (empty → leaves existing entries
+    // untouched). Read before the await so a concurrent navigation
+    // doesn't change which branch we take. Using the path itself rather
+    // than `currentFolderCid` makes the intent ("did the cascade run?")
+    // explicit and decoupled from the breadcrumb derivation.
+    const wasNestedCreate = breadcrumbStack.length > 0;
+
+    try {
+      await service.createFolder(name.trim(), breadcrumbStack);
+    } catch (err) {
+      // Surface known backend errors to the user; identical-contents
+      // collisions and similar are returned as plain Err strings.
+      const msg = err instanceof Error ? err.message : String(err);
+      window.alert(`Could not create folder: ${msg}`);
+      return;
+    }
+
+    // Nested create only: the ancestor cascade rewrites every CID along
+    // the path including currentFolderCid, so refetching the same CID
+    // would just re-read the now-stale bundle. Until ZEB-164 lands a
+    // stable sidecar identity, navigate back to the root view — the new
+    // folder appears in the root's refreshed listing (createFolder
+    // already called refetchRoot internally) and the user can re-enter
+    // the path. A root-level create touches no ancestor CIDs, so we
+    // leave the user where they were.
+    if (wasNestedCreate) {
+      onNavigateFolder(null);
+    }
   }
 </script>
 
@@ -149,6 +311,9 @@
     {onSearchChange}
     {onUploadClick}
     {onCleanupClick}
+    onNewFolderClick={section === 'private' && !showCleanup
+      ? handleNewFolder
+      : undefined}
     {showCleanup}
     {section}
     {onSectionChange}

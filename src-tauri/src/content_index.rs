@@ -40,6 +40,22 @@ pub enum ReplicationTier {
     Ultra,
 }
 
+/// ZEB-158 slice 1: distinguishes user-visible content kinds at the sidecar
+/// level. Leaves are ingested files (books or chunked-file bundles); folders
+/// are bundles whose child-0 is a manifest book (see
+/// `src-tauri/src/folders.rs` and `docs/specs/2026-04-24-folder-primitive-design.md`).
+///
+/// The default variant is `Leaf` so `#[serde(default)]` on the `kind` field
+/// lets pre-ZEB-158 sidecar entries deserialize correctly (they were all
+/// leaves at the time of their last save).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentKind {
+    #[default]
+    Leaf,
+    Folder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIndexEntry {
     #[serde(with = "hex_cid")]
@@ -62,6 +78,12 @@ pub struct ContentIndexEntry {
     /// pinned at their last save, since the field didn't exist).
     #[serde(default)]
     pub pinned: bool,
+    /// ZEB-158 slice 1: distinguishes leaf files from folder bundles at the
+    /// sidecar level. Default `Leaf` with `#[serde(default)]` keeps pre-slice-1
+    /// sidecars readable — legacy entries were all leaves by construction,
+    /// because folders didn't exist before slice 1.
+    #[serde(default)]
+    pub kind: ContentKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,6 +95,17 @@ struct IndexFile {
 pub struct ContentIndex {
     path: PathBuf,
     entries: HashMap<[u8; 32], ContentIndexEntry>,
+}
+
+/// Errors returned by [`ContentIndex::rekey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyError {
+    /// The `old` CID wasn't in the index — nothing to rekey.
+    OldMissing,
+    /// The `new` CID is already present (and differs from `old`); the
+    /// rekey would overwrite an unrelated entry. Caller should surface
+    /// a "identical contents already exists" message.
+    Collision,
 }
 
 impl ContentIndex {
@@ -194,6 +227,44 @@ impl ContentIndex {
         true
     }
 
+    /// ZEB-158 slice 1: atomically replace an entry's CID while
+    /// preserving user-state fields (file_name, sensitivity,
+    /// replication_tier, licensed, archived, pinned, kind). Used when a
+    /// folder mutation produces a new top-level root CID (nested
+    /// `create_folder`, future move/rename operations). One save() for
+    /// the whole replacement — remove-then-insert would give two.
+    ///
+    /// Refuses on collision: if `new` is already present in the index
+    /// (and `new != *old`), the call is a no-op and returns
+    /// `Err(RekeyError::Collision)`. Without this guard, the inner
+    /// `HashMap::insert` would silently overwrite the existing entry
+    /// under `new`, dropping a different user-visible row. The collision
+    /// happens for real under content-addressing: nested folder
+    /// mutations can produce a CID that already names another sidecar
+    /// root (two distinct paths converging on identical bundle
+    /// contents). Symlink-style multiple-entries-per-CID is tracked in
+    /// ZEB-164.
+    pub fn rekey(
+        &mut self,
+        old: &[u8; 32],
+        new: [u8; 32],
+        new_size_bytes: u64,
+        new_stored_at_ms: u64,
+    ) -> Result<(), RekeyError> {
+        if old != &new && self.entries.contains_key(&new) {
+            return Err(RekeyError::Collision);
+        }
+        let Some(mut entry) = self.entries.remove(old) else {
+            return Err(RekeyError::OldMissing);
+        };
+        entry.cid = new;
+        entry.size_bytes = new_size_bytes;
+        entry.stored_at_ms = new_stored_at_ms;
+        self.entries.insert(new, entry);
+        self.save();
+        Ok(())
+    }
+
     /// Flip the `pinned` flag. Returns `true` if the flag changed;
     /// `false` if already at the target state or the CID is unknown.
     pub fn set_pinned(&mut self, cid: &[u8; 32], pinned: bool) -> bool {
@@ -244,7 +315,7 @@ impl ContentIndex {
     }
 }
 
-mod hex_cid {
+pub(crate) mod hex_cid {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(cid: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
@@ -276,6 +347,7 @@ mod tests {
             licensed: false,
             archived: false,
             pinned: false,
+            kind: ContentKind::Leaf,
         }
     }
 
@@ -460,6 +532,126 @@ mod tests {
             reloaded.get(&[0xB3; 32]).expect("B3 persisted").pinned,
             "pinned flag must survive save/load"
         );
+    }
+
+    #[test]
+    fn kind_defaults_to_leaf_on_legacy_sidecar() {
+        let dir = tempdir().unwrap();
+        // v1 sidecar from before ZEB-158 slice 1 — no `kind` field.
+        let legacy = br#"{
+            "version": 1,
+            "entries": [{
+                "cid": "aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00",
+                "file_name": "legacy.txt",
+                "size_bytes": 42,
+                "stored_at_ms": 1700000000000,
+                "sensitivity": "private",
+                "replication_tier": "default",
+                "licensed": false,
+                "archived": false,
+                "pinned": false
+            }]
+        }"#;
+        std::fs::write(dir.path().join(INDEX_FILE), legacy).unwrap();
+
+        let idx = ContentIndex::load(dir.path());
+        let entry = idx
+            .entries()
+            .next()
+            .expect("legacy entry must load");
+        assert_eq!(entry.kind, ContentKind::Leaf);
+    }
+
+    #[test]
+    fn save_persists_kind_field() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let mut entry = sample_entry([0xF0; 32]);
+        entry.file_name = "Photos".into();
+        entry.kind = ContentKind::Folder;
+        idx.insert(entry.clone());
+
+        let reloaded = ContentIndex::load(dir.path());
+        let got = reloaded.get(&entry.cid).expect("round-trips");
+        assert_eq!(got.kind, ContentKind::Folder);
+        assert_eq!(got.file_name, "Photos");
+    }
+
+    #[test]
+    fn rekey_atomically_replaces_cid_and_preserves_user_state() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let mut entry = sample_entry([0x01; 32]);
+        entry.file_name = "Folder".into();
+        entry.kind = ContentKind::Folder;
+        entry.pinned = true;
+        entry.archived = false;
+        idx.insert(entry.clone());
+
+        let result = idx.rekey(
+            &[0x01; 32],
+            [0x02; 32],
+            /* new_size_bytes */ 999,
+            /* new_stored_at_ms */ 1234,
+        );
+        assert!(result.is_ok(), "rekey must succeed when old key exists");
+
+        assert!(idx.get(&[0x01; 32]).is_none(), "old key removed");
+        let after = idx.get(&[0x02; 32]).expect("new key present");
+        assert_eq!(after.file_name, "Folder", "file_name carried forward");
+        assert_eq!(after.kind, ContentKind::Folder, "kind carried forward");
+        assert!(after.pinned, "pinned carried forward");
+        assert_eq!(after.size_bytes, 999, "size_bytes updated");
+        assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
+
+        // Non-existent old key returns OldMissing.
+        assert_eq!(
+            idx.rekey(&[0xFF; 32], [0xEE; 32], 0, 0),
+            Err(RekeyError::OldMissing),
+        );
+    }
+
+    #[test]
+    fn rekey_refuses_collision_instead_of_overwriting() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        // Two distinct entries: keeper at 0xAA, victim-target at 0xBB.
+        let mut keeper = sample_entry([0xAA; 32]);
+        keeper.file_name = "Keeper".into();
+        idx.insert(keeper);
+
+        let mut other = sample_entry([0xBB; 32]);
+        other.file_name = "OtherRoot".into();
+        idx.insert(other);
+
+        // Try to rekey OtherRoot from 0xBB → 0xAA. Without the collision
+        // guard this would clobber Keeper. With it we get a Collision
+        // error and both entries remain intact.
+        let result = idx.rekey(&[0xBB; 32], [0xAA; 32], 0, 0);
+        assert_eq!(result, Err(RekeyError::Collision));
+
+        // Both entries still present and unchanged.
+        assert_eq!(idx.get(&[0xAA; 32]).unwrap().file_name, "Keeper");
+        assert_eq!(idx.get(&[0xBB; 32]).unwrap().file_name, "OtherRoot");
+    }
+
+    #[test]
+    fn rekey_old_equals_new_is_a_self_update_not_a_collision() {
+        // rekey(old=X, new=X) should be allowed — it's a metadata refresh
+        // (size_bytes / stored_at_ms only). The collision guard checks
+        // `old != &new` before refusing, so this path is not blocked.
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xCC; 32]);
+        idx.insert(entry);
+
+        let result = idx.rekey(&[0xCC; 32], [0xCC; 32], 12345, 67890);
+        assert!(result.is_ok());
+        let after = idx.get(&[0xCC; 32]).expect("entry still present");
+        assert_eq!(after.size_bytes, 12345);
+        assert_eq!(after.stored_at_ms, 67890);
     }
 
     #[test]

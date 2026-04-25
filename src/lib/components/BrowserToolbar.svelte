@@ -8,6 +8,7 @@
     onSearchChange,
     onUploadClick,
     onCleanupClick,
+    onNewFolderClick,
     showCleanup = false,
     section,
     onSectionChange,
@@ -18,6 +19,7 @@
     onSearchChange: (query: string) => void;
     onUploadClick: () => void;
     onCleanupClick: () => void;
+    onNewFolderClick?: () => void;
     showCleanup?: boolean;
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
@@ -69,6 +71,9 @@
           onclick={() => onViewModeChange('grid')}
         >⊞</button>
         <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
+        {#if onNewFolderClick}
+          <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
+        {/if}
       {/if}
       <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
     {/if}
