@@ -548,6 +548,12 @@ async fn start_node(
             let idx = content_index
                 .lock()
                 .map_err(|e| format!("content_index lock on startup: {e}"))?;
+            // ZEB-164: multiple sidecar entries can pin the same CID. The
+            // runtime pin_intent set is CID-keyed, so we dedupe here —
+            // collecting into a HashSet drops duplicates without effect.
+            // (Functionally identical to the pre-ZEB-164 path; the dedupe
+            // is just made explicit so debug logs don't show repeated
+            // restores for the same CID.)
             idx.entries()
                 .filter(|e| e.pinned)
                 .map(|e| e.cid)
