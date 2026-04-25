@@ -1409,16 +1409,24 @@ async fn pin_content(
             .cid
     };
 
-    // Sidecar already committed. Runtime Pin is best-effort: if the
-    // event loop is gone, the missing pin_intent self-corrects on the
-    // next start_node pin-restore sweep (it walks the sidecar and
-    // re-pins every entry with pinned=true). Bytes could be evicted in
-    // the gap if the cache is under quota pressure, but the next read
-    // re-fetches them. Log, don't propagate — matches unpin_content's
-    // and burn_content's RuntimeAction::Burn/Unpin branches; otherwise
-    // the caller sees an error while the sidecar already shows pinned,
-    // and the divergence is silent until next start.
-    if let Some(verb_tx) = maybe_verb_tx {
+    // Sidecar already committed. Runtime Pin failures split into two
+    // categories:
+    //   - Deterministic refusal (Ok(Ok(false)) = pin quota exhausted):
+    //     surface to the caller as Ok(false). The sidecar bit is set so
+    //     intent is recorded, but the runtime answered "no, can't fit"
+    //     and the user needs to know (free space, retry). The
+    //     start_node sweep will retry on next start; if quota is still
+    //     exhausted there too, it also gets false.
+    //   - Transient runtime gaps (event loop down, dropped reply,
+    //     verb_tx None, runtime returned Err): best-effort, log, return
+    //     Ok(true). Intent is recorded; the start_node pin-restore
+    //     sweep walks the sidecar and re-pins every entry with
+    //     pinned=true, so the gap is bounded and self-healing.
+    // This preserves the runtime's quota-exhausted signal that the
+    // pre-best-effort code returned via the bool, while keeping the
+    // best-effort behavior for transient failures that pin/unpin/burn
+    // all share.
+    let pinned = if let Some(verb_tx) = maybe_verb_tx {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         match verb_tx
             .send(event_loop::ContentVerbRequest::Pin {
@@ -1428,29 +1436,46 @@ async fn pin_content(
             .await
         {
             Ok(()) => match reply_rx.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    cid = %hex::encode(cid_bytes),
-                    err = %e,
-                    "pin_content: runtime pin failed; pin_intent will repopulate on next start_node sweep",
-                ),
-                Err(_) => tracing::warn!(
-                    cid = %hex::encode(cid_bytes),
-                    "pin_content: event loop dropped pin reply",
-                ),
+                Ok(Ok(true)) => true,
+                Ok(Ok(false)) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        "pin_content: runtime pin quota exhausted",
+                    );
+                    false
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        err = %e,
+                        "pin_content: runtime pin failed; pin_intent will repopulate on next start_node sweep",
+                    );
+                    true
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        "pin_content: event loop dropped pin reply",
+                    );
+                    true
+                }
             },
-            Err(_) => tracing::warn!(
-                cid = %hex::encode(cid_bytes),
-                "pin_content: event loop closed before pin send; pin_intent will repopulate on next start_node sweep",
-            ),
+            Err(_) => {
+                tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    "pin_content: event loop closed before pin send; pin_intent will repopulate on next start_node sweep",
+                );
+                true
+            }
         }
     } else {
         tracing::warn!(
             cid = %hex::encode(cid_bytes),
             "pin_content: runtime unavailable; pin_intent will repopulate on next start_node sweep",
         );
-    }
-    Ok(true)
+        true
+    };
+    Ok(pinned)
 }
 
 #[tauri::command]
@@ -1534,13 +1559,16 @@ async fn burn_content(
 ) -> Result<bool, String> {
     let id = parse_sidecar_id(&sidecar_id)?;
 
-    let (index, verb_tx) = {
+    // Match pin_content/unpin_content's best-effort pattern: clone
+    // maybe_verb_tx without erroring on None. The pre-existing upfront
+    // ok_or_else was a weak guard anyway — runtime can die between the
+    // check and the verb_tx.send().await — and asymmetry meant users
+    // could pin/unpin offline but not burn. With sidecar-as-source-of-
+    // truth, the entry-removal step succeeds even with the runtime down;
+    // a future reconciliation pass cleans up surviving bytes.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let verb_tx = guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?;
-        (guard.content_index.clone(), verb_tx)
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
 
     // Three-branch decision under a single lock acquisition: read entry's
@@ -1574,30 +1602,37 @@ async fn burn_content(
             // W-TinyLFU evicts them or a future reconciliation pass runs.
             // Log so the desync is diagnosable. Matches the unpin /
             // post-burn-Unpin pattern.
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            match verb_tx
-                .send(event_loop::ContentVerbRequest::Burn {
-                    cid,
-                    reply: reply_tx,
-                })
-                .await
-            {
-                Ok(()) => match reply_rx.await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::warn!(
-                        cid = %hex::encode(cid),
-                        err = %e,
-                        "burn_content: runtime burn failed; bytes may survive until reconciliation",
-                    ),
+            if let Some(verb_tx) = maybe_verb_tx {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                match verb_tx
+                    .send(event_loop::ContentVerbRequest::Burn {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => match reply_rx.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            err = %e,
+                            "burn_content: runtime burn failed; bytes may survive until reconciliation",
+                        ),
+                        Err(_) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            "burn_content: event loop dropped burn reply",
+                        ),
+                    },
                     Err(_) => tracing::warn!(
                         cid = %hex::encode(cid),
-                        "burn_content: event loop dropped burn reply",
+                        "burn_content: event loop closed before burn send; bytes may survive",
                     ),
-                },
-                Err(_) => tracing::warn!(
+                }
+            } else {
+                tracing::warn!(
                     cid = %hex::encode(cid),
-                    "burn_content: event loop closed before burn send; bytes may survive",
-                ),
+                    "burn_content: runtime unavailable; bytes may survive until reconciliation",
+                );
             }
         }
         RuntimeAction::Unpin(cid) => {
@@ -1606,30 +1641,37 @@ async fn burn_content(
             // effort: any failure here is a runtime/cache desync, not a
             // user-visible regression (the sidecar mutation already
             // committed). Log so the desync is diagnosable.
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            match verb_tx
-                .send(event_loop::ContentVerbRequest::Unpin {
-                    cid,
-                    reply: reply_tx,
-                })
-                .await
-            {
-                Ok(()) => match reply_rx.await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::warn!(
-                        cid = %hex::encode(cid),
-                        err = %e,
-                        "burn_content: post-burn unpin failed; runtime may hold stale pin",
-                    ),
+            if let Some(verb_tx) = maybe_verb_tx {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                match verb_tx
+                    .send(event_loop::ContentVerbRequest::Unpin {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => match reply_rx.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            err = %e,
+                            "burn_content: post-burn unpin failed; runtime may hold stale pin",
+                        ),
+                        Err(_) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            "burn_content: event loop dropped post-burn unpin reply",
+                        ),
+                    },
                     Err(_) => tracing::warn!(
                         cid = %hex::encode(cid),
-                        "burn_content: event loop dropped post-burn unpin reply",
+                        "burn_content: event loop closed before post-burn unpin send",
                     ),
-                },
-                Err(_) => tracing::warn!(
+                }
+            } else {
+                tracing::warn!(
                     cid = %hex::encode(cid),
-                    "burn_content: event loop closed before post-burn unpin send",
-                ),
+                    "burn_content: runtime unavailable for post-burn unpin; runtime may hold stale pin",
+                );
             }
         }
         RuntimeAction::Nothing => {} // siblings still pin; runtime untouched
