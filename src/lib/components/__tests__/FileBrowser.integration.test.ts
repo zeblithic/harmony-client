@@ -501,7 +501,7 @@ describe('File Manager Integration', () => {
     const service = new FileManagerService();
     const privateBefore = service.getContents().length;
 
-    service.burn(['cid-training-data']);
+    service.burn(['mock-sidecar-7']);
 
     const privateAfter = service.getContents();
     expect(privateAfter.length).toBe(privateBefore - 1);
@@ -514,7 +514,7 @@ describe('File Manager Integration', () => {
     const service = new FileManagerService();
     const quotaBefore = service.getQuotaStatus().usedBytes;
 
-    service.burn(['cid-video-lecture']);
+    service.burn(['mock-sidecar-5']);
 
     const quotaAfter = service.getQuotaStatus().usedBytes;
     expect(quotaAfter).toBeLessThan(quotaBefore);
