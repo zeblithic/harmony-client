@@ -4,6 +4,7 @@ import FileCard from '../FileCard.svelte';
 import type { ContentItem } from '../../types';
 
 const baseItem: ContentItem = {
+  sidecarId: 'mock-sidecar-card-001',
   cid: 'cid-card-001',
   name: 'photo.jpg',
   category: 'image',

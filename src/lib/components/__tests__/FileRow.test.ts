@@ -4,6 +4,7 @@ import FileRow from '../FileRow.svelte';
 import type { ContentItem } from '../../types';
 
 const baseItem: ContentItem = {
+  sidecarId: 'mock-sidecar-row-001',
   cid: 'cid-test-001',
   name: 'test-document.md',
   category: 'text',

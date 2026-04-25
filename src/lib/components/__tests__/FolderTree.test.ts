@@ -8,6 +8,7 @@ const now = Date.now();
 
 function makeFolder(overrides: Partial<ContentItem> = {}): ContentItem {
   return {
+    sidecarId: 'mock-sidecar-folder',
     cid: 'cid-folder-root',
     name: 'Projects',
     category: 'bundle',
@@ -29,6 +30,7 @@ function makeFolder(overrides: Partial<ContentItem> = {}): ContentItem {
 
 function makeFile(overrides: Partial<ContentItem> = {}): ContentItem {
   return {
+    sidecarId: 'mock-sidecar-file',
     cid: 'cid-file-1',
     name: 'notes.md',
     category: 'text',

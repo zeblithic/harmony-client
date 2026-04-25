@@ -184,6 +184,13 @@ export interface PeerRef {
 }
 
 export interface ContentItem {
+  /**
+   * ZEB-164: opaque per-entry stable identity. Empty string for
+   * manifest-derived rows (children of a folder bundle that have no
+   * sidecar entry of their own). Backend mutations (pin, archive, burn,
+   * setReplicationTier) take sidecarId, not cid.
+   */
+  sidecarId: string;
   cid: string;
   name: string;
   category: ContentCategory;
