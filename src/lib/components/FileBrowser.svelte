@@ -258,6 +258,15 @@
     const name = window.prompt('Folder name:');
     if (!name || !name.trim()) return;
 
+    // Capture pre-create state. breadcrumbStack drives whether this is a
+    // nested create (non-empty → ancestor cascade rewrites every CID up
+    // the path) or a root create (empty → leaves existing entries
+    // untouched). Read before the await so a concurrent navigation
+    // doesn't change which branch we take. Using the path itself rather
+    // than `currentFolderCid` makes the intent ("did the cascade run?")
+    // explicit and decoupled from the breadcrumb derivation.
+    const wasNestedCreate = breadcrumbStack.length > 0;
+
     try {
       await service.createFolder(name.trim(), breadcrumbStack);
     } catch (err) {
@@ -268,13 +277,15 @@
       return;
     }
 
-    // Nested create: the backend's ancestor cascade rewrites every CID
-    // along the path including currentFolderCid, so refetching the same
-    // CID would just re-read the now-stale bundle. Until ZEB-164 lands a
+    // Nested create only: the ancestor cascade rewrites every CID along
+    // the path including currentFolderCid, so refetching the same CID
+    // would just re-read the now-stale bundle. Until ZEB-164 lands a
     // stable sidecar identity, navigate back to the root view — the new
-    // folder appears in the root's refreshed listing (createFolder already
-    // called refetchRoot internally) and the user can re-enter the path.
-    if (currentFolderCid) {
+    // folder appears in the root's refreshed listing (createFolder
+    // already called refetchRoot internally) and the user can re-enter
+    // the path. A root-level create touches no ancestor CIDs, so we
+    // leave the user where they were.
+    if (wasNestedCreate) {
       onNavigateFolder(null);
     }
   }

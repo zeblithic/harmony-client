@@ -2051,51 +2051,64 @@ async fn create_folder_nested(
 
     // 5. Event-loop pin sync: unpin old, pin new (if old had pin intent).
     //
-    // The replies here are best-effort: the sidecar has already committed
-    // the rekey, so a failure here is a runtime/cache desync rather than a
-    // user-visible regression. Log so the desync is at least diagnosable
-    // — silent swallow would let "sidecar says pinned, runtime isn't"
-    // happen invisibly. The fetch-completion hook (ZEB-155 + ZEB-159)
-    // re-converges on the next fetch of the new root.
+    // The whole step is best-effort: the sidecar has already committed
+    // the rekey, so any failure here — channel send, reply, or remote
+    // error — is a runtime/cache desync rather than a user-visible
+    // regression. Log so the desync is diagnosable (silent swallow would
+    // let "sidecar says pinned, runtime isn't" happen invisibly) but do
+    // not propagate, otherwise the user sees "event loop not running"
+    // on a folder that was fully created and persisted. The fetch-
+    // completion hook (ZEB-155 + ZEB-159) re-converges on the next fetch
+    // of the new root.
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
+    match verb_tx
         .send(event_loop::ContentVerbRequest::Unpin {
             cid: root_old,
             reply: reply_tx,
         })
         .await
-        .map_err(|_| "event loop not running".to_string())?;
-    match reply_rx.await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(
-            old_cid = %hex::encode(root_old),
-            err = %e,
-            "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
-        ),
+    {
+        Ok(()) => match reply_rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                old_cid = %hex::encode(root_old),
+                err = %e,
+                "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
+            ),
+            Err(_) => tracing::warn!(
+                old_cid = %hex::encode(root_old),
+                "create_folder_nested: event loop dropped unpin reply",
+            ),
+        },
         Err(_) => tracing::warn!(
             old_cid = %hex::encode(root_old),
-            "create_folder_nested: event loop dropped unpin reply",
+            "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
         ),
     }
     if had_pin {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        verb_tx
+        match verb_tx
             .send(event_loop::ContentVerbRequest::Pin {
                 cid: prev_new_cid,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| "event loop not running".to_string())?;
-        match reply_rx.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                new_cid = %hex::encode(prev_new_cid),
-                err = %e,
-                "create_folder_nested: runtime pin of new root failed; sidecar pin intent will repin on next fetch",
-            ),
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    new_cid = %hex::encode(prev_new_cid),
+                    err = %e,
+                    "create_folder_nested: runtime pin of new root failed; sidecar pin intent will repin on next fetch",
+                ),
+                Err(_) => tracing::warn!(
+                    new_cid = %hex::encode(prev_new_cid),
+                    "create_folder_nested: event loop dropped pin reply",
+                ),
+            },
             Err(_) => tracing::warn!(
                 new_cid = %hex::encode(prev_new_cid),
-                "create_folder_nested: event loop dropped pin reply",
+                "create_folder_nested: event loop closed before pin send; sidecar pin intent will repin on next fetch",
             ),
         }
     }
