@@ -154,12 +154,16 @@
         // consistency-check failures, event-loop drop). Surface them to the
         // user so a corrupted folder doesn't look indistinguishable from an
         // empty one, and clear the list so stale contents don't mislead.
+        // Everything (state, log, alert) is gated on the same staleness
+        // check so a rapid navigate-away doesn't pop a blocking alert
+        // about a folder the user is no longer viewing — the error is
+        // not actionable from elsewhere in the tree.
         if (currentFolderCid === cid && mySeq === folderFetchSeq) {
           folderItems = [];
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('listFolderContents failed:', err);
+          window.alert(`Could not load folder: ${msg}`);
         }
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('listFolderContents failed:', err);
-        window.alert(`Could not load folder: ${msg}`);
       });
   });
 
