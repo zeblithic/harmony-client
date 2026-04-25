@@ -68,18 +68,19 @@
   // empty items array means the folder exists but is empty.
   let folderItems = $state<{ cid: string; items: ContentItem[] } | null>(null);
 
-  // Explicit navigation stack of {cid, name} from root sentinel down to the
-  // current folder. Maintained locally because nested folder rows are not in
-  // the sidecar (Option Y) and cannot be walked via parentCid. handleItemClick
-  // stashes the (cid, name) before calling onNavigateFolder so the $effect
-  // below can extend the stack with a real name. Truncates on back-navigation
-  // (clicking a breadcrumb), resets when currentFolderCid → null.
   // Explicit navigation stack from root sentinel down to the current
-  // folder. Each segment carries cid (for content-addressed bundle
-  // lookups during refetch and breadcrumb display) and an optional
-  // sidecarId — only present on the FIRST segment after the sentinel,
-  // which is the top-level sidecar entry. Nested segments (manifest-
-  // derived rows below the top-level root) have no sidecar of their own.
+  // folder. Maintained locally because nested folder rows are not in the
+  // sidecar (Option Y) and cannot be walked via parentCid. handleItemClick
+  // stashes (cid, name, sidecarId) before calling onNavigateFolder so the
+  // $effect below can extend the stack with a real name. Truncates on
+  // back-navigation (clicking a breadcrumb), resets when currentFolderCid
+  // → null.
+  //
+  // Each segment carries cid (for content-addressed bundle lookups during
+  // refetch and breadcrumb display) and an optional sidecarId — only
+  // present on the FIRST segment after the sentinel, which is the
+  // top-level sidecar entry. Nested segments (manifest-derived rows below
+  // the top-level root) have no sidecar of their own.
   let navStack = $state<Array<{ cid: string; name: string; sidecarId?: string }>>([]);
   let pendingNav: { cid: string; name: string; sidecarId?: string } | null = null;
 
