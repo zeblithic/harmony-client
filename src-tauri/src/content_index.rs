@@ -28,11 +28,10 @@ use uuid::Uuid;
 /// is independent of content. UUID v4 is opaque (callers can't conflate
 /// identity with content), survives restart, and is unique across devices
 /// in case sidecars ever sync.
-///
-/// Tracing renders short-form (`uuid[..8]`) for log readability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SidecarId(Uuid);
 
+#[allow(clippy::new_without_default)]
 impl SidecarId {
     /// Mint a fresh random SidecarId. Backend is the source of truth for
     /// minting; the frontend never generates these.
