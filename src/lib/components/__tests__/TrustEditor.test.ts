@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import TrustEditor from '../TrustEditor.svelte';
-import { buildScore, getIdentity, getCompliance, getAssociation, getEndorsement } from '../../trust-score';
+import { buildScore, getIdentity } from '../../trust-score';
 
 describe('TrustEditor', () => {
   it('renders four radiogroups', () => {

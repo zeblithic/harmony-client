@@ -6,7 +6,6 @@ import type {
   NodeMetrics,
   LinkSnapshot,
   InterfaceType,
-  NodeStatus,
   NodeCapability,
   TransportType,
   NetworkDataService,

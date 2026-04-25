@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect } from 'vitest';
 import PublishedView from '../PublishedView.svelte';
-import type { PublishedItem, ContentCategory } from '../../types';
+import type { PublishedItem } from '../../types';
 
 const day = 86_400_000;
 const now = Date.now();

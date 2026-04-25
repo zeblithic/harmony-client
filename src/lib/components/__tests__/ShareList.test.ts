@@ -92,7 +92,7 @@ describe('ShareList', () => {
   });
 
   it('only shows peers not already shared with in the picker', () => {
-    const { container } = renderShareList();
+    renderShareList();
     const select = screen.getByLabelText('Share with...');
     const options = select.querySelectorAll('option:not([disabled])');
     // Alice and Bob are already shared with, so Carol and Dave remain

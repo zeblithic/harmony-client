@@ -165,7 +165,7 @@ describe('CleanupView', () => {
   });
 
   it('shows recoverable for multiple selections', async () => {
-    const { container } = render(CleanupView, { props: baseProps() });
+    render(CleanupView, { props: baseProps() });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     // 250MB + 1500MB + 8.5MB = 1758.5MB = 1.8 GB
@@ -174,7 +174,7 @@ describe('CleanupView', () => {
   });
 
   it('shows bulk action buttons when items are selected', async () => {
-    const { container } = render(CleanupView, { props: baseProps() });
+    render(CleanupView, { props: baseProps() });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     expect(screen.getByRole('button', { name: /burn all/i })).toBeTruthy();
@@ -185,7 +185,7 @@ describe('CleanupView', () => {
 
   it('fires onBulkBurn with selected CIDs after confirmation', async () => {
     const onBulkBurn = vi.fn();
-    const { container } = render(CleanupView, { props: { ...baseProps(), onBulkBurn } });
+    render(CleanupView, { props: { ...baseProps(), onBulkBurn } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /burn all/i }));
@@ -199,7 +199,7 @@ describe('CleanupView', () => {
 
   it('fires onBulkArchive with selected CIDs after confirmation', async () => {
     const onBulkArchive = vi.fn();
-    const { container } = render(CleanupView, { props: { ...baseProps(), onBulkArchive } });
+    render(CleanupView, { props: { ...baseProps(), onBulkArchive } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /archive all/i }));
@@ -212,7 +212,7 @@ describe('CleanupView', () => {
 
   it('fires onBulkRelease with selected CIDs after confirmation', async () => {
     const onBulkRelease = vi.fn();
-    const { container } = render(CleanupView, { props: { ...baseProps(), onBulkRelease } });
+    render(CleanupView, { props: { ...baseProps(), onBulkRelease } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /release all/i }));
@@ -229,7 +229,7 @@ describe('CleanupView', () => {
 
   it('fires onBulkPublish with selected CIDs after confirmation', async () => {
     const onBulkPublish = vi.fn();
-    const { container } = render(CleanupView, { props: { ...baseProps(), onBulkPublish } });
+    render(CleanupView, { props: { ...baseProps(), onBulkPublish } });
     const selectAll = screen.getByRole('checkbox', { name: /select all/i });
     await fireEvent.click(selectAll);
     await fireEvent.click(screen.getByRole('button', { name: /publish all/i }));

@@ -63,7 +63,7 @@ describe('ConfirmDialog', () => {
   });
 
   it('applies destructive class when destructive prop is true', () => {
-    const { container } = render(ConfirmDialog, {
+    render(ConfirmDialog, {
       props: {
         title: 'Delete',
         message: 'This is permanent.',

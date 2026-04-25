@@ -15,10 +15,11 @@ import { TrustService } from '../../trust-service';
 import type { Message, Peer } from '../../types';
 import type { ThreadMetaEntry } from '../../feed-utils';
 
-// jsdom lacks IntersectionObserver — provide a minimal mock
+// jsdom lacks IntersectionObserver — provide a minimal mock. The
+// callback is accepted to match the constructor signature but never
+// invoked in tests; observe/unobserve/disconnect are no-ops.
 class MockIntersectionObserver {
-  private cb: IntersectionObserverCallback;
-  constructor(cb: IntersectionObserverCallback) { this.cb = cb; }
+  constructor(_cb: IntersectionObserverCallback) {}
   observe() {}
   unobserve() {}
   disconnect() {}
