@@ -1409,18 +1409,48 @@ async fn pin_content(
             .cid
     };
 
-    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Pin {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped pin request".to_string())?
+    // Sidecar already committed. Runtime Pin is best-effort: if the
+    // event loop is gone, the missing pin_intent self-corrects on the
+    // next start_node pin-restore sweep (it walks the sidecar and
+    // re-pins every entry with pinned=true). Bytes could be evicted in
+    // the gap if the cache is under quota pressure, but the next read
+    // re-fetches them. Log, don't propagate — matches unpin_content's
+    // and burn_content's RuntimeAction::Burn/Unpin branches; otherwise
+    // the caller sees an error while the sidecar already shows pinned,
+    // and the divergence is silent until next start.
+    if let Some(verb_tx) = maybe_verb_tx {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Pin {
+                cid: cid_bytes,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    err = %e,
+                    "pin_content: runtime pin failed; pin_intent will repopulate on next start_node sweep",
+                ),
+                Err(_) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    "pin_content: event loop dropped pin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                cid = %hex::encode(cid_bytes),
+                "pin_content: event loop closed before pin send; pin_intent will repopulate on next start_node sweep",
+            ),
+        }
+    } else {
+        tracing::warn!(
+            cid = %hex::encode(cid_bytes),
+            "pin_content: runtime unavailable; pin_intent will repopulate on next start_node sweep",
+        );
+    }
+    Ok(true)
 }
 
 #[tauri::command]
