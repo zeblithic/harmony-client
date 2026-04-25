@@ -18,6 +18,41 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Opaque per-entry stable identity for a sidecar row.
+///
+/// The sidecar key was `[u8; 32]` CID prior to ZEB-164, which forced one
+/// entry per CID. With multiple user-visible entries (folders or otherwise)
+/// allowed to share a CID — symlink-style — we need a stable identity that
+/// is independent of content. UUID v4 is opaque (callers can't conflate
+/// identity with content), survives restart, and is unique across devices
+/// in case sidecars ever sync.
+///
+/// Tracing renders short-form (`uuid[..8]`) for log readability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SidecarId(Uuid);
+
+impl SidecarId {
+    /// Mint a fresh random SidecarId. Backend is the source of truth for
+    /// minting; the frontend never generates these.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Parse the hyphenated lowercase Display form back into a SidecarId.
+    /// Used at the IPC boundary when commands receive sidecar_id strings.
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+impl std::fmt::Display for SidecarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hyphenated lowercase, e.g. "8b4f7c2e-1a3d-4f5b-9c0e-1234567890ab".
+        write!(f, "{}", self.0.as_hyphenated())
+    }
+}
 
 const INDEX_FILE: &str = "content-index.json";
 const FILE_VERSION: u32 = 1;
@@ -681,5 +716,39 @@ mod tests {
         let entry = idx.get(&[0xAA; 32]).expect("legacy entry must load");
         assert!(!entry.pinned, "legacy entries must read as pinned=false");
         assert_eq!(entry.file_name, "legacy.txt");
+    }
+
+    #[test]
+    fn sidecar_id_new_produces_unique_values() {
+        let a = SidecarId::new();
+        let b = SidecarId::new();
+        assert_ne!(a, b, "two SidecarId::new() calls must produce distinct values");
+    }
+
+    #[test]
+    fn sidecar_id_round_trips_through_display_and_parse() {
+        let original = SidecarId::new();
+        let s = original.to_string();
+        let parsed = SidecarId::parse_str(&s).expect("must parse own Display output");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn sidecar_id_parse_str_rejects_garbage() {
+        assert!(SidecarId::parse_str("").is_err());
+        assert!(SidecarId::parse_str("not-a-uuid").is_err());
+        assert!(SidecarId::parse_str("8b4f7c2e-1a3d-4f5b-9c0e-XXXXXXXXXXXX").is_err());
+    }
+
+    #[test]
+    fn sidecar_id_serializes_as_hyphenated_string() {
+        let id = SidecarId::new();
+        let json = serde_json::to_string(&id).expect("serialize");
+        // Hyphenated UUID is 38 chars wrapped in quotes: "<36 chars>"
+        assert_eq!(json.len(), 38, "got {json}");
+        assert!(json.starts_with('"') && json.ends_with('"'));
+        // Round-trip via deserialization too.
+        let back: SidecarId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, id);
     }
 }

@@ -25,6 +25,7 @@ rand = "0.8"
 zeroize = "1"
 tracing = "0.1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
