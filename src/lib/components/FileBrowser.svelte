@@ -57,10 +57,16 @@
     serviceVersion?: number;
   } = $props();
 
-  // Live folder contents fetched from the backend when navigating into a folder.
-  // Null means "not yet fetched" (while navigating); an empty array means the
-  // folder exists but is empty. Used only when currentFolderCid != null.
-  let folderItems = $state<ContentItem[] | null>(null);
+  // Live folder contents fetched from the backend, paired with the cid
+  // they were fetched for. Tagging by cid lets the items derived reject
+  // stale data during the gap between currentFolderCid changing and the
+  // fetch effect kicking off — without the tag, a fresh render between
+  // those two events would briefly paint the previous folder's items in
+  // the new folder's view.
+  //
+  // Null means "no fetch result for the current folder is in hand". An
+  // empty items array means the folder exists but is empty.
+  let folderItems = $state<{ cid: string; items: ContentItem[] } | null>(null);
 
   // Explicit navigation stack of {cid, name} from root sentinel down to the
   // current folder. Maintained locally because nested folder rows are not in
@@ -105,12 +111,6 @@
     });
   });
 
-  // Track the most recently fetched folder CID so that version bumps
-  // (pin/unpin/burn/archive/tier mutations) re-fetch in the background
-  // without clearing the visible list. Clearing is reserved for real
-  // navigation — i.e. when cid actually changes.
-  let lastFetchedCid: string | null = null;
-
   // Monotonic token for in-flight listFolderContents calls. Rapid
   // serviceVersion bumps can queue multiple fetches for the same cid; the
   // cid-equality guard alone isn't enough because an older fetch can still
@@ -123,21 +123,21 @@
   // contents from the backend. The serviceVersion dependency catches
   // pin/unpin/burn/archive/tier mutations on items inside the current folder,
   // which bump the service's version counter but don't change currentFolderCid.
+  //
+  // We deliberately do NOT clear folderItems on cid change here: clearing
+  // would only happen in the post-render $effect, leaving the pre-effect
+  // render painting the previous folder's items into the new folder's
+  // view. Instead, the items derived guards on folderItems.cid ===
+  // currentFolderCid; a mismatched tag is treated as "no data yet" and
+  // the fallback fires. On serviceVersion bumps (same cid), the visible
+  // list stays put until the re-fetch resolves.
   $effect(() => {
     void serviceVersion; // re-fetch on cache mutation
     const cid = currentFolderCid;
     const mySeq = ++folderFetchSeq;
     if (!cid) {
       folderItems = null;
-      lastFetchedCid = null;
       return;
-    }
-    // Only clear the visible list when entering a new folder. On
-    // serviceVersion bumps (same cid), keep the old list until the new
-    // one arrives to avoid flashing empty state on every mutation.
-    if (cid !== lastFetchedCid) {
-      folderItems = null;
-      lastFetchedCid = cid;
     }
     service
       .listFolderContents(cid)
@@ -146,7 +146,7 @@
         // Without the seq check an older resolution could overwrite a newer
         // snapshot after a rapid mutation burst.
         if (currentFolderCid === cid && mySeq === folderFetchSeq) {
-          folderItems = result;
+          folderItems = { cid, items: result };
         }
       })
       .catch((err) => {
@@ -159,7 +159,7 @@
         // about a folder the user is no longer viewing — the error is
         // not actionable from elsewhere in the tree.
         if (currentFolderCid === cid && mySeq === folderFetchSeq) {
-          folderItems = [];
+          folderItems = { cid, items: [] };
           const msg = err instanceof Error ? err.message : String(err);
           console.error('listFolderContents failed:', err);
           window.alert(`Could not load folder: ${msg}`);
@@ -173,11 +173,11 @@
   });
 
   function applyFiltersAndSort(contents: ContentItem[]): ContentItem[] {
-    // Defensive copy: callers may pass folderItems (a $state proxy) directly
-    // when no filter is applied, and our trailing .sort() would otherwise
-    // mutate the proxy in-place inside a $derived.by — Svelte 5 flags this
-    // as a reactivity cycle. Copying once here is cheaper than copying inside
-    // every filter branch.
+    // Defensive copy: callers may pass folderItems.items (a $state proxy)
+    // directly when no filter is applied, and our trailing .sort() would
+    // otherwise mutate the proxy in-place inside a $derived.by — Svelte 5
+    // flags this as a reactivity cycle. Copying once here is cheaper than
+    // copying inside every filter branch.
     contents = [...contents];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
@@ -214,14 +214,22 @@
   }
 
   // When inside a folder:
-  //   - If folderItems is non-null (backend fetch completed), use that.
-  //   - If folderItems is null (fetching in progress or no adapter), fall back
-  //     to the cached service data so tests/Storybook see content immediately.
+  //   - If folderItems is tagged with the current cid (backend fetch
+  //     resolved for THIS folder), use its items.
+  //   - Otherwise (no fetch yet, or folderItems still tagged with the
+  //     previous folder's cid because we just navigated and the fetch
+  //     effect hasn't kicked in), fall back to the cached service data.
+  //     For real adapters this returns [] during the brief inter-folder
+  //     gap (better than flashing the prior folder's contents); for
+  //     tests/Storybook with mock data populated by parentCid it returns
+  //     the expected children synchronously.
   // When at root, always use the cached service data.
   let items = $derived.by(() => {
     void serviceVersion;
     if (currentFolderCid !== null) {
-      return applyFiltersAndSort(folderItems ?? service.getContents(currentFolderCid));
+      const matching =
+        folderItems?.cid === currentFolderCid ? folderItems.items : null;
+      return applyFiltersAndSort(matching ?? service.getContents(currentFolderCid));
     }
     return applyFiltersAndSort(service.getContents(null));
   });
