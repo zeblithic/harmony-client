@@ -1299,18 +1299,7 @@ pub async fn list_folder(
     let folder_cid = parse_cid_hex(&folder_cid_hex)?;
 
     // Fetch the folder's bundle bytes from the runtime cache.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::ReadBytes {
-            cid: folder_cid,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    let bundle_bytes = reply_rx
-        .await
-        .map_err(|_| "event loop dropped read request".to_string())?;
-    let bundle_bytes = match bundle_bytes {
+    let bundle_bytes = match read_cached_bytes(&verb_tx, folder_cid).await? {
         Some(b) => b,
         None => {
             // Folder not in cache — likely evicted or never admitted.
@@ -1336,17 +1325,8 @@ pub async fn list_folder(
         .ok_or_else(|| "folder bundle has no children".to_string())?;
 
     // Read the manifest book bytes.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::ReadBytes {
-            cid: manifest_cid,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    let manifest_bytes = reply_rx
-        .await
-        .map_err(|_| "event loop dropped read request".to_string())?
+    let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid)
+        .await?
         .ok_or_else(|| "manifest book not in cache".to_string())?;
 
     let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
