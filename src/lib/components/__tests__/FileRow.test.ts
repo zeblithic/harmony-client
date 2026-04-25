@@ -4,6 +4,7 @@ import FileRow from '../FileRow.svelte';
 import type { ContentItem } from '../../types';
 
 const baseItem: ContentItem = {
+  sidecarId: 'mock-sidecar-row-001',
   cid: 'cid-test-001',
   name: 'test-document.md',
   category: 'text',
@@ -35,12 +36,12 @@ describe('FileRow', () => {
     expect(container.querySelector('.staleness-dot')).toBeTruthy();
   });
 
-  it('calls onClick with CID when clicked', async () => {
+  it('calls onClick with ContentItem when clicked', async () => {
     const onClick = vi.fn();
     render(FileRow, { props: { item: baseItem, onClick } });
     const row = screen.getByRole('row');
     await fireEvent.click(row);
-    expect(onClick).toHaveBeenCalledWith('cid-test-001');
+    expect(onClick).toHaveBeenCalledWith(baseItem);
   });
 
   it('applies selected class when selected', () => {

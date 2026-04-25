@@ -9,7 +9,7 @@
     selected = false,
   }: {
     item: ContentItem;
-    onClick?: (cid: string) => void;
+    onClick?: (item: ContentItem) => void;
     selected?: boolean;
   } = $props();
 
@@ -24,7 +24,7 @@
   class="file-row"
   class:selected
   role="row"
-  onclick={() => onClick?.(item.cid)}
+  onclick={() => onClick?.(item)}
   aria-label={item.name}
 >
   <span class="file-row-icon" aria-hidden="true">{icon}</span>

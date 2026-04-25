@@ -4,6 +4,7 @@ import FileDetailPanel from '../FileDetailPanel.svelte';
 import type { ContentDetail } from '../../types';
 
 const mockDetail: ContentDetail = {
+  sidecarId: 'mock-sidecar-detail-001',
   cid: 'test-cid',
   name: 'test-file.txt',
   category: 'text',

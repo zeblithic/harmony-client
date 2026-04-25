@@ -15,8 +15,8 @@
   }: {
     recommendation: CleanupRecommendation;
     checked: boolean;
-    onAction: (cid: string, action: CleanupAction) => void;
-    onToggle: (cid: string) => void;
+    onAction: (rec: CleanupRecommendation, action: CleanupAction) => void;
+    onToggle: (sidecarId: string) => void;
   } = $props();
 
   let icon = $derived(categoryIcon(recommendation.category));
@@ -64,7 +64,7 @@
       gate = 'double';
       return;
     }
-    onAction(recommendation.cid, action);
+    onAction(recommendation, action);
   }
 
   function cancelFlow() {
@@ -76,14 +76,14 @@
     if (flowMode === 'release') {
       // Release completes after double confirm regardless of sensitivity.
       // Release is ephemeral — lower stakes than durable publish.
-      onAction(recommendation.cid, 'release');
+      onAction(recommendation, 'release');
       cancelFlow();
       return;
     }
     if (confirmLevel >= 3) {
       gate = 'type';
     } else {
-      onAction(recommendation.cid, 'publish');
+      onAction(recommendation, 'publish');
       cancelFlow();
     }
   }
@@ -92,19 +92,19 @@
     if (confirmLevel >= 4) {
       gate = 'oob';
     } else {
-      onAction(recommendation.cid, 'publish');
+      onAction(recommendation, 'publish');
       cancelFlow();
     }
   }
 
   function onOobConfirm() {
-    onAction(recommendation.cid, 'publish');
+    onAction(recommendation, 'publish');
     cancelFlow();
   }
 
   function confirmBurn() {
     showBurnConfirm = false;
-    onAction(recommendation.cid, 'burn');
+    onAction(recommendation, 'burn');
   }
 </script>
 
@@ -113,7 +113,7 @@
     <input
       type="checkbox"
       checked={checked}
-      onchange={() => onToggle(recommendation.cid)}
+      onchange={() => onToggle(recommendation.sidecarId)}
       aria-label="Select {recommendation.name}"
     />
     <span class="card-icon" aria-hidden="true">{icon}</span>

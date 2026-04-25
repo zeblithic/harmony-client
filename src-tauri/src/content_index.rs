@@ -1,10 +1,15 @@
 //! Client-side sidecar for self-ingested content metadata (ZEB-146).
 //!
-//! Persists a map of `cid -> ContentIndexEntry` as JSON under
+//! Persists a map of `sidecar_id -> ContentIndexEntry` as JSON under
 //! `app_data_dir/content-index.json` so the File Manager UI can surface
 //! filenames, ingest timestamps, and user-set flags (sensitivity,
 //! replication tier, licensed, archived) for content that the runtime's
 //! RAM-only cache doesn't know about.
+//!
+//! ZEB-164: the storage key flips from `[u8;32]` CID to `SidecarId` so
+//! multiple user-visible entries (symlink-style) can share a CID. The
+//! runtime pin_intent invariant now derives from the OR of every sidecar
+//! entry's pinned flag for a given CID — see `is_cid_pinned_by_any`.
 //!
 //! Authority split:
 //! - Sidecar is authoritative for membership, size_bytes, and pin *intent*
@@ -18,6 +23,47 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Opaque per-entry stable identity for a sidecar row.
+///
+/// The sidecar key was `[u8; 32]` CID prior to ZEB-164, which forced one
+/// entry per CID. With multiple user-visible entries (folders or otherwise)
+/// allowed to share a CID — symlink-style — we need a stable identity that
+/// is independent of content. UUID v4 is opaque (callers can't conflate
+/// identity with content), survives restart, and is unique across devices
+/// in case sidecars ever sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SidecarId(Uuid);
+
+#[allow(clippy::new_without_default)]
+impl SidecarId {
+    /// Mint a fresh random SidecarId. Backend is the source of truth for
+    /// minting; the frontend never generates these.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Parse the hyphenated lowercase Display form back into a SidecarId.
+    /// Used at the IPC boundary when commands receive sidecar_id strings.
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+
+    /// Underlying 16-byte UUID representation. Used for allocation-free
+    /// deterministic ordering on disk; do not depend on this being a
+    /// stable hash for cross-version comparisons.
+    pub fn as_bytes(&self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+}
+
+impl std::fmt::Display for SidecarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hyphenated lowercase, e.g. "8b4f7c2e-1a3d-4f5b-9c0e-1234567890ab".
+        write!(f, "{}", self.0.as_hyphenated())
+    }
+}
 
 const INDEX_FILE: &str = "content-index.json";
 const FILE_VERSION: u32 = 1;
@@ -58,6 +104,7 @@ pub enum ContentKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentIndexEntry {
+    pub sidecar_id: SidecarId,
     #[serde(with = "hex_cid")]
     pub cid: [u8; 32],
     pub file_name: String,
@@ -67,11 +114,12 @@ pub struct ContentIndexEntry {
     pub replication_tier: ReplicationTier,
     pub licensed: bool,
     pub archived: bool,
-    /// ZEB-155: persisted pin intent. True when the user has asked for
-    /// this content to remain pinned across restarts. The runtime cache's
-    /// `PinnedSet` is still authoritative for active eviction protection —
-    /// this field is "the user wants this pinned whenever bytes are
-    /// resident," joined with the runtime set at list_content time.
+    /// ZEB-155: persisted pin intent. With ZEB-164's symlink model, the
+    /// runtime cache's `pin_intent` derives from the OR of every sidecar
+    /// entry's pinned flag for a given CID — see `is_cid_pinned_by_any`.
+    /// Per-row UI uses this entry's flag directly; cross-entry computation
+    /// happens on mutation paths (pin/unpin/burn/rekey) to keep the
+    /// runtime invariant in sync.
     ///
     /// `#[serde(default)]` makes pre-ZEB-155 sidecars readable: legacy
     /// entries deserialize with pinned=false (correct — they weren't
@@ -94,18 +142,27 @@ struct IndexFile {
 
 pub struct ContentIndex {
     path: PathBuf,
-    entries: HashMap<[u8; 32], ContentIndexEntry>,
+    entries: HashMap<SidecarId, ContentIndexEntry>,
 }
 
-/// Errors returned by [`ContentIndex::rekey`].
+/// Error returned by [`ContentIndex::rekey`].
+///
+/// `Collision` was retired in ZEB-164: multiple entries can legally
+/// share a CID under the symlink-style sidecar model, so the rekey target
+/// already being present is no longer an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekeyError {
-    /// The `old` CID wasn't in the index — nothing to rekey.
+    /// The given `sidecar_id` doesn't refer to any known entry.
     OldMissing,
-    /// The `new` CID is already present (and differs from `old`); the
-    /// rekey would overwrite an unrelated entry. Caller should surface
-    /// a "identical contents already exists" message.
-    Collision,
+    /// The entry exists but its current CID doesn't match the
+    /// `expected_old_cid` the caller passed — a concurrent rekey
+    /// landed first. The caller's view of the chain is stale; any
+    /// retry would need to rebuild ancestors from `actual` rather
+    /// than the CID it walked. Surfaces the CAS-style guard added
+    /// after the create_folder_nested ingest reorder widened the
+    /// verify→rekey window from "ancestor reads" to "drain
+    /// pending_ingests."
+    Conflict { actual: [u8; 32] },
 }
 
 impl ContentIndex {
@@ -125,7 +182,7 @@ impl ContentIndex {
         ContentIndex { path, entries }
     }
 
-    fn read_file(path: &Path) -> Option<HashMap<[u8; 32], ContentIndexEntry>> {
+    fn read_file(path: &Path) -> Option<HashMap<SidecarId, ContentIndexEntry>> {
         let data = std::fs::read(path).ok()?;
         let file: IndexFile = serde_json::from_slice(&data).ok()?;
         if file.version != FILE_VERSION {
@@ -133,8 +190,8 @@ impl ContentIndex {
         }
         let mut map = HashMap::with_capacity(file.entries.len());
         for entry in file.entries {
-            if map.insert(entry.cid, entry).is_some() {
-                tracing::warn!("duplicate CID in content-index.json; last-write-wins");
+            if map.insert(entry.sidecar_id, entry).is_some() {
+                tracing::warn!("duplicate sidecar_id in content-index.json; last-write-wins");
             }
         }
         Some(map)
@@ -158,11 +215,11 @@ impl ContentIndex {
             );
             return;
         }
-        // Sort by CID for deterministic on-disk ordering; HashMap iteration
-        // order would otherwise churn the file on every save and make diffs
-        // (and future snapshotting) noisy.
+        // Sort by sidecar_id for deterministic on-disk ordering; HashMap
+        // iteration order would otherwise churn the file on every save and
+        // make diffs (and future snapshotting) noisy.
         let mut sorted: Vec<ContentIndexEntry> = self.entries.values().cloned().collect();
-        sorted.sort_by_key(|e| e.cid);
+        sorted.sort_unstable_by_key(|e| e.sidecar_id.as_bytes());
         let file = IndexFile {
             version: FILE_VERSION,
             entries: sorted,
@@ -192,21 +249,20 @@ impl ContentIndex {
         }
     }
 
-    /// Insert a new entry. Returns `true` if added, `false` if the CID
-    /// was already present (no mutation in that case). Callers that want
-    /// overwrite semantics should remove first.
+    /// Insert a new entry. Returns `true` if added, `false` if the
+    /// `sidecar_id` was already present (no mutation in that case).
     pub fn insert(&mut self, entry: ContentIndexEntry) -> bool {
-        if self.entries.contains_key(&entry.cid) {
+        if self.entries.contains_key(&entry.sidecar_id) {
             return false;
         }
-        self.entries.insert(entry.cid, entry);
+        self.entries.insert(entry.sidecar_id, entry);
         self.save();
         true
     }
 
-    /// Remove an entry by CID. Returns `true` if present before the call.
-    pub fn remove(&mut self, cid: &[u8; 32]) -> bool {
-        let removed = self.entries.remove(cid).is_some();
+    /// Remove an entry by sidecar_id. Returns `true` if present before the call.
+    pub fn remove(&mut self, id: &SidecarId) -> bool {
+        let removed = self.entries.remove(id).is_some();
         if removed {
             self.save();
         }
@@ -214,9 +270,9 @@ impl ContentIndex {
     }
 
     /// Flip the `archived` flag. Returns `true` if the flag changed;
-    /// `false` if already at the target state or the CID is unknown.
-    pub fn set_archived(&mut self, cid: &[u8; 32], archived: bool) -> bool {
-        let Some(entry) = self.entries.get_mut(cid) else {
+    /// `false` if already at the target state or the sidecar_id is unknown.
+    pub fn set_archived(&mut self, id: &SidecarId, archived: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
             return false;
         };
         if entry.archived == archived {
@@ -227,48 +283,46 @@ impl ContentIndex {
         true
     }
 
-    /// ZEB-158 slice 1: atomically replace an entry's CID while
-    /// preserving user-state fields (file_name, sensitivity,
-    /// replication_tier, licensed, archived, pinned, kind). Used when a
-    /// folder mutation produces a new top-level root CID (nested
-    /// `create_folder`, future move/rename operations). One save() for
-    /// the whole replacement — remove-then-insert would give two.
+    /// Atomically replace an entry's CID while preserving user-state
+    /// (file_name, sensitivity, replication_tier, licensed, archived,
+    /// pinned, kind). Used when a folder mutation produces a new top-level
+    /// root CID (nested `create_folder`, future move/rename). One save()
+    /// for the whole replacement.
     ///
-    /// Refuses on collision: if `new` is already present in the index
-    /// (and `new != *old`), the call is a no-op and returns
-    /// `Err(RekeyError::Collision)`. Without this guard, the inner
-    /// `HashMap::insert` would silently overwrite the existing entry
-    /// under `new`, dropping a different user-visible row. The collision
-    /// happens for real under content-addressing: nested folder
-    /// mutations can produce a CID that already names another sidecar
-    /// root (two distinct paths converging on identical bundle
-    /// contents). Symlink-style multiple-entries-per-CID is tracked in
-    /// ZEB-164.
+    /// CAS-style: caller passes `expected_old_cid`; rekey fails with
+    /// `Conflict { actual }` if the entry's current CID doesn't match,
+    /// preventing lost-update when two concurrent mutations rebuild
+    /// from the same old tree but the second one's verify→rekey
+    /// gap straddles the first one's commit.
+    ///
+    /// ZEB-164 retired `RekeyError::Collision`: under the symlink-style
+    /// model, the new CID already being used by another entry is not an
+    /// error — entries are identified by `sidecar_id`, not CID.
     pub fn rekey(
         &mut self,
-        old: &[u8; 32],
-        new: [u8; 32],
+        id: &SidecarId,
+        expected_old_cid: [u8; 32],
+        new_cid: [u8; 32],
         new_size_bytes: u64,
         new_stored_at_ms: u64,
     ) -> Result<(), RekeyError> {
-        if old != &new && self.entries.contains_key(&new) {
-            return Err(RekeyError::Collision);
-        }
-        let Some(mut entry) = self.entries.remove(old) else {
+        let Some(entry) = self.entries.get_mut(id) else {
             return Err(RekeyError::OldMissing);
         };
-        entry.cid = new;
+        if entry.cid != expected_old_cid {
+            return Err(RekeyError::Conflict { actual: entry.cid });
+        }
+        entry.cid = new_cid;
         entry.size_bytes = new_size_bytes;
         entry.stored_at_ms = new_stored_at_ms;
-        self.entries.insert(new, entry);
         self.save();
         Ok(())
     }
 
     /// Flip the `pinned` flag. Returns `true` if the flag changed;
-    /// `false` if already at the target state or the CID is unknown.
-    pub fn set_pinned(&mut self, cid: &[u8; 32], pinned: bool) -> bool {
-        let Some(entry) = self.entries.get_mut(cid) else {
+    /// `false` if already at the target state or the sidecar_id is unknown.
+    pub fn set_pinned(&mut self, id: &SidecarId, pinned: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
             return false;
         };
         if entry.pinned == pinned {
@@ -279,17 +333,16 @@ impl ContentIndex {
         true
     }
 
-    /// Set replication tier on a batch. Returns the count of entries
-    /// whose tier actually changed (missing or already-at-tier entries
-    /// are skipped silently).
+    /// Set replication tier on a batch of sidecar_ids. Returns the count
+    /// of entries whose tier actually changed.
     pub fn set_replication_tier(
         &mut self,
-        cids: &[[u8; 32]],
+        ids: &[SidecarId],
         tier: ReplicationTier,
     ) -> usize {
         let mut changed = 0;
-        for cid in cids {
-            if let Some(entry) = self.entries.get_mut(cid) {
+        for id in ids {
+            if let Some(entry) = self.entries.get_mut(id) {
                 if entry.replication_tier != tier {
                     entry.replication_tier = tier;
                     changed += 1;
@@ -302,14 +355,35 @@ impl ContentIndex {
         changed
     }
 
-    /// Look up a single entry by CID.
-    pub fn get(&self, cid: &[u8; 32]) -> Option<&ContentIndexEntry> {
-        self.entries.get(cid)
+    /// Look up a single entry by sidecar_id.
+    pub fn get(&self, id: &SidecarId) -> Option<&ContentIndexEntry> {
+        self.entries.get(id)
+    }
+
+    /// Iterate over every sidecar entry referencing this CID.
+    ///
+    /// With multiple entries allowed per CID (symlink-style), this is the
+    /// natural shape for the OR-join logic that maintains the runtime
+    /// `pin_intent` invariant. Linear scan; sidecar size is bounded by
+    /// user library scale (hundreds to low thousands of entries) and
+    /// scans run only on mutation paths, not on `list_content`.
+    pub fn entries_for_cid<'a>(
+        &'a self,
+        cid: &'a [u8; 32],
+    ) -> impl Iterator<Item = &'a ContentIndexEntry> {
+        self.entries.values().filter(move |e| &e.cid == cid)
+    }
+
+    /// True iff some sidecar entry references this CID with `pinned == true`.
+    /// Backs the runtime pin_intent invariant: runtime should hold this CID
+    /// in `pin_intent` iff this returns true (assuming nothing else outside
+    /// the sidecar pins it).
+    pub fn is_cid_pinned_by_any(&self, cid: &[u8; 32]) -> bool {
+        self.entries_for_cid(cid).any(|e| e.pinned)
     }
 
     /// Iterate over all entries. **Order is not guaranteed** (HashMap-backed).
-    /// Callers that surface results to users must sort — for example, by
-    /// `stored_at_ms` descending in the File Manager list view.
+    /// Callers that surface results to users must sort.
     pub fn entries(&self) -> impl Iterator<Item = &ContentIndexEntry> {
         self.entries.values()
     }
@@ -338,6 +412,7 @@ mod tests {
 
     fn sample_entry(cid: [u8; 32]) -> ContentIndexEntry {
         ContentIndexEntry {
+            sidecar_id: SidecarId::new(),
             cid,
             file_name: "hello.txt".into(),
             size_bytes: 42,
@@ -364,12 +439,12 @@ mod tests {
         let entry = sample_entry([0xAA; 32]);
 
         let mut idx = ContentIndex::load(dir.path());
-        idx.entries.insert(entry.cid, entry.clone());
+        idx.entries.insert(entry.sidecar_id, entry.clone());
         idx.save();
 
         let reloaded = ContentIndex::load(dir.path());
         assert_eq!(reloaded.entries.len(), 1);
-        assert_eq!(reloaded.entries.get(&entry.cid), Some(&entry));
+        assert_eq!(reloaded.entries.get(&entry.sidecar_id), Some(&entry));
     }
 
     #[test]
@@ -397,17 +472,43 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let entry = sample_entry([0xBB; 32]);
+        let id = entry.sidecar_id;
         assert!(idx.insert(entry.clone()));
-        assert_eq!(idx.get(&entry.cid), Some(&entry));
+        assert_eq!(idx.get(&id), Some(&entry));
     }
 
     #[test]
-    fn insert_duplicate_cid_returns_false() {
+    fn insert_two_entries_with_same_cid_coexist() {
+        // Pre-ZEB-164 this case was rejected via duplicate-CID guard. Now
+        // each entry's identity is its sidecar_id, so two entries pointing
+        // at the same CID are legal (symlink-style).
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
-        let entry = sample_entry([0xCC; 32]);
+
+        let mut alpha = sample_entry([0xCC; 32]);
+        alpha.file_name = "Alpha".into();
+        let mut beta = sample_entry([0xCC; 32]);
+        beta.file_name = "Beta".into();
+
+        assert_ne!(alpha.sidecar_id, beta.sidecar_id, "fresh ids must differ");
+        assert!(idx.insert(alpha.clone()));
+        assert!(idx.insert(beta.clone()));
+
+        // Both entries are retrievable by their own sidecar_id.
+        assert_eq!(idx.get(&alpha.sidecar_id).unwrap().file_name, "Alpha");
+        assert_eq!(idx.get(&beta.sidecar_id).unwrap().file_name, "Beta");
+    }
+
+    #[test]
+    fn insert_duplicate_sidecar_id_returns_false() {
+        // Defense-in-depth: SidecarId collisions are practically impossible
+        // for UUID v4, but the API still has to behave sensibly if a caller
+        // re-uses one (e.g. tests cloning an entry verbatim).
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xCD; 32]);
         assert!(idx.insert(entry.clone()));
-        assert!(!idx.insert(entry));
+        assert!(!idx.insert(entry), "duplicate sidecar_id is rejected");
     }
 
     #[test]
@@ -415,9 +516,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let entry = sample_entry([0xDD; 32]);
-        idx.insert(entry.clone());
-        assert!(idx.remove(&entry.cid));
-        assert!(!idx.remove(&entry.cid));
+        let id = entry.sidecar_id;
+        idx.insert(entry);
+        assert!(idx.remove(&id));
+        assert!(!idx.remove(&id));
     }
 
     #[test]
@@ -425,18 +527,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let entry = sample_entry([0xEE; 32]);
-        idx.insert(entry.clone());
+        let id = entry.sidecar_id;
+        idx.insert(entry);
 
-        assert!(idx.set_archived(&entry.cid, true));  // flipped
-        assert!(idx.get(&entry.cid).unwrap().archived);
-        assert!(!idx.set_archived(&entry.cid, true)); // idempotent
+        assert!(idx.set_archived(&id, true));  // flipped
+        assert!(idx.get(&id).unwrap().archived);
+        assert!(!idx.set_archived(&id, true)); // idempotent
     }
 
     #[test]
-    fn set_archived_missing_cid_returns_false() {
+    fn set_archived_missing_id_returns_false() {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
-        assert!(!idx.set_archived(&[0xFF; 32], true));
+        let bogus = SidecarId::new();
+        assert!(!idx.set_archived(&bogus, true));
     }
 
     #[test]
@@ -445,20 +549,20 @@ mod tests {
         let mut idx = ContentIndex::load(dir.path());
         let a = sample_entry([0x01; 32]);
         let b = sample_entry([0x02; 32]);
-        idx.insert(a.clone());
-        idx.insert(b.clone());
+        let a_id = a.sidecar_id;
+        let b_id = b.sidecar_id;
+        idx.insert(a);
+        idx.insert(b);
 
-        // Both are Default; bumping to Ultra should update 2.
-        let updated = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Ultra);
+        let updated = idx.set_replication_tier(&[a_id, b_id], ReplicationTier::Ultra);
         assert_eq!(updated, 2);
 
-        // Same call again: tier already Ultra, so 0 updated.
-        let again = idx.set_replication_tier(&[a.cid, b.cid], ReplicationTier::Ultra);
+        let again = idx.set_replication_tier(&[a_id, b_id], ReplicationTier::Ultra);
         assert_eq!(again, 0);
 
-        // Missing CID is skipped, not an error.
+        let bogus = SidecarId::new();
         let with_missing =
-            idx.set_replication_tier(&[a.cid, [0xAA; 32]], ReplicationTier::Expendable);
+            idx.set_replication_tier(&[a_id, bogus], ReplicationTier::Expendable);
         assert_eq!(with_missing, 1);
     }
 
@@ -476,26 +580,27 @@ mod tests {
     #[test]
     fn save_persists_mutations() {
         let dir = tempdir().unwrap();
+        let saved_id;
         {
             let mut idx = ContentIndex::load(dir.path());
-            idx.insert(sample_entry([0xA1; 32]));
-            idx.insert(sample_entry([0xA2; 32]));
-            idx.remove(&[0xA1; 32]);
-            assert!(idx.set_archived(&[0xA2; 32], true));
+            let a1 = sample_entry([0xA1; 32]);
+            let a2 = sample_entry([0xA2; 32]);
+            let a1_id = a1.sidecar_id;
+            saved_id = a2.sidecar_id;
+            idx.insert(a1);
+            idx.insert(a2);
+            idx.remove(&a1_id);
+            assert!(idx.set_archived(&saved_id, true));
             assert_eq!(
-                idx.set_replication_tier(&[[0xA2; 32]], ReplicationTier::Ultra),
+                idx.set_replication_tier(&[saved_id], ReplicationTier::Ultra),
                 1
             );
         }
         let reloaded = ContentIndex::load(dir.path());
         assert_eq!(reloaded.entries.len(), 1);
-        let entry = reloaded.get(&[0xA2; 32]).expect("A2 persisted");
-        assert!(entry.archived, "archived flag persisted");
-        assert_eq!(
-            entry.replication_tier,
-            ReplicationTier::Ultra,
-            "tier mutation persisted"
-        );
+        let entry = reloaded.get(&saved_id).expect("saved entry persisted");
+        assert!(entry.archived);
+        assert_eq!(entry.replication_tier, ReplicationTier::Ultra);
     }
 
     #[test]
@@ -503,63 +608,40 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let entry = sample_entry([0xB1; 32]);
-        idx.insert(entry.clone());
+        let id = entry.sidecar_id;
+        idx.insert(entry);
 
-        assert!(idx.set_pinned(&entry.cid, true));  // flipped
-        assert!(idx.get(&entry.cid).unwrap().pinned);
-        assert!(!idx.set_pinned(&entry.cid, true)); // idempotent, no change
-        assert!(idx.set_pinned(&entry.cid, false)); // flipped back
-        assert!(!idx.get(&entry.cid).unwrap().pinned);
+        assert!(idx.set_pinned(&id, true));
+        assert!(idx.get(&id).unwrap().pinned);
+        assert!(!idx.set_pinned(&id, true));
+        assert!(idx.set_pinned(&id, false));
+        assert!(!idx.get(&id).unwrap().pinned);
     }
 
     #[test]
-    fn set_pinned_missing_cid_returns_false() {
+    fn set_pinned_missing_id_returns_false() {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
-        assert!(!idx.set_pinned(&[0xB2; 32], true));
+        let bogus = SidecarId::new();
+        assert!(!idx.set_pinned(&bogus, true));
     }
 
     #[test]
     fn save_persists_pin_mutations() {
         let dir = tempdir().unwrap();
+        let entry_id;
         {
             let mut idx = ContentIndex::load(dir.path());
-            idx.insert(sample_entry([0xB3; 32]));
-            assert!(idx.set_pinned(&[0xB3; 32], true));
+            let entry = sample_entry([0xB3; 32]);
+            entry_id = entry.sidecar_id;
+            idx.insert(entry);
+            assert!(idx.set_pinned(&entry_id, true));
         }
         let reloaded = ContentIndex::load(dir.path());
         assert!(
-            reloaded.get(&[0xB3; 32]).expect("B3 persisted").pinned,
+            reloaded.get(&entry_id).expect("persisted").pinned,
             "pinned flag must survive save/load"
         );
-    }
-
-    #[test]
-    fn kind_defaults_to_leaf_on_legacy_sidecar() {
-        let dir = tempdir().unwrap();
-        // v1 sidecar from before ZEB-158 slice 1 — no `kind` field.
-        let legacy = br#"{
-            "version": 1,
-            "entries": [{
-                "cid": "aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00",
-                "file_name": "legacy.txt",
-                "size_bytes": 42,
-                "stored_at_ms": 1700000000000,
-                "sensitivity": "private",
-                "replication_tier": "default",
-                "licensed": false,
-                "archived": false,
-                "pinned": false
-            }]
-        }"#;
-        std::fs::write(dir.path().join(INDEX_FILE), legacy).unwrap();
-
-        let idx = ContentIndex::load(dir.path());
-        let entry = idx
-            .entries()
-            .next()
-            .expect("legacy entry must load");
-        assert_eq!(entry.kind, ContentKind::Leaf);
     }
 
     #[test]
@@ -569,10 +651,11 @@ mod tests {
         let mut entry = sample_entry([0xF0; 32]);
         entry.file_name = "Photos".into();
         entry.kind = ContentKind::Folder;
-        idx.insert(entry.clone());
+        let id = entry.sidecar_id;
+        idx.insert(entry);
 
         let reloaded = ContentIndex::load(dir.path());
-        let got = reloaded.get(&entry.cid).expect("round-trips");
+        let got = reloaded.get(&id).expect("round-trips");
         assert_eq!(got.kind, ContentKind::Folder);
         assert_eq!(got.file_name, "Photos");
     }
@@ -586,100 +669,219 @@ mod tests {
         entry.file_name = "Folder".into();
         entry.kind = ContentKind::Folder;
         entry.pinned = true;
-        entry.archived = false;
-        idx.insert(entry.clone());
+        entry.sensitivity = Sensitivity::Confidential;
+        entry.replication_tier = ReplicationTier::Ultra;
+        entry.licensed = true;
+        entry.archived = true;
+        let id = entry.sidecar_id;
+        idx.insert(entry);
 
-        let result = idx.rekey(
-            &[0x01; 32],
-            [0x02; 32],
-            /* new_size_bytes */ 999,
-            /* new_stored_at_ms */ 1234,
-        );
-        assert!(result.is_ok(), "rekey must succeed when old key exists");
+        let result = idx.rekey(&id, [0x01; 32], [0x02; 32], 999, 1234);
+        assert!(result.is_ok());
 
-        assert!(idx.get(&[0x01; 32]).is_none(), "old key removed");
-        let after = idx.get(&[0x02; 32]).expect("new key present");
-        assert_eq!(after.file_name, "Folder", "file_name carried forward");
-        assert_eq!(after.kind, ContentKind::Folder, "kind carried forward");
-        assert!(after.pinned, "pinned carried forward");
+        let after = idx.get(&id).expect("entry still present under same sidecar_id");
+        assert_eq!(after.cid, [0x02; 32], "cid updated");
         assert_eq!(after.size_bytes, 999, "size_bytes updated");
         assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
-
-        // Non-existent old key returns OldMissing.
-        assert_eq!(
-            idx.rekey(&[0xFF; 32], [0xEE; 32], 0, 0),
-            Err(RekeyError::OldMissing),
-        );
+        // All seven user-state fields preserved.
+        assert_eq!(after.file_name, "Folder");
+        assert_eq!(after.kind, ContentKind::Folder);
+        assert!(after.pinned);
+        assert_eq!(after.sensitivity, Sensitivity::Confidential);
+        assert_eq!(after.replication_tier, ReplicationTier::Ultra);
+        assert!(after.licensed);
+        assert!(after.archived);
     }
 
     #[test]
-    fn rekey_refuses_collision_instead_of_overwriting() {
+    fn rekey_missing_id_returns_old_missing() {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
-
-        // Two distinct entries: keeper at 0xAA, victim-target at 0xBB.
-        let mut keeper = sample_entry([0xAA; 32]);
-        keeper.file_name = "Keeper".into();
-        idx.insert(keeper);
-
-        let mut other = sample_entry([0xBB; 32]);
-        other.file_name = "OtherRoot".into();
-        idx.insert(other);
-
-        // Try to rekey OtherRoot from 0xBB → 0xAA. Without the collision
-        // guard this would clobber Keeper. With it we get a Collision
-        // error and both entries remain intact.
-        let result = idx.rekey(&[0xBB; 32], [0xAA; 32], 0, 0);
-        assert_eq!(result, Err(RekeyError::Collision));
-
-        // Both entries still present and unchanged.
-        assert_eq!(idx.get(&[0xAA; 32]).unwrap().file_name, "Keeper");
-        assert_eq!(idx.get(&[0xBB; 32]).unwrap().file_name, "OtherRoot");
+        let bogus = SidecarId::new();
+        // OldMissing fires before the expected_old_cid check.
+        assert_eq!(idx.rekey(&bogus, [0x00; 32], [0xEE; 32], 0, 0), Err(RekeyError::OldMissing));
     }
 
     #[test]
-    fn rekey_old_equals_new_is_a_self_update_not_a_collision() {
-        // rekey(old=X, new=X) should be allowed — it's a metadata refresh
-        // (size_bytes / stored_at_ms only). The collision guard checks
-        // `old != &new` before refusing, so this path is not blocked.
+    fn rekey_self_update_refreshes_size_and_stored_at() {
         let dir = tempdir().unwrap();
         let mut idx = ContentIndex::load(dir.path());
         let entry = sample_entry([0xCC; 32]);
+        let id = entry.sidecar_id;
         idx.insert(entry);
 
-        let result = idx.rekey(&[0xCC; 32], [0xCC; 32], 12345, 67890);
+        // Self-update: expected_old_cid == new_cid == current cid.
+        let result = idx.rekey(&id, [0xCC; 32], [0xCC; 32], 12345, 67890);
         assert!(result.is_ok());
-        let after = idx.get(&[0xCC; 32]).expect("entry still present");
+        let after = idx.get(&id).expect("entry still present");
         assert_eq!(after.size_bytes, 12345);
         assert_eq!(after.stored_at_ms, 67890);
     }
 
     #[test]
-    fn legacy_sidecar_without_pinned_field_loads_as_unpinned() {
-        // Simulate a pre-ZEB-155 sidecar: version 1, entries with every field
-        // EXCEPT pinned. `#[serde(default)]` on the new field must make this
-        // deserialize cleanly with pinned=false.
-        let dir = tempdir().unwrap();
-        let legacy_json = br#"{
-            "version": 1,
-            "entries": [
-                {
-                    "cid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "file_name": "legacy.txt",
-                    "size_bytes": 10,
-                    "stored_at_ms": 1700000000000,
-                    "sensitivity": "private",
-                    "replication_tier": "default",
-                    "licensed": false,
-                    "archived": false
-                }
-            ]
-        }"#;
-        std::fs::write(dir.path().join(INDEX_FILE), legacy_json).unwrap();
+    fn sidecar_id_new_produces_unique_values() {
+        let a = SidecarId::new();
+        let b = SidecarId::new();
+        assert_ne!(a, b, "two SidecarId::new() calls must produce distinct values");
+    }
 
+    #[test]
+    fn sidecar_id_round_trips_through_display_and_parse() {
+        let original = SidecarId::new();
+        let s = original.to_string();
+        let parsed = SidecarId::parse_str(&s).expect("must parse own Display output");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn sidecar_id_parse_str_rejects_garbage() {
+        assert!(SidecarId::parse_str("").is_err());
+        assert!(SidecarId::parse_str("not-a-uuid").is_err());
+        assert!(SidecarId::parse_str("8b4f7c2e-1a3d-4f5b-9c0e-XXXXXXXXXXXX").is_err());
+    }
+
+    #[test]
+    fn sidecar_id_serializes_as_hyphenated_string() {
+        let id = SidecarId::new();
+        let json = serde_json::to_string(&id).expect("serialize");
+        // Hyphenated UUID is 38 chars wrapped in quotes: "<36 chars>"
+        assert_eq!(json.len(), 38, "got {json}");
+        assert!(json.starts_with('"') && json.ends_with('"'));
+        // Round-trip via deserialization too.
+        let back: SidecarId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn load_v1_without_sidecar_id_returns_empty() {
+        // After ZEB-164, sidecar_id is a required field. v1 fixtures from
+        // before this change fail deserialization → load() falls back to
+        // empty (the existing malformed-JSON path). The two test sidecars
+        // in dev are re-uploaded post-deploy.
+        let dir = tempdir().unwrap();
+        let pre_zeb164 = br#"{
+            "version": 1,
+            "entries": [{
+                "cid": "aa11bb22cc33dd44ee55ff6677889900112233445566778899aabbccddeeff00",
+                "file_name": "old.txt",
+                "size_bytes": 42,
+                "stored_at_ms": 1700000000000,
+                "sensitivity": "private",
+                "replication_tier": "default",
+                "licensed": false,
+                "archived": false,
+                "pinned": false,
+                "kind": "leaf"
+            }]
+        }"#;
+        std::fs::write(dir.path().join(INDEX_FILE), pre_zeb164).unwrap();
         let idx = ContentIndex::load(dir.path());
-        let entry = idx.get(&[0xAA; 32]).expect("legacy entry must load");
-        assert!(!entry.pinned, "legacy entries must read as pinned=false");
-        assert_eq!(entry.file_name, "legacy.txt");
+        assert!(idx.entries.is_empty(), "legacy entry without sidecar_id must not load");
+    }
+
+    #[test]
+    fn rekey_target_cid_already_used_succeeds() {
+        // Pre-ZEB-164 this would have returned RekeyError::Collision. Now
+        // multiple entries can share a CID — the rekey target collision
+        // case is no longer an error.
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let keeper = sample_entry([0xAA; 32]);
+        let other = sample_entry([0xBB; 32]);
+        let keeper_id = keeper.sidecar_id;
+        let other_id = other.sidecar_id;
+        idx.insert(keeper);
+        idx.insert(other);
+
+        // other's current cid is [0xBB; 32]; rekey to [0xAA; 32] (which keeper already has).
+        let result = idx.rekey(&other_id, [0xBB; 32], [0xAA; 32], 0, 0);
+        assert!(result.is_ok());
+
+        assert_eq!(idx.get(&keeper_id).unwrap().cid, [0xAA; 32]);
+        assert_eq!(idx.get(&other_id).unwrap().cid, [0xAA; 32]);
+    }
+
+    #[test]
+    fn rekey_with_stale_expected_cid_returns_conflict() {
+        // CAS guard: if a concurrent rekey landed first, the entry's
+        // current CID won't match what the caller walked from. Surface
+        // the actual CID so a future retry path could rebuild from it.
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let entry = sample_entry([0xAA; 32]);
+        let id = entry.sidecar_id;
+        idx.insert(entry);
+
+        // Caller thinks current cid is [0xBB; 32], but it's actually [0xAA; 32].
+        let result = idx.rekey(&id, [0xBB; 32], [0xCC; 32], 0, 0);
+        assert_eq!(result, Err(RekeyError::Conflict { actual: [0xAA; 32] }));
+
+        // Entry must be unchanged.
+        let after = idx.get(&id).expect("entry still present");
+        assert_eq!(after.cid, [0xAA; 32], "Conflict must not mutate the entry");
+    }
+
+    #[test]
+    fn entries_for_cid_returns_all_matching() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let a = sample_entry([0x10; 32]);
+        let b = sample_entry([0x10; 32]);
+        let c = sample_entry([0x20; 32]);
+        idx.insert(a.clone());
+        idx.insert(b.clone());
+        idx.insert(c.clone());
+
+        let mut matched: Vec<SidecarId> = idx.entries_for_cid(&[0x10; 32])
+            .map(|e| e.sidecar_id)
+            .collect();
+        matched.sort_by_key(|id| id.to_string());
+        let mut expected = vec![a.sidecar_id, b.sidecar_id];
+        expected.sort_by_key(|id| id.to_string());
+        assert_eq!(matched, expected);
+
+        let lone: Vec<SidecarId> = idx.entries_for_cid(&[0x20; 32])
+            .map(|e| e.sidecar_id)
+            .collect();
+        assert_eq!(lone, vec![c.sidecar_id]);
+
+        let none: Vec<SidecarId> = idx.entries_for_cid(&[0x99; 32])
+            .map(|e| e.sidecar_id)
+            .collect();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn is_cid_pinned_by_any_or_joins_entries() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+
+        let mut a = sample_entry([0x30; 32]);
+        let mut b = sample_entry([0x30; 32]);
+        let a_id = a.sidecar_id;
+        let b_id = b.sidecar_id;
+        a.pinned = false;
+        b.pinned = false;
+        idx.insert(a);
+        idx.insert(b);
+
+        assert!(!idx.is_cid_pinned_by_any(&[0x30; 32]), "neither pinned");
+
+        idx.set_pinned(&a_id, true);
+        assert!(idx.is_cid_pinned_by_any(&[0x30; 32]), "one pinned");
+
+        idx.set_pinned(&b_id, true);
+        assert!(idx.is_cid_pinned_by_any(&[0x30; 32]), "both pinned");
+
+        idx.set_pinned(&a_id, false);
+        assert!(idx.is_cid_pinned_by_any(&[0x30; 32]), "still one pinned");
+
+        idx.set_pinned(&b_id, false);
+        assert!(!idx.is_cid_pinned_by_any(&[0x30; 32]), "all unpinned");
+
+        assert!(!idx.is_cid_pinned_by_any(&[0x99; 32]));
     }
 }

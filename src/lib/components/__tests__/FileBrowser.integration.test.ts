@@ -103,7 +103,11 @@ describe('File Manager Integration', () => {
     const fileRow = screen.getByLabelText('favorite-track.flac');
     await fireEvent.click(fileRow);
 
-    expect(callbacks.onItemClick).toHaveBeenCalledWith('cid-song-favorite');
+    // ZEB-164: onItemClick now receives the full ContentItem, not just the cid.
+    expect(callbacks.onItemClick).toHaveBeenCalledOnce();
+    const arg = callbacks.onItemClick.mock.calls[0][0];
+    expect(arg.cid).toBe('cid-song-favorite');
+    expect(arg.sidecarId).toBe('mock-sidecar-4');
   });
 
   // ── 3. Click a folder to navigate ────────────────────────────────
@@ -501,7 +505,7 @@ describe('File Manager Integration', () => {
     const service = new FileManagerService();
     const privateBefore = service.getContents().length;
 
-    service.burn(['cid-training-data']);
+    service.burn(['mock-sidecar-7']);
 
     const privateAfter = service.getContents();
     expect(privateAfter.length).toBe(privateBefore - 1);
@@ -514,7 +518,7 @@ describe('File Manager Integration', () => {
     const service = new FileManagerService();
     const quotaBefore = service.getQuotaStatus().usedBytes;
 
-    service.burn(['cid-video-lecture']);
+    service.burn(['mock-sidecar-5']);
 
     const quotaAfter = service.getQuotaStatus().usedBytes;
     expect(quotaAfter).toBeLessThan(quotaBefore);

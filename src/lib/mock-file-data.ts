@@ -40,6 +40,7 @@ export const mockStorageBuddies: StorageBuddy[] = [
 export const mockPrivateContent: ContentItem[] = [
   // Folder: "Projects" bundle at root
   {
+    sidecarId: 'mock-sidecar-1',
     cid: 'cid-folder-projects',
     name: 'Projects',
     category: 'bundle',
@@ -58,6 +59,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // File inside Projects folder
   {
+    sidecarId: 'mock-sidecar-2',
     cid: 'cid-design-doc',
     name: 'mesh-design.md',
     category: 'text',
@@ -76,6 +78,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // File inside Projects folder
   {
+    sidecarId: 'mock-sidecar-3',
     cid: 'cid-arch-diagram',
     name: 'architecture.svg',
     category: 'image',
@@ -94,6 +97,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level music file, pinned
   {
+    sidecarId: 'mock-sidecar-4',
     cid: 'cid-song-favorite',
     name: 'favorite-track.flac',
     category: 'music',
@@ -112,6 +116,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level video, large, under-replicated
   {
+    sidecarId: 'mock-sidecar-5',
     cid: 'cid-video-lecture',
     name: 'distributed-systems-lecture.mp4',
     category: 'video',
@@ -130,6 +135,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level confidential text
   {
+    sidecarId: 'mock-sidecar-6',
     cid: 'cid-private-keys-backup',
     name: 'key-backup.enc',
     category: 'text',
@@ -148,6 +154,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level dataset
   {
+    sidecarId: 'mock-sidecar-7',
     cid: 'cid-training-data',
     name: 'sensor-readings.parquet',
     category: 'dataset',
@@ -166,6 +173,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level software bundle
   {
+    sidecarId: 'mock-sidecar-8',
     cid: 'cid-app-build',
     name: 'harmony-client-v0.3.tar.gz',
     category: 'software',
@@ -184,6 +192,7 @@ export const mockPrivateContent: ContentItem[] = [
   },
   // Root-level intimate photo
   {
+    sidecarId: 'mock-sidecar-9',
     cid: 'cid-family-photo',
     name: 'family-reunion-2025.jpg',
     category: 'image',
@@ -235,6 +244,7 @@ export const mockPublishedContent: PublishedItem[] = [
 
 export const mockCleanupRecommendations: CleanupRecommendation[] = [
   {
+    sidecarId: 'mock-sidecar-7',
     cid: 'cid-training-data',
     name: 'sensor-readings.parquet',
     category: 'dataset',
@@ -246,6 +256,7 @@ export const mockCleanupRecommendations: CleanupRecommendation[] = [
     confidence: 0.92,
   },
   {
+    sidecarId: 'mock-sidecar-5',
     cid: 'cid-video-lecture',
     name: 'distributed-systems-lecture.mp4',
     category: 'video',
@@ -257,6 +268,7 @@ export const mockCleanupRecommendations: CleanupRecommendation[] = [
     confidence: 0.78,
   },
   {
+    sidecarId: 'mock-sidecar-9',
     cid: 'cid-family-photo',
     name: 'family-reunion-2025.jpg',
     category: 'image',

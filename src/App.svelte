@@ -28,7 +28,7 @@
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail } from './lib/types';
+  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -424,6 +424,7 @@
 
   // ── File manager state ──────────────────────────────────────────────
   let selectedFileCid = $state<string | null>(null);
+  let selectedFileSidecarId = $state<string | null>(null);
   let currentFolderCid = $state<string | null>(null);
   let fileViewMode = $state<FileViewMode>('list');
   let showCleanup = $state(false);
@@ -454,33 +455,40 @@
   });
 
   // ── File manager callbacks ──────────────────────────────────────────
-  function handleFileItemClick(cid: string) {
-    selectedFileCid = cid;
+  function handleFileItemClick(item: ContentItem) {
+    selectedFileCid = item.cid;
+    // ZEB-164: sidecarId is the stable per-entry identity. For manifest-derived
+    // rows (sidecarId === '') selection is informational only — pin/burn/archive
+    // are gated downstream.
+    selectedFileSidecarId = item.sidecarId || null;
   }
 
   function handleNavigateFolder(cid: string | null) {
     currentFolderCid = cid;
     selectedFileCid = null;
+    selectedFileSidecarId = null;
     showCleanup = false;
   }
 
   async function handleFileBurn() {
-    if (!selectedFileCid) return;
+    if (!selectedFileSidecarId) return;
     try {
-      await fileManagerService.burn([selectedFileCid]);
+      await fileManagerService.burn([selectedFileSidecarId]);
       fileManagerVersion++;
       selectedFileCid = null;
+      selectedFileSidecarId = null;
     } catch (err) {
       console.error('File burn failed:', err);
     }
   }
 
   async function handleFileArchive() {
-    if (!selectedFileCid) return;
+    if (!selectedFileSidecarId) return;
     try {
-      await fileManagerService.archive([selectedFileCid]);
+      await fileManagerService.archive([selectedFileSidecarId]);
       fileManagerVersion++;
       selectedFileCid = null;
+      selectedFileSidecarId = null;
     } catch (err) {
       console.error('File archive failed:', err);
     }
@@ -490,18 +498,20 @@
     fileManagerService.publish([cid]);
     fileManagerVersion++;
     selectedFileCid = null;
+    selectedFileSidecarId = null;
   }
 
   function handleFileRelease(cid: string) {
     fileManagerService.release([cid]);
     fileManagerVersion++;
     selectedFileCid = null;
+    selectedFileSidecarId = null;
   }
 
   async function handleFilePin() {
-    if (!selectedFileCid) return;
+    if (!selectedFileSidecarId) return;
     try {
-      await fileManagerService.pin(selectedFileCid);
+      await fileManagerService.pin(selectedFileSidecarId);
       fileManagerVersion++;
     } catch (err) {
       // Most common failure: pin quota exhausted. Surface via console for now;
@@ -511,9 +521,9 @@
   }
 
   async function handleFileUnpin() {
-    if (!selectedFileCid) return;
+    if (!selectedFileSidecarId) return;
     try {
-      await fileManagerService.unpin(selectedFileCid);
+      await fileManagerService.unpin(selectedFileSidecarId);
       fileManagerVersion++;
     } catch (err) {
       console.error('File unpin failed:', err);
@@ -530,9 +540,9 @@
   }
 
   async function handleFileTierChange(tier: ReplicationTier) {
-    if (!selectedFileCid) return;
+    if (!selectedFileSidecarId) return;
     try {
-      await fileManagerService.setReplicationTier([selectedFileCid], tier);
+      await fileManagerService.setReplicationTier([selectedFileSidecarId], tier);
       fileManagerVersion++;
     } catch (err) {
       console.error('Replication-tier update failed:', err);
@@ -555,40 +565,53 @@
     showCleanup = !showCleanup;
   }
 
-  async function handleCleanupAction(cid: string, action: string) {
+  async function handleCleanupAction(rec: CleanupRecommendation, action: string) {
     try {
-      if (action === 'burn') await fileManagerService.burn([cid]);
-      else if (action === 'archive') await fileManagerService.archive([cid]);
-      else if (action === 'release') fileManagerService.release([cid]);
-      else if (action === 'publish') fileManagerService.publish([cid]);
-      else if (action === 'pin') await fileManagerService.pin(cid);
+      if (action === 'burn') {
+        await fileManagerService.burn([rec.sidecarId]);
+      } else if (action === 'archive') {
+        await fileManagerService.archive([rec.sidecarId]);
+      } else if (action === 'release') {
+        fileManagerService.release([rec.cid]);
+      } else if (action === 'publish') {
+        fileManagerService.publish([rec.cid]);
+      } else if (action === 'pin') {
+        await fileManagerService.pin(rec.sidecarId);
+      }
       fileManagerVersion++;
-      if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
+      if (selectedFileCid === rec.cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
         selectedFileCid = null;
+        selectedFileSidecarId = null;
       }
     } catch (err) {
       console.error(`Cleanup ${action} failed:`, err);
     }
   }
 
-  async function handleBulkBurn(cids: string[]) {
+  async function handleBulkBurn(recs: CleanupRecommendation[]) {
     try {
-      await fileManagerService.burn(cids);
+      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
+      if (sidecarIds.length === 0) return;
+      await fileManagerService.burn(sidecarIds);
       fileManagerVersion++;
-      if (selectedFileCid && cids.includes(selectedFileCid)) {
+      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
         selectedFileCid = null;
+        selectedFileSidecarId = null;
       }
     } catch (err) {
       console.error('Bulk burn failed:', err);
     }
   }
 
-  async function handleBulkArchive(cids: string[]) {
+  async function handleBulkArchive(recs: CleanupRecommendation[]) {
     try {
-      await fileManagerService.archive(cids);
+      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
+      if (sidecarIds.length === 0) return;
+      await fileManagerService.archive(sidecarIds);
       fileManagerVersion++;
-      if (selectedFileCid && cids.includes(selectedFileCid)) {
+      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
         selectedFileCid = null;
+        selectedFileSidecarId = null;
       }
     } catch (err) {
       console.error('Bulk archive failed:', err);
@@ -600,6 +623,7 @@
     fileManagerVersion++;
     if (selectedFileCid && cids.includes(selectedFileCid)) {
       selectedFileCid = null;
+      selectedFileSidecarId = null;
     }
   }
 
@@ -608,6 +632,7 @@
     fileManagerVersion++;
     if (selectedFileCid && cids.includes(selectedFileCid)) {
       selectedFileCid = null;
+      selectedFileSidecarId = null;
     }
   }
 
@@ -631,6 +656,7 @@
     fileFilters = {};
     fileSearchQuery = '';
     selectedFileCid = null;
+    selectedFileSidecarId = null;
     currentFolderCid = null;
   }
 
@@ -866,6 +892,7 @@
       service={fileManagerService}
       {currentFolderCid}
       selectedCid={selectedFileCid}
+      selectedSidecarId={selectedFileSidecarId}
       viewMode={fileViewMode}
       section={fileSection}
       searchQuery={fileSearchQuery}

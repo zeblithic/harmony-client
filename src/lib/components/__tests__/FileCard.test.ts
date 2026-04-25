@@ -4,6 +4,7 @@ import FileCard from '../FileCard.svelte';
 import type { ContentItem } from '../../types';
 
 const baseItem: ContentItem = {
+  sidecarId: 'mock-sidecar-card-001',
   cid: 'cid-card-001',
   name: 'photo.jpg',
   category: 'image',
@@ -33,12 +34,12 @@ describe('FileCard', () => {
     expect(container.querySelector('.staleness-dot')).toBeTruthy();
   });
 
-  it('calls onClick with CID when clicked', async () => {
+  it('calls onClick with ContentItem when clicked', async () => {
     const onClick = vi.fn();
     render(FileCard, { props: { item: baseItem, onClick } });
     const card = screen.getByRole('button');
     await fireEvent.click(card);
-    expect(onClick).toHaveBeenCalledWith('cid-card-001');
+    expect(onClick).toHaveBeenCalledWith(baseItem);
   });
 
   it('shows folder icon for folders', () => {

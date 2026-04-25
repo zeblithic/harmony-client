@@ -184,6 +184,13 @@ export interface PeerRef {
 }
 
 export interface ContentItem {
+  /**
+   * ZEB-164: opaque per-entry stable identity. Empty string for
+   * manifest-derived rows (children of a folder bundle that have no
+   * sidecar entry of their own). Backend mutations (pin, archive, burn,
+   * setReplicationTier) take sidecarId, not cid.
+   */
+  sidecarId: string;
   cid: string;
   name: string;
   category: ContentCategory;
@@ -217,6 +224,13 @@ export interface QuotaStatus {
 }
 
 export interface CleanupRecommendation {
+  /**
+   * ZEB-164: per-entry stable identity matching the ContentItem.sidecarId
+   * that backs this recommendation. Required so action handlers can route
+   * sidecar mutations (burn/archive/pin) without a CID re-lookup, which
+   * would be non-deterministic when two entries share a CID.
+   */
+  sidecarId: string;
   cid: string;
   name: string;
   category: ContentCategory;

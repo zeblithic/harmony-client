@@ -29,6 +29,7 @@ describe('File manager types', () => {
 
   it('ContentItem has required fields', () => {
     const item: ContentItem = {
+      sidecarId: 'sidecar-abc',
       cid: 'abc123',
       name: 'photo.jpg',
       category: 'image',
@@ -51,6 +52,7 @@ describe('File manager types', () => {
 
   it('ContentDetail extends ContentItem with peer info', () => {
     const detail: ContentDetail = {
+      sidecarId: 'sidecar-abc',
       cid: 'abc123',
       name: 'photo.jpg',
       category: 'image',

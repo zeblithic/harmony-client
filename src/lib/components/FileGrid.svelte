@@ -5,17 +5,19 @@
   let {
     items,
     selectedCid,
+    selectedSidecarId = null,
     onItemClick,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
-    onItemClick: (cid: string) => void;
+    selectedSidecarId?: string | null;
+    onItemClick: (item: ContentItem) => void;
   } = $props();
 </script>
 
 <div class="file-grid" aria-label="File grid">
-  {#each items as item (item.cid)}
-    <FileCard {item} onClick={onItemClick} selected={selectedCid === item.cid} />
+  {#each items as item (item.sidecarId || item.cid)}
+    <FileCard {item} onClick={onItemClick} selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid} />
   {/each}
 </div>
 

@@ -102,6 +102,7 @@ describe('NavPanel', () => {
   describe('files mode', () => {
     const testContentItems: ContentItem[] = [
       {
+        sidecarId: 'mock-sidecar-navpanel-1',
         cid: 'cid-folder-projects',
         name: 'Projects',
         category: 'bundle',

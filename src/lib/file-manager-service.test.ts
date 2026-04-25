@@ -88,7 +88,7 @@ describe('FileManagerService', () => {
     const target = svc.getContents().find((i) => i.cid === 'cid-training-data');
     expect(target).toBeDefined();
 
-    svc.burn([target!.cid]);
+    svc.burn([target!.sidecarId]);
 
     const after = svc.getQuotaStatus();
     expect(after.usedBytes).toBe(before.usedBytes - target!.sizeBytes);
@@ -98,7 +98,7 @@ describe('FileManagerService', () => {
 
   it('burn filters out burned items from cleanup recommendations', () => {
     const svc = new FileManagerService();
-    svc.burn(['cid-training-data']);
+    svc.burn(['mock-sidecar-7']);
     const recs = svc.getCleanupRecommendations();
     expect(recs.find((r) => r.cid === 'cid-training-data')).toBeUndefined();
   });
@@ -108,7 +108,7 @@ describe('FileManagerService', () => {
     const item = svc.getContents().find((i) => i.cid === 'cid-video-lecture');
     expect(item!.pinned).toBe(false);
 
-    svc.pin('cid-video-lecture');
+    svc.pin('mock-sidecar-5');
 
     const updated = svc.getContents().find((i) => i.cid === 'cid-video-lecture');
     expect(updated!.pinned).toBe(true);
@@ -120,7 +120,7 @@ describe('FileManagerService', () => {
     const item = svc.getContents().find((i) => i.cid === 'cid-song-favorite');
     expect(item!.pinned).toBe(true);
 
-    svc.unpin('cid-song-favorite');
+    svc.unpin('mock-sidecar-4');
 
     const updated = svc.getContents().find((i) => i.cid === 'cid-song-favorite');
     expect(updated!.pinned).toBe(false);
@@ -158,7 +158,7 @@ describe('FileManagerService', () => {
 
   it('setReplicationTier updates tier for specified items', () => {
     const svc = new FileManagerService();
-    svc.setReplicationTier(['cid-video-lecture', 'cid-training-data'], 'high');
+    svc.setReplicationTier(['mock-sidecar-5', 'mock-sidecar-7'], 'high');
 
     const video = svc.getContents().find((i) => i.cid === 'cid-video-lecture');
     const data = svc.getContents().find((i) => i.cid === 'cid-training-data');
@@ -184,7 +184,7 @@ describe('FileManagerService', () => {
   it('each instance is independent (structuredClone)', () => {
     const svc1 = new FileManagerService();
     const svc2 = new FileManagerService();
-    svc1.burn(['cid-training-data']);
+    svc1.burn(['mock-sidecar-7']);
     // svc2 should still have the item
     expect(svc2.getContents().find((i) => i.cid === 'cid-training-data')).toBeDefined();
   });
@@ -195,20 +195,20 @@ describe('FileManagerService', () => {
     const target = svc.getContents().find((i) => i.cid === 'cid-design-doc');
     expect(target).toBeDefined();
 
-    svc.archive([target!.cid]);
+    svc.archive([target!.sidecarId]);
 
     const after = svc.getQuotaStatus();
     expect(after.usedBytes).toBe(before.usedBytes - target!.sizeBytes);
     expect(svc.getContents().find((i) => i.cid === 'cid-design-doc')).toBeUndefined();
   });
 
-  it('archive invokes archive_content on the adapter for each cid', async () => {
+  it('archive invokes archive_content on the adapter for each sidecar_id', async () => {
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    svc.archive(['cid-design-doc', 'cid-video-lecture']);
-    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { cid: 'cid-design-doc' });
-    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { cid: 'cid-video-lecture' });
+    svc.archive(['mock-sidecar-2', 'mock-sidecar-5']);
+    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { sidecarId: 'mock-sidecar-2' });
+    expect(adapter.invoke).toHaveBeenCalledWith('archive_content', { sidecarId: 'mock-sidecar-5' });
   });
 
   it('exportToDevice invokes export_content with cid as filename when item not in real list', async () => {
@@ -291,29 +291,29 @@ describe('FileManagerService', () => {
 
   // ── adapter invoke on mutations ───────────────────────────────────
 
-  it('burn invokes burn_content on the adapter for each cid', async () => {
+  it('burn invokes burn_content on the adapter for each sidecar_id', async () => {
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    svc.burn(['cid-training-data', 'cid-video-lecture']);
-    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { cid: 'cid-training-data' });
-    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { cid: 'cid-video-lecture' });
+    svc.burn(['mock-sidecar-7', 'mock-sidecar-5']);
+    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { sidecarId: 'mock-sidecar-7' });
+    expect(adapter.invoke).toHaveBeenCalledWith('burn_content', { sidecarId: 'mock-sidecar-5' });
   });
 
   it('pin invokes pin_content on the adapter', async () => {
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    svc.pin('cid-video-lecture');
-    expect(adapter.invoke).toHaveBeenCalledWith('pin_content', { cid: 'cid-video-lecture' });
+    svc.pin('mock-sidecar-5');
+    expect(adapter.invoke).toHaveBeenCalledWith('pin_content', { sidecarId: 'mock-sidecar-5' });
   });
 
   it('unpin invokes unpin_content on the adapter', async () => {
     const svc = new FileManagerService();
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    svc.unpin('cid-song-favorite');
-    expect(adapter.invoke).toHaveBeenCalledWith('unpin_content', { cid: 'cid-song-favorite' });
+    svc.unpin('mock-sidecar-4');
+    expect(adapter.invoke).toHaveBeenCalledWith('unpin_content', { sidecarId: 'mock-sidecar-4' });
   });
 
   // ── destroy / addUnlisten ─────────────────────────────────────────

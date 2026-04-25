@@ -548,6 +548,12 @@ async fn start_node(
             let idx = content_index
                 .lock()
                 .map_err(|e| format!("content_index lock on startup: {e}"))?;
+            // ZEB-164: multiple sidecar entries can pin the same CID. The
+            // runtime pin_intent set is CID-keyed, so we dedupe here —
+            // collecting into a HashSet drops duplicates without effect.
+            // (Functionally identical to the pre-ZEB-164 path; the dedupe
+            // is just made explicit so debug logs don't show repeated
+            // restores for the same CID.)
             idx.entries()
                 .filter(|e| e.pinned)
                 .map(|e| e.cid)
@@ -1164,10 +1170,17 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
 /// Wire format returned by `list_content` — one entry per self-ingested
 /// file the client is aware of. Joins sidecar metadata with the runtime
 /// cache's pinned state snapshot. ZEB-158 slice 1 adds `kind` to
-/// distinguish leaf files from folder bundles.
+/// distinguish leaf files from folder bundles. ZEB-164 adds `sidecarId`
+/// (the wire-stable handle for pin/burn/archive operations); empty for
+/// manifest-derived rows where no sidecar entry exists.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentItemWire {
+    /// ZEB-164: opaque per-entry stable handle. Empty string for
+    /// manifest-derived rows (children inside a folder bundle that have
+    /// no sidecar entry of their own). Frontend gates pin/burn/archive
+    /// buttons on this being non-empty.
+    pub sidecar_id: String,
     pub cid: String,              // hex
     pub name: String,
     pub size_bytes: u64,
@@ -1211,24 +1224,33 @@ fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "cid must be 32 bytes".to_string())
 }
 
+fn parse_sidecar_id(s: &str) -> Result<content_index::SidecarId, String> {
+    if s.is_empty() {
+        return Err("sidecar_id is empty (manifest-derived row?)".into());
+    }
+    content_index::SidecarId::parse_str(s)
+        .map_err(|e| format!("invalid sidecar_id: {e}"))
+}
+
 /// Result returned to the frontend after a successful file ingest.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IngestResult {
+    pub sidecar_id: String,
     pub cid: String,
     pub file_name: String,
     pub size_bytes: u64,
 }
 
-/// ZEB-155: resolve the `pinned` flag for a single wire entry by
-/// OR-joining the sidecar's persisted intent with the runtime cache's
-/// currently-pinned set. Extracted so unit tests can exercise the join
-/// logic without a live Tauri state.
-fn joined_pinned(
-    entry: &content_index::ContentIndexEntry,
-    runtime_pinned: &std::collections::HashSet<[u8; 32]>,
-) -> bool {
-    entry.pinned || runtime_pinned.contains(&entry.cid)
+/// Result returned by `create_folder` and `create_folder_at_root`. The
+/// frontend stashes `sidecar_id` immediately so subsequent operations on
+/// the just-created folder (pin, archive, future move/rename) have the
+/// stable handle. `cid` is provided alongside for content-addressed reads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFolderResult {
+    pub sidecar_id: String,
+    pub cid: String,
 }
 
 #[tauri::command]
@@ -1236,32 +1258,35 @@ async fn list_content(
     folder_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<ContentItemWire>, String> {
-    // 1. Snapshot pinned CIDs from the runtime cache.
-    let verb_tx = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?
-    };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    let pinned_set = reply_rx
-        .await
-        .map_err(|_| "event loop dropped snapshot request".to_string())?;
-
+    // Root listings read entry.pinned directly from the sidecar (the runtime
+    // pin_intent OR-join keeps that flag authoritative), so they don't need
+    // the runtime's pinned-CID snapshot. Only fetch it for folder listings,
+    // where manifest-derived rows have no sidecar entry to consult.
     match folder_cid {
-        None => list_root(state, &pinned_set),
-        Some(hex) => list_folder(hex, verb_tx, &pinned_set).await,
+        None => list_root(state),
+        Some(hex) => {
+            let verb_tx = {
+                let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+                guard
+                    .content_verb_tx
+                    .clone()
+                    .ok_or_else(|| "runtime unavailable".to_string())?
+            };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            verb_tx
+                .send(event_loop::ContentVerbRequest::PinnedSet { reply: reply_tx })
+                .await
+                .map_err(|_| "event loop not running".to_string())?;
+            let pinned_set = reply_rx
+                .await
+                .map_err(|_| "event loop dropped snapshot request".to_string())?;
+            list_folder(hex, verb_tx, &pinned_set).await
+        }
     }
 }
 
 pub(crate) fn list_root(
     state: tauri::State<'_, Mutex<NodeState>>,
-    pinned_set: &std::collections::HashSet<[u8; 32]>,
 ) -> Result<Vec<ContentItemWire>, String> {
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1271,13 +1296,14 @@ pub(crate) fn list_root(
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.entries()
             .map(|e| ContentItemWire {
+                sidecar_id: e.sidecar_id.to_string(),
                 cid: hex::encode(e.cid),
                 name: e.file_name.clone(),
                 size_bytes: e.size_bytes,
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: joined_pinned(e, pinned_set),
+                pinned: e.pinned,
                 licensed: e.licensed,
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
@@ -1332,14 +1358,19 @@ pub async fn list_folder(
     let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
     crate::folders::validate_manifest_matches_bundle(&manifest, &child_cids)?;
 
-    // Synthesize wire rows. Nested items have no sidecar: size_bytes/stored_at
-    // are unavailable (reported 0), sensitivity/replication_tier default,
-    // licensed/archived false. Pinned joins the runtime's pinned_set.
+    // Synthesize wire rows. Nested items have no sidecar: sidecar_id is
+    // the empty-string sentinel ("frontend: no mutations apply"); size_bytes
+    // /stored_at default to 0; sensitivity/replication_tier default;
+    // licensed/archived false. For manifest-derived rows we DO consult the
+    // runtime pinned set — those rows have no sidecar.pinned to read, and
+    // a CID currently held in cache via some other entry's pin_intent is
+    // the only signal of "this content is sticking around right now".
     Ok(manifest
         .folder_manifest
         .entries
         .into_iter()
         .map(|e| ContentItemWire {
+            sidecar_id: String::new(),
             cid: hex::encode(e.cid),
             name: e.name,
             size_bytes: 0,
@@ -1356,147 +1387,329 @@ pub async fn list_folder(
 
 #[tauri::command]
 async fn pin_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: persist pin intent on the sidecar BEFORE the runtime verb.
-    // Durability bias — if the runtime is gone (stop_node in flight, event
-    // loop torn down) the user's click still lands on disk and is restored
-    // on next start_node. Sidecar writes are best-effort: ContentIndex::save
-    // already tracing::warn's on disk-write errors.
-    //
-    // `content_verb_tx` is cloned as Option to AVOID gating the sidecar
-    // write on runtime availability — the spec mandates sidecar-first even
-    // when we know we can't dispatch. We unwrap the Option AFTER the
-    // sidecar write so the durable side is consistent with the user's click
-    // regardless of the runtime outcome.
+    // ZEB-155 + ZEB-164: persist pin intent on the sidecar BEFORE the
+    // runtime verb. After flipping the bit, look up the entry's CID so
+    // we can dispatch Pin against it. The Pin verb is idempotent for
+    // CIDs already in pin_intent (a sibling entry pinning the same CID
+    // will have already added it).
     let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
-    {
+    let cid_bytes = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_pinned(&cid_bytes, true);
-    }
+        idx.set_pinned(&id, true);
+        idx.get(&id)
+            .ok_or_else(|| "unknown sidecar_id".to_string())?
+            .cid
+    };
 
-    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Pin {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped pin request".to_string())?
+    // Sidecar already committed. Runtime Pin failures split into two
+    // categories:
+    //   - Deterministic refusal (Ok(Ok(false)) = pin quota exhausted):
+    //     surface to the caller as Ok(false). The sidecar bit is set so
+    //     intent is recorded, but the runtime answered "no, can't fit"
+    //     and the user needs to know (free space, retry). The
+    //     start_node sweep will retry on next start; if quota is still
+    //     exhausted there too, it also gets false.
+    //   - Transient runtime gaps (event loop down, dropped reply,
+    //     verb_tx None, runtime returned Err): best-effort, log, return
+    //     Ok(true). Intent is recorded; the start_node pin-restore
+    //     sweep walks the sidecar and re-pins every entry with
+    //     pinned=true, so the gap is bounded and self-healing.
+    // This preserves the runtime's quota-exhausted signal that the
+    // pre-best-effort code returned via the bool, while keeping the
+    // best-effort behavior for transient failures that pin/unpin/burn
+    // all share.
+    let pinned = if let Some(verb_tx) = maybe_verb_tx {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Pin {
+                cid: cid_bytes,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(true)) => true,
+                Ok(Ok(false)) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        "pin_content: runtime pin quota exhausted",
+                    );
+                    false
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        err = %e,
+                        "pin_content: runtime pin failed; pin_intent will repopulate on next start_node sweep",
+                    );
+                    true
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        cid = %hex::encode(cid_bytes),
+                        "pin_content: event loop dropped pin reply",
+                    );
+                    true
+                }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    "pin_content: event loop closed before pin send; pin_intent will repopulate on next start_node sweep",
+                );
+                true
+            }
+        }
+    } else {
+        tracing::warn!(
+            cid = %hex::encode(cid_bytes),
+            "pin_content: runtime unavailable; pin_intent will repopulate on next start_node sweep",
+        );
+        true
+    };
+    Ok(pinned)
 }
 
 #[tauri::command]
 async fn unpin_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: clear sidecar intent first, then dispatch the runtime
-    // unpin. Mirror of pin_content's ordering — durable side stays
-    // consistent with the user's click even when the runtime is gone
-    // (content_verb_tx is None). See pin_content for the full rationale.
+    // ZEB-164: clear sidecar intent. Then check OR-join: if some other
+    // sidecar entry STILL pins this CID, leave runtime pin_intent alone
+    // (the bytes are still wanted). Only dispatch Unpin to the runtime
+    // when no entry references this CID with pinned=true anymore.
     let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
-    {
+    let unpin_runtime_for: Option<[u8; 32]> = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_pinned(&cid_bytes, false);
-    }
+        idx.set_pinned(&id, false);
+        let cid = idx
+            .get(&id)
+            .ok_or_else(|| "unknown sidecar_id".to_string())?
+            .cid;
+        if idx.is_cid_pinned_by_any(&cid) {
+            None
+        } else {
+            Some(cid)
+        }
+    };
 
-    let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Unpin {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped unpin request".to_string())?
+    let Some(cid_bytes) = unpin_runtime_for else {
+        return Ok(true); // sidecar updated; another entry still pins
+    };
+
+    // Sidecar already committed. Runtime Unpin is best-effort: if the
+    // event loop is gone, we have a stale pin_intent that self-corrects
+    // on the next start_node pin-restore sweep. Log, don't propagate —
+    // matches burn_content's RuntimeAction::Unpin branch and the
+    // create_folder_nested post-rekey pattern.
+    if let Some(verb_tx) = maybe_verb_tx {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Unpin {
+                cid: cid_bytes,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    err = %e,
+                    "unpin_content: runtime unpin failed; pin_intent may be stale",
+                ),
+                Err(_) => tracing::warn!(
+                    cid = %hex::encode(cid_bytes),
+                    "unpin_content: event loop dropped unpin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                cid = %hex::encode(cid_bytes),
+                "unpin_content: event loop closed before unpin send; pin_intent may be stale",
+            ),
+        }
+    }
+    Ok(true)
 }
 
-/// Burn a CID: unpin runtime-side, then remove the sidecar entry.
-///
-/// ZEB-155: removing the sidecar entry implicitly drops any persisted
-/// pin intent — no explicit `set_pinned(false)` needed, because there's
-/// no entry left to hold a flag on. The event-loop Burn arm also clears
-/// the CID from the in-memory `pin_intent` set so the two stay in sync.
+/// Burn a sidecar entry. With ZEB-164's symlink-style sidecar, burn is
+/// "remove this entry from my list" — not "destroy the bytes everyone
+/// shares." The runtime's `Burn` verb only fires when this entry was the
+/// last reference to its CID. Otherwise we issue an `Unpin` (if the burn
+/// drops the only pinning entry) or no runtime action (if siblings still
+/// pin it).
 #[tauri::command]
 async fn burn_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: snapshot both handles under a single NodeState lock, matching
-    // pin_content / unpin_content. Fail fast if the runtime is gone — no
-    // point removing the sidecar entry if we can't also clear the cache.
-    let (index, verb_tx) = {
+    // Match pin_content/unpin_content's best-effort pattern: clone
+    // maybe_verb_tx without erroring on None. The pre-existing upfront
+    // ok_or_else was a weak guard anyway — runtime can die between the
+    // check and the verb_tx.send().await — and asymmetry meant users
+    // could pin/unpin offline but not burn. With sidecar-as-source-of-
+    // truth, the entry-removal step succeeds even with the runtime down;
+    // a future reconciliation pass cleans up surviving bytes.
+    let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        let verb_tx = guard
-            .content_verb_tx
-            .clone()
-            .ok_or_else(|| "runtime unavailable".to_string())?;
-        (guard.content_index.clone(), verb_tx)
+        (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
 
-    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Burn {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped burn request".to_string())??;
-
-    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the entry
-    //    (so the frontend knows whether the burn actually removed something
-    //    or was a no-op on an already-unknown CID).
-    let removed = {
+    // Three-branch decision under a single lock acquisition: read entry's
+    // CID, remove the entry, then inspect the post-state to decide which
+    // (if any) runtime verb to dispatch.
+    enum RuntimeAction {
+        Burn([u8; 32]),
+        Unpin([u8; 32]),
+        Nothing,
+    }
+    let action = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.remove(&cid_bytes)
+        // Snapshot the burned entry's pinned bit before removing — we
+        // need it to decide whether the runtime pin_intent had this CID
+        // at all. If the burned entry wasn't pinning, then runtime
+        // pin_intent state is independent of any sibling (the OR-join
+        // is unchanged by removing a contributor that wasn't asserting).
+        let (cid, was_pinned) = match idx.get(&id) {
+            Some(e) => (e.cid, e.pinned),
+            None => return Ok(false), // unknown sidecar_id; no-op
+        };
+        idx.remove(&id);
+        if idx.entries_for_cid(&cid).next().is_none() {
+            RuntimeAction::Burn(cid)
+        } else if was_pinned && !idx.is_cid_pinned_by_any(&cid) {
+            // The burned entry was the last pinning reference; drop
+            // runtime pin_intent. Without the was_pinned guard, an
+            // unpinned-entry burn whose siblings are also unpinned
+            // would dispatch a spurious Unpin (no-op at the cache
+            // layer, but generates misleading "post-burn unpin failed"
+            // warnings if the runtime path errors).
+            RuntimeAction::Unpin(cid)
+        } else {
+            RuntimeAction::Nothing
+        }
     };
-    Ok(removed)
+
+    match action {
+        RuntimeAction::Burn(cid) => {
+            // Sidecar mutation already committed — runtime Burn is best-
+            // effort. If the event loop is gone, bytes may survive until
+            // W-TinyLFU evicts them or a future reconciliation pass runs.
+            // Log so the desync is diagnosable. Matches the unpin /
+            // post-burn-Unpin pattern.
+            if let Some(verb_tx) = maybe_verb_tx {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                match verb_tx
+                    .send(event_loop::ContentVerbRequest::Burn {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => match reply_rx.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            err = %e,
+                            "burn_content: runtime burn failed; bytes may survive until reconciliation",
+                        ),
+                        Err(_) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            "burn_content: event loop dropped burn reply",
+                        ),
+                    },
+                    Err(_) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        "burn_content: event loop closed before burn send; bytes may survive",
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    cid = %hex::encode(cid),
+                    "burn_content: runtime unavailable; bytes may survive until reconciliation",
+                );
+            }
+        }
+        RuntimeAction::Unpin(cid) => {
+            // Sibling entries still reference this CID, but none pin it —
+            // drop runtime pin_intent so W-TinyLFU can reclaim. Best-
+            // effort: any failure here is a runtime/cache desync, not a
+            // user-visible regression (the sidecar mutation already
+            // committed). Log so the desync is diagnosable.
+            if let Some(verb_tx) = maybe_verb_tx {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                match verb_tx
+                    .send(event_loop::ContentVerbRequest::Unpin {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => match reply_rx.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            err = %e,
+                            "burn_content: post-burn unpin failed; runtime may hold stale pin",
+                        ),
+                        Err(_) => tracing::warn!(
+                            cid = %hex::encode(cid),
+                            "burn_content: event loop dropped post-burn unpin reply",
+                        ),
+                    },
+                    Err(_) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        "burn_content: event loop closed before post-burn unpin send",
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    cid = %hex::encode(cid),
+                    "burn_content: runtime unavailable for post-burn unpin; runtime may hold stale pin",
+                );
+            }
+        }
+        RuntimeAction::Nothing => {} // siblings still pin; runtime untouched
+    }
+    Ok(true)
 }
 
 #[tauri::command]
 async fn archive_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
     };
     let flipped = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_archived(&cid_bytes, true)
+        idx.set_archived(&id, true)
     };
     Ok(flipped)
 }
 
 #[tauri::command]
 async fn set_replication_tier(
-    cids: Vec<String>,
+    sidecar_ids: Vec<String>,
     tier: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<u32, String> {
@@ -1508,9 +1721,9 @@ async fn set_replication_tier(
         "ultra" => content_index::ReplicationTier::Ultra,
         other => return Err(format!("unknown replication tier: {other}")),
     };
-    let mut parsed_cids: Vec<[u8; 32]> = Vec::with_capacity(cids.len());
-    for c in &cids {
-        parsed_cids.push(parse_cid_hex(c)?);
+    let mut parsed_ids: Vec<content_index::SidecarId> = Vec::with_capacity(sidecar_ids.len());
+    for s in &sidecar_ids {
+        parsed_ids.push(parse_sidecar_id(s)?);
     }
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1518,7 +1731,7 @@ async fn set_replication_tier(
     };
     let updated = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_replication_tier(&parsed_cids, parsed_tier)
+        idx.set_replication_tier(&parsed_ids, parsed_tier)
     };
     Ok(updated as u32)
 }
@@ -1691,9 +1904,11 @@ async fn ingest_content(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let sidecar_id = content_index::SidecarId::new();
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
+            sidecar_id,
             cid: root_cid_bytes,
             file_name: file_name.clone(),
             size_bytes,
@@ -1706,16 +1921,27 @@ async fn ingest_content(
             kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
-            tracing::debug!(
-                cid = %hex::encode(root_cid_bytes),
+            // Effectively impossible (UUID v4 collision); kept as a
+            // sanity guard against future SidecarId construction bugs.
+            // Pre-ZEB-164 this branch silently deduped duplicate-CID
+            // re-uploads; under the symlink model, two ingests of the
+            // same content produce two distinct sidecar entries, so
+            // !inserted here means the freshly-minted sidecar_id was
+            // already in use. Fail loudly so the caller doesn't get a
+            // phantom IngestResult whose sidecar_id list_content/pin/
+            // burn/archive will all reject as unknown — mirrors
+            // create_folder_at_root's symmetric guard.
+            tracing::error!(
+                sidecar_id = %sidecar_id,
                 file_name = %file_name,
-                "ingest_content: duplicate CID; sidecar entry unchanged \
-                 (file_name/stored_at_ms retain their original values)"
+                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
             );
+            return Err("sidecar_id collision".into());
         }
     }
 
     Ok(IngestResult {
+        sidecar_id: sidecar_id.to_string(),
         cid: hex::encode(root_cid_bytes),
         file_name,
         size_bytes,
@@ -1745,16 +1971,16 @@ pub async fn send_ingest(
     Ok(())
 }
 
-/// ZEB-158 slice 1: create a new folder at the root or inside an existing
-/// folder. Empty `parent_path` means root; non-empty means a walk from
-/// top-level root (index 0) down to immediate parent (last element).
-/// Nested creation is implemented in a follow-up step.
+/// ZEB-164: create a new folder at the root or inside an existing folder.
+/// Empty `parent_path` means root; non-empty means a walk from top-level
+/// root (index 0) down to immediate parent (last element).
 #[tauri::command]
 async fn create_folder(
     name: String,
+    parent_sidecar_id: Option<String>,
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     // Defence-in-depth: the UI already trims and rejects blank names, but
     // the IPC surface is callable by anything with a Tauri handle. An empty
     // or whitespace-only label would produce folders that are hard to
@@ -1764,21 +1990,24 @@ async fn create_folder(
         return Err("folder name cannot be empty".to_string());
     }
     if parent_path.is_empty() {
+        if parent_sidecar_id.is_some() {
+            return Err("root creates must not provide parent_sidecar_id".into());
+        }
         return create_folder_at_root(name, state).await;
     }
-    create_folder_nested(name, parent_path, state).await
+    let psid = parent_sidecar_id
+        .ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
+    create_folder_nested(name, psid, parent_path, state).await
 }
 
 async fn create_folder_at_root(
     name: String,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     // Build the (empty) manifest + bundle locally. No runtime state
-    // mutated yet — we can still bail cleanly on collision.
+    // mutated yet — we can still bail cleanly on send_ingest failure.
     let built = folders::build_folder(&name, &[])?;
 
-    // Snapshot handles up-front so a collision check can fail fast without
-    // touching the ingest channel.
     let (ingest_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -1795,17 +2024,16 @@ async fn create_folder_at_root(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // ZEB-158 slice 1 corner case: every empty folder produces the same
-    // bundle CID (the manifest is byte-identical: {"folder_manifest":
-    // {"version":1,"entries":[]}}). Under the current CID-keyed sidecar,
-    // a second empty folder collides with the first. We reserve the
-    // sidecar slot FIRST so a collision bails out without publishing
-    // orphan manifest/bundle bytes to the runtime. The architectural fix
-    // (sidecar entries keyed by an opaque id so multiple entries can share
-    // a CID, symlink-style) is tracked separately.
+    // ZEB-164: every empty folder bundle has the same CID, but multiple
+    // sidecar entries can now reference that shared CID — so the slice-1
+    // collision workaround ("a folder with identical contents already
+    // exists") is gone. We mint a fresh sidecar_id, reserve the slot
+    // before publishing bytes, and roll back if either ingest fails.
+    let sidecar_id = content_index::SidecarId::new();
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
+            sidecar_id,
             cid: built.bundle_cid.to_bytes(),
             file_name: name,
             size_bytes: bundle_size,
@@ -1818,23 +2046,17 @@ async fn create_folder_at_root(
             kind: content_index::ContentKind::Folder,
         });
         if !inserted {
-            return Err(
-                "a folder with identical contents already exists; \
-                 add content to it before creating another empty folder"
-                    .to_string(),
-            );
+            // Effectively impossible (UUID v4 collision); kept as a
+            // sanity guard against future SidecarId construction bugs.
+            return Err("sidecar_id collision".into());
         }
     }
 
     // Slot reserved — now publish the bytes. ZEB-155's fetch-completion
-    // recovery hook is gated on ZEB-159 (not yet implemented), so an
-    // orphan sidecar entry would be unrecoverable until the user manually
-    // burned it. Roll back the reservation on any ingest failure so the
-    // sidecar never points at bytes that don't exist. Best-effort: if the
-    // mutex is poisoned during rollback we leave the orphan, but that
-    // failure mode is strictly worse than the common case (transient
-    // event-loop drop) which we DO recover from.
-    let bundle_cid_bytes = built.bundle_cid.to_bytes();
+    // recovery hook is gated on ZEB-159, so an orphan sidecar entry
+    // would be unrecoverable until the user manually burned it. Roll
+    // back the reservation on any ingest failure so the sidecar never
+    // points at bytes that don't exist.
     if let Err(e) = send_ingest(
         &ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
@@ -1843,32 +2065,38 @@ async fn create_folder_at_root(
     .await
     {
         if let Ok(mut idx) = index.lock() {
-            idx.remove(&bundle_cid_bytes);
+            idx.remove(&sidecar_id);
         }
         return Err(e);
     }
     if let Err(e) = send_ingest(
         &ingest_tx,
-        hex::encode(bundle_cid_bytes),
+        hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
     )
     .await
     {
         if let Ok(mut idx) = index.lock() {
-            idx.remove(&bundle_cid_bytes);
+            idx.remove(&sidecar_id);
         }
         return Err(e);
     }
 
-    Ok(hex::encode(bundle_cid_bytes))
+    Ok(CreateFolderResult {
+        sidecar_id: sidecar_id.to_string(),
+        cid: hex::encode(built.bundle_cid.to_bytes()),
+    })
 }
 
 async fn create_folder_nested(
     name: String,
+    parent_sidecar_id: String,
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     use harmony_content::bundle::parse_bundle;
+
+    let parent_id = parse_sidecar_id(&parent_sidecar_id)?;
 
     // Parse all path CIDs up-front; fail fast on malformed input.
     let path_cids: Vec<[u8; 32]> = parent_path
@@ -1878,7 +2106,6 @@ async fn create_folder_nested(
     let root_old = *path_cids.first().expect("non-empty by guard above");
     let immediate_parent_cid = *path_cids.last().expect("non-empty");
 
-    // Snapshot handles.
     let (ingest_tx, verb_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -1894,14 +2121,42 @@ async fn create_folder_nested(
         )
     };
 
-    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so that
-    // a downstream collision/OldMissing failure during rekey doesn't leave
-    // orphan bytes in the runtime cache (which could be announced over Zenoh
-    // and waste capacity for content no sidecar entry will ever reference).
+    // Verify the caller's claim: parent_sidecar_id maps to root_old.
+    {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let entry = idx.get(&parent_id).ok_or_else(|| {
+            "parent_sidecar_id not in sidecar".to_string()
+        })?;
+        if entry.cid != root_old {
+            return Err(format!(
+                "parent_sidecar_id refers to cid {} but parent_path[0] is {}",
+                hex::encode(entry.cid),
+                hex::encode(root_old),
+            ));
+        }
+    }
+
+    // The verification above and the rekey below are non-atomic — we
+    // yield across multiple await points (ancestor reads, then
+    // pending_ingests drain). A concurrent create_folder_nested on the
+    // same parent_sidecar_id could land its rekey between our verify
+    // and our rekey, so we pass root_old as the expected_old_cid to
+    // ContentIndex::rekey: if the entry's current CID has shifted,
+    // rekey returns RekeyError::Conflict instead of silently
+    // overwriting the concurrent winner. The UI serializes per-folder
+    // mutations so this is rarely hit in practice, but the
+    // ingest-before-rekey reorder widened the verify→rekey window
+    // from "ancestor reads" to "drain pending_ingests" — wide enough
+    // that the CAS guard is now load-bearing rather than defensive.
+
+    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so
+    // that a downstream OldMissing during rekey doesn't leave orphan
+    // bytes in the runtime cache (which could be announced over Zenoh
+    // and waste capacity for content no sidecar entry will ever
+    // reference).
     let new_child = folders::build_folder(&name, &[])?;
     let new_child_bundle_cid = new_child.bundle_cid;
 
-    // (cid_hex, bytes) pairs to ingest after rekey succeeds.
     let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
     pending_ingests.push((
         hex::encode(new_child.manifest_cid.to_bytes()),
@@ -1914,8 +2169,6 @@ async fn create_folder_nested(
 
     // 2. Bottom-up walk: rebuild each ancestor LOCALLY (read-only verb
     // requests), accumulating into pending_ingests.
-    //    prev_old_cid = the ancestor's old CID (as given in parent_path).
-    //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
     let mut prev_old_cid = immediate_parent_cid;
     let mut prev_new_cid = new_child_bundle_cid.to_bytes();
     let mut last_bundle_size: u64 = pending_ingests
@@ -1923,12 +2176,9 @@ async fn create_folder_nested(
         .map(|(_, b)| b.len() as u64)
         .unwrap_or(0);
 
-    // First iteration: APPEND at the immediate parent.
-    // Higher iterations: REPLACE the entry pointing to prev_old_cid.
     for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
         let is_deepest = i == path_cids.len() - 1;
 
-        // Fetch the ancestor's bundle bytes (read-only).
         let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
             .await?
             .ok_or_else(|| {
@@ -1943,20 +2193,14 @@ async fn create_folder_nested(
             .first()
             .copied()
             .ok_or_else(|| "ancestor bundle has no children".to_string())?;
-        // Collect bundle children as raw [u8; 32] for the manifest/bundle
-        // consistency check below.
         let anc_children: Vec<[u8; 32]> =
             anc_child_ids.iter().map(|c| c.to_bytes()).collect();
 
-        // Read the ancestor's manifest book (read-only).
         let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
             .await?
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
         let mut manifest = folders::parse_manifest(&manifest_bytes)
             .map_err(|e| format!("ancestor {e}"))?;
-        // Defend against a malformed ancestor rewriting the tree with
-        // phantom children: refuse to mutate unless manifest entries and
-        // bundle child slots agree.
         folders::validate_manifest_matches_bundle(&manifest, &anc_children)
             .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
 
@@ -1985,10 +2229,8 @@ async fn create_folder_nested(
             manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
         }
 
-        // Rebuild manifest book + bundle with updated entries; queue both
-        // for ingest (deferred until after rekey succeeds).
         let rebuilt = folders::build_folder(
-            /* display name not used by manifest; empty is fine */ "",
+            "",
             &manifest.folder_manifest.entries,
         )?;
         let rebuilt_bundle_cid = rebuilt.bundle_cid;
@@ -2006,90 +2248,110 @@ async fn create_folder_nested(
         prev_new_cid = rebuilt_bundle_cid.to_bytes();
     }
 
-    // 3. Rekey the top-level sidecar entry FIRST. If this fails (collision
-    // or old-missing), no ingests have happened — no orphan bytes.
+    // 3. Drain the deferred ingests BEFORE rekeying. Earlier this was
+    // ordered rekey-then-ingest to avoid leaving orphan bytes in the
+    // runtime cache (and being announced over Zenoh) if rekey hit
+    // OldMissing — but that ordering had a strictly worse failure
+    // mode: a send_ingest failure after a successful rekey would leave
+    // the sidecar pointing at a chain whose bytes are missing,
+    // rendering the user's folder unreadable until manual burn.
+    //
+    // Reversed: an ingest failure now leaves the sidecar pointing at
+    // the original root_old (intact). Bytes ingested before the
+    // failure become orphans, but W-TinyLFU evicts them under cache
+    // pressure since nothing pins them — recoverable, vs. data-loss
+    // for the user. ZEB-167 still tracks the rekey-rollback path for
+    // the residual rekey-OldMissing case (would leave orphans without
+    // user-visible damage).
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    // Read the pre-rekey pin state AND perform the rekey under a single lock
-    // acquisition: a concurrent pin_content/unpin_content landing between the
-    // read and the rekey would otherwise leave had_pin disagreeing with what
-    // the sidecar just persisted, so the subsequent runtime Pin/Unpin dispatch
-    // below would fight the intervening toggle.
-    let had_pin = {
-        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let had_pin = idx.get(&root_old).map(|e| e.pinned).unwrap_or(false);
-        match idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms) {
-            Ok(()) => had_pin,
-            Err(content_index::RekeyError::OldMissing) => {
-                return Err(
-                    "top-level folder not in sidecar — nothing to rekey".to_string(),
-                );
-            }
-            Err(content_index::RekeyError::Collision) => {
-                return Err(
-                    "the new folder's contents collide with an existing top-level entry; \
-                     rename the existing one or differentiate the new one before retrying"
-                        .to_string(),
-                );
-            }
-        }
-    };
-
-    // 4. Drain the deferred ingests now that the sidecar is committed.
-    // If the event loop dies mid-drain, we end up with a sidecar pointer
-    // (the new top-level root CID) referencing a chain whose bytes are
-    // partially resident at best. ZEB-155's fetch-completion recovery
-    // hook is gated on ZEB-159 (not yet implemented), so the user is
-    // left with a folder whose nested contents fail to load until they
-    // manually burn the root. A proper rekey-rollback (mirroring
-    // create_folder_at_root's sidecar.remove) requires snapshotting the
-    // pre-rekey size + stored_at and reversing the rekey on failure;
-    // tracked separately so the moderate complexity isn't bundled into
-    // the slice 1 PR. See ZEB-167.
     for (cid_hex, bytes) in pending_ingests {
         send_ingest(&ingest_tx, cid_hex, bytes).await?;
     }
 
-    // 5. Event-loop pin sync: unpin old, pin new (if old had pin intent).
-    //
-    // The whole step is best-effort: the sidecar has already committed
-    // the rekey, so any failure here — channel send, reply, or remote
-    // error — is a runtime/cache desync rather than a user-visible
-    // regression. Log so the desync is diagnosable (silent swallow would
-    // let "sidecar says pinned, runtime isn't" happen invisibly) but do
-    // not propagate, otherwise the user sees "event loop not running"
-    // on a folder that was fully created and persisted. The fetch-
-    // completion hook (ZEB-155 + ZEB-159) re-converges on the next fetch
-    // of the new root.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    match verb_tx
-        .send(event_loop::ContentVerbRequest::Unpin {
-            cid: root_old,
-            reply: reply_tx,
-        })
-        .await
+    // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
+    // as the expected current CID. With ZEB-164 the CID-collision
+    // branch is gone — multiple entries sharing a CID is legal —
+    // so OldMissing and Conflict are the only failure modes.
     {
-        Ok(()) => match reply_rx.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                old_cid = %hex::encode(root_old),
-                err = %e,
-                "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
-            ),
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        match idx.rekey(
+            &parent_id,
+            root_old,
+            prev_new_cid,
+            new_bundle_size,
+            stored_at_ms,
+        ) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err(
+                    "parent_sidecar_id removed mid-flight — nothing to rekey".to_string(),
+                );
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                // A concurrent rekey on the same parent_sidecar_id
+                // landed between our verify and our rekey. The new
+                // bundle bytes we just ingested are orphans — W-TinyLFU
+                // will evict them under cache pressure. Surface the
+                // actual current CID so future retry logic could
+                // rebuild from it; for now the user re-issues the
+                // create from the refreshed UI state.
+                return Err(format!(
+                    "concurrent rekey on parent_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
+            }
+        }
+    }
+
+    // 5. Maintain the runtime pin_intent OR-join invariant for both
+    // old and new CIDs. If no remaining entry pins root_old, drop it
+    // from runtime pin_intent. If any entry pins prev_new_cid (this
+    // entry might, depending on its persisted intent), add it.
+    //
+    // Both dispatches are best-effort: the sidecar has already
+    // committed the rekey, so any failure here is a runtime/cache
+    // desync rather than a user-visible regression. Log so the desync
+    // is diagnosable. The fetch-completion hook (ZEB-155 + ZEB-159)
+    // re-converges on the next fetch of the new root.
+    let (drop_old, add_new) = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        (
+            !idx.is_cid_pinned_by_any(&root_old),
+            idx.is_cid_pinned_by_any(&prev_new_cid),
+        )
+    };
+    if drop_old {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Unpin {
+                cid: root_old,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    old_cid = %hex::encode(root_old),
+                    err = %e,
+                    "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
+                ),
+                Err(_) => tracing::warn!(
+                    old_cid = %hex::encode(root_old),
+                    "create_folder_nested: event loop dropped unpin reply",
+                ),
+            },
             Err(_) => tracing::warn!(
                 old_cid = %hex::encode(root_old),
-                "create_folder_nested: event loop dropped unpin reply",
+                "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
             ),
-        },
-        Err(_) => tracing::warn!(
-            old_cid = %hex::encode(root_old),
-            "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
-        ),
+        }
     }
-    if had_pin {
+    if add_new {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         match verb_tx
             .send(event_loop::ContentVerbRequest::Pin {
@@ -2117,7 +2379,13 @@ async fn create_folder_nested(
         }
     }
 
-    Ok(hex::encode(prev_new_cid))
+    Ok(CreateFolderResult {
+        // Identity unchanged, but emit the canonical lowercase-hyphenated form
+        // (via SidecarId::Display) instead of echoing the caller's raw input —
+        // every other endpoint that returns a sidecar_id wire field does the same.
+        sidecar_id: parent_id.to_string(),
+        cid: hex::encode(prev_new_cid),
+    })
 }
 
 async fn read_cached_bytes(
@@ -3147,26 +3415,12 @@ mod chunked_ingest_tests {
 #[cfg(test)]
 mod pin_persistence_tests {
     use super::*;
-    use std::collections::HashSet;
-
-    fn sidecar_entry(cid: [u8; 32], pinned: bool) -> content_index::ContentIndexEntry {
-        content_index::ContentIndexEntry {
-            cid,
-            file_name: "t.txt".into(),
-            size_bytes: 0,
-            stored_at_ms: 0,
-            sensitivity: content_index::Sensitivity::Private,
-            replication_tier: content_index::ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned,
-            kind: content_index::ContentKind::Leaf,
-        }
-    }
 
     #[test]
-    fn content_item_wire_serializes_kind_field() {
+    fn content_item_wire_serializes_sidecar_id_and_kind() {
+        let id = uuid::Uuid::new_v4().as_hyphenated().to_string();
         let wire = ContentItemWire {
+            sidecar_id: id.clone(),
             cid: "aa".repeat(32),
             name: "Photos".into(),
             size_bytes: 32,
@@ -3179,37 +3433,15 @@ mod pin_persistence_tests {
             kind: "folder".into(),
         };
         let json = serde_json::to_string(&wire).expect("serialize");
-        // camelCase rename_all is already on ContentItemWire; kind is a plain field.
+        assert!(json.contains(&format!("\"sidecarId\":\"{id}\"")), "got: {json}");
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
     }
 
     #[test]
-    fn joined_pinned_true_when_only_intent_is_set() {
-        let entry = sidecar_entry([0x11; 32], true);
-        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_true_when_only_runtime_effect_is_set() {
-        let entry = sidecar_entry([0x22; 32], false);
-        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        runtime_pinned.insert([0x22; 32]);
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_true_when_both_agree() {
-        let entry = sidecar_entry([0x33; 32], true);
-        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        runtime_pinned.insert([0x33; 32]);
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_false_when_neither_says_so() {
-        let entry = sidecar_entry([0x44; 32], false);
-        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        assert!(!joined_pinned(&entry, &runtime_pinned));
+    fn parse_sidecar_id_accepts_hyphenated_uuid_rejects_garbage() {
+        let id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        assert!(parse_sidecar_id(&id).is_ok());
+        assert!(parse_sidecar_id("").is_err(), "empty rejected");
+        assert!(parse_sidecar_id("not-a-uuid").is_err(), "garbage rejected");
     }
 }

@@ -27,13 +27,21 @@ export interface ContentAnnouncementEvent {
 
 /** Wire format returned by the ingest_content Tauri command. */
 interface IngestResult {
+  sidecarId: string;
   cid: string;
   fileName: string;
   sizeBytes: number;
 }
 
+/** Wire format returned by the create_folder Tauri command. */
+export interface CreateFolderResult {
+  sidecarId: string;
+  cid: string;
+}
+
 /** Wire format for entries returned by the list_content Tauri command. */
 interface ContentItemWire {
+  sidecarId: string;
   cid: string;
   name: string;
   sizeBytes: number;
@@ -69,6 +77,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
   // client-side convenience kept for back-compat with existing
   // filter/sort predicates in FileBrowser and FileList.
   return {
+    sidecarId: wire.sidecarId,
     cid: wire.cid,
     name: wire.name,
     category: inferCategory(wire.name),
@@ -182,8 +191,15 @@ export class FileManagerService {
   getQuotaStatus(): QuotaStatus {
     const byCategory: Partial<Record<ContentCategory, number>> = {};
     let usedBytes = 0;
-
+    // ZEB-164: multiple sidecar entries can share a CID. Storage is
+    // content-addressed, so each unique CID contributes its bytes once.
+    // We pick the first-seen entry's category for byCategory tie-breaking
+    // (HashMap iteration is non-deterministic on the wire, but
+    // privateContent is locally stable for the duration of a session).
+    const seenCids = new Set<string>();
     for (const item of this.privateContent) {
+      if (seenCids.has(item.cid)) continue;
+      seenCids.add(item.cid);
       usedBytes += item.sizeBytes;
       byCategory[item.category] = (byCategory[item.category] ?? 0) + item.sizeBytes;
     }
@@ -199,10 +215,16 @@ export class FileManagerService {
    *  TODO: Re-evaluate recommendation reasons dynamically (e.g., drop 'over-replicated'
    *  after tier change) once real replication backends are wired in. */
   getCleanupRecommendations(): CleanupRecommendation[] {
-    const activeCids = new Map(this.privateContent.map((i) => [i.cid, i]));
+    // Key by sidecarId, not cid: with symlink-style sidecars, multiple entries
+    // can share a CID, so a CID-keyed Map collapses them to "whichever the
+    // iterator visited last" and would route the action to the wrong entry.
+    const activeBySidecar = new Map(this.privateContent.map((i) => [i.sidecarId, i]));
     return this.cleanupRecommendations
-      .filter((r) => activeCids.has(r.cid))
-      .map((r) => ({ ...r, sensitivity: activeCids.get(r.cid)!.sensitivity }))
+      .filter((r) => activeBySidecar.has(r.sidecarId))
+      .map((r) => ({
+        ...r,
+        sensitivity: activeBySidecar.get(r.sidecarId)!.sensitivity,
+      }))
       .sort((a, b) => b.confidence - a.confidence);
   }
 
@@ -221,47 +243,51 @@ export class FileManagerService {
     return [...mockPeers];
   }
 
-  /** Permanently removes content items and frees their quota. */
-  async burn(cids: string[]): Promise<void> {
+  /**
+   * Permanently removes content items. With ZEB-164's symlink-style sidecar,
+   * burn is "remove this entry from my list" — quota only frees on the
+   * last-reference burn (when no sibling sidecar entry references the CID).
+   */
+  async burn(sidecarIds: string[]): Promise<void> {
     if (!this.adapter) {
       // Offline-only path: still mutate local state so tests/Storybook work.
-      const cidSet = new Set(cids);
-      this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+      const idSet = new Set(sidecarIds);
+      this.privateContent = this.privateContent.filter((i) => !idSet.has(i.sidecarId));
       this.onChange?.();
       return;
     }
     const results = await Promise.allSettled(
-      cids.map((cid) => this.adapter!.invoke('burn_content', { cid })),
+      sidecarIds.map((sidecarId) => this.adapter!.invoke('burn_content', { sidecarId })),
     );
     const succeeded = new Set(
-      cids.filter((_, i) => {
+      sidecarIds.filter((_, i) => {
         const r = results[i];
         return r.status === 'fulfilled' && r.value === true;
       }),
     );
-    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
+    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.sidecarId));
     this.onChange?.();
   }
 
   /** Move content to cold storage (archive tier). Items are removed from
    *  the active file list and the backend is notified to migrate the data. */
-  async archive(cids: string[]): Promise<void> {
+  async archive(sidecarIds: string[]): Promise<void> {
     if (!this.adapter) {
-      const cidSet = new Set(cids);
-      this.privateContent = this.privateContent.filter((i) => !cidSet.has(i.cid));
+      const idSet = new Set(sidecarIds);
+      this.privateContent = this.privateContent.filter((i) => !idSet.has(i.sidecarId));
       this.onChange?.();
       return;
     }
     const results = await Promise.allSettled(
-      cids.map((cid) => this.adapter!.invoke('archive_content', { cid })),
+      sidecarIds.map((sidecarId) => this.adapter!.invoke('archive_content', { sidecarId })),
     );
     const succeeded = new Set(
-      cids.filter((_, i) => {
+      sidecarIds.filter((_, i) => {
         const r = results[i];
         return r.status === 'fulfilled' && r.value === true;
       }),
     );
-    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.cid));
+    this.privateContent = this.privateContent.filter((i) => !succeeded.has(i.sidecarId));
     this.onChange?.();
   }
 
@@ -276,48 +302,45 @@ export class FileManagerService {
   }
 
   /** Sets the pinned flag on a content item. */
-  async pin(cid: string): Promise<void> {
+  async pin(sidecarId: string): Promise<void> {
     if (!this.adapter) {
       // Offline-only path: mutate local state for Storybook/test contexts.
-      const item = this.privateContent.find((i) => i.cid === cid);
+      const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
       if (item) item.pinned = true;
       this.onChange?.();
       return;
     }
-    const ok = (await this.adapter.invoke('pin_content', { cid })) as boolean;
+    const ok = (await this.adapter.invoke('pin_content', { sidecarId })) as boolean;
     if (ok === false) {
       throw new Error('pin quota exhausted');
     }
-    const item = this.privateContent.find((i) => i.cid === cid);
+    const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
     if (item) item.pinned = true;
     this.onChange?.();
   }
 
   /** Clears the pinned flag on a content item. */
-  async unpin(cid: string): Promise<void> {
+  async unpin(sidecarId: string): Promise<void> {
     if (!this.adapter) {
-      const item = this.privateContent.find((i) => i.cid === cid);
+      const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
       if (item) item.pinned = false;
       this.onChange?.();
       return;
     }
-    await this.adapter.invoke('unpin_content', { cid });
-    const item = this.privateContent.find((i) => i.cid === cid);
+    await this.adapter.invoke('unpin_content', { sidecarId });
+    const item = this.privateContent.find((i) => i.sidecarId === sidecarId);
     if (item) item.pinned = false;
     this.onChange?.();
   }
 
   /** Updates the replication tier for specified items. */
-  async setReplicationTier(cids: string[], tier: ReplicationTier): Promise<void> {
-    // Wait for the sidecar write before publishing the change locally; if the
-    // backend rejects, callers see the rejection and the UI stays consistent
-    // with what's persisted.
+  async setReplicationTier(sidecarIds: string[], tier: ReplicationTier): Promise<void> {
     if (this.adapter) {
-      await this.adapter.invoke('set_replication_tier', { cids, tier });
+      await this.adapter.invoke('set_replication_tier', { sidecarIds, tier });
     }
-    const cidSet = new Set(cids);
+    const idSet = new Set(sidecarIds);
     for (const item of this.privateContent) {
-      if (cidSet.has(item.cid)) {
+      if (idSet.has(item.sidecarId)) {
         item.replicationTier = tier;
       }
     }
@@ -341,9 +364,13 @@ export class FileManagerService {
   async ingest(parentCid?: string | null): Promise<ContentItem | undefined> {
     if (!this.adapter) return undefined;
     const result = (await this.adapter.invoke('ingest_content')) as IngestResult;
-    // Deduplicate: if this CID already exists in private content, skip.
-    if (this.privateContent.some((i) => i.cid === result.cid)) return undefined;
+    // ZEB-164: CID-based dedupe removed — the backend mints a fresh sidecar_id
+    // on every ingest, even for duplicate-content uploads. Multiple sidecar
+    // entries per CID are expected and intentional (symlink-style semantics).
+    // Defense-in-depth against the practically-impossible UUID v4 collision:
+    if (this.privateContent.some((i) => i.sidecarId === result.sidecarId)) return undefined;
     const item: ContentItem = {
+      sidecarId: result.sidecarId,
       cid: result.cid,
       name: result.fileName,
       category: inferCategory(result.fileName),
@@ -388,27 +415,33 @@ export class FileManagerService {
   }
 
   /**
-   * Create a new folder via the backend. parentPath is empty for root
-   * creation; otherwise it's the stack of ancestor CIDs from top-level
-   * root down to immediate parent.
+   * Create a new folder via the backend.
    *
-   * Returns the new folder's CID (for root creation) or the new top-level
-   * root CID (for nested creation — the ancestor cascade changes the root).
+   * @param name              folder display name
+   * @param parentSidecarId   the top-level sidecar entry's id (root entry
+   *                          owning the cascade), or null for root creation
+   * @param parentPath        CID chain from top-level root (inclusive) down
+   *                          to the immediate parent; empty for root creation
+   *
+   * Returns `{ sidecarId, cid }`. For nested creation, `sidecarId` is the
+   * unchanged top-level entry's id; `cid` is the new top-level root CID
+   * after the ancestor cascade.
    *
    * Refetches the root listing and emits onChange. Callers navigating
    * inside a folder at the time of creation should also refetch the
    * folder contents.
    */
-  async createFolder(name: string, parentPath: string[]): Promise<string> {
+  async createFolder(
+    name: string,
+    parentSidecarId: string | null,
+    parentPath: string[],
+  ): Promise<CreateFolderResult> {
     if (!this.adapter) throw new Error('adapter not connected');
-    const newCid = (await this.adapter.invoke('create_folder', {
+    const result = (await this.adapter.invoke('create_folder', {
       name,
+      parentSidecarId,
       parentPath,
-    })) as string;
-    // Refetch is best-effort: the folder is already created on the backend
-    // by the time we get here, so a refresh failure shouldn't surface as
-    // "create failed" to the user. The next list_content call (or a manual
-    // refresh) will pick up the new entry.
+    })) as CreateFolderResult;
     try {
       await this.refetchRoot();
     } catch (err) {
@@ -417,7 +450,7 @@ export class FileManagerService {
         err,
       );
     }
-    return newCid;
+    return result;
   }
 
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */
