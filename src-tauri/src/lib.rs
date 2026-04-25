@@ -1373,30 +1373,27 @@ pub async fn list_folder(
 
 #[tauri::command]
 async fn pin_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: persist pin intent on the sidecar BEFORE the runtime verb.
-    // Durability bias — if the runtime is gone (stop_node in flight, event
-    // loop torn down) the user's click still lands on disk and is restored
-    // on next start_node. Sidecar writes are best-effort: ContentIndex::save
-    // already tracing::warn's on disk-write errors.
-    //
-    // `content_verb_tx` is cloned as Option to AVOID gating the sidecar
-    // write on runtime availability — the spec mandates sidecar-first even
-    // when we know we can't dispatch. We unwrap the Option AFTER the
-    // sidecar write so the durable side is consistent with the user's click
-    // regardless of the runtime outcome.
+    // ZEB-155 + ZEB-164: persist pin intent on the sidecar BEFORE the
+    // runtime verb. After flipping the bit, look up the entry's CID so
+    // we can dispatch Pin against it. The Pin verb is idempotent for
+    // CIDs already in pin_intent (a sibling entry pinning the same CID
+    // will have already added it).
     let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
-    {
+    let cid_bytes = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_pinned(&cid_bytes, true);
-    }
+        idx.set_pinned(&id, true);
+        idx.get(&id)
+            .ok_or_else(|| "unknown sidecar_id".to_string())?
+            .cid
+    };
 
     let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1414,23 +1411,36 @@ async fn pin_content(
 
 #[tauri::command]
 async fn unpin_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: clear sidecar intent first, then dispatch the runtime
-    // unpin. Mirror of pin_content's ordering — durable side stays
-    // consistent with the user's click even when the runtime is gone
-    // (content_verb_tx is None). See pin_content for the full rationale.
+    // ZEB-164: clear sidecar intent. Then check OR-join: if some other
+    // sidecar entry STILL pins this CID, leave runtime pin_intent alone
+    // (the bytes are still wanted). Only dispatch Unpin to the runtime
+    // when no entry references this CID with pinned=true anymore.
     let (index, maybe_verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (guard.content_index.clone(), guard.content_verb_tx.clone())
     };
-    {
+    let unpin_runtime_for: Option<[u8; 32]> = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_pinned(&cid_bytes, false);
-    }
+        idx.set_pinned(&id, false);
+        let cid = idx
+            .get(&id)
+            .ok_or_else(|| "unknown sidecar_id".to_string())?
+            .cid;
+        if idx.is_cid_pinned_by_any(&cid) {
+            None
+        } else {
+            Some(cid)
+        }
+    };
+
+    let Some(cid_bytes) = unpin_runtime_for else {
+        return Ok(true); // sidecar updated; another entry still pins
+    };
 
     let verb_tx = maybe_verb_tx.ok_or_else(|| "runtime unavailable".to_string())?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1446,22 +1456,19 @@ async fn unpin_content(
         .map_err(|_| "event loop dropped unpin request".to_string())?
 }
 
-/// Burn a CID: unpin runtime-side, then remove the sidecar entry.
-///
-/// ZEB-155: removing the sidecar entry implicitly drops any persisted
-/// pin intent — no explicit `set_pinned(false)` needed, because there's
-/// no entry left to hold a flag on. The event-loop Burn arm also clears
-/// the CID from the in-memory `pin_intent` set so the two stay in sync.
+/// Burn a sidecar entry. With ZEB-164's symlink-style sidecar, burn is
+/// "remove this entry from my list" — not "destroy the bytes everyone
+/// shares." The runtime's `Burn` verb only fires when this entry was the
+/// last reference to its CID. Otherwise we issue an `Unpin` (if the burn
+/// drops the only pinning entry) or no runtime action (if siblings still
+/// pin it).
 #[tauri::command]
 async fn burn_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
 
-    // ZEB-155: snapshot both handles under a single NodeState lock, matching
-    // pin_content / unpin_content. Fail fast if the runtime is gone — no
-    // point removing the sidecar entry if we can't also clear the cache.
     let (index, verb_tx) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let verb_tx = guard
@@ -1471,49 +1478,101 @@ async fn burn_content(
         (guard.content_index.clone(), verb_tx)
     };
 
-    // 1. Unpin in the runtime cache so W-TinyLFU can reclaim the RAM.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    verb_tx
-        .send(event_loop::ContentVerbRequest::Burn {
-            cid: cid_bytes,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())?;
-    reply_rx
-        .await
-        .map_err(|_| "event loop dropped burn request".to_string())??;
-
-    // 2. Remove the sidecar entry. `Ok(true)` iff the sidecar had the entry
-    //    (so the frontend knows whether the burn actually removed something
-    //    or was a no-op on an already-unknown CID).
-    let removed = {
+    // Three-branch decision under a single lock acquisition: read entry's
+    // CID, remove the entry, then inspect the post-state to decide which
+    // (if any) runtime verb to dispatch.
+    enum RuntimeAction {
+        Burn([u8; 32]),
+        Unpin([u8; 32]),
+        Nothing,
+    }
+    let action = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.remove(&cid_bytes)
+        let cid = match idx.get(&id) {
+            Some(e) => e.cid,
+            None => return Ok(false), // unknown sidecar_id; no-op
+        };
+        idx.remove(&id);
+        if idx.entries_for_cid(&cid).next().is_none() {
+            RuntimeAction::Burn(cid)
+        } else if !idx.is_cid_pinned_by_any(&cid) {
+            RuntimeAction::Unpin(cid)
+        } else {
+            RuntimeAction::Nothing
+        }
     };
-    Ok(removed)
+
+    match action {
+        RuntimeAction::Burn(cid) => {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            verb_tx
+                .send(event_loop::ContentVerbRequest::Burn {
+                    cid,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| "event loop not running".to_string())?;
+            reply_rx
+                .await
+                .map_err(|_| "event loop dropped burn request".to_string())??;
+        }
+        RuntimeAction::Unpin(cid) => {
+            // Sibling entries still reference this CID, but none pin it —
+            // drop runtime pin_intent so W-TinyLFU can reclaim. Best-
+            // effort: any failure here is a runtime/cache desync, not a
+            // user-visible regression (the sidecar mutation already
+            // committed). Log so the desync is diagnosable.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            match verb_tx
+                .send(event_loop::ContentVerbRequest::Unpin {
+                    cid,
+                    reply: reply_tx,
+                })
+                .await
+            {
+                Ok(()) => match reply_rx.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        err = %e,
+                        "burn_content: post-burn unpin failed; runtime may hold stale pin",
+                    ),
+                    Err(_) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        "burn_content: event loop dropped post-burn unpin reply",
+                    ),
+                },
+                Err(_) => tracing::warn!(
+                    cid = %hex::encode(cid),
+                    "burn_content: event loop closed before post-burn unpin send",
+                ),
+            }
+        }
+        RuntimeAction::Nothing => {} // siblings still pin; runtime untouched
+    }
+    Ok(true)
 }
 
 #[tauri::command]
 async fn archive_content(
-    cid: String,
+    sidecar_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let cid_bytes = parse_cid_hex(&cid)?;
+    let id = parse_sidecar_id(&sidecar_id)?;
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
     };
     let flipped = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_archived(&cid_bytes, true)
+        idx.set_archived(&id, true)
     };
     Ok(flipped)
 }
 
 #[tauri::command]
 async fn set_replication_tier(
-    cids: Vec<String>,
+    sidecar_ids: Vec<String>,
     tier: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<u32, String> {
@@ -1525,9 +1584,9 @@ async fn set_replication_tier(
         "ultra" => content_index::ReplicationTier::Ultra,
         other => return Err(format!("unknown replication tier: {other}")),
     };
-    let mut parsed_cids: Vec<[u8; 32]> = Vec::with_capacity(cids.len());
-    for c in &cids {
-        parsed_cids.push(parse_cid_hex(c)?);
+    let mut parsed_ids: Vec<content_index::SidecarId> = Vec::with_capacity(sidecar_ids.len());
+    for s in &sidecar_ids {
+        parsed_ids.push(parse_sidecar_id(s)?);
     }
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -1535,7 +1594,7 @@ async fn set_replication_tier(
     };
     let updated = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.set_replication_tier(&parsed_cids, parsed_tier)
+        idx.set_replication_tier(&parsed_ids, parsed_tier)
     };
     Ok(updated as u32)
 }
