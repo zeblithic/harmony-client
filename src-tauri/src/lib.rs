@@ -1173,7 +1173,7 @@ pub struct ContentItemWire {
     pub size_bytes: u64,
     pub stored_at: u64,           // ms since epoch
     pub sensitivity: String,      // "private" | "confidential" | "public"
-    pub replication_tier: String, // "minimal" | "default" | "durable"
+    pub replication_tier: String, // "expendable" | "light" | "default" | "high" | "ultra"
     pub pinned: bool,
     pub licensed: bool,
     pub archived: bool,
@@ -1350,27 +1350,7 @@ pub async fn list_folder(
         .ok_or_else(|| "manifest book not in cache".to_string())?;
 
     let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
-
-    // Consistency check: manifest entry CIDs must match bundle child-1..N.
-    let bundle_children_after_manifest: Vec<[u8; 32]> = child_cids
-        .iter()
-        .skip(1)
-        .copied()
-        .collect();
-    if manifest.folder_manifest.entries.len() != bundle_children_after_manifest.len() {
-        return Err(format!(
-            "manifest/bundle mismatch: manifest has {} entries, bundle has {} children after manifest",
-            manifest.folder_manifest.entries.len(),
-            bundle_children_after_manifest.len()
-        ));
-    }
-    for (i, entry) in manifest.folder_manifest.entries.iter().enumerate() {
-        if entry.cid != bundle_children_after_manifest[i] {
-            return Err(format!(
-                "manifest/bundle cid mismatch at index {i}",
-            ));
-        }
-    }
+    crate::folders::validate_manifest_matches_bundle(&manifest, &child_cids)?;
 
     // Synthesize wire rows. Nested items have no sidecar: size_bytes/stored_at
     // are unavailable (reported 0), sensitivity/replication_tier default,
@@ -1813,49 +1793,36 @@ async fn create_folder_at_root(
     name: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<String, String> {
-    // Build the (empty) manifest + bundle.
+    // Build the (empty) manifest + bundle locally. No runtime state
+    // mutated yet — we can still bail cleanly on collision.
     let built = folders::build_folder(&name, &[])?;
 
-    // Ingest manifest book + bundle through the event loop.
-    let ingest_tx = {
+    // Snapshot handles up-front so a collision check can fail fast without
+    // touching the ingest channel.
+    let (ingest_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
     };
-
-    send_ingest(
-        &ingest_tx,
-        hex::encode(built.manifest_cid.to_bytes()),
-        built.manifest_bytes,
-    )
-    .await?;
     let bundle_size = built.bundle_bytes.len() as u64;
-    send_ingest(
-        &ingest_tx,
-        hex::encode(built.bundle_cid.to_bytes()),
-        built.bundle_bytes,
-    )
-    .await?;
-
-    // Insert sidecar entry for the top-level root.
-    let index = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
-    };
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+
     // ZEB-158 slice 1 corner case: every empty folder produces the same
     // bundle CID (the manifest is byte-identical: {"folder_manifest":
     // {"version":1,"entries":[]}}). Under the current CID-keyed sidecar,
-    // a second empty folder collides with the first. Rather than silently
-    // fail, surface a specific error so the user can either rename the
-    // existing folder or add content to differentiate the new one. The
-    // architectural fix (sidecar entries keyed by an opaque id so multiple
-    // entries can share a CID, symlink-style) is tracked separately.
+    // a second empty folder collides with the first. We reserve the
+    // sidecar slot FIRST so a collision bails out without publishing
+    // orphan manifest/bundle bytes to the runtime. The architectural fix
+    // (sidecar entries keyed by an opaque id so multiple entries can share
+    // a CID, symlink-style) is tracked separately.
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
@@ -1878,6 +1845,23 @@ async fn create_folder_at_root(
             );
         }
     }
+
+    // Slot reserved — now publish the bytes. If either ingest fails the
+    // sidecar is left pointing to a CID whose bytes aren't fully resident;
+    // that's the same failure mode as create_folder_nested and is
+    // recoverable on next fetch via ZEB-155's fetch-completion hook.
+    send_ingest(
+        &ingest_tx,
+        hex::encode(built.manifest_cid.to_bytes()),
+        built.manifest_bytes,
+    )
+    .await?;
+    send_ingest(
+        &ingest_tx,
+        hex::encode(built.bundle_cid.to_bytes()),
+        built.bundle_bytes,
+    )
+    .await?;
 
     Ok(hex::encode(built.bundle_cid.to_bytes()))
 }
@@ -1956,12 +1940,16 @@ async fn create_folder_nested(
                     hex::encode(anc_cid)
                 )
             })?;
-        let anc_children = parse_bundle(&anc_bundle)
+        let anc_child_ids = parse_bundle(&anc_bundle)
             .map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
-        let manifest_cid = anc_children
+        let manifest_cid = anc_child_ids
             .first()
             .copied()
             .ok_or_else(|| "ancestor bundle has no children".to_string())?;
+        // Collect bundle children as raw [u8; 32] for the manifest/bundle
+        // consistency check below.
+        let anc_children: Vec<[u8; 32]> =
+            anc_child_ids.iter().map(|c| c.to_bytes()).collect();
 
         // Read the ancestor's manifest book (read-only).
         let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
@@ -1969,6 +1957,11 @@ async fn create_folder_nested(
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
         let mut manifest = folders::parse_manifest(&manifest_bytes)
             .map_err(|e| format!("ancestor {e}"))?;
+        // Defend against a malformed ancestor rewriting the tree with
+        // phantom children: refuse to mutate unless manifest entries and
+        // bundle child slots agree.
+        folders::validate_manifest_matches_bundle(&manifest, &anc_children)
+            .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
 
         if is_deepest {
             manifest

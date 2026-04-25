@@ -101,6 +101,36 @@ pub fn build_folder(
     })
 }
 
+/// Validate that a parsed manifest is consistent with the bundle's child
+/// layout. `bundle_children[0]` is the manifest book itself;
+/// `bundle_children[1..]` must match `manifest.folder_manifest.entries[i].cid`
+/// position-for-position. Any parse site that intends to READ the entry list
+/// for surfacing to users, or REWRITE it for an ancestor cascade, must run
+/// this check first — otherwise a malformed ancestor could let an edit
+/// silently drop or invent children.
+pub fn validate_manifest_matches_bundle(
+    manifest: &FolderManifest,
+    bundle_children: &[[u8; 32]],
+) -> Result<(), String> {
+    if bundle_children.is_empty() {
+        return Err("folder bundle has no children (manifest missing)".to_string());
+    }
+    let children_after_manifest = &bundle_children[1..];
+    if manifest.folder_manifest.entries.len() != children_after_manifest.len() {
+        return Err(format!(
+            "manifest/bundle mismatch: manifest has {} entries, bundle has {} children after manifest",
+            manifest.folder_manifest.entries.len(),
+            children_after_manifest.len()
+        ));
+    }
+    for (i, entry) in manifest.folder_manifest.entries.iter().enumerate() {
+        if entry.cid != children_after_manifest[i] {
+            return Err(format!("manifest/bundle cid mismatch at index {i}"));
+        }
+    }
+    Ok(())
+}
+
 /// Deserialize a folder manifest from bytes and reject unsupported versions.
 /// This is the ONLY approved entry point into `FolderManifest` from raw
 /// wire/cache bytes — direct `serde_json::from_slice::<FolderManifest>(...)`
@@ -248,5 +278,81 @@ mod tests {
     fn parse_manifest_rejects_malformed_bytes() {
         let err = parse_manifest(b"not json").expect_err("garbage must be rejected");
         assert!(err.starts_with("manifest parse:"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_manifest_matches_bundle_accepts_consistent() {
+        let entries = vec![
+            ManifestEntry {
+                cid: [0x11; 32],
+                name: "a".into(),
+                kind: ContentKind::Leaf,
+            },
+            ManifestEntry {
+                cid: [0x22; 32],
+                name: "b".into(),
+                kind: ContentKind::Folder,
+            },
+        ];
+        let manifest = FolderManifest {
+            folder_manifest: ManifestBody {
+                version: 1,
+                entries: entries.clone(),
+            },
+        };
+        // Bundle layout: [manifest_placeholder, child_1, child_2]
+        let bundle_children = vec![[0xFF; 32], [0x11; 32], [0x22; 32]];
+        validate_manifest_matches_bundle(&manifest, &bundle_children).expect("consistent");
+    }
+
+    #[test]
+    fn validate_manifest_matches_bundle_rejects_length_mismatch() {
+        let manifest = FolderManifest {
+            folder_manifest: ManifestBody {
+                version: 1,
+                entries: vec![ManifestEntry {
+                    cid: [0x11; 32],
+                    name: "a".into(),
+                    kind: ContentKind::Leaf,
+                }],
+            },
+        };
+        // Manifest claims 1 entry, bundle has 2 children after the manifest slot.
+        let bundle_children = vec![[0xFF; 32], [0x11; 32], [0x22; 32]];
+        let err = validate_manifest_matches_bundle(&manifest, &bundle_children)
+            .expect_err("length mismatch must be rejected");
+        assert!(err.contains("manifest has 1 entries, bundle has 2"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_manifest_matches_bundle_rejects_cid_mismatch() {
+        let manifest = FolderManifest {
+            folder_manifest: ManifestBody {
+                version: 1,
+                entries: vec![ManifestEntry {
+                    cid: [0x11; 32],
+                    name: "a".into(),
+                    kind: ContentKind::Leaf,
+                }],
+            },
+        };
+        // Bundle's child after manifest is [0x22], but manifest says [0x11].
+        let bundle_children = vec![[0xFF; 32], [0x22; 32]];
+        let err = validate_manifest_matches_bundle(&manifest, &bundle_children)
+            .expect_err("cid mismatch must be rejected");
+        assert!(err.contains("cid mismatch at index 0"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_manifest_matches_bundle_rejects_empty_bundle() {
+        let manifest = FolderManifest {
+            folder_manifest: ManifestBody {
+                version: 1,
+                entries: vec![],
+            },
+        };
+        let err = validate_manifest_matches_bundle(&manifest, &[])
+            .expect_err("empty bundle must be rejected");
+        assert!(err.contains("no children"), "got: {err}");
     }
 }

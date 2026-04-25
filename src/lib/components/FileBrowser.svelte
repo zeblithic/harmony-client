@@ -139,14 +139,28 @@
       folderItems = null;
       lastFetchedCid = cid;
     }
-    service.listFolderContents(cid).then((result) => {
-      // Guards: still in the same folder AND this is the newest fetch.
-      // Without the seq check an older resolution could overwrite a newer
-      // snapshot after a rapid mutation burst.
-      if (currentFolderCid === cid && mySeq === folderFetchSeq) {
-        folderItems = result;
-      }
-    });
+    service
+      .listFolderContents(cid)
+      .then((result) => {
+        // Guards: still in the same folder AND this is the newest fetch.
+        // Without the seq check an older resolution could overwrite a newer
+        // snapshot after a rapid mutation burst.
+        if (currentFolderCid === cid && mySeq === folderFetchSeq) {
+          folderItems = result;
+        }
+      })
+      .catch((err) => {
+        // The service no longer swallows backend errors (malformed manifest,
+        // consistency-check failures, event-loop drop). Surface them to the
+        // user so a corrupted folder doesn't look indistinguishable from an
+        // empty one, and clear the list so stale contents don't mislead.
+        if (currentFolderCid === cid && mySeq === folderFetchSeq) {
+          folderItems = [];
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('listFolderContents failed:', err);
+        window.alert(`Could not load folder: ${msg}`);
+      });
   });
 
   let publishedItems = $derived.by(() => {
@@ -274,7 +288,9 @@
     {onSearchChange}
     {onUploadClick}
     {onCleanupClick}
-    onNewFolderClick={handleNewFolder}
+    onNewFolderClick={section === 'private' && !showCleanup
+      ? handleNewFolder
+      : undefined}
     {showCleanup}
     {section}
     {onSectionChange}
