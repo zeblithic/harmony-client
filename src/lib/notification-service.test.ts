@@ -1,12 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { NotificationService } from './notification-service';
-import type { NotificationPolicy, Profile } from './types';
-
-const DEFAULT_POLICY: NotificationPolicy = {
-  quiet: 'dot_only',
-  standard: 'sound',
-  loud: 'break_dnd',
-};
+import type { Profile } from './types';
 
 describe('NotificationService', () => {
   it('returns global defaults when no overrides exist', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ZenohService, type TauriAdapter, type DiscoveredNode } from './zenoh-service';
+import { ZenohService, type TauriAdapter } from './zenoh-service';
 
 function mockAdapter(): TauriAdapter & { handlers: Record<string, (e: { payload: unknown }) => void> } {
   const handlers: Record<string, (e: { payload: unknown }) => void> = {};

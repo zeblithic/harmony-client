@@ -41,7 +41,7 @@ export function nibbleExpressMatch(
 export function failingNibbleInRedByte(
   expectedByte: number,
   heardHigh: number,
-  heardLow: number,
+  _heardLow: number,
   mode: ExpressMode,
 ): 0 | 1 {
   const expHigh = (expectedByte >> 4) & 0xf;

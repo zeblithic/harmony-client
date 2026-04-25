@@ -1,16 +1,7 @@
 // src/lib/flashcard-types.test.ts
 import { describe, it, expect } from 'vitest';
 import type { AppMode } from './types';
-import {
-  type FlashcardLevel,
-  type ByteResult,
-  type RowState,
-  type SessionStats,
-  type Challenge,
-  LEVELS,
-  LEVEL_NAMES,
-  initialSessionStats,
-} from './flashcard-types';
+import { LEVELS, LEVEL_NAMES, initialSessionStats } from './flashcard-types';
 
 describe('flashcard-types', () => {
   it('AppMode includes spellbook', () => {

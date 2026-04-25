@@ -1,4 +1,4 @@
-import type { Peer, Profile, Message, NavNode, VineVideo } from './types';
+import type { Profile, Message, NavNode, VineVideo } from './types';
 
 export const peers: Profile[] = [
   { address: 'a1b2c3d4', displayName: 'Alice', statusText: 'Working on transport layer' },

@@ -61,7 +61,10 @@ export function linkDashPattern(transportType: TransportType): number[] {
     case 'rawlink': return [4, 8];
     case 's3': return [1, 3];
     default: {
+      // Exhaustiveness check: if a new TransportType is added without
+      // a matching case, this `never` binding becomes ill-typed.
       const _exhaustive: never = transportType;
+      void _exhaustive;
       return [];
     }
   }
