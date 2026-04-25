@@ -1581,14 +1581,25 @@ async fn burn_content(
     }
     let action = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let cid = match idx.get(&id) {
-            Some(e) => e.cid,
+        // Snapshot the burned entry's pinned bit before removing — we
+        // need it to decide whether the runtime pin_intent had this CID
+        // at all. If the burned entry wasn't pinning, then runtime
+        // pin_intent state is independent of any sibling (the OR-join
+        // is unchanged by removing a contributor that wasn't asserting).
+        let (cid, was_pinned) = match idx.get(&id) {
+            Some(e) => (e.cid, e.pinned),
             None => return Ok(false), // unknown sidecar_id; no-op
         };
         idx.remove(&id);
         if idx.entries_for_cid(&cid).next().is_none() {
             RuntimeAction::Burn(cid)
-        } else if !idx.is_cid_pinned_by_any(&cid) {
+        } else if was_pinned && !idx.is_cid_pinned_by_any(&cid) {
+            // The burned entry was the last pinning reference; drop
+            // runtime pin_intent. Without the was_pinned guard, an
+            // unpinned-entry burn whose siblings are also unpinned
+            // would dispatch a spurious Unpin (no-op at the cache
+            // layer, but generates misleading "post-burn unpin failed"
+            // warnings if the runtime path errors).
             RuntimeAction::Unpin(cid)
         } else {
             RuntimeAction::Nothing
@@ -1912,15 +1923,20 @@ async fn ingest_content(
         if !inserted {
             // Effectively impossible (UUID v4 collision); kept as a
             // sanity guard against future SidecarId construction bugs.
-            // Pre-ZEB-164 this branch caught duplicate-CID re-uploads
-            // and silently deduped; under the new symlink model, two
-            // ingests of the same content produce two distinct
-            // sidecar entries (same CID, different sidecar_ids).
-            tracing::warn!(
+            // Pre-ZEB-164 this branch silently deduped duplicate-CID
+            // re-uploads; under the symlink model, two ingests of the
+            // same content produce two distinct sidecar entries, so
+            // !inserted here means the freshly-minted sidecar_id was
+            // already in use. Fail loudly so the caller doesn't get a
+            // phantom IngestResult whose sidecar_id list_content/pin/
+            // burn/archive will all reject as unknown — mirrors
+            // create_folder_at_root's symmetric guard.
+            tracing::error!(
                 sidecar_id = %sidecar_id,
                 file_name = %file_name,
-                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); entry not inserted",
+                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
             );
+            return Err("sidecar_id collision".into());
         }
     }
 
@@ -2229,14 +2245,33 @@ async fn create_folder_nested(
         prev_new_cid = rebuilt_bundle_cid.to_bytes();
     }
 
-    // 3. Rekey the top-level sidecar entry FIRST. With ZEB-164 the
-    // CID-collision branch is gone — multiple entries sharing a CID is
-    // legal. Only OldMissing remains.
+    // 3. Drain the deferred ingests BEFORE rekeying. Earlier this was
+    // ordered rekey-then-ingest to avoid leaving orphan bytes in the
+    // runtime cache (and being announced over Zenoh) if rekey hit
+    // OldMissing — but that ordering had a strictly worse failure
+    // mode: a send_ingest failure after a successful rekey would leave
+    // the sidecar pointing at a chain whose bytes are missing,
+    // rendering the user's folder unreadable until manual burn.
+    //
+    // Reversed: an ingest failure now leaves the sidecar pointing at
+    // the original root_old (intact). Bytes ingested before the
+    // failure become orphans, but W-TinyLFU evicts them under cache
+    // pressure since nothing pins them — recoverable, vs. data-loss
+    // for the user. ZEB-167 still tracks the rekey-rollback path for
+    // the residual rekey-OldMissing case (would leave orphans without
+    // user-visible damage).
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // 4. Rekey the top-level sidecar entry. With ZEB-164 the
+    // CID-collision branch is gone — multiple entries sharing a CID is
+    // legal. Only OldMissing remains.
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         match idx.rekey(&parent_id, prev_new_cid, new_bundle_size, stored_at_ms) {
@@ -2247,12 +2282,6 @@ async fn create_folder_nested(
                 );
             }
         }
-    }
-
-    // 4. Drain the deferred ingests now that the sidecar is committed.
-    // ZEB-167 tracks proper rekey-rollback for ingest failures.
-    for (cid_hex, bytes) in pending_ingests {
-        send_ingest(&ingest_tx, cid_hex, bytes).await?;
     }
 
     // 5. Maintain the runtime pin_intent OR-join invariant for both
