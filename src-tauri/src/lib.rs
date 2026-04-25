@@ -1164,10 +1164,17 @@ pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<Cont
 /// Wire format returned by `list_content` — one entry per self-ingested
 /// file the client is aware of. Joins sidecar metadata with the runtime
 /// cache's pinned state snapshot. ZEB-158 slice 1 adds `kind` to
-/// distinguish leaf files from folder bundles.
+/// distinguish leaf files from folder bundles. ZEB-164 adds `sidecarId`
+/// (the wire-stable handle for pin/burn/archive operations); empty for
+/// manifest-derived rows where no sidecar entry exists.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentItemWire {
+    /// ZEB-164: opaque per-entry stable handle. Empty string for
+    /// manifest-derived rows (children inside a folder bundle that have
+    /// no sidecar entry of their own). Frontend gates pin/burn/archive
+    /// buttons on this being non-empty.
+    pub sidecar_id: String,
     pub cid: String,              // hex
     pub name: String,
     pub size_bytes: u64,
@@ -1211,6 +1218,14 @@ fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "cid must be 32 bytes".to_string())
 }
 
+fn parse_sidecar_id(s: &str) -> Result<content_index::SidecarId, String> {
+    if s.is_empty() {
+        return Err("sidecar_id is empty (manifest-derived row?)".into());
+    }
+    content_index::SidecarId::parse_str(s)
+        .map_err(|e| format!("invalid sidecar_id: {e}"))
+}
+
 /// Result returned to the frontend after a successful file ingest.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1218,17 +1233,6 @@ pub struct IngestResult {
     pub cid: String,
     pub file_name: String,
     pub size_bytes: u64,
-}
-
-/// ZEB-155: resolve the `pinned` flag for a single wire entry by
-/// OR-joining the sidecar's persisted intent with the runtime cache's
-/// currently-pinned set. Extracted so unit tests can exercise the join
-/// logic without a live Tauri state.
-fn joined_pinned(
-    entry: &content_index::ContentIndexEntry,
-    runtime_pinned: &std::collections::HashSet<[u8; 32]>,
-) -> bool {
-    entry.pinned || runtime_pinned.contains(&entry.cid)
 }
 
 #[tauri::command]
@@ -1263,6 +1267,13 @@ pub(crate) fn list_root(
     state: tauri::State<'_, Mutex<NodeState>>,
     pinned_set: &std::collections::HashSet<[u8; 32]>,
 ) -> Result<Vec<ContentItemWire>, String> {
+    // pinned_set is kept in the signature for interface stability with
+    // list_folder (which still consults it for manifest-derived rows).
+    // Top-level rows expose entry.pinned directly — every command that
+    // touches pin state maintains the runtime pin_intent OR-join, so the
+    // sidecar's own flag is the authoritative per-row signal.
+    let _ = pinned_set;
+
     let index = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard.content_index.clone()
@@ -1271,13 +1282,14 @@ pub(crate) fn list_root(
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         idx.entries()
             .map(|e| ContentItemWire {
+                sidecar_id: e.sidecar_id.to_string(),
                 cid: hex::encode(e.cid),
                 name: e.file_name.clone(),
                 size_bytes: e.size_bytes,
                 stored_at: e.stored_at_ms,
                 sensitivity: sensitivity_wire(e.sensitivity).to_string(),
                 replication_tier: replication_tier_wire(e.replication_tier).to_string(),
-                pinned: joined_pinned(e, pinned_set),
+                pinned: e.pinned,
                 licensed: e.licensed,
                 archived: e.archived,
                 kind: kind_wire(e.kind).to_string(),
@@ -1332,14 +1344,19 @@ pub async fn list_folder(
     let manifest = crate::folders::parse_manifest(&manifest_bytes)?;
     crate::folders::validate_manifest_matches_bundle(&manifest, &child_cids)?;
 
-    // Synthesize wire rows. Nested items have no sidecar: size_bytes/stored_at
-    // are unavailable (reported 0), sensitivity/replication_tier default,
-    // licensed/archived false. Pinned joins the runtime's pinned_set.
+    // Synthesize wire rows. Nested items have no sidecar: sidecar_id is
+    // the empty-string sentinel ("frontend: no mutations apply"); size_bytes
+    // /stored_at default to 0; sensitivity/replication_tier default;
+    // licensed/archived false. For manifest-derived rows we DO consult the
+    // runtime pinned set — those rows have no sidecar.pinned to read, and
+    // a CID currently held in cache via some other entry's pin_intent is
+    // the only signal of "this content is sticking around right now".
     Ok(manifest
         .folder_manifest
         .entries
         .into_iter()
         .map(|e| ContentItemWire {
+            sidecar_id: String::new(),
             cid: hex::encode(e.cid),
             name: e.name,
             size_bytes: 0,
@@ -3147,26 +3164,12 @@ mod chunked_ingest_tests {
 #[cfg(test)]
 mod pin_persistence_tests {
     use super::*;
-    use std::collections::HashSet;
-
-    fn sidecar_entry(cid: [u8; 32], pinned: bool) -> content_index::ContentIndexEntry {
-        content_index::ContentIndexEntry {
-            cid,
-            file_name: "t.txt".into(),
-            size_bytes: 0,
-            stored_at_ms: 0,
-            sensitivity: content_index::Sensitivity::Private,
-            replication_tier: content_index::ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned,
-            kind: content_index::ContentKind::Leaf,
-        }
-    }
 
     #[test]
-    fn content_item_wire_serializes_kind_field() {
+    fn content_item_wire_serializes_sidecar_id_and_kind() {
+        let id = uuid::Uuid::new_v4().as_hyphenated().to_string();
         let wire = ContentItemWire {
+            sidecar_id: id.clone(),
             cid: "aa".repeat(32),
             name: "Photos".into(),
             size_bytes: 32,
@@ -3179,37 +3182,15 @@ mod pin_persistence_tests {
             kind: "folder".into(),
         };
         let json = serde_json::to_string(&wire).expect("serialize");
-        // camelCase rename_all is already on ContentItemWire; kind is a plain field.
+        assert!(json.contains(&format!("\"sidecarId\":\"{id}\"")), "got: {json}");
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
     }
 
     #[test]
-    fn joined_pinned_true_when_only_intent_is_set() {
-        let entry = sidecar_entry([0x11; 32], true);
-        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_true_when_only_runtime_effect_is_set() {
-        let entry = sidecar_entry([0x22; 32], false);
-        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        runtime_pinned.insert([0x22; 32]);
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_true_when_both_agree() {
-        let entry = sidecar_entry([0x33; 32], true);
-        let mut runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        runtime_pinned.insert([0x33; 32]);
-        assert!(joined_pinned(&entry, &runtime_pinned));
-    }
-
-    #[test]
-    fn joined_pinned_false_when_neither_says_so() {
-        let entry = sidecar_entry([0x44; 32], false);
-        let runtime_pinned: HashSet<[u8; 32]> = HashSet::new();
-        assert!(!joined_pinned(&entry, &runtime_pinned));
+    fn parse_sidecar_id_accepts_hyphenated_uuid_rejects_garbage() {
+        let id = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        assert!(parse_sidecar_id(&id).is_ok());
+        assert!(parse_sidecar_id("").is_err(), "empty rejected");
+        assert!(parse_sidecar_id("not-a-uuid").is_err(), "garbage rejected");
     }
 }
