@@ -2,18 +2,12 @@ import { describe, it, expect } from 'vitest';
 import type {
   AppMode,
   ReplicationTier,
-  ContentSensitivity,
-  FileViewMode,
-  ContentSection,
-  PublishMode,
   ContentItem,
   ContentDetail,
   QuotaStatus,
   CleanupRecommendation,
-  CleanupReason,
   StorageBuddy,
   PublishedItem,
-  FileManagerSettings,
 } from './types';
 
 describe('File manager types', () => {
@@ -87,9 +81,11 @@ describe('File manager types', () => {
 
   it('CleanupRecommendation has action-relevant fields', () => {
     const rec: CleanupRecommendation = {
+      sidecarId: 'sidecar-abc',
       cid: 'abc123',
       name: 'old-doc.txt',
       category: 'text',
+      sensitivity: 'private',
       sizeBytes: 50_000,
       reason: 'stale',
       stalenessScore: 0.87,
