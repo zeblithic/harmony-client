@@ -1816,11 +1816,16 @@ async fn ingest_content(
             kind: content_index::ContentKind::Leaf,
         });
         if !inserted {
-            tracing::debug!(
-                cid = %hex::encode(root_cid_bytes),
+            // Effectively impossible (UUID v4 collision); kept as a
+            // sanity guard against future SidecarId construction bugs.
+            // Pre-ZEB-164 this branch caught duplicate-CID re-uploads
+            // and silently deduped; under the new symlink model, two
+            // ingests of the same content produce two distinct
+            // sidecar entries (same CID, different sidecar_ids).
+            tracing::warn!(
+                sidecar_id = %sidecar_id,
                 file_name = %file_name,
-                "ingest_content: duplicate CID; sidecar entry unchanged \
-                 (file_name/stored_at_ms retain their original values)"
+                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); entry not inserted",
             );
         }
     }
@@ -2019,6 +2024,16 @@ async fn create_folder_nested(
             ));
         }
     }
+
+    // NOTE on concurrency: this verification + the rekey at step 3 are
+    // not atomic. Between them we yield across multiple await points
+    // (read_cached_bytes per ancestor). A concurrent create_folder_nested
+    // on the same parent_sidecar_id would rekey under us; the
+    // OldMissing-only guard at step 3 catches the case where the entry
+    // is removed but not the case where it is rekeyed to a different
+    // CID. The UI serialises per-folder mutations, so this race is not
+    // observable in practice; a backend-enforced optimistic lock (CAS
+    // rekey) is deferred to ZEB-162 or a follow-on.
 
     // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so
     // that a downstream OldMissing during rekey doesn't leave orphan
