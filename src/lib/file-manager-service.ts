@@ -27,6 +27,7 @@ export interface ContentAnnouncementEvent {
 
 /** Wire format returned by the ingest_content Tauri command. */
 interface IngestResult {
+  sidecarId: string;
   cid: string;
   fileName: string;
   sizeBytes: number;
@@ -349,7 +350,7 @@ export class FileManagerService {
     // Deduplicate: if this CID already exists in private content, skip.
     if (this.privateContent.some((i) => i.cid === result.cid)) return undefined;
     const item: ContentItem = {
-      sidecarId: '',
+      sidecarId: result.sidecarId,
       cid: result.cid,
       name: result.fileName,
       category: inferCategory(result.fileName),

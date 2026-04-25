@@ -1236,6 +1236,7 @@ fn parse_sidecar_id(s: &str) -> Result<content_index::SidecarId, String> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IngestResult {
+    pub sidecar_id: String,
     pub cid: String,
     pub file_name: String,
     pub size_bytes: u64,
@@ -1805,9 +1806,9 @@ async fn ingest_content(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let sidecar_id = content_index::SidecarId::new();
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let sidecar_id = content_index::SidecarId::new();
         let inserted = idx.insert(content_index::ContentIndexEntry {
             sidecar_id,
             cid: root_cid_bytes,
@@ -1837,6 +1838,7 @@ async fn ingest_content(
     }
 
     Ok(IngestResult {
+        sidecar_id: sidecar_id.to_string(),
         cid: hex::encode(root_cid_bytes),
         file_name,
         size_bytes,
