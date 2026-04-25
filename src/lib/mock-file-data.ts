@@ -244,6 +244,7 @@ export const mockPublishedContent: PublishedItem[] = [
 
 export const mockCleanupRecommendations: CleanupRecommendation[] = [
   {
+    sidecarId: 'mock-sidecar-7',
     cid: 'cid-training-data',
     name: 'sensor-readings.parquet',
     category: 'dataset',
@@ -255,6 +256,7 @@ export const mockCleanupRecommendations: CleanupRecommendation[] = [
     confidence: 0.92,
   },
   {
+    sidecarId: 'mock-sidecar-5',
     cid: 'cid-video-lecture',
     name: 'distributed-systems-lecture.mp4',
     category: 'video',
@@ -266,6 +268,7 @@ export const mockCleanupRecommendations: CleanupRecommendation[] = [
     confidence: 0.78,
   },
   {
+    sidecarId: 'mock-sidecar-9',
     cid: 'cid-family-photo',
     name: 'family-reunion-2025.jpg',
     category: 'image',

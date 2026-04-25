@@ -18,61 +18,72 @@
   }: {
     quota: QuotaStatus;
     recommendations: CleanupRecommendation[];
-    onAction: (cid: string, action: CleanupAction) => void;
-    onBulkBurn: (cids: string[]) => void;
-    onBulkArchive: (cids: string[]) => void;
+    onAction: (rec: CleanupRecommendation, action: CleanupAction) => void;
+    onBulkBurn: (recs: CleanupRecommendation[]) => void;
+    onBulkArchive: (recs: CleanupRecommendation[]) => void;
     onBulkRelease: (cids: string[]) => void;
     onBulkPublish: (cids: string[]) => void;
   } = $props();
 
-  let selectedCids = $state<Set<string>>(new Set());
+  // ZEB-164: selection keyed by sidecarId for unambiguous row identity.
+  // Recommendations that share a CID would be non-deterministic if keyed by CID.
+  let selectedSidecarIds = $state<Set<string>>(new Set());
 
-  // Prune selectedCids when recommendations change (e.g., after burning an item)
-  let validSelectedCids = $derived.by(() => {
-    const recCids = new Set(recommendations.map(r => r.cid));
+  // Prune selectedSidecarIds when recommendations change (e.g., after burning an item)
+  let validSelectedSidecarIds = $derived.by(() => {
+    const recSidecarIds = new Set(recommendations.map(r => r.sidecarId));
     const pruned = new Set<string>();
-    for (const cid of selectedCids) {
-      if (recCids.has(cid)) pruned.add(cid);
+    for (const id of selectedSidecarIds) {
+      if (recSidecarIds.has(id)) pruned.add(id);
     }
     return pruned;
   });
 
+  // Keep cid-keyed set for backward compat with consumers that still need cids
+  // (release/publish are content-addressed operations).
+  let validSelectedCids = $derived.by(() => {
+    const validRecs = recommendations.filter(r => validSelectedSidecarIds.has(r.sidecarId));
+    return new Set(validRecs.map(r => r.cid));
+  });
+
   let allSelected = $derived(
-    recommendations.length > 0 && validSelectedCids.size === recommendations.length
+    recommendations.length > 0 && validSelectedSidecarIds.size === recommendations.length
   );
 
-  let selectedCount = $derived(validSelectedCids.size);
+  let selectedCount = $derived(validSelectedSidecarIds.size);
 
   let totalRecoverable = $derived.by(() => {
     let total = 0;
     for (const rec of recommendations) {
-      if (validSelectedCids.has(rec.cid)) {
+      if (validSelectedSidecarIds.has(rec.sidecarId)) {
         total += rec.spaceRecoverable;
       }
     }
     return total;
   });
 
-  let selectedCidsArray = $derived(
-    recommendations.filter(r => validSelectedCids.has(r.cid)).map(r => r.cid)
+  let selectedRecsArray = $derived(
+    recommendations.filter(r => validSelectedSidecarIds.has(r.sidecarId))
   );
+
+  let selectedCidsArray = $derived(selectedRecsArray.map(r => r.cid));
 
   function toggleSelectAll() {
     if (allSelected) {
-      selectedCids = new Set();
+      selectedSidecarIds = new Set();
     } else {
-      selectedCids = new Set(recommendations.map(r => r.cid));
+      selectedSidecarIds = new Set(recommendations.map(r => r.sidecarId));
     }
   }
 
-  function toggleItem(cid: string) {
-    const next = new Set(selectedCids);
-    if (next.has(cid)) {
-      next.delete(cid);
+  function toggleItem(sidecarId: string) {
+    const next = new Set(selectedSidecarIds);
+    if (next.has(sidecarId)) {
+      next.delete(sidecarId);
     } else {
-      next.add(cid);
+      next.add(sidecarId);
     }
-    selectedCids = next;
+    selectedSidecarIds = next;
   }
 
   let itemWord = $derived(selectedCount === 1 ? 'item' : 'items');
@@ -84,12 +95,12 @@
 
   function confirmBulkBurn() {
     showBulkBurnConfirm = false;
-    onBulkBurn(selectedCidsArray);
+    onBulkBurn(selectedRecsArray);
   }
 
   function confirmBulkArchive() {
     showBulkArchiveConfirm = false;
-    onBulkArchive(selectedCidsArray);
+    onBulkArchive(selectedRecsArray);
   }
 
   function confirmBulkRelease() {
@@ -140,13 +151,13 @@
       <p class="empty-message">No cleanup recommendations — your storage looks good.</p>
     {:else}
       <div class="recommendations-list" role="list">
-        {#each recommendations as rec (rec.cid)}
+        {#each recommendations as rec (rec.sidecarId || rec.cid)}
           <div role="listitem">
             <RecommendationCard
               recommendation={rec}
-              checked={validSelectedCids.has(rec.cid)}
+              checked={validSelectedSidecarIds.has(rec.sidecarId)}
               {onAction}
-              onToggle={toggleItem}
+              onToggle={(sidecarId) => toggleItem(sidecarId)}
             />
           </div>
         {/each}

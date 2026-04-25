@@ -5,11 +5,13 @@
   let {
     items,
     selectedCid,
+    selectedSidecarId = null,
     onItemClick,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
-    onItemClick: (cid: string) => void;
+    selectedSidecarId?: string | null;
+    onItemClick: (item: ContentItem) => void;
   } = $props();
 </script>
 
@@ -24,7 +26,7 @@
     <span class="header-sensitivity" aria-hidden="true"></span>
   </div>
   {#each items as item (item.sidecarId || item.cid)}
-    <FileRow {item} onClick={onItemClick} selected={selectedCid === item.cid} />
+    <FileRow {item} onClick={onItemClick} selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid} />
   {/each}
 </div>
 

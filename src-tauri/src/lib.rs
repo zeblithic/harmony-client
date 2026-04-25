@@ -1543,17 +1543,36 @@ async fn burn_content(
 
     match action {
         RuntimeAction::Burn(cid) => {
+            // Sidecar mutation already committed — runtime Burn is best-
+            // effort. If the event loop is gone, bytes may survive until
+            // W-TinyLFU evicts them or a future reconciliation pass runs.
+            // Log so the desync is diagnosable. Matches the unpin /
+            // post-burn-Unpin pattern.
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            verb_tx
+            match verb_tx
                 .send(event_loop::ContentVerbRequest::Burn {
                     cid,
                     reply: reply_tx,
                 })
                 .await
-                .map_err(|_| "event loop not running".to_string())?;
-            reply_rx
-                .await
-                .map_err(|_| "event loop dropped burn request".to_string())??;
+            {
+                Ok(()) => match reply_rx.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        err = %e,
+                        "burn_content: runtime burn failed; bytes may survive until reconciliation",
+                    ),
+                    Err(_) => tracing::warn!(
+                        cid = %hex::encode(cid),
+                        "burn_content: event loop dropped burn reply",
+                    ),
+                },
+                Err(_) => tracing::warn!(
+                    cid = %hex::encode(cid),
+                    "burn_content: event loop closed before burn send; bytes may survive",
+                ),
+            }
         }
         RuntimeAction::Unpin(cid) => {
             // Sibling entries still reference this CID, but none pin it —

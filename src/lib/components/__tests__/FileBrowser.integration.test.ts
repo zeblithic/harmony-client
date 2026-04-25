@@ -103,7 +103,11 @@ describe('File Manager Integration', () => {
     const fileRow = screen.getByLabelText('favorite-track.flac');
     await fireEvent.click(fileRow);
 
-    expect(callbacks.onItemClick).toHaveBeenCalledWith('cid-song-favorite');
+    // ZEB-164: onItemClick now receives the full ContentItem, not just the cid.
+    expect(callbacks.onItemClick).toHaveBeenCalledOnce();
+    const arg = callbacks.onItemClick.mock.calls[0][0];
+    expect(arg.cid).toBe('cid-song-favorite');
+    expect(arg.sidecarId).toBe('mock-sidecar-4');
   });
 
   // ── 3. Click a folder to navigate ────────────────────────────────

@@ -9,7 +9,7 @@
     selected = false,
   }: {
     item: ContentItem;
-    onClick?: (cid: string) => void;
+    onClick?: (item: ContentItem) => void;
     selected?: boolean;
   } = $props();
 
@@ -21,7 +21,7 @@
 <button
   class="file-card"
   class:selected
-  onclick={() => onClick?.(item.cid)}
+  onclick={() => onClick?.(item)}
   aria-label={item.name}
 >
   <div class="file-card-overlay-top">

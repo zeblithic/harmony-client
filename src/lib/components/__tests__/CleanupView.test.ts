@@ -19,6 +19,7 @@ const quota: QuotaStatus = {
 
 const recommendations: CleanupRecommendation[] = [
   {
+    sidecarId: 'mock-sidecar-7',
     cid: 'cid-training-data',
     name: 'sensor-readings.parquet',
     category: 'dataset',
@@ -30,6 +31,7 @@ const recommendations: CleanupRecommendation[] = [
     confidence: 0.92,
   },
   {
+    sidecarId: 'mock-sidecar-5',
     cid: 'cid-video-lecture',
     name: 'distributed-systems-lecture.mp4',
     category: 'video',
@@ -41,6 +43,7 @@ const recommendations: CleanupRecommendation[] = [
     confidence: 0.78,
   },
   {
+    sidecarId: 'mock-sidecar-9',
     cid: 'cid-family-photo',
     name: 'family-reunion-2025.jpg',
     category: 'image',
@@ -102,7 +105,7 @@ describe('CleanupView', () => {
     const dialog = screen.getByRole('dialog');
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'burn');
+    expect(onAction).toHaveBeenCalledWith(recommendations[0], 'burn');
   });
 
   // ── Select all ──────────────────────────────────────────────────
@@ -191,11 +194,7 @@ describe('CleanupView', () => {
     const dialog = screen.getByRole('dialog');
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onBulkBurn).toHaveBeenCalledWith([
-      'cid-training-data',
-      'cid-video-lecture',
-      'cid-family-photo',
-    ]);
+    expect(onBulkBurn).toHaveBeenCalledWith(recommendations);
   });
 
   it('fires onBulkArchive with selected CIDs after confirmation', async () => {
@@ -208,11 +207,7 @@ describe('CleanupView', () => {
     const dialog = screen.getByRole('dialog');
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onBulkArchive).toHaveBeenCalledWith([
-      'cid-training-data',
-      'cid-video-lecture',
-      'cid-family-photo',
-    ]);
+    expect(onBulkArchive).toHaveBeenCalledWith(recommendations);
   });
 
   it('fires onBulkRelease with selected CIDs after confirmation', async () => {
@@ -260,7 +255,7 @@ describe('CleanupView', () => {
     const dialog = screen.getByRole('dialog');
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onBulkBurn).toHaveBeenCalledWith(['cid-video-lecture']);
+    expect(onBulkBurn).toHaveBeenCalledWith([recommendations[1]]);
   });
 
   // ── Empty state ─────────────────────────────────────────────────

@@ -28,7 +28,7 @@
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail } from './lib/types';
+  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -455,15 +455,12 @@
   });
 
   // ── File manager callbacks ──────────────────────────────────────────
-  function handleFileItemClick(cid: string) {
-    selectedFileCid = cid;
-    // Lookup sidecarId from the active list. The FileBrowser only emits
-    // cids on click (its callback contract is unchanged), so we resolve
-    // sidecarId here. Top-level entries always have a sidecarId; for
-    // manifest-derived rows (sidecarId === '' from the wire) selection
-    // is informational only — pin/burn/archive are gated downstream.
-    const item = fileManagerService.getContents().find((i) => i.cid === cid);
-    selectedFileSidecarId = item?.sidecarId || null;
+  function handleFileItemClick(item: ContentItem) {
+    selectedFileCid = item.cid;
+    // ZEB-164: sidecarId is the stable per-entry identity. For manifest-derived
+    // rows (sidecarId === '') selection is informational only — pin/burn/archive
+    // are gated downstream.
+    selectedFileSidecarId = item.sidecarId || null;
   }
 
   function handleNavigateFolder(cid: string | null) {
@@ -568,25 +565,21 @@
     showCleanup = !showCleanup;
   }
 
-  async function handleCleanupAction(cid: string, action: string) {
-    const item = fileManagerService.getContents().find((i) => i.cid === cid);
+  async function handleCleanupAction(rec: CleanupRecommendation, action: string) {
     try {
       if (action === 'burn') {
-        if (!item) return;
-        await fileManagerService.burn([item.sidecarId]);
+        await fileManagerService.burn([rec.sidecarId]);
       } else if (action === 'archive') {
-        if (!item) return;
-        await fileManagerService.archive([item.sidecarId]);
+        await fileManagerService.archive([rec.sidecarId]);
       } else if (action === 'release') {
-        fileManagerService.release([cid]);
+        fileManagerService.release([rec.cid]);
       } else if (action === 'publish') {
-        fileManagerService.publish([cid]);
+        fileManagerService.publish([rec.cid]);
       } else if (action === 'pin') {
-        if (!item) return;
-        await fileManagerService.pin(item.sidecarId);
+        await fileManagerService.pin(rec.sidecarId);
       }
       fileManagerVersion++;
-      if (selectedFileCid === cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
+      if (selectedFileCid === rec.cid && (action === 'burn' || action === 'archive' || action === 'release' || action === 'publish')) {
         selectedFileCid = null;
         selectedFileSidecarId = null;
       }
@@ -595,15 +588,13 @@
     }
   }
 
-  async function handleBulkBurn(cids: string[]) {
+  async function handleBulkBurn(recs: CleanupRecommendation[]) {
     try {
-      const sidecarIds = cids
-        .map((cid) => fileManagerService.getContents().find((i) => i.cid === cid)?.sidecarId)
-        .filter((id): id is string => !!id);
+      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
       if (sidecarIds.length === 0) return;
       await fileManagerService.burn(sidecarIds);
       fileManagerVersion++;
-      if (selectedFileCid && cids.includes(selectedFileCid)) {
+      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
         selectedFileCid = null;
         selectedFileSidecarId = null;
       }
@@ -612,15 +603,13 @@
     }
   }
 
-  async function handleBulkArchive(cids: string[]) {
+  async function handleBulkArchive(recs: CleanupRecommendation[]) {
     try {
-      const sidecarIds = cids
-        .map((cid) => fileManagerService.getContents().find((i) => i.cid === cid)?.sidecarId)
-        .filter((id): id is string => !!id);
+      const sidecarIds = recs.map((r) => r.sidecarId).filter(Boolean);
       if (sidecarIds.length === 0) return;
       await fileManagerService.archive(sidecarIds);
       fileManagerVersion++;
-      if (selectedFileCid && cids.includes(selectedFileCid)) {
+      if (selectedFileCid && recs.some((r) => r.cid === selectedFileCid)) {
         selectedFileCid = null;
         selectedFileSidecarId = null;
       }
@@ -903,6 +892,7 @@
       service={fileManagerService}
       {currentFolderCid}
       selectedCid={selectedFileCid}
+      selectedSidecarId={selectedFileSidecarId}
       viewMode={fileViewMode}
       section={fileSection}
       searchQuery={fileSearchQuery}

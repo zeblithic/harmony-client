@@ -4,6 +4,7 @@ import RecommendationCard from '../RecommendationCard.svelte';
 import type { CleanupRecommendation } from '../../types';
 
 const baseRec: CleanupRecommendation = {
+  sidecarId: 'mock-rec-sidecar-1',
   cid: 'cid-training-data',
   name: 'sensor-readings.parquet',
   category: 'dataset',
@@ -83,7 +84,7 @@ describe('RecommendationCard', () => {
     const dialog = screen.getByRole('dialog');
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'burn');
+    expect(onAction).toHaveBeenCalledWith(baseRec, 'burn');
   });
 
   it('fires onAction with cid and action when Archive clicked', async () => {
@@ -92,7 +93,7 @@ describe('RecommendationCard', () => {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /archive/i }));
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'archive');
+    expect(onAction).toHaveBeenCalledWith(baseRec, 'archive');
   });
 
   it('fires onAction with cid and release after double confirmation', async () => {
@@ -109,7 +110,7 @@ describe('RecommendationCard', () => {
     // Gate 2: click Confirm Release — release always completes after double confirm
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'release');
+    expect(onAction).toHaveBeenCalledWith(baseRec, 'release');
   });
 
   it('fires onAction with cid and publish after double confirmation (private sensitivity)', async () => {
@@ -126,7 +127,7 @@ describe('RecommendationCard', () => {
     // Gate 2: click Confirm Publish — private sensitivity = level 2, completes here
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'publish');
+    expect(onAction).toHaveBeenCalledWith(baseRec, 'publish');
   });
 
   it('requires type-to-confirm for intimate publish', async () => {
@@ -150,7 +151,7 @@ describe('RecommendationCard', () => {
     await fireEvent.input(input, { target: { value: 'sensor-readings.parquet' } });
     const confirmBtn = dialog.querySelector('.confirm-btn') as HTMLElement;
     await fireEvent.click(confirmBtn);
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'publish');
+    expect(onAction).toHaveBeenCalledWith(intimateRec, 'publish');
   });
 
   it('fires onAction with cid and action when Pin clicked', async () => {
@@ -159,7 +160,7 @@ describe('RecommendationCard', () => {
       props: { recommendation: baseRec, checked: false, onAction, onToggle: vi.fn() },
     });
     await fireEvent.click(screen.getByRole('button', { name: /pin/i }));
-    expect(onAction).toHaveBeenCalledWith('cid-training-data', 'pin');
+    expect(onAction).toHaveBeenCalledWith(baseRec, 'pin');
   });
 
   it('renders checkbox and fires onToggle when toggled', async () => {
@@ -170,7 +171,7 @@ describe('RecommendationCard', () => {
     const checkbox = screen.getByRole('checkbox');
     expect(checkbox).toBeTruthy();
     await fireEvent.click(checkbox);
-    expect(onToggle).toHaveBeenCalledWith('cid-training-data');
+    expect(onToggle).toHaveBeenCalledWith('mock-rec-sidecar-1');
   });
 
   it('reflects checked state on checkbox', () => {

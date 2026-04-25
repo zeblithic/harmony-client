@@ -15,6 +15,7 @@
     service,
     currentFolderCid = null,
     selectedCid = null,
+    selectedSidecarId = null,
     viewMode = 'list' as FileViewMode,
     section = 'private' as ContentSection,
     searchQuery = '',
@@ -37,21 +38,22 @@
     service: FileManagerService;
     currentFolderCid?: string | null;
     selectedCid?: string | null;
+    selectedSidecarId?: string | null;
     viewMode?: FileViewMode;
     section?: ContentSection;
     searchQuery?: string;
     filters?: Record<string, unknown>;
     showCleanup?: boolean;
-    onItemClick: (cid: string) => void;
+    onItemClick: (item: ContentItem) => void;
     onNavigateFolder: (cid: string | null) => void;
     onViewModeChange: (mode: FileViewMode) => void;
     onSearchChange: (query: string) => void;
     onSectionChange: (section: ContentSection) => void;
     onUploadClick: () => void;
     onCleanupClick: () => void;
-    onCleanupAction?: (cid: string, action: string) => void;
-    onBulkBurn?: (cids: string[]) => void;
-    onBulkArchive?: (cids: string[]) => void;
+    onCleanupAction?: (rec: import('../types').CleanupRecommendation, action: string) => void;
+    onBulkBurn?: (recs: import('../types').CleanupRecommendation[]) => void;
+    onBulkArchive?: (recs: import('../types').CleanupRecommendation[]) => void;
     onBulkRelease?: (cids: string[]) => void;
     onBulkPublish?: (cids: string[]) => void;
     serviceVersion?: number;
@@ -274,9 +276,8 @@
   // Used by createFolder so the backend can cascade the CID update up the tree.
   let breadcrumbStack = $derived.by<string[]>(() => navStack.map((seg) => seg.cid));
 
-  function handleItemClick(cid: string) {
-    const item = items.find((i) => i.cid === cid);
-    if (item?.isFolder) {
+  function handleItemClick(item: ContentItem) {
+    if (item.isFolder) {
       // Stash for the navStack $effect. sidecarId is only set when the
       // click came from the root listing (entries there have a sidecar
       // entry); manifest-derived rows pass empty sidecarId, which we
@@ -290,7 +291,7 @@
       onNavigateFolder(item.cid);
       return;
     }
-    onItemClick(cid);
+    onItemClick(item);
   }
 
   async function handleNewFolder() {
@@ -351,9 +352,9 @@
       <CleanupView
         {quota}
         recommendations={cleanupRecommendations}
-        onAction={(cid, action) => onCleanupAction?.(cid, action)}
-        onBulkBurn={(cids) => onBulkBurn?.(cids)}
-        onBulkArchive={(cids) => onBulkArchive?.(cids)}
+        onAction={(rec, action) => onCleanupAction?.(rec, action)}
+        onBulkBurn={(recs) => onBulkBurn?.(recs)}
+        onBulkArchive={(recs) => onBulkArchive?.(recs)}
         onBulkRelease={(cids) => onBulkRelease?.(cids)}
         onBulkPublish={(cids) => onBulkPublish?.(cids)}
       />
@@ -361,9 +362,9 @@
       <Breadcrumbs path={breadcrumbPath} onNavigate={onNavigateFolder} />
 
       {#if viewMode === 'list'}
-        <FileList {items} {selectedCid} onItemClick={handleItemClick} />
+        <FileList {items} {selectedCid} {selectedSidecarId} onItemClick={handleItemClick} />
       {:else}
-        <FileGrid {items} {selectedCid} onItemClick={handleItemClick} />
+        <FileGrid {items} {selectedCid} {selectedSidecarId} onItemClick={handleItemClick} />
       {/if}
 
       <QuotaBar

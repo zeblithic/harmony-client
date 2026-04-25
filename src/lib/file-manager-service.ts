@@ -191,8 +191,15 @@ export class FileManagerService {
   getQuotaStatus(): QuotaStatus {
     const byCategory: Partial<Record<ContentCategory, number>> = {};
     let usedBytes = 0;
-
+    // ZEB-164: multiple sidecar entries can share a CID. Storage is
+    // content-addressed, so each unique CID contributes its bytes once.
+    // We pick the first-seen entry's category for byCategory tie-breaking
+    // (HashMap iteration is non-deterministic on the wire, but
+    // privateContent is locally stable for the duration of a session).
+    const seenCids = new Set<string>();
     for (const item of this.privateContent) {
+      if (seenCids.has(item.cid)) continue;
+      seenCids.add(item.cid);
       usedBytes += item.sizeBytes;
       byCategory[item.category] = (byCategory[item.category] ?? 0) + item.sizeBytes;
     }
@@ -211,7 +218,13 @@ export class FileManagerService {
     const activeCids = new Map(this.privateContent.map((i) => [i.cid, i]));
     return this.cleanupRecommendations
       .filter((r) => activeCids.has(r.cid))
-      .map((r) => ({ ...r, sensitivity: activeCids.get(r.cid)!.sensitivity }))
+      .map((r) => ({
+        ...r,
+        sensitivity: activeCids.get(r.cid)!.sensitivity,
+        // ZEB-164: attach sidecarId so action handlers can route sidecar
+        // mutations without a CID re-lookup (non-deterministic on shared CIDs).
+        sidecarId: activeCids.get(r.cid)!.sidecarId,
+      }))
       .sort((a, b) => b.confidence - a.confidence);
   }
 
@@ -230,7 +243,11 @@ export class FileManagerService {
     return [...mockPeers];
   }
 
-  /** Permanently removes content items and frees their quota. */
+  /**
+   * Permanently removes content items. With ZEB-164's symlink-style sidecar,
+   * burn is "remove this entry from my list" — quota only frees on the
+   * last-reference burn (when no sibling sidecar entry references the CID).
+   */
   async burn(sidecarIds: string[]): Promise<void> {
     if (!this.adapter) {
       // Offline-only path: still mutate local state so tests/Storybook work.
@@ -347,8 +364,11 @@ export class FileManagerService {
   async ingest(parentCid?: string | null): Promise<ContentItem | undefined> {
     if (!this.adapter) return undefined;
     const result = (await this.adapter.invoke('ingest_content')) as IngestResult;
-    // Deduplicate: if this CID already exists in private content, skip.
-    if (this.privateContent.some((i) => i.cid === result.cid)) return undefined;
+    // ZEB-164: CID-based dedupe removed — the backend mints a fresh sidecar_id
+    // on every ingest, even for duplicate-content uploads. Multiple sidecar
+    // entries per CID are expected and intentional (symlink-style semantics).
+    // Defense-in-depth against the practically-impossible UUID v4 collision:
+    if (this.privateContent.some((i) => i.sidecarId === result.sidecarId)) return undefined;
     const item: ContentItem = {
       sidecarId: result.sidecarId,
       cid: result.cid,
