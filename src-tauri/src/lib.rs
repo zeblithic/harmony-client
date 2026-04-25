@@ -1235,6 +1235,17 @@ pub struct IngestResult {
     pub size_bytes: u64,
 }
 
+/// Result returned by `create_folder` and `create_folder_at_root`. The
+/// frontend stashes `sidecar_id` immediately so subsequent operations on
+/// the just-created folder (pin, archive, future move/rename) have the
+/// stable handle. `cid` is provided alongside for content-addressed reads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFolderResult {
+    pub sidecar_id: String,
+    pub cid: String,
+}
+
 #[tauri::command]
 async fn list_content(
     folder_cid: Option<String>,
@@ -1790,7 +1801,9 @@ async fn ingest_content(
         .unwrap_or(0);
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let sidecar_id = content_index::SidecarId::new();
         let inserted = idx.insert(content_index::ContentIndexEntry {
+            sidecar_id,
             cid: root_cid_bytes,
             file_name: file_name.clone(),
             size_bytes,
@@ -1842,16 +1855,16 @@ pub async fn send_ingest(
     Ok(())
 }
 
-/// ZEB-158 slice 1: create a new folder at the root or inside an existing
-/// folder. Empty `parent_path` means root; non-empty means a walk from
-/// top-level root (index 0) down to immediate parent (last element).
-/// Nested creation is implemented in a follow-up step.
+/// ZEB-164: create a new folder at the root or inside an existing folder.
+/// Empty `parent_path` means root; non-empty means a walk from top-level
+/// root (index 0) down to immediate parent (last element).
 #[tauri::command]
 async fn create_folder(
     name: String,
+    parent_sidecar_id: Option<String>,
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     // Defence-in-depth: the UI already trims and rejects blank names, but
     // the IPC surface is callable by anything with a Tauri handle. An empty
     // or whitespace-only label would produce folders that are hard to
@@ -1861,21 +1874,24 @@ async fn create_folder(
         return Err("folder name cannot be empty".to_string());
     }
     if parent_path.is_empty() {
+        if parent_sidecar_id.is_some() {
+            return Err("root creates must not provide parent_sidecar_id".into());
+        }
         return create_folder_at_root(name, state).await;
     }
-    create_folder_nested(name, parent_path, state).await
+    let psid = parent_sidecar_id
+        .ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
+    create_folder_nested(name, psid, parent_path, state).await
 }
 
 async fn create_folder_at_root(
     name: String,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     // Build the (empty) manifest + bundle locally. No runtime state
-    // mutated yet — we can still bail cleanly on collision.
+    // mutated yet — we can still bail cleanly on send_ingest failure.
     let built = folders::build_folder(&name, &[])?;
 
-    // Snapshot handles up-front so a collision check can fail fast without
-    // touching the ingest channel.
     let (ingest_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -1892,17 +1908,16 @@ async fn create_folder_at_root(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // ZEB-158 slice 1 corner case: every empty folder produces the same
-    // bundle CID (the manifest is byte-identical: {"folder_manifest":
-    // {"version":1,"entries":[]}}). Under the current CID-keyed sidecar,
-    // a second empty folder collides with the first. We reserve the
-    // sidecar slot FIRST so a collision bails out without publishing
-    // orphan manifest/bundle bytes to the runtime. The architectural fix
-    // (sidecar entries keyed by an opaque id so multiple entries can share
-    // a CID, symlink-style) is tracked separately.
+    // ZEB-164: every empty folder bundle has the same CID, but multiple
+    // sidecar entries can now reference that shared CID — so the slice-1
+    // collision workaround ("a folder with identical contents already
+    // exists") is gone. We mint a fresh sidecar_id, reserve the slot
+    // before publishing bytes, and roll back if either ingest fails.
+    let sidecar_id = content_index::SidecarId::new();
     {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
+            sidecar_id,
             cid: built.bundle_cid.to_bytes(),
             file_name: name,
             size_bytes: bundle_size,
@@ -1915,23 +1930,17 @@ async fn create_folder_at_root(
             kind: content_index::ContentKind::Folder,
         });
         if !inserted {
-            return Err(
-                "a folder with identical contents already exists; \
-                 add content to it before creating another empty folder"
-                    .to_string(),
-            );
+            // Effectively impossible (UUID v4 collision); kept as a
+            // sanity guard against future SidecarId construction bugs.
+            return Err("sidecar_id collision".into());
         }
     }
 
     // Slot reserved — now publish the bytes. ZEB-155's fetch-completion
-    // recovery hook is gated on ZEB-159 (not yet implemented), so an
-    // orphan sidecar entry would be unrecoverable until the user manually
-    // burned it. Roll back the reservation on any ingest failure so the
-    // sidecar never points at bytes that don't exist. Best-effort: if the
-    // mutex is poisoned during rollback we leave the orphan, but that
-    // failure mode is strictly worse than the common case (transient
-    // event-loop drop) which we DO recover from.
-    let bundle_cid_bytes = built.bundle_cid.to_bytes();
+    // recovery hook is gated on ZEB-159, so an orphan sidecar entry
+    // would be unrecoverable until the user manually burned it. Roll
+    // back the reservation on any ingest failure so the sidecar never
+    // points at bytes that don't exist.
     if let Err(e) = send_ingest(
         &ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
@@ -1940,32 +1949,38 @@ async fn create_folder_at_root(
     .await
     {
         if let Ok(mut idx) = index.lock() {
-            idx.remove(&bundle_cid_bytes);
+            idx.remove(&sidecar_id);
         }
         return Err(e);
     }
     if let Err(e) = send_ingest(
         &ingest_tx,
-        hex::encode(bundle_cid_bytes),
+        hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
     )
     .await
     {
         if let Ok(mut idx) = index.lock() {
-            idx.remove(&bundle_cid_bytes);
+            idx.remove(&sidecar_id);
         }
         return Err(e);
     }
 
-    Ok(hex::encode(bundle_cid_bytes))
+    Ok(CreateFolderResult {
+        sidecar_id: sidecar_id.to_string(),
+        cid: hex::encode(built.bundle_cid.to_bytes()),
+    })
 }
 
 async fn create_folder_nested(
     name: String,
+    parent_sidecar_id: String,
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+) -> Result<CreateFolderResult, String> {
     use harmony_content::bundle::parse_bundle;
+
+    let parent_id = parse_sidecar_id(&parent_sidecar_id)?;
 
     // Parse all path CIDs up-front; fail fast on malformed input.
     let path_cids: Vec<[u8; 32]> = parent_path
@@ -1975,7 +1990,6 @@ async fn create_folder_nested(
     let root_old = *path_cids.first().expect("non-empty by guard above");
     let immediate_parent_cid = *path_cids.last().expect("non-empty");
 
-    // Snapshot handles.
     let (ingest_tx, verb_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -1991,14 +2005,29 @@ async fn create_folder_nested(
         )
     };
 
-    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so that
-    // a downstream collision/OldMissing failure during rekey doesn't leave
-    // orphan bytes in the runtime cache (which could be announced over Zenoh
-    // and waste capacity for content no sidecar entry will ever reference).
+    // Verify the caller's claim: parent_sidecar_id maps to root_old.
+    {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let entry = idx.get(&parent_id).ok_or_else(|| {
+            "parent_sidecar_id not in sidecar".to_string()
+        })?;
+        if entry.cid != root_old {
+            return Err(format!(
+                "parent_sidecar_id refers to cid {} but parent_path[0] is {}",
+                hex::encode(entry.cid),
+                hex::encode(root_old),
+            ));
+        }
+    }
+
+    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so
+    // that a downstream OldMissing during rekey doesn't leave orphan
+    // bytes in the runtime cache (which could be announced over Zenoh
+    // and waste capacity for content no sidecar entry will ever
+    // reference).
     let new_child = folders::build_folder(&name, &[])?;
     let new_child_bundle_cid = new_child.bundle_cid;
 
-    // (cid_hex, bytes) pairs to ingest after rekey succeeds.
     let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
     pending_ingests.push((
         hex::encode(new_child.manifest_cid.to_bytes()),
@@ -2011,8 +2040,6 @@ async fn create_folder_nested(
 
     // 2. Bottom-up walk: rebuild each ancestor LOCALLY (read-only verb
     // requests), accumulating into pending_ingests.
-    //    prev_old_cid = the ancestor's old CID (as given in parent_path).
-    //    prev_new_cid = the ancestor's new CID (after mutation at its layer).
     let mut prev_old_cid = immediate_parent_cid;
     let mut prev_new_cid = new_child_bundle_cid.to_bytes();
     let mut last_bundle_size: u64 = pending_ingests
@@ -2020,12 +2047,9 @@ async fn create_folder_nested(
         .map(|(_, b)| b.len() as u64)
         .unwrap_or(0);
 
-    // First iteration: APPEND at the immediate parent.
-    // Higher iterations: REPLACE the entry pointing to prev_old_cid.
     for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
         let is_deepest = i == path_cids.len() - 1;
 
-        // Fetch the ancestor's bundle bytes (read-only).
         let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
             .await?
             .ok_or_else(|| {
@@ -2040,20 +2064,14 @@ async fn create_folder_nested(
             .first()
             .copied()
             .ok_or_else(|| "ancestor bundle has no children".to_string())?;
-        // Collect bundle children as raw [u8; 32] for the manifest/bundle
-        // consistency check below.
         let anc_children: Vec<[u8; 32]> =
             anc_child_ids.iter().map(|c| c.to_bytes()).collect();
 
-        // Read the ancestor's manifest book (read-only).
         let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
             .await?
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
         let mut manifest = folders::parse_manifest(&manifest_bytes)
             .map_err(|e| format!("ancestor {e}"))?;
-        // Defend against a malformed ancestor rewriting the tree with
-        // phantom children: refuse to mutate unless manifest entries and
-        // bundle child slots agree.
         folders::validate_manifest_matches_bundle(&manifest, &anc_children)
             .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
 
@@ -2082,10 +2100,8 @@ async fn create_folder_nested(
             manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
         }
 
-        // Rebuild manifest book + bundle with updated entries; queue both
-        // for ingest (deferred until after rekey succeeds).
         let rebuilt = folders::build_folder(
-            /* display name not used by manifest; empty is fine */ "",
+            "",
             &manifest.folder_manifest.entries,
         )?;
         let rebuilt_bundle_cid = rebuilt.bundle_cid;
@@ -2103,90 +2119,77 @@ async fn create_folder_nested(
         prev_new_cid = rebuilt_bundle_cid.to_bytes();
     }
 
-    // 3. Rekey the top-level sidecar entry FIRST. If this fails (collision
-    // or old-missing), no ingests have happened — no orphan bytes.
+    // 3. Rekey the top-level sidecar entry FIRST. With ZEB-164 the
+    // CID-collision branch is gone — multiple entries sharing a CID is
+    // legal. Only OldMissing remains.
     let new_bundle_size = last_bundle_size;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    // Read the pre-rekey pin state AND perform the rekey under a single lock
-    // acquisition: a concurrent pin_content/unpin_content landing between the
-    // read and the rekey would otherwise leave had_pin disagreeing with what
-    // the sidecar just persisted, so the subsequent runtime Pin/Unpin dispatch
-    // below would fight the intervening toggle.
-    let had_pin = {
+    {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let had_pin = idx.get(&root_old).map(|e| e.pinned).unwrap_or(false);
-        match idx.rekey(&root_old, prev_new_cid, new_bundle_size, stored_at_ms) {
-            Ok(()) => had_pin,
+        match idx.rekey(&parent_id, prev_new_cid, new_bundle_size, stored_at_ms) {
+            Ok(()) => {}
             Err(content_index::RekeyError::OldMissing) => {
                 return Err(
-                    "top-level folder not in sidecar — nothing to rekey".to_string(),
-                );
-            }
-            Err(content_index::RekeyError::Collision) => {
-                return Err(
-                    "the new folder's contents collide with an existing top-level entry; \
-                     rename the existing one or differentiate the new one before retrying"
-                        .to_string(),
+                    "parent_sidecar_id removed mid-flight — nothing to rekey".to_string(),
                 );
             }
         }
-    };
+    }
 
     // 4. Drain the deferred ingests now that the sidecar is committed.
-    // If the event loop dies mid-drain, we end up with a sidecar pointer
-    // (the new top-level root CID) referencing a chain whose bytes are
-    // partially resident at best. ZEB-155's fetch-completion recovery
-    // hook is gated on ZEB-159 (not yet implemented), so the user is
-    // left with a folder whose nested contents fail to load until they
-    // manually burn the root. A proper rekey-rollback (mirroring
-    // create_folder_at_root's sidecar.remove) requires snapshotting the
-    // pre-rekey size + stored_at and reversing the rekey on failure;
-    // tracked separately so the moderate complexity isn't bundled into
-    // the slice 1 PR. See ZEB-167.
+    // ZEB-167 tracks proper rekey-rollback for ingest failures.
     for (cid_hex, bytes) in pending_ingests {
         send_ingest(&ingest_tx, cid_hex, bytes).await?;
     }
 
-    // 5. Event-loop pin sync: unpin old, pin new (if old had pin intent).
+    // 5. Maintain the runtime pin_intent OR-join invariant for both
+    // old and new CIDs. If no remaining entry pins root_old, drop it
+    // from runtime pin_intent. If any entry pins prev_new_cid (this
+    // entry might, depending on its persisted intent), add it.
     //
-    // The whole step is best-effort: the sidecar has already committed
-    // the rekey, so any failure here — channel send, reply, or remote
-    // error — is a runtime/cache desync rather than a user-visible
-    // regression. Log so the desync is diagnosable (silent swallow would
-    // let "sidecar says pinned, runtime isn't" happen invisibly) but do
-    // not propagate, otherwise the user sees "event loop not running"
-    // on a folder that was fully created and persisted. The fetch-
-    // completion hook (ZEB-155 + ZEB-159) re-converges on the next fetch
-    // of the new root.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    match verb_tx
-        .send(event_loop::ContentVerbRequest::Unpin {
-            cid: root_old,
-            reply: reply_tx,
-        })
-        .await
-    {
-        Ok(()) => match reply_rx.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                old_cid = %hex::encode(root_old),
-                err = %e,
-                "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
-            ),
+    // Both dispatches are best-effort: the sidecar has already
+    // committed the rekey, so any failure here is a runtime/cache
+    // desync rather than a user-visible regression. Log so the desync
+    // is diagnosable. The fetch-completion hook (ZEB-155 + ZEB-159)
+    // re-converges on the next fetch of the new root.
+    let (drop_old, add_new) = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        (
+            !idx.is_cid_pinned_by_any(&root_old),
+            idx.is_cid_pinned_by_any(&prev_new_cid),
+        )
+    };
+    if drop_old {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Unpin {
+                cid: root_old,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    old_cid = %hex::encode(root_old),
+                    err = %e,
+                    "create_folder_nested: runtime unpin of old root failed; cache may hold stale pin",
+                ),
+                Err(_) => tracing::warn!(
+                    old_cid = %hex::encode(root_old),
+                    "create_folder_nested: event loop dropped unpin reply",
+                ),
+            },
             Err(_) => tracing::warn!(
                 old_cid = %hex::encode(root_old),
-                "create_folder_nested: event loop dropped unpin reply",
+                "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
             ),
-        },
-        Err(_) => tracing::warn!(
-            old_cid = %hex::encode(root_old),
-            "create_folder_nested: event loop closed before unpin send; cache may hold stale pin",
-        ),
+        }
     }
-    if had_pin {
+    if add_new {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         match verb_tx
             .send(event_loop::ContentVerbRequest::Pin {
@@ -2214,7 +2217,10 @@ async fn create_folder_nested(
         }
     }
 
-    Ok(hex::encode(prev_new_cid))
+    Ok(CreateFolderResult {
+        sidecar_id: parent_sidecar_id, // unchanged — same identity, new cid
+        cid: hex::encode(prev_new_cid),
+    })
 }
 
 async fn read_cached_bytes(
