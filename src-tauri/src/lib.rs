@@ -1846,24 +1846,41 @@ async fn create_folder_at_root(
         }
     }
 
-    // Slot reserved — now publish the bytes. If either ingest fails the
-    // sidecar is left pointing to a CID whose bytes aren't fully resident;
-    // that's the same failure mode as create_folder_nested and is
-    // recoverable on next fetch via ZEB-155's fetch-completion hook.
-    send_ingest(
+    // Slot reserved — now publish the bytes. ZEB-155's fetch-completion
+    // recovery hook is gated on ZEB-159 (not yet implemented), so an
+    // orphan sidecar entry would be unrecoverable until the user manually
+    // burned it. Roll back the reservation on any ingest failure so the
+    // sidecar never points at bytes that don't exist. Best-effort: if the
+    // mutex is poisoned during rollback we leave the orphan, but that
+    // failure mode is strictly worse than the common case (transient
+    // event-loop drop) which we DO recover from.
+    let bundle_cid_bytes = built.bundle_cid.to_bytes();
+    if let Err(e) = send_ingest(
         &ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
     )
-    .await?;
-    send_ingest(
+    .await
+    {
+        if let Ok(mut idx) = index.lock() {
+            idx.remove(&bundle_cid_bytes);
+        }
+        return Err(e);
+    }
+    if let Err(e) = send_ingest(
         &ingest_tx,
-        hex::encode(built.bundle_cid.to_bytes()),
+        hex::encode(bundle_cid_bytes),
         built.bundle_bytes,
     )
-    .await?;
+    .await
+    {
+        if let Ok(mut idx) = index.lock() {
+            idx.remove(&bundle_cid_bytes);
+        }
+        return Err(e);
+    }
 
-    Ok(hex::encode(built.bundle_cid.to_bytes()))
+    Ok(hex::encode(bundle_cid_bytes))
 }
 
 async fn create_folder_nested(
@@ -2043,8 +2060,15 @@ async fn create_folder_nested(
 
     // 4. Drain the deferred ingests now that the sidecar is committed.
     // If the event loop dies mid-drain, we end up with a sidecar pointer
-    // to a CID whose bytes aren't fully resident — recoverable on next
-    // fetch via ZEB-155's fetch-completion hook (gated on ZEB-159).
+    // (the new top-level root CID) referencing a chain whose bytes are
+    // partially resident at best. ZEB-155's fetch-completion recovery
+    // hook is gated on ZEB-159 (not yet implemented), so the user is
+    // left with a folder whose nested contents fail to load until they
+    // manually burn the root. A proper rekey-rollback (mirroring
+    // create_folder_at_root's sidecar.remove) requires snapshotting the
+    // pre-rekey size + stored_at and reversing the rekey on failure;
+    // tracked separately so the moderate complexity isn't bundled into
+    // the slice 1 PR. See ZEB-167.
     for (cid_hex, bytes) in pending_ingests {
         send_ingest(&ingest_tx, cid_hex, bytes).await?;
     }
