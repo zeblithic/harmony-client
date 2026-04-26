@@ -7,6 +7,7 @@
 //! or fresh dev machines without an identity in the keychain, all assertions
 //! run.
 
+use serial_test::serial;
 use std::env;
 
 /// Returns true if the OS keychain has an identity stored — meaning
@@ -40,6 +41,7 @@ fn keychain_has_identity() -> bool {
 }
 
 #[test]
+#[serial]
 fn no_old_passphrase_env_refuses() {
     if keychain_has_identity() {
         eprintln!("SKIP: OS keychain has an identity; refusal-1 fires before refusal-2 on this machine");
@@ -62,6 +64,7 @@ fn no_old_passphrase_env_refuses() {
 }
 
 #[test]
+#[serial]
 fn missing_new_passphrase_file_refuses() {
     if keychain_has_identity() {
         eprintln!("SKIP: OS keychain has an identity; refusal-1 fires before refusal-3 on this machine");

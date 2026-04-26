@@ -2855,8 +2855,10 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
         ));
     }
 
-    // Warn if no-op rotation.
-    let candidate = SecretString::from(new_str.clone());
+    // Move into SecretString immediately so the plaintext String is consumed
+    // (no second copy lingers on the heap unzeroed). passphrase_eq takes a
+    // borrow, then rotate_passphrase moves the SecretString through.
+    let candidate = SecretString::from(new_str);
     if old_store.passphrase_eq(&candidate) {
         tracing::warn!("new passphrase matches old — proceeding anyway");
     }
