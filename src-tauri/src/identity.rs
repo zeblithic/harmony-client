@@ -1,8 +1,12 @@
 //! Node identity management — Ed25519 + post-quantum key generation and persistence.
 //!
-//! Two storage backends behind a common `KeyStore` trait:
-//! - `KeychainStore` — OS-native keychain via the `keyring` crate
-//! - `FileStore`     — binary file at `~/.harmony/identity.key`
+//! Storage backends:
+//! - `KeychainStore`         — OS-native keychain via the `keyring` crate (KeyStore impl)
+//! - `FileStore`             — binary file at `~/.harmony/identity.key` (KeyStore impl;
+//!                              transitional, will be retired in favour of the encrypted
+//!                              backend)
+//! - `LegacyPlaintextReader` — read-only migration helper; reads the legacy plaintext
+//!                              file but never writes one (intentionally NOT a KeyStore)
 //!
 //! `load_or_generate()` tries keychain first, migrates existing files,
 //! and falls back to file storage when no keychain is available.
@@ -211,23 +215,23 @@ impl KeyStore for FileStore {
 /// will never be one. This type exists solely to migrate identities written by
 /// the pre-encryption code path into the modern keychain or encrypted-file
 /// backends.
-pub struct LegacyPlaintextReader {
+pub(crate) struct LegacyPlaintextReader {
     path: PathBuf,
 }
 
 impl LegacyPlaintextReader {
-    pub fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
     /// Read the plaintext identity at `self.path`, or `Ok(None)` if missing.
-    pub fn read(&self) -> Result<Option<NodeIdentity>, String> {
+    pub(crate) fn read(&self) -> Result<Option<NodeIdentity>, String> {
         Self::read_from(&self.path)
     }
 
     /// Free function variant — read plaintext identity from `path`, or
     /// `Ok(None)` if missing.
-    pub fn read_from(path: &Path) -> Result<Option<NodeIdentity>, String> {
+    pub(crate) fn read_from(path: &Path) -> Result<Option<NodeIdentity>, String> {
         let raw = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -831,10 +835,14 @@ mod tests {
             let path = dir.path().join("identity.key");
             let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
             let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            FileStore::new(path.clone()).save(&NodeIdentity { pq, ed25519 }).unwrap();
+            let original = NodeIdentity { pq, ed25519 };
+            let original_addr = original.ed25519.public_identity().address_hash;
+            FileStore::new(path.clone()).save(&original).unwrap();
 
-            let loaded = LegacyPlaintextReader::read_from(&path).unwrap();
-            assert!(loaded.is_some());
+            let loaded = LegacyPlaintextReader::read_from(&path)
+                .unwrap()
+                .expect("should read plaintext via static method");
+            assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
         }
     }
 }
