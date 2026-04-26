@@ -1009,27 +1009,50 @@ fn save_with_fallback(
 /// can still boot — the keychain is the source of truth and `from_env`
 /// configuration errors only matter when the keychain doesn't have the answer.
 pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
-    let keychain = KeychainStore::new().ok();
+    load_or_generate_with_keychain(plaintext_path, KeychainStore::new().ok())
+}
 
-    // Fast-path: keychain hit short-circuits before any env-var resolution.
+/// Inner entry point that takes an injected keychain so tests can exercise the
+/// env-var resolution chain with a deterministic keychain backend (typically
+/// `KeychainStore::new_load_failing_mock()` to simulate a keychain that's
+/// constructed but unreadable). Production callers go through `load_or_generate`.
+pub(crate) fn load_or_generate_with_keychain(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<NodeIdentity, String> {
+    // Probe the keychain ONCE at the top so the env-var error policy below can
+    // distinguish three states: keychain returned an identity (fast-path),
+    // keychain responded but was empty (probe ok, env errors are non-fatal),
+    // or keychain failed (probe failed, env errors stay fatal because the
+    // env-configured encrypted file may be the user's real identity store).
+    let mut keychain_probe_ok = false;
     if let Some(kc) = &keychain {
-        if let Ok(Some(id)) = kc.load() {
-            cleanup_legacy_bak(plaintext_path, &id, kc);
-            return Ok(id);
+        match kc.load() {
+            Ok(Some(id)) => {
+                cleanup_legacy_bak(plaintext_path, &id, kc);
+                return Ok(id);
+            }
+            Ok(None) => keychain_probe_ok = true,
+            Err(e) => {
+                tracing::warn!(
+                    "keychain probe failed in load_or_generate ({e}); \
+                     env-var configuration errors will stay fatal"
+                );
+                // keychain_probe_ok stays false.
+            }
         }
-        // Ok(None) or Err: fall through to the full chain, which re-probes
-        // and treats the empty/error case correctly.
     }
 
     let enc_path = plaintext_path.with_file_name("identity.enc");
-    // Env-var error tolerance: if the keychain is available as a possible
-    // destination (construction succeeded), an unreadable HARMONY_PASSPHRASE_FILE
-    // or empty HARMONY_PASSPHRASE is a warning rather than a hard fail — the
-    // chain can still mint into the keychain. If no keychain is available at
-    // all, the env var is the only path forward and its errors stay fatal.
+    // Env-var error tolerance, scoped to a successful keychain probe: an
+    // unreadable HARMONY_PASSPHRASE_FILE or empty HARMONY_PASSPHRASE is only a
+    // warning when the keychain itself is reachable and can serve as a
+    // fallback destination. If the keychain probe failed, treating the env
+    // error as non-fatal would silently fall through to fresh-generate and
+    // could overwrite the user's real (encrypted-file-resident) identity.
     let encrypted = match EncryptedFileStore::from_env(enc_path) {
         Ok(opt) => opt,
-        Err(e) if keychain.is_some() => {
+        Err(e) if keychain_probe_ok => {
             tracing::warn!(
                 "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE configured but invalid \
                  ({e}); ignoring — keychain is available as fallback"
@@ -1906,6 +1929,67 @@ mod tests {
             let err = verify_round_trip(&store, &original).unwrap_err();
             assert!(err.contains("verify-after-write failed"), "got: {err}");
             assert!(plaintext_path.exists(), "plaintext must be preserved on verify-fail");
+        }
+
+        // ── from_env error policy: scoped to a successful keychain probe ──
+        //
+        // Regression coverage for the bug where `keychain.is_some()` was used as
+        // the swallowing predicate, causing an unreadable HARMONY_PASSPHRASE_FILE
+        // to be silently demoted to a warning even when the keychain probe had
+        // errored — masking the env-var failure and routing the caller to a
+        // misleading "no identity store available" path. The fix tracks
+        // `keychain_probe_ok` separately so the swallow only fires when the
+        // keychain actually responded.
+
+        /// Probe-failed keychain + invalid env var must surface the env error,
+        /// not silently fall through to a "no destination" message.
+        #[test]
+        #[serial_test::serial]
+        fn keychain_probe_err_propagates_env_error() {
+            std::env::remove_var("HARMONY_PASSPHRASE");
+            std::env::set_var("HARMONY_PASSPHRASE_FILE", "/nonexistent/passphrase/file");
+
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+
+            let kc = KeychainStore::new_load_failing_mock();
+            let err = load_or_generate_with_keychain(&plaintext_path, Some(kc)).unwrap_err();
+
+            assert!(
+                err.contains("could not be read"),
+                "expected the env-var read error to surface, got: {err}",
+            );
+            assert!(
+                !err.contains("no identity store available"),
+                "must NOT mask env error with the no-destination message: {err}",
+            );
+
+            std::env::remove_var("HARMONY_PASSPHRASE_FILE");
+        }
+
+        /// Healthy-empty keychain + invalid env var: swallow the env error
+        /// (warning only) and let the chain mint into the keychain. Positive
+        /// control matching the policy from the docstring on `load_or_generate`.
+        #[test]
+        #[serial_test::serial]
+        fn keychain_probe_ok_swallows_env_error() {
+            std::env::remove_var("HARMONY_PASSPHRASE");
+            std::env::set_var("HARMONY_PASSPHRASE_FILE", "/nonexistent/passphrase/file");
+
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+
+            // Healthy mock keychain: load returns Ok(None), save succeeds.
+            let kc = KeychainStore::new_mock();
+            let result = load_or_generate_with_keychain(&plaintext_path, Some(kc));
+
+            assert!(
+                result.is_ok(),
+                "healthy keychain should swallow env error and mint fresh: {:?}",
+                result.err(),
+            );
+
+            std::env::remove_var("HARMONY_PASSPHRASE_FILE");
         }
     }
 
