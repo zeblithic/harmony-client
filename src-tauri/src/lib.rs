@@ -2817,11 +2817,23 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     use secrecy::SecretString;
 
     // Refusal 1: keychain has identity, or its state can't be determined.
-    // Failing closed on Err is important — if we can't tell whether the
+    // Failing closed on load() Err is important — if we can't tell whether the
     // identity is in the keychain, we must NOT rotate the encrypted file
     // (the rotation would silently target the wrong backend).
-    if let Ok(kc) = identity::KeychainStore::new() {
-        match kc.load() {
+    //
+    // KeychainStore::new() Err is trickier. The strict-correct posture is to
+    // also fail closed, but that breaks the legitimate headless case (Linux
+    // server with no Secret Service / no D-Bus session — the entire point of
+    // the encrypted-file backend). The keyring crate's error type doesn't
+    // cleanly distinguish "no backend on this system" from "backend present
+    // but transiently unreachable", so we can't auto-discriminate. Compromise:
+    // log a loud warning on new() Err so an operator on a misconfigured
+    // desktop sees a signal, and proceed (the typical headless case is
+    // benign). Operators with both a populated OS keychain and an .enc file
+    // who hit a transient keychain failure mid-rotation could rotate the
+    // wrong backend; this is a known niche risk documented here.
+    match identity::KeychainStore::new() {
+        Ok(kc) => match kc.load() {
             Ok(Some(_)) => {
                 return Err(
                     "your identity is currently in the OS keychain; passphrase rotation only applies to headless installs. \
@@ -2836,11 +2848,17 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
                     "could not determine whether the identity is stored in the OS keychain — refusing to rotate to avoid acting on the wrong backend: {e}"
                 ));
             }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "OS keychain backend unavailable ({e}); proceeding with encrypted-file \
+                 rotation. If you have a desktop install where the keychain SHOULD be \
+                 reachable, this may indicate a transient or configuration issue and the \
+                 rotation could affect a different backend than your active identity. \
+                 On a headless install (typical case for this command) this is expected."
+            );
         }
     }
-    // KeychainStore::new() returning Err means no keychain available at all
-    // (e.g., headless Linux with no Secret Service) — that's the expected
-    // headless install state, so it's safe to proceed.
 
     // Resolve old passphrase via the standard env chain.
     let plaintext_path = identity::resolve_path(None)?;
