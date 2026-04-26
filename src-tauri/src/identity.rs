@@ -438,35 +438,24 @@ mod tests {
 
     #[test]
     fn file_store_round_trip() {
-        // PQ keygen (ML-DSA scalar NTT) requires ~2 MB stack — spawn a larger thread.
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("identity.key");
-                let store = FileStore::new(path.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let store = FileStore::new(path.clone());
 
-                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-                let identity = NodeIdentity {
-                    pq: pq,
-                    ed25519: ed25519,
-                };
+        let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let identity = NodeIdentity { pq, ed25519 };
 
-                store.save(&identity).unwrap();
-                let loaded = store.load().unwrap().expect("should find saved identity");
-                assert_eq!(
-                    loaded.ed25519.public_identity().address_hash,
-                    identity.ed25519.public_identity().address_hash,
-                );
-                assert_eq!(
-                    loaded.pq.public_identity().address_hash,
-                    identity.pq.public_identity().address_hash,
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        store.save(&identity).unwrap();
+        let loaded = store.load().unwrap().expect("should find saved identity");
+        assert_eq!(
+            loaded.ed25519.public_identity().address_hash,
+            identity.ed25519.public_identity().address_hash,
+        );
+        assert_eq!(
+            loaded.pq.public_identity().address_hash,
+            identity.pq.public_identity().address_hash,
+        );
     }
 
     #[test]

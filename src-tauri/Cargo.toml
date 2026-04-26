@@ -37,6 +37,11 @@ harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
 blake3 = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+secrecy = "0.10"
+subtle = "2"
 
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without
@@ -47,6 +52,7 @@ sha3 = "=0.11.0-rc.8"
 keccak = "=0.2.0-rc.2"
 
 [dev-dependencies]
+serial_test = "3"
 tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
