@@ -69,6 +69,83 @@ fn blob_to_identity(buf: &[u8]) -> Result<NodeIdentity, String> {
     Ok(NodeIdentity { pq, ed25519 })
 }
 
+// ── Atomic file write ──────────────────────────────────────────────────
+
+/// Write `bytes` to `path` atomically with mode 0o600 on Unix.
+///
+/// Steps:
+///   1. Ensure parent directory exists with mode 0o700 (Unix only).
+///   2. Open `<path>.tmp` with mode 0o600 (Unix only).
+///   3. Write + fsync.
+///   4. Atomic rename `<path>.tmp` → `<path>`.
+///
+/// `TmpGuard` removes the `.tmp` file if anything panics or returns Err
+/// before the rename completes. After successful rename, the guard is
+/// `mem::forget`ed so the renamed file isn't unlinked.
+fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let tmp_path = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
+
+    struct TmpGuard<'a>(&'a Path);
+    impl Drop for TmpGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let guard = TmpGuard(&tmp_path);
+
+    {
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+        };
+        #[cfg(not(unix))]
+        let f = {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
+        };
+        use std::io::Write;
+        (&f)
+            .write_all(bytes)
+            .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        format!(
+            "Failed to rename {} → {}: {e}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    std::mem::forget(guard);
+    Ok(())
+}
+
 // ── KeyStore trait ──────────────────────────────────────────────────────
 
 /// Common interface for identity storage backends.
@@ -119,70 +196,8 @@ impl KeyStore for FileStore {
     }
 
     fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
         let blob = identity_to_blob(identity);
-
-        // Atomic write: tmp file with restricted permissions → fsync → rename.
-        let tmp_path = {
-            let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-            name.push(".tmp");
-            self.path.with_file_name(name)
-        };
-
-        struct TmpGuard<'a>(&'a Path);
-        impl Drop for TmpGuard<'_> {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(self.0);
-            }
-        }
-        let guard = TmpGuard(&tmp_path);
-
-        {
-            #[cfg(unix)]
-            let f = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp_path)
-                    .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
-            };
-            #[cfg(not(unix))]
-            let f = {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&tmp_path)
-                    .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
-            };
-            use std::io::Write;
-            (&f)
-                .write_all(&blob)
-                .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
-            f.sync_all()
-                .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
-        }
-        std::fs::rename(&tmp_path, &self.path).map_err(|e| {
-            format!(
-                "Failed to rename {} → {}: {e}",
-                tmp_path.display(),
-                self.path.display()
-            )
-        })?;
-        std::mem::forget(guard);
-        Ok(())
+        write_atomic_0600(&self.path, &blob)
     }
 }
 
