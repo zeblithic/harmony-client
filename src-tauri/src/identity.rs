@@ -639,6 +639,18 @@ impl EncryptedFileStore {
         &self.path
     }
 
+    /// Constant-time check whether `candidate` matches the stored passphrase.
+    ///
+    /// Used by the CLI rotate handler to detect a no-op rotation (old == new) so
+    /// it can emit a warning without aborting.
+    pub(crate) fn passphrase_eq(&self, candidate: &SecretString) -> bool {
+        use secrecy::ExposeSecret;
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            self.passphrase.expose_secret().as_bytes(),
+            candidate.expose_secret().as_bytes(),
+        ))
+    }
+
     /// Construct from the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`
     /// environment variables.
     ///

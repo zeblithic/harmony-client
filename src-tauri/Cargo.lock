@@ -1874,6 +1874,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zenoh",
  "zeroize",

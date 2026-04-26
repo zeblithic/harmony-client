@@ -42,6 +42,7 @@ chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 secrecy = "0.10"
 subtle = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Pin pre-release PQ crypto deps to match the harmony workspace.
 # These RC crates have breaking changes between point releases; without

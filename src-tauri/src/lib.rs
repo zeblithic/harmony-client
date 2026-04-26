@@ -2800,6 +2800,72 @@ async fn e2e_close_window(app: AppHandle, label: String) -> Result<(), String> {
     Ok(())
 }
 
+// ── CLI entry points ─────────────────────────────────────────────────────
+
+/// CLI entry point for `harmony-app rotate-passphrase`.
+///
+/// Refusal conditions (in order):
+///   1. OS keychain has an identity → refuse with explanation
+///   2. HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set → refuse
+///   3. --new-passphrase-file unreadable / empty → refuse
+///   4. New passphrase byte-identical to old → log warning, proceed
+///
+/// Returns Ok(()) on successful rotation; Err on any refusal or rotation
+/// failure. Caller (main.rs) translates Err into a non-zero exit.
+pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<(), String> {
+    use identity::KeyStore as _;
+    use secrecy::SecretString;
+
+    // Refusal 1: keychain has identity.
+    if let Ok(kc) = identity::KeychainStore::new() {
+        if let Ok(Some(_)) = kc.load() {
+            return Err(
+                "your identity is currently in the OS keychain; passphrase rotation only applies to headless installs. \
+                 Re-encryption of keychain entries is handled by the OS when you change your login password.".to_string(),
+            );
+        }
+    }
+
+    // Resolve old passphrase via the standard env chain.
+    let plaintext_path = identity::resolve_path(None)?;
+    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let old_store = identity::EncryptedFileStore::from_env(enc_path)?
+        .ok_or_else(|| {
+            "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — cannot rotate without the old passphrase".to_string()
+        })?;
+
+    // Read the new passphrase file (same parsing rules as HARMONY_PASSPHRASE_FILE).
+    let raw = std::fs::read(new_passphrase_file)
+        .map_err(|e| format!("--new-passphrase-file={} could not be read: {e}", new_passphrase_file.display()))?;
+    let mut new_str = String::from_utf8(raw).map_err(|_| {
+        format!(
+            "--new-passphrase-file={} is not valid UTF-8",
+            new_passphrase_file.display()
+        )
+    })?;
+    if new_str.ends_with("\r\n") {
+        new_str.truncate(new_str.len() - 2);
+    } else if new_str.ends_with('\n') {
+        new_str.truncate(new_str.len() - 1);
+    }
+    if new_str.is_empty() {
+        return Err(format!(
+            "--new-passphrase-file={} contains an empty passphrase (after trimming one trailing newline)",
+            new_passphrase_file.display()
+        ));
+    }
+
+    // Warn if no-op rotation.
+    let candidate = SecretString::from(new_str.clone());
+    if old_store.passphrase_eq(&candidate) {
+        tracing::warn!("new passphrase matches old — proceeding anyway");
+    }
+
+    // Rotate.
+    identity::rotate_passphrase(&old_store, candidate)?;
+    Ok(())
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 pub fn run() {
