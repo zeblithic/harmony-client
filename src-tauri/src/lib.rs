@@ -12,7 +12,7 @@ pub mod content_index;
 pub mod event_loop;
 pub mod folders;
 mod follows;
-mod identity;
+pub mod identity;
 pub mod mail;
 pub mod mail_sync;
 pub mod voice;
@@ -2797,6 +2797,93 @@ async fn e2e_close_window(app: AppHandle, label: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&label) {
         window.close().map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+// ── CLI entry points ─────────────────────────────────────────────────────
+
+/// CLI entry point for `harmony-app rotate-passphrase`.
+///
+/// Refusal conditions (in order):
+///   1. OS keychain has an identity → refuse with explanation
+///   2. HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set → refuse
+///   3. --new-passphrase-file unreadable / empty → refuse
+///   4. New passphrase byte-identical to old → log warning, proceed
+///
+/// Returns Ok(()) on successful rotation; Err on any refusal or rotation
+/// failure. Caller (main.rs) translates Err into a non-zero exit.
+pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<(), String> {
+    use identity::KeyStore as _;
+    use secrecy::SecretString;
+
+    // Refusal 1: keychain has identity, or its state can't be determined.
+    // Failing closed on load() Err is important — if we can't tell whether the
+    // identity is in the keychain, we must NOT rotate the encrypted file
+    // (the rotation would silently target the wrong backend).
+    //
+    // KeychainStore::new() Err is trickier. The strict-correct posture is to
+    // also fail closed, but that breaks the legitimate headless case (Linux
+    // server with no Secret Service / no D-Bus session — the entire point of
+    // the encrypted-file backend). The keyring crate's error type doesn't
+    // cleanly distinguish "no backend on this system" from "backend present
+    // but transiently unreachable", so we can't auto-discriminate. Compromise:
+    // log a loud warning on new() Err so an operator on a misconfigured
+    // desktop sees a signal, and proceed (the typical headless case is
+    // benign). Operators with both a populated OS keychain and an .enc file
+    // who hit a transient keychain failure mid-rotation could rotate the
+    // wrong backend; this is a known niche risk documented here.
+    match identity::KeychainStore::new() {
+        Ok(kc) => match kc.load() {
+            Ok(Some(_)) => {
+                return Err(
+                    "your identity is currently in the OS keychain; passphrase rotation only applies to headless installs. \
+                     Re-encryption of keychain entries is handled by the OS when you change your login password.".to_string(),
+                );
+            }
+            Ok(None) => {
+                // Keychain reachable and empty → safe to rotate the .enc backend.
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not determine whether the identity is stored in the OS keychain — refusing to rotate to avoid acting on the wrong backend: {e}"
+                ));
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "OS keychain backend unavailable ({e}); proceeding with encrypted-file \
+                 rotation. If you have a desktop install where the keychain SHOULD be \
+                 reachable, this may indicate a transient or configuration issue and the \
+                 rotation could affect a different backend than your active identity. \
+                 On a headless install (typical case for this command) this is expected."
+            );
+        }
+    }
+
+    // Resolve old passphrase via the standard env chain.
+    let plaintext_path = identity::resolve_path(None)?;
+    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let old_store = identity::EncryptedFileStore::from_env(enc_path)?
+        .ok_or_else(|| {
+            "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — cannot rotate without the old passphrase".to_string()
+        })?;
+
+    // Read the new passphrase file via the same parser as HARMONY_PASSPHRASE_FILE
+    // — UTF-8, exactly one trailing newline strip, empty rejection, AND the
+    // 0600-mode warning the inline version was missing.
+    let new_str = identity::parse_passphrase_file(new_passphrase_file)
+        .map_err(|e| format!("--new-passphrase-file={} {e}", new_passphrase_file.display()))?;
+
+    // Move into SecretString immediately so the plaintext String is consumed
+    // (no second copy lingers on the heap unzeroed). passphrase_eq takes a
+    // borrow, then rotate_passphrase moves the SecretString through.
+    let candidate = SecretString::from(new_str);
+    if old_store.passphrase_eq(&candidate) {
+        tracing::warn!("new passphrase matches old — proceeding anyway");
+    }
+
+    // Rotate.
+    identity::rotate_passphrase(&old_store, candidate)?;
     Ok(())
 }
 

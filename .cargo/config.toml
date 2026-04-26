@@ -1,0 +1,13 @@
+# Workspace-level cargo config.
+#
+# ML-DSA scalar NTT keygen requires ~2 MB of stack. Default Rust thread stacks
+# are 2 MB but `cargo test` uses smaller worker threads. Bumping RUST_MIN_STACK
+# lets every test that allocates a PqPrivateIdentity skip the explicit
+# `std::thread::Builder::new().stack_size(...)` boilerplate.
+#
+# NOTE: src-tauri/.cargo/config.toml also sets RUST_MIN_STACK with
+# `force = true` (for Zenoh / Tokio worker stacks). Cargo merges outer →
+# inner configs and requires the same value type for a given key; we use
+# the table form here to stay compatible.
+[env]
+RUST_MIN_STACK = { value = "8388608" }  # 8 MiB
