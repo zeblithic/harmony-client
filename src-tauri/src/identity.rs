@@ -444,11 +444,16 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
             .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?,
     );
 
-    let blob_arr: [u8; BLOB_LEN] = plaintext
+    // Validate length, then copy directly into a Zeroizing-protected buffer
+    // (no intermediate unprotected stack array). The borrowed slice points
+    // into `plaintext`'s heap buffer, which is itself in Zeroizing<Vec<u8>>.
+    let plaintext_slice: &[u8; BLOB_LEN] = plaintext
         .as_slice()
         .try_into()
         .map_err(|_| format!("decrypted plaintext was {} bytes, expected {}", plaintext.len(), BLOB_LEN))?;
-    Ok(Zeroizing::new(blob_arr))
+    let mut blob_arr: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
+    blob_arr.copy_from_slice(plaintext_slice);
+    Ok(blob_arr)
 }
 
 // ── KeyStore trait ──────────────────────────────────────────────────────
@@ -943,14 +948,31 @@ fn save_with_fallback(
 
     if keychain_healthy {
         let kc = keychain.expect("keychain_healthy implies Some(keychain)");
-        match kc.save(id).and_then(|_| verify_round_trip(kc, id)) {
+        // Save and verify are split deliberately: a save Err means nothing
+        // landed in the keychain, so we can safely fall back to encrypted.
+        // A verify Err is different — the save APPEARED to succeed (the
+        // keychain may now contain a corrupt entry that load_or_generate's
+        // step 1 would prefer on next boot), so we MUST NOT fall back; doing
+        // so would mask the corruption and the user's real identity would
+        // diverge between the two backends. Verify Err is terminal here.
+        match kc.save(id) {
             Ok(()) => {
+                if let Err(verify_err) = verify_round_trip(kc, id) {
+                    tracing::error!(
+                        "keychain save succeeded but verify-after-write failed: {verify_err}. \
+                         The keychain entry may be corrupt and would be preferred over any \
+                         encrypted-file fallback on next boot. Refusing to proceed. Manual \
+                         cleanup likely needed: delete the 'harmony/identity' keychain entry \
+                         before retrying."
+                    );
+                    return Err(verify_err);
+                }
                 tracing::info!("identity stored in OS keychain");
                 return Ok(());
             }
             Err(e) => {
                 tracing::warn!(
-                    "keychain save/verify failed: {e}; trying encrypted fallback if available"
+                    "keychain save failed: {e}; trying encrypted fallback if available"
                 );
                 keychain_err = Some(e);
             }
