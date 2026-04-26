@@ -171,6 +171,101 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+// ── Verify-after-write helper ──────────────────────────────────────────
+
+/// After a `KeyStore::save`, immediately re-read and byte-compare against the
+/// expected identity. Constant-time comparison via the `subtle` crate.
+///
+/// Returns Err if the store doesn't return what was written — never used as a
+/// "should I delete the source?" check on its own; it's a precondition for
+/// any destructive cleanup (legacy plaintext unlink, .bak removal).
+fn verify_round_trip(store: &dyn KeyStore, expected: &NodeIdentity) -> Result<(), String> {
+    let loaded = store
+        .load()?
+        .ok_or_else(|| "verify-after-write returned None from store".to_string())?;
+    let expected_blob = identity_to_blob(expected);
+    let loaded_blob = identity_to_blob(&loaded);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        expected_blob.as_slice(),
+        loaded_blob.as_slice(),
+    )) {
+        return Err(
+            "identity store verify-after-write failed: store does not return what was written".to_string(),
+        );
+    }
+    Ok(())
+}
+
+// ── Legacy .bak cleanup ────────────────────────────────────────────────
+
+/// Best-effort cleanup of a legacy `identity.key.bak` from the pre-encryption
+/// code path. Removes only when the .bak content matches the in-memory identity
+/// AND the live store's verify-round-trip succeeds.
+///
+/// All failure modes log warnings and leave the .bak in place — this is
+/// defensive cleanup, not a hard guarantee.
+fn cleanup_legacy_bak(plaintext_path: &Path, in_memory: &NodeIdentity, store: &dyn KeyStore) {
+    let bak = plaintext_path.with_extension("key.bak");
+    if !bak.exists() {
+        return;
+    }
+
+    let bak_id = match LegacyPlaintextReader::read_from(&bak) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::warn!(
+                path = %bak.display(),
+                "legacy .bak unreadable (file disappeared) — leaving in place"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %bak.display(),
+                error = %e,
+                "legacy .bak unreadable — leaving in place"
+            );
+            return;
+        }
+    };
+
+    let expected_blob = identity_to_blob(in_memory);
+    let bak_blob = identity_to_blob(&bak_id);
+    let identities_match = bool::from(subtle::ConstantTimeEq::ct_eq(
+        expected_blob.as_slice(),
+        bak_blob.as_slice(),
+    ));
+    if !identities_match {
+        tracing::warn!(
+            path = %bak.display(),
+            "legacy .bak present but identity differs from current — leaving in place; manual review needed"
+        );
+        return;
+    }
+
+    // Verify the live store actually returns the same identity before deleting.
+    if let Err(e) = verify_round_trip(store, in_memory) {
+        tracing::warn!(
+            path = %bak.display(),
+            error = %e,
+            "legacy .bak NOT removed: live store verify failed"
+        );
+        return;
+    }
+
+    match std::fs::remove_file(&bak) {
+        Ok(()) => tracing::info!(
+            path = %bak.display(),
+            "removed legacy plaintext .bak after verifying live store has matching identity"
+        ),
+        Err(e) => tracing::warn!(
+            path = %bak.display(),
+            error = %e,
+            "legacy .bak removal failed — manual cleanup needed"
+        ),
+    }
+}
+
 // ── Encrypted file wire format helpers ─────────────────────────────────
 
 /// Encode a 161-byte identity blob into the 230-byte encrypted-file format.
@@ -1480,6 +1575,84 @@ mod tests {
                 .unwrap()
                 .expect("should read plaintext via static method");
             assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
+        }
+    }
+
+    mod legacy_bak_cleanup {
+        use super::*;
+
+        fn fresh_identity() -> NodeIdentity {
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            NodeIdentity { pq, ed25519 }
+        }
+
+        #[test]
+        fn matching_bak_deleted_after_keychain_verify() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            let bak_path = dir.path().join("identity.key.bak");
+
+            let id = fresh_identity();
+            // Pre-populate .bak with the same identity that's in the keychain.
+            FileStore::new(bak_path.clone()).save(&id).unwrap();
+
+            let keychain = KeychainStore::new_mock();
+            keychain.save(&id).unwrap();
+
+            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
+
+            assert!(!bak_path.exists(), ".bak should be removed");
+        }
+
+        #[test]
+        fn mismatched_bak_left_in_place() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            let bak_path = dir.path().join("identity.key.bak");
+
+            let id_in_use = fresh_identity();
+            let id_in_bak = fresh_identity();  // different
+            FileStore::new(bak_path.clone()).save(&id_in_bak).unwrap();
+
+            let keychain = KeychainStore::new_mock();
+            keychain.save(&id_in_use).unwrap();
+
+            cleanup_legacy_bak(&plaintext_path, &id_in_use, &keychain);
+
+            assert!(bak_path.exists(), ".bak with mismatched identity must be preserved");
+        }
+
+        #[test]
+        fn unreadable_bak_left_in_place() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            let bak_path = dir.path().join("identity.key.bak");
+
+            // Write garbage to .bak (not a valid 161-byte identity blob).
+            std::fs::write(&bak_path, b"not a valid identity blob").unwrap();
+
+            let id = fresh_identity();
+            let keychain = KeychainStore::new_mock();
+            keychain.save(&id).unwrap();
+
+            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
+
+            assert!(bak_path.exists(), "unreadable .bak must be preserved");
+        }
+
+        #[test]
+        fn no_bak_no_op() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            // No .bak exists.
+
+            let id = fresh_identity();
+            let keychain = KeychainStore::new_mock();
+            keychain.save(&id).unwrap();
+
+            // Should not panic / error.
+            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
         }
     }
 }
