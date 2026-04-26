@@ -235,7 +235,11 @@ fn encrypt_with_params(
 /// Indistinguishable error for wrong-passphrase vs corrupted-ciphertext to
 /// avoid leaking which case occurred (an attacker who can probe with arbitrary
 /// passphrases gains no signal from the error message).
-fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<[u8; BLOB_LEN], String> {
+///
+/// Returns `Zeroizing<[u8; BLOB_LEN]>` so the caller's stack-resident copy of
+/// the plaintext key bytes is wiped on drop. The intermediate `Vec<u8>` from
+/// `cipher.decrypt(...)` is also wrapped in `Zeroizing` before any further use.
+fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use chacha20poly1305::{
         aead::{Aead, KeyInit, Payload},
@@ -305,15 +309,18 @@ fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<[u8; BLOB_LEN], String> {
         msg: ciphertext_with_tag,
         aad: &bytes[..HEADER_LEN],
     };
-    let plaintext = cipher
-        .decrypt(XNonce::from_slice(nonce), payload)
-        .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
+    // Wrap the AEAD output Vec in Zeroizing immediately so it is wiped on drop.
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(XNonce::from_slice(nonce), payload)
+            .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?,
+    );
 
-    let blob: [u8; BLOB_LEN] = plaintext
+    let blob_arr: [u8; BLOB_LEN] = plaintext
         .as_slice()
         .try_into()
         .map_err(|_| format!("decrypted plaintext was {} bytes, expected {}", plaintext.len(), BLOB_LEN))?;
-    Ok(blob)
+    Ok(Zeroizing::new(blob_arr))
 }
 
 // ── KeyStore trait ──────────────────────────────────────────────────────
@@ -513,9 +520,10 @@ impl KeyStore for EncryptedFileStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
         };
+        // `decrypt` returns Zeroizing<[u8; BLOB_LEN]> — the stack array's bytes
+        // are wiped on drop. blob_to_identity reads the slice without copying.
         let blob = decrypt(self.passphrase.expose_secret().as_bytes(), &raw)?;
-        let blob_buf = Zeroizing::new(blob.to_vec());
-        let identity = blob_to_identity(&blob_buf)?;
+        let identity = blob_to_identity(blob.as_slice())?;
         Ok(Some(identity))
     }
 
