@@ -213,9 +213,11 @@ fn cleanup_legacy_bak(plaintext_path: &Path, in_memory: &NodeIdentity, store: &d
     let bak_id = match LegacyPlaintextReader::read_from(&bak) {
         Ok(Some(id)) => id,
         Ok(None) => {
+            // TOCTOU: file was present at the .exists() check above but gone
+            // by the time read_from() opened it.
             tracing::warn!(
                 path = %bak.display(),
-                "legacy .bak unreadable (file disappeared) — leaving in place"
+                "legacy .bak disappeared between existence check and read — leaving in place"
             );
             return;
         }
