@@ -496,6 +496,7 @@ use secrecy::{ExposeSecret, SecretString};
 /// Used as the headless fallback when no OS keychain is reachable. Keyed from
 /// the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` environment variables
 /// — see `Self::from_env` (added in Task 6).
+#[derive(Debug)]
 pub(crate) struct EncryptedFileStore {
     path: PathBuf,
     passphrase: SecretString,
@@ -510,6 +511,72 @@ impl EncryptedFileStore {
     /// Path to the on-disk file (used by callers like `rotate_passphrase`).
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Construct from the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`
+    /// environment variables.
+    ///
+    /// Returns:
+    ///   - `Ok(None)` if neither env var is set
+    ///   - `Ok(Some(store))` if a non-empty passphrase resolves
+    ///   - `Err(...)` if either var is set but malformed (empty, file unreadable,
+    ///     resolves to empty)
+    ///
+    /// Precedence: `HARMONY_PASSPHRASE` (direct) wins over `HARMONY_PASSPHRASE_FILE`
+    /// when both are set; a warning is logged.
+    pub(crate) fn from_env(path: PathBuf) -> Result<Option<Self>, String> {
+        let direct = std::env::var("HARMONY_PASSPHRASE").ok();
+        let file_path = std::env::var("HARMONY_PASSPHRASE_FILE").ok();
+
+        if direct.is_some() && file_path.is_some() {
+            tracing::warn!(
+                "both HARMONY_PASSPHRASE and HARMONY_PASSPHRASE_FILE are set; HARMONY_PASSPHRASE takes precedence"
+            );
+        }
+
+        let passphrase_str = if let Some(s) = direct {
+            if s.is_empty() {
+                return Err("HARMONY_PASSPHRASE is set to an empty string".to_string());
+            }
+            s
+        } else if let Some(file_path) = file_path {
+            let raw = std::fs::read(&file_path)
+                .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} could not be read: {e}"))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&file_path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %file_path,
+                            mode = format!("{mode:#05o}"),
+                            "HARMONY_PASSPHRASE_FILE has open permissions, should be 0600"
+                        );
+                    }
+                }
+            }
+
+            // Strip exactly one trailing \n or \r\n.
+            let mut s = String::from_utf8(raw)
+                .map_err(|_| format!("HARMONY_PASSPHRASE_FILE={file_path} is not valid UTF-8"))?;
+            if s.ends_with("\r\n") {
+                s.truncate(s.len() - 2);
+            } else if s.ends_with('\n') {
+                s.truncate(s.len() - 1);
+            }
+            if s.is_empty() {
+                return Err(format!(
+                    "HARMONY_PASSPHRASE_FILE={file_path} contains an empty passphrase (after trimming one trailing newline)"
+                ));
+            }
+            s
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self::new(path, SecretString::from(passphrase_str))))
     }
 }
 
@@ -1234,6 +1301,132 @@ mod tests {
 
             let err = store.load().unwrap_err();
             assert!(err.contains("expected 230 bytes"), "got: {err}");
+        }
+    }
+
+    mod env {
+        use super::*;
+        use serial_test::serial;
+        use secrecy::ExposeSecret;
+
+        const HARMONY_PASSPHRASE: &str = "HARMONY_PASSPHRASE";
+        const HARMONY_PASSPHRASE_FILE: &str = "HARMONY_PASSPHRASE_FILE";
+
+        /// Clear both env vars before each test to avoid cross-test leakage.
+        fn clear_env() {
+            std::env::remove_var(HARMONY_PASSPHRASE);
+            std::env::remove_var(HARMONY_PASSPHRASE_FILE);
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_no_env_var() {
+            clear_env();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            assert!(EncryptedFileStore::from_env(path).unwrap().is_none());
+        }
+
+        #[test]
+        #[serial]
+        fn direct_env_var_set() {
+            clear_env();
+            std::env::set_var(HARMONY_PASSPHRASE, "foo");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            assert_eq!(store.passphrase.expose_secret(), "foo");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn file_var_set_strips_trailing_lf() {
+            clear_env();
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"bar\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&pass_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
+
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            assert_eq!(store.passphrase.expose_secret(), "bar");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn file_var_set_strips_trailing_crlf() {
+            clear_env();
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"bar\r\n").unwrap();
+            std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
+
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            assert_eq!(store.passphrase.expose_secret(), "bar");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn direct_wins_over_file() {
+            clear_env();
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"from_file").unwrap();
+            std::env::set_var(HARMONY_PASSPHRASE, "from_env");
+            std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
+
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            assert_eq!(store.passphrase.expose_secret(), "from_env");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn empty_direct_hard_fails() {
+            clear_env();
+            std::env::set_var(HARMONY_PASSPHRASE, "");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let err = EncryptedFileStore::from_env(path).unwrap_err();
+            assert!(err.contains("empty"), "got: {err}");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn empty_file_hard_fails() {
+            clear_env();
+            let dir = tempfile::tempdir().unwrap();
+            let pass_file = dir.path().join("pass.txt");
+            std::fs::write(&pass_file, b"\n").unwrap();  // strips to empty
+            std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
+
+            let path = dir.path().join("identity.enc");
+            let err = EncryptedFileStore::from_env(path).unwrap_err();
+            assert!(err.contains("empty"), "got: {err}");
+            clear_env();
+        }
+
+        #[test]
+        #[serial]
+        fn missing_file_hard_fails() {
+            clear_env();
+            std::env::set_var(HARMONY_PASSPHRASE_FILE, "/nonexistent/passphrase/file");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let err = EncryptedFileStore::from_env(path).unwrap_err();
+            assert!(err.contains("could not be read"), "got: {err}");
+            clear_env();
         }
     }
 
