@@ -283,7 +283,8 @@ fn cleanup_legacy_bak(plaintext_path: &Path, in_memory: &NodeIdentity, store: &d
 ///
 /// Caller supplies salt and nonce explicitly so the function is deterministic
 /// for testing. Production code generates fresh random values per save.
-fn encrypt_with_params(
+#[doc(hidden)]
+pub fn encrypt_with_params(
     passphrase: &[u8],
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -345,7 +346,8 @@ fn encrypt_with_params(
 /// Returns `Zeroizing<[u8; BLOB_LEN]>` so the caller's stack-resident copy of
 /// the plaintext key bytes is wiped on drop. The intermediate `Vec<u8>` from
 /// `cipher.decrypt(...)` is also wrapped in `Zeroizing` before any further use.
-fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
+#[doc(hidden)]
+pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use chacha20poly1305::{
         aead::{Aead, KeyInit, Payload},
@@ -1000,6 +1002,15 @@ fn warn_permissions(path: &Path) {
             );
         }
     }
+}
+
+/// Test-only re-exports. Used by integration tests in `tests/` to pin the
+/// wire format. Production code MUST NOT use these.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod test_only {
+    pub use super::decrypt as decrypt_for_test;
+    pub use super::encrypt_with_params as encrypt_with_params_for_test;
 }
 
 #[cfg(test)]

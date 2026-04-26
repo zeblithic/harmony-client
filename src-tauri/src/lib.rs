@@ -12,7 +12,7 @@ pub mod content_index;
 pub mod event_loop;
 pub mod folders;
 mod follows;
-mod identity;
+pub mod identity;
 pub mod mail;
 pub mod mail_sync;
 pub mod voice;
