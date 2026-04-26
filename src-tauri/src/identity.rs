@@ -883,6 +883,33 @@ pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
     load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref(), plaintext_path)
 }
 
+/// Re-encrypt the identity at `old.path()` with `new_passphrase`.
+///
+/// Loads the identity using the old store's passphrase, writes back to the same
+/// path with the new passphrase (fresh salt + nonce, atomic rename), and
+/// verifies the round-trip before returning.
+///
+/// Caller-side concerns (keychain check, env var resolution, CLI wiring) live
+/// in `main.rs` — this function is the pure key-rotation primitive.
+pub(crate) fn rotate_passphrase(
+    old: &EncryptedFileStore,
+    new_passphrase: SecretString,
+) -> Result<(), String> {
+    let identity = old
+        .load()?
+        .ok_or_else(|| {
+            format!(
+                "no encrypted identity to rotate at {}",
+                old.path().display()
+            )
+        })?;
+
+    let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
+    new_store.save(&identity)?;
+    verify_round_trip(&new_store, &identity)?;
+    Ok(())
+}
+
 /// A `CredentialApi` implementation that always returns `NoEntry` on reads
 /// and `Error::Invalid` on writes. Used only in tests for failure-path coverage.
 #[cfg(test)]
@@ -1743,6 +1770,97 @@ mod tests {
 
             // Should not panic / error.
             cleanup_legacy_bak(&plaintext_path, &id, &keychain);
+        }
+    }
+
+    mod rotation {
+        use super::*;
+        use secrecy::SecretString;
+
+        fn fresh_identity() -> NodeIdentity {
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            NodeIdentity { pq, ed25519 }
+        }
+
+        #[test]
+        fn rotate_happy_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+
+            let pass_a = SecretString::from("pass_a".to_string());
+            let pass_b = SecretString::from("pass_b".to_string());
+
+            let id = fresh_identity();
+            let id_addr = id.ed25519.public_identity().address_hash;
+
+            // Write with A.
+            EncryptedFileStore::new(path.clone(), pass_a.clone())
+                .save(&id)
+                .unwrap();
+
+            // Rotate to B.
+            let store_a = EncryptedFileStore::new(path.clone(), pass_a.clone());
+            rotate_passphrase(&store_a, pass_b.clone()).unwrap();
+
+            // B can decrypt.
+            let loaded = EncryptedFileStore::new(path.clone(), pass_b)
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.ed25519.public_identity().address_hash, id_addr);
+
+            // A can no longer decrypt.
+            let err = EncryptedFileStore::new(path, pass_a).load().unwrap_err();
+            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+        }
+
+        #[test]
+        fn rotate_wrong_old_passphrase_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+
+            EncryptedFileStore::new(path.clone(), SecretString::from("real".to_string()))
+                .save(&fresh_identity())
+                .unwrap();
+
+            let bytes_before = std::fs::read(&path).unwrap();
+
+            let wrong = EncryptedFileStore::new(path.clone(), SecretString::from("wrong".to_string()));
+            let err = rotate_passphrase(&wrong, SecretString::from("new".to_string())).unwrap_err();
+            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+
+            // File untouched.
+            let bytes_after = std::fs::read(&path).unwrap();
+            assert_eq!(bytes_before, bytes_after, "file must not be modified on auth failure");
+        }
+
+        #[test]
+        fn rotate_to_same_passphrase_succeeds_with_new_salt_nonce() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let pass = SecretString::from("same".to_string());
+
+            EncryptedFileStore::new(path.clone(), pass.clone())
+                .save(&fresh_identity())
+                .unwrap();
+            let bytes_before = std::fs::read(&path).unwrap();
+
+            let store = EncryptedFileStore::new(path.clone(), pass.clone());
+            rotate_passphrase(&store, pass.clone()).unwrap();
+
+            let bytes_after = std::fs::read(&path).unwrap();
+            assert_ne!(bytes_before, bytes_after, "salt+nonce must rotate even when passphrase is same");
+        }
+
+        #[test]
+        fn rotate_no_file_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path, SecretString::from("any".to_string()));
+
+            let err = rotate_passphrase(&store, SecretString::from("new".to_string())).unwrap_err();
+            assert!(err.contains("no encrypted identity to rotate"), "got: {err}");
         }
     }
 }
