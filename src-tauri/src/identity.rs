@@ -615,6 +615,58 @@ impl KeyStore for KeychainStore {
     }
 }
 
+// ── Passphrase-file parser ─────────────────────────────────────────────
+
+/// Read a passphrase from `path`, with the same parsing rules used for
+/// `HARMONY_PASSPHRASE_FILE` and the `--new-passphrase-file` CLI flag:
+///
+///   1. Read raw bytes
+///   2. Warn (Unix only) if the file mode is more permissive than 0600
+///   3. UTF-8 decode (zeroizing the bytes if decode fails)
+///   4. Strip exactly one trailing `\r\n` or `\n`
+///   5. Reject empty result
+///
+/// Returned errors are *unprefixed* — callers add their own context (e.g.,
+/// "HARMONY_PASSPHRASE_FILE=<path> ..." or "--new-passphrase-file=<path> ...")
+/// because the same parser is invoked from both env-var and CLI paths.
+pub(crate) fn parse_passphrase_file(path: &Path) -> Result<String, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("could not be read: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:#05o}"),
+                    "passphrase file has open permissions, should be 0600"
+                );
+            }
+        }
+    }
+
+    // On UTF-8 failure, the FromUtf8Error owns the original Vec<u8> — zeroize
+    // those bytes before dropping the error so the (sensitive) raw passphrase
+    // bytes don't linger on the heap.
+    let mut s = String::from_utf8(raw).map_err(|e| {
+        use zeroize::Zeroize;
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        "is not valid UTF-8".to_string()
+    })?;
+    if s.ends_with("\r\n") {
+        s.truncate(s.len() - 2);
+    } else if s.ends_with('\n') {
+        s.truncate(s.len() - 1);
+    }
+    if s.is_empty() {
+        return Err("contains an empty passphrase (after trimming one trailing newline)".to_string());
+    }
+    Ok(s)
+}
+
 // ── EncryptedFileStore ─────────────────────────────────────────────────
 
 use secrecy::{ExposeSecret, SecretString};
@@ -689,38 +741,8 @@ impl EncryptedFileStore {
             }
             s
         } else if let Some(file_path) = file_path {
-            let raw = std::fs::read(&file_path)
-                .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} could not be read: {e}"))?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&file_path) {
-                    let mode = meta.permissions().mode() & 0o777;
-                    if mode & 0o077 != 0 {
-                        tracing::warn!(
-                            path = %file_path,
-                            mode = format!("{mode:#05o}"),
-                            "HARMONY_PASSPHRASE_FILE has open permissions, should be 0600"
-                        );
-                    }
-                }
-            }
-
-            // Strip exactly one trailing \n or \r\n.
-            let mut s = String::from_utf8(raw)
-                .map_err(|_| format!("HARMONY_PASSPHRASE_FILE={file_path} is not valid UTF-8"))?;
-            if s.ends_with("\r\n") {
-                s.truncate(s.len() - 2);
-            } else if s.ends_with('\n') {
-                s.truncate(s.len() - 1);
-            }
-            if s.is_empty() {
-                return Err(format!(
-                    "HARMONY_PASSPHRASE_FILE={file_path} contains an empty passphrase (after trimming one trailing newline)"
-                ));
-            }
-            s
+            parse_passphrase_file(Path::new(&file_path))
+                .map_err(|e| format!("HARMONY_PASSPHRASE_FILE={file_path} {e}"))?
         } else {
             return Ok(None);
         };

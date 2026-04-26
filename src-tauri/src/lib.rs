@@ -2834,26 +2834,11 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
             "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — cannot rotate without the old passphrase".to_string()
         })?;
 
-    // Read the new passphrase file (same parsing rules as HARMONY_PASSPHRASE_FILE).
-    let raw = std::fs::read(new_passphrase_file)
-        .map_err(|e| format!("--new-passphrase-file={} could not be read: {e}", new_passphrase_file.display()))?;
-    let mut new_str = String::from_utf8(raw).map_err(|_| {
-        format!(
-            "--new-passphrase-file={} is not valid UTF-8",
-            new_passphrase_file.display()
-        )
-    })?;
-    if new_str.ends_with("\r\n") {
-        new_str.truncate(new_str.len() - 2);
-    } else if new_str.ends_with('\n') {
-        new_str.truncate(new_str.len() - 1);
-    }
-    if new_str.is_empty() {
-        return Err(format!(
-            "--new-passphrase-file={} contains an empty passphrase (after trimming one trailing newline)",
-            new_passphrase_file.display()
-        ));
-    }
+    // Read the new passphrase file via the same parser as HARMONY_PASSPHRASE_FILE
+    // — UTF-8, exactly one trailing newline strip, empty rejection, AND the
+    // 0600-mode warning the inline version was missing.
+    let new_str = identity::parse_passphrase_file(new_passphrase_file)
+        .map_err(|e| format!("--new-passphrase-file={} {e}", new_passphrase_file.display()))?;
 
     // Move into SecretString immediately so the plaintext String is consumed
     // (no second copy lingers on the heap unzeroed). passphrase_eq takes a
