@@ -127,9 +127,14 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
         }
     }
 
+    // Per-write unique temp file: a high-entropy suffix plus `create_new` makes
+    // staging exclusive, so two processes (or two threads) writing the same
+    // identity never share a `.tmp` and never publish a partial file. The
+    // `create_new` flag also turns any pre-existing collision into an error
+    // we surface rather than silently truncating someone else's in-flight save.
     let tmp_path = {
         let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(".tmp");
+        name.push(format!(".{:016x}.tmp", rand::random::<u64>()));
         path.with_file_name(name)
     };
 
@@ -147,8 +152,7 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(&tmp_path)
                 .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
@@ -157,8 +161,7 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let f = {
             std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&tmp_path)
                 .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
         };
