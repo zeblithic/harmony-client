@@ -1088,7 +1088,22 @@ pub(crate) fn rotate_passphrase(
 
     let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
     new_store.save(&identity)?;
-    verify_round_trip(&new_store, &identity)?;
+    // After save() returns Ok, the file at `old.path()` has been atomically
+    // replaced and is now decryptable ONLY by the new passphrase. A
+    // verify-after-write failure here is a transient I/O / corruption signal,
+    // not a "rotation didn't happen" signal — the operator MUST keep the new
+    // passphrase or they lose access to their identity. Rewrite the error so
+    // a panicked operator doesn't discard the new passphrase file.
+    verify_round_trip(&new_store, &identity).map_err(|e| {
+        format!(
+            "{} was rewritten with the new passphrase, but the verify-after-write \
+             read-back failed: {e}. The new passphrase is now REQUIRED to decrypt \
+             this file — do NOT discard the new passphrase file. Investigate the \
+             read-back failure (disk error? concurrent writer?) and re-run \
+             rotate-passphrase if needed once the underlying issue is resolved.",
+            old.path().display()
+        )
+    })?;
     Ok(())
 }
 
