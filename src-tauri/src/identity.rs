@@ -767,10 +767,12 @@ impl KeyStore for EncryptedFileStore {
 
     fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
         let blob = identity_to_blob(identity);
-        let blob_arr: [u8; BLOB_LEN] = blob
-            .as_slice()
-            .try_into()
-            .expect("identity_to_blob always returns BLOB_LEN bytes");
+        // Wrap the fixed-size copy in Zeroizing so the second plaintext-key
+        // buffer is wiped on drop. The original `blob: Zeroizing<Vec<u8>>` is
+        // already protected; without this, dropping the owned `[u8; BLOB_LEN]`
+        // at end of scope would leave key bytes on the stack.
+        let mut blob_arr: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
+        blob_arr.copy_from_slice(blob.as_slice());
 
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
