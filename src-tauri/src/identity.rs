@@ -878,20 +878,20 @@ fn load_or_generate_with_stores(
     // Step 3: legacy plaintext migration.
     let legacy = LegacyPlaintextReader::new(plaintext_path.to_path_buf());
     if let Some(id) = legacy.read()? {
-        // Pick destination: keychain > encrypted > hard fail.
-        if keychain_healthy {
-            let kc = keychain.expect("keychain_healthy implies Some(keychain)");
-            kc.save(&id)?;
-            verify_round_trip(kc, &id)?;
-        } else if let Some(enc) = encrypted {
-            enc.save(&id)?;
-            verify_round_trip(enc, &id)?;
-        } else {
-            return Err(format!(
-                "plaintext identity at {} needs a destination but no keychain available and HARMONY_PASSPHRASE not set — see docs/headless-install.md",
+        save_with_fallback(
+            keychain_healthy,
+            keychain,
+            encrypted,
+            &id,
+            || format!(
+                "plaintext identity at {} needs a destination but no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md",
                 plaintext_path.display()
-            ));
-        }
+            ),
+            |e| format!(
+                "plaintext identity at {} could not be migrated: keychain save failed ({e}) and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md",
+                plaintext_path.display()
+            ),
+        )?;
         // Verified copy is in the destination; unlink the plaintext.
         if let Err(e) = std::fs::remove_file(plaintext_path) {
             tracing::warn!(
@@ -908,21 +908,65 @@ fn load_or_generate_with_stores(
         pq: PqPrivateIdentity::generate(&mut rand::rngs::OsRng),
         ed25519: PrivateIdentity::generate(&mut rand::rngs::OsRng),
     };
+    save_with_fallback(
+        keychain_healthy,
+        keychain,
+        encrypted,
+        &id,
+        || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
+        |e| format!(
+            "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
+        ),
+    )?;
+    Ok(id)
+}
+
+/// Save `id` to the preferred destination (keychain > encrypted), with
+/// fallback when the keychain save/verify fails. Used by both the legacy
+/// migration path (step 3) and the fresh-generate path (step 4) so the
+/// destination-selection-with-fallback logic isn't duplicated.
+///
+/// `no_dest_err` produces the error returned when no destination is available
+/// at all (no keychain, no encrypted store). `keychain_failed_no_enc_err`
+/// produces the error returned when the keychain was tried, the save failed,
+/// AND there's no encrypted store to fall back to — the keychain failure
+/// message is passed to it for context.
+fn save_with_fallback(
+    keychain_healthy: bool,
+    keychain: Option<&KeychainStore>,
+    encrypted: Option<&EncryptedFileStore>,
+    id: &NodeIdentity,
+    no_dest_err: impl FnOnce() -> String,
+    keychain_failed_no_enc_err: impl FnOnce(&str) -> String,
+) -> Result<(), String> {
+    let mut keychain_err: Option<String> = None;
+
     if keychain_healthy {
         let kc = keychain.expect("keychain_healthy implies Some(keychain)");
-        kc.save(&id)?;
-        verify_round_trip(kc, &id)?;
-        tracing::info!("new identity stored in OS keychain");
-    } else if let Some(enc) = encrypted {
-        enc.save(&id)?;
-        verify_round_trip(enc, &id)?;
-        tracing::info!(path = %enc.path().display(), "new identity stored in encrypted file");
-    } else {
-        return Err(
-            "no identity store available: keychain unavailable and HARMONY_PASSPHRASE not set — see docs/headless-install.md".to_string(),
-        );
+        match kc.save(id).and_then(|_| verify_round_trip(kc, id)) {
+            Ok(()) => {
+                tracing::info!("identity stored in OS keychain");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "keychain save/verify failed: {e}; trying encrypted fallback if available"
+                );
+                keychain_err = Some(e);
+            }
+        }
     }
-    Ok(id)
+
+    if let Some(enc) = encrypted {
+        enc.save(id)?;
+        verify_round_trip(enc, id)?;
+        tracing::info!(path = %enc.path().display(), "identity stored in encrypted file");
+        Ok(())
+    } else if let Some(e) = keychain_err {
+        Err(keychain_failed_no_enc_err(&e))
+    } else {
+        Err(no_dest_err())
+    }
 }
 
 /// Public entry point — resolves env-derived encrypted store, attempts the
@@ -953,7 +997,22 @@ pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
     }
 
     let enc_path = plaintext_path.with_file_name("identity.enc");
-    let encrypted = EncryptedFileStore::from_env(enc_path)?;
+    // Env-var error tolerance: if the keychain is available as a possible
+    // destination (construction succeeded), an unreadable HARMONY_PASSPHRASE_FILE
+    // or empty HARMONY_PASSPHRASE is a warning rather than a hard fail — the
+    // chain can still mint into the keychain. If no keychain is available at
+    // all, the env var is the only path forward and its errors stay fatal.
+    let encrypted = match EncryptedFileStore::from_env(enc_path) {
+        Ok(opt) => opt,
+        Err(e) if keychain.is_some() => {
+            tracing::warn!(
+                "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE configured but invalid \
+                 ({e}); ignoring — keychain is available as fallback"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
 
     load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref(), plaintext_path)
 }
@@ -1749,6 +1808,45 @@ mod tests {
             assert_eq!(
                 from_enc.ed25519.public_identity().address_hash,
                 result.ed25519.public_identity().address_hash,
+            );
+        }
+
+        /// Step 4 (fresh generate) used to hard-fail when the keychain accepted
+        /// load (Ok(None)) but rejected save — even when an encrypted store
+        /// was configured. This test covers the post-fix behavior: keychain
+        /// save failure falls back to the encrypted backend rather than
+        /// hard-failing.
+        #[test]
+        fn keychain_save_failure_falls_back_to_encrypted_on_fresh() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            let enc_path = dir.path().join("identity.enc");
+
+            // new_failing_mock: load returns NoEntry (so step 1's Ok(None)
+            // sets keychain_healthy = true), but save returns Err.
+            let keychain = KeychainStore::new_failing_mock();
+            let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
+
+            let result = load_or_generate_with_stores(
+                Some(&keychain),
+                Some(&encrypted),
+                &plaintext_path,
+            )
+            .expect("must fall back to encrypted, not hard-fail");
+
+            assert!(enc_path.exists(), "encrypted file should be the destination");
+            let from_enc = encrypted
+                .load()
+                .unwrap()
+                .expect("encrypted store should hold the new identity");
+            assert_eq!(
+                from_enc.ed25519.public_identity().address_hash,
+                result.ed25519.public_identity().address_hash,
+            );
+            // Sanity: the keychain entry was NOT persisted (mock fails save).
+            assert!(
+                keychain.load().unwrap().is_none(),
+                "failing keychain mock must not have persisted anything"
             );
         }
 
