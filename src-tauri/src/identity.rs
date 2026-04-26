@@ -1144,14 +1144,18 @@ mod tests {
         }
 
         #[test]
-        fn tampered_kdf_params_fails_aad() {
+        fn tampered_kdf_params_fails() {
             let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            // Flip a byte in kdf_m_kib (offset 6..10) — part of AAD
+            // Flip a byte in kdf_m_kib (offset 6..10). For v1 this fires the
+            // strict-equality KDF param check (which also avoids allocating
+            // attacker-controlled Argon2 memory). The 13-byte header is also
+            // bound as AAD, so even if the strict check were ever removed, the
+            // Poly1305 tag would reject the same tamper — defense in depth.
             bytes[7] ^= 0x01;
             let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
             assert!(
                 err.contains("wrong passphrase or corrupted file"),
-                "AAD binding should reject param tampering, got: {err}"
+                "tampered KDF params must be rejected, got: {err}"
             );
         }
 
