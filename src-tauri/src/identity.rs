@@ -176,6 +176,17 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
             path.display()
         )
     })?;
+    // fsync the parent directory so the new directory entry survives a crash
+    // immediately after rename. Without this, the temp file's contents are
+    // durable but the rename is not. Unix-only (Windows doesn't expose
+    // directory fsync via std).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| format!("Failed to open {} for fsync: {e}", parent.display()))?;
+        dir.sync_all()
+            .map_err(|e| format!("Failed to fsync {}: {e}", parent.display()))?;
+    }
     std::mem::forget(guard);
     Ok(())
 }
