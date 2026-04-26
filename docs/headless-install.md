@@ -75,10 +75,11 @@ If you upgrade from an earlier harmony-client that wrote plaintext to
 
 - **With keychain available**: harmony migrates plaintext → keychain on first
   launch, verifies, then deletes the plaintext file. No `.bak` is left.
-- **Headless with `HARMONY_PASSPHRASE` set**: same migration, destination is
-  `~/.harmony/identity.enc`.
-- **Headless without `HARMONY_PASSPHRASE`**: harmony refuses to start with a
-  hard error pointing here. Set the env var and re-launch.
+- **Headless with `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE` set**: same
+  migration, destination is `~/.harmony/identity.enc`.
+- **Headless without `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE`**: harmony
+  refuses to start with a hard error pointing here. Set one of the env vars and
+  re-launch.
 
 A `.bak` file from earlier code that did keep backups is auto-cleaned on first
 launch after harmony verifies the live store has the same identity.
@@ -118,11 +119,11 @@ both up to separate storage if you can't tolerate identity loss.
 
 | Error | Meaning | Fix |
 |---|---|---|
-| `no identity store available: keychain unavailable and HARMONY_PASSPHRASE not set` | Step 4 in resolution chain | Set `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE`, or install/start a Secret Service provider |
+| `no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set` | Step 4 in resolution chain | Set `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE`, or install/start a Secret Service provider |
 | `identity store could not be decrypted: wrong passphrase or corrupted file` | AEAD tag rejected | Verify the passphrase exactly matches what was used to encrypt; do not regenerate identity unless you accept losing it |
 | `identity store is in an unrecognized format` | Old binary, newer file | Upgrade harmony-client |
 | `identity store verify-after-write failed` | The store accepted the write but returned different bytes — keychain/disk corruption | File a bug; do not retry blindly |
-| `plaintext identity at <path> needs a destination but no keychain available and HARMONY_PASSPHRASE not set` | Existing plaintext file but no destination to migrate it to | Set `HARMONY_PASSPHRASE` or run on a system with a keychain — harmony will migrate the plaintext on next launch |
+| `plaintext identity at <path> needs a destination but no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set` | Existing plaintext file but no destination to migrate it to | Set `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE`, or run on a system with a keychain — harmony will migrate the plaintext on next launch |
 
 ## Not yet supported
 
