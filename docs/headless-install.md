@@ -39,7 +39,11 @@ Environment=HARMONY_PASSPHRASE_FILE=/etc/harmony/passphrase
 User=harmony
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/harmony
+# harmony-app stores the encrypted identity at $HOME/.harmony/identity.enc;
+# whitelist that path under ProtectSystem=strict so the daemon can create and
+# rotate it. (If you'd rather store identity outside $HOME, set HOME explicitly
+# and adjust this path to match.)
+ReadWritePaths=/home/harmony/.harmony
 ```
 
 ## Docker

@@ -43,7 +43,7 @@ cleanup of legacy `.bak` files from the prior code, and adds a
 
 ### Three storage layers
 
-```
+```text
 ┌─────────────────┐
 │ KeychainStore   │ ── implements KeyStore  (load + save)
 └─────────────────┘     unchanged from ZEB-34
@@ -65,14 +65,14 @@ cleanup of legacy `.bak` files from the prior code, and adds a
 
 `FileStore` is removed. The plaintext file format is read-only via
 `LegacyPlaintextReader`; we never write a fresh plaintext file again.
-The trait stays at three methods — `load`, `save` — and only the two
+The trait stays at two methods — `load`, `save` — and only the two
 modern stores implement it.
 
 ### Resolution chain
 
 `load_or_generate_with_stores` becomes:
 
-```
+```text
 1. match keychain.load() {
        Ok(Some(id)) → cleanup_legacy_bak(plaintext_path, &id, &keychain); return id
        Ok(None)     → fall through  (no entry yet)
@@ -198,7 +198,7 @@ keeps the `.tmp → fsync → rename + TmpGuard` semantics that already work.
 
 Fixed-size, network byte order, totally self-describing. 230 bytes total.
 
-```
+```text
 offset  size  field
 ------  ----  -----
 0       4     magic            = b"HRMI"
@@ -363,8 +363,8 @@ The error type stays `Result<_, String>` to match the existing
 
 | Condition | Error message | Why hard-fail |
 |---|---|---|
-| Plaintext exists + no keychain healthy + no `HARMONY_PASSPHRASE` | `"plaintext identity at <path> needs a destination but no keychain available and HARMONY_PASSPHRASE not set — see docs/headless-install.md"` | Deleting plaintext without a verified destination = identity loss |
-| Fresh generate needed + no keychain healthy + no `HARMONY_PASSPHRASE` | `"no identity store available: keychain unavailable and HARMONY_PASSPHRASE not set — see docs/headless-install.md"` | Falling back to plaintext is the bug we are fixing |
+| Plaintext exists + no keychain healthy + no `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` | `"plaintext identity at <path> needs a destination but no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md"` | Deleting plaintext without a verified destination = identity loss |
+| Fresh generate needed + no keychain healthy + no `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` | `"no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md"` | Falling back to plaintext is the bug we are fixing |
 | `EncryptedFileStore::load` AEAD tag fails | `"identity store at <path> could not be decrypted: wrong passphrase or corrupted file"` | Indistinguishable on purpose — do not leak which |
 | `EncryptedFileStore::load` format/magic/version mismatch | `"identity store at <path> is in an unrecognized format (magic=<…>, version=<…>) — this build may be too old"` | Older binary on newer file → bail loudly, do not regenerate |
 | `EncryptedFileStore::load` length mismatch | `"identity store at <path> is corrupt: expected 230 bytes, got <N>"` | File is truncated or wrong type — bail |
@@ -522,7 +522,7 @@ The pinned fixture above.
 - OpenWRT params tuning
 - Cross-store divergence detection
 
-**Total tally: ~35 new tests on top of the existing 9 → ~44 total.**
+**Final test tally:** 52 lib `identity` tests passing (4 baseline KeychainStore/FileStore + 3 LegacyPlaintextReader + 9 wire_format + 7 EncryptedFileStore + 8 env + 4 legacy_bak_cleanup + 12 resolution_chain + 4 rotation + 1 keychain-Err fall-through), plus 1 wire-format-fixture integration test. The 2 `rotate_passphrase_cli` integration tests are `#[ignore]`d by default (probe the real OS keychain — opt in via `--ignored` on environments with a known-clean keychain).
 
 ## Documentation: `docs/headless-install.md`
 
@@ -544,7 +544,7 @@ code so it stays in sync. Outline:
 
 ## Crate / file layout
 
-```
+```text
 harmony-client/
 ├── docs/
 │   ├── specs/
