@@ -496,6 +496,10 @@ use secrecy::{ExposeSecret, SecretString};
 /// Used as the headless fallback when no OS keychain is reachable. Keyed from
 /// the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` environment variables
 /// — see `Self::from_env` (added in Task 6).
+//
+// Debug is safe to derive: SecretString (secrecy 0.10) formats as
+// `SecretBox<str>([REDACTED])`. If new secret-bearing fields are added they
+// must use a `secrecy` wrapper, or this derive must become a manual impl.
 #[derive(Debug)]
 pub(crate) struct EncryptedFileStore {
     path: PathBuf,
