@@ -43,6 +43,12 @@ fn no_old_passphrase_env_refuses() {
 #[ignore = "probes real OS keychain — may hang on macOS dev machines; opt-in via --ignored"]
 #[serial]
 fn missing_new_passphrase_file_refuses() {
+    // Clear BOTH env vars first — if the runner inherits HARMONY_PASSPHRASE_FILE
+    // from the surrounding shell, from_env would read THAT file instead of
+    // exercising the refusal-2 path the test targets, and the assertion below
+    // would shift to a different error string.
+    env::remove_var("HARMONY_PASSPHRASE");
+    env::remove_var("HARMONY_PASSPHRASE_FILE");
     env::set_var("HARMONY_PASSPHRASE", "old");
 
     let dir = tempfile::tempdir().unwrap();

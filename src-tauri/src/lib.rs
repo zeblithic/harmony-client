@@ -2816,15 +2816,31 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     use identity::KeyStore as _;
     use secrecy::SecretString;
 
-    // Refusal 1: keychain has identity.
+    // Refusal 1: keychain has identity, or its state can't be determined.
+    // Failing closed on Err is important — if we can't tell whether the
+    // identity is in the keychain, we must NOT rotate the encrypted file
+    // (the rotation would silently target the wrong backend).
     if let Ok(kc) = identity::KeychainStore::new() {
-        if let Ok(Some(_)) = kc.load() {
-            return Err(
-                "your identity is currently in the OS keychain; passphrase rotation only applies to headless installs. \
-                 Re-encryption of keychain entries is handled by the OS when you change your login password.".to_string(),
-            );
+        match kc.load() {
+            Ok(Some(_)) => {
+                return Err(
+                    "your identity is currently in the OS keychain; passphrase rotation only applies to headless installs. \
+                     Re-encryption of keychain entries is handled by the OS when you change your login password.".to_string(),
+                );
+            }
+            Ok(None) => {
+                // Keychain reachable and empty → safe to rotate the .enc backend.
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not determine whether the identity is stored in the OS keychain — refusing to rotate to avoid acting on the wrong backend: {e}"
+                ));
+            }
         }
     }
+    // KeychainStore::new() returning Err means no keychain available at all
+    // (e.g., headless Linux with no Secret Service) — that's the expected
+    // headless install state, so it's safe to proceed.
 
     // Resolve old passphrase via the standard env chain.
     let plaintext_path = identity::resolve_path(None)?;
