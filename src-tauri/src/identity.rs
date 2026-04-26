@@ -396,9 +396,18 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
     let nonce: &[u8; NONCE_LEN] = bytes[NONCE_OFF..CIPHER_OFF].try_into().unwrap();
     let ciphertext_with_tag = &bytes[CIPHER_OFF..ENC_FILE_LEN];
 
-    // Invalid params most likely indicate tampering (a flipped bit in the
-    // header can produce values below Argon2's minimum). Return the
-    // indistinguishable error so an attacker learns nothing from probing.
+    // Strict v1 KDF param check: refuse to allocate Argon2 memory on
+    // attacker-controlled values. The AAD binding via the Poly1305 tag would
+    // reject mismatched params eventually, but only AFTER hash_password_into
+    // attempts the m_kib allocation — which is a DoS vector if m_kib is
+    // 16 GiB. v1 hardcodes all three params, so any other value is either a
+    // future format (handled by the format_version check above) or tampering.
+    // Return the indistinguishable error to leak nothing about which it is.
+    if m_kib != KDF_M_KIB || t != KDF_T as u32 || p != KDF_P as u32 {
+        return Err(
+            "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
+        );
+    }
     let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN))
         .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -889,9 +898,26 @@ fn load_or_generate_with_stores(
 ///   2. ~/.harmony/identity.enc  (if HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE set)
 ///   3. ~/.harmony/identity.key  (legacy plaintext — migrated to (1) or (2), then unlinked)
 ///   4. Generate fresh keys (stored in (1) or (2); HARD FAIL if neither available)
+///
+/// Fast-path: if the keychain returns a stored identity, this function returns
+/// immediately *without* probing the env vars. That guarantees a desktop user
+/// with a stale `HARMONY_PASSPHRASE_FILE` pointing at a removed/unreadable file
+/// can still boot — the keychain is the source of truth and `from_env`
+/// configuration errors only matter when the keychain doesn't have the answer.
 pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
-    let enc_path = plaintext_path.with_file_name("identity.enc");
     let keychain = KeychainStore::new().ok();
+
+    // Fast-path: keychain hit short-circuits before any env-var resolution.
+    if let Some(kc) = &keychain {
+        if let Ok(Some(id)) = kc.load() {
+            cleanup_legacy_bak(plaintext_path, &id, kc);
+            return Ok(id);
+        }
+        // Ok(None) or Err: fall through to the full chain, which re-probes
+        // and treats the empty/error case correctly.
+    }
+
+    let enc_path = plaintext_path.with_file_name("identity.enc");
     let encrypted = EncryptedFileStore::from_env(enc_path)?;
 
     load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref(), plaintext_path)

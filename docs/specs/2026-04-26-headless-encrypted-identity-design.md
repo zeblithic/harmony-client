@@ -205,7 +205,7 @@ offset  size  field
 4       1     format_version   = 0x01
 5       1     kdf_id           = 0x01 (Argon2id)
 6       4     kdf_m_kib        u32 BE  (memory in KiB; 65536 = 64 MiB)
-10      4     kdf_t            u32 BE  (time/iterations; 3)
+10      2     kdf_t            u16 BE  (time/iterations; 3)
 12      1     kdf_p            u8       (parallelism; 1)
 13      16    salt             OsRng
 29      24    nonce            OsRng (XChaCha20 needs 192-bit nonce)
