@@ -845,9 +845,10 @@ fn load_or_generate_with_stores(
     encrypted: Option<&EncryptedFileStore>,
     plaintext_path: &Path,
 ) -> Result<NodeIdentity, String> {
+    // Step 1: keychain probe. Inlined here (rather than delegating to the
+    // shared `_post_probe` below) so callers that already probed don't pay
+    // a second `kc.load()` round-trip — see `load_or_generate_with_keychain`.
     let mut keychain_healthy = false;
-
-    // Step 1: keychain.
     if let Some(kc) = keychain {
         match kc.load() {
             Ok(Some(id)) => {
@@ -855,7 +856,7 @@ fn load_or_generate_with_stores(
                 return Ok(id);
             }
             Ok(None) => {
-                keychain_healthy = true;  // present but empty
+                keychain_healthy = true; // present but empty
             }
             Err(e) => {
                 // keychain_healthy stays false (its initial value) — we'll fall
@@ -866,6 +867,24 @@ fn load_or_generate_with_stores(
         }
     }
 
+    load_or_generate_with_stores_post_probe(
+        keychain,
+        keychain_healthy,
+        encrypted,
+        plaintext_path,
+    )
+}
+
+/// Steps 2-4 of the resolution chain. Split from `load_or_generate_with_stores`
+/// so the outer `load_or_generate_with_keychain` entry point can supply its own
+/// probe result without doing the keychain `load()` twice. The caller is
+/// responsible for any `cleanup_legacy_bak` that would have happened in step 1.
+fn load_or_generate_with_stores_post_probe(
+    keychain: Option<&KeychainStore>,
+    keychain_healthy: bool,
+    encrypted: Option<&EncryptedFileStore>,
+    plaintext_path: &Path,
+) -> Result<NodeIdentity, String> {
     // Step 2: encrypted file (if env var set).
     if let Some(enc) = encrypted {
         match enc.load() {
@@ -1062,7 +1081,16 @@ pub(crate) fn load_or_generate_with_keychain(
         Err(e) => return Err(e),
     };
 
-    load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref(), plaintext_path)
+    // Skip the inner step-1 probe — we already did it above, and on a healthy
+    // boot path the keychain backend is real I/O (Secret Service round-trip
+    // on Linux, OS API on macOS / Windows). Reuse `keychain_probe_ok` as the
+    // `keychain_healthy` flag — both mean "keychain responded with no entry".
+    load_or_generate_with_stores_post_probe(
+        keychain.as_ref(),
+        keychain_probe_ok,
+        encrypted.as_ref(),
+        plaintext_path,
+    )
 }
 
 /// Re-encrypt the identity at `old.path()` with `new_passphrase`.
