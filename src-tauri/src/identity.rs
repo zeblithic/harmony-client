@@ -89,6 +89,8 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Best-effort: ignore failures (directory may already exist with a
+            // different owner — common in containers / multi-user setups).
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
