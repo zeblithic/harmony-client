@@ -21,6 +21,25 @@ const PQ_KEY_LEN: usize = 96;
 const ED25519_KEY_LEN: usize = 64;
 const BLOB_LEN: usize = 1 + PQ_KEY_LEN + ED25519_KEY_LEN; // 161
 
+// ── Encrypted file wire format constants ───────────────────────────────
+
+const ENC_MAGIC: &[u8; 4] = b"HRMI";
+const ENC_FORMAT_VERSION: u8 = 0x01;
+const ENC_KDF_ID_ARGON2ID: u8 = 0x01;
+
+// Argon2id parameters (v1):
+const KDF_M_KIB: u32 = 65536;  // 64 MiB
+const KDF_T: u16 = 3;          // iterations
+const KDF_P: u8 = 1;           // parallelism
+const KDF_OUT_LEN: usize = 32; // XChaCha20-Poly1305 key length
+
+// Wire format offsets:
+const HEADER_LEN: usize = 13;   // magic(4) + version(1) + kdf_id(1) + m(4) + t(2) + p(1)
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24;    // XChaCha20 needs 192-bit nonce
+const TAG_LEN: usize = 16;      // Poly1305 tag
+const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN; // 230
+
 pub struct NodeIdentity {
     pub pq: PqPrivateIdentity,
     pub ed25519: PrivateIdentity,
@@ -150,6 +169,138 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })?;
     std::mem::forget(guard);
     Ok(())
+}
+
+// ── Encrypted file wire format helpers ─────────────────────────────────
+
+/// Encode a 161-byte identity blob into the 230-byte encrypted-file format.
+///
+/// Caller supplies salt and nonce explicitly so the function is deterministic
+/// for testing. Production code generates fresh random values per save.
+fn encrypt_with_params(
+    passphrase: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+    blob: &[u8; BLOB_LEN],
+) -> Vec<u8> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        XChaCha20Poly1305, XNonce,
+    };
+
+    // Build header (13 bytes — also serves as AAD).
+    let mut out = Vec::with_capacity(ENC_FILE_LEN);
+    out.extend_from_slice(ENC_MAGIC);
+    out.push(ENC_FORMAT_VERSION);
+    out.push(ENC_KDF_ID_ARGON2ID);
+    out.extend_from_slice(&KDF_M_KIB.to_be_bytes());
+    out.extend_from_slice(&KDF_T.to_be_bytes());
+    out.push(KDF_P);
+    debug_assert_eq!(out.len(), HEADER_LEN);
+
+    // Append salt, nonce.
+    out.extend_from_slice(salt);
+    out.extend_from_slice(nonce);
+    debug_assert_eq!(out.len(), HEADER_LEN + SALT_LEN + NONCE_LEN);
+
+    // KDF.
+    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
+        .expect("Argon2 params hardcoded valid");
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
+    argon
+        .hash_password_into(passphrase, salt, key.as_mut_slice())
+        .expect("Argon2 derivation cannot fail with hardcoded params");
+
+    // AEAD encrypt with header (first 13 bytes) as AAD.
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
+        .expect("32-byte key always valid");
+    let payload = Payload {
+        msg: blob,
+        aad: &out[..HEADER_LEN],
+    };
+    let ciphertext_with_tag = cipher
+        .encrypt(XNonce::from_slice(nonce), payload)
+        .expect("AEAD encrypt cannot fail with valid inputs");
+    debug_assert_eq!(ciphertext_with_tag.len(), BLOB_LEN + TAG_LEN);
+
+    out.extend_from_slice(&ciphertext_with_tag);
+    debug_assert_eq!(out.len(), ENC_FILE_LEN);
+    out
+}
+
+/// Decode a 230-byte encrypted-file blob back into the 161-byte identity blob.
+///
+/// Indistinguishable error for wrong-passphrase vs corrupted-ciphertext to
+/// avoid leaking which case occurred (an attacker who can probe with arbitrary
+/// passphrases gains no signal from the error message).
+fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<[u8; BLOB_LEN], String> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        XChaCha20Poly1305, XNonce,
+    };
+
+    if bytes.len() != ENC_FILE_LEN {
+        return Err(format!(
+            "identity store is corrupt: expected {ENC_FILE_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    if &bytes[0..4] != ENC_MAGIC {
+        return Err(format!(
+            "identity store is in an unrecognized format (magic={:?}) — this build may be too old",
+            &bytes[0..4]
+        ));
+    }
+    if bytes[4] != ENC_FORMAT_VERSION {
+        return Err(format!(
+            "identity store is in an unrecognized format (version={:#04x}) — this build may be too old",
+            bytes[4]
+        ));
+    }
+    if bytes[5] != ENC_KDF_ID_ARGON2ID {
+        return Err(format!(
+            "identity store is in an unrecognized format (kdf_id={:#04x}) — this build may be too old",
+            bytes[5]
+        ));
+    }
+
+    // Pull KDF params from the file (self-describing).
+    let m_kib = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
+    let t = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as u32;
+    let p = bytes[12] as u32;
+    let salt: &[u8; SALT_LEN] = bytes[13..29].try_into().unwrap();
+    let nonce: &[u8; NONCE_LEN] = bytes[29..53].try_into().unwrap();
+    let ciphertext_with_tag = &bytes[53..ENC_FILE_LEN];
+
+    // Invalid params most likely indicate tampering (a flipped bit in the
+    // header can produce values below Argon2's minimum). Return the
+    // indistinguishable error so an attacker learns nothing from probing.
+    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN))
+        .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
+    argon
+        .hash_password_into(passphrase, salt, key.as_mut_slice())
+        .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
+
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
+        .expect("32-byte key always valid");
+    let payload = Payload {
+        msg: ciphertext_with_tag,
+        aad: &bytes[..HEADER_LEN],
+    };
+    let plaintext = cipher
+        .decrypt(XNonce::from_slice(nonce), payload)
+        .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
+
+    let blob: [u8; BLOB_LEN] = plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("decrypted plaintext was {} bytes, expected {}", plaintext.len(), BLOB_LEN))?;
+    Ok(blob)
 }
 
 // ── KeyStore trait ──────────────────────────────────────────────────────
@@ -795,6 +946,97 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    mod wire_format {
+        use super::*;
+
+        const TEST_PASSPHRASE: &[u8] = b"correct horse battery staple";
+        const TEST_SALT: [u8; 16] = [0xAB; 16];
+        const TEST_NONCE: [u8; 24] = [0xCD; 24];
+        const TEST_BLOB: [u8; 161] = [0x42; 161];
+
+        #[test]
+        fn round_trip_correct_passphrase() {
+            let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            let decrypted = decrypt(TEST_PASSPHRASE, &bytes).unwrap();
+            assert_eq!(&decrypted[..], &TEST_BLOB[..]);
+        }
+
+        #[test]
+        fn wrong_passphrase_fails_aead() {
+            let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            let err = decrypt(b"wrong passphrase", &bytes).unwrap_err();
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "expected indistinguishable error, got: {err}"
+            );
+        }
+
+        #[test]
+        fn tampered_ciphertext_fails() {
+            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[100] ^= 0x01;  // flip one bit in the ciphertext range (53..214)
+            let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
+            assert!(err.contains("wrong passphrase or corrupted file"));
+        }
+
+        #[test]
+        fn tampered_kdf_params_fails_aad() {
+            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            // Flip a byte in kdf_m_kib (offset 6..10) — part of AAD
+            bytes[7] ^= 0x01;
+            let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "AAD binding should reject param tampering, got: {err}"
+            );
+        }
+
+        #[test]
+        fn tampered_magic_fails() {
+            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[0] = b'X';  // trash magic
+            let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
+            assert!(err.contains("unrecognized format"), "got: {err}");
+        }
+
+        #[test]
+        fn tampered_version_fails() {
+            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[4] = 0xFF;  // unknown version
+            let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
+            assert!(err.contains("unrecognized format"), "got: {err}");
+        }
+
+        #[test]
+        fn truncated_file_fails() {
+            let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            let err = decrypt(TEST_PASSPHRASE, &bytes[..200]).unwrap_err();
+            assert!(err.contains("expected 230 bytes"), "got: {err}");
+        }
+
+        #[test]
+        fn output_is_exactly_230_bytes() {
+            let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            assert_eq!(bytes.len(), 230);
+        }
+
+        #[test]
+        fn header_layout_is_exact() {
+            let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            // 230-byte file: 13-byte header, 16-byte salt, 24-byte nonce, 161-byte ciphertext, 16-byte tag.
+            // NOTE: kdf_t is u16 BE (not u32) so the header fits in 13 bytes total.
+            assert_eq!(&bytes[0..4], b"HRMI", "magic mismatch");
+            assert_eq!(bytes[4], 0x01, "format_version mismatch");
+            assert_eq!(bytes[5], 0x01, "kdf_id mismatch");
+            assert_eq!(&bytes[6..10], &65536u32.to_be_bytes(), "kdf_m_kib (u32 BE) mismatch");
+            assert_eq!(&bytes[10..12], &3u16.to_be_bytes(), "kdf_t (u16 BE) mismatch");
+            assert_eq!(bytes[12], 1, "kdf_p (u8) mismatch");
+            assert_eq!(&bytes[13..29], &TEST_SALT[..], "salt mismatch");
+            assert_eq!(&bytes[29..53], &TEST_NONCE[..], "nonce mismatch");
+            assert_eq!(bytes.len(), 230);
+        }
     }
 
     mod legacy_plaintext_reader {
