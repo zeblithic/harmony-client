@@ -267,13 +267,22 @@ fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<[u8; BLOB_LEN], String> {
         ));
     }
 
-    // Pull KDF params from the file (self-describing).
-    let m_kib = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
-    let t = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as u32;
-    let p = bytes[12] as u32;
-    let salt: &[u8; SALT_LEN] = bytes[13..29].try_into().unwrap();
-    let nonce: &[u8; NONCE_LEN] = bytes[29..53].try_into().unwrap();
-    let ciphertext_with_tag = &bytes[53..ENC_FILE_LEN];
+    // Pull KDF params from the file (self-describing). Offsets are derived from
+    // the named layout constants so a future format change automatically shifts
+    // every range — adding a new field would only require updating the constants.
+    const M_KIB_OFF: usize = 6;
+    const T_OFF: usize = M_KIB_OFF + 4; // = 10
+    const P_OFF: usize = T_OFF + 2; // = 12
+    const SALT_OFF: usize = HEADER_LEN; // = 13
+    const NONCE_OFF: usize = SALT_OFF + SALT_LEN; // = 29
+    const CIPHER_OFF: usize = NONCE_OFF + NONCE_LEN; // = 53
+
+    let m_kib = u32::from_be_bytes(bytes[M_KIB_OFF..M_KIB_OFF + 4].try_into().unwrap());
+    let t = u16::from_be_bytes(bytes[T_OFF..T_OFF + 2].try_into().unwrap()) as u32;
+    let p = bytes[P_OFF] as u32;
+    let salt: &[u8; SALT_LEN] = bytes[SALT_OFF..NONCE_OFF].try_into().unwrap();
+    let nonce: &[u8; NONCE_LEN] = bytes[NONCE_OFF..CIPHER_OFF].try_into().unwrap();
+    let ciphertext_with_tag = &bytes[CIPHER_OFF..ENC_FILE_LEN];
 
     // Invalid params most likely indicate tampering (a flipped bit in the
     // header can produce values below Argon2's minimum). Return the
@@ -282,6 +291,10 @@ fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<[u8; BLOB_LEN], String> {
         .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
+    // hash_password_into can return SaltTooShort/SaltTooLong (ruled out: salt is
+    // a fixed 16-byte slice from the file) or PwdTooLong (requires a >4 GiB
+    // passphrase — practically unreachable). Surfacing the specific error here
+    // is safe: it cannot be triggered by an adversary tampering with the file.
     argon
         .hash_password_into(passphrase, salt, key.as_mut_slice())
         .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
