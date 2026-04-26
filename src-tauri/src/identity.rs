@@ -1,15 +1,24 @@
 //! Node identity management — Ed25519 + post-quantum key generation and persistence.
 //!
-//! Storage backends:
-//! - `KeychainStore`         — OS-native keychain via the `keyring` crate (KeyStore impl)
-//! - `FileStore`             — binary file at `~/.harmony/identity.key` (KeyStore impl;
-//!                              transitional, will be retired in favour of the encrypted
-//!                              backend)
-//! - `LegacyPlaintextReader` — read-only migration helper; reads the legacy plaintext
-//!                              file but never writes one (intentionally NOT a KeyStore)
+//! Storage backends (production):
+//! - `KeychainStore`         — OS-native keychain via the `keyring` crate (primary on
+//!                              macOS / Windows / Linux-with-Secret-Service)
+//! - `EncryptedFileStore`    — Argon2id + XChaCha20-Poly1305 envelope at
+//!                              `~/.harmony/identity.enc`, keyed from the
+//!                              `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` env
+//!                              vars (headless installs without a keychain)
+//! - `LegacyPlaintextReader` — one-shot read-only migration helper for
+//!                              `~/.harmony/identity.key` written by older builds;
+//!                              intentionally NOT a `KeyStore` (no save method)
 //!
-//! `load_or_generate()` tries keychain first, migrates existing files,
-//! and falls back to file storage when no keychain is available.
+//! `FileStore` is retained behind `#[cfg(test)]` solely to write legacy plaintext
+//! fixtures — production code never writes plaintext at all.
+//!
+//! `load_or_generate()` runs the resolution chain: keychain → encrypted file →
+//! legacy plaintext (migrated, then unlinked) → fresh-generate. Hard-fails with a
+//! pointer to `docs/headless-install.md` when no destination is available rather
+//! than silently writing plaintext. Wrong passphrase on the encrypted file is a
+//! hard fail too — never silently regenerates identity.
 
 use std::path::{Path, PathBuf};
 
@@ -783,8 +792,10 @@ fn load_or_generate_with_stores(
                 keychain_healthy = true;  // present but empty
             }
             Err(e) => {
+                // keychain_healthy stays false (its initial value) — we'll fall
+                // through to step 2 / 3 / 4 and use whichever destination is
+                // available, treating the keychain as if it weren't present.
                 tracing::warn!("keychain load failed, trying next store: {e}");
-                keychain_healthy = false;
             }
         }
     }
@@ -1588,6 +1599,39 @@ mod tests {
             load_or_generate_with_stores(Some(&keychain), None, &plaintext_path).unwrap();
 
             assert!(!bak_path.exists(), "matching .bak should be auto-removed");
+        }
+
+        /// Keychain Err (transient OS-keychain failure) is recoverable: the
+        /// chain falls through to the encrypted backend rather than hard-failing.
+        /// This is the asymmetry between step 1 (recoverable) and step 2
+        /// (hard-fail) — exercised here with `new_load_failing_mock` which
+        /// errors on every load attempt.
+        #[test]
+        fn keychain_err_falls_through_to_encrypted() {
+            let dir = tempfile::tempdir().unwrap();
+            let plaintext_path = dir.path().join("identity.key");
+            let enc_path = dir.path().join("identity.enc");
+
+            let keychain = KeychainStore::new_load_failing_mock();
+            let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
+
+            let result = load_or_generate_with_stores(
+                Some(&keychain),
+                Some(&encrypted),
+                &plaintext_path,
+            )
+            .expect("keychain Err must fall through, not hard-fail");
+
+            // Identity ended up in the encrypted store, not the keychain.
+            assert!(enc_path.exists(), "encrypted file should be the destination");
+            let from_enc = encrypted
+                .load()
+                .unwrap()
+                .expect("encrypted store should hold the new identity");
+            assert_eq!(
+                from_enc.ed25519.public_identity().address_hash,
+                result.ed25519.public_identity().address_hash,
+            );
         }
 
         /// Legacy plaintext + corrupted destination would cause verify-round-trip
