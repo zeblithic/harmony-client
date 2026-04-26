@@ -1006,8 +1006,11 @@ fn warn_permissions(path: &Path) {
 
 /// Test-only re-exports. Used by integration tests in `tests/` to pin the
 /// wire format. Production code MUST NOT use these.
+///
+/// `decrypt_for_test` isn't called by any current test but is exported
+/// symmetrically with `encrypt_with_params_for_test` so future round-trip
+/// fixture tests can use either side without re-touching this module.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub mod test_only {
     pub use super::decrypt as decrypt_for_test;
     pub use super::encrypt_with_params as encrypt_with_params_for_test;
