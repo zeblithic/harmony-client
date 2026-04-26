@@ -475,6 +475,73 @@ impl KeyStore for KeychainStore {
     }
 }
 
+// ── EncryptedFileStore ─────────────────────────────────────────────────
+
+use secrecy::{ExposeSecret, SecretString};
+
+/// Passphrase-encrypted identity file at a given path.
+///
+/// On-disk format is the 230-byte layout produced by `encrypt_with_params`:
+/// Argon2id (m=64MiB, t=3, p=1) derives a 32-byte key for XChaCha20-Poly1305
+/// AEAD over the 161-byte identity blob. The 13-byte header (magic, version,
+/// kdf_id, KDF params) is bound as AAD.
+///
+/// Used as the headless fallback when no OS keychain is reachable. Keyed from
+/// the `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` environment variables
+/// — see `Self::from_env` (added in Task 6).
+pub(crate) struct EncryptedFileStore {
+    path: PathBuf,
+    passphrase: SecretString,
+}
+
+impl EncryptedFileStore {
+    /// Build a store backed by `path`, encrypted with `passphrase`.
+    pub(crate) fn new(path: PathBuf, passphrase: SecretString) -> Self {
+        Self { path, passphrase }
+    }
+
+    /// Path to the on-disk file (used by callers like `rotate_passphrase`).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl KeyStore for EncryptedFileStore {
+    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+        let raw = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
+        };
+        let blob = decrypt(self.passphrase.expose_secret().as_bytes(), &raw)?;
+        let blob_buf = Zeroizing::new(blob.to_vec());
+        let identity = blob_to_identity(&blob_buf)?;
+        Ok(Some(identity))
+    }
+
+    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
+        let blob = identity_to_blob(identity);
+        let blob_arr: [u8; BLOB_LEN] = blob
+            .as_slice()
+            .try_into()
+            .expect("identity_to_blob always returns BLOB_LEN bytes");
+
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce = [0u8; NONCE_LEN];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+        let bytes = encrypt_with_params(
+            self.passphrase.expose_secret().as_bytes(),
+            &salt,
+            &nonce,
+            &blob_arr,
+        );
+        write_atomic_0600(&self.path, &bytes)
+    }
+}
+
 // ── Public API (unchanged shape) ────────────────────────────────────────
 
 /// Resolve the identity file path. Uses `~/.harmony/identity.key` by default.
@@ -1049,6 +1116,116 @@ mod tests {
             assert_eq!(&bytes[13..29], &TEST_SALT[..], "salt mismatch");
             assert_eq!(&bytes[29..53], &TEST_NONCE[..], "nonce mismatch");
             assert_eq!(bytes.len(), 230);
+        }
+    }
+
+    mod encrypted_file_store {
+        use super::*;
+        use secrecy::SecretString;
+
+        fn fresh_identity() -> NodeIdentity {
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            NodeIdentity { pq, ed25519 }
+        }
+
+        fn fresh_passphrase() -> SecretString {
+            SecretString::from("correct horse battery staple".to_string())
+        }
+
+        #[test]
+        fn round_trip_correct_passphrase() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
+
+            let original = fresh_identity();
+            let original_addr = original.ed25519.public_identity().address_hash;
+
+            store.save(&original).unwrap();
+            let loaded = store.load().unwrap().expect("should find saved identity");
+            assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
+        }
+
+        #[test]
+        fn load_returns_none_when_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nonexistent.enc");
+            let store = EncryptedFileStore::new(path, fresh_passphrase());
+            assert!(store.load().unwrap().is_none());
+        }
+
+        #[test]
+        fn wrong_passphrase_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+
+            EncryptedFileStore::new(path.clone(), fresh_passphrase())
+                .save(&fresh_identity())
+                .unwrap();
+
+            let wrong = EncryptedFileStore::new(path, SecretString::from("wrong".to_string()));
+            let err = wrong.load().unwrap_err();
+            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+        }
+
+        #[test]
+        fn salt_rotates_per_save() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
+            let id = fresh_identity();
+
+            store.save(&id).unwrap();
+            let bytes_a = std::fs::read(&path).unwrap();
+            store.save(&id).unwrap();
+            let bytes_b = std::fs::read(&path).unwrap();
+
+            assert_ne!(bytes_a, bytes_b, "salt+nonce must rotate per save");
+            // Both must still load back to the same identity:
+            let loaded = store.load().unwrap().unwrap();
+            assert_eq!(
+                loaded.ed25519.public_identity().address_hash,
+                id.ed25519.public_identity().address_hash,
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn file_mode_0o600_unix() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
+
+            store.save(&fresh_identity()).unwrap();
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600, got {mode:#o}");
+        }
+
+        #[test]
+        fn file_is_exactly_230_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
+            store.save(&fresh_identity()).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 230);
+        }
+
+        #[test]
+        fn truncated_file_load_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
+            store.save(&fresh_identity()).unwrap();
+
+            // Truncate to 200 bytes.
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, &bytes[..200]).unwrap();
+
+            let err = store.load().unwrap_err();
+            assert!(err.contains("expected 230 bytes"), "got: {err}");
         }
     }
 
