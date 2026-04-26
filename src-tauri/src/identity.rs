@@ -203,6 +203,44 @@ impl KeyStore for FileStore {
     }
 }
 
+// ── LegacyPlaintextReader ───────────────────────────────────────────────
+
+/// Read-only reader for legacy plaintext identity files at `~/.harmony/identity.key`.
+///
+/// Deliberately does not implement `KeyStore` — there is no `save` and there
+/// will never be one. This type exists solely to migrate identities written by
+/// the pre-encryption code path into the modern keychain or encrypted-file
+/// backends.
+pub struct LegacyPlaintextReader {
+    path: PathBuf,
+}
+
+impl LegacyPlaintextReader {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Read the plaintext identity at `self.path`, or `Ok(None)` if missing.
+    pub fn read(&self) -> Result<Option<NodeIdentity>, String> {
+        Self::read_from(&self.path)
+    }
+
+    /// Free function variant — read plaintext identity from `path`, or
+    /// `Ok(None)` if missing.
+    pub fn read_from(path: &Path) -> Result<Option<NodeIdentity>, String> {
+        let raw = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+        };
+        let buf = Zeroizing::new(raw);
+        let identity = blob_to_identity(&buf)?;
+        #[cfg(unix)]
+        warn_permissions(path);
+        Ok(Some(identity))
+    }
+}
+
 // ── KeychainStore ───────────────────────────────────────────────────────
 
 const KEYCHAIN_SERVICE: &str = "harmony";
@@ -753,5 +791,50 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    mod legacy_plaintext_reader {
+        use super::*;
+
+        #[test]
+        fn read_existing_plaintext() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.key");
+
+            // Pre-populate via FileStore (which writes the same 161-byte format)
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let original = NodeIdentity { pq, ed25519 };
+            let original_addr = original.ed25519.public_identity().address_hash;
+            FileStore::new(path.clone()).save(&original).unwrap();
+
+            // Read back via LegacyPlaintextReader
+            let reader = LegacyPlaintextReader::new(path);
+            let loaded = reader.read().unwrap().expect("should read plaintext");
+            assert_eq!(
+                loaded.ed25519.public_identity().address_hash,
+                original_addr,
+            );
+        }
+
+        #[test]
+        fn read_returns_none_when_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nonexistent.key");
+            let reader = LegacyPlaintextReader::new(path);
+            assert!(reader.read().unwrap().is_none());
+        }
+
+        #[test]
+        fn read_from_static_method_works() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.key");
+            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
+            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
+            FileStore::new(path.clone()).save(&NodeIdentity { pq, ed25519 }).unwrap();
+
+            let loaded = LegacyPlaintextReader::read_from(&path).unwrap();
+            assert!(loaded.is_some());
+        }
     }
 }
