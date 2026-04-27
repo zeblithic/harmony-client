@@ -66,7 +66,7 @@ enum RestoreFormat {
     /// Read a passphrase-encrypted recovery file. Requires
     /// HARMONY_RECOVERY_PASSPHRASE / HARMONY_RECOVERY_PASSPHRASE_FILE.
     RecoveryFile {
-        #[arg(long, name = "in", value_name = "PATH")]
+        #[arg(long = "in", value_name = "PATH")]
         in_path: PathBuf,
     },
 }
