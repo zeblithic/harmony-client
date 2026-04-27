@@ -66,6 +66,22 @@ impl std::fmt::Debug for NodeIdentity {
     }
 }
 
+impl NodeIdentity {
+    /// Derive a `NodeIdentity` from a 32-byte master seed.
+    ///
+    /// Thin shim over `PrivateIdentity::from_seed` and
+    /// `PqPrivateIdentity::from_seed` (ZEB-177). Deterministic: the same
+    /// seed produces byte-identical sub-keys on every call. This is the
+    /// load-bearing invariant for the seed-on-disk storage model — every
+    /// launch reads the seed and re-derives the keypairs from scratch.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self {
+            pq: PqPrivateIdentity::from_seed(seed),
+            ed25519: PrivateIdentity::from_seed(seed),
+        }
+    }
+}
+
 // ── Serialization helpers (shared by both backends) ─────────────────────
 
 /// Serialize a `NodeIdentity` into the 161-byte binary format.
@@ -2112,6 +2128,23 @@ mod tests {
             // Should not panic / error.
             cleanup_legacy_bak(&plaintext_path, &id, &keychain);
         }
+    }
+
+    #[test]
+    fn from_seed_yields_same_node_identity_across_launches() {
+        let seed = [0x42u8; 32];
+        let id_a = NodeIdentity::from_seed(&seed);
+        let id_b = NodeIdentity::from_seed(&seed);
+        assert_eq!(
+            id_a.ed25519.to_private_bytes().as_slice(),
+            id_b.ed25519.to_private_bytes().as_slice(),
+            "Ed25519 sub-key must be deterministic across calls"
+        );
+        assert_eq!(
+            id_a.pq.to_private_bytes().as_slice(),
+            id_b.pq.to_private_bytes().as_slice(),
+            "PQ sub-key must be deterministic across calls"
+        );
     }
 
     mod rotation {
