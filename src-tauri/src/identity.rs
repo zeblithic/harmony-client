@@ -397,9 +397,9 @@ pub trait KeyStore {
 
 /// File-based identity storage at a given path.
 ///
-/// Test-only fixture helper for writing legacy plaintext blobs. Production
-/// code reads legacy plaintext through `LegacyPlaintextReader` and writes
-/// only through `KeychainStore` or `EncryptedFileStore`.
+/// Test-only fixture helper for writing seed blobs to a plaintext file at a
+/// given path. Production code never writes plaintext at all — the only
+/// backends are `KeychainStore` and `EncryptedFileStore`.
 #[cfg(test)]
 pub struct FileStore {
     path: PathBuf,
@@ -481,6 +481,14 @@ impl KeychainStore {
         let credential = AlwaysFailOnLoad;
         let entry = keyring::Entry::new_with_credential(Box::new(credential));
         Self { entry }
+    }
+
+    /// Delete the keychain entry. Returns `Ok(())` if deleted or not present.
+    ///
+    /// Used by `write_seed_to_disk_with_keychain` to best-effort unlink a stale
+    /// keychain entry after a successful force-write to the encrypted-file backend.
+    pub(crate) fn delete(&self) -> Result<(), keyring::Error> {
+        self.entry.delete_credential()
     }
 }
 
@@ -929,7 +937,48 @@ pub fn write_seed_to_disk_with_keychain(
         |e| format!(
             "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
         ),
-    )
+    )?;
+
+    // After save_with_fallback succeeds, with force=true: best-effort unlink
+    // the non-destination so the user can't be stranded on a stale backup
+    // after a future keychain clear or env-var change. save_with_fallback's
+    // preference order is keychain (if healthy) → encrypted file; we replicate
+    // that here to pick the OTHER side.
+    if force {
+        let wrote_to_keychain = keychain_healthy && keychain.is_some();
+        if wrote_to_keychain {
+            // Unlink the encrypted file if it exists. A leftover .enc with the
+            // pre-restore seed is the silent-failure scenario this guards against.
+            let enc_path = plaintext_path.with_file_name("identity.enc");
+            match std::fs::remove_file(&enc_path) {
+                Ok(()) => tracing::info!(
+                    path = %enc_path.display(),
+                    "removed stale encrypted-file backend after keychain force-restore"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Nothing to clean up.
+                }
+                Err(e) => tracing::warn!(
+                    path = %enc_path.display(),
+                    error = %e,
+                    "could not remove stale encrypted-file backend after keychain force-restore — manual cleanup may be needed"
+                ),
+            }
+        } else if let Some(kc) = &keychain {
+            // We wrote to the encrypted file; clean up the keychain if it
+            // had a previous entry.
+            match kc.delete() {
+                Ok(()) => tracing::info!("removed stale keychain entry after encrypted-file force-restore"),
+                Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
+                ),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Re-encrypt the identity at `old.path()` with `new_passphrase`.
@@ -1174,6 +1223,37 @@ mod tests {
 
         let reloaded = read_seed_from_disk(&plaintext_path).expect("reload");
         assert_eq!(*reloaded, new_seed, "after force-overwrite, the new seed must be present");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn force_unlinks_stale_encrypted_file_after_keychain_write() {
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+
+        // Seed both backends with different seeds. We use a healthy mock keychain
+        // for the keychain path; the encrypted file is real on disk.
+        std::env::set_var("HARMONY_PASSPHRASE", "force-cleanup-test");
+        let kc = KeychainStore::new_mock();
+        kc.save(&[0x11u8; 32]).unwrap();
+
+        let store = EncryptedFileStore::new(
+            enc_path.clone(),
+            SecretString::from("force-cleanup-test".to_string()),
+        );
+        store.save(&[0x22u8; 32]).unwrap();
+        assert!(enc_path.exists(), "test setup: enc file present");
+
+        // Force-write a third seed. With keychain healthy, save_with_fallback
+        // writes to keychain; the cleanup logic should unlink the stale .enc.
+        write_seed_to_disk_with_keychain(&plaintext_path, &[0x33u8; 32], true, Some(kc))
+            .expect("force write must succeed");
+        assert!(!enc_path.exists(), "stale enc file must be unlinked after keychain force-restore");
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
@@ -1537,16 +1617,6 @@ mod tests {
 
             let from_keychain = keychain.load().unwrap().expect("seed should be in keychain");
             assert_eq!(*from_keychain, *result);
-        }
-
-        #[test]
-        fn migrate_plaintext_to_keychain_and_unlink() {
-            // Post-ZEB-176: no plaintext migration. Seed saved directly to keychain.
-            let original = fresh_seed();
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&original).unwrap();
-            let result = load_or_generate_with_stores(Some(&keychain), None).unwrap();
-            assert_eq!(*result, original);
         }
 
         #[test]
