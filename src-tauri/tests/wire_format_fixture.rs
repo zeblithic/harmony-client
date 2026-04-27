@@ -16,7 +16,7 @@ use std::path::PathBuf;
 const TEST_PASSPHRASE: &[u8] = b"correct horse battery staple";
 const TEST_SALT: [u8; 16] = [0xAB; 16];
 const TEST_NONCE: [u8; 24] = [0xCD; 24];
-const TEST_BLOB: [u8; 161] = [0x42; 161];
+const TEST_BLOB: [u8; 32] = [0x42; 32];
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,7 +28,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn wire_format_v1_pinned() {
     let bytes = encrypt_with_params_for_test(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-    assert_eq!(bytes.len(), 230, "v1 format must be exactly 230 bytes");
+    assert_eq!(bytes.len(), 101, "v1 format must be exactly 101 bytes");
 
     let path = fixture_path();
 
