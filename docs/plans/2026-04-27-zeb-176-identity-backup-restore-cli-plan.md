@@ -960,7 +960,8 @@ Create `src-tauri/src/recovery_cli.rs` with:
 
 use std::path::Path;
 
-use harmony_owner::recovery::{RecoveryArtifact, RecoveryMetadata};
+use harmony_owner::lifecycle::RecoveryArtifact;
+use harmony_owner::recovery::RecoveryMetadata;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
@@ -1579,7 +1580,7 @@ Create `src-tauri/tests/recovery_cli_integration.rs`:
 //!   5. Verifies the restored seed yields the same master `identity_hash`.
 
 use harmony_app::{identity, recovery_cli};
-use harmony_owner::recovery::RecoveryArtifact;
+use harmony_owner::lifecycle::RecoveryArtifact;
 use serial_test::serial;
 
 fn plant_seed(plaintext_path: &std::path::Path, seed: &[u8; 32]) {
