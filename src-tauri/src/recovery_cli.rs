@@ -101,11 +101,11 @@ pub fn export_recovery_file_cli(
     };
     let bytes = artifact
         .to_encrypted_file(&passphrase, &metadata)
-        .map_err(|e| format!("Error: {e}"))?;
+        .map_err(|e| e.to_string())?;
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
     std::fs::write(out, &bytes)
-        .map_err(|e| format!("Error: failed to write {}: {e}", out.display()))?;
+        .map_err(|e| format!("failed to write {}: {e}", out.display()))?;
 
     eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
     eprintln!("identity-hash: {}", hex::encode(id_hash));
@@ -127,11 +127,11 @@ pub fn restore_mnemonic_cli(
 ) -> Result<(), String> {
     // Read the mnemonic file. Wrap in Zeroizing so the contents do not linger.
     let raw = std::fs::read_to_string(mnemonic_file)
-        .map_err(|e| format!("Error: failed to read {}: {e}", mnemonic_file.display()))?;
+        .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
 
     let artifact = RecoveryArtifact::from_mnemonic(raw.as_str())
-        .map_err(|e| format!("Error: {e}"))?;
+        .map_err(|e| e.to_string())?;
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
@@ -155,10 +155,10 @@ pub fn restore_recovery_file_cli(
     force: bool,
 ) -> Result<(), String> {
     let bytes = std::fs::read(in_path)
-        .map_err(|e| format!("Error: failed to read {}: {e}", in_path.display()))?;
+        .map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
     let passphrase = resolve_recovery_passphrase()?;
     let restored = RecoveryArtifact::from_encrypted_file(&bytes, &passphrase)
-        .map_err(|e| format!("Error: {e}"))?;
+        .map_err(|e| e.to_string())?;
     let artifact = restored.into_artifact();
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();

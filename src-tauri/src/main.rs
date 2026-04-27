@@ -119,7 +119,7 @@ fn main() {
                 match result {
                     Ok(()) => std::process::exit(0),
                     Err(e) => {
-                        eprintln!("{e}");
+                        eprintln!("Error: {e}");
                         std::process::exit(1);
                     }
                 }
@@ -152,7 +152,7 @@ fn main() {
                 match result {
                     Ok(()) => std::process::exit(0),
                     Err(e) => {
-                        eprintln!("{e}");
+                        eprintln!("Error: {e}");
                         std::process::exit(1);
                     }
                 }
