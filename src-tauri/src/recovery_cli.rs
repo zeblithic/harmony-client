@@ -39,6 +39,8 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
         }
         s
     } else if let Some(file_path) = file_path {
+        // parse_passphrase_file rejects empty content directly — no asymmetry
+        // with the direct-var branch.
         identity::parse_passphrase_file(Path::new(&file_path))
             .map_err(|e| format!("HARMONY_RECOVERY_PASSPHRASE_FILE={file_path} {e}"))?
     } else {
@@ -312,6 +314,43 @@ mod tests {
         let reloaded_seed = identity::read_seed_from_disk(&plaintext_path).unwrap();
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_mnemonic_round_trips_via_recovery_artifact() {
+        use crate::identity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        // Plant a known seed.
+        std::env::set_var("HARMONY_PASSPHRASE", "mnemonic-export-test");
+        let planted = [0xA7u8; 32];
+        identity::write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &planted,
+            /*force=*/ true,
+            None,
+        )
+        .unwrap();
+
+        // Call the CLI entry point. We cannot capture stdout/stderr from the
+        // unit test directly without process indirection, but we can confirm
+        // the function returns Ok and that the seed-from-disk derives an
+        // artifact whose mnemonic round-trips back to the same seed.
+        export_mnemonic_cli(&plaintext_path).expect("export must succeed");
+
+        // Re-derive the artifact and verify the mnemonic encodes back to the
+        // planted seed — this is the behavioral contract export_mnemonic_cli
+        // promises to operators.
+        let seed = identity::read_seed_from_disk(&plaintext_path).unwrap();
+        let artifact = RecoveryArtifact::from_seed(*seed);
+        let mnemonic = artifact.to_mnemonic();
+        let parsed = RecoveryArtifact::from_mnemonic(mnemonic.as_str()).unwrap();
+        assert_eq!(*parsed.as_bytes(), planted);
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
