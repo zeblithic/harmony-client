@@ -871,6 +871,67 @@ pub fn read_seed_from_disk_with_keychain(
     load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref())
 }
 
+/// Write the master seed to disk via the standard resolution chain
+/// (keychain preferred, encrypted-file fallback). Refuses if a destination
+/// already exists unless `force` is true; with `force = true`, overwrites
+/// in place via the existing atomic `create_new` tmp-then-rename pattern in
+/// `save_with_fallback`.
+pub fn write_seed_to_disk(
+    plaintext_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+) -> Result<(), String> {
+    write_seed_to_disk_with_keychain(plaintext_path, seed, force, KeychainStore::new().ok())
+}
+
+pub fn write_seed_to_disk_with_keychain(
+    plaintext_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    if !force {
+        // Refuse if either destination has an existing identity.
+        // Check the keychain first (cheap probe), then the encrypted file path.
+        if let Some(kc) = &keychain {
+            if matches!(kc.load(), Ok(Some(_))) {
+                return Err(format!(
+                    "identity already exists in OS keychain; pass --force to overwrite (this is destructive)"
+                ));
+            }
+        }
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+        if enc_path.exists() {
+            return Err(format!(
+                "identity already exists at {}; pass --force to overwrite (this is destructive)",
+                enc_path.display()
+            ));
+        }
+    }
+
+    let mut keychain_healthy = false;
+    if let Some(kc) = &keychain {
+        // Use load() as a connectivity probe (Ok(_) means responsive).
+        if kc.load().is_ok() {
+            keychain_healthy = true;
+        }
+    }
+
+    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let encrypted = EncryptedFileStore::from_env(enc_path)?;
+
+    save_with_fallback(
+        keychain_healthy,
+        keychain.as_ref(),
+        encrypted.as_ref(),
+        seed,
+        || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
+        |e| format!(
+            "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
+        ),
+    )
+}
+
 /// Re-encrypt the identity at `old.path()` with `new_passphrase`.
 ///
 /// Loads the identity using the old store's passphrase, writes back to the same
@@ -1008,6 +1069,7 @@ pub mod test_only {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn file_store_round_trip() {
@@ -1049,6 +1111,71 @@ mod tests {
     fn keychain_store_load_returns_none_when_empty() {
         let store = KeychainStore::new_mock();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn read_seed_round_trips_via_encrypted_file() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        // Set up an encrypted store with a known passphrase, write a known seed.
+        std::env::set_var("HARMONY_PASSPHRASE", "round-trip-test");
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("round-trip-test".to_string()));
+        let written = [0xCDu8; 32];
+        store.save(&written).expect("save");
+
+        // Read it back through the public seed-shaped helper.
+        let loaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read");
+        assert_eq!(*loaded, written, "seed must round-trip through the encrypted store");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn write_seed_refuses_when_identity_exists_without_force() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "refuse-test");
+        let existing_seed = [0x11u8; 32];
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("refuse-test".to_string()));
+        store.save(&existing_seed).unwrap();
+
+        let new_seed = [0x22u8; 32];
+        let err = write_seed_to_disk(&plaintext_path, &new_seed, /*force=*/ false)
+            .expect_err("must refuse when destination exists");
+        assert!(err.contains("identity already exists"), "actual: {err}");
+        assert!(err.contains("--force"), "actual: {err}");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn write_seed_with_force_overwrites_existing() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "force-test");
+        let existing_seed = [0x33u8; 32];
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("force-test".to_string()));
+        store.save(&existing_seed).unwrap();
+
+        let new_seed = [0x44u8; 32];
+        write_seed_to_disk(&plaintext_path, &new_seed, /*force=*/ true).expect("force must succeed");
+
+        let reloaded = read_seed_from_disk(&plaintext_path).expect("reload");
+        assert_eq!(*reloaded, new_seed, "after force-overwrite, the new seed must be present");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     mod wire_format {
