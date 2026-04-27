@@ -15,6 +15,7 @@ mod follows;
 pub mod identity;
 pub mod mail;
 pub mod mail_sync;
+pub mod recovery_cli;
 pub mod voice;
 
 // ── Chunked ingest (ZEB-154) ──────────────────────────────────────────────
