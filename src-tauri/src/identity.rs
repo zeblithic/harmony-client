@@ -44,7 +44,7 @@ const HEADER_LEN: usize = 13;   // magic(4) + version(1) + kdf_id(1) + m(4) + t(
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;    // XChaCha20 needs 192-bit nonce
 const TAG_LEN: usize = 16;      // Poly1305 tag
-const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN; // 230
+const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN;
 
 pub struct NodeIdentity {
     pub pq: PqPrivateIdentity,
@@ -411,21 +411,6 @@ impl FileStore {
         Self { path }
     }
 
-    /// Rename the identity file to `.bak` (used during migration).
-    ///
-    /// Retained for test fixtures only — production code never renames to .bak
-    /// (the new chain unlinks plaintext directly after verify_round_trip).
-    #[allow(dead_code)]
-    pub fn rename_to_backup(&self) -> Result<(), String> {
-        let bak = self.path.with_extension("key.bak");
-        std::fs::rename(&self.path, &bak).map_err(|e| {
-            format!(
-                "Failed to rename {} → {}: {e}",
-                self.path.display(),
-                bak.display()
-            )
-        })
-    }
 }
 
 // FileStore is retained as a test-only helper for setting up seed fixtures.
