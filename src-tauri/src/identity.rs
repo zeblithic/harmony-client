@@ -487,7 +487,9 @@ impl KeychainStore {
     ///
     /// Used by `write_seed_to_disk_with_keychain` to best-effort unlink a stale
     /// keychain entry after a successful force-write to the encrypted-file backend.
-    pub(crate) fn delete(&self) -> Result<(), keyring::Error> {
+    /// Also used by integration tests (different crate boundary) to clean up
+    /// stale keychain state before exercising `*_cli` functions.
+    pub fn delete(&self) -> Result<(), keyring::Error> {
         self.entry.delete_credential()
     }
 }

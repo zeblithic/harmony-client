@@ -11,6 +11,16 @@ use harmony_app::{identity, recovery_cli};
 use harmony_owner::lifecycle::RecoveryArtifact;
 use serial_test::serial;
 
+/// Clear any pre-existing OS keychain entry before each integration test.
+/// The `*_cli` functions call the public `identity::read_seed_from_disk` /
+/// `write_seed_to_disk` which construct `KeychainStore::new()` internally,
+/// so stale keychain state from prior runs leaks across test boundaries.
+fn clear_keychain_for_test() {
+    if let Ok(kc) = identity::KeychainStore::new() {
+        let _ = kc.delete();
+    }
+}
+
 fn plant_seed(plaintext_path: &std::path::Path, seed: &[u8; 32]) {
     identity::write_seed_to_disk_with_keychain(
         plaintext_path,
@@ -33,6 +43,7 @@ fn mnemonic_round_trip_preserves_identity_hash() {
     let plaintext_path = dir.path().join("identity.key");
     let mnemonic_path = dir.path().join("mnemonic.txt");
 
+    clear_keychain_for_test();
     std::env::set_var("HARMONY_PASSPHRASE", "mnemonic-rt");
 
     let original_seed = [0xA1u8; 32];
@@ -58,6 +69,7 @@ fn mnemonic_round_trip_preserves_identity_hash() {
         .identity_hash();
     assert_eq!(reloaded_id, original_id);
 
+    clear_keychain_for_test();
     std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
@@ -68,6 +80,7 @@ fn recovery_file_round_trip_preserves_identity_hash() {
     let plaintext_path = dir.path().join("identity.key");
     let recovery_path = dir.path().join("recovery.bin");
 
+    clear_keychain_for_test();
     std::env::set_var("HARMONY_PASSPHRASE", "recovery-rt");
     std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-pass");
 
@@ -91,6 +104,7 @@ fn recovery_file_round_trip_preserves_identity_hash() {
         .identity_hash();
     assert_eq!(reloaded_id, original_id);
 
+    clear_keychain_for_test();
     std::env::remove_var("HARMONY_PASSPHRASE");
     std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
@@ -103,6 +117,7 @@ fn cross_encoding_equivalence_via_cli() {
     let mnemonic_path = dir.path().join("mnemonic.txt");
     let recovery_path = dir.path().join("recovery.bin");
 
+    clear_keychain_for_test();
     std::env::set_var("HARMONY_PASSPHRASE", "cross-rt");
     std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-cross");
 
@@ -129,7 +144,11 @@ fn cross_encoding_equivalence_via_cli() {
     assert_eq!(id_via_m, original_id, "mnemonic restore preserves identity_hash");
 
     // Wipe + restore from recovery file.
+    // Also clear the keychain: restore_mnemonic_cli wrote to it via the public
+    // write_seed_to_disk, and we want to prove restore-from-file works with a
+    // clean slate (not merely prove force-overwrite works).
     wipe_identity_store(&plaintext_path);
+    clear_keychain_for_test();
     recovery_cli::restore_recovery_file_cli(&plaintext_path, &recovery_path, false)
         .expect("restore-recovery");
     let id_via_f = RecoveryArtifact::from_seed(*identity::read_seed_from_disk(&plaintext_path).unwrap())
@@ -137,6 +156,7 @@ fn cross_encoding_equivalence_via_cli() {
         .identity_hash();
     assert_eq!(id_via_f, original_id, "recovery-file restore preserves identity_hash");
 
+    clear_keychain_for_test();
     std::env::remove_var("HARMONY_PASSPHRASE");
     std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }

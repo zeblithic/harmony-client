@@ -173,6 +173,18 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Clear any pre-existing OS keychain entry before each test that goes
+    /// through a `*_cli` function. The CLI functions call the public
+    /// `identity::read_seed_from_disk` / `write_seed_to_disk` which use the
+    /// real OS keychain — without this cleanup, seeds left over from prior
+    /// test runs (or other tests in this run) can leak in via the keychain
+    /// and cause spurious assertion failures.
+    fn clear_keychain_for_test() {
+        if let Ok(kc) = crate::identity::KeychainStore::new() {
+            let _ = kc.delete();
+        }
+    }
+
     #[test]
     #[serial]
     fn recovery_passphrase_neither_set_fails_with_pointer_to_docs() {
@@ -208,6 +220,7 @@ mod tests {
     #[test]
     #[serial]
     fn export_recovery_file_with_metadata() {
+        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let recovery_out = dir.path().join("recovery.bin");
@@ -239,6 +252,7 @@ mod tests {
         .into_artifact();
         assert_eq!(restored.as_bytes(), &[0xCAu8; 32]);
 
+        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
     }
@@ -246,6 +260,7 @@ mod tests {
     #[test]
     #[serial]
     fn restore_mnemonic_idempotent() {
+        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -261,12 +276,14 @@ mod tests {
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
+        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn restore_refuses_when_identity_exists_without_force() {
+        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -287,12 +304,14 @@ mod tests {
             .expect_err("must refuse");
         assert!(err.contains("identity already exists"), "actual: {err}");
 
+        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn restore_with_force_overwrites_existing() {
+        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -315,6 +334,7 @@ mod tests {
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
+        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
@@ -322,7 +342,7 @@ mod tests {
     #[serial]
     fn export_mnemonic_round_trips_via_recovery_artifact() {
         use crate::identity;
-
+        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
 
@@ -352,6 +372,7 @@ mod tests {
         let parsed = RecoveryArtifact::from_mnemonic(mnemonic.as_str()).unwrap();
         assert_eq!(*parsed.as_bytes(), planted);
 
+        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }
