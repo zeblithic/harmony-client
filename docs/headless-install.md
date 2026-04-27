@@ -172,8 +172,7 @@ The mnemonic is the catastrophic-loss recovery path: words on paper
 survive everything except the paper itself. The encrypted recovery file
 is the routine-portability path: you can copy it across machines, mail
 it to yourself, store it on a USB stick — and without the passphrase
-it's useless. Together, both lost simultaneously is required to lose
-the identity.
+it's useless. If both backups have been made, only losing them simultaneously results in identity loss.
 
 The existing "treat `~/.harmony/identity.enc` and your passphrase as
 two halves of a recovery key" guidance still applies for at-rest
@@ -191,8 +190,8 @@ storage — the recovery commands give you an additional layer.
 | `Error: unknown word at position <N>: "<word>"` | Mnemonic typo | Re-check the indicated word against the BIP39 wordlist |
 | `Error: mnemonic checksum mismatch — likely a typo somewhere in the 24 words` | One or more typos | Visually re-verify each word against the source |
 | `Error: wrong passphrase or corrupted recovery file (AEAD tag rejected)` | Bad recovery passphrase OR the file was tampered with | Verify the recovery passphrase matches what was used to export |
-| `identity already exists at <path>; pass --force to overwrite (this is destructive)` | Restore policy | If you really want to overwrite, re-run with `--force`; otherwise, this is the safety net |
-| `neither HARMONY_RECOVERY_PASSPHRASE nor HARMONY_RECOVERY_PASSPHRASE_FILE is set` | Recovery passphrase missing | Set one; remember it's distinct from the at-rest passphrase |
+| `identity already exists at <path>; pass --force ...` or `identity already exists in OS keychain; pass --force ...` | Restore policy | If you really want to overwrite, re-run with `--force`; otherwise, this is the safety net |
+| `neither HARMONY_RECOVERY_PASSPHRASE nor HARMONY_RECOVERY_PASSPHRASE_FILE is set — see docs/headless-install.md` | Recovery passphrase missing | Set one; remember it's distinct from the at-rest passphrase |
 
 ## Not yet supported
 
