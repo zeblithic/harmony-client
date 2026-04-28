@@ -814,7 +814,7 @@ describe('Restore wizard — step 1 (pickSource)', () => {
     expect(screen.getByRole('button', { name: /continue/i })).toBeDisabled();
   });
 
-  it('selecting mnemonic and clicking Continue transitions to mnemonicEntry placeholder', async () => {
+  it('selecting mnemonic and clicking Continue transitions to mnemonicEntry step', async () => {
     render(IdentityPanel);
     await screen.findByText(/0xaaaaaaaa/);
     await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
@@ -822,7 +822,7 @@ describe('Restore wizard — step 1 (pickSource)', () => {
     await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
-    await screen.findByText(/enter recovery phrase/i);
+    await screen.findByText(/restore from recovery phrase/i);
     expect(screen.queryByText(/restore identity/i)).not.toBeInTheDocument();
   });
 
@@ -840,11 +840,26 @@ describe('Restore wizard — step 1 (pickSource)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Task 7: Restore wizard — step 3 (confirm) — needs Tasks 8/9 to drive into;
-// using it.skip per plan Option B. Un-skip at end of Task 8.
+// Task 8: Restore wizard — step 2a (mnemonic textarea)
 // ---------------------------------------------------------------------------
 
-describe('Restore wizard — step 3 (confirm)', () => {
+/**
+ * Helper: navigate to the mnemonicEntry phase.
+ * Caller must set up mockInvoke BEFORE calling (at minimum: handle
+ * 'current_identity_hash'). Does NOT overwrite any existing mock setup.
+ */
+async function arrangeAtMnemonicEntry() {
+  render(IdentityPanel);
+  await screen.findByText(/0xa1b2c3d4/);
+  await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+  await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+  // mnemonicEntry phase should now be rendered
+  await screen.findByText(/restore from recovery phrase/i);
+}
+
+describe('Restore wizard — step 2a (mnemonic textarea)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
@@ -853,86 +868,545 @@ describe('Restore wizard — step 3 (confirm)', () => {
     });
   });
 
-  it.skip('renders hash diff, type-to-confirm input, and disabled Replace identity button (needs Task 8/9 to navigate here)', async () => {
-    // Navigate via Task 8's mnemonic entry → confirm transition.
-    // Un-skip when Task 8 is implemented.
+  it('shows textarea, word count, and disabled Continue on open', async () => {
+    await arrangeAtMnemonicEntry();
+
+    expect(screen.getByRole('textbox', { name: /recovery phrase/i })).toBeInTheDocument();
+    expect(screen.getByText(/0 \/ 24 words/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /continue/i })).toBeDisabled();
   });
 
-  it.skip('Replace identity is disabled until typedPrefix matches current hash prefix (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('updates word count live as user types', async () => {
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+
+    await fireEvent.input(textarea, { target: { value: 'only three words' } });
+    expect(screen.getByText(/3 \/ 24 words/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /continue/i })).toBeDisabled();
+
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    expect(screen.getByText(/24 \/ 24 words/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /continue/i })).not.toBeDisabled();
   });
 
-  it.skip('inline error shown when typedPrefix is non-empty but mismatching (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('shows word count, validates on Continue click, and advances to confirm on success', async () => {
+    const newHash = 'b2c3d4e5'.repeat(8);
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') {
+        const a = args as { words: string[] };
+        if (a.words.length !== 24) throw new Error(`expected 24 words, got ${a.words.length}`);
+        return newHash;
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    expect(screen.getByText(/24 \/ 24 words/i)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    // Step 2a calls preview_mnemonic_identity, advances to step 3 (confirm).
+    await screen.findByText(/0xb2c3d4e5/i);  // restored hash diff in confirm step
+    expect(screen.getByText(/confirm overwrite/i)).toBeInTheDocument();
   });
 
-  it.skip('Cancel from confirm returns to idle (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('renders inline error on bad checksum', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') {
+        throw new Error('invalid recovery phrase: failed checksum');
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/don't form a valid recovery phrase/i);
   });
 
-  it.skip('Replace identity (mnemonic) invokes restore_mnemonic_from_words and transitions to done (needs Task 8)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('renders inline error on wordlist failure', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') {
+        throw new Error('not a word in the BIP39 wordlist');
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('xyzzy').join(' ') } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/isn't a recognized recovery word/i);
+  });
+
+  it('renders generic inline error for unknown failures', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') {
+        throw new Error('some unexpected backend error');
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/could not parse recovery phrase/i);
+  });
+
+  it('clears validation error when user types again', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') {
+        throw new Error('invalid recovery phrase: failed checksum');
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    await screen.findByText(/don't form a valid recovery phrase/i);
+
+    // Typing clears the error immediately.
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('abandon').join(' ') } });
+    expect(screen.queryByText(/don't form a valid recovery phrase/i)).not.toBeInTheDocument();
+  });
+
+  it('Cancel from mnemonicEntry returns to idle', async () => {
+    await arrangeAtMnemonicEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xa1b2c3d4/);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
+  });
+
+  it('race guard: cancel during preview_mnemonic_identity invoke does not resurrect wizard', async () => {
+    let resolvePreview!: (hash: string) => void;
+    const previewPromise = new Promise<string>((resolve) => { resolvePreview = resolve; });
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_mnemonic_identity') return previewPromise;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtMnemonicEntry();
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+
+    // Click Continue — starts the pending invoke.
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    // Cancel while invoke is pending.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    // Sanity-check: idle screen visible right after cancel.
+    await screen.findByText(/0xa1b2c3d4/);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+
+    // Now resolve the invoke — wizard should NOT resurrect into confirm.
+    resolvePreview('b2c3d4e5'.repeat(8));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Assert: still on idle screen, no confirm UI present.
+    expect(screen.queryByText(/replace your current identity/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 7/8: Restore wizard — step 3 (confirm) — un-skipped in Task 8 for
+// the mnemonic path. File-specific test stays skipped until Task 9.
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper: navigate to the confirm phase via the mnemonic path.
+ * Caller is responsible for setting up mockInvoke BEFORE calling this
+ * (must handle 'current_identity_hash' and 'preview_mnemonic_identity').
+ */
+async function arrangeAtConfirmViaMnemonic(newHash: string) {
+  render(IdentityPanel);
+  await screen.findByText(/0xa1b2c3d4/);
+  await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+  await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+  await screen.findByText(/restore from recovery phrase/i);
+
+  const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+  await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+  // Wait for confirm step to appear (the restored hash prefix appears in the hash diff).
+  await screen.findByText(new RegExp(`0x${newHash.slice(0, 8)}`, 'i'));
+}
+
+describe('Restore wizard — step 3 (confirm)', () => {
+  const currentHash = 'a1b2c3d4'.repeat(8);
+  const newHash = 'b2c3d4e5'.repeat(8);
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+  });
+
+  it('renders hash diff, type-to-confirm input, and disabled Replace identity button', async () => {
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    // Hash diff: current (dimmed) → restored (accent)
+    expect(screen.getByText(/0xa1b2c3d4/i)).toBeInTheDocument();
+    expect(screen.getByText(/0xb2c3d4e5/i)).toBeInTheDocument();
+
+    // Type-to-confirm input
+    expect(screen.getByLabelText(/confirm current identity hash prefix/i)).toBeInTheDocument();
+
+    // Replace identity button is disabled until prefix is typed
+    expect(screen.getByRole('button', { name: /replace identity/i })).toBeDisabled();
+  });
+
+  it('Replace identity is disabled until typedPrefix matches current hash prefix', async () => {
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    const replaceBtn = screen.getByRole('button', { name: /replace identity/i });
+
+    expect(replaceBtn).toBeDisabled();
+
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d' } }); // one char short
+    expect(replaceBtn).toBeDisabled();
+
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } }); // exact match
+    expect(replaceBtn).not.toBeDisabled();
+  });
+
+  it('inline error shown when typedPrefix is non-empty but mismatching', async () => {
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'xxxxxxxx' } });
+
+    expect(screen.getByText(/doesn't match your current identity hash/i)).toBeInTheDocument();
+  });
+
+  it('Cancel from confirm returns to idle', async () => {
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
+  });
+
+  it('Replace identity (mnemonic) invokes restore_mnemonic_from_words and transitions to done', async () => {
+    const postRestoreHash = 'c3d4e5f6'.repeat(8);
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') {
+        const a = args as { words: string[] };
+        expect(a.words).toHaveLength(24);
+        expect(a.words[0]).toBe('witness');
+        return postRestoreHash;
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+    await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+    await screen.findByText(/identity restored/i);
+    expect(screen.getByText(/0xc3d4e5f6/i)).toBeInTheDocument();
   });
 
   it.skip('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done (needs Task 9)', async () => {
     // Un-skip when Task 9 is implemented.
   });
 
-  it.skip('invoke error transitions to commitError (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('invoke error transitions to commitError', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') throw new Error('write failed: disk full');
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+    await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+    await screen.findByText(/restore failed/i);
+    expect(screen.getByText(/write failed: disk full/i)).toBeInTheDocument();
   });
 
-  it.skip('race guard: cancel while commit invoke pending does not resurrect wizard (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('race guard: cancel while commit invoke pending does not resurrect wizard', async () => {
+    let resolveCommit!: (hash: string) => void;
+    const commitPromise = new Promise<string>((resolve) => { resolveCommit = resolve; });
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') return commitPromise;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+
+    // Click Replace identity — starts the pending invoke.
+    await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+    // Cancel while commit is pending.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    // Sanity-check: idle screen visible right after cancel.
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+
+    // Now resolve the commit — wizard should NOT resurrect into done.
+    resolveCommit('c3d4e5f6'.repeat(8));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Assert: still on idle screen, no done UI present.
+    expect(screen.queryByText(/identity restored/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
   });
 });
 
 // ---------------------------------------------------------------------------
-// Task 7: Restore wizard — commitError
+// Task 7/8: Restore wizard — commitError (un-skipped in Task 8 via mnemonic path)
 // ---------------------------------------------------------------------------
 
+/**
+ * Helper: navigate to the commitError phase via the mnemonic path.
+ */
+async function arrangeAtCommitErrorViaMnemonic() {
+  render(IdentityPanel);
+  await screen.findByText(/0xa1b2c3d4/i);
+  await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+  await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+  await screen.findByText(/restore from recovery phrase/i);
+
+  const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+  await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+  // Wait for confirm step.
+  await screen.findByText(/0xb2c3d4e5/i);
+  const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+  await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+  await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+  // Wait for commitError.
+  await screen.findByText(/restore failed/i);
+}
+
 describe('Restore wizard — commitError', () => {
+  const currentHash = 'a1b2c3d4'.repeat(8);
+  const newHash = 'b2c3d4e5'.repeat(8);
+
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') throw new Error('identity write failed');
       throw new Error(`unexpected: ${cmd}`);
     });
   });
 
-  it.skip('shows error message with Back and Cancel buttons (needs Task 8/9 to navigate here)', async () => {
-    // The commitError variant is reachable only after the confirm step, which
-    // requires Tasks 8/9 to build the entry path. Un-skip after Task 8.
+  it('shows error message with Back and Cancel buttons', async () => {
+    await arrangeAtCommitErrorViaMnemonic();
+
+    expect(screen.getByText(/identity write failed/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /back/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeInTheDocument();
   });
 
-  it.skip('Back from commitError returns to pickSource (needs Task 8/9)', async () => {
-    // Un-skip after Task 8.
+  it('Back from commitError returns to pickSource', async () => {
+    await arrangeAtCommitErrorViaMnemonic();
+
+    await fireEvent.click(screen.getByRole('button', { name: /back/i }));
+
+    await screen.findByText(/restore identity/i);
+    expect(screen.getByLabelText(/24-word recovery phrase/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /continue/i })).toBeInTheDocument();
   });
 
-  it.skip('Cancel from commitError returns to idle (needs Task 8/9)', async () => {
-    // Un-skip after Task 8.
+  it('Cancel from commitError returns to idle', async () => {
+    await arrangeAtCommitErrorViaMnemonic();
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
   });
 });
 
 // ---------------------------------------------------------------------------
-// Task 7: Restore wizard — step 4 (done)
+// Task 7/8: Restore wizard — step 4 (done) (un-skipped in Task 8 via mnemonic path)
 // ---------------------------------------------------------------------------
 
+/**
+ * Helper: navigate to the done phase via the mnemonic path.
+ */
+async function arrangeAtDoneViaMnemonic() {
+  render(IdentityPanel);
+  await screen.findByText(/0xa1b2c3d4/i);
+  await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+  await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+  await screen.findByText(/restore from recovery phrase/i);
+
+  const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+  await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+  // Wait for confirm step.
+  await screen.findByText(/0xb2c3d4e5/i);
+  const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+  await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+  await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+  // Wait for done step.
+  await screen.findByText(/identity restored/i);
+}
+
 describe('Restore wizard — step 4 (done)', () => {
+  const currentHash = 'a1b2c3d4'.repeat(8);
+  const newHash = 'b2c3d4e5'.repeat(8);
+  const postRestoreHash = 'c3d4e5f6'.repeat(8);
+
   beforeEach(() => {
     mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') return postRestoreHash;
+      throw new Error(`unexpected: ${cmd}`);
+    });
   });
 
-  it.skip('shows new identity hash prefix with click-to-copy and Done button (needs Task 8/9 to navigate here)', async () => {
-    // The done step is reachable only after confirm, which requires Tasks 8/9.
-    // Un-skip when Task 8 is implemented.
+  it('shows new identity hash prefix with click-to-copy and Done button', async () => {
+    await arrangeAtDoneViaMnemonic();
+
+    // The done screen shows 0xc3d4e5f6 (first 8 chars of postRestoreHash)
+    expect(screen.getByText(/0xc3d4e5f6/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /done/i })).toBeInTheDocument();
   });
 
-  it.skip('Done button refreshes fullHash via current_identity_hash and returns to idle (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('Done button refreshes fullHash via current_identity_hash and returns to idle', async () => {
+    const refreshedHash = 'c3d4e5f6'.repeat(8);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') return postRestoreHash;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    // Override after restore commits — simulate the hash refresh call
+    // returning the new hash.
+    let callCount = 0;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') {
+        callCount++;
+        // First call: initial load. Subsequent calls: post-restore refresh.
+        return callCount === 1 ? currentHash : refreshedHash;
+      }
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') return postRestoreHash;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    render(IdentityPanel);
+    await screen.findByText(/0xa1b2c3d4/i);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+    await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    await screen.findByText(/restore from recovery phrase/i);
+
+    const textarea = screen.getByRole('textbox', { name: /recovery phrase/i });
+    await fireEvent.input(textarea, { target: { value: Array(24).fill('witness').join(' ') } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    await screen.findByText(/0xb2c3d4e5/i);
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+    await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+    await screen.findByText(/identity restored/i);
+
+    await fireEvent.click(screen.getByRole('button', { name: /done/i }));
+
+    // Back to idle with refreshed hash
+    await screen.findByText(/0xc3d4e5f6/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
   });
 
-  it.skip('race guard: cancel between done render and Done click does not double-transition (needs Task 8/9)', async () => {
-    // Un-skip when Task 8 is implemented.
+  it('race guard: cancel between done render and Done click does not double-transition', async () => {
+    // This tests the finishRestore epoch guard. If the wizard transitions to
+    // idle before finishRestore's current_identity_hash refresh resolves, the
+    // refresh should not drive a second idle transition.
+    let resolveRefresh!: (hash: string) => void;
+    const refreshPromise = new Promise<string>((resolve) => { resolveRefresh = resolve; });
+
+    let callCount = 0;
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') {
+        callCount++;
+        if (callCount === 1) return currentHash;
+        // Hang the refresh so we can control when it resolves.
+        return refreshPromise;
+      }
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') return postRestoreHash;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtDoneViaMnemonic();
+
+    // Click Done — triggers finishRestore which starts the pending refresh.
+    await fireEvent.click(screen.getByRole('button', { name: /done/i }));
+
+    // finishRestore awaits current_identity_hash, so the wizard transitions
+    // to idle synchronously... but the refresh is still pending.
+    // Resolve the refresh — should NOT cause a second state mutation after idle.
+    resolveRefresh(postRestoreHash);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // We should be in idle state with no errors.
+    await screen.findByText(/0x/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
   });
 });

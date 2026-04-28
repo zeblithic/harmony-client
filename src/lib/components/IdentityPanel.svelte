@@ -198,6 +198,49 @@
     selectedRestoreSource = null;
   }
 
+  async function advanceFromMnemonicEntry() {
+    if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'mnemonicEntry') return;
+    const { input } = wizardState.step;
+    const words = input.split(/\s+/).filter(w => w.length > 0);
+    if (words.length !== 24) return;
+
+    // Clear any prior validation error before the invoke.
+    wizardState = { kind: 'restore', step: { phase: 'mnemonicEntry', input, validationError: null } };
+
+    // Race-pattern epoch guard.
+    const epoch = wizardState;
+
+    let candidateHash: string;
+    try {
+      candidateHash = await invoke<string>('preview_mnemonic_identity', { words });
+    } catch (e) {
+      if (wizardState !== epoch) return;
+      const msg = String(e);
+      let friendly: string;
+      if (/checksum/i.test(msg)) {
+        friendly = "These 24 words don't form a valid recovery phrase. Double-check your transcription.";
+      } else if (/wordlist|not.*word/i.test(msg)) {
+        friendly = "One or more words isn't a recognized recovery word.";
+      } else {
+        friendly = `Could not parse recovery phrase: ${msg}`;
+      }
+      wizardState = { kind: 'restore', step: { phase: 'mnemonicEntry', input, validationError: friendly } };
+      return;
+    }
+
+    if (wizardState !== epoch) return;
+    wizardState = {
+      kind: 'restore',
+      step: {
+        phase: 'confirm',
+        restoreSource: 'mnemonic',
+        pendingWords: words,
+        restoreCandidate: { identity_hash: candidateHash },
+        typedPrefix: '',
+      },
+    };
+  }
+
   async function commitRestore() {
     if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'confirm') return;
     const step = wizardState.step;
@@ -461,13 +504,38 @@
       </div>
     </section>
   {:else if wizardState.step.phase === 'mnemonicEntry'}
-    <!-- Task 8 placeholder -->
     <section class="identity-panel" aria-label="Identity">
-      <h3 class="section-title">Enter recovery phrase</h3>
-      <p class="explainer">Task 8 placeholder — mnemonic entry not yet implemented.</p>
+      <h3 class="section-title">Restore from recovery phrase</h3>
+      <label class="field-label">
+        Recovery phrase
+        <textarea
+          class="mnemonic-textarea"
+          aria-label="Recovery phrase"
+          rows={6}
+          placeholder="Paste your 24 words here. Spaces or newlines are fine."
+          value={wizardState.step.input}
+          oninput={(e) => {
+            if (wizardState.kind === 'restore' && wizardState.step.phase === 'mnemonicEntry') {
+              wizardState = {
+                kind: 'restore',
+                step: { phase: 'mnemonicEntry', input: (e.target as HTMLTextAreaElement).value, validationError: null },
+              };
+            }
+          }}
+        ></textarea>
+      </label>
+      <p class="word-count">
+        {wizardState.step.input.split(/\s+/).filter(w => w.length > 0).length} / 24 words
+      </p>
+      {#if wizardState.step.validationError !== null}
+        <p class="inline-error" role="alert">{wizardState.step.validationError}</p>
+      {/if}
       <div class="actions">
-        <button onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}>Back</button>
         <button onclick={resetToIdle}>Cancel</button>
+        <button
+          disabled={wizardState.step.input.split(/\s+/).filter(w => w.length > 0).length !== 24}
+          onclick={advanceFromMnemonicEntry}
+        >Continue</button>
       </div>
     </section>
   {:else if wizardState.step.phase === 'fileEntry'}
@@ -664,4 +732,21 @@
     display: flex; gap: 6px; align-items: center;
   }
   .passphrase-row input { flex: 1; }
+  .mnemonic-textarea {
+    font-family: ui-monospace, monospace;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: inherit;
+    font-size: inherit;
+    resize: vertical;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .word-count {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    margin: 4px 0;
+  }
 </style>
