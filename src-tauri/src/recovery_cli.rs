@@ -81,16 +81,14 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     stdout: &mut W1,
     stderr: &mut W2,
 ) -> Result<(), String> {
-    // Read the seed once; derive both the word list and the identity-hash from it.
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
-    let artifact = RecoveryArtifact::from_seed(*seed);
-    let words: Vec<String> = artifact
-        .to_mnemonic()
-        .as_str()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
+    // Single source of truth for word derivation.
+    let words = export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
     let phrase = words.join(" ");
+
+    // Reconstruct the artifact from the phrase to derive the identity-hash
+    // for the stderr log line. (One extra parse; no extra disk read.)
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase)
+        .map_err(|e| format!("internal: re-parse of just-derived mnemonic failed: {e}"))?;
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
