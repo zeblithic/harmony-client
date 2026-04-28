@@ -8,6 +8,13 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import { invoke } from '@tauri-apps/api/core';
 
+import { loadProfile, saveProfile } from '../../profile-service';
+
+vi.mock('../../profile-service', () => ({
+  loadProfile: vi.fn(),
+  saveProfile: vi.fn(),
+}));
+
 const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 describe('DevicesPanel — empty + bootstrap states', () => {
@@ -132,5 +139,52 @@ describe('DevicesPanel — populated state', () => {
     render(DevicesPanel);
     await screen.findByText(/add another device/i);
     expect(screen.getByText(/pairing UI is coming/i)).toBeInTheDocument();
+  });
+});
+
+describe('DevicesPanel — rename', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('clicking Rename shows inline edit field with current name pre-filled', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1', ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22', displayName: 'KRILE', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'a', displayName: 'KRILE' });
+
+    render(DevicesPanel);
+    const renameBtn = await screen.findByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtn);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    expect((input as HTMLInputElement).value).toBe('KRILE');
+  });
+
+  it('saving the rename calls profile-service.saveProfile', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1', ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22', displayName: 'KRILE', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'a', displayName: 'KRILE' });
+
+    render(DevicesPanel);
+    const renameBtn = await screen.findByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtn);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'KRILE-prime' } });
+    const saveBtn = screen.getByRole('button', { name: /save/i });
+    await fireEvent.click(saveBtn);
+    expect(saveProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ displayName: 'KRILE-prime' })
+    );
   });
 });

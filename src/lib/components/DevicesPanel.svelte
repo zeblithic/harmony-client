@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
+  import { loadProfile, saveProfile } from '../profile-service';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -24,6 +25,34 @@
   });
 
   let backupRequested = $state(false);
+  let renamingDeviceId = $state<string | null>(null);
+  let renameDraft = $state('');
+
+  function startRename(device: { deviceId: string; displayName: string; isThisDevice: boolean }) {
+    renamingDeviceId = device.deviceId;
+    renameDraft = device.displayName;
+  }
+
+  function saveRename(deviceId: string) {
+    const trimmed = renameDraft.trim();
+    if (trimmed.length === 0) return;
+    const profile = loadProfile();
+    saveProfile({ ...profile, displayName: trimmed });
+    if (state) {
+      // Optimistic local update — refresh from backend on next mount.
+      state = {
+        ...state,
+        devices: state.devices.map((d) =>
+          d.deviceId === deviceId ? { ...d, displayName: trimmed } : d,
+        ),
+      };
+    }
+    renamingDeviceId = null;
+  }
+
+  function cancelRename() {
+    renamingDeviceId = null;
+  }
 
   function formatOwnerFingerprint(hex: string): string {
     // 32 hex chars → "xxxx·xxxx·xxxx·xxxx" for readability
@@ -101,9 +130,24 @@
             <div class="device-icon">{deviceInitial(device.displayName)}</div>
             <div class="device-meta">
               <div class="device-name-row">
-                <span class="device-name">{device.displayName}</span>
-                {#if device.isThisDevice}
-                  <span class="this-device-marker">this device</span>
+                {#if renamingDeviceId === device.deviceId}
+                  <input
+                    type="text"
+                    bind:value={renameDraft}
+                    aria-label="Device name"
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') saveRename(device.deviceId);
+                      if (e.key === 'Escape') cancelRename();
+                    }}
+                  />
+                  <button class="secondary" onclick={() => saveRename(device.deviceId)}>Save</button>
+                  <button class="secondary" onclick={cancelRename}>Cancel</button>
+                {:else}
+                  <span class="device-name">{device.displayName}</span>
+                  {#if device.isThisDevice}
+                    <span class="this-device-marker">this device</span>
+                    <button class="rename-btn" onclick={() => startRename(device)}>Rename</button>
+                  {/if}
                 {/if}
               </div>
               <div class="device-secondary">
@@ -323,5 +367,17 @@
     background: var(--bg-tertiary);
     padding: 1px 4px;
     border-radius: 3px;
+  }
+  .rename-btn {
+    font-size: 11px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .rename-btn:hover {
+    background: var(--bg-tertiary);
   }
 </style>
