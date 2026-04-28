@@ -64,28 +64,40 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
 /// mnemonic > backup.txt` writes only the words; running interactively shows
 /// the warning + fingerprint on the terminal.
 pub fn export_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
-    export_mnemonic_with_keychain(plaintext_path, KeychainStore::new().ok())
+    export_mnemonic_to_writers(
+        plaintext_path,
+        KeychainStore::new().ok(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
 }
 
-/// Inner entry point — accepts an injected keychain so tests can stay
-/// hermetic. Production callers go through [`export_mnemonic_cli`].
-pub fn export_mnemonic_with_keychain(
+/// Inner entry point — accepts an injected keychain AND output writers so
+/// tests can both stay hermetic AND assert the exact stdout/stderr contract.
+/// Production callers go through [`export_mnemonic_cli`].
+pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     plaintext_path: &Path,
     keychain: Option<KeychainStore>,
+    stdout: &mut W1,
+    stderr: &mut W2,
 ) -> Result<(), String> {
     let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let mnemonic = artifact.to_mnemonic();
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    eprintln!("*** Identity recovery mnemonic ***");
-    eprintln!("Write these 24 words on paper. Anyone with these");
-    eprintln!("words can impersonate you. Storing in a digital");
-    eprintln!("file is dangerous.");
-    eprintln!();
-    eprintln!("identity-hash: {}", hex::encode(id_hash));
+    let map_err = |stream: &'static str| {
+        move |e: std::io::Error| format!("{stream}: {e}")
+    };
 
-    println!("{}", mnemonic.as_str());
+    writeln!(stderr, "*** Identity recovery mnemonic ***").map_err(map_err("stderr"))?;
+    writeln!(stderr, "Write these 24 words on paper. Anyone with these").map_err(map_err("stderr"))?;
+    writeln!(stderr, "words can impersonate you. Storing in a digital").map_err(map_err("stderr"))?;
+    writeln!(stderr, "file is dangerous.").map_err(map_err("stderr"))?;
+    writeln!(stderr).map_err(map_err("stderr"))?;
+    writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
+
+    writeln!(stdout, "{}", mnemonic.as_str()).map_err(map_err("stdout"))?;
     Ok(())
 }
 
@@ -385,12 +397,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn export_mnemonic_round_trips_via_recovery_artifact() {
+    fn export_mnemonic_writes_warning_to_stderr_and_words_to_stdout() {
         use crate::identity;
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
 
-        // Plant a known seed.
         std::env::set_var("HARMONY_PASSPHRASE", "mnemonic-export-test");
         let planted = [0xA7u8; 32];
         identity::write_seed_to_disk_with_keychain(
@@ -401,20 +412,46 @@ mod tests {
         )
         .unwrap();
 
-        // Call the keychain-injected entry point. We can't capture stdout/stderr
-        // from the unit test directly, but we can confirm the function returns
-        // Ok and the seed-from-disk derives an artifact whose mnemonic
-        // round-trips back to the same seed.
-        export_mnemonic_with_keychain(&plaintext_path, None).expect("export must succeed");
+        // Capture stdout + stderr in-memory and assert against the published
+        // CLI contract. This is what the spec promises operators: bare 24
+        // words on stdout (so `harmony-app export mnemonic > backup.txt`
+        // writes only the words), warning preamble + identity-hash on stderr.
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        export_mnemonic_to_writers(&plaintext_path, None, &mut stdout, &mut stderr)
+            .expect("export must succeed");
 
-        // Re-derive the artifact and verify the mnemonic encodes back to the
-        // planted seed — this is the behavioral contract export_mnemonic_cli
-        // promises to operators.
-        let seed = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
-        let artifact = RecoveryArtifact::from_seed(*seed);
-        let mnemonic = artifact.to_mnemonic();
-        let parsed = RecoveryArtifact::from_mnemonic(mnemonic.as_str()).unwrap();
-        assert_eq!(*parsed.as_bytes(), planted);
+        let stdout_str = String::from_utf8(stdout).expect("stdout is utf-8");
+        let stderr_str = String::from_utf8(stderr).expect("stderr is utf-8");
+
+        // Stdout: bare 24 words on a single line, terminated by exactly one \n.
+        assert!(
+            stdout_str.ends_with('\n'),
+            "stdout must end with newline; got: {stdout_str:?}"
+        );
+        let line = stdout_str.trim_end_matches('\n');
+        assert!(
+            !line.contains('\n'),
+            "stdout must be a single line; got: {line:?}"
+        );
+        let words: Vec<&str> = line.split(' ').collect();
+        assert_eq!(words.len(), 24, "stdout must be exactly 24 words; got: {line:?}");
+
+        // Stdout must round-trip back to the planted seed via RecoveryArtifact.
+        let parsed = RecoveryArtifact::from_mnemonic(line).expect("words parse");
+        assert_eq!(*parsed.as_bytes(), planted, "stdout words must encode the planted seed");
+
+        // Stderr: warning preamble + identity-hash. Don't pin the exact prose
+        // (it's user-facing text that may evolve) but pin the load-bearing
+        // markers.
+        assert!(
+            stderr_str.contains("Identity recovery mnemonic"),
+            "stderr must include warning preamble; got: {stderr_str:?}"
+        );
+        assert!(
+            stderr_str.contains("identity-hash:"),
+            "stderr must include identity-hash; got: {stderr_str:?}"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }

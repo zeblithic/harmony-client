@@ -906,6 +906,31 @@ pub fn write_seed_to_disk(
     write_seed_to_disk_with_keychain(plaintext_path, seed, force, KeychainStore::new().ok())
 }
 
+/// Documented TOCTOU note (`!force` path): the existence probes (keychain
+/// `load()`, `enc_path.exists()`, `EncryptedFileStore::from_env`) happen
+/// before `save_with_fallback`, so two concurrent processes that both pass
+/// the probe could both proceed to save, with the second silently winning.
+///
+/// We accept this race because:
+///   1. The threat model is a single-user CLI tool; the only realistic
+///      scenario is the same operator invoking `harmony-app restore` twice
+///      in parallel (e.g. by accident). There is no adversarial concurrent
+///      writer.
+///   2. The integrity guarantee that matters most — AEAD authentication of
+///      the encrypted file — is unaffected. A `restore` race ends with one
+///      operator-supplied identity winning; neither half-state nor a
+///      forged identity is reachable.
+///   3. A correct lockfile fix is non-trivial: stdlib has no portable
+///      file-lock primitive (would require `fs2` / `fd-lock`), stale
+///      lockfiles after process crashes need recovery UX, NFS-mounted
+///      `~/.harmony` directories have known fcntl-lock quirks, and the
+///      keychain side of the resolution chain has no atomic
+///      "add-if-absent" primitive exposed by the `keyring` crate — so
+///      locking would only close the file-path race, leaving the keychain
+///      race documented but unfixed.
+///
+/// Tracked as a follow-up; not blocking ZEB-176. If you hit this in
+/// practice, that's a signal we should revisit — please file a bug.
 pub fn write_seed_to_disk_with_keychain(
     plaintext_path: &Path,
     seed: &[u8; BLOB_LEN],

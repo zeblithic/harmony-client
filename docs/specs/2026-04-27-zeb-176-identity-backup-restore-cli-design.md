@@ -79,12 +79,20 @@ harmony-app restore recovery-file --in PATH [--force]
 
 ### Per-command I/O contract
 
+All reads and writes go through `identity::read_seed_from_disk_*` /
+`identity::write_seed_to_disk_*`, which resolve to the OS keychain
+(preferred) before falling back to the encrypted file. On a keychain-backed
+install, "Reads `identity.enc`" really means "tries OS keychain first, then
+`identity.enc`"; "Writes `identity.enc`" means "writes to OS keychain when
+present, otherwise falls back to `identity.enc`". Restore subcommands also
+refuse to overwrite an entry in EITHER backend unless `--force` is passed.
+
 | Command | Reads | Writes | Stdout | Stderr |
 |---|---|---|---|---|
-| `export mnemonic` | `identity.enc` (via `HARMONY_PASSPHRASE`/`_FILE`) | nothing | bare 24 words on a single line | warning preamble + `identity-hash: <hex32>` |
-| `export recovery-file --out PATH [--comment S]` | `identity.enc` (at-rest passphrase) + `HARMONY_RECOVERY_PASSPHRASE`/`_FILE` | `PATH` (encrypted recovery file) | nothing | `wrote <PATH> (<NN> bytes)\nidentity-hash: <hex32>` |
-| `restore mnemonic --mnemonic-file PATH [--force]` | `PATH` (24 ASCII words, permissive whitespace) + `HARMONY_PASSPHRASE`/`_FILE` (for re-encrypt) | `identity.enc` (at-rest passphrase) | nothing | `restored identity-hash: <hex32>` |
-| `restore recovery-file --in PATH [--force]` | `PATH` (encrypted recovery file) + `HARMONY_RECOVERY_PASSPHRASE`/`_FILE` (for decrypt) + `HARMONY_PASSPHRASE`/`_FILE` (for re-encrypt) | `identity.enc` (at-rest passphrase) | nothing | `restored identity-hash: <hex32>` |
+| `export mnemonic` | OS keychain → `identity.enc` (via `HARMONY_PASSPHRASE`/`_FILE`) | nothing | bare 24 words on a single line | warning preamble + `identity-hash: <hex32>` |
+| `export recovery-file --out PATH [--comment S]` | OS keychain → `identity.enc` (at-rest passphrase) + `HARMONY_RECOVERY_PASSPHRASE`/`_FILE` | `PATH` (encrypted recovery file) | nothing | `wrote <PATH> (<NN> bytes)\nidentity-hash: <hex32>` |
+| `restore mnemonic --mnemonic-file PATH [--force]` | `PATH` (24 ASCII words, permissive whitespace) + `HARMONY_PASSPHRASE`/`_FILE` (for re-encrypt) | OS keychain (preferred) → `identity.enc` (fallback, at-rest passphrase) | nothing | `restored identity-hash: <hex32>` |
+| `restore recovery-file --in PATH [--force]` | `PATH` (encrypted recovery file) + `HARMONY_RECOVERY_PASSPHRASE`/`_FILE` (for decrypt) + `HARMONY_PASSPHRASE`/`_FILE` (for re-encrypt) | OS keychain (preferred) → `identity.enc` (fallback, at-rest passphrase) | nothing | `restored identity-hash: <hex32>` |
 
 ### Mnemonic stdout shape (export)
 
