@@ -373,7 +373,9 @@ fn pin_intent_survives_restart_for_folder() {
     }
 
     let idx = ContentIndex::load(dir.path());
-    let entry = idx.get(&sid).expect("folder entry persisted under same sid");
+    let entry = idx
+        .get(&sid)
+        .expect("folder entry persisted under same sid");
     assert_eq!(entry.kind, ContentKind::Folder);
     assert_eq!(entry.file_name, "Pinned");
     assert!(entry.pinned, "pin intent survives reload");

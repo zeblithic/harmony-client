@@ -66,10 +66,18 @@ jobs:
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust` job
   # above runs on stable for newer clippy lints + fastest iteration; this job
-  # runs `cargo check --all-targets` on the declared MSRV so accidental use of
-  # post-1.75 Rust features is caught at PR review, not at first compile on a
+  # runs `cargo check --locked --all-targets` on the declared MSRV so
+  # accidental use of post-MSRV Rust features (or a transitive dep that
+  # raises its own MSRV) is caught at PR review, not at first compile on a
   # contributor's pinned-toolchain box. `check` (not `test`) keeps the job
-  # fast — MSRV regressions surface as compile errors, not test failures.
+  # fast — MSRV regressions surface as compile errors. `--locked` ensures we
+  # test against the actual Cargo.lock dep graph, not whatever resolves
+  # fresh.
+  #
+  # The 1.88 floor is set by transitive deps: `time-core`/`time-macros` need
+  # 1.88, and `signature-3.0.0-rc.10` (via PQ crypto) needs edition 2024
+  # which stabilised in 1.85. Bumping this is a normal consequence of dep
+  # updates; treat it like any other version bump.
   msrv:
     name: MSRV — cargo check on declared rust-version
     runs-on: ubuntu-latest
@@ -92,15 +100,15 @@ jobs:
             libayatana-appindicator3-dev \
             build-essential
 
-      - uses: dtolnay/rust-toolchain@1.75
+      - uses: dtolnay/rust-toolchain@1.88
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
           key: msrv
 
-      - name: cargo check --all-targets
-        run: cargo check --all-targets
+      - name: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets
 
   frontend:
     name: Frontend — tsc, vitest
