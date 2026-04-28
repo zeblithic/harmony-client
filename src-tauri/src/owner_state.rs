@@ -75,12 +75,23 @@ struct TokenEntry {
 static TOKEN_CACHE: LazyLock<Mutex<HashMap<Uuid, TokenEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Acquire the cache lock, recovering from poisoning. A single panicked
+/// request handler should not brick the cache for all subsequent requests
+/// in the same process — mirrors PR-61's `preview_cache_lock` policy.
+fn token_cache_lock() -> std::sync::MutexGuard<'static, HashMap<Uuid, TokenEntry>> {
+    TOKEN_CACHE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Insert a master seed into the token cache, returning a fresh single-use
 /// token. Caller hands the token to the GUI; GUI presents it back via
 /// `take_token`. Single-use semantics prevent token replay.
-pub(crate) fn insert_token(seed: [u8; 32]) -> Uuid {
+///
+/// `seed` is `Zeroizing<[u8; 32]>` so the caller holds the zeroize-on-drop
+/// guarantee from the moment the seed is materialized — not only after it
+/// enters the cache. Mirrors PR-61's `insert_preview` signature.
+pub(crate) fn insert_token(seed: Zeroizing<[u8; 32]>) -> Uuid {
     let token = Uuid::new_v4();
-    let mut cache = TOKEN_CACHE.lock().expect("token cache lock poisoned");
+    let mut cache = token_cache_lock();
     evict_expired(&mut cache);
     if cache.len() >= MAX_LIVE_TOKENS {
         // Oldest entry is the LRU candidate; drop it.
@@ -92,27 +103,26 @@ pub(crate) fn insert_token(seed: [u8; 32]) -> Uuid {
             cache.remove(&k);
         }
     }
-    cache.insert(token, TokenEntry { seed: Zeroizing::new(seed), inserted_at: Instant::now() });
+    cache.insert(token, TokenEntry { seed, inserted_at: Instant::now() });
     token
 }
 
 /// Consume a token: returns the master seed exactly once. Subsequent
 /// `take_token(same_uuid)` returns `None`.
 pub(crate) fn take_token(token: &Uuid) -> Option<Zeroizing<[u8; 32]>> {
-    let mut cache = TOKEN_CACHE.lock().expect("token cache lock poisoned");
+    let mut cache = token_cache_lock();
     evict_expired(&mut cache);
     cache.remove(token).map(|e| e.seed)
 }
 
 fn evict_expired(cache: &mut HashMap<Uuid, TokenEntry>) {
-    let now = Instant::now();
-    cache.retain(|_, e| now.duration_since(e.inserted_at) < TOKEN_TTL);
+    cache.retain(|_, e| e.inserted_at.elapsed() < TOKEN_TTL);
 }
 
 #[doc(hidden)]
 #[cfg(test)]
-pub fn clear_token_cache() {
-    TOKEN_CACHE.lock().unwrap().clear();
+pub(crate) fn clear_token_cache() {
+    token_cache_lock().clear();
 }
 
 #[cfg(test)]
@@ -125,7 +135,7 @@ mod token_cache_tests {
     fn insert_then_take_returns_seed_once() {
         clear_token_cache();
         let seed = [0xAAu8; 32];
-        let token = insert_token(seed);
+        let token = insert_token(Zeroizing::new(seed));
         let taken = take_token(&token).expect("first take must succeed");
         assert_eq!(*taken, seed);
         assert!(take_token(&token).is_none(), "second take must return None (single-use)");
@@ -145,7 +155,7 @@ mod token_cache_tests {
         clear_token_cache();
         let mut tokens = Vec::new();
         for i in 0..(MAX_LIVE_TOKENS + 2) {
-            tokens.push(insert_token([i as u8; 32]));
+            tokens.push(insert_token(Zeroizing::new([i as u8; 32])));
         }
         // The first 2 inserted should have been LRU-evicted.
         let first_taken = take_token(&tokens[0]);
