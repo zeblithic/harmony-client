@@ -224,13 +224,23 @@
   }
 
   async function finishRestore() {
+    // Capture the hash we know succeeded — the commit returned it. If the
+    // refresh below fails (network blip, IPC error), we still have a correct
+    // value to display rather than the stale pre-restore one.
+    const knownPostRestoreHash =
+      wizardState.kind === 'restore' && wizardState.step.phase === 'done'
+        ? wizardState.step.postRestoreHash
+        : null;
     const epoch = wizardState;
     try {
       const refreshed = await invoke<string>('current_identity_hash');
       if (wizardState !== epoch) return;
       fullHash = refreshed;
     } catch {
-      // Best-effort refresh — if it fails the panel is still functional.
+      // Refresh failed — fall back to the value commitRestore returned, which
+      // we know matches what's on disk because commit succeeded.
+      if (wizardState !== epoch) return;
+      if (knownPostRestoreHash) fullHash = knownPostRestoreHash;
     }
     if (wizardState !== epoch) return;
     wizardState = { kind: 'idle' };
@@ -535,6 +545,7 @@
       </div>
     </section>
   {:else if wizardState.step.phase === 'done'}
+    {@const restoredHash = wizardState.step.postRestoreHash}
     <section class="identity-panel" aria-label="Identity">
       <h3 class="section-title">✓ Identity restored</h3>
       <p class="hash-anchor">New identity hash:</p>
@@ -543,9 +554,9 @@
         title="Click to copy full identity hash"
         onclick={async () => {
           if (!navigator.clipboard) return;
-          try { await navigator.clipboard.writeText(wizardState.kind === 'restore' && wizardState.step.phase === 'done' ? wizardState.step.postRestoreHash : ''); } catch { /* ignore */ }
+          try { await navigator.clipboard.writeText(restoredHash); } catch { /* ignore */ }
         }}
-      >0x{wizardState.step.postRestoreHash.slice(0, 8)}…</button>
+      >0x{restoredHash.slice(0, 8)}…</button>
       <p class="explainer">
         Verify this matches what you expected. If it does not match your backup's expected hash,
         restore again from the correct backup before performing any other action.
