@@ -180,7 +180,12 @@
             <div class="owner-name">{state.ownerDisplayName}</div>
             <div class="owner-fingerprint">{formatOwnerFingerprint(state.ownerId)}</div>
           </div>
-          <button class="primary" onclick={openBackup}>
+          <button
+            class="primary"
+            disabled={!state.canBackUp}
+            title={state.canBackUp ? '' : 'Master seed not on this device — backup is no longer possible.'}
+            onclick={openBackup}
+          >
             Back up owner identity →
           </button>
         </div>

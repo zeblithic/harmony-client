@@ -236,3 +236,21 @@ describe('DevicesPanel — backup wiring', () => {
     );
   });
 });
+
+describe('DevicesPanel — degraded state (canBackUp: false)', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('Back-up CTA is disabled when canBackUp is false', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x', ownerDisplayName: 'me',
+      devices: [{ deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x' }],
+      canBackUp: false,
+    });
+    render(DevicesPanel);
+    const btn = await screen.findByRole('button', { name: /back up owner identity/i });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('title');
+  });
+});
