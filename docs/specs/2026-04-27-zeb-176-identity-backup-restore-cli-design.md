@@ -121,15 +121,25 @@ Stdout/stderr separation is the load-bearing UX: `harmony-app export mnemonic > 
 
 ### Restore policy when an identity already exists
 
-Both restore subcommands check whether `~/.harmony/identity.enc` exists at the start. If it does and `--force` is NOT passed, the command fails with:
+Both restore subcommands check both backends at startup — the OS keychain
+entry AND `~/.harmony/identity.enc`. If either has an identity and `--force`
+is NOT passed, the command fails with one of:
 
 ```text
+Error: identity already exists in OS keychain; pass --force to overwrite (this is destructive)
 Error: identity already exists at <path>; pass --force to overwrite (this is destructive)
 ```
 
-Process exits 1. With `--force`, the file is overwritten in place via the existing atomic `create_new` tmp-then-rename pattern in `identity.rs:save_with_fallback`.
+Process exits 1. With `--force`, the destination backend (keychain when
+healthy, encrypted file otherwise) is overwritten via the existing atomic
+tmp-then-rename pattern in `identity.rs:save_with_fallback`, and the
+non-destination backend is best-effort cleaned up so the operator can't be
+stranded on a stale entry after a future keychain clear or env-var change.
+The file write is atomic; the keychain delete is best-effort (a transient
+backend error is logged but does not fail the restore).
 
-This is the standard CLI convention (`cp -f` etc.) and avoids reintroducing the `.bak` cleanup tangle that ZEB-174 explicitly removed.
+This is the standard CLI convention (`cp -f` etc.) and avoids reintroducing
+the `.bak` cleanup tangle that ZEB-174 explicitly removed.
 
 ### Identity-hash display
 

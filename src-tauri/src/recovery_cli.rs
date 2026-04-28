@@ -124,8 +124,14 @@ pub fn export_recovery_file_with_keychain(
     comment: Option<&str>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    // Resolve the recovery passphrase BEFORE reading the seed: on an empty
+    // install, read_seed_from_disk_with_keychain mints + persists a fresh
+    // identity as a side effect. If we resolved the passphrase after the
+    // read, a missing/invalid HARMONY_RECOVERY_PASSPHRASE would mutate the
+    // identity store and then fail — the operator wanted to back up an
+    // existing identity, not silently create one.
     let passphrase = resolve_recovery_passphrase()?;
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
         mint_at: None,
@@ -267,6 +273,53 @@ mod tests {
         let pp = resolve_recovery_passphrase().expect("env-file resolves");
         assert_eq!(pp.expose_secret(), "from-env-file");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_recovery_file_does_not_mint_identity_when_recovery_passphrase_missing() {
+        // Regression: export recovery-file used to read (and thus mint) the
+        // seed BEFORE resolving the recovery passphrase. On an empty install
+        // with HARMONY_RECOVERY_PASSPHRASE unset, that left a freshly-minted
+        // identity on disk after a "failed" export. The fix resolves the
+        // recovery passphrase first; this test pins the order.
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+        let recovery_out = dir.path().join("recovery.bin");
+
+        // Empty install: no .enc, no keychain entry. At-rest store IS
+        // configured (so a successful read could mint), but recovery
+        // passphrase env vars are deliberately unset.
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest-pass");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
+        assert!(!enc_path.exists(), "test setup: enc file must be absent");
+
+        let err = export_recovery_file_with_keychain(
+            &plaintext_path,
+            &recovery_out,
+            Some("rt"),
+            None,
+        )
+        .expect_err("must fail when recovery passphrase is unset");
+        assert!(
+            err.contains("HARMONY_RECOVERY_PASSPHRASE"),
+            "must fail with recovery-passphrase error; got: {err}"
+        );
+
+        // The crucial invariant: no identity store was created as a side
+        // effect of the failed precondition check.
+        assert!(
+            !enc_path.exists(),
+            "export must not mint identity.enc when recovery passphrase is missing"
+        );
+        assert!(
+            !recovery_out.exists(),
+            "export must not write the output file when recovery passphrase is missing"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
