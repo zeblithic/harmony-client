@@ -15,7 +15,7 @@ function latestObserver() {
 class MockIntersectionObserver {
   private _entry: typeof observers[number];
   constructor(callback: IntersectionObserverCallback) {
-    this._entry = { callback, elements: [], disconnect: vi.fn() };
+    this._entry = { callback, elements: [], disconnect: vi.fn<() => void>() };
     observers.push(this._entry);
   }
   observe(el: Element) { this._entry.elements.push(el); }

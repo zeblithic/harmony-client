@@ -350,12 +350,15 @@ async fn pin_folder_cascades_to_nested_leaf() {
 #[test]
 fn pin_intent_survives_restart_for_folder() {
     let dir = tempdir().unwrap();
+    // Capture the sid before the first scope ends so the post-reload lookup
+    // proves SidecarId persistence, not just "some folder entry survived".
+    let sid = SidecarId::new();
 
     {
         let mut idx = ContentIndex::load(dir.path());
         let built = folders::build_folder("Pinned", &[]).expect("build");
         idx.insert(ContentIndexEntry {
-            sidecar_id: SidecarId::new(),
+            sidecar_id: sid,
             cid: built.bundle_cid.to_bytes(),
             file_name: "Pinned".into(),
             size_bytes: built.bundle_bytes.len() as u64,
@@ -370,10 +373,8 @@ fn pin_intent_survives_restart_for_folder() {
     }
 
     let idx = ContentIndex::load(dir.path());
-    let entry = idx
-        .entries()
-        .find(|e| e.kind == ContentKind::Folder)
-        .expect("folder entry persisted");
+    let entry = idx.get(&sid).expect("folder entry persisted under same sid");
+    assert_eq!(entry.kind, ContentKind::Folder);
     assert_eq!(entry.file_name, "Pinned");
     assert!(entry.pinned, "pin intent survives reload");
 }

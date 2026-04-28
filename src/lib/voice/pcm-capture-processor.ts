@@ -3,7 +3,7 @@
 // AudioWorkletProcessor that accumulates input samples into 20ms frames
 // and posts each completed frame to the main thread.
 
-/// <reference types="@types/audioworklet" />
+/// <reference types="audioworklet" />
 //
 // Frame size is derived from the AudioContext sample rate:
 //   16 kHz → 320 samples, 8 kHz → 160 samples.

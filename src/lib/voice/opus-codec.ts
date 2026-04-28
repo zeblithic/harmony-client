@@ -56,8 +56,8 @@ export class OpusCodec implements VoiceCodec {
     }
 
     this._channels = channels;
-    // sampleRate is consumed via the OpusScript constructor below; we don't
-    // retain it as a field since callers can re-derive it from frame size.
+    // sampleRate is only needed to construct OpusScript below, so we do not
+    // retain it as instance state after initialization.
 
     // opusscript (emscripten) uses Node's Buffer internally.
     // Ensure a Buffer polyfill is available in the Tauri webview.
