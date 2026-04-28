@@ -23,13 +23,22 @@
   // double-click cannot issue duplicate restore_* requests against the store.
   let restoreInFlight = $state(false);
 
-  // Wire-format from Rust `RestoreInfo` (camelCase per project convention —
-  // see `src-tauri/src/identity_commands.rs` and every other IPC payload
-  // struct in `lib.rs`).
+  // Wire-format from Rust `RestoreInfo` / `PreviewedRecovery` (camelCase per
+  // project convention — see `src-tauri/src/identity_commands.rs` and every
+  // other IPC payload struct in `lib.rs`).
+  //
+  // `previewToken` is set only for file-based restore. It identifies the
+  // server-side cached seed from `preview_recovery_file` — `commitRestore`
+  // passes it back to `restore_recovery_from_preview_token` so the backend
+  // restores the EXACT seed the user just saw the hash for, even if the
+  // recovery file on disk has changed in the meantime.
+  // The mnemonic-based restore re-derives from the words at commit time, so
+  // it has no token.
   interface RestoreCandidate {
     identityHash: string;
     mintedAt?: number;
     comment?: string;
+    previewToken?: string;
   }
 
   type BackupStep =
@@ -398,14 +407,14 @@
     if (!hashLoaded) return;
     const step = wizardState.step;
 
-    // Option B runtime guard (I-3): the confirm variant has optional
-    // pendingFilePath/passphrase to avoid a full variant split, but they are
-    // required when restoreSource === 'file'. Catch the invariant violation at
-    // runtime rather than relying on TypeScript's structural types alone.
-    if (step.restoreSource === 'file' && (!step.pendingFilePath || step.passphrase === undefined)) {
+    // Runtime guard: file-restore commits on the previewToken from
+    // restoreCandidate, NOT pendingFilePath / passphrase. The token was
+    // populated by decryptRestoreFile from the preview IPC response.
+    // Defends against a future refactor that loses the token.
+    if (step.restoreSource === 'file' && !step.restoreCandidate.previewToken) {
       wizardState = {
         kind: 'restore',
-        step: { phase: 'commitError', error: 'Internal error: file path or passphrase missing.' },
+        step: { phase: 'commitError', error: 'Internal error: preview token missing — re-pick the recovery file.' },
       };
       return;
     }
@@ -418,9 +427,8 @@
       if (step.restoreSource === 'mnemonic') {
         postRestoreHash = await invoke<string>('restore_mnemonic_from_words', { words: step.pendingWords });
       } else {
-        const info = await invoke<{ identityHash: string }>('restore_recovery_file_from_path', {
-          inPath: step.pendingFilePath,
-          passphrase: step.passphrase,
+        const info = await invoke<{ identityHash: string }>('restore_recovery_from_preview_token', {
+          previewToken: step.restoreCandidate.previewToken,
         });
         postRestoreHash = info.identityHash;
       }

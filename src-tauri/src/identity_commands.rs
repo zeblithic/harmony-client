@@ -4,9 +4,19 @@
 //! The actual logic lives in `recovery_cli` so it can be tested without a
 //! live Tauri runtime. Commands delegate to `*_helper` functions that take
 //! a `plaintext_path` argument; tests call the helpers directly.
+//!
+//! Tauri commands wrap each helper in [`tokio::task::spawn_blocking`] —
+//! the helpers do file I/O, Argon2id KDF, and XChaCha20-Poly1305 work that
+//! would otherwise stall the async executor and starve other tasks
+//! (zenoh sync, IPC, UI events).
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::identity;
 use crate::identity::KeychainStore;
@@ -31,7 +41,103 @@ pub struct RestoreInfo {
     pub comment: Option<String>,
 }
 
+/// Successful preview of a recovery file. Returned by `preview_recovery_file`.
+///
+/// The `previewToken` ties this preview to the seed that the GUI just showed
+/// the user (hash + comment + mintedAt). The frontend passes the token back
+/// to `restore_recovery_from_preview_token` — the backend looks up the
+/// already-decrypted seed from the in-memory cache and writes THAT seed,
+/// without ever re-reading the path. This closes the two-IPC TOCTOU window
+/// where a swap of the recovery file between preview and commit would let
+/// the wizard show backup A's hash while restoring backup B's seed
+/// (CodeRabbit Critical, round 4).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewedRecovery {
+    /// Opaque token identifying the cached preview. The frontend treats this
+    /// as a string and passes it back unchanged on commit.
+    pub preview_token: String,
+    /// Identity metadata for the cached seed (shown in the confirm step).
+    #[serde(flatten)]
+    pub info: RestoreInfo,
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────
+
+/// In-memory cache of decrypted recovery seeds keyed by preview token.
+///
+/// Purpose: bind the `preview_recovery_file` IPC call to the
+/// `restore_recovery_from_preview_token` IPC call so the seed the user sees
+/// metadata for is byte-equal to the seed the backend writes. The naïve
+/// preview-then-commit-by-path flow is TOCTOU-vulnerable (swap between
+/// IPCs).
+///
+/// Lifetime: an entry survives at most [`PREVIEW_TTL`]; expired entries are
+/// pruned lazily on every preview/commit. A successful commit removes the
+/// entry, so the seed cannot be replayed. The cached seed is wrapped in
+/// [`Zeroizing`] so it is wiped from memory on drop.
+///
+/// Capacity: bounded by [`MAX_PREVIEW_ENTRIES`]. If the user previews more
+/// distinct files than the cap, the oldest entry is evicted. The wizard's
+/// serial UX makes this exceedingly rare, but the cap protects against a
+/// memory-leak attack from a misbehaving frontend.
+struct PreviewEntry {
+    created_at: Instant,
+    seed: Zeroizing<[u8; 32]>,
+    info: RestoreInfo,
+}
+
+const PREVIEW_TTL: Duration = Duration::from_secs(300);
+const MAX_PREVIEW_ENTRIES: usize = 16;
+
+static PREVIEW_CACHE: LazyLock<Mutex<HashMap<Uuid, PreviewEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn preview_cache_lock() -> std::sync::MutexGuard<'static, HashMap<Uuid, PreviewEntry>> {
+    PREVIEW_CACHE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Insert a freshly-decrypted seed into the preview cache and return the
+/// generated token. Evicts expired entries first; if still over capacity,
+/// drops the single oldest entry.
+fn insert_preview(seed: Zeroizing<[u8; 32]>, info: RestoreInfo) -> Uuid {
+    let mut cache = preview_cache_lock();
+    cache.retain(|_, entry| entry.created_at.elapsed() < PREVIEW_TTL);
+    if cache.len() >= MAX_PREVIEW_ENTRIES {
+        if let Some(oldest_uuid) = cache
+            .iter()
+            .min_by_key(|(_, e)| e.created_at)
+            .map(|(k, _)| *k)
+        {
+            cache.remove(&oldest_uuid);
+        }
+    }
+    let token = Uuid::new_v4();
+    cache.insert(
+        token,
+        PreviewEntry {
+            created_at: Instant::now(),
+            seed,
+            info,
+        },
+    );
+    token
+}
+
+/// Remove and return a cached preview by token. Returns `None` if the token
+/// is unknown or the entry has expired (eviction is performed first).
+fn take_preview(token: Uuid) -> Option<(Zeroizing<[u8; 32]>, RestoreInfo)> {
+    let mut cache = preview_cache_lock();
+    cache.retain(|_, entry| entry.created_at.elapsed() < PREVIEW_TTL);
+    cache.remove(&token).map(|e| (e.seed, e.info))
+}
+
+/// Clear the preview cache. Used by tests to keep state isolated; production
+/// callers rely on TTL + take-on-commit to bound exposure.
+#[cfg(test)]
+fn clear_preview_cache() {
+    preview_cache_lock().clear();
+}
 
 /// Process-wide lock around `HARMONY_RECOVERY_PASSPHRASE*` env-var mutation.
 /// `recovery_cli::resolve_recovery_passphrase` reads from the environment
@@ -95,11 +201,26 @@ const MAX_RECOVERY_FILE_BYTES: u64 = 1 << 20;
 /// so the GUI rejection fires first.
 const MAX_RECOVERY_COMMENT_BYTES: usize = 256;
 
-/// Read a recovery file with a size guard. Reject files larger than
-/// [`MAX_RECOVERY_FILE_BYTES`] before allocating.
+/// Read a recovery file with a size guard.
+///
+/// Opens the path **once** and uses the same descriptor for both the size
+/// check (`file.metadata()`) and the bounded read. Doing two separate path
+/// lookups (`std::fs::metadata(path)` then `std::fs::read(path)`) is
+/// TOCTOU-vulnerable: a swap between the two calls could let an attacker
+/// pass the metadata cap with a small file and then have the process
+/// allocate and read an arbitrary file (CodeRabbit Major, round 4).
+///
+/// The bounded `take()` is belt-and-suspenders: even if the file grows
+/// underneath the open descriptor on a filesystem that supports it, the
+/// read stops at `MAX_RECOVERY_FILE_BYTES + 1` and we reject above the cap.
 fn read_recovery_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     if metadata.len() > MAX_RECOVERY_FILE_BYTES {
         return Err(format!(
             "{} is too large to be a recovery file ({} bytes; max {} bytes)",
@@ -108,7 +229,22 @@ fn read_recovery_file(path: &Path) -> Result<Vec<u8>, String> {
             MAX_RECOVERY_FILE_BYTES
         ));
     }
-    std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+    // Cap the read at MAX + 1 so a file growing concurrently still cannot
+    // force an unbounded allocation here.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_RECOVERY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_RECOVERY_FILE_BYTES {
+        return Err(format!(
+            "{} is too large to be a recovery file ({} bytes; max {} bytes)",
+            path.display(),
+            bytes.len(),
+            MAX_RECOVERY_FILE_BYTES
+        ));
+    }
+    Ok(bytes)
 }
 
 // ── Helpers (testable without Tauri runtime) ──────────────────────────────
@@ -161,14 +297,20 @@ pub fn preview_mnemonic_identity_helper(words: &[String]) -> Result<String, Stri
     Ok(hex::encode(id_hash))
 }
 
-/// Decrypt a recovery file and return its metadata WITHOUT writing to disk.
+/// Decrypt a recovery file, cache the resulting seed in [`PREVIEW_CACHE`],
+/// and return a token + metadata WITHOUT writing to disk.
 ///
 /// The GUI restore-file step calls this to show "this restores identity
-/// 0x…, created <date>, comment: …" before the user commits.
+/// 0x…, created <date>, comment: …" before the user commits. The returned
+/// `previewToken` must be passed back to
+/// [`restore_recovery_from_preview_token_helper`] on commit — that handler
+/// looks up the same decrypted seed from the cache, never re-reading
+/// `in_path`. This is what closes the two-IPC TOCTOU window between
+/// preview-and-commit.
 pub fn preview_recovery_file_helper(
     in_path: &Path,
     passphrase: &str,
-) -> Result<RestoreInfo, String> {
+) -> Result<PreviewedRecovery, String> {
     use harmony_owner::lifecycle::RecoveryArtifact;
     use secrecy::SecretString;
 
@@ -177,10 +319,21 @@ pub fn preview_recovery_file_helper(
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
     let id_hash = restored.artifact.master_pubkey_bundle().identity_hash();
-    Ok(RestoreInfo {
+    let info = RestoreInfo {
         identity_hash: hex::encode(id_hash),
         minted_at: restored.metadata.mint_at,
-        comment: restored.metadata.comment,
+        comment: restored.metadata.comment.clone(),
+    };
+
+    // Cache the seed (zeroized on drop) and mint a token that the GUI will
+    // pass back on commit. The seed never leaves this process.
+    let artifact = restored.into_artifact();
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    let token = insert_preview(seed, info.clone());
+
+    Ok(PreviewedRecovery {
+        preview_token: token.to_string(),
+        info,
     })
 }
 
@@ -269,65 +422,44 @@ pub fn restore_mnemonic_from_words_helper(
     Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
 }
 
-/// Restore the on-disk identity from a passphrase-encrypted recovery file and
-/// return its metadata.
+/// Commit the seed cached under `preview_token` to disk.
 ///
-/// `force` is always `true` on this path: the GUI has already shown the user a
-/// `TypeToConfirmDialog` and received explicit acknowledgement that the current
-/// identity will be overwritten.
+/// `force` is always `true` on this path: the GUI has already shown the
+/// user a `TypeToConfirmDialog` and received explicit acknowledgement that
+/// the current identity will be overwritten.
 ///
-/// **Single-decrypt design.** The recovery file is read and decrypted exactly
-/// once. Metadata is extracted from the decrypted artifact, then the same
-/// in-memory artifact's seed is written directly to disk via
-/// [`identity::write_seed_to_disk_with_keychain`]. The function never
-/// re-touches `in_path` after the initial read. This is load-bearing for two
-/// reasons:
+/// **No re-read.** The seed written here was decrypted during
+/// [`preview_recovery_file_helper`] and held in [`PREVIEW_CACHE`] until
+/// commit. `in_path` is not consulted at all on this code path — the
+/// preview-and-commit pair is bound through the token, not the filename.
+/// A swap of the recovery file between IPCs cannot affect what gets
+/// restored (CodeRabbit Critical, round 4). The token is single-use:
+/// [`take_preview`] removes it from the cache, so a successful or partial
+/// commit cannot be replayed.
 ///
-/// 1. **Greptile P1 (round 2):** if anything fails before the seed is
-///    written, the on-disk identity is untouched and the caller can retry.
-/// 2. **CodeRabbit TOCTOU (round 3):** an earlier version called
-///    `restore_recovery_file_with_keychain(in_path, …)` after the metadata
-///    read, opening a TOCTOU window where the file could be swapped or
-///    grown between the two reads — letting an attacker show the user
-///    metadata for backup A while restoring backup B's seed, or bypass the
-///    [`MAX_RECOVERY_FILE_BYTES`] guard with a swap.
-///
-/// Because we no longer go through `recovery_cli::restore_recovery_file_*`,
-/// the env-var dance (`HARMONY_RECOVERY_PASSPHRASE*`) is unnecessary on this
-/// path: passphrase resolution happened during decrypt above.
-pub fn restore_recovery_file_from_path_helper(
+/// Errors:
+/// - **invalid token** (unknown UUID, expired, or already consumed): the
+///   on-disk identity is untouched. The GUI will surface this and ask the
+///   user to re-pick the recovery file.
+/// - **disk write failure**: the cache entry has already been consumed
+///   (we cannot tell whether the partial write succeeded), so the user
+///   must re-preview before retrying. Identity may be partially written;
+///   retry with the same backup is safe (`force=true`).
+pub fn restore_recovery_from_preview_token_helper(
     plaintext_path: &Path,
-    in_path: &Path,
-    passphrase: &str,
+    preview_token: &str,
     keychain: Option<KeychainStore>,
 ) -> Result<RestoreInfo, String> {
-    use harmony_owner::lifecycle::RecoveryArtifact;
-    use secrecy::SecretString;
-    use zeroize::Zeroizing;
-
-    // ── Step 1: read + decrypt once. Read-only; on-disk identity untouched. ─
-    let bytes = read_recovery_file(in_path)?;
-    let pass = SecretString::from(passphrase.to_string());
-    let restored =
-        RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
-    let id_hash = restored.artifact.master_pubkey_bundle().identity_hash();
-    let info = RestoreInfo {
-        identity_hash: hex::encode(id_hash),
-        minted_at: restored.metadata.mint_at,
-        comment: restored.metadata.comment.clone(),
-    };
-
-    // ── Step 2: extract the seed from the decrypted artifact and write. ────
-    // No re-read of `in_path` — the seed we write is byte-equal to the seed
-    // whose hash was just shown to the user (see TOCTOU note in doc comment).
-    // `Zeroizing` clears the seed from stack memory once we're done.
-    let artifact = restored.into_artifact();
-    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    let token = Uuid::parse_str(preview_token)
+        .map_err(|_| "invalid preview token (re-pick the recovery file)".to_string())?;
+    let (seed, info) = take_preview(token).ok_or_else(|| {
+        "preview expired or already used; re-pick the recovery file to continue".to_string()
+    })?;
 
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     identity::write_seed_to_disk_with_keychain(
         plaintext_path,
-        &seed_bytes,
+        &seed,
         /*force=*/ true,
         keychain,
     )
@@ -338,34 +470,55 @@ pub fn restore_recovery_file_from_path_helper(
 
 // ── Tauri commands ────────────────────────────────────────────────────────
 
+/// Run a synchronous helper on the blocking thread pool.
+///
+/// Each helper does file I/O, Argon2id KDF, and/or
+/// XChaCha20-Poly1305 work — running these directly on the async executor
+/// would stall other tasks (zenoh sync, IPC handling, UI events) for the
+/// hundreds of milliseconds that a single Argon2id derivation takes
+/// (Cursor Bugbot, round 4).
+async fn run_blocking<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
+
 /// Return the 32-char hex identity hash of the current on-disk identity.
 #[tauri::command]
 pub async fn current_identity_hash() -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    current_identity_hash_helper(&plaintext_path, KeychainStore::new().ok())
+    run_blocking(move || current_identity_hash_helper(&plaintext_path, KeychainStore::new().ok()))
+        .await
 }
 
 /// Return the 24 BIP39 mnemonic words for the backup wizard.
 #[tauri::command]
 pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    export_mnemonic_words_helper(&plaintext_path, KeychainStore::new().ok())
+    run_blocking(move || export_mnemonic_words_helper(&plaintext_path, KeychainStore::new().ok()))
+        .await
 }
 
 /// Return the identity hash that would result from restoring the given
 /// words, WITHOUT writing anything to disk.
 #[tauri::command]
 pub async fn preview_mnemonic_identity(words: Vec<String>) -> Result<String, String> {
-    preview_mnemonic_identity_helper(&words)
+    run_blocking(move || preview_mnemonic_identity_helper(&words)).await
 }
 
-/// Decrypt a recovery file and return its metadata WITHOUT writing to disk.
+/// Decrypt a recovery file and return a preview token + metadata WITHOUT
+/// writing to disk. The token must be passed back to
+/// `restore_recovery_from_preview_token` to commit.
 #[tauri::command]
 pub async fn preview_recovery_file(
     in_path: String,
     passphrase: String,
-) -> Result<RestoreInfo, String> {
-    preview_recovery_file_helper(Path::new(&in_path), &passphrase)
+) -> Result<PreviewedRecovery, String> {
+    run_blocking(move || preview_recovery_file_helper(Path::new(&in_path), &passphrase)).await
 }
 
 /// Export the master seed as a passphrase-encrypted recovery file at `out_path`.
@@ -379,13 +532,16 @@ pub async fn export_recovery_file_to_path(
     comment: Option<String>,
 ) -> Result<(), String> {
     let plaintext_path = identity::resolve_path(None)?;
-    export_recovery_file_to_path_helper(
-        &plaintext_path,
-        &out_path,
-        &passphrase,
-        comment,
-        KeychainStore::new().ok(),
-    )
+    run_blocking(move || {
+        export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &out_path,
+            &passphrase,
+            comment,
+            KeychainStore::new().ok(),
+        )
+    })
+    .await
 }
 
 /// Restore the on-disk identity from a 24-word mnemonic array.
@@ -396,26 +552,33 @@ pub async fn export_recovery_file_to_path(
 #[tauri::command]
 pub async fn restore_mnemonic_from_words(words: Vec<String>) -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    restore_mnemonic_from_words_helper(&plaintext_path, &words, KeychainStore::new().ok())
+    run_blocking(move || {
+        restore_mnemonic_from_words_helper(&plaintext_path, &words, KeychainStore::new().ok())
+    })
+    .await
 }
 
-/// Restore the on-disk identity from a passphrase-encrypted recovery file.
+/// Commit the seed cached under `preview_token` to disk.
 ///
-/// Returns metadata (`identity_hash`, `minted_at`, `comment`) for the restored
-/// identity. The GUI calls this only after the user has passed the
-/// `TypeToConfirmDialog` gate, so `force=true` is applied unconditionally.
+/// Returns metadata (`identityHash`, `mintedAt`, `comment`) for the
+/// restored identity. The GUI calls this only after the user has passed
+/// the `TypeToConfirmDialog` gate, so `force=true` is applied
+/// unconditionally. The token comes from a prior `preview_recovery_file`
+/// IPC call; see [`restore_recovery_from_preview_token_helper`] for the
+/// TOCTOU rationale.
 #[tauri::command]
-pub async fn restore_recovery_file_from_path(
-    in_path: PathBuf,
-    passphrase: String,
+pub async fn restore_recovery_from_preview_token(
+    preview_token: String,
 ) -> Result<RestoreInfo, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    restore_recovery_file_from_path_helper(
-        &plaintext_path,
-        &in_path,
-        &passphrase,
-        KeychainStore::new().ok(),
-    )
+    run_blocking(move || {
+        restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &preview_token,
+            KeychainStore::new().ok(),
+        )
+    })
+    .await
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────
@@ -558,10 +721,15 @@ mod tests {
         let bytes = artifact.to_encrypted_file(&pass, &metadata).unwrap();
         std::fs::write(&recovery_path, &bytes).unwrap();
 
-        let info = preview_recovery_file_helper(&recovery_path, "preview-test").expect("preview");
-        assert_eq!(info.identity_hash, expected_hash);
-        assert_eq!(info.minted_at, Some(1_700_000_000));
-        assert_eq!(info.comment.as_deref(), Some("test backup"));
+        let preview =
+            preview_recovery_file_helper(&recovery_path, "preview-test").expect("preview");
+        assert_eq!(preview.info.identity_hash, expected_hash);
+        assert_eq!(preview.info.minted_at, Some(1_700_000_000));
+        assert_eq!(preview.info.comment.as_deref(), Some("test backup"));
+        // Token must be a parseable UUID — the GUI treats it as an opaque
+        // string but the backend parses it back on commit.
+        Uuid::parse_str(&preview.preview_token).expect("token must parse as UUID");
+        clear_preview_cache();
     }
 
     #[test]
@@ -583,48 +751,34 @@ mod tests {
         assert!(!err.is_empty(), "error must be non-empty; got: {err}");
     }
 
-    /// Pin the load-bearing invariant from Greptile P1: if metadata
-    /// extraction fails (file missing, corrupted, wrong passphrase), the
-    /// on-disk identity must NOT be overwritten. The function must return
-    /// `Err` BEFORE touching disk.
+    /// Pin the load-bearing invariant from Greptile P1: if preview fails
+    /// (file missing, corrupted, wrong passphrase), no token is issued —
+    /// so commit cannot run, and the on-disk identity is untouched.
+    /// The token-cache architecture (round 4) makes this property
+    /// architectural rather than ordering-dependent: there's literally no
+    /// way to write the seed without first having a valid preview.
     #[test]
     #[serial]
-    fn restore_recovery_file_failure_leaves_identity_untouched() {
+    fn preview_failure_issues_no_token_and_leaves_identity_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
 
-        std::env::set_var("HARMONY_PASSPHRASE", "metadata-first-test");
-        let original_seed = [0xC1u8; 32];
-        plant_seed(&plaintext_path, &original_seed);
+        std::env::set_var("HARMONY_PASSPHRASE", "preview-fail-test");
+        plant_seed(&plaintext_path, &[0xC1u8; 32]);
 
-        // Capture original on-disk encrypted bytes for content equality.
         let enc_path = plaintext_path.with_file_name("identity.enc");
         let original_enc = std::fs::read(&enc_path).expect("read original enc");
 
-        // Point at a non-existent recovery file. Step 1 (read metadata)
-        // must fail before step 2 (write seed) is ever invoked.
+        // Sub-case 1: missing recovery file — preview returns Err.
         let bogus_recovery = dir.path().join("does-not-exist.recovery");
-        let err = restore_recovery_file_from_path_helper(
-            &plaintext_path,
-            &bogus_recovery,
-            "any-pass",
-            None,
-        )
-        .expect_err("missing recovery file must fail");
+        let err = preview_recovery_file_helper(&bogus_recovery, "any-pass")
+            .expect_err("missing recovery file must fail");
         assert!(
             err.contains("failed to read") || err.contains("does-not-exist"),
             "error must mention the missing file; got: {err}"
         );
 
-        // Bytes on disk must be byte-for-byte identical to before the call.
-        let after_enc = std::fs::read(&enc_path).expect("read after enc");
-        assert_eq!(
-            original_enc, after_enc,
-            "identity must NOT be overwritten when metadata extraction fails"
-        );
-
-        // ── Same invariant for wrong-passphrase failure (file exists but
-        // can't decrypt). ──
+        // Sub-case 2: wrong passphrase — preview returns Err.
         use secrecy::SecretString;
         let recovery_path = dir.path().join("good.recovery");
         let artifact = RecoveryArtifact::from_seed([0xB7u8; 32]);
@@ -634,15 +788,16 @@ mod tests {
             .unwrap();
         std::fs::write(&recovery_path, &bytes).unwrap();
 
-        let err =
-            restore_recovery_file_from_path_helper(&plaintext_path, &recovery_path, "WRONG", None)
-                .expect_err("wrong passphrase must fail");
+        let err = preview_recovery_file_helper(&recovery_path, "WRONG")
+            .expect_err("wrong passphrase must fail");
         assert!(!err.is_empty(), "error must be non-empty; got: {err}");
 
-        let after_enc = std::fs::read(&enc_path).expect("read after wrong-pass");
+        // Identity bytes are byte-for-byte identical to before the call —
+        // preview never touches plaintext_path.
+        let after_enc = std::fs::read(&enc_path).expect("read after enc");
         assert_eq!(
             original_enc, after_enc,
-            "identity must NOT be overwritten when passphrase is wrong"
+            "identity must NOT be overwritten when preview fails"
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
@@ -818,53 +973,157 @@ mod tests {
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
-    // ── restore_recovery_file_from_path_helper TOCTOU regression ─────────
+    // ── token-cache TOCTOU regression (round 4) ──────────────────────────
 
-    /// CodeRabbit round 3: the helper must NOT re-read `in_path` after the
-    /// initial decrypt. Swapping the recovery file between metadata-shown
-    /// and seed-written must NOT change which seed lands on disk; the seed
-    /// written must be byte-equal to the seed whose hash was returned.
+    /// CodeRabbit round 4 (Critical): if the recovery file is swapped between
+    /// `preview_recovery_file` and `restore_recovery_from_preview_token`, the
+    /// commit must restore the seed shown to the user during preview, NOT
+    /// the seed that's currently on disk.
+    ///
+    /// This test performs an **actual** swap: write A → preview → overwrite
+    /// the path with B → commit by token → assert on-disk seed is A's. In
+    /// the old path-based implementation the commit would re-read the path
+    /// and restore B's seed, failing this test.
     #[test]
     #[serial]
-    fn restore_recovery_file_seed_matches_returned_metadata_under_swap() {
-        use harmony_owner::recovery::RecoveryMetadata;
+    fn token_commit_uses_cached_seed_not_current_file_contents() {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let recovery_path = dir.path().join("rec.bin");
 
-        std::env::set_var("HARMONY_PASSPHRASE", "toctou-test");
+        std::env::set_var("HARMONY_PASSPHRASE", "swap-test");
         plant_seed(&plaintext_path, &[0xA1u8; 32]);
+        clear_preview_cache();
 
-        // Backup A — what the user picks and confirms.
+        // Backup A — the one the user picks, previews, and confirms.
         let seed_a = [0xAAu8; 32];
         let artifact_a = RecoveryArtifact::from_seed(seed_a);
         let expected_hash_a = hex::encode(artifact_a.master_pubkey_bundle().identity_hash());
-        let pass = "toctou-pass";
-        let pass_secret = SecretString::from(pass.to_string());
+        let pass_a = SecretString::from("pass-a".to_string());
         let bytes_a = artifact_a
-            .to_encrypted_file(&pass_secret, &RecoveryMetadata::default())
+            .to_encrypted_file(&pass_a, &RecoveryMetadata::default())
             .unwrap();
         std::fs::write(&recovery_path, &bytes_a).unwrap();
 
-        // Restore from path; helper must read+decrypt once. We simulate a
-        // post-decrypt swap by wiping the file BEFORE the call returns: if
-        // the helper ever re-reads, this restore would fail.  (The previous
-        // implementation called `restore_recovery_file_with_keychain(in_path,…)`
-        // after metadata extraction, which would do exactly that re-read.)
-        let info =
-            restore_recovery_file_from_path_helper(&plaintext_path, &recovery_path, pass, None)
-                .expect("restore");
-        assert_eq!(info.identity_hash, expected_hash_a);
+        // Step 1: preview A → get a token bound to A's seed.
+        let preview = preview_recovery_file_helper(&recovery_path, "pass-a").expect("preview");
+        assert_eq!(preview.info.identity_hash, expected_hash_a);
 
-        // The seed actually written to disk must be backup A's seed —
-        // matching the hash we just returned.
-        let on_disk = identity::read_seed_from_disk_with_keychain(&plaintext_path, None)
-            .expect("read planted");
+        // Step 2: SWAP. An attacker (or buggy app) replaces the file at the
+        // same path with backup B, encrypted under a different passphrase.
+        let seed_b = [0xBBu8; 32];
+        let artifact_b = RecoveryArtifact::from_seed(seed_b);
+        let pass_b = SecretString::from("pass-b".to_string());
+        let bytes_b = artifact_b
+            .to_encrypted_file(&pass_b, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes_b).unwrap();
+
+        // Step 3: commit by token. Backend must use the cached A seed; it
+        // must NEVER re-read recovery_path, so B's contents are irrelevant.
+        let info = restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &preview.preview_token,
+            None,
+        )
+        .expect("restore by token");
+        assert_eq!(
+            info.identity_hash, expected_hash_a,
+            "commit must report A's hash (the previewed one), not B's"
+        );
+
+        // Step 4: verify the on-disk seed is A's, not B's.
+        let on_disk =
+            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read seed");
         assert_eq!(
             *on_disk, seed_a,
-            "written seed must match returned metadata"
+            "on-disk seed must be A (previewed), not B (current file contents)"
+        );
+        assert_ne!(
+            *on_disk, seed_b,
+            "swap to B between preview and commit must NOT influence the restore"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// Token must be single-use: a successful commit removes the entry, so
+    /// a second commit attempt with the same token fails. Defends against
+    /// replay attacks (e.g. the GUI accidentally double-submitting).
+    #[test]
+    #[serial]
+    fn token_commit_is_single_use() {
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "single-use-test");
+        plant_seed(&plaintext_path, &[0xC2u8; 32]);
+        clear_preview_cache();
+
+        let artifact = RecoveryArtifact::from_seed([0xCCu8; 32]);
+        let pass = SecretString::from("pass".to_string());
+        let bytes = artifact
+            .to_encrypted_file(&pass, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes).unwrap();
+
+        let preview = preview_recovery_file_helper(&recovery_path, "pass").expect("preview");
+        // First commit: succeeds.
+        restore_recovery_from_preview_token_helper(&plaintext_path, &preview.preview_token, None)
+            .expect("first commit");
+        // Second commit with the SAME token: fails — the entry was consumed.
+        let err = restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &preview.preview_token,
+            None,
+        )
+        .expect_err("second commit must fail");
+        assert!(
+            err.contains("expired") || err.contains("already used"),
+            "error must explain replay protection; got: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// An unknown / malformed token must be rejected before any disk write.
+    #[test]
+    #[serial]
+    fn token_commit_rejects_unknown_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "unknown-token-test");
+        plant_seed(&plaintext_path, &[0xD3u8; 32]);
+        clear_preview_cache();
+
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let original_enc = std::fs::read(&enc_path).expect("read original enc");
+
+        // Random UUID that was never issued.
+        let bogus = Uuid::new_v4().to_string();
+        let err = restore_recovery_from_preview_token_helper(&plaintext_path, &bogus, None)
+            .expect_err("unknown token must fail");
+        assert!(!err.is_empty(), "error must be non-empty; got: {err}");
+
+        // Identity untouched.
+        let after_enc = std::fs::read(&enc_path).expect("read after enc");
+        assert_eq!(
+            original_enc, after_enc,
+            "identity must NOT be overwritten on unknown token"
+        );
+
+        // Non-UUID garbage is also rejected.
+        let err = restore_recovery_from_preview_token_helper(&plaintext_path, "not-a-uuid", None)
+            .expect_err("malformed token must fail");
+        assert!(
+            err.contains("invalid preview token"),
+            "error must say invalid token; got: {err}"
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");

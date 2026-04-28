@@ -2952,7 +2952,7 @@ pub fn run() {
             identity_commands::preview_recovery_file,
             identity_commands::export_recovery_file_to_path,
             identity_commands::restore_mnemonic_from_words,
-            identity_commands::restore_recovery_file_from_path,
+            identity_commands::restore_recovery_from_preview_token,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

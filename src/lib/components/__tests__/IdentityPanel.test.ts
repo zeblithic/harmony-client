@@ -1208,17 +1208,20 @@ describe('Restore wizard — step 3 (confirm)', () => {
     expect(screen.getByText(/0xc3d4e5f6/i)).toBeInTheDocument();
   });
 
-  it('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done', async () => {
+  it('Replace identity (file) invokes restore_recovery_from_preview_token and transitions to done', async () => {
     const filePath = '/tmp/identity.recovery';
     const postRestoreHash = 'c3d4e5f6'.repeat(4);
+    const previewToken = '11111111-2222-3333-4444-555555555555';
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return currentHash;
-      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: null, comment: null };
-      if (cmd === 'restore_recovery_file_from_path') {
-        const a = args as { inPath: string; passphrase: string };
-        expect(a.inPath).toBe(filePath);
-        expect(a.passphrase).toBe('hunter2');
+      if (cmd === 'preview_recovery_file') return { previewToken, identityHash: newHash, mintedAt: null, comment: null };
+      if (cmd === 'restore_recovery_from_preview_token') {
+        const a = args as { previewToken: string };
+        // Pin the TOCTOU fix: commit must use the preview token, NOT a path
+        // or passphrase. Old (`inPath`+`passphrase`) shape would re-read
+        // disk between IPCs and could restore a swapped backup.
+        expect(a.previewToken).toBe(previewToken);
         return { identityHash: postRestoreHash };
       }
       throw new Error(`unexpected: ${cmd}`);
@@ -1784,7 +1787,7 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
   it('successful decrypt transitions to fileDecrypted step', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
+      if (cmd === 'preview_recovery_file') return { previewToken: 'tok-1', identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -1851,7 +1854,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
+      if (cmd === 'preview_recovery_file') return { previewToken: 'tok-2', identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -1869,7 +1872,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
   it('omits Minted line when minted_at is null', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: null, comment: 'test' };
+      if (cmd === 'preview_recovery_file') return { previewToken: 'tok-3', identityHash: newHash, mintedAt: null, comment: 'test' };
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -1882,7 +1885,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
   it('omits Comment line when comment is absent', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: undefined };
+      if (cmd === 'preview_recovery_file') return { previewToken: 'tok-4', identityHash: newHash, mintedAt: 1744999931, comment: undefined };
       throw new Error(`unexpected: ${cmd}`);
     });
 
