@@ -2,6 +2,10 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
 
+  function assertNever(x: never): never {
+    throw new Error(`unhandled wizard variant: ${JSON.stringify(x)}`);
+  }
+
   let fullHash = $state('');
   let displayHash = $derived(fullHash ? `0x${fullHash.slice(0, 8)}…` : '…');
   let loadError = $state<string | null>(null);
@@ -35,6 +39,43 @@
 
   let wizardState = $state<WizardState>({ kind: 'idle' });
 
+  // Compile-time exhaustiveness check: the compiler proves this switch is
+  // exhaustive over BackupStep / RestoreStep. If a new variant is added in
+  // Tasks 6-9 without a matching case here, tsc will error at the
+  // assertNever(step) call — catching forgotten-variant bugs before runtime.
+  function checkExhaustive(state: WizardState): void {
+    if (state.kind === 'backup') {
+      const step = state.step;
+      switch (step.phase) {
+        case 'pickType':
+        case 'mnemonicReveal':
+        case 'fileEntry':
+        case 'fileSaved':
+        case 'fileSaveError':
+          break;
+        default:
+          assertNever(step);
+      }
+    } else if (state.kind === 'restore') {
+      const step = state.step;
+      switch (step.phase) {
+        case 'pickSource':
+        case 'mnemonicEntry':
+        case 'fileEntry':
+        case 'fileDecrypted':
+        case 'confirm':
+        case 'commitError':
+        case 'done':
+          break;
+        default:
+          assertNever(step);
+      }
+    }
+  }
+  // Silence the unused-variable warning — this function is intentionally
+  // called only for its compile-time type narrowing.
+  void checkExhaustive;
+
   // Transient UI state for pickType step (not yet committed to wizardState)
   let selectedBackupType = $state<'mnemonic' | 'file' | null>(null);
 
@@ -63,24 +104,28 @@
   async function advanceFromPickType() {
     if (!selectedBackupType) return;
     if (selectedBackupType === 'mnemonic') {
-      // Fetch words then transition
+      // Capture the current state so we can detect if the user cancelled
+      // (or otherwise transitioned away) while the invoke was pending.
+      const epoch = wizardState;
       let words: string[];
-      let fetchError: string | null = null;
       try {
         words = await invoke<string[]>('export_mnemonic_words');
       } catch (e) {
-        fetchError = `Could not load recovery phrase: ${e}`;
+        // Same guard for the error path: don't resurrect a cancelled wizard.
+        if (wizardState !== epoch) return;
         wizardState = {
           kind: 'backup',
-          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: fetchError },
+          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: `Could not load recovery phrase: ${e}` },
         };
         return;
       }
+      if (wizardState !== epoch) return;
       wizardState = {
         kind: 'backup',
         step: { phase: 'mnemonicReveal', words, revealed: false, storedSafely: false, loadError: null },
       };
     } else {
+      // No await on this path — direct transition is safe.
       wizardState = {
         kind: 'backup',
         step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false },
@@ -151,15 +196,15 @@
           Write these 24 words down. Anyone with them can recover your identity.
           There is no way to retrieve them later.
         </p>
-        <div
+        <ol
           data-testid="mnemonic-grid"
           class="mnemonic-grid"
           class:blurred={!wizardState.step.revealed}
         >
-          {#each wizardState.step.words as w, i}
-            <div class="word"><span class="num">{i + 1}.</span> {w}</div>
+          {#each wizardState.step.words as w, i (i)}
+            <li class="word">{w}</li>
           {/each}
-        </div>
+        </ol>
         {#if !wizardState.step.revealed}
           <button onclick={() => {
             if (wizardState.kind === 'backup' && wizardState.step.phase === 'mnemonicReveal') {
@@ -246,14 +291,14 @@
     gap: 6px;
     background: var(--bg-tertiary);
     border-radius: 6px;
-    padding: 12px;
+    padding: 12px 12px 12px 36px; /* left padding leaves room for the list marker */
     font-family: ui-monospace, monospace;
     font-size: 0.85em;
     margin: 12px 0;
+    list-style: decimal;
   }
   .mnemonic-grid.blurred { filter: blur(6px); user-select: none; }
   .word { padding: 2px 0; }
-  .word .num { color: var(--text-muted); margin-right: 4px; }
   .confirm-label {
     display: flex; align-items: center; gap: 8px;
     margin: 12px 0; cursor: pointer; color: var(--text-primary);

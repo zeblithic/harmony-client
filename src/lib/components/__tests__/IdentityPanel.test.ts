@@ -363,4 +363,40 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
     await fireEvent.click(screen.getByRole('button', { name: /reveal/i }));
     expect(grid).not.toHaveClass('blurred');
   });
+
+  it('cancel during pending export does not resurrect the wizard', async () => {
+    // Make the invoke hang via a pending promise we control.
+    let resolveExport!: (words: string[]) => void;
+    const exportPromise = new Promise<string[]>((resolve) => { resolveExport = resolve; });
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'export_mnemonic_words') return exportPromise;
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+
+    // Open backup wizard, pick mnemonic, click Continue (starts the pending invoke).
+    await fireEvent.click(screen.getByRole('button', { name: /backup/i }));
+    await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    // Cancel the wizard while invoke is pending.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    // Sanity-check: idle screen visible right after cancel.
+    await screen.findByText(/0xaaaaaaaa/);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+
+    // Now resolve the invoke — wizard should NOT resurrect.
+    resolveExport(Array.from({ length: 24 }, (_, i) => `word${i + 1}`));
+    // Give Svelte a tick to potentially re-render.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Assert: still on idle screen, no mnemonic-reveal UI present.
+    expect(screen.queryByText(/anyone with them can recover/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+  });
 });
