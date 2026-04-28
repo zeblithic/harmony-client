@@ -23,6 +23,28 @@
     }
   });
 
+  let backupRequested = $state(false);
+
+  function formatOwnerFingerprint(hex: string): string {
+    // 32 hex chars → "xxxx·xxxx·xxxx·xxxx" for readability
+    if (hex.length < 16) return hex;
+    return `${hex.slice(0,4)}·${hex.slice(4,8)}·${hex.slice(8,12)}·${hex.slice(12,16)}`;
+  }
+
+  function deviceInitial(name: string): string {
+    return name.trim().charAt(0).toUpperCase() || '?';
+  }
+
+  function formatEnrolledAt(ts: number): string {
+    const ms = ts * 1000;
+    const now = Date.now();
+    const ageDays = Math.floor((now - ms) / (1000 * 60 * 60 * 24));
+    if (ageDays < 1) return 'today';
+    if (ageDays < 2) return 'yesterday';
+    if (ageDays < 30) return `${ageDays}d ago`;
+    return new Date(ms).toLocaleDateString();
+  }
+
   async function handleConfirmMint() {
     mintInFlight = true;
     mintError = null;
@@ -56,9 +78,61 @@
       </button>
     </div>
   {:else}
-    <!-- Populated state added in Task 8 -->
     <div class="populated">
-      <h3>My Devices ({state.devices.length})</h3>
+      <!-- ① Owner identity header -->
+      <div class="owner-header">
+        <div class="label">OWNER IDENTITY</div>
+        <div class="owner-row">
+          <div>
+            <div class="owner-name">{state.ownerDisplayName}</div>
+            <div class="owner-fingerprint">{formatOwnerFingerprint(state.ownerId)}</div>
+          </div>
+          <button class="primary" onclick={() => { backupRequested = true; }}>
+            Back up owner identity →
+          </button>
+        </div>
+      </div>
+
+      <!-- ② Devices list -->
+      <div class="devices-list">
+        <div class="label">MY DEVICES ({state.devices.length})</div>
+        {#each state.devices as device (device.deviceId)}
+          <div class="device-row">
+            <div class="device-icon">{deviceInitial(device.displayName)}</div>
+            <div class="device-meta">
+              <div class="device-name-row">
+                <span class="device-name">{device.displayName}</span>
+                {#if device.isThisDevice}
+                  <span class="this-device-marker">this device</span>
+                {/if}
+              </div>
+              <div class="device-secondary">
+                {#if device.trustDecision.kind === 'full'}
+                  <span class="trust-badge full">● trusted</span>
+                {:else if device.trustDecision.kind === 'provisional'}
+                  <span class="trust-badge provisional">● provisional</span>
+                {:else}
+                  <span class="trust-badge refused">● refused</span>
+                {/if}
+                <span class="separator">·</span>
+                <span>added {formatEnrolledAt(device.enrolledAt)}</span>
+                <span class="separator">·</span>
+                <span class="fingerprint">{device.fingerprint}</span>
+              </div>
+            </div>
+          </div>
+        {/each}
+      </div>
+
+      <!-- ③ Educational footer -->
+      <div class="add-another-footer">
+        <div class="label">ADD ANOTHER DEVICE</div>
+        <p class="explainer">
+          Pairing UI is coming. For now, multi-device coexistence requires the
+          <code>enroll_via_master</code> flow which ships in a follow-up. Currently
+          only one device is bound under your owner identity.
+        </p>
+      </div>
     </div>
   {/if}
 
@@ -154,5 +228,100 @@
   .loading {
     color: var(--text-muted);
     font-size: 13px;
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .owner-header {
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .owner-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  .owner-name {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .owner-fingerprint {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+  .devices-list {
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .device-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px;
+    background: var(--bg-primary);
+    border-radius: 4px;
+  }
+  .device-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .device-meta {
+    flex: 1;
+    min-width: 0;
+  }
+  .device-name-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .device-name {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .this-device-marker {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .device-secondary {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
+  .trust-badge.full { color: #4ade80; }
+  .trust-badge.provisional { color: #fbbf24; }
+  .trust-badge.refused { color: var(--danger); }
+  .separator { margin: 0 6px; color: var(--text-muted); }
+  .fingerprint { font-family: monospace; }
+  .add-another-footer .explainer {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 0;
+  }
+  .add-another-footer code {
+    font-family: monospace;
+    font-size: 11px;
+    background: var(--bg-tertiary);
+    padding: 1px 4px;
+    border-radius: 3px;
   }
 </style>

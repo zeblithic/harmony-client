@@ -70,3 +70,67 @@ describe('DevicesPanel — empty + bootstrap states', () => {
     expect(screen.queryByText(/will create your owner identity/i)).not.toBeInTheDocument();
   });
 });
+
+describe('DevicesPanel — populated state', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('renders owner header with display name and fingerprint', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    render(DevicesPanel);
+    await screen.findByText('zeblith');
+    expect(screen.getByText(/a4f1·c823/i)).toBeInTheDocument();
+    expect(screen.getByText(/back up owner identity/i)).toBeInTheDocument();
+  });
+
+  it('renders device row with name, this-device marker, trust badge, fingerprint, enrolled date', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'KRILE',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    render(DevicesPanel);
+    await screen.findByText('KRILE');
+    expect(screen.getByText(/this device/i)).toBeInTheDocument();
+    expect(screen.getByText(/trusted/i)).toBeInTheDocument();
+    expect(screen.getByText(/aa11·bb22/i)).toBeInTheDocument();
+  });
+
+  it('renders educational footer for adding another device', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    render(DevicesPanel);
+    await screen.findByText(/add another device/i);
+    expect(screen.getByText(/pairing UI is coming/i)).toBeInTheDocument();
+  });
+});
