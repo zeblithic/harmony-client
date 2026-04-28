@@ -175,8 +175,7 @@ mod token_cache_tests {
 // The `.cbor` file's presence is the minted-marker — its absence means the
 // natural un-minted state.
 
-use crate::identity::{write_atomic_0600, EncryptedFileStore, KeychainStore};
-use crate::identity::KeyStore;
+use crate::identity::{write_atomic_0600, EncryptedFileStore, KeychainStore, KeyStore};
 use ed25519_dalek::SigningKey;
 use harmony_owner::cbor;
 use harmony_owner::state::OwnerState;
@@ -290,7 +289,7 @@ fn load_secret(
             Ok(bytes) => {
                 if bytes.len() != 32 {
                     return Err(format!(
-                        "keychain entry {keychain_name} length is {} bytes, expected 32",
+                        "keychain entry {KEYCHAIN_OWNER_SERVICE}/{keychain_name} length is {} bytes, expected 32",
                         bytes.len()
                     ));
                 }
@@ -304,19 +303,20 @@ fn load_secret(
     }
     // Fallback: encrypted file under HARMONY_PASSPHRASE.
     let path = identity_dir.join(fallback_filename);
-    if !path.exists() {
-        return Ok(None);
+    let store_opt = EncryptedFileStore::from_env(path.clone())
+        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?;
+    let store = match store_opt {
+        Some(s) => s,
+        None => {
+            // HARMONY_PASSPHRASE not set — treat as "no fallback configured" → Ok(None).
+            return Ok(None);
+        }
+    };
+    match store.load() {
+        Ok(Some(seed_bytes)) => Ok(Some(*seed_bytes)),
+        Ok(None) => Ok(None),  // file simply absent — natural un-minted state
+        Err(e) => Err(format!("read {fallback_filename}: {e}")),
     }
-    let store = EncryptedFileStore::from_env(path.clone())
-        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?
-        .ok_or_else(|| {
-            format!("HARMONY_PASSPHRASE not set; cannot decrypt {fallback_filename}")
-        })?;
-    let seed = store
-        .load()
-        .map_err(|e| format!("read {fallback_filename}: {e}"))?
-        .ok_or_else(|| format!("{fallback_filename} disappeared between exists() and read()"))?;
-    Ok(Some(*seed))
 }
 
 fn save_secret(
@@ -352,10 +352,29 @@ mod persistence_tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    /// RAII guard: sets an env var on construction and removes it on drop (including on panic).
+    /// Prevents a test-panic from leaking env vars into the next `#[serial]` test.
+    struct EnvVarGuard {
+        name: &'static str,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            std::env::set_var(name, value);
+            Self { name }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.name);
+        }
+    }
+
     #[test]
     #[serial]
     fn save_then_load_roundtrip_preserves_state() {
-        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-1");
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-1");
         let dir = tempdir().unwrap();
 
         let MintResult { state, recovery_artifact, device_signing_key } =
@@ -372,13 +391,12 @@ mod persistence_tests {
         assert_eq!(loaded.state.enrollments.len(), 1);
         assert_eq!(loaded.device_signing_key.to_bytes(), device_signing_key.to_bytes());
         assert_eq!(loaded.master_seed, Some(master_seed));
-
-        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn load_returns_none_when_no_cbor_present() {
+        // No HARMONY_PASSPHRASE needed: this test exits before any secret load.
         let dir = tempdir().unwrap();
         let result = load_owner_state(dir.path(), None).expect("load");
         assert!(result.is_none(), "un-minted state must be None, not Err");
@@ -387,6 +405,7 @@ mod persistence_tests {
     #[test]
     #[serial]
     fn load_returns_err_when_cbor_corrupt() {
+        // No HARMONY_PASSPHRASE needed: this test exits before any secret load.
         let dir = tempdir().unwrap();
         let cbor_path = dir.path().join(OWNER_STATE_FILENAME);
         std::fs::write(&cbor_path, b"not-cbor-bytes").unwrap();
@@ -397,7 +416,7 @@ mod persistence_tests {
     #[test]
     #[serial]
     fn load_returns_err_when_signing_key_missing() {
-        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-2");
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-2");
         let dir = tempdir().unwrap();
 
         let MintResult { state, recovery_artifact, device_signing_key } =
@@ -420,13 +439,12 @@ mod persistence_tests {
             err.contains("device_signing_key missing") || err.contains("inconsistent"),
             "actual: {err}"
         );
-        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn load_returns_some_with_none_master_seed_when_only_seed_missing() {
-        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-3");
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-3");
         let dir = tempdir().unwrap();
 
         let MintResult { state, recovery_artifact, device_signing_key } =
@@ -450,7 +468,38 @@ mod persistence_tests {
             loaded.master_seed.is_none(),
             "degraded state: master seed gone, signing key present"
         );
-        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn load_returns_none_when_cbor_missing_but_keychain_orphans_present() {
+        // Spec: if keychain entries exist without owner_state.cbor (e.g., from a
+        // partial save_owner_state_atomic that crashed mid-sequence), load
+        // returns Ok(None) — the .cbor file is the minted-marker. Orphan
+        // keychain entries are tolerated and overwritten by the next mint.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "orphan-test-pp");
+        let dir = tempdir().unwrap();
+
+        // Successful save first (writes both keychain entries + .cbor).
+        let MintResult { state, recovery_artifact, device_signing_key } =
+            mint_owner(1_700_000_999).unwrap();
+        save_owner_state_atomic(
+            dir.path(), &state, &device_signing_key, recovery_artifact.as_bytes(), None,
+        ).unwrap();
+
+        // Now simulate the partial-failure end state: delete the .cbor minted-marker
+        // but leave the device_sk.enc and master_seed.enc files in place. This
+        // mirrors what a save_owner_state_atomic that crashes after the keychain
+        // writes but before write_atomic_0600 leaves on disk.
+        std::fs::remove_file(dir.path().join(OWNER_STATE_FILENAME)).unwrap();
+
+        let result = load_owner_state(dir.path(), None).expect("load");
+        assert!(
+            result.is_none(),
+            "orphan keychain entries with absent .cbor must be Ok(None) (un-minted), \
+             not Err. The .cbor file is the minted-marker; its absence means the \
+             system is in the un-minted state regardless of keychain residue."
+        );
     }
 }
 
