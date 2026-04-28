@@ -82,7 +82,9 @@ fn main() {
     // typos still print the parse error to stderr before falling through.
     match Cli::try_parse() {
         Ok(cli) => match cli.command {
-            Some(Command::RotatePassphrase { new_passphrase_file }) => {
+            Some(Command::RotatePassphrase {
+                new_passphrase_file,
+            }) => {
                 init_tracing();
                 match harmony_app::rotate_passphrase_cli(&new_passphrase_file) {
                     Ok(()) => {

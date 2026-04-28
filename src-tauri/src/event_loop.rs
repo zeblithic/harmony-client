@@ -89,9 +89,19 @@ pub enum FollowRequest {
 
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
-    Query { key_expr: String, payload: Vec<u8> },
-    ComputeQuery { key_expr: String, payload: Vec<u8> },
-    Subscription { key_expr: String, payload: Vec<u8>, source_zid: Option<String> },
+    Query {
+        key_expr: String,
+        payload: Vec<u8>,
+    },
+    ComputeQuery {
+        key_expr: String,
+        payload: Vec<u8>,
+    },
+    Subscription {
+        key_expr: String,
+        payload: Vec<u8>,
+        source_zid: Option<String>,
+    },
     FetchResponse {
         cid: [u8; 32],
         is_module: bool,
@@ -358,9 +368,7 @@ pub async fn run<R: Runtime>(
             let key = own_root_key.clone();
             tokio::spawn(async move {
                 match query_mail_root(&session_clone, &key, "startup").await {
-                    Ok(Some(payload)) => {
-                        sync.handle_startup_query_reply(Some(&payload)).await
-                    }
+                    Ok(Some(payload)) => sync.handle_startup_query_reply(Some(&payload)).await,
                     Ok(None) => {
                         tracing::warn!(
                             "startup root query: no responder — live push will catch up on next gateway publish"
@@ -1013,54 +1021,50 @@ async fn query_mail_root(
     use zenoh::query::ConsolidationMode;
 
     let label = op_label.to_string();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            let replies = session
-                .get(key)
-                .consolidation(ConsolidationMode::None)
-                .await
-                .map_err(|e| format!("get: {e}"))?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let replies = session
+            .get(key)
+            .consolidation(ConsolidationMode::None)
+            .await
+            .map_err(|e| format!("get: {e}"))?;
 
-            // Drain all replies. Track three outcomes so an all-errors
-            // result doesn't silently collapse into "no responder":
-            //   - non_empty: a real root CID (best — short-circuits)
-            //   - saw_empty: gateway explicitly says "no mail"
-            //   - reply_error: every reply that landed was an Err
-            let mut non_empty: Option<Vec<u8>> = None;
-            let mut saw_empty = false;
-            let mut reply_error: Option<String> = None;
-            while let Ok(reply) = replies.recv_async().await {
-                match reply.result() {
-                    Ok(sample) => {
-                        let bytes = sample.payload().to_bytes().to_vec();
-                        if bytes.is_empty() {
-                            saw_empty = true;
-                        } else {
-                            non_empty = Some(bytes);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        // Keep the first error message for the surfaced Err.
-                        reply_error.get_or_insert_with(|| {
-                            String::from_utf8_lossy(&err.payload().to_bytes())
-                                .into_owned()
-                        });
+        // Drain all replies. Track three outcomes so an all-errors
+        // result doesn't silently collapse into "no responder":
+        //   - non_empty: a real root CID (best — short-circuits)
+        //   - saw_empty: gateway explicitly says "no mail"
+        //   - reply_error: every reply that landed was an Err
+        let mut non_empty: Option<Vec<u8>> = None;
+        let mut saw_empty = false;
+        let mut reply_error: Option<String> = None;
+        while let Ok(reply) = replies.recv_async().await {
+            match reply.result() {
+                Ok(sample) => {
+                    let bytes = sample.payload().to_bytes().to_vec();
+                    if bytes.is_empty() {
+                        saw_empty = true;
+                    } else {
+                        non_empty = Some(bytes);
+                        break;
                     }
                 }
+                Err(err) => {
+                    // Keep the first error message for the surfaced Err.
+                    reply_error.get_or_insert_with(|| {
+                        String::from_utf8_lossy(&err.payload().to_bytes()).into_owned()
+                    });
+                }
             }
-            if let Some(bytes) = non_empty {
-                Ok(Some(bytes))
-            } else if saw_empty {
-                Ok(Some(Vec::new()))
-            } else if let Some(err) = reply_error {
-                Err(format!("{label} root query reply error: {err}"))
-            } else {
-                Ok(None)
-            }
-        },
-    )
+        }
+        if let Some(bytes) = non_empty {
+            Ok(Some(bytes))
+        } else if saw_empty {
+            Ok(Some(Vec::new()))
+        } else if let Some(err) = reply_error {
+            Err(format!("{label} root query reply error: {err}"))
+        } else {
+            Ok(None)
+        }
+    })
     .await
     .map_err(|_| format!("{op_label} root query timed out (10s)"))
     .and_then(|r| r)
@@ -1160,8 +1164,8 @@ where
         }
         let bytes = fetch_one(cid).await?;
         if matches!(cid.cid_type(), CidType::Bundle(_)) {
-            let children = bundle::parse_bundle(&bytes)
-                .map_err(|e| format!("malformed bundle: {e:?}"))?;
+            let children =
+                bundle::parse_bundle(&bytes).map_err(|e| format!("malformed bundle: {e:?}"))?;
             for child in children.iter().rev() {
                 stack.push((*child, depth + 1));
             }
@@ -1176,10 +1180,10 @@ where
 mod descendants_tests {
     use super::collect_descendants;
     use harmony_content::book::BookStore;
+    use harmony_content::book::MemoryBookStore;
     use harmony_content::bundle::BundleBuilder;
     use harmony_content::cache::ContentStore;
     use harmony_content::cid::{ContentFlags, ContentId};
-    use harmony_content::book::MemoryBookStore;
 
     fn new_store() -> ContentStore<MemoryBookStore> {
         ContentStore::new(MemoryBookStore::new(), 1024)
@@ -1199,15 +1203,19 @@ mod descendants_tests {
     #[test]
     fn walks_a_flat_bundle() {
         let mut store = new_store();
-        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
-        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
-        let c = store.insert_with_flags(b"ccc", ContentFlags::default()).unwrap();
+        let a = store
+            .insert_with_flags(b"aaa", ContentFlags::default())
+            .unwrap();
+        let b = store
+            .insert_with_flags(b"bbb", ContentFlags::default())
+            .unwrap();
+        let c = store
+            .insert_with_flags(b"ccc", ContentFlags::default())
+            .unwrap();
 
         let mut builder = BundleBuilder::new();
         builder.add(a).add(b).add(c);
-        let (payload, root) = builder
-            .build_with_flags(ContentFlags::default())
-            .unwrap();
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
         store.store(root, payload);
 
         let all = collect_descendants(&store, root);
@@ -1221,14 +1229,16 @@ mod descendants_tests {
     #[test]
     fn skips_subtrees_whose_bundle_payload_is_missing() {
         let mut store = new_store();
-        let a = store.insert_with_flags(b"aaa", ContentFlags::default()).unwrap();
-        let b = store.insert_with_flags(b"bbb", ContentFlags::default()).unwrap();
+        let a = store
+            .insert_with_flags(b"aaa", ContentFlags::default())
+            .unwrap();
+        let b = store
+            .insert_with_flags(b"bbb", ContentFlags::default())
+            .unwrap();
 
         let mut builder = BundleBuilder::new();
         builder.add(a).add(b);
-        let (_payload, root) = builder
-            .build_with_flags(ContentFlags::default())
-            .unwrap();
+        let (_payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
         // Deliberately DO NOT store the bundle payload.
 
         let all = collect_descendants(&store, root);
@@ -1271,9 +1281,7 @@ mod fetch_recursive_tests {
 
         let mut builder = BundleBuilder::new();
         builder.add(a).add(b).add(c);
-        let (payload, root) = builder
-            .build_with_flags(ContentFlags::default())
-            .unwrap();
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
 
         let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
         store.insert(a, a_bytes.clone());
@@ -1299,9 +1307,7 @@ mod fetch_recursive_tests {
         let b = ContentId::for_book(b"bbb", ContentFlags::default()).unwrap();
         let mut builder = BundleBuilder::new();
         builder.add(a).add(b);
-        let (payload, root) = builder
-            .build_with_flags(ContentFlags::default())
-            .unwrap();
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
 
         let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
         // Deliberately omit `b`.
@@ -1324,8 +1330,7 @@ mod content_verb_tests {
 
     #[test]
     fn read_bytes_verb_variant_is_constructible() {
-        let (reply_tx, _reply_rx) =
-            tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
         let req = ContentVerbRequest::ReadBytes {
             cid: [0x7Au8; 32],
             reply: reply_tx,
@@ -1383,7 +1388,10 @@ fn emit_frontend_event<R: Runtime>(
                 // Re-serialize to Value so we can inject the source field
                 if let Ok(mut val) = serde_json::to_value(&vine) {
                     if let Some(obj) = val.as_object_mut() {
-                        obj.insert("source".to_string(), serde_json::Value::String(source.to_string()));
+                        obj.insert(
+                            "source".to_string(),
+                            serde_json::Value::String(source.to_string()),
+                        );
                     }
                     let _ = app.emit("vine-received", &val);
                 }
@@ -1433,10 +1441,7 @@ fn emit_frontend_event<R: Runtime>(
                 let _ = app.emit("mail-received", &entry);
             }
             Ok(crate::mail::ReceiveOutcome::Promoted(_entry)) => {
-                tracing::debug!(
-                    key_expr,
-                    "live push promoted Pending to Local (no emit)"
-                );
+                tracing::debug!(key_expr, "live push promoted Pending to Local (no emit)");
             }
             Err(e) => {
                 tracing::debug!(key_expr, error = %e, "mail receive skipped");

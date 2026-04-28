@@ -9,9 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use harmony_mailbox::message::{
-    HarmonyMessage, RecipientType, ADDRESS_HASH_LEN,
-};
+use harmony_mailbox::message::{HarmonyMessage, RecipientType, ADDRESS_HASH_LEN};
 use serde::{Deserialize, Serialize};
 
 // ── Public types (shared with Tauri commands) ────────────────────────
@@ -186,9 +184,12 @@ impl MailManager {
         // Ensure required folders exist even if the persisted index was
         // edited or written by an older version that omitted some.
         for name in &["inbox", "sent", "drafts", "trash"] {
-            index.folders.entry(name.to_string()).or_insert_with(|| FolderState {
-                entries: Vec::new(),
-            });
+            index
+                .folders
+                .entry(name.to_string())
+                .or_insert_with(|| FolderState {
+                    entries: Vec::new(),
+                });
         }
 
         Self {
@@ -228,7 +229,9 @@ impl MailManager {
         let mut has_pending_match = false;
         let mut has_local_match = false;
         for folder_name in ["inbox", "trash", "drafts"] {
-            let Some(folder) = self.index.folders.get(folder_name) else { continue };
+            let Some(folder) = self.index.folders.get(folder_name) else {
+                continue;
+            };
             for entry in &folder.entries {
                 if entry.message_id == msg_id_hex {
                     if entry.body_state == BodyState::Local {
@@ -266,7 +269,10 @@ impl MailManager {
             // Write the blob FIRST so the `Local ⇒ blob exists` invariant holds
             // even if I/O fails mid-promotion. (Atomic: tmp + rename.)
             let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-            let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+            let tmp_blob = self
+                .data_dir
+                .join("blobs")
+                .join(format!("{cid_hex}.bin.tmp"));
             std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
             std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
@@ -274,7 +280,9 @@ impl MailManager {
             // CID equality already verified in the scan — no need to re-check.
             let mut promoted_entry: Option<EntryRecord> = None;
             for folder_name in ["inbox", "trash", "drafts"] {
-                let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
+                let Some(folder) = self.index.folders.get_mut(folder_name) else {
+                    continue;
+                };
                 for entry in folder.entries.iter_mut() {
                     if entry.message_id == msg_id_hex && entry.body_state == BodyState::Pending {
                         entry.body_state = BodyState::Local;
@@ -290,8 +298,8 @@ impl MailManager {
             // Pending entry exists at scan time; no other mutator runs between
             // scan and promote (single-threaded &mut self borrow), and the
             // promote predicate matches the scan predicate exactly.
-            let promoted = promoted_entry
-                .expect("has_pending_match implies at least one promotion");
+            let promoted =
+                promoted_entry.expect("has_pending_match implies at least one promotion");
             return Ok(ReceiveOutcome::Promoted(promoted));
         }
 
@@ -311,11 +319,12 @@ impl MailManager {
 
         // Store blob (atomic: write tmp then rename, matching save_index pattern)
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, msg_bytes)
-            .map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path)
-            .map_err(|e| format!("rename blob: {e}"))?;
+        let tmp_blob = self
+            .data_dir
+            .join("blobs")
+            .join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
         // Prepend to inbox (newest first)
         let inbox = self.index.folders.get_mut("inbox").unwrap();
@@ -409,7 +418,9 @@ impl MailManager {
         // Verify bytes hash to the claimed CID.
         let computed = hex::encode(blake3::hash(bytes).as_bytes());
         if computed != cid_hex {
-            return Err(format!("hash mismatch: claimed {cid_hex}, computed {computed}"));
+            return Err(format!(
+                "hash mismatch: claimed {cid_hex}, computed {computed}"
+            ));
         }
 
         // Pre-scan immutably: is there anything to promote? If not, return
@@ -434,13 +445,18 @@ impl MailManager {
         // `state == Local ⇒ blob exists on disk` holds even if I/O fails
         // mid-way. (Atomic: tmp + rename.)
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
+        let tmp_blob = self
+            .data_dir
+            .join("blobs")
+            .join(format!("{cid_hex}.bin.tmp"));
         std::fs::write(&tmp_blob, bytes).map_err(|e| format!("write blob: {e}"))?;
         std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
         // Blob is durable; now flip every matching Pending entry to Local.
         for folder_name in ["inbox", "trash", "drafts"] {
-            let Some(folder) = self.index.folders.get_mut(folder_name) else { continue };
+            let Some(folder) = self.index.folders.get_mut(folder_name) else {
+                continue;
+            };
             for entry in folder.entries.iter_mut() {
                 if entry.message_cid == cid_hex && entry.body_state == BodyState::Pending {
                     entry.body_state = BodyState::Local;
@@ -453,21 +469,18 @@ impl MailManager {
     }
 
     /// Store a sent message (already serialized).
-    pub fn store_sent(
-        &mut self,
-        msg_bytes: &[u8],
-        msg: &HarmonyMessage,
-    ) -> Result<String, String> {
+    pub fn store_sent(&mut self, msg_bytes: &[u8], msg: &HarmonyMessage) -> Result<String, String> {
         let hash = blake3::hash(msg_bytes);
         let cid_hex = hex::encode(hash.as_bytes());
 
         // Store blob (atomic: write tmp then rename)
         let blob_path = self.data_dir.join("blobs").join(format!("{cid_hex}.bin"));
-        let tmp_blob = self.data_dir.join("blobs").join(format!("{cid_hex}.bin.tmp"));
-        std::fs::write(&tmp_blob, msg_bytes)
-            .map_err(|e| format!("write blob: {e}"))?;
-        std::fs::rename(&tmp_blob, &blob_path)
-            .map_err(|e| format!("rename blob: {e}"))?;
+        let tmp_blob = self
+            .data_dir
+            .join("blobs")
+            .join(format!("{cid_hex}.bin.tmp"));
+        std::fs::write(&tmp_blob, msg_bytes).map_err(|e| format!("write blob: {e}"))?;
+        std::fs::rename(&tmp_blob, &blob_path).map_err(|e| format!("rename blob: {e}"))?;
 
         // Add to sent folder
         let snippet = truncate_snippet(&msg.subject);
@@ -551,12 +564,23 @@ impl MailManager {
     /// Mark a message as read/unread.
     /// When `folder` is provided, targets that specific folder (deterministic
     /// even when the same CID exists in multiple folders, e.g. self-send).
-    pub fn mark_read(&mut self, cid_hex: &str, read: bool, folder: Option<&str>) -> Result<(), String> {
+    pub fn mark_read(
+        &mut self,
+        cid_hex: &str,
+        read: bool,
+        folder: Option<&str>,
+    ) -> Result<(), String> {
         validate_hex(cid_hex)?;
         if let Some(folder_name) = folder {
-            let state = self.index.folders.get_mut(folder_name)
+            let state = self
+                .index
+                .folders
+                .get_mut(folder_name)
                 .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
-            let entry = state.entries.iter_mut().find(|e| e.message_cid == cid_hex)
+            let entry = state
+                .entries
+                .iter_mut()
+                .find(|e| e.message_cid == cid_hex)
                 .ok_or("message not found in folder")?;
             if entry.read != read {
                 entry.read = read;
@@ -580,7 +604,12 @@ impl MailManager {
     /// Move a message between folders.
     /// When `from_folder` is provided, only searches that folder (deterministic
     /// for duplicate CIDs across folders, e.g. self-send).
-    pub fn move_message(&mut self, cid_hex: &str, from_folder: Option<&str>, to_folder: &str) -> Result<(), String> {
+    pub fn move_message(
+        &mut self,
+        cid_hex: &str,
+        from_folder: Option<&str>,
+        to_folder: &str,
+    ) -> Result<(), String> {
         validate_hex(cid_hex)?;
         if !self.index.folders.contains_key(to_folder) {
             return Err(format!("unknown folder: {to_folder}"));
@@ -588,9 +617,15 @@ impl MailManager {
 
         // Find and remove from source folder
         let entry = if let Some(folder_name) = from_folder {
-            let state = self.index.folders.get_mut(folder_name)
+            let state = self
+                .index
+                .folders
+                .get_mut(folder_name)
                 .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
-            let pos = state.entries.iter().position(|e| e.message_cid == cid_hex)
+            let pos = state
+                .entries
+                .iter()
+                .position(|e| e.message_cid == cid_hex)
                 .ok_or("message not found in folder")?;
             state.entries.remove(pos)
         } else {
@@ -621,9 +656,15 @@ impl MailManager {
 
         // Remove the entry from its folder
         if let Some(folder_name) = folder {
-            let state = self.index.folders.get_mut(folder_name)
+            let state = self
+                .index
+                .folders
+                .get_mut(folder_name)
                 .ok_or_else(|| format!("unknown folder: {folder_name}"))?;
-            let pos = state.entries.iter().position(|e| e.message_cid == cid_hex)
+            let pos = state
+                .entries
+                .iter()
+                .position(|e| e.message_cid == cid_hex)
                 .ok_or("message not found in folder")?;
             state.entries.remove(pos);
         } else {
@@ -684,12 +725,10 @@ impl MailManager {
     fn save_index(&self) -> Result<(), String> {
         let index_path = self.data_dir.join("index.json");
         let tmp_path = self.data_dir.join("index.json.tmp");
-        let json = serde_json::to_vec_pretty(&self.index)
-            .map_err(|e| format!("serialize index: {e}"))?;
-        std::fs::write(&tmp_path, &json)
-            .map_err(|e| format!("write index: {e}"))?;
-        std::fs::rename(&tmp_path, &index_path)
-            .map_err(|e| format!("replace index: {e}"))?;
+        let json =
+            serde_json::to_vec_pretty(&self.index).map_err(|e| format!("serialize index: {e}"))?;
+        std::fs::write(&tmp_path, &json).map_err(|e| format!("write index: {e}"))?;
+        std::fs::rename(&tmp_path, &index_path).map_err(|e| format!("replace index: {e}"))?;
         Ok(())
     }
 }
@@ -817,7 +856,8 @@ mod tests {
         };
 
         assert_eq!(mgr.folder_counts()["inbox"].unread, 1);
-        mgr.mark_read(&entry.message_cid, true, Some("inbox")).unwrap();
+        mgr.mark_read(&entry.message_cid, true, Some("inbox"))
+            .unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].unread, 0);
     }
 
@@ -832,7 +872,8 @@ mod tests {
             panic!("expected Inserted outcome on fresh receive");
         };
 
-        mgr.move_message(&entry.message_cid, Some("inbox"), "trash").unwrap();
+        mgr.move_message(&entry.message_cid, Some("inbox"), "trash")
+            .unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
         assert_eq!(mgr.folder_counts()["trash"].total, 1);
     }
@@ -865,10 +906,14 @@ mod tests {
             panic!("expected Inserted outcome on fresh receive");
         };
 
-        let blob_path = dir.path().join("blobs").join(format!("{}.bin", entry.message_cid));
+        let blob_path = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.bin", entry.message_cid));
         assert!(blob_path.exists());
 
-        mgr.delete_message(&entry.message_cid, Some("inbox")).unwrap();
+        mgr.delete_message(&entry.message_cid, Some("inbox"))
+            .unwrap();
         assert!(!blob_path.exists());
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
     }
@@ -995,25 +1040,32 @@ mod tests {
         assert_eq!(mgr.folder_counts()["sent"].unread, 0);
 
         // Mark inbox copy as read — must not affect sent
-        mgr.mark_read(&entry.message_cid, true, Some("inbox")).unwrap();
+        mgr.mark_read(&entry.message_cid, true, Some("inbox"))
+            .unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].unread, 0);
         assert_eq!(mgr.folder_counts()["sent"].unread, 0);
 
         // Move inbox copy to trash — sent copy must remain
-        mgr.move_message(&entry.message_cid, Some("inbox"), "trash").unwrap();
+        mgr.move_message(&entry.message_cid, Some("inbox"), "trash")
+            .unwrap();
         assert_eq!(mgr.folder_counts()["inbox"].total, 0);
         assert_eq!(mgr.folder_counts()["sent"].total, 1);
         assert_eq!(mgr.folder_counts()["trash"].total, 1);
 
         // Delete from trash — blob kept because sent still references it
-        mgr.delete_message(&entry.message_cid, Some("trash")).unwrap();
+        mgr.delete_message(&entry.message_cid, Some("trash"))
+            .unwrap();
         assert_eq!(mgr.folder_counts()["trash"].total, 0);
         // Blob still on disk (sent copy references it)
-        let blob_path = dir.path().join("blobs").join(format!("{}.bin", entry.message_cid));
+        let blob_path = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.bin", entry.message_cid));
         assert!(blob_path.exists());
 
         // Delete from sent — now blob is removed
-        mgr.delete_message(&entry.message_cid, Some("sent")).unwrap();
+        mgr.delete_message(&entry.message_cid, Some("sent"))
+            .unwrap();
         assert!(!blob_path.exists());
     }
 
@@ -1161,16 +1213,26 @@ mod tests {
         let wrong_bytes = b"not a harmony message";
 
         let result = mgr.mark_body_received(&claimed_cid_hex, wrong_bytes);
-        assert!(result.is_err(), "should reject bytes that don't hash to the claimed CID");
+        assert!(
+            result.is_err(),
+            "should reject bytes that don't hash to the claimed CID"
+        );
 
         // Rejection must not leak any filesystem side effects.
-        let blob_path = mail_dir.join("blobs").join(format!("{claimed_cid_hex}.bin"));
+        let blob_path = mail_dir
+            .join("blobs")
+            .join(format!("{claimed_cid_hex}.bin"));
         assert!(
             !blob_path.exists(),
             "rejected bytes must not produce a blob file"
         );
-        let tmp_blob = mail_dir.join("blobs").join(format!("{claimed_cid_hex}.bin.tmp"));
-        assert!(!tmp_blob.exists(), "rejected bytes must not leave a tmp file");
+        let tmp_blob = mail_dir
+            .join("blobs")
+            .join(format!("{claimed_cid_hex}.bin.tmp"));
+        assert!(
+            !tmp_blob.exists(),
+            "rejected bytes must not leave a tmp file"
+        );
     }
 
     #[test]
@@ -1196,10 +1258,7 @@ mod tests {
 
         // Blob was NOT re-written — this is the contract: don't touch the
         // filesystem when there's no Pending entry to promote.
-        assert!(
-            !blob_path.exists(),
-            "no-op path must not re-write the blob"
-        );
+        assert!(!blob_path.exists(), "no-op path must not re-write the blob");
 
         let inbox = mgr.list_folder("inbox", 0, 100);
         assert_eq!(inbox.len(), 1);
@@ -1248,7 +1307,10 @@ mod tests {
 
         // User moved it to trash before the live push arrived.
         mgr.move_message(&cid_hex, Some("inbox"), "trash").unwrap();
-        assert_eq!(mgr.list_folder("trash", 0, 100)[0].body_state, BodyState::Pending);
+        assert_eq!(
+            mgr.list_folder("trash", 0, 100)[0].body_state,
+            BodyState::Pending
+        );
 
         // NOW the live raw push arrives.
         let result = mgr.receive_message(&bytes);

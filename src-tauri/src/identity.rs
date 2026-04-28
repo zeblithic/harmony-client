@@ -34,16 +34,16 @@ const ENC_FORMAT_VERSION: u8 = 0x01;
 const ENC_KDF_ID_ARGON2ID: u8 = 0x01;
 
 // Argon2id parameters (v1):
-const KDF_M_KIB: u32 = 65536;  // 64 MiB
-const KDF_T: u16 = 3;          // iterations
-const KDF_P: u8 = 1;           // parallelism
+const KDF_M_KIB: u32 = 65536; // 64 MiB
+const KDF_T: u16 = 3; // iterations
+const KDF_P: u8 = 1; // parallelism
 const KDF_OUT_LEN: usize = 32; // XChaCha20-Poly1305 key length
 
 // Wire format offsets:
-const HEADER_LEN: usize = 13;   // magic(4) + version(1) + kdf_id(1) + m(4) + t(2) + p(1)
+const HEADER_LEN: usize = 13; // magic(4) + version(1) + kdf_id(1) + m(4) + t(2) + p(1)
 const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 24;    // XChaCha20 needs 192-bit nonce
-const TAG_LEN: usize = 16;      // Poly1305 tag
+const NONCE_LEN: usize = 24; // XChaCha20 needs 192-bit nonce
+const TAG_LEN: usize = 16; // Poly1305 tag
 const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN;
 
 /// Destination chosen by `save_with_fallback`. Returned so force-cleanup
@@ -178,8 +178,7 @@ pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String>
                 .map_err(|e| format!("Failed to create {}: {e}", tmp_path.display()))?
         };
         use std::io::Write;
-        (&f)
-            .write_all(bytes)
+        (&f).write_all(bytes)
             .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
         f.sync_all()
             .map_err(|e| format!("Failed to fsync {}: {e}", tmp_path.display()))?;
@@ -219,7 +218,9 @@ fn verify_round_trip(store: &dyn KeyStore, expected: &[u8; BLOB_LEN]) -> Result<
         .ok_or_else(|| "verify-after-write read-back returned None".to_string())?;
     use subtle::ConstantTimeEq;
     if !bool::from(loaded.as_slice().ct_eq(expected.as_slice())) {
-        return Err("verify-after-write returned a different seed than was just written".to_string());
+        return Err(
+            "verify-after-write returned a different seed than was just written".to_string(),
+        );
     }
     Ok(())
 }
@@ -268,8 +269,8 @@ pub fn encrypt_with_params(
         .expect("Argon2 derivation cannot fail with hardcoded params");
 
     // AEAD encrypt with header (first 13 bytes) as AAD.
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
-        .expect("32-byte key always valid");
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
     let payload = Payload {
         msg: blob,
         aad: &out[..HEADER_LEN],
@@ -355,8 +356,9 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
             "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
         );
     }
-    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN))
-        .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?;
+    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).map_err(|_| {
+        "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
+    })?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
     // hash_password_into can return SaltTooShort/SaltTooLong (ruled out: salt is
@@ -367,26 +369,27 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
         .hash_password_into(passphrase, salt, key.as_mut_slice())
         .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
 
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
-        .expect("32-byte key always valid");
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
     let payload = Payload {
         msg: ciphertext_with_tag,
         aad: &bytes[..HEADER_LEN],
     };
     // Wrap the AEAD output Vec in Zeroizing immediately so it is wiped on drop.
-    let plaintext = Zeroizing::new(
-        cipher
-            .decrypt(XNonce::from_slice(nonce), payload)
-            .map_err(|_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string())?,
-    );
+    let plaintext = Zeroizing::new(cipher.decrypt(XNonce::from_slice(nonce), payload).map_err(
+        |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
+    )?);
 
     // Validate length, then copy directly into a Zeroizing-protected buffer
     // (no intermediate unprotected stack array). The borrowed slice points
     // into `plaintext`'s heap buffer, which is itself in Zeroizing<Vec<u8>>.
-    let plaintext_slice: &[u8; BLOB_LEN] = plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("decrypted plaintext was {} bytes, expected {}", plaintext.len(), BLOB_LEN))?;
+    let plaintext_slice: &[u8; BLOB_LEN] = plaintext.as_slice().try_into().map_err(|_| {
+        format!(
+            "decrypted plaintext was {} bytes, expected {}",
+            plaintext.len(),
+            BLOB_LEN
+        )
+    })?;
     let mut blob_arr: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
     blob_arr.copy_from_slice(plaintext_slice);
     Ok(blob_arr)
@@ -419,7 +422,6 @@ impl FileStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
-
 }
 
 // FileStore is retained as a test-only helper for setting up seed fixtures.
@@ -571,7 +573,9 @@ pub(crate) fn parse_passphrase_file(path: &Path) -> Result<String, String> {
         s.truncate(s.len() - 1);
     }
     if s.is_empty() {
-        return Err("contains an empty passphrase (after trimming one trailing newline)".to_string());
+        return Err(
+            "contains an empty passphrase (after trimming one trailing newline)".to_string(),
+        );
     }
     Ok(s)
 }
@@ -701,8 +705,7 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| {
-            "Cannot determine identity file path: neither $HOME nor $USERPROFILE is set"
-                .to_string()
+            "Cannot determine identity file path: neither $HOME nor $USERPROFILE is set".to_string()
         })?;
     Ok(PathBuf::from(home).join(".harmony").join("identity.key"))
 }
@@ -757,10 +760,14 @@ fn load_or_generate_with_stores_post_probe(
         keychain,
         encrypted,
         &seed_buf,
-        || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
-        |e| format!(
+        || {
+            "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string()
+        },
+        |e| {
+            format!(
             "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
-        ),
+        )
+        },
     )?;
     Ok(seed_buf)
 }
@@ -809,9 +816,7 @@ fn save_with_fallback(
                 return Ok(SaveDestination::Keychain);
             }
             Err(e) => {
-                tracing::warn!(
-                    "keychain save failed: {e}; trying encrypted fallback if available"
-                );
+                tracing::warn!("keychain save failed: {e}; trying encrypted fallback if available");
                 keychain_err = Some(e);
             }
         }
@@ -890,7 +895,11 @@ pub fn read_seed_from_disk_with_keychain(
     // Use _post_probe variant: we already probed the keychain above (single
     // round-trip). The non-post-probe variant probes again, which is a real
     // perf regression on macOS Keychain / Linux Secret Service.
-    load_or_generate_with_stores_post_probe(keychain.as_ref(), keychain_probe_ok, encrypted.as_ref())
+    load_or_generate_with_stores_post_probe(
+        keychain.as_ref(),
+        keychain_probe_ok,
+        encrypted.as_ref(),
+    )
 }
 
 /// Write the master seed to disk via the standard resolution chain
@@ -992,10 +1001,14 @@ pub fn write_seed_to_disk_with_keychain(
         keychain.as_ref(),
         encrypted.as_ref(),
         seed,
-        || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
-        |e| format!(
+        || {
+            "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string()
+        },
+        |e| {
+            format!(
             "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
-        ),
+        )
+        },
     )?;
 
     // After save_with_fallback succeeds, with force=true: best-effort unlink
@@ -1029,7 +1042,9 @@ pub fn write_seed_to_disk_with_keychain(
                 // Wrote to encrypted file → clean up any stale keychain entry.
                 if let Some(kc) = &keychain {
                     match kc.delete() {
-                        Ok(()) => tracing::info!("removed stale keychain entry after encrypted-file force-restore"),
+                        Ok(()) => tracing::info!(
+                            "removed stale keychain entry after encrypted-file force-restore"
+                        ),
                         Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
                         Err(e) => tracing::warn!(
                             error = %e,
@@ -1056,14 +1071,12 @@ pub(crate) fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
-    let seed = old
-        .load()?
-        .ok_or_else(|| {
-            format!(
-                "no encrypted identity to rotate at {}",
-                old.path().display()
-            )
-        })?;
+    let seed = old.load()?.ok_or_else(|| {
+        format!(
+            "no encrypted identity to rotate at {}",
+            old.path().display()
+        )
+    })?;
 
     let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
     new_store.save(&seed)?;
@@ -1235,13 +1248,19 @@ mod tests {
 
         // Set up an encrypted store with a known passphrase, write a known seed.
         std::env::set_var("HARMONY_PASSPHRASE", "round-trip-test");
-        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("round-trip-test".to_string()));
+        let store = EncryptedFileStore::new(
+            enc_path.clone(),
+            SecretString::from("round-trip-test".to_string()),
+        );
         let written = [0xCDu8; 32];
         store.save(&written).expect("save");
 
         // Read it back through the public seed-shaped helper.
         let loaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read");
-        assert_eq!(*loaded, written, "seed must round-trip through the encrypted store");
+        assert_eq!(
+            *loaded, written,
+            "seed must round-trip through the encrypted store"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
@@ -1256,7 +1275,10 @@ mod tests {
 
         std::env::set_var("HARMONY_PASSPHRASE", "refuse-test");
         let existing_seed = [0x11u8; 32];
-        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("refuse-test".to_string()));
+        let store = EncryptedFileStore::new(
+            enc_path.clone(),
+            SecretString::from("refuse-test".to_string()),
+        );
         store.save(&existing_seed).unwrap();
 
         let new_seed = [0x22u8; 32];
@@ -1287,22 +1309,23 @@ mod tests {
 
         std::env::set_var("HARMONY_PASSPHRASE", "force-test");
         let existing_seed = [0x33u8; 32];
-        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("force-test".to_string()));
+        let store = EncryptedFileStore::new(
+            enc_path.clone(),
+            SecretString::from("force-test".to_string()),
+        );
         store.save(&existing_seed).unwrap();
 
         let new_seed = [0x44u8; 32];
         // Pass `None` so the test stays file-only and never touches the real OS
         // keychain (see hermeticity comment on the sibling test above).
-        write_seed_to_disk_with_keychain(
-            &plaintext_path,
-            &new_seed,
-            /*force=*/ true,
-            None,
-        )
-        .expect("force must succeed");
+        write_seed_to_disk_with_keychain(&plaintext_path, &new_seed, /*force=*/ true, None)
+            .expect("force must succeed");
 
         let reloaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("reload");
-        assert_eq!(*reloaded, new_seed, "after force-overwrite, the new seed must be present");
+        assert_eq!(
+            *reloaded, new_seed,
+            "after force-overwrite, the new seed must be present"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
@@ -1333,7 +1356,10 @@ mod tests {
         // writes to keychain; the cleanup logic should unlink the stale .enc.
         write_seed_to_disk_with_keychain(&plaintext_path, &[0x33u8; 32], true, Some(kc))
             .expect("force write must succeed");
-        assert!(!enc_path.exists(), "stale enc file must be unlinked after keychain force-restore");
+        assert!(
+            !enc_path.exists(),
+            "stale enc file must be unlinked after keychain force-restore"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
@@ -1365,15 +1391,17 @@ mod tests {
 
         #[test]
         fn tampered_ciphertext_fails() {
-            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            bytes[60] ^= 0x01;  // flip one bit in the ciphertext range (53..85)
+            let mut bytes =
+                encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[60] ^= 0x01; // flip one bit in the ciphertext range (53..85)
             let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
             assert!(err.contains("wrong passphrase or corrupted file"));
         }
 
         #[test]
         fn tampered_kdf_params_fails() {
-            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            let mut bytes =
+                encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
             // Flip a byte in kdf_m_kib (offset 6..10). For v1 this fires the
             // strict-equality KDF param check (which also avoids allocating
             // attacker-controlled Argon2 memory). The 13-byte header is also
@@ -1389,16 +1417,18 @@ mod tests {
 
         #[test]
         fn tampered_magic_fails() {
-            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            bytes[0] = b'X';  // trash magic
+            let mut bytes =
+                encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[0] = b'X'; // trash magic
             let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
             assert!(err.contains("unrecognized format"), "got: {err}");
         }
 
         #[test]
         fn tampered_version_fails() {
-            let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            bytes[4] = 0xFF;  // unknown version
+            let mut bytes =
+                encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
+            bytes[4] = 0xFF; // unknown version
             let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
             assert!(err.contains("unrecognized format"), "got: {err}");
         }
@@ -1424,8 +1454,16 @@ mod tests {
             assert_eq!(&bytes[0..4], b"HRMI", "magic mismatch");
             assert_eq!(bytes[4], 0x01, "format_version mismatch");
             assert_eq!(bytes[5], 0x01, "kdf_id mismatch");
-            assert_eq!(&bytes[6..10], &65536u32.to_be_bytes(), "kdf_m_kib (u32 BE) mismatch");
-            assert_eq!(&bytes[10..12], &3u16.to_be_bytes(), "kdf_t (u16 BE) mismatch");
+            assert_eq!(
+                &bytes[6..10],
+                &65536u32.to_be_bytes(),
+                "kdf_m_kib (u32 BE) mismatch"
+            );
+            assert_eq!(
+                &bytes[10..12],
+                &3u16.to_be_bytes(),
+                "kdf_t (u16 BE) mismatch"
+            );
             assert_eq!(bytes[12], 1, "kdf_p (u8) mismatch");
             assert_eq!(&bytes[13..29], &TEST_SALT[..], "salt mismatch");
             assert_eq!(&bytes[29..53], &TEST_NONCE[..], "nonce mismatch");
@@ -1479,7 +1517,10 @@ mod tests {
 
             let wrong = EncryptedFileStore::new(path, SecretString::from("wrong".to_string()));
             let err = wrong.load().unwrap_err();
-            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "got: {err}"
+            );
         }
 
         #[test]
@@ -1541,8 +1582,8 @@ mod tests {
 
     mod env {
         use super::*;
-        use serial_test::serial;
         use secrecy::ExposeSecret;
+        use serial_test::serial;
 
         const HARMONY_PASSPHRASE: &str = "HARMONY_PASSPHRASE";
         const HARMONY_PASSPHRASE_FILE: &str = "HARMONY_PASSPHRASE_FILE";
@@ -1569,7 +1610,9 @@ mod tests {
             std::env::set_var(HARMONY_PASSPHRASE, "foo");
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("identity.enc");
-            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            let store = EncryptedFileStore::from_env(path)
+                .unwrap()
+                .expect("should be Some");
             assert_eq!(store.passphrase.expose_secret(), "foo");
             clear_env();
         }
@@ -1584,12 +1627,15 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&pass_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::set_permissions(&pass_file, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
             }
             std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
 
             let path = dir.path().join("identity.enc");
-            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            let store = EncryptedFileStore::from_env(path)
+                .unwrap()
+                .expect("should be Some");
             assert_eq!(store.passphrase.expose_secret(), "bar");
             clear_env();
         }
@@ -1604,7 +1650,9 @@ mod tests {
             std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
 
             let path = dir.path().join("identity.enc");
-            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            let store = EncryptedFileStore::from_env(path)
+                .unwrap()
+                .expect("should be Some");
             assert_eq!(store.passphrase.expose_secret(), "bar");
             clear_env();
         }
@@ -1620,7 +1668,9 @@ mod tests {
             std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
 
             let path = dir.path().join("identity.enc");
-            let store = EncryptedFileStore::from_env(path).unwrap().expect("should be Some");
+            let store = EncryptedFileStore::from_env(path)
+                .unwrap()
+                .expect("should be Some");
             assert_eq!(store.passphrase.expose_secret(), "from_env");
             clear_env();
         }
@@ -1643,7 +1693,7 @@ mod tests {
             clear_env();
             let dir = tempfile::tempdir().unwrap();
             let pass_file = dir.path().join("pass.txt");
-            std::fs::write(&pass_file, b"\n").unwrap();  // strips to empty
+            std::fs::write(&pass_file, b"\n").unwrap(); // strips to empty
             std::env::set_var(HARMONY_PASSPHRASE_FILE, &pass_file);
 
             let path = dir.path().join("identity.enc");
@@ -1695,7 +1745,10 @@ mod tests {
             let keychain = KeychainStore::new_mock();
             let result = load_or_generate_with_stores(Some(&keychain), None).unwrap();
 
-            let from_keychain = keychain.load().unwrap().expect("seed should be in keychain");
+            let from_keychain = keychain
+                .load()
+                .unwrap()
+                .expect("seed should be in keychain");
             assert_eq!(*from_keychain, *result);
         }
 
@@ -1716,7 +1769,10 @@ mod tests {
         fn headless_no_keychain_no_env_hard_fails_on_fresh() {
             let err = load_or_generate_with_stores(None, None).unwrap_err();
             assert!(err.contains("no identity store available"), "got: {err}");
-            assert!(err.contains("docs/headless-install.md"), "should point at docs: {err}");
+            assert!(
+                err.contains("docs/headless-install.md"),
+                "should point at docs: {err}"
+            );
         }
 
         #[test]
@@ -1731,9 +1787,13 @@ mod tests {
                 .unwrap();
 
             // Try to load with wrong passphrase B.
-            let wrong = EncryptedFileStore::new(enc_path.clone(), SecretString::from("WRONG".to_string()));
+            let wrong =
+                EncryptedFileStore::new(enc_path.clone(), SecretString::from("WRONG".to_string()));
             let err = load_or_generate_with_stores(None, Some(&wrong)).unwrap_err();
-            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "got: {err}"
+            );
 
             // Critically: original .enc must still be intact (not regenerated).
             let recovered = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase())
@@ -1741,8 +1801,7 @@ mod tests {
                 .unwrap()
                 .expect("original .enc must still be loadable with correct passphrase");
             assert_eq!(
-                *recovered,
-                original,
+                *recovered, original,
                 "wrong-passphrase must NOT trigger fresh generate",
             );
         }
@@ -1760,14 +1819,14 @@ mod tests {
             let keychain = KeychainStore::new_load_failing_mock();
             let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
 
-            let result = load_or_generate_with_stores(
-                Some(&keychain),
-                Some(&encrypted),
-            )
-            .expect("keychain Err must fall through, not hard-fail");
+            let result = load_or_generate_with_stores(Some(&keychain), Some(&encrypted))
+                .expect("keychain Err must fall through, not hard-fail");
 
             // Seed ended up in the encrypted store, not the keychain.
-            assert!(enc_path.exists(), "encrypted file should be the destination");
+            assert!(
+                enc_path.exists(),
+                "encrypted file should be the destination"
+            );
             let from_enc = encrypted
                 .load()
                 .unwrap()
@@ -1787,13 +1846,13 @@ mod tests {
             let keychain = KeychainStore::new_failing_mock();
             let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
 
-            let result = load_or_generate_with_stores(
-                Some(&keychain),
-                Some(&encrypted),
-            )
-            .expect("must fall back to encrypted, not hard-fail");
+            let result = load_or_generate_with_stores(Some(&keychain), Some(&encrypted))
+                .expect("must fall back to encrypted, not hard-fail");
 
-            assert!(enc_path.exists(), "encrypted file should be the destination");
+            assert!(
+                enc_path.exists(),
+                "encrypted file should be the destination"
+            );
             let from_enc = encrypted
                 .load()
                 .unwrap()
@@ -1809,9 +1868,13 @@ mod tests {
         /// verify_round_trip: custom store that returns a different seed on load.
         #[test]
         fn verify_round_trip_detects_mismatch() {
-            struct CorruptingStore { inner: KeychainStore }
+            struct CorruptingStore {
+                inner: KeychainStore,
+            }
             impl KeyStore for CorruptingStore {
-                fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> { self.inner.save(seed) }
+                fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+                    self.inner.save(seed)
+                }
                 fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
                     // Always return a different seed to force mismatch.
                     let mut buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
@@ -1822,7 +1885,9 @@ mod tests {
             }
 
             let original = fresh_seed();
-            let store = CorruptingStore { inner: KeychainStore::new_mock() };
+            let store = CorruptingStore {
+                inner: KeychainStore::new_mock(),
+            };
             let err = verify_round_trip(&store, &original).unwrap_err();
             assert!(err.contains("verify-after-write"), "got: {err}");
         }
@@ -1894,7 +1959,10 @@ mod tests {
         let seed = [0xABu8; 32];
         let blob = seed_to_blob(&seed);
         let recovered = blob_to_seed(blob.as_slice()).unwrap();
-        assert_eq!(seed, *recovered, "seed must round-trip byte-for-byte through blob serialization");
+        assert_eq!(
+            seed, *recovered,
+            "seed must round-trip byte-for-byte through blob serialization"
+        );
     }
 
     #[test]
@@ -1953,7 +2021,10 @@ mod tests {
 
             // A can no longer decrypt.
             let err = EncryptedFileStore::new(path, pass_a).load().unwrap_err();
-            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "got: {err}"
+            );
         }
 
         #[test]
@@ -1967,13 +2038,20 @@ mod tests {
 
             let bytes_before = std::fs::read(&path).unwrap();
 
-            let wrong = EncryptedFileStore::new(path.clone(), SecretString::from("wrong".to_string()));
+            let wrong =
+                EncryptedFileStore::new(path.clone(), SecretString::from("wrong".to_string()));
             let err = rotate_passphrase(&wrong, SecretString::from("new".to_string())).unwrap_err();
-            assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
+            assert!(
+                err.contains("wrong passphrase or corrupted file"),
+                "got: {err}"
+            );
 
             // File untouched.
             let bytes_after = std::fs::read(&path).unwrap();
-            assert_eq!(bytes_before, bytes_after, "file must not be modified on auth failure");
+            assert_eq!(
+                bytes_before, bytes_after,
+                "file must not be modified on auth failure"
+            );
         }
 
         #[test]
@@ -1991,7 +2069,10 @@ mod tests {
             rotate_passphrase(&store, pass.clone()).unwrap();
 
             let bytes_after = std::fs::read(&path).unwrap();
-            assert_ne!(bytes_before, bytes_after, "salt+nonce must rotate even when passphrase is same");
+            assert_ne!(
+                bytes_before, bytes_after,
+                "salt+nonce must rotate even when passphrase is same"
+            );
         }
 
         #[test]
@@ -2001,7 +2082,10 @@ mod tests {
             let store = EncryptedFileStore::new(path, SecretString::from("any".to_string()));
 
             let err = rotate_passphrase(&store, SecretString::from("new".to_string())).unwrap_err();
-            assert!(err.contains("no encrypted identity to rotate"), "got: {err}");
+            assert!(
+                err.contains("no encrypted identity to rotate"),
+                "got: {err}"
+            );
         }
     }
 
@@ -2030,9 +2114,16 @@ mod tests {
         )
         .expect("force write must succeed via encrypted-file fallback");
 
-        assert!(enc_path.exists(), "the freshly-written encrypted file must NOT be deleted");
+        assert!(
+            enc_path.exists(),
+            "the freshly-written encrypted file must NOT be deleted"
+        );
         let raw = std::fs::read(&enc_path).unwrap();
-        assert_eq!(raw.len(), ENC_FILE_LEN, "the encrypted file must hold the new envelope");
+        assert_eq!(
+            raw.len(),
+            ENC_FILE_LEN,
+            "the encrypted file must hold the new envelope"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }

@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel older in-flight runs when a new commit lands on the same PR/branch.
+# Saves CI minutes and gets the latest commit's feedback to the author faster.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least-privilege GITHUB_TOKEN: this workflow only checks out code and runs
+# local validation commands — it never writes to the repo, opens PRs, posts
+# comments, or pushes packages. Locking to read-only here means a compromised
+# action or step can't escalate beyond what CI legitimately needs.
+permissions:
+  contents: read
+
+# All third-party actions are pinned to full commit SHAs (not moving tags) so
+# a compromised upstream or moved tag can't silently change what runs in CI.
+# The trailing comment names the original tag for auditability — bump both
+# together when refreshing.
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      # Tauri's Linux build needs WebKit/GTK system libraries even when
+      # only the Rust side is being built/tested — the tauri crate's build
+      # script links against them at compile time.
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            build-essential
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` is load-bearing: it builds tests/benches/examples,
+      # not just the lib. Without it, integration test compile errors slip
+      # through merge — exactly how ZEB-164's SidecarId migration broke
+      # tests/content_index_integration.rs and tests/folder_primitive_integration.rs
+      # but main stayed "green" for two days because contributors only
+      # ran `cargo test --lib` locally.
+      #
+      # `--locked` ensures we test against the exact Cargo.lock dep graph
+      # the repo committed. Without it, cargo can silently re-resolve
+      # patched/yanked deps and CI would be testing a different graph than
+      # contributors run locally. The MSRV job already uses --locked; the
+      # main gate should match.
+      - name: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets --no-deps
+
+      - name: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
+
+  # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust` job
+  # above runs on stable for newer clippy lints + fastest iteration; this job
+  # runs `cargo check --locked --all-targets` on the declared MSRV so
+  # accidental use of post-MSRV Rust features (or a transitive dep that
+  # raises its own MSRV) is caught at PR review, not at first compile on a
+  # contributor's pinned-toolchain box. `check` (not `test`) keeps the job
+  # fast — MSRV regressions surface as compile errors. `--locked` ensures we
+  # test against the actual Cargo.lock dep graph, not whatever resolves
+  # fresh.
+  #
+  # The MSRV value comes from a single source of truth — Cargo.toml's
+  # `rust-version` — extracted at job time. This means a bump in Cargo.toml
+  # automatically retargets the gate, no second edit required.
+  msrv:
+    name: MSRV — cargo check on declared rust-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            build-essential
+
+      # Use cargo's own TOML parser via `cargo metadata` so single-quoted
+      # strings, multi-line definitions, and any other valid TOML form all
+      # parse correctly — a regex against Cargo.toml would not. `--no-deps`
+      # skips dep resolution so this is a fast local-manifest read.
+      # `cargo` is preinstalled on the GitHub-hosted ubuntu runner image,
+      # so this step runs before any toolchain install.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -uo pipefail
+          msrv=$(cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml | jq -r '.packages[0].rust_version' || echo '')
+          if [ -z "$msrv" ] || [ "$msrv" = "null" ]; then
+            echo "::error::Cargo.toml has no [package].rust-version field; the MSRV gate has nothing to enforce" >&2
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Resolved MSRV from Cargo.toml: $msrv"
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        with:
+          workspaces: src-tauri
+          key: msrv
+
+      - name: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets
+
+  frontend:
+    name: Frontend — tsc, vitest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: vitest
+        run: npx vitest run

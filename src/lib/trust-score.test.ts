@@ -7,6 +7,7 @@ import {
   getEndorsement,
   trustScoreColor,
   trustScoreLabel,
+  type TrustScore,
 } from './trust-score';
 
 describe('buildScore', () => {
@@ -51,24 +52,24 @@ describe('buildScore', () => {
 
 describe('dimension extractors', () => {
   it('extracts identity from bits 0-1', () => {
-    expect(getIdentity(0b00000011)).toBe(3);
-    expect(getIdentity(0b00000010)).toBe(2);
-    expect(getIdentity(0b00000000)).toBe(0);
+    expect(getIdentity(0b00000011 as TrustScore)).toBe(3);
+    expect(getIdentity(0b00000010 as TrustScore)).toBe(2);
+    expect(getIdentity(0b00000000 as TrustScore)).toBe(0);
   });
 
   it('extracts compliance from bits 2-3', () => {
-    expect(getCompliance(0b00001100)).toBe(3);
-    expect(getCompliance(0b00000100)).toBe(1);
+    expect(getCompliance(0b00001100 as TrustScore)).toBe(3);
+    expect(getCompliance(0b00000100 as TrustScore)).toBe(1);
   });
 
   it('extracts association from bits 4-5', () => {
-    expect(getAssociation(0b00110000)).toBe(3);
-    expect(getAssociation(0b00010000)).toBe(1);
+    expect(getAssociation(0b00110000 as TrustScore)).toBe(3);
+    expect(getAssociation(0b00010000 as TrustScore)).toBe(1);
   });
 
   it('extracts endorsement from bits 6-7', () => {
-    expect(getEndorsement(0b11000000)).toBe(3);
-    expect(getEndorsement(0b01000000)).toBe(1);
+    expect(getEndorsement(0b11000000 as TrustScore)).toBe(3);
+    expect(getEndorsement(0b01000000 as TrustScore)).toBe(1);
   });
 
   it('round-trips through buildScore', () => {
@@ -80,10 +81,10 @@ describe('dimension extractors', () => {
   });
 
   it('round-trips 0xFF', () => {
-    expect(getIdentity(0xFF)).toBe(3);
-    expect(getCompliance(0xFF)).toBe(3);
-    expect(getAssociation(0xFF)).toBe(3);
-    expect(getEndorsement(0xFF)).toBe(3);
+    expect(getIdentity(0xFF as TrustScore)).toBe(3);
+    expect(getCompliance(0xFF as TrustScore)).toBe(3);
+    expect(getAssociation(0xFF as TrustScore)).toBe(3);
+    expect(getEndorsement(0xFF as TrustScore)).toBe(3);
   });
 });
 

@@ -103,8 +103,8 @@ pub fn chunk_and_bundle(
         ));
     }
 
-    let ranges = chunk_all(bytes, &ChunkerConfig::DEFAULT)
-        .map_err(|e| format!("chunker error: {e:?}"))?;
+    let ranges =
+        chunk_all(bytes, &ChunkerConfig::DEFAULT).map_err(|e| format!("chunker error: {e:?}"))?;
 
     let mut leaves: Vec<(ContentId, &[u8])> = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -330,7 +330,20 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
-    let (shutdown_tx, thread, publish_tx, fetch_tx, ingest_tx, content_verb_tx, follow_tx, voice_tx, voice_channel_tx, _follow_mgr, _followed_set, _mail_sync) = {
+    let (
+        shutdown_tx,
+        thread,
+        publish_tx,
+        fetch_tx,
+        ingest_tx,
+        content_verb_tx,
+        follow_tx,
+        voice_tx,
+        voice_channel_tx,
+        _follow_mgr,
+        _followed_set,
+        _mail_sync,
+    ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -408,18 +421,22 @@ async fn start_node(
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
         use tauri::Manager;
-        app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?
+        app.path()
+            .app_data_dir()
+            .map_err(|e| format!("app_data_dir: {e}"))?
     };
     std::fs::create_dir_all(&app_data_dir).map_err(|e| format!("create app_data_dir: {e}"))?;
     let follow_mgr = follows::FollowManager::load(&app_data_dir);
     let followed_set = std::sync::Arc::new(std::sync::Mutex::new(
-        follow_mgr.addresses().into_iter().collect::<std::collections::HashSet<String>>(),
+        follow_mgr
+            .addresses()
+            .into_iter()
+            .collect::<std::collections::HashSet<String>>(),
     ));
     // ZEB-155: fetch-completion channel. Both halves are owned by
     // start_node so the spawned fetch task (in event_loop) can clone the
     // tx, while the main loop consumes from the rx.
-    let (fetch_completion_tx, fetch_completion_rx) =
-        tokio::sync::mpsc::channel::<[u8; 32]>(32);
+    let (fetch_completion_tx, fetch_completion_rx) = tokio::sync::mpsc::channel::<[u8; 32]>(32);
 
     let followed_set_clone = followed_set.clone();
 
@@ -468,16 +485,16 @@ async fn start_node(
         let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
         drop(pq);
 
-        let reticulum_identity_bytes =
-            Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+        let reticulum_identity_bytes = Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
         drop(ed25519);
 
         tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
 
         // Initialize mail manager (needs owner address from identity).
-        mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(
-            mail::MailManager::load(&app_data_dir.join("mail"), our_addr_bytes),
-        ));
+        mail_mgr = std::sync::Arc::new(std::sync::Mutex::new(mail::MailManager::load(
+            &app_data_dir.join("mail"),
+            our_addr_bytes,
+        )));
 
         // Construct MailSync now that identity, mail_mgr, and the refresh
         // channel are all available. Owns a clone of fetch_tx (so commands
@@ -555,10 +572,7 @@ async fn start_node(
             // (Functionally identical to the pre-ZEB-164 path; the dedupe
             // is just made explicit so debug logs don't show repeated
             // restores for the same CID.)
-            idx.entries()
-                .filter(|e| e.pinned)
-                .map(|e| e.cid)
-                .collect()
+            idx.entries().filter(|e| e.pinned).map(|e| e.cid).collect()
         };
 
         let ep_clone = endpoint.clone();
@@ -652,9 +666,7 @@ async fn start_node(
             Ok(())
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => {
-            Err("runtime thread exited before reporting startup status".to_string())
-        }
+        Err(_) => Err("runtime thread exited before reporting startup status".to_string()),
     };
 
     // On startup failure, clean up stale handles — but only if the
@@ -670,10 +682,7 @@ async fn start_node(
 
 /// Stop the harmony node and clean up.
 #[tauri::command]
-fn stop_node(
-    app: AppHandle,
-    state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<(), String> {
+fn stop_node(app: AppHandle, state: tauri::State<'_, Mutex<NodeState>>) -> Result<(), String> {
     let gen = {
         let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         guard.generation
@@ -739,8 +748,7 @@ async fn publish_profile(
     };
 
     let key_expr = format!("harmony/profile/{}", profile.address);
-    let payload =
-        serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
+    let payload = serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     publish_tx
@@ -795,7 +803,11 @@ async fn send_message(
         .as_millis() as u64;
 
     let wire = ChannelMessagePayload {
-        id: format!("msg-{}-{now_ms}-{:08x}", &node_addr[..8.min(node_addr.len())], rand::random::<u32>()),
+        id: format!(
+            "msg-{}-{now_ms}-{:08x}",
+            &node_addr[..8.min(node_addr.len())],
+            rand::random::<u32>()
+        ),
         sender_address: node_addr.clone(),
         sender_name: message.sender_name.clone(),
         channel: message.channel.clone(),
@@ -810,8 +822,7 @@ async fn send_message(
         "harmony/community/{}/channels/{}",
         message.hub, message.channel
     );
-    let payload =
-        serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+    let payload = serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     publish_tx
@@ -832,9 +843,7 @@ async fn send_message(
 ///
 /// The frontend uses this to identify self-sent messages in the Zenoh echo.
 #[tauri::command]
-fn get_node_addr(
-    state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<String, String> {
+fn get_node_addr(state: tauri::State<'_, Mutex<NodeState>>) -> Result<String, String> {
     let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     if guard.node_addr.is_empty() {
         return Err("not connected".to_string());
@@ -966,8 +975,7 @@ async fn publish_vine(
     };
 
     let key_expr = format!("harmony/vines/{}", node_addr);
-    let payload =
-        serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
+    let payload = serde_json::to_vec(&wire).map_err(|e| format!("serialize: {e}"))?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     publish_tx
@@ -1071,7 +1079,10 @@ async fn follow_vine_creator(
     }
 
     if let Some(ref tx) = guard.follow_tx {
-        if tx.try_send(event_loop::FollowRequest::Follow { address }).is_err() {
+        if tx
+            .try_send(event_loop::FollowRequest::Follow { address })
+            .is_err()
+        {
             tracing::error!("follow_tx full — follow update not sent to event loop");
         }
     }
@@ -1097,7 +1108,10 @@ async fn unfollow_vine_creator(
     }
 
     if let Some(ref tx) = guard.follow_tx {
-        if tx.try_send(event_loop::FollowRequest::Unfollow { address }).is_err() {
+        if tx
+            .try_send(event_loop::FollowRequest::Unfollow { address })
+            .is_err()
+        {
             tracing::error!("follow_tx full — unfollow update not sent to event loop");
         }
     }
@@ -1121,7 +1135,6 @@ fn list_followed(
         })
         .collect())
 }
-
 
 #[tauri::command]
 fn mark_vine_viewed(vine_id: String) -> bool {
@@ -1150,7 +1163,10 @@ pub struct ContentAnnouncementPayload {
 ///
 /// Key format: `harmony/announce/{cid_hex}`
 /// Payload: 4 bytes big-endian u32 size.
-pub fn parse_content_announcement(key_expr: &str, payload: &[u8]) -> Option<ContentAnnouncementPayload> {
+pub fn parse_content_announcement(
+    key_expr: &str,
+    payload: &[u8],
+) -> Option<ContentAnnouncementPayload> {
     let cid_hex = key_expr.strip_prefix("harmony/announce/")?;
     if cid_hex.is_empty() {
         return None;
@@ -1182,7 +1198,7 @@ pub struct ContentItemWire {
     /// no sidecar entry of their own). Frontend gates pin/burn/archive
     /// buttons on this being non-empty.
     pub sidecar_id: String,
-    pub cid: String,              // hex
+    pub cid: String, // hex
     pub name: String,
     pub size_bytes: u64,
     pub stored_at: u64,           // ms since epoch
@@ -1191,7 +1207,7 @@ pub struct ContentItemWire {
     pub pinned: bool,
     pub licensed: bool,
     pub archived: bool,
-    pub kind: String,             // ZEB-158: "leaf" | "folder"
+    pub kind: String, // ZEB-158: "leaf" | "folder"
 }
 
 fn sensitivity_wire(s: content_index::Sensitivity) -> &'static str {
@@ -1221,16 +1237,14 @@ fn kind_wire(k: content_index::ContentKind) -> &'static str {
 
 fn parse_cid_hex(cid_hex: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(cid_hex).map_err(|_| "invalid cid hex".to_string())?;
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| "cid must be 32 bytes".to_string())
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "cid must be 32 bytes".to_string())
 }
 
 fn parse_sidecar_id(s: &str) -> Result<content_index::SidecarId, String> {
     if s.is_empty() {
         return Err("sidecar_id is empty (manifest-derived row?)".into());
     }
-    content_index::SidecarId::parse_str(s)
-        .map_err(|e| format!("invalid sidecar_id: {e}"))
+    content_index::SidecarId::parse_str(s).map_err(|e| format!("invalid sidecar_id: {e}"))
 }
 
 /// Result returned to the frontend after a successful file ingest.
@@ -1796,7 +1810,9 @@ async fn export_content(
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
-    tokio::fs::write(path, &bytes).await.map_err(|e| format!("write failed: {e}"))?;
+    tokio::fs::write(path, &bytes)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
 
     Ok(true)
 }
@@ -1886,12 +1902,7 @@ async fn ingest_content(
                 .await?;
             }
             // Ingest the bundle itself.
-            send_ingest(
-                &ingest_tx,
-                hex::encode(root.to_bytes()),
-                bundle_payload,
-            )
-            .await?;
+            send_ingest(&ingest_tx, hex::encode(root.to_bytes()), bundle_payload).await?;
             root.to_bytes()
         }
     };
@@ -1996,8 +2007,8 @@ async fn create_folder(
         }
         return create_folder_at_root(name, state).await;
     }
-    let psid = parent_sidecar_id
-        .ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
+    let psid =
+        parent_sidecar_id.ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
     create_folder_nested(name, psid, parent_path, state).await
 }
 
@@ -2125,9 +2136,9 @@ async fn create_folder_nested(
     // Verify the caller's claim: parent_sidecar_id maps to root_old.
     {
         let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        let entry = idx.get(&parent_id).ok_or_else(|| {
-            "parent_sidecar_id not in sidecar".to_string()
-        })?;
+        let entry = idx
+            .get(&parent_id)
+            .ok_or_else(|| "parent_sidecar_id not in sidecar".to_string())?;
         if entry.cid != root_old {
             return Err(format!(
                 "parent_sidecar_id refers to cid {} but parent_path[0] is {}",
@@ -2180,28 +2191,25 @@ async fn create_folder_nested(
     for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
         let is_deepest = i == path_cids.len() - 1;
 
-        let anc_bundle = read_cached_bytes(&verb_tx, anc_cid)
-            .await?
-            .ok_or_else(|| {
-                format!(
-                    "ancestor {} not in cache; cannot rebuild parent chain",
-                    hex::encode(anc_cid)
-                )
-            })?;
-        let anc_child_ids = parse_bundle(&anc_bundle)
-            .map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
+        let anc_bundle = read_cached_bytes(&verb_tx, anc_cid).await?.ok_or_else(|| {
+            format!(
+                "ancestor {} not in cache; cannot rebuild parent chain",
+                hex::encode(anc_cid)
+            )
+        })?;
+        let anc_child_ids =
+            parse_bundle(&anc_bundle).map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
         let manifest_cid = anc_child_ids
             .first()
             .copied()
             .ok_or_else(|| "ancestor bundle has no children".to_string())?;
-        let anc_children: Vec<[u8; 32]> =
-            anc_child_ids.iter().map(|c| c.to_bytes()).collect();
+        let anc_children: Vec<[u8; 32]> = anc_child_ids.iter().map(|c| c.to_bytes()).collect();
 
         let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
             .await?
             .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
-        let mut manifest = folders::parse_manifest(&manifest_bytes)
-            .map_err(|e| format!("ancestor {e}"))?;
+        let mut manifest =
+            folders::parse_manifest(&manifest_bytes).map_err(|e| format!("ancestor {e}"))?;
         folders::validate_manifest_matches_bundle(&manifest, &anc_children)
             .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
 
@@ -2230,10 +2238,7 @@ async fn create_folder_nested(
             manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
         }
 
-        let rebuilt = folders::build_folder(
-            "",
-            &manifest.folder_manifest.entries,
-        )?;
+        let rebuilt = folders::build_folder("", &manifest.folder_manifest.entries)?;
         let rebuilt_bundle_cid = rebuilt.bundle_cid;
         last_bundle_size = rebuilt.bundle_bytes.len() as u64;
         pending_ingests.push((
@@ -2288,9 +2293,7 @@ async fn create_folder_nested(
         ) {
             Ok(()) => {}
             Err(content_index::RekeyError::OldMissing) => {
-                return Err(
-                    "parent_sidecar_id removed mid-flight — nothing to rekey".to_string(),
-                );
+                return Err("parent_sidecar_id removed mid-flight — nothing to rekey".to_string());
             }
             Err(content_index::RekeyError::Conflict { actual }) => {
                 // A concurrent rekey on the same parent_sidecar_id
@@ -2534,8 +2537,7 @@ async fn send_mail(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     use harmony_mailbox::message::{
-        HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
-        unique_message_id,
+        unique_message_id, HarmonyMessage, MailMessageType, MessageFlags, Recipient, RecipientType,
     };
 
     if payload.to.is_empty() {
@@ -2581,8 +2583,8 @@ async fn send_mail(
         .to
         .iter()
         .map(|addr_hex| {
-            let bytes = hex::decode(addr_hex)
-                .map_err(|e| format!("bad recipient {addr_hex}: {e}"))?;
+            let bytes =
+                hex::decode(addr_hex).map_err(|e| format!("bad recipient {addr_hex}: {e}"))?;
             let arr: [u8; 16] = bytes
                 .try_into()
                 .map_err(|_| format!("recipient {addr_hex} not 16 bytes"))?;
@@ -2650,7 +2652,10 @@ fn list_mail(
 ) -> Result<Vec<mail::EntryRecord>, String> {
     let mgr_arc = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+        guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?
     }; // NodeState lock dropped — disk I/O below doesn't block other commands
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     Ok(mgr.list_folder(&folder, page, per_page))
@@ -2663,7 +2668,10 @@ fn get_mail(
 ) -> Result<mail::MailDetail, String> {
     let mgr_arc = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+        guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?
     };
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
 
@@ -2696,9 +2704,7 @@ fn get_mail(
 }
 
 #[tauri::command]
-async fn refresh_mail(
-    state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<(), String> {
+async fn refresh_mail(state: tauri::State<'_, Mutex<NodeState>>) -> Result<(), String> {
     let sync_arc = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -2751,7 +2757,10 @@ fn update_mail(
 ) -> Result<(), String> {
     let mgr_arc = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+        guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?
     };
     let mut mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     let folder_ref = folder.as_deref();
@@ -2771,7 +2780,10 @@ fn get_mail_counts(
 ) -> Result<std::collections::HashMap<String, mail::FolderCounts>, String> {
     let mgr_arc = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.mail_mgr.clone().ok_or_else(|| "mail not initialized".to_string())?
+        guard
+            .mail_mgr
+            .clone()
+            .ok_or_else(|| "mail not initialized".to_string())?
     };
     let mgr = mgr_arc.lock().map_err(|e| format!("mail lock: {e}"))?;
     Ok(mgr.folder_counts())
@@ -2872,8 +2884,12 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     // Read the new passphrase file via the same parser as HARMONY_PASSPHRASE_FILE
     // — UTF-8, exactly one trailing newline strip, empty rejection, AND the
     // 0600-mode warning the inline version was missing.
-    let new_str = identity::parse_passphrase_file(new_passphrase_file)
-        .map_err(|e| format!("--new-passphrase-file={} {e}", new_passphrase_file.display()))?;
+    let new_str = identity::parse_passphrase_file(new_passphrase_file).map_err(|e| {
+        format!(
+            "--new-passphrase-file={} {e}",
+            new_passphrase_file.display()
+        )
+    })?;
 
     // Move into SecretString immediately so the plaintext String is consumed
     // (no second copy lingers on the heap unzeroed). passphrase_eq takes a
@@ -2960,10 +2976,7 @@ mod tests {
 
     #[test]
     fn parse_capacity_valid_busy() {
-        let result = parse_capacity(
-            "harmony/compute/capacity/node42",
-            &make_payload(0x00),
-        );
+        let result = parse_capacity("harmony/compute/capacity/node42", &make_payload(0x00));
         let update = result.unwrap();
         assert_eq!(update.node_addr, "node42");
         assert!(!update.ready);
@@ -2971,28 +2984,19 @@ mod tests {
 
     #[test]
     fn parse_capacity_truncated() {
-        let result = parse_capacity(
-            "harmony/compute/capacity/node1",
-            &[0xAA; 10],
-        );
+        let result = parse_capacity("harmony/compute/capacity/node1", &[0xAA; 10]);
         assert!(result.is_none());
     }
 
     #[test]
     fn parse_capacity_wrong_prefix() {
-        let result = parse_capacity(
-            "harmony/telemetry/node1/health",
-            &make_payload(0x01),
-        );
+        let result = parse_capacity("harmony/telemetry/node1/health", &make_payload(0x01));
         assert!(result.is_none());
     }
 
     #[test]
     fn parse_capacity_empty_payload() {
-        let result = parse_capacity(
-            "harmony/compute/capacity/node1",
-            &[],
-        );
+        let result = parse_capacity("harmony/compute/capacity/node1", &[]);
         assert!(result.is_none());
     }
 
@@ -3025,9 +3029,18 @@ mod tests {
             avatar_mini_cid: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
-        assert!(json.contains("\"displayName\""), "expected camelCase: {json}");
-        assert!(!json.contains("\"display_name\""), "unexpected snake_case: {json}");
-        assert!(!json.contains("statusText"), "None field should be skipped: {json}");
+        assert!(
+            json.contains("\"displayName\""),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            !json.contains("\"display_name\""),
+            "unexpected snake_case: {json}"
+        );
+        assert!(
+            !json.contains("statusText"),
+            "None field should be skipped: {json}"
+        );
     }
 
     #[test]
@@ -3118,9 +3131,18 @@ mod tests {
             reply_to: Some("msg-0".to_string()),
         };
         let json = String::from_utf8(serde_json::to_vec(&msg).unwrap()).unwrap();
-        assert!(json.contains("\"senderAddress\""), "expected camelCase: {json}");
-        assert!(json.contains("\"replyTo\""), "replyTo should be present: {json}");
-        assert!(!json.contains("\"sender_address\""), "unexpected snake_case: {json}");
+        assert!(
+            json.contains("\"senderAddress\""),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"replyTo\""),
+            "replyTo should be present: {json}"
+        );
+        assert!(
+            !json.contains("\"sender_address\""),
+            "unexpected snake_case: {json}"
+        );
     }
 
     #[test]
@@ -3188,11 +3210,23 @@ mod tests {
             reshare_of: Some("vine-0".to_string()),
         };
         let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
-        assert!(json.contains("\"creatorAddress\""), "expected camelCase: {json}");
+        assert!(
+            json.contains("\"creatorAddress\""),
+            "expected camelCase: {json}"
+        );
         assert!(json.contains("\"videoCid\""), "expected camelCase: {json}");
-        assert!(json.contains("\"reshareOf\""), "reshareOf should be present: {json}");
-        assert!(!json.contains("\"creator_address\""), "unexpected snake_case: {json}");
-        assert!(!json.contains("\"title\""), "None title should be skipped: {json}");
+        assert!(
+            json.contains("\"reshareOf\""),
+            "reshareOf should be present: {json}"
+        );
+        assert!(
+            !json.contains("\"creator_address\""),
+            "unexpected snake_case: {json}"
+        );
+        assert!(
+            !json.contains("\"title\""),
+            "None title should be skipped: {json}"
+        );
     }
 
     #[test]
@@ -3249,11 +3283,26 @@ mod tests {
         };
         let json = String::from_utf8(serde_json::to_vec(&reaction).unwrap()).unwrap();
         assert!(json.contains("\"vineId\""), "expected camelCase: {json}");
-        assert!(json.contains("\"reactorAddress\""), "expected camelCase: {json}");
-        assert!(json.contains("\"reactorName\""), "expected camelCase: {json}");
-        assert!(!json.contains("\"vine_id\""), "unexpected snake_case: {json}");
-        assert!(!json.contains("\"reactor_address\""), "unexpected snake_case: {json}");
-        assert!(!json.contains("\"reactor_name\""), "unexpected snake_case: {json}");
+        assert!(
+            json.contains("\"reactorAddress\""),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"reactorName\""),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            !json.contains("\"vine_id\""),
+            "unexpected snake_case: {json}"
+        );
+        assert!(
+            !json.contains("\"reactor_address\""),
+            "unexpected snake_case: {json}"
+        );
+        assert!(
+            !json.contains("\"reactor_name\""),
+            "unexpected snake_case: {json}"
+        );
     }
 
     #[test]
@@ -3297,10 +3346,7 @@ mod tests {
     fn content_announcement_valid() {
         let size: u32 = 65536;
         let payload = size.to_be_bytes().to_vec();
-        let result = parse_content_announcement(
-            "harmony/announce/aabbccdd11223344",
-            &payload,
-        );
+        let result = parse_content_announcement("harmony/announce/aabbccdd11223344", &payload);
         let ann = result.unwrap();
         assert_eq!(ann.cid, "aabbccdd11223344");
         assert_eq!(ann.size_bytes, 65536);
@@ -3313,7 +3359,10 @@ mod tests {
         let ann = parse_content_announcement("harmony/announce/abc123", &payload).unwrap();
         let json = serde_json::to_string(&ann).unwrap();
         assert!(json.contains("\"sizeBytes\""), "expected camelCase: {json}");
-        assert!(!json.contains("\"size_bytes\""), "unexpected snake_case: {json}");
+        assert!(
+            !json.contains("\"size_bytes\""),
+            "unexpected snake_case: {json}"
+        );
     }
 
     #[test]
@@ -3356,7 +3405,10 @@ mod tests {
         // integration test malformed_manifest_returns_error.
         let payload = b"definitely not a manifest";
         let parse_result: Result<FolderManifest, _> = serde_json::from_slice(payload);
-        assert!(parse_result.is_err(), "bad JSON must not parse as FolderManifest");
+        assert!(
+            parse_result.is_err(),
+            "bad JSON must not parse as FolderManifest"
+        );
     }
 }
 
@@ -3391,8 +3443,10 @@ mod chunked_ingest_tests {
         let too_big = FLAT_BUNDLE_MAX + 1;
         let err = ingest_dispatch(too_big).unwrap_err();
         assert!(err.contains("file too large"), "got: {err}");
-        assert!(err.contains("flat-bundle"),
-                "message should explain the cap origin, got: {err}");
+        assert!(
+            err.contains("flat-bundle"),
+            "message should explain the cap origin, got: {err}"
+        );
     }
 
     #[test]
@@ -3449,16 +3503,11 @@ mod chunked_ingest_tests {
 
         // Every leaf is a book CID.
         for (leaf_cid, _data) in &leaves {
-            assert_eq!(
-                leaf_cid.cid_type(),
-                CidType::Book,
-                "leaves must be books"
-            );
+            assert_eq!(leaf_cid.cid_type(), CidType::Book, "leaves must be books");
         }
 
         // The bundle payload parses back to exactly those leaf CIDs in order.
-        let parsed = bundle::parse_bundle(&bundle_payload)
-            .expect("bundle payload must parse");
+        let parsed = bundle::parse_bundle(&bundle_payload).expect("bundle payload must parse");
         let expected: Vec<ContentId> = leaves.iter().map(|(c, _)| *c).collect();
         assert_eq!(parsed.to_vec(), expected);
     }
@@ -3468,7 +3517,11 @@ mod chunked_ingest_tests {
         let bytes = synthetic_bytes(3 * 1024 * 1024);
         let (leaves, _bundle_payload, _root) = chunk_and_bundle(&bytes).unwrap();
         let total: usize = leaves.iter().map(|(_, d)| d.len()).sum();
-        assert_eq!(total, bytes.len(), "leaves must cover the full input exactly");
+        assert_eq!(
+            total,
+            bytes.len(),
+            "leaves must cover the full input exactly"
+        );
         let reassembled: Vec<u8> = leaves.iter().flat_map(|(_, d)| d.iter().copied()).collect();
         assert_eq!(reassembled, bytes, "leaves in order must equal original");
     }
@@ -3521,7 +3574,10 @@ mod pin_persistence_tests {
             kind: "folder".into(),
         };
         let json = serde_json::to_string(&wire).expect("serialize");
-        assert!(json.contains(&format!("\"sidecarId\":\"{id}\"")), "got: {json}");
+        assert!(
+            json.contains(&format!("\"sidecarId\":\"{id}\"")),
+            "got: {json}"
+        );
         assert!(json.contains("\"kind\":\"folder\""), "got: {json}");
     }
 

@@ -4,7 +4,9 @@ import ThreadIndicator from '../ThreadIndicator.svelte';
 import type { Peer } from '../../types';
 
 // Per-instance IntersectionObserver mock
-let observers: { callback: IntersectionObserverCallback; elements: Element[]; disconnect: ReturnType<typeof vi.fn> }[] = [];
+// `disconnect` is typed as a callable mock (vi.fn's default Mock type is
+// Procedure | Constructable, which TS can't resolve for plain calls).
+let observers: { callback: IntersectionObserverCallback; elements: Element[]; disconnect: ReturnType<typeof vi.fn<() => void>> }[] = [];
 
 function latestObserver() {
   return observers[observers.length - 1];
@@ -13,7 +15,7 @@ function latestObserver() {
 class MockIntersectionObserver {
   private _entry: typeof observers[number];
   constructor(callback: IntersectionObserverCallback) {
-    this._entry = { callback, elements: [], disconnect: vi.fn() };
+    this._entry = { callback, elements: [], disconnect: vi.fn<() => void>() };
     observers.push(this._entry);
   }
   observe(el: Element) { this._entry.elements.push(el); }

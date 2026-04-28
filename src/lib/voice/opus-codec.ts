@@ -42,7 +42,6 @@ interface OpusScriptInstance {
 export class OpusCodec implements VoiceCodec {
   readonly codecType: CodecType = 'opus';
   private _codec: OpusScriptInstance | null = null;
-  private _sampleRate = 0;
   private _channels = 0;
 
   /**
@@ -56,8 +55,9 @@ export class OpusCodec implements VoiceCodec {
       this._codec = null;
     }
 
-    this._sampleRate = sampleRate;
     this._channels = channels;
+    // sampleRate is only needed to construct OpusScript below, so we do not
+    // retain it as instance state after initialization.
 
     // opusscript (emscripten) uses Node's Buffer internally.
     // Ensure a Buffer polyfill is available in the Tauri webview.

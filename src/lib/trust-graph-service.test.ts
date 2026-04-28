@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { MockTrustGraphService } from './trust-graph-service';
-import { buildScore } from './trust-score';
+import { buildScore, type TrustScore } from './trust-score';
 
 describe('MockTrustGraphService', () => {
   it('initializes with edges between mock peers', () => {
@@ -17,14 +17,14 @@ describe('MockTrustGraphService', () => {
 describe('setScore / directScore', () => {
   it('sets and retrieves a direct score', () => {
     const svc = new MockTrustGraphService('local-addr', ['peer-a']);
-    svc.setScore('peer-a', 0xFF);
+    svc.setScore('peer-a', 0xFF as TrustScore);
     expect(svc.directScore('local-addr', 'peer-a')).toBe(0xFF);
   });
 
   it('updates existing score', () => {
     const svc = new MockTrustGraphService('local-addr', ['peer-a']);
-    svc.setScore('peer-a', 0xFF);
-    svc.setScore('peer-a', 0x00);
+    svc.setScore('peer-a', 0xFF as TrustScore);
+    svc.setScore('peer-a', 0x00 as TrustScore);
     expect(svc.directScore('local-addr', 'peer-a')).toBe(0x00);
   });
 
@@ -38,7 +38,7 @@ describe('setScore / directScore', () => {
 describe('clearScore', () => {
   it('removes a score', () => {
     const svc = new MockTrustGraphService('local-addr', ['peer-a']);
-    svc.setScore('peer-a', 0xFF);
+    svc.setScore('peer-a', 0xFF as TrustScore);
     svc.clearScore('peer-a');
     expect(svc.directScore('local-addr', 'peer-a')).toBeNull();
   });
@@ -47,8 +47,8 @@ describe('clearScore', () => {
 describe('edgesFrom / edgesTo', () => {
   it('edgesFrom returns all edges from a given source', () => {
     const svc = new MockTrustGraphService('local-addr', ['peer-a', 'peer-b']);
-    svc.setScore('peer-a', 0xFF);
-    svc.setScore('peer-b', 0x80);
+    svc.setScore('peer-a', 0xFF as TrustScore);
+    svc.setScore('peer-b', 0x80 as TrustScore);
     const edges = svc.edgesFrom('local-addr');
     const targets = edges.map((e) => e.target);
     expect(targets).toContain('peer-a');
@@ -57,7 +57,7 @@ describe('edgesFrom / edgesTo', () => {
 
   it('edgesTo returns all edges pointing to a given target', () => {
     const svc = new MockTrustGraphService('local-addr', ['peer-a', 'peer-b']);
-    svc.setScore('peer-a', 0xFF);
+    svc.setScore('peer-a', 0xFF as TrustScore);
     // peer-a may also have mock edges pointing to others
     const edges = svc.edgesTo('peer-a');
     expect(edges.length).toBeGreaterThan(0);
