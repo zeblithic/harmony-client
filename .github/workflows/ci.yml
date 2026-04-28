@@ -15,6 +15,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# All third-party actions are pinned to full commit SHAs (not moving tags) so
+# a compromised upstream or moved tag can't silently change what runs in CI.
+# The trailing comment names the original tag for auditability — bump both
+# together when refreshing.
+
 jobs:
   rust:
     name: Rust — fmt, clippy, test
@@ -24,7 +29,7 @@ jobs:
       run:
         working-directory: src-tauri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       # Tauri's Linux build needs WebKit/GTK system libraries even when
       # only the Rust side is being built/tested — the tauri crate's build
@@ -41,11 +46,12 @@ jobs:
             libayatana-appindicator3-dev \
             build-essential
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           workspaces: src-tauri
 
@@ -74,10 +80,9 @@ jobs:
   # test against the actual Cargo.lock dep graph, not whatever resolves
   # fresh.
   #
-  # The 1.88 floor is set by transitive deps: `time-core`/`time-macros` need
-  # 1.88, and `signature-3.0.0-rc.10` (via PQ crypto) needs edition 2024
-  # which stabilised in 1.85. Bumping this is a normal consequence of dep
-  # updates; treat it like any other version bump.
+  # The MSRV value comes from a single source of truth — Cargo.toml's
+  # `rust-version` — extracted at job time. This means a bump in Cargo.toml
+  # automatically retargets the gate, no second edit required.
   msrv:
     name: MSRV — cargo check on declared rust-version
     runs-on: ubuntu-latest
@@ -86,7 +91,7 @@ jobs:
       run:
         working-directory: src-tauri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Tauri Linux deps
         run: |
@@ -100,9 +105,23 @@ jobs:
             libayatana-appindicator3-dev \
             build-essential
 
-      - uses: dtolnay/rust-toolchain@1.88
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          msrv=$(grep -E '^rust-version' Cargo.toml | sed -E 's/rust-version *= *"(.*)"/\1/')
+          if [ -z "$msrv" ]; then
+            echo "::error::Cargo.toml has no rust-version field; the MSRV gate has nothing to enforce" >&2
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Resolved MSRV from Cargo.toml: $msrv"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           workspaces: src-tauri
           key: msrv
@@ -115,9 +134,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '20'
           cache: 'npm'

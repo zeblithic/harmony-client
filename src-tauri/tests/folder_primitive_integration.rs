@@ -74,7 +74,10 @@ fn create_nested_folder_updates_top_level_root_cid() {
     // Now simulate creating "2026" inside Photos. This should produce:
     //   - A new empty "2026" folder (child of the new Photos bundle).
     //   - A new Photos bundle (root_v2) whose manifest lists "2026".
-    //   - Sidecar rekey: old key photos_v1 → new key photos_v2.
+    //   - Sidecar rekey: same SidecarId, but the entry's `cid` field
+    //     flips from photos_v1 to photos_v2. (ZEB-164's symlink-style
+    //     model keys entries by SidecarId, not CID — the map key is
+    //     stable across rekey.)
     //   - Sidecar's pinned flag still true after rekey.
     let sub = folders::build_folder("2026", &[]).expect("sub build");
     let photos_v2 = folders::build_folder(
