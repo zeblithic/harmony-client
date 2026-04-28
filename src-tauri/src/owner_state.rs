@@ -49,6 +49,114 @@ pub enum TrustKind {
     Refused,
 }
 
+// ── Token cache for recovery-artifact bytes ───────────────────────────────
+//
+// The master seed is generated inside `mint_owner_identity()` and must reach
+// `export_owner_recovery_file_to_path()` without ever crossing the IPC
+// boundary as plaintext. The token (an opaque UUID string) is what the GUI
+// ferries between those two commands; the backend resolves the token to the
+// cached seed on the export call. This mirrors the `PreviewedRecovery` pattern
+// in `identity_commands.rs` (PR-61).
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+const TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_LIVE_TOKENS: usize = 8;
+
+struct TokenEntry {
+    seed: Zeroizing<[u8; 32]>,
+    inserted_at: Instant,
+}
+
+static TOKEN_CACHE: LazyLock<Mutex<HashMap<Uuid, TokenEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Insert a master seed into the token cache, returning a fresh single-use
+/// token. Caller hands the token to the GUI; GUI presents it back via
+/// `take_token`. Single-use semantics prevent token replay.
+pub(crate) fn insert_token(seed: [u8; 32]) -> Uuid {
+    let token = Uuid::new_v4();
+    let mut cache = TOKEN_CACHE.lock().expect("token cache lock poisoned");
+    evict_expired(&mut cache);
+    if cache.len() >= MAX_LIVE_TOKENS {
+        // Oldest entry is the LRU candidate; drop it.
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, e)| e.inserted_at)
+            .map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(token, TokenEntry { seed: Zeroizing::new(seed), inserted_at: Instant::now() });
+    token
+}
+
+/// Consume a token: returns the master seed exactly once. Subsequent
+/// `take_token(same_uuid)` returns `None`.
+pub(crate) fn take_token(token: &Uuid) -> Option<Zeroizing<[u8; 32]>> {
+    let mut cache = TOKEN_CACHE.lock().expect("token cache lock poisoned");
+    evict_expired(&mut cache);
+    cache.remove(token).map(|e| e.seed)
+}
+
+fn evict_expired(cache: &mut HashMap<Uuid, TokenEntry>) {
+    let now = Instant::now();
+    cache.retain(|_, e| now.duration_since(e.inserted_at) < TOKEN_TTL);
+}
+
+#[doc(hidden)]
+#[cfg(test)]
+pub fn clear_token_cache() {
+    TOKEN_CACHE.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+mod token_cache_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn insert_then_take_returns_seed_once() {
+        clear_token_cache();
+        let seed = [0xAAu8; 32];
+        let token = insert_token(seed);
+        let taken = take_token(&token).expect("first take must succeed");
+        assert_eq!(*taken, seed);
+        assert!(take_token(&token).is_none(), "second take must return None (single-use)");
+    }
+
+    #[test]
+    #[serial]
+    fn nonexistent_token_returns_none() {
+        clear_token_cache();
+        let bogus = Uuid::new_v4();
+        assert!(take_token(&bogus).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn lru_evicts_when_max_live_tokens_exceeded() {
+        clear_token_cache();
+        let mut tokens = Vec::new();
+        for i in 0..(MAX_LIVE_TOKENS + 2) {
+            tokens.push(insert_token([i as u8; 32]));
+        }
+        // The first 2 inserted should have been LRU-evicted.
+        let first_taken = take_token(&tokens[0]);
+        let second_taken = take_token(&tokens[1]);
+        let last_taken = take_token(&tokens[MAX_LIVE_TOKENS + 1]);
+        assert!(first_taken.is_none(), "oldest must have been evicted");
+        assert!(second_taken.is_none(), "second-oldest must have been evicted");
+        assert!(last_taken.is_some(), "newest must remain");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
