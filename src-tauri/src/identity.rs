@@ -887,7 +887,10 @@ pub fn read_seed_from_disk_with_keychain(
         Err(e) => return Err(e),
     };
 
-    load_or_generate_with_stores(keychain.as_ref(), encrypted.as_ref())
+    // Use _post_probe variant: we already probed the keychain above (single
+    // round-trip). The non-post-probe variant probes again, which is a real
+    // perf regression on macOS Keychain / Linux Secret Service.
+    load_or_generate_with_stores_post_probe(keychain.as_ref(), keychain_probe_ok, encrypted.as_ref())
 }
 
 /// Write the master seed to disk via the standard resolution chain
@@ -909,9 +912,15 @@ pub fn write_seed_to_disk_with_keychain(
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let mut keychain_healthy = false;
+
     if !force {
         // Refuse if either destination has an existing identity.
         // Check the keychain first (cheap probe), then the encrypted file path.
+        // The probe also doubles as a connectivity check — Ok(None) means the
+        // backend is responsive AND there's no existing entry, so we can mark
+        // it healthy and skip the second probe below.
         if let Some(kc) = &keychain {
             match kc.load() {
                 Ok(Some(_)) => {
@@ -920,7 +929,7 @@ pub fn write_seed_to_disk_with_keychain(
                             .to_string(),
                     );
                 }
-                Ok(None) => {}
+                Ok(None) => keychain_healthy = true,
                 Err(e) => {
                     return Err(format!(
                         "could not determine whether an identity already exists in OS keychain — refusing to overwrite: {e}; pass --force to override"
@@ -928,25 +937,20 @@ pub fn write_seed_to_disk_with_keychain(
                 }
             }
         }
-        let enc_path = plaintext_path.with_file_name("identity.enc");
         if enc_path.exists() {
             return Err(format!(
                 "identity already exists at {}; pass --force to overwrite (this is destructive)",
                 enc_path.display()
             ));
         }
-    }
-
-    let mut keychain_healthy = false;
-    if let Some(kc) = &keychain {
-        // Use load() as a connectivity probe (Ok(_) means responsive).
+    } else if let Some(kc) = &keychain {
+        // Force path: still need a connectivity probe to compute keychain_healthy.
         if kc.load().is_ok() {
             keychain_healthy = true;
         }
     }
 
-    let enc_path = plaintext_path.with_file_name("identity.enc");
-    let encrypted = match EncryptedFileStore::from_env(enc_path) {
+    let encrypted = match EncryptedFileStore::from_env(enc_path.clone()) {
         Ok(opt) => opt,
         Err(e) if keychain_healthy => {
             tracing::warn!(
@@ -981,7 +985,6 @@ pub fn write_seed_to_disk_with_keychain(
                 // Wrote to keychain → unlink the encrypted file if it exists.
                 // A leftover .enc with the pre-restore seed is the silent-failure
                 // scenario this guards against.
-                let enc_path = plaintext_path.with_file_name("identity.enc");
                 match std::fs::remove_file(&enc_path) {
                     Ok(()) => tracing::info!(
                         path = %enc_path.display(),
@@ -1232,8 +1235,17 @@ mod tests {
         store.save(&existing_seed).unwrap();
 
         let new_seed = [0x22u8; 32];
-        let err = write_seed_to_disk(&plaintext_path, &new_seed, /*force=*/ false)
-            .expect_err("must refuse when destination exists");
+        // Pass `None` for the keychain to keep this test hermetic — without it,
+        // write_seed_to_disk would resolve `KeychainStore::new().ok()`, which on
+        // a developer machine reads/writes the real `harmony/identity` keychain
+        // entry and prompts for keychain access.
+        let err = write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &new_seed,
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("must refuse when destination exists");
         assert!(err.contains("identity already exists"), "actual: {err}");
         assert!(err.contains("--force"), "actual: {err}");
 
@@ -1254,9 +1266,17 @@ mod tests {
         store.save(&existing_seed).unwrap();
 
         let new_seed = [0x44u8; 32];
-        write_seed_to_disk(&plaintext_path, &new_seed, /*force=*/ true).expect("force must succeed");
+        // Pass `None` so the test stays file-only and never touches the real OS
+        // keychain (see hermeticity comment on the sibling test above).
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &new_seed,
+            /*force=*/ true,
+            None,
+        )
+        .expect("force must succeed");
 
-        let reloaded = read_seed_from_disk(&plaintext_path).expect("reload");
+        let reloaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("reload");
         assert_eq!(*reloaded, new_seed, "after force-overwrite, the new seed must be present");
 
         std::env::remove_var("HARMONY_PASSPHRASE");

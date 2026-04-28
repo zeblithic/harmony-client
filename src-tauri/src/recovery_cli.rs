@@ -15,7 +15,7 @@ use harmony_owner::recovery::RecoveryMetadata;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
-use crate::identity;
+use crate::identity::{self, KeychainStore};
 
 /// Resolve the recovery passphrase from `HARMONY_RECOVERY_PASSPHRASE` or
 /// `HARMONY_RECOVERY_PASSPHRASE_FILE`. Hard-fails if neither is set, with
@@ -64,7 +64,16 @@ pub(crate) fn resolve_recovery_passphrase() -> Result<SecretString, String> {
 /// mnemonic > backup.txt` writes only the words; running interactively shows
 /// the warning + fingerprint on the terminal.
 pub fn export_mnemonic_cli(plaintext_path: &Path) -> Result<(), String> {
-    let seed = identity::read_seed_from_disk(plaintext_path)?;
+    export_mnemonic_with_keychain(plaintext_path, KeychainStore::new().ok())
+}
+
+/// Inner entry point — accepts an injected keychain so tests can stay
+/// hermetic. Production callers go through [`export_mnemonic_cli`].
+pub fn export_mnemonic_with_keychain(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let mnemonic = artifact.to_mnemonic();
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
@@ -92,7 +101,18 @@ pub fn export_recovery_file_cli(
     out: &Path,
     comment: Option<&str>,
 ) -> Result<(), String> {
-    let seed = identity::read_seed_from_disk(plaintext_path)?;
+    export_recovery_file_with_keychain(plaintext_path, out, comment, KeychainStore::new().ok())
+}
+
+/// Inner entry point — accepts an injected keychain so tests can stay
+/// hermetic. Production callers go through [`export_recovery_file_cli`].
+pub fn export_recovery_file_with_keychain(
+    plaintext_path: &Path,
+    out: &Path,
+    comment: Option<&str>,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let passphrase = resolve_recovery_passphrase()?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
@@ -125,6 +145,22 @@ pub fn restore_mnemonic_cli(
     mnemonic_file: &Path,
     force: bool,
 ) -> Result<(), String> {
+    restore_mnemonic_with_keychain(
+        plaintext_path,
+        mnemonic_file,
+        force,
+        KeychainStore::new().ok(),
+    )
+}
+
+/// Inner entry point — accepts an injected keychain so tests can stay
+/// hermetic. Production callers go through [`restore_mnemonic_cli`].
+pub fn restore_mnemonic_with_keychain(
+    plaintext_path: &Path,
+    mnemonic_file: &Path,
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     // Read the mnemonic file. Wrap in Zeroizing so the contents do not linger.
     let raw = std::fs::read_to_string(mnemonic_file)
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
@@ -135,7 +171,7 @@ pub fn restore_mnemonic_cli(
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    identity::write_seed_to_disk(plaintext_path, &seed_bytes, force)?;
+    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
     Ok(())
 }
@@ -154,6 +190,22 @@ pub fn restore_recovery_file_cli(
     in_path: &Path,
     force: bool,
 ) -> Result<(), String> {
+    restore_recovery_file_with_keychain(
+        plaintext_path,
+        in_path,
+        force,
+        KeychainStore::new().ok(),
+    )
+}
+
+/// Inner entry point — accepts an injected keychain so tests can stay
+/// hermetic. Production callers go through [`restore_recovery_file_cli`].
+pub fn restore_recovery_file_with_keychain(
+    plaintext_path: &Path,
+    in_path: &Path,
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     let bytes = std::fs::read(in_path)
         .map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
     let passphrase = resolve_recovery_passphrase()?;
@@ -163,7 +215,7 @@ pub fn restore_recovery_file_cli(
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    identity::write_seed_to_disk(plaintext_path, &seed_bytes, force)?;
+    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
     Ok(())
 }
@@ -172,18 +224,6 @@ pub fn restore_recovery_file_cli(
 mod tests {
     use super::*;
     use serial_test::serial;
-
-    /// Clear any pre-existing OS keychain entry before each test that goes
-    /// through a `*_cli` function. The CLI functions call the public
-    /// `identity::read_seed_from_disk` / `write_seed_to_disk` which use the
-    /// real OS keychain — without this cleanup, seeds left over from prior
-    /// test runs (or other tests in this run) can leak in via the keychain
-    /// and cause spurious assertion failures.
-    fn clear_keychain_for_test() {
-        if let Ok(kc) = crate::identity::KeychainStore::new() {
-            let _ = kc.delete();
-        }
-    }
 
     #[test]
     #[serial]
@@ -220,7 +260,6 @@ mod tests {
     #[test]
     #[serial]
     fn export_recovery_file_with_metadata() {
-        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let recovery_out = dir.path().join("recovery.bin");
@@ -238,7 +277,11 @@ mod tests {
         )
         .unwrap();
 
-        export_recovery_file_cli(&plaintext_path, &recovery_out, Some("test")).expect("export");
+        // Use the keychain-injected variant with `None` — keeps the test
+        // hermetic and prevents any read/write to the developer's real OS
+        // keychain entry.
+        export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("test"), None)
+            .expect("export");
         assert!(recovery_out.exists(), "recovery file must be written");
 
         // Decode the file back; it should round-trip to the same seed.
@@ -252,7 +295,6 @@ mod tests {
         .into_artifact();
         assert_eq!(restored.as_bytes(), &[0xCAu8; 32]);
 
-        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
     }
@@ -260,7 +302,6 @@ mod tests {
     #[test]
     #[serial]
     fn restore_mnemonic_idempotent() {
-        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -270,20 +311,20 @@ mod tests {
         std::fs::write(&mnemonic_path, original.to_mnemonic().as_str()).unwrap();
         let original_id = original.master_pubkey_bundle().identity_hash();
 
-        restore_mnemonic_cli(&plaintext_path, &mnemonic_path, /*force=*/ false).expect("restore");
+        restore_mnemonic_with_keychain(&plaintext_path, &mnemonic_path, /*force=*/ false, None)
+            .expect("restore");
 
-        let reloaded_seed = identity::read_seed_from_disk(&plaintext_path).unwrap();
+        let reloaded_seed =
+            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
-        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn restore_refuses_when_identity_exists_without_force() {
-        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -300,18 +341,21 @@ mod tests {
         )
         .unwrap();
 
-        let err = restore_mnemonic_cli(&plaintext_path, &mnemonic_path, /*force=*/ false)
-            .expect_err("must refuse");
+        let err = restore_mnemonic_with_keychain(
+            &plaintext_path,
+            &mnemonic_path,
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("must refuse");
         assert!(err.contains("identity already exists"), "actual: {err}");
 
-        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
     #[serial]
     fn restore_with_force_overwrites_existing() {
-        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
         let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -329,12 +373,13 @@ mod tests {
         )
         .unwrap();
 
-        restore_mnemonic_cli(&plaintext_path, &mnemonic_path, /*force=*/ true).expect("force succeeds");
-        let reloaded_seed = identity::read_seed_from_disk(&plaintext_path).unwrap();
+        restore_mnemonic_with_keychain(&plaintext_path, &mnemonic_path, /*force=*/ true, None)
+            .expect("force succeeds");
+        let reloaded_seed =
+            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
         let reloaded = RecoveryArtifact::from_seed(*reloaded_seed);
         assert_eq!(reloaded.master_pubkey_bundle().identity_hash(), original_id);
 
-        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
@@ -342,7 +387,6 @@ mod tests {
     #[serial]
     fn export_mnemonic_round_trips_via_recovery_artifact() {
         use crate::identity;
-        clear_keychain_for_test();
         let dir = tempfile::tempdir().unwrap();
         let plaintext_path = dir.path().join("identity.key");
 
@@ -357,22 +401,21 @@ mod tests {
         )
         .unwrap();
 
-        // Call the CLI entry point. We cannot capture stdout/stderr from the
-        // unit test directly without process indirection, but we can confirm
-        // the function returns Ok and that the seed-from-disk derives an
-        // artifact whose mnemonic round-trips back to the same seed.
-        export_mnemonic_cli(&plaintext_path).expect("export must succeed");
+        // Call the keychain-injected entry point. We can't capture stdout/stderr
+        // from the unit test directly, but we can confirm the function returns
+        // Ok and the seed-from-disk derives an artifact whose mnemonic
+        // round-trips back to the same seed.
+        export_mnemonic_with_keychain(&plaintext_path, None).expect("export must succeed");
 
         // Re-derive the artifact and verify the mnemonic encodes back to the
         // planted seed — this is the behavioral contract export_mnemonic_cli
         // promises to operators.
-        let seed = identity::read_seed_from_disk(&plaintext_path).unwrap();
+        let seed = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
         let artifact = RecoveryArtifact::from_seed(*seed);
         let mnemonic = artifact.to_mnemonic();
         let parsed = RecoveryArtifact::from_mnemonic(mnemonic.as_str()).unwrap();
         assert_eq!(*parsed.as_bytes(), planted);
 
-        clear_keychain_for_test();
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }
