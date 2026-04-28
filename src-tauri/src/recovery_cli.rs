@@ -81,10 +81,10 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     stdout: &mut W1,
     stderr: &mut W2,
 ) -> Result<(), String> {
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
-    let artifact = RecoveryArtifact::from_seed(*seed);
-    let mnemonic = artifact.to_mnemonic();
-    let id_hash = artifact.master_pubkey_bundle().identity_hash();
+    // Single source of truth for word derivation; identity_hash comes back
+    // alongside the words so we avoid re-parsing the mnemonic.
+    let (words, id_hash) = export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
+    let phrase = words.join(" ");
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
 
@@ -97,8 +97,33 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
 
-    writeln!(stdout, "{}", mnemonic.as_str()).map_err(map_err("stdout"))?;
+    writeln!(stdout, "{phrase}").map_err(map_err("stdout"))?;
     Ok(())
+}
+
+/// Read the seed from disk and convert to 24 BIP39 words.
+///
+/// Returns `(words, identity_hash_bytes)` — the hash bytes are derived
+/// directly from the artifact so callers (e.g. `export_mnemonic_to_writers`
+/// and the GUI's `export_mnemonic_words` Tauri command) do not need to
+/// re-parse the mnemonic just to obtain the fingerprint.
+///
+/// Used by the GUI wizard so the words never touch a temp file. The CLI's
+/// `export_mnemonic_to_writers` delegates here.
+pub fn export_mnemonic_words_with_keychain(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<(Vec<String>, [u8; 16]), String> {
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let id_hash = artifact.master_pubkey_bundle().identity_hash();
+    let mnemonic = artifact.to_mnemonic();
+    let words = mnemonic
+        .as_str()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    Ok((words, id_hash))
 }
 
 /// Export the master seed as a passphrase-encrypted recovery file at `out`.
@@ -113,15 +138,30 @@ pub fn export_recovery_file_cli(
     out: &Path,
     comment: Option<&str>,
 ) -> Result<(), String> {
-    export_recovery_file_with_keychain(plaintext_path, out, comment, KeychainStore::new().ok())
+    export_recovery_file_with_keychain(
+        plaintext_path,
+        out,
+        comment,
+        /*passphrase=*/ None,
+        KeychainStore::new().ok(),
+    )
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`export_recovery_file_cli`].
+///
+/// `passphrase`: when `Some`, used directly. When `None`, resolved from
+/// `HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`
+/// environment variables (the CLI path). The GUI passes `Some` — it would
+/// otherwise have to mutate process-global env vars, which is unsafe in a
+/// multithreaded program (CodeRabbit round 5). The env-var fallback is
+/// kept for the headless CLI binary, which runs single-threaded and has
+/// no other way to receive the secret.
 pub fn export_recovery_file_with_keychain(
     plaintext_path: &Path,
     out: &Path,
     comment: Option<&str>,
+    passphrase: Option<&SecretString>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
     // Resolve the recovery passphrase BEFORE reading the seed: on an empty
@@ -130,7 +170,10 @@ pub fn export_recovery_file_with_keychain(
     // read, a missing/invalid HARMONY_RECOVERY_PASSPHRASE would mutate the
     // identity store and then fail — the operator wanted to back up an
     // existing identity, not silently create one.
-    let passphrase = resolve_recovery_passphrase()?;
+    let passphrase: SecretString = match passphrase {
+        Some(p) => p.clone(),
+        None => resolve_recovery_passphrase()?,
+    };
     let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
@@ -171,6 +214,26 @@ pub fn restore_mnemonic_cli(
     )
 }
 
+/// Restore the on-disk identity from a 24-word array. Refuses to
+/// overwrite an existing identity unless `force` is true. The CLI's
+/// `restore_mnemonic_with_keychain` (which reads from a file path)
+/// delegates here after reading the file.
+pub fn restore_mnemonic_from_words_with_keychain(
+    plaintext_path: &Path,
+    words: &[String],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    if words.len() != 24 {
+        return Err(format!("expected 24 BIP39 words, got {}", words.len()));
+    }
+    let phrase = words.join(" ");
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)
+        .map_err(|e| e.to_string())
+}
+
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`restore_mnemonic_cli`].
 pub fn restore_mnemonic_with_keychain(
@@ -184,12 +247,21 @@ pub fn restore_mnemonic_with_keychain(
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
 
-    let artifact = RecoveryArtifact::from_mnemonic(raw.as_str()).map_err(|e| e.to_string())?;
-    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    let id_hash = artifact.master_pubkey_bundle().identity_hash();
-
-    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
-    eprintln!("restored identity-hash: {}", hex::encode(id_hash));
+    let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    restore_mnemonic_from_words_with_keychain(plaintext_path, &words, force, keychain)?;
+    // Derive the identity-hash for the confirmation message. We re-parse the
+    // SAME normalized input the inner used (`words.join(" ")`), not the raw
+    // file text — otherwise tabs or multiple spaces between words would let
+    // the inner parse succeed (after `split_whitespace` normalization) while
+    // the outer `from_mnemonic(raw.trim())` could fail and panic, regressing
+    // a graceful error into a panic AFTER the irreversible disk write.
+    let phrase = words.join(" ");
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase)
+        .expect("post-restore mnemonic re-parse must succeed; same normalized input already parsed in restore_mnemonic_from_words_with_keychain");
+    eprintln!(
+        "restored identity-hash: {}",
+        hex::encode(artifact.master_pubkey_bundle().identity_hash())
+    );
     Ok(())
 }
 
@@ -290,9 +362,14 @@ mod tests {
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
         assert!(!enc_path.exists(), "test setup: enc file must be absent");
 
-        let err =
-            export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("rt"), None)
-                .expect_err("must fail when recovery passphrase is unset");
+        let err = export_recovery_file_with_keychain(
+            &plaintext_path,
+            &recovery_out,
+            Some("rt"),
+            /*passphrase=*/ None,
+            /*keychain=*/ None,
+        )
+        .expect_err("must fail when recovery passphrase is unset");
         assert!(
             err.contains("HARMONY_RECOVERY_PASSPHRASE"),
             "must fail with recovery-passphrase error; got: {err}"
@@ -335,8 +412,14 @@ mod tests {
         // Use the keychain-injected variant with `None` — keeps the test
         // hermetic and prevents any read/write to the developer's real OS
         // keychain entry.
-        export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("test"), None)
-            .expect("export");
+        export_recovery_file_with_keychain(
+            &plaintext_path,
+            &recovery_out,
+            Some("test"),
+            /*passphrase=*/ None,
+            /*keychain=*/ None,
+        )
+        .expect("export");
         assert!(recovery_out.exists(), "recovery file must be written");
 
         // Decode the file back; it should round-trip to the same seed.

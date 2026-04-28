@@ -13,6 +13,7 @@ pub mod event_loop;
 pub mod folders;
 mod follows;
 pub mod identity;
+pub mod identity_commands;
 pub mod mail;
 pub mod mail_sync;
 pub mod recovery_cli;
@@ -127,7 +128,7 @@ pub fn chunk_and_bundle(
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
-struct NodeState {
+pub struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
     /// Send `true` to shut down the event loop.
@@ -161,6 +162,16 @@ struct NodeState {
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+}
+
+impl NodeState {
+    /// True when the event-loop thread is running. Identity-restore IPCs
+    /// refuse while the node is up, since the running NodeRuntime caches
+    /// the old keys + zenoh subscriptions and would not pick up the new
+    /// identity until restart (CodeRabbit round 5).
+    pub fn is_running(&self) -> bool {
+        self.thread.is_some()
+    }
 }
 
 impl Default for NodeState {
@@ -2945,6 +2956,13 @@ pub fn run() {
             fetch_mail_body,
             update_mail,
             get_mail_counts,
+            identity_commands::current_identity_hash,
+            identity_commands::export_mnemonic_words,
+            identity_commands::preview_mnemonic_identity,
+            identity_commands::preview_recovery_file,
+            identity_commands::export_recovery_file_to_path,
+            identity_commands::restore_mnemonic_from_words,
+            identity_commands::restore_recovery_from_preview_token,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
