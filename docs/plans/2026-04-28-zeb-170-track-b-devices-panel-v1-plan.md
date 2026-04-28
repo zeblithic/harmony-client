@@ -107,8 +107,11 @@ pub struct TrustDecisionView {
     pub reason: Option<String>,
 }
 
+// `rename_all = "lowercase"` — single-word PascalCase variants are not
+// lowercased by `camelCase` (which only operates on multi-word). Spec
+// requires JS-side discriminants `'full' | 'provisional' | 'refused'`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum TrustKind {
     Full,
     Provisional,
@@ -140,6 +143,8 @@ mod tests {
         assert!(json.contains("\"canBackUp\""), "expected canBackUp, got {json}");
         assert!(json.contains("\"isThisDevice\""), "expected isThisDevice, got {json}");
         assert!(json.contains("\"trustDecision\""), "expected trustDecision, got {json}");
+        assert!(json.contains("\"full\""), "TrustKind::Full must serialize as lowercase \"full\", got {json}");
+        assert!(!json.contains("\"Full\""), "TrustKind PascalCase must not leak to wire: {json}");
         assert!(!json.contains("owner_id"), "snake_case must not leak: {json}");
     }
 }
