@@ -14,6 +14,7 @@ pub mod folders;
 mod follows;
 pub mod identity;
 pub mod identity_commands;
+pub mod owner_commands;
 pub mod owner_state;
 pub mod mail;
 pub mod mail_sync;
@@ -2964,6 +2965,9 @@ pub fn run() {
             identity_commands::export_recovery_file_to_path,
             identity_commands::restore_mnemonic_from_words,
             identity_commands::restore_recovery_from_preview_token,
+            owner_commands::get_owner_state,
+            owner_commands::mint_owner_identity,
+            owner_commands::export_owner_recovery_file_to_path,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

@@ -416,7 +416,7 @@ pub fn restore_recovery_from_preview_token_helper(
 /// would stall other tasks (zenoh sync, IPC handling, UI events) for the
 /// hundreds of milliseconds that a single Argon2id derivation takes
 /// (Cursor Bugbot, round 4).
-async fn run_blocking<F, T>(f: F) -> Result<T, String>
+pub(crate) async fn run_blocking<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
