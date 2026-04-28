@@ -109,7 +109,7 @@ fn export_mnemonic_words_returns_24_words() {
     let original_seed = [0xD4u8; 32];
     plant_seed(&plaintext_path, &original_seed);
 
-    let words = recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None)
+    let (words, id_hash) = recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None)
         .expect("export words");
     assert_eq!(words.len(), 24, "BIP39-24 produces exactly 24 words");
     for w in &words {
@@ -118,6 +118,14 @@ fn export_mnemonic_words_returns_24_words() {
             "each word is non-empty lowercase ASCII"
         );
     }
+    // The returned hash must match what re-parsing the phrase produces.
+    let phrase = words.join(" ");
+    let reparsed = RecoveryArtifact::from_mnemonic(&phrase).expect("re-parse");
+    assert_eq!(
+        id_hash,
+        reparsed.master_pubkey_bundle().identity_hash(),
+        "returned hash must match artifact derived from words"
+    );
 
     std::env::remove_var("HARMONY_PASSPHRASE");
 }
@@ -136,7 +144,7 @@ fn restore_mnemonic_from_words_round_trip() {
         .master_pubkey_bundle()
         .identity_hash();
 
-    let words =
+    let (words, _id_hash) =
         recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None).expect("export");
     wipe_identity_store(&plaintext_path);
 

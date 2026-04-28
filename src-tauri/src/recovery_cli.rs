@@ -81,15 +81,10 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     stdout: &mut W1,
     stderr: &mut W2,
 ) -> Result<(), String> {
-    // Single source of truth for word derivation.
-    let words = export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
+    // Single source of truth for word derivation; identity_hash comes back
+    // alongside the words so we avoid re-parsing the mnemonic.
+    let (words, id_hash) = export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
     let phrase = words.join(" ");
-
-    // Reconstruct the artifact from the phrase to derive the identity-hash
-    // for the stderr log line. (One extra parse; no extra disk read.)
-    let artifact = RecoveryArtifact::from_mnemonic(&phrase)
-        .map_err(|e| format!("internal: re-parse of just-derived mnemonic failed: {e}"))?;
-    let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
 
@@ -106,21 +101,29 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     Ok(())
 }
 
-/// Read the seed from disk and convert to 24 BIP39 words. Used by the
-/// GUI wizard so the words never touch a temp file. The CLI's
-/// `export_mnemonic_to_writers` refactors to delegate here.
+/// Read the seed from disk and convert to 24 BIP39 words.
+///
+/// Returns `(words, identity_hash_bytes)` — the hash bytes are derived
+/// directly from the artifact so callers (e.g. `export_mnemonic_to_writers`
+/// and the GUI's `export_mnemonic_words` Tauri command) do not need to
+/// re-parse the mnemonic just to obtain the fingerprint.
+///
+/// Used by the GUI wizard so the words never touch a temp file. The CLI's
+/// `export_mnemonic_to_writers` delegates here.
 pub fn export_mnemonic_words_with_keychain(
     plaintext_path: &Path,
     keychain: Option<KeychainStore>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, [u8; 16]), String> {
     let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
+    let id_hash = artifact.master_pubkey_bundle().identity_hash();
     let mnemonic = artifact.to_mnemonic();
-    Ok(mnemonic
+    let words = mnemonic
         .as_str()
         .split_whitespace()
         .map(String::from)
-        .collect())
+        .collect();
+    Ok((words, id_hash))
 }
 
 /// Export the master seed as a passphrase-encrypted recovery file at `out`.
