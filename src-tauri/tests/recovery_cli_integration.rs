@@ -100,6 +100,65 @@ fn recovery_file_round_trip_preserves_identity_hash() {
 
 #[test]
 #[serial]
+fn export_mnemonic_words_returns_24_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let plaintext_path = dir.path().join("identity.key");
+
+    std::env::set_var("HARMONY_PASSPHRASE", "words-test");
+
+    let original_seed = [0xD4u8; 32];
+    plant_seed(&plaintext_path, &original_seed);
+
+    let words = recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None)
+        .expect("export words");
+    assert_eq!(words.len(), 24, "BIP39-24 produces exactly 24 words");
+    for w in &words {
+        assert!(
+            !w.is_empty() && w.chars().all(|c: char| c.is_ascii_lowercase()),
+            "each word is non-empty lowercase ASCII"
+        );
+    }
+
+    std::env::remove_var("HARMONY_PASSPHRASE");
+}
+
+#[test]
+#[serial]
+fn restore_mnemonic_from_words_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let plaintext_path = dir.path().join("identity.key");
+
+    std::env::set_var("HARMONY_PASSPHRASE", "words-rt");
+
+    let original_seed = [0xD5u8; 32];
+    plant_seed(&plaintext_path, &original_seed);
+    let original_id = RecoveryArtifact::from_seed(original_seed)
+        .master_pubkey_bundle()
+        .identity_hash();
+
+    let words =
+        recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None).expect("export");
+    wipe_identity_store(&plaintext_path);
+
+    recovery_cli::restore_mnemonic_from_words_with_keychain(
+        &plaintext_path,
+        &words,
+        /*force=*/ false,
+        None,
+    )
+    .expect("restore from words");
+
+    let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+    let reloaded_id = RecoveryArtifact::from_seed(*reloaded)
+        .master_pubkey_bundle()
+        .identity_hash();
+    assert_eq!(reloaded_id, original_id);
+
+    std::env::remove_var("HARMONY_PASSPHRASE");
+}
+
+#[test]
+#[serial]
 fn cross_encoding_equivalence_via_cli() {
     let dir = tempfile::tempdir().unwrap();
     let plaintext_path = dir.path().join("identity.key");

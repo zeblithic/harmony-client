@@ -81,9 +81,16 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     stdout: &mut W1,
     stderr: &mut W2,
 ) -> Result<(), String> {
+    // Read the seed once; derive both the word list and the identity-hash from it.
     let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
-    let mnemonic = artifact.to_mnemonic();
+    let words: Vec<String> = artifact
+        .to_mnemonic()
+        .as_str()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let phrase = words.join(" ");
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
     let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
@@ -97,8 +104,25 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
 
-    writeln!(stdout, "{}", mnemonic.as_str()).map_err(map_err("stdout"))?;
+    writeln!(stdout, "{phrase}").map_err(map_err("stdout"))?;
     Ok(())
+}
+
+/// Read the seed from disk and convert to 24 BIP39 words. Used by the
+/// GUI wizard so the words never touch a temp file. The CLI's
+/// `export_mnemonic_to_writers` refactors to delegate here.
+pub fn export_mnemonic_words_with_keychain(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<Vec<String>, String> {
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let mnemonic = artifact.to_mnemonic();
+    Ok(mnemonic
+        .as_str()
+        .split_whitespace()
+        .map(String::from)
+        .collect())
 }
 
 /// Export the master seed as a passphrase-encrypted recovery file at `out`.
@@ -171,6 +195,26 @@ pub fn restore_mnemonic_cli(
     )
 }
 
+/// Restore the on-disk identity from a 24-word array. Refuses to
+/// overwrite an existing identity unless `force` is true. The CLI's
+/// `restore_mnemonic_with_keychain` (which reads from a file path)
+/// delegates here after reading the file.
+pub fn restore_mnemonic_from_words_with_keychain(
+    plaintext_path: &Path,
+    words: &[String],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    if words.len() != 24 {
+        return Err(format!("expected 24 BIP39 words, got {}", words.len()));
+    }
+    let phrase = words.join(" ");
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)
+        .map_err(|e| e.to_string())
+}
+
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`restore_mnemonic_cli`].
 pub fn restore_mnemonic_with_keychain(
@@ -184,12 +228,14 @@ pub fn restore_mnemonic_with_keychain(
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
 
-    let artifact = RecoveryArtifact::from_mnemonic(raw.as_str()).map_err(|e| e.to_string())?;
-    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    let id_hash = artifact.master_pubkey_bundle().identity_hash();
-
-    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
-    eprintln!("restored identity-hash: {}", hex::encode(id_hash));
+    let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
+    restore_mnemonic_from_words_with_keychain(plaintext_path, &words, force, keychain)?;
+    // Derive the identity-hash for the confirmation message.
+    let artifact = RecoveryArtifact::from_mnemonic(raw.trim()).map_err(|e| e.to_string())?;
+    eprintln!(
+        "restored identity-hash: {}",
+        hex::encode(artifact.master_pubkey_bundle().identity_hash())
+    );
     Ok(())
 }
 
