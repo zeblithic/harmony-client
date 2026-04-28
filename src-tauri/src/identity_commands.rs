@@ -139,55 +139,6 @@ fn clear_preview_cache() {
     preview_cache_lock().clear();
 }
 
-/// Process-wide lock around `HARMONY_RECOVERY_PASSPHRASE*` env-var mutation.
-/// `recovery_cli::resolve_recovery_passphrase` reads from the environment
-/// (shared code path with the headless CLI), so the GUI must temporarily set
-/// these vars while invoking the helpers. Concurrent calls must serialize or
-/// they will race on the global env. The wizard's UX is serial today, but
-/// any non-UI caller (tests, background tasks) gets the same protection.
-///
-/// Poison recovery is genuinely safe because env-var cleanup is performed by
-/// [`EnvVarGuard`] in `Drop`, which runs during stack unwinding even when a
-/// panic poisons this lock. Without the guard, accepting a poisoned lock
-/// would leak the prior call's passphrase into the environment for the next
-/// caller — but with it, the env state is always restored.
-fn recovery_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// RAII guard for an environment variable. On construction, captures the
-/// prior value and applies a new value (or removes it). On drop, restores
-/// the prior value. Restoration runs on panic-unwind too — load-bearing for
-/// poison-safe interaction with [`recovery_env_lock`].
-struct EnvVarGuard {
-    key: &'static str,
-    prev: Option<String>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self { key, prev }
-    }
-
-    fn unset(key: &'static str) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::remove_var(key);
-        Self { key, prev }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 /// Maximum size of a recovery file the GUI will read.
 /// Recovery files are ~101 bytes today; 1 MiB is a generous upper bound that
 /// rejects accidental selection of a large file (image, video, archive).
@@ -343,23 +294,14 @@ pub fn preview_recovery_file_helper(
 /// passphrase in the file-backup wizard. The `comment` field is stored in
 /// the backup metadata and shown back to the user on restore.
 ///
-/// Wraps `HARMONY_RECOVERY_PASSPHRASE` and `HARMONY_RECOVERY_PASSPHRASE_FILE`
-/// with the caller-supplied `passphrase` because
-/// `export_recovery_file_with_keychain` resolves the passphrase from the
-/// environment (to share one code path with the headless CLI).
-/// `HARMONY_RECOVERY_PASSPHRASE_FILE` is cleared for the duration so that
-/// `resolve_recovery_passphrase()` does not log a warning about both vars
-/// being set when a user previously configured the CLI file-based path.
-///
-/// Concurrent calls are serialized through [`recovery_env_lock`]; env-var
-/// restoration uses [`EnvVarGuard`] (RAII) so cleanup runs even on panic.
-///
-/// ZEB-187 (security): passing the passphrase through a process-global
-/// `String` env var leaves it transiently readable by any debugger or tool
-/// attached to this process, and `secrecy::SecretString` zeroing does not
-/// apply. The follow-up will thread the passphrase through
-/// `recovery_cli::*_with_keychain` as `Option<&SecretString>` and delete
-/// the env-var dance entirely.
+/// The passphrase is threaded directly into
+/// [`recovery_cli::export_recovery_file_with_keychain`] as a `SecretString`
+/// — never via process-global env vars. `std::env::set_var` is unsafe in a
+/// multithreaded program (per Rust docs: another thread reading
+/// `getenv` concurrently can race), so a Tauri GUI process must not touch
+/// it from a command handler (CodeRabbit round 5). `secrecy::SecretString`
+/// also zeroizes the heap allocation on drop, which a `String` env var
+/// does not.
 pub fn export_recovery_file_to_path_helper(
     plaintext_path: &Path,
     out_path: &Path,
@@ -367,9 +309,11 @@ pub fn export_recovery_file_to_path_helper(
     comment: Option<String>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    // Reject oversized comments BEFORE acquiring the env-var lock or doing any
-    // work — the inner write would otherwise produce a recovery file the same
-    // GUI later refuses to read back (see [`MAX_RECOVERY_FILE_BYTES`]).
+    use secrecy::SecretString;
+
+    // Reject oversized comments before any I/O — the inner write would
+    // otherwise produce a recovery file the same GUI later refuses to read
+    // back (see [`MAX_RECOVERY_FILE_BYTES`]).
     if let Some(c) = comment.as_deref() {
         let len = c.len();
         if len > MAX_RECOVERY_COMMENT_BYTES {
@@ -379,17 +323,12 @@ pub fn export_recovery_file_to_path_helper(
         }
     }
 
-    // Serialize concurrent helper calls; env-var mutation is process-global.
-    let _lock = recovery_env_lock();
-    // Drop order is reverse declaration: `_file` restores first, then
-    // `_pass`, then the mutex guard releases. Each Drop runs even on panic.
-    let _pass = EnvVarGuard::set("HARMONY_RECOVERY_PASSPHRASE", passphrase);
-    let _file = EnvVarGuard::unset("HARMONY_RECOVERY_PASSPHRASE_FILE");
-
+    let pass = SecretString::from(passphrase.to_string());
     recovery_cli::export_recovery_file_with_keychain(
         plaintext_path,
         out_path,
         comment.as_deref(),
+        Some(&pass),
         keychain,
     )
 }
@@ -544,13 +483,39 @@ pub async fn export_recovery_file_to_path(
     .await
 }
 
+/// Error message when a restore IPC is invoked while the node is running.
+/// The frontend matches on this exact text to surface a friendlier prompt
+/// (and may eventually offer a "Stop node and retry" button), so don't
+/// rephrase without updating the JS side.
+const ERR_NODE_RUNNING: &str =
+    "Stop the node before restoring identity (the running node still holds the old keys).";
+
+/// Refuse the call if the node event-loop thread is running. The running
+/// `NodeRuntime` caches the OLD identity's keys and zenoh subscriptions; a
+/// silent identity overwrite would leave the user in an inconsistent state
+/// where outgoing messages are stamped with the new identity hash but
+/// signed by the old keys (CodeRabbit round 5).
+fn require_node_stopped(state: &std::sync::Mutex<crate::NodeState>) -> Result<(), String> {
+    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+    if guard.is_running() {
+        return Err(ERR_NODE_RUNNING.to_string());
+    }
+    Ok(())
+}
+
 /// Restore the on-disk identity from a 24-word mnemonic array.
 ///
 /// Returns the 32-char hex identity hash of the restored identity.
 /// The GUI calls this only after the user has passed the `TypeToConfirmDialog`
 /// gate, so `force=true` is applied unconditionally on this path.
+///
+/// Refuses while the node is running — see [`require_node_stopped`].
 #[tauri::command]
-pub async fn restore_mnemonic_from_words(words: Vec<String>) -> Result<String, String> {
+pub async fn restore_mnemonic_from_words(
+    words: Vec<String>,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<String, String> {
+    require_node_stopped(&state)?;
     let plaintext_path = identity::resolve_path(None)?;
     run_blocking(move || {
         restore_mnemonic_from_words_helper(&plaintext_path, &words, KeychainStore::new().ok())
@@ -566,10 +531,14 @@ pub async fn restore_mnemonic_from_words(words: Vec<String>) -> Result<String, S
 /// unconditionally. The token comes from a prior `preview_recovery_file`
 /// IPC call; see [`restore_recovery_from_preview_token_helper`] for the
 /// TOCTOU rationale.
+///
+/// Refuses while the node is running — see [`require_node_stopped`].
 #[tauri::command]
 pub async fn restore_recovery_from_preview_token(
     preview_token: String,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<RestoreInfo, String> {
+    require_node_stopped(&state)?;
     let plaintext_path = identity::resolve_path(None)?;
     run_blocking(move || {
         restore_recovery_from_preview_token_helper(
@@ -704,11 +673,17 @@ mod tests {
     // ── preview_recovery_file_helper ──────────────────────────────────────
 
     #[test]
+    #[serial]
     fn preview_recovery_file_returns_correct_metadata() {
         use secrecy::SecretString;
 
         let dir = tempfile::tempdir().unwrap();
         let recovery_path = dir.path().join("recovery.bin");
+
+        // Defensive: clear at start in case a prior panic left state behind
+        // (CodeRabbit round 5). #[serial] above prevents concurrent tests
+        // from interfering with the cache during this run.
+        clear_preview_cache();
 
         let seed = [0x55u8; 32];
         let artifact = RecoveryArtifact::from_seed(seed);
@@ -837,95 +812,9 @@ mod tests {
         );
     }
 
-    // ── export_recovery_file_to_path_helper env-var save/restore ─────────
-
-    /// Pins the load-bearing invariant that both HARMONY_RECOVERY_PASSPHRASE
-    /// and HARMONY_RECOVERY_PASSPHRASE_FILE are restored to their prior values
-    /// after each call — including on error paths.  A future refactor that
-    /// moves `?` before the restore block would cause sub-case 3 or 4 to fail.
-    #[test]
-    #[serial]
-    fn export_recovery_file_to_path_restores_prior_env() {
-        let dir = tempfile::tempdir().unwrap();
-        let plaintext_path = dir.path().join("identity.key");
-        let recovery_path = dir.path().join("rec.bin");
-
-        std::env::set_var("HARMONY_PASSPHRASE", "outer-pass");
-        let seed = [0xE0u8; 32];
-        plant_seed(&plaintext_path, &seed);
-
-        // Sub-case 1: prior env value is restored after a successful call.
-        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
-        export_recovery_file_to_path_helper(
-            &plaintext_path,
-            &recovery_path,
-            "inner-call",
-            None,
-            None,
-        )
-        .expect("export");
-        assert_eq!(
-            std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
-            Ok("outer-original"),
-            "prior HARMONY_RECOVERY_PASSPHRASE must be restored"
-        );
-
-        // Sub-case 2: when prior was unset, env is removed (not left at "inner-call").
-        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
-        let _ = std::fs::remove_file(&recovery_path);
-        export_recovery_file_to_path_helper(
-            &plaintext_path,
-            &recovery_path,
-            "inner-call",
-            None,
-            None,
-        )
-        .expect("export");
-        assert!(
-            std::env::var("HARMONY_RECOVERY_PASSPHRASE").is_err(),
-            "HARMONY_RECOVERY_PASSPHRASE must be unset after the call (was unset before)"
-        );
-
-        // Sub-case 3: env is restored even on error (load-bearing invariant).
-        // Point out_path at a non-existent nested directory so the write fails.
-        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
-        let bogus_path = dir.path().join("no-such-dir").join("rec.bin");
-        let _ = export_recovery_file_to_path_helper(
-            &plaintext_path,
-            &bogus_path,
-            "inner-call",
-            None,
-            None,
-        );
-        // call may or may not error depending on internal flow; what matters is the env state:
-        assert_eq!(
-            std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
-            Ok("outer-original"),
-            "prior HARMONY_RECOVERY_PASSPHRASE must be restored even on error"
-        );
-
-        // Sub-case 4: HARMONY_RECOVERY_PASSPHRASE_FILE is also save/restored (Fix 1 behavior).
-        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", "/tmp/some-file");
-        let _ = std::fs::remove_file(&recovery_path);
-        export_recovery_file_to_path_helper(
-            &plaintext_path,
-            &recovery_path,
-            "inner-call",
-            None,
-            None,
-        )
-        .expect("export");
-        assert_eq!(
-            std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").as_deref(),
-            Ok("/tmp/some-file"),
-            "HARMONY_RECOVERY_PASSPHRASE_FILE must be restored to its prior value"
-        );
-
-        // Cleanup
-        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
-        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
-        std::env::remove_var("HARMONY_PASSPHRASE");
-    }
+    // (env-var save/restore test removed in round 5 along with the
+    // EnvVarGuard / recovery_env_lock infrastructure — passphrase is now
+    // threaded directly via SecretString instead of process-global env.)
 
     /// Reject oversized comments before any I/O. Pins the
     /// `MAX_RECOVERY_COMMENT_BYTES` cap (CodeRabbit round 3): an unbounded

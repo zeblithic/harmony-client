@@ -138,15 +138,30 @@ pub fn export_recovery_file_cli(
     out: &Path,
     comment: Option<&str>,
 ) -> Result<(), String> {
-    export_recovery_file_with_keychain(plaintext_path, out, comment, KeychainStore::new().ok())
+    export_recovery_file_with_keychain(
+        plaintext_path,
+        out,
+        comment,
+        /*passphrase=*/ None,
+        KeychainStore::new().ok(),
+    )
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
 /// hermetic. Production callers go through [`export_recovery_file_cli`].
+///
+/// `passphrase`: when `Some`, used directly. When `None`, resolved from
+/// `HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`
+/// environment variables (the CLI path). The GUI passes `Some` — it would
+/// otherwise have to mutate process-global env vars, which is unsafe in a
+/// multithreaded program (CodeRabbit round 5). The env-var fallback is
+/// kept for the headless CLI binary, which runs single-threaded and has
+/// no other way to receive the secret.
 pub fn export_recovery_file_with_keychain(
     plaintext_path: &Path,
     out: &Path,
     comment: Option<&str>,
+    passphrase: Option<&SecretString>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
     // Resolve the recovery passphrase BEFORE reading the seed: on an empty
@@ -155,7 +170,10 @@ pub fn export_recovery_file_with_keychain(
     // read, a missing/invalid HARMONY_RECOVERY_PASSPHRASE would mutate the
     // identity store and then fail — the operator wanted to back up an
     // existing identity, not silently create one.
-    let passphrase = resolve_recovery_passphrase()?;
+    let passphrase: SecretString = match passphrase {
+        Some(p) => p.clone(),
+        None => resolve_recovery_passphrase()?,
+    };
     let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
@@ -344,9 +362,14 @@ mod tests {
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
         assert!(!enc_path.exists(), "test setup: enc file must be absent");
 
-        let err =
-            export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("rt"), None)
-                .expect_err("must fail when recovery passphrase is unset");
+        let err = export_recovery_file_with_keychain(
+            &plaintext_path,
+            &recovery_out,
+            Some("rt"),
+            /*passphrase=*/ None,
+            /*keychain=*/ None,
+        )
+        .expect_err("must fail when recovery passphrase is unset");
         assert!(
             err.contains("HARMONY_RECOVERY_PASSPHRASE"),
             "must fail with recovery-passphrase error; got: {err}"
@@ -389,8 +412,14 @@ mod tests {
         // Use the keychain-injected variant with `None` — keeps the test
         // hermetic and prevents any read/write to the developer's real OS
         // keychain entry.
-        export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("test"), None)
-            .expect("export");
+        export_recovery_file_with_keychain(
+            &plaintext_path,
+            &recovery_out,
+            Some("test"),
+            /*passphrase=*/ None,
+            /*keychain=*/ None,
+        )
+        .expect("export");
         assert!(recovery_out.exists(), "recovery file must be written");
 
         // Decode the file back; it should round-trip to the same seed.

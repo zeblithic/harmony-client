@@ -79,7 +79,8 @@ fn recovery_file_round_trip_preserves_identity_hash() {
         &plaintext_path,
         &recovery_path,
         Some("rt-test"),
-        None,
+        /*passphrase=*/ None,
+        /*keychain=*/ None,
     )
     .expect("export");
 
@@ -186,8 +187,14 @@ fn cross_encoding_equivalence_via_cli() {
     let seed = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
     let mnemonic = RecoveryArtifact::from_seed(*seed).to_mnemonic();
     std::fs::write(&mnemonic_path, mnemonic.as_str()).unwrap();
-    recovery_cli::export_recovery_file_with_keychain(&plaintext_path, &recovery_path, None, None)
-        .expect("export-recovery");
+    recovery_cli::export_recovery_file_with_keychain(
+        &plaintext_path,
+        &recovery_path,
+        /*comment=*/ None,
+        /*passphrase=*/ None,
+        /*keychain=*/ None,
+    )
+    .expect("export-recovery");
 
     // Wipe + restore from mnemonic.
     wipe_identity_store(&plaintext_path);

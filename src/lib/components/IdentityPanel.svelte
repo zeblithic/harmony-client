@@ -52,8 +52,8 @@
     | { phase: 'pickSource' }                                                                                             // step 1
     | { phase: 'mnemonicEntry'; input: string; validationError: string | null }                                          // step 2a
     | { phase: 'fileEntry'; pendingFilePath: string; passphrase: string; showPass: boolean; restoreError: string | null }  // step 2b before decrypt
-    | { phase: 'fileDecrypted'; pendingFilePath: string; passphrase: string; restoreCandidate: RestoreCandidate }        // step 2b after decrypt
-    | { phase: 'confirm'; restoreSource: 'mnemonic' | 'file'; pendingWords: string[]; pendingFilePath?: string; passphrase?: string; restoreCandidate: RestoreCandidate; typedPrefix: string }  // step 3
+    | { phase: 'fileDecrypted'; pendingFilePath: string; restoreCandidate: RestoreCandidate }                              // step 2b after decrypt — no passphrase: token replaces it
+    | { phase: 'confirm'; restoreSource: 'mnemonic' | 'file'; pendingWords: string[]; pendingFilePath?: string; restoreCandidate: RestoreCandidate; typedPrefix: string }  // step 3 — no passphrase: commit goes through previewToken
     | { phase: 'commitError'; error: string }                                                                             // step 3 error
     | { phase: 'done'; postRestoreHash: string };                                                                         // step 4
 
@@ -365,12 +365,15 @@
     }
 
     if (wizardState !== epoch) return;
+    // The passphrase is intentionally NOT carried into fileDecrypted: once
+    // preview returns a token, the commit IPC takes only the token. Keeping
+    // the passphrase in reactive state would prolong secret retention with
+    // no upside (CodeRabbit round 5).
     wizardState = {
       kind: 'restore',
       step: {
         phase: 'fileDecrypted',
         pendingFilePath: step.pendingFilePath,
-        passphrase: step.passphrase,
         restoreCandidate: candidate,
       },
     };
@@ -386,7 +389,6 @@
         restoreSource: 'file',
         pendingWords: [],
         pendingFilePath: step.pendingFilePath,
-        passphrase: step.passphrase,
         restoreCandidate: step.restoreCandidate,
         typedPrefix: '',
       },
