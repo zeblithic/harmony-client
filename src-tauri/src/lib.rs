@@ -14,6 +14,7 @@ pub mod folders;
 mod follows;
 pub mod identity;
 pub mod identity_commands;
+pub mod owner_state;
 pub mod mail;
 pub mod mail_sync;
 pub mod recovery_cli;
