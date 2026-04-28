@@ -39,7 +39,10 @@ pub struct TrustDecisionView {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+// `camelCase` does NOT lowercase single-word PascalCase variants (e.g. "Full" stays "Full").
+// Use `lowercase` to produce the conventional JSON discriminant form ("full" / "provisional" /
+// "refused") that the TypeScript consumer does strict equality against.
+#[serde(rename_all = "lowercase")]
 pub enum TrustKind {
     Full,
     Provisional,
@@ -72,5 +75,8 @@ mod tests {
         assert!(json.contains("\"isThisDevice\""), "expected isThisDevice, got {json}");
         assert!(json.contains("\"trustDecision\""), "expected trustDecision, got {json}");
         assert!(!json.contains("owner_id"), "snake_case must not leak: {json}");
+        // TrustKind must serialize as lowercase — camelCase does NOT lowercase single-word variants.
+        assert!(json.contains("\"full\""), "expected lowercase \"full\" on wire, got {json}");
+        assert!(!json.contains("\"Full\""), "PascalCase \"Full\" must not appear on wire: {json}");
     }
 }
