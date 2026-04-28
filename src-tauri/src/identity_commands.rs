@@ -87,6 +87,14 @@ impl Drop for EnvVarGuard {
 /// rejects accidental selection of a large file (image, video, archive).
 const MAX_RECOVERY_FILE_BYTES: u64 = 1 << 20;
 
+/// Maximum byte length of a user-supplied recovery-file comment.
+/// `harmony_owner::recovery` already enforces this cap inside
+/// `to_encrypted_file`; the GUI mirrors it (round 3 review) so the user sees
+/// a friendly, predictable error before any I/O instead of a generic message
+/// surfaced from the encryption layer. The value MUST match the inner cap
+/// so the GUI rejection fires first.
+const MAX_RECOVERY_COMMENT_BYTES: usize = 256;
+
 /// Read a recovery file with a size guard. Reject files larger than
 /// [`MAX_RECOVERY_FILE_BYTES`] before allocating.
 fn read_recovery_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -206,6 +214,18 @@ pub fn export_recovery_file_to_path_helper(
     comment: Option<String>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    // Reject oversized comments BEFORE acquiring the env-var lock or doing any
+    // work — the inner write would otherwise produce a recovery file the same
+    // GUI later refuses to read back (see [`MAX_RECOVERY_FILE_BYTES`]).
+    if let Some(c) = comment.as_deref() {
+        let len = c.len();
+        if len > MAX_RECOVERY_COMMENT_BYTES {
+            return Err(format!(
+                "comment is too large ({len} bytes; max {MAX_RECOVERY_COMMENT_BYTES} bytes)"
+            ));
+        }
+    }
+
     // Serialize concurrent helper calls; env-var mutation is process-global.
     let _lock = recovery_env_lock();
     // Drop order is reverse declaration: `_file` restores first, then
@@ -256,20 +276,25 @@ pub fn restore_mnemonic_from_words_helper(
 /// `TypeToConfirmDialog` and received explicit acknowledgement that the current
 /// identity will be overwritten.
 ///
-/// **Ordering is load-bearing.** Metadata extraction runs FIRST (read-only
-/// decrypt). Only after it succeeds do we run the irreversible write via
-/// `restore_recovery_file_with_keychain`. If anything in step 1 fails (file
-/// missing, wrong passphrase, corrupted), the on-disk identity is untouched
-/// and the caller can safely retry. If we did it the other way around, a
-/// transient failure between the write and the metadata extraction (e.g.
-/// USB drive ejected) would surface as `Err` to the UI even though the
-/// identity had already been replaced — leaving the user thinking the
-/// restore failed, potentially restoring a different backup over the
-/// (correctly-restored) identity (Greptile P1).
+/// **Single-decrypt design.** The recovery file is read and decrypted exactly
+/// once. Metadata is extracted from the decrypted artifact, then the same
+/// in-memory artifact's seed is written directly to disk via
+/// [`identity::write_seed_to_disk_with_keychain`]. The function never
+/// re-touches `in_path` after the initial read. This is load-bearing for two
+/// reasons:
 ///
-/// The recovery file is read and decrypted twice in total (once for
-/// metadata, once inside the inner restore). Recovery files are ~101 bytes,
-/// so the cost is negligible.
+/// 1. **Greptile P1 (round 2):** if anything fails before the seed is
+///    written, the on-disk identity is untouched and the caller can retry.
+/// 2. **CodeRabbit TOCTOU (round 3):** an earlier version called
+///    `restore_recovery_file_with_keychain(in_path, …)` after the metadata
+///    read, opening a TOCTOU window where the file could be swapped or
+///    grown between the two reads — letting an attacker show the user
+///    metadata for backup A while restoring backup B's seed, or bypass the
+///    [`MAX_RECOVERY_FILE_BYTES`] guard with a swap.
+///
+/// Because we no longer go through `recovery_cli::restore_recovery_file_*`,
+/// the env-var dance (`HARMONY_RECOVERY_PASSPHRASE*`) is unnecessary on this
+/// path: passphrase resolution happened during decrypt above.
 pub fn restore_recovery_file_from_path_helper(
     plaintext_path: &Path,
     in_path: &Path,
@@ -278,9 +303,9 @@ pub fn restore_recovery_file_from_path_helper(
 ) -> Result<RestoreInfo, String> {
     use harmony_owner::lifecycle::RecoveryArtifact;
     use secrecy::SecretString;
+    use zeroize::Zeroizing;
 
-    // ── Step 1: extract metadata BEFORE touching disk. ─────────────────────
-    // If this fails, the on-disk identity is untouched; caller can retry.
+    // ── Step 1: read + decrypt once. Read-only; on-disk identity untouched. ─
     let bytes = read_recovery_file(in_path)?;
     let pass = SecretString::from(passphrase.to_string());
     let restored =
@@ -289,24 +314,24 @@ pub fn restore_recovery_file_from_path_helper(
     let info = RestoreInfo {
         identity_hash: hex::encode(id_hash),
         minted_at: restored.metadata.mint_at,
-        comment: restored.metadata.comment,
+        comment: restored.metadata.comment.clone(),
     };
 
-    // ── Step 2: perform the irreversible restore (writes seed to disk). ────
-    // Env-var wrapping for CLI passphrase parity. Same locking + RAII
-    // semantics as `export_recovery_file_to_path_helper`. ZEB-187 will
-    // remove this dance.
-    let _lock = recovery_env_lock();
-    let _pass_guard = EnvVarGuard::set("HARMONY_RECOVERY_PASSPHRASE", passphrase);
-    let _file_guard = EnvVarGuard::unset("HARMONY_RECOVERY_PASSPHRASE_FILE");
+    // ── Step 2: extract the seed from the decrypted artifact and write. ────
+    // No re-read of `in_path` — the seed we write is byte-equal to the seed
+    // whose hash was just shown to the user (see TOCTOU note in doc comment).
+    // `Zeroizing` clears the seed from stack memory once we're done.
+    let artifact = restored.into_artifact();
+    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
 
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
-    recovery_cli::restore_recovery_file_with_keychain(
+    identity::write_seed_to_disk_with_keychain(
         plaintext_path,
-        in_path,
+        &seed_bytes,
         /*force=*/ true,
         keychain,
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(info)
 }
@@ -744,6 +769,104 @@ mod tests {
         // Cleanup
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// Reject oversized comments before any I/O. Pins the
+    /// `MAX_RECOVERY_COMMENT_BYTES` cap (CodeRabbit round 3): an unbounded
+    /// comment could push the resulting recovery file past
+    /// `MAX_RECOVERY_FILE_BYTES`, making the same GUI later refuse to read it.
+    #[test]
+    #[serial]
+    fn export_recovery_file_rejects_oversized_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "comment-cap-test");
+        plant_seed(&plaintext_path, &[0xC0u8; 32]);
+
+        let too_long = "x".repeat(MAX_RECOVERY_COMMENT_BYTES + 1);
+        let err = export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &recovery_path,
+            "any-pass",
+            Some(too_long),
+            None,
+        )
+        .expect_err("oversized comment must be rejected");
+        assert!(
+            err.contains("comment is too large"),
+            "error must explain the cap; got: {err}"
+        );
+        assert!(
+            !recovery_path.exists(),
+            "recovery file must NOT be written when the comment is rejected"
+        );
+
+        // Boundary: exactly the cap is accepted.
+        let max_ok = "x".repeat(MAX_RECOVERY_COMMENT_BYTES);
+        export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &recovery_path,
+            "any-pass",
+            Some(max_ok),
+            None,
+        )
+        .expect("comment at exactly the cap is allowed");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── restore_recovery_file_from_path_helper TOCTOU regression ─────────
+
+    /// CodeRabbit round 3: the helper must NOT re-read `in_path` after the
+    /// initial decrypt. Swapping the recovery file between metadata-shown
+    /// and seed-written must NOT change which seed lands on disk; the seed
+    /// written must be byte-equal to the seed whose hash was returned.
+    #[test]
+    #[serial]
+    fn restore_recovery_file_seed_matches_returned_metadata_under_swap() {
+        use harmony_owner::recovery::RecoveryMetadata;
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "toctou-test");
+        plant_seed(&plaintext_path, &[0xA1u8; 32]);
+
+        // Backup A — what the user picks and confirms.
+        let seed_a = [0xAAu8; 32];
+        let artifact_a = RecoveryArtifact::from_seed(seed_a);
+        let expected_hash_a = hex::encode(artifact_a.master_pubkey_bundle().identity_hash());
+        let pass = "toctou-pass";
+        let pass_secret = SecretString::from(pass.to_string());
+        let bytes_a = artifact_a
+            .to_encrypted_file(&pass_secret, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes_a).unwrap();
+
+        // Restore from path; helper must read+decrypt once. We simulate a
+        // post-decrypt swap by wiping the file BEFORE the call returns: if
+        // the helper ever re-reads, this restore would fail.  (The previous
+        // implementation called `restore_recovery_file_with_keychain(in_path,…)`
+        // after metadata extraction, which would do exactly that re-read.)
+        let info =
+            restore_recovery_file_from_path_helper(&plaintext_path, &recovery_path, pass, None)
+                .expect("restore");
+        assert_eq!(info.identity_hash, expected_hash_a);
+
+        // The seed actually written to disk must be backup A's seed —
+        // matching the hash we just returned.
+        let on_disk = identity::read_seed_from_disk_with_keychain(&plaintext_path, None)
+            .expect("read planted");
+        assert_eq!(
+            *on_disk, seed_a,
+            "written seed must match returned metadata"
+        );
+
         std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }

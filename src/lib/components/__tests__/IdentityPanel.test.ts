@@ -1752,6 +1752,35 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
     expect(screen.queryByText(/passphrase incorrect or file corrupted/i)).not.toBeInTheDocument();
   });
 
+  it('picking a new file clears the prior decrypt error', async () => {
+    // Round 3 (Cursor + CodeRabbit): when a decrypt failed and the user
+    // picks a different recovery file, the stale "passphrase incorrect or
+    // file corrupted" message must not linger next to the new path. The
+    // user could otherwise mistake the new file for being also-broken.
+    const file1 = '/tmp/first.recovery';
+    const file2 = '/tmp/second.recovery';
+    mockOpen.mockResolvedValueOnce(file1).mockResolvedValueOnce(file2);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
+      if (cmd === 'preview_recovery_file') throw new Error('mac mismatch');
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileEntry();
+
+    // Pick file 1, fail decrypt → error visible.
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/first\.recovery/i);
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'wrong' } });
+    await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+    await screen.findByText(/passphrase incorrect or file corrupted/i);
+
+    // Pick file 2 — old error must clear, new path must show.
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/second\.recovery/i);
+    expect(screen.queryByText(/passphrase incorrect or file corrupted/i)).not.toBeInTheDocument();
+  });
+
   it('successful decrypt transitions to fileDecrypted step', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);

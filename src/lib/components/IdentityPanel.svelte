@@ -306,10 +306,13 @@
     // open() with multiple: false returns string | null (not string[]).
     const filePath = Array.isArray(pickedPath) ? pickedPath[0] : pickedPath;
 
-    // Reflect the picked path into wizardState.
+    // Reflect the picked path into wizardState. Clear any prior decrypt/IO
+    // error: it referred to the OLD file and would otherwise persist next to
+    // the new file path (Cursor + CodeRabbit round 3) until the user touched
+    // the passphrase field.
     wizardState = {
       kind: 'restore',
-      step: { ...wizardState.step, pendingFilePath: filePath },
+      step: { ...wizardState.step, pendingFilePath: filePath, restoreError: null },
     };
   }
 
@@ -883,8 +886,7 @@
   .hash-display:hover { background: var(--border); }
   .actions { display: flex; gap: 8px; margin: 16px 0; }
   .explainer { color: var(--text-secondary); font-size: 0.85em; margin-top: 14px; }
-  /* TODO: add --danger token to app.css for semantic error coloring */
-  .error { color: var(--text-secondary); }
+  .error { color: var(--danger); }
   .visually-hidden {
     position: absolute; width: 1px; height: 1px; padding: 0;
     margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0);
@@ -940,7 +942,7 @@
   .hash-diff-current { opacity: 0.65; }
   .hash-diff-new { color: var(--accent); }
   .hash-diff-arrow { color: var(--text-muted); }
-  .inline-error { color: var(--text-secondary); font-size: 0.85em; margin: 4px 0; }
+  .inline-error { color: var(--danger); font-size: 0.85em; margin: 4px 0; }
   .field-label {
     display: flex; flex-direction: column; gap: 4px;
     margin: 8px 0; color: var(--text-primary); font-size: 0.9em;
