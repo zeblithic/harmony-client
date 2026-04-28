@@ -792,6 +792,28 @@ describe('Restore wizard — step 1 (pickSource)', () => {
     expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
   });
 
+  it('Cancel from pickSource clears prior selection on re-open', async () => {
+    // Regression: resetToIdle() must clear selectedRestoreSource, otherwise
+    // the radio stays checked and Continue is enabled when the user re-opens
+    // the wizard without explicitly picking a source.
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+
+    // First entry: pick file, then cancel.
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+    await fireEvent.click(screen.getByLabelText(/recovery file/i));
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    await screen.findByText(/0xaaaaaaaa/);
+
+    // Re-open: no radio should be checked, Continue should be disabled.
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+    const fileRadio = screen.getByLabelText(/recovery file/i) as HTMLInputElement;
+    const mnemonicRadio = screen.getByLabelText(/24-word recovery phrase/i) as HTMLInputElement;
+    expect(fileRadio.checked).toBe(false);
+    expect(mnemonicRadio.checked).toBe(false);
+    expect(screen.getByRole('button', { name: /continue/i })).toBeDisabled();
+  });
+
   it('selecting mnemonic and clicking Continue transitions to mnemonicEntry placeholder', async () => {
     render(IdentityPanel);
     await screen.findByText(/0xaaaaaaaa/);

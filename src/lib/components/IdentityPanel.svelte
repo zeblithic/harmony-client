@@ -100,6 +100,7 @@
   function resetToIdle() {
     wizardState = { kind: 'idle' };
     selectedBackupType = null;
+    selectedRestoreSource = null;
   }
 
   async function advanceFromPickType() {
