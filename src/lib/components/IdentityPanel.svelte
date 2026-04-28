@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { save } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
 
   function assertNever(x: never): never {
@@ -132,6 +133,50 @@
       };
     }
   }
+
+  async function advanceFromFileEntry() {
+    if (wizardState.kind !== 'backup' || wizardState.step.phase !== 'fileEntry') return;
+    const { passphrase, passphraseConfirm, comment } = wizardState.step;
+    if (!passphrase || passphrase !== passphraseConfirm) return;
+
+    // Capture epoch before first await (save dialog).
+    const epoch = wizardState;
+
+    let outPath: string | null;
+    try {
+      outPath = await save({
+        title: 'Save recovery file',
+        defaultPath: 'identity.recovery',
+        filters: [{ name: 'Recovery file', extensions: ['recovery'] }],
+      });
+    } catch {
+      // Treat a dialog error the same as cancel — silent return to fileEntry.
+      return;
+    }
+
+    // Guard: did the user cancel the wizard while the dialog was open?
+    if (wizardState !== epoch) return;
+
+    // User cancelled the dialog — silent return per spec.
+    if (!outPath) return;
+
+    // Capture epoch again before the second await (file write).
+    const epoch2 = wizardState;
+
+    try {
+      await invoke('export_recovery_file_to_path', {
+        outPath,
+        passphrase,
+        comment: comment || null,
+      });
+
+      if (wizardState !== epoch2) return;
+      wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath: outPath } };
+    } catch (e) {
+      if (wizardState !== epoch2) return;
+      wizardState = { kind: 'backup', step: { phase: 'fileSaveError', error: `Could not save to ${outPath}: ${e}. Try a different location.` } };
+    }
+  }
 </script>
 
 {#if loadError}
@@ -234,11 +279,95 @@
         </div>
       {/if}
     </section>
-  {:else}
-    <!-- fileEntry / fileSaved / fileSaveError — Task 6 placeholder -->
+  {:else if wizardState.step.phase === 'fileEntry'}
     <section class="identity-panel" aria-label="Identity">
-      <button onclick={resetToIdle}>← Back</button>
-      <p>Backup wizard placeholder.</p>
+      <p class="hash-anchor">Backing up identity {displayHash}</p>
+      <h3 class="section-title">Recovery file passphrase</h3>
+      <p class="explainer">
+        This passphrase encrypts your recovery file. You'll need it to
+        restore later. Don't reuse your account password — pick something
+        you can remember or store in a password manager.
+      </p>
+      <label class="field-label">
+        Passphrase
+        <div class="passphrase-row">
+          <input
+            type={wizardState.step.showPass ? 'text' : 'password'}
+            aria-label="Passphrase"
+            value={wizardState.step.passphrase}
+            oninput={(e) => {
+              if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileEntry') {
+                wizardState = { kind: 'backup', step: { ...wizardState.step, passphrase: (e.target as HTMLInputElement).value } };
+              }
+            }}
+            autocomplete="new-password"
+          />
+          <button
+            type="button"
+            aria-label={wizardState.step.showPass ? 'Hide passphrase' : 'Show passphrase'}
+            onclick={() => {
+              if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileEntry') {
+                wizardState = { kind: 'backup', step: { ...wizardState.step, showPass: !wizardState.step.showPass } };
+              }
+            }}
+          >{wizardState.step.showPass ? '🙈' : '👁'}</button>
+        </div>
+      </label>
+      <label class="field-label">
+        Confirm passphrase
+        <input
+          type={wizardState.step.showPass ? 'text' : 'password'}
+          aria-label="Confirm passphrase"
+          value={wizardState.step.passphraseConfirm}
+          oninput={(e) => {
+            if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileEntry') {
+              wizardState = { kind: 'backup', step: { ...wizardState.step, passphraseConfirm: (e.target as HTMLInputElement).value } };
+            }
+          }}
+          autocomplete="new-password"
+        />
+      </label>
+      <label class="field-label">
+        Comment (optional)
+        <input
+          type="text"
+          aria-label="Comment (optional)"
+          value={wizardState.step.comment}
+          oninput={(e) => {
+            if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileEntry') {
+              wizardState = { kind: 'backup', step: { ...wizardState.step, comment: (e.target as HTMLInputElement).value } };
+            }
+          }}
+          placeholder="laptop-2026-04-15"
+        />
+      </label>
+      <div class="actions">
+        <button onclick={resetToIdle}>Cancel</button>
+        <button
+          disabled={!wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
+          onclick={advanceFromFileEntry}
+        >Continue</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'fileSaved'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Recovery file saved</h3>
+      <p class="hash-anchor">Backing up identity {displayHash}</p>
+      <p>✓ Wrote recovery file to <code>{wizardState.step.savedPath}</code></p>
+      <div class="actions">
+        <button onclick={resetToIdle}>Done</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'fileSaveError'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Recovery file save failed</h3>
+      <p class="error">{wizardState.step.error}</p>
+      <div class="actions">
+        <button onclick={() => {
+          wizardState = { kind: 'backup', step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false } };
+        }}>Back</button>
+        <button onclick={resetToIdle}>Cancel</button>
+      </div>
     </section>
   {/if}
 {:else}
@@ -304,4 +433,21 @@
     margin: 12px 0; cursor: pointer; color: var(--text-primary);
   }
   .hash-anchor { color: var(--text-secondary); font-size: 0.85em; margin: 4px 0 8px; }
+  .field-label {
+    display: flex; flex-direction: column; gap: 4px;
+    margin: 8px 0; color: var(--text-primary); font-size: 0.9em;
+  }
+  .field-label input {
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: inherit;
+    font-size: inherit;
+  }
+  .passphrase-row {
+    display: flex; gap: 6px; align-items: center;
+  }
+  .passphrase-row input { flex: 1; }
 </style>
