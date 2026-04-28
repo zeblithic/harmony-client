@@ -197,12 +197,18 @@ pub async fn export_owner_recovery_file_to_path(
     comment: Option<String>,
 ) -> Result<ExportInfo, String> {
     // Validate passphrase length BEFORE consuming the token.
-    if passphrase.len() < MIN_RECOVERY_PASSPHRASE_LEN {
+    // Use Unicode codepoint count (not byte count) so the "characters"
+    // error wording matches the check, and so multibyte passphrases
+    // (emoji, CJK) round-trip identically with the JS frontend's
+    // [...str].length check.
+    if passphrase.chars().count() < MIN_RECOVERY_PASSPHRASE_LEN {
         return Err(format!(
             "Recovery passphrase must be at least {MIN_RECOVERY_PASSPHRASE_LEN} characters."
         ));
     }
     // Validate comment length BEFORE consuming the token.
+    // 256-BYTE cap matches harmony-owner's hard limit on the underlying
+    // field. Frontend mirrors with a TextEncoder byte count before submit.
     let comment_validated = match comment {
         Some(c) if c.as_bytes().len() > 256 => {
             return Err("Recovery comment must be at most 256 bytes.".to_string());

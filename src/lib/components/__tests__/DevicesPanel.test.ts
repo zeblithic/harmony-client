@@ -290,6 +290,68 @@ describe('DevicesPanel — rename overlay survives refresh', () => {
   });
 });
 
+describe('DevicesPanel — byte-cap on backup comment', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('rejects backup comment that exceeds 256 bytes (multibyte aware)', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x', ownerDisplayName: 'me',
+      devices: [{ deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x' }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    const commentInput = screen.getByLabelText('Comment');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    // 90 emoji × 4 bytes/emoji = 360 bytes, well over the 256-byte cap, even
+    // though [...str].length only counts 90 codepoints. The byte-aware check
+    // must reject.
+    const longEmojiComment = '🌟'.repeat(90);
+    await fireEvent.input(commentInput, { target: { value: longEmojiComment } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+    expect(screen.getByText(/at most 256 bytes/i)).toBeInTheDocument();
+    // export must NOT have been called — validation precedes the invoke.
+    expect(invoke).not.toHaveBeenCalledWith(
+      'export_owner_recovery_file_to_path',
+      expect.anything(),
+    );
+  });
+});
+
+describe('DevicesPanel — Save backup disabled when token unavailable', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('disables Save backup if issue_owner_recovery_token fails on openBackup', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x', ownerDisplayName: 'me',
+      devices: [{ deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x' }],
+      canBackUp: true,
+    });
+    // issue_owner_recovery_token rejects
+    mockedInvoke.mockRejectedValueOnce(new Error('keychain locked'));
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    // Wait for the error to render (proves issue_owner_recovery_token resolved-with-rejection)
+    await screen.findByText(/keychain locked/i);
+    // The "Save backup" button must be disabled because recoveryToken is null.
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    expect(saveBtn).toBeDisabled();
+  });
+});
+
 describe('DevicesPanel — stale token cleared after export failure', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 

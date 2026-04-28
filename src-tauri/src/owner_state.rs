@@ -242,6 +242,8 @@ pub fn load_owner_state(
             },
         )?;
 
+    // SigningKey::from_bytes copies; the Zeroizing wrapper around
+    // signing_key_bytes ensures the source heap buffer wipes on drop.
     let device_signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
     let master_seed = load_secret(
@@ -249,8 +251,7 @@ pub fn load_owner_state(
         KEYCHAIN_MASTER_SEED,
         identity_dir,
         "master_seed.enc",
-    )?
-    .map(|s| Zeroizing::new(s));
+    )?;
 
     Ok(Some(LoadedOwnerState {
         state,
@@ -298,16 +299,24 @@ pub fn save_owner_state_atomic(
 /// Load a 32-byte secret from keychain primary, encrypted-file fallback.
 /// Returns `Ok(None)` when neither source has the secret.
 ///
+/// Returns `Zeroizing<[u8; 32]>` so the secret zeros on drop through the
+/// entire call chain — matches the discipline applied elsewhere in this
+/// module and in `crate::identity`.
+///
 /// Keychain errors other than `NoEntry` (locked keychain, permission denied,
 /// flaky backend) fall through to the encrypted-file fallback rather than
 /// hard-failing — matches the pattern in `crate::identity` which made
 /// keychain integration robust on partially-broken systems.
+///
+/// TODO(ZEB-189): the `keychain` parameter is currently used as a boolean
+/// sentinel; the injected `KeychainStore` value is bypassed in favor of a
+/// raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
 fn load_secret(
     keychain: &Option<KeychainStore>,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
-) -> Result<Option<[u8; 32]>, String> {
+) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     if keychain.is_some() {
         let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
@@ -322,7 +331,7 @@ fn load_secret(
                         bytes.len()
                     ));
                 }
-                let mut arr = [0u8; 32];
+                let mut arr = Zeroizing::new([0u8; 32]);
                 arr.copy_from_slice(&bytes);
                 return Ok(Some(arr));
             }
@@ -349,12 +358,14 @@ fn load_secret(
         }
     };
     match store.load() {
-        Ok(Some(seed_bytes)) => Ok(Some(*seed_bytes)),
-        Ok(None) => Ok(None), // file simply absent — natural un-minted state
+        Ok(seed_bytes) => Ok(seed_bytes), // already Option<Zeroizing<[u8; 32]>>
         Err(e) => Err(format!("read {fallback_filename}: {e}")),
     }
 }
 
+// TODO(ZEB-189): the `keychain` parameter is currently used as a boolean
+// sentinel; the injected `KeychainStore` value is bypassed in favor of a
+// raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
 fn save_secret(
     keychain: &Option<KeychainStore>,
     keychain_name: &str,

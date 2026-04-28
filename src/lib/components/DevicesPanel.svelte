@@ -20,6 +20,14 @@
    * and restart. Cross-device names will eventually come via gossip
    * (deferred); v1 only overlays the local entry.
    *
+   * v1 coupling: ownerDisplayName and the local device's displayName both
+   * come from `profile.displayName`. These ARE conceptually distinct (the
+   * owner identity name vs. a per-device label), but profile-service ships
+   * a single displayName field and there's no v1 UI to distinguish them.
+   * When multi-device support lands and per-device names propagate via
+   * gossip, this overlay should be split: ownerDisplayName from the local
+   * profile, device displayNames from the per-device gossip layer.
+   *
    * Defensive: if loadProfile returns no usable name (e.g., localStorage
    * unavailable in private-mode browsers), pass the view through unchanged
    * so the user still sees the backend placeholder rather than a crash.
@@ -112,8 +120,20 @@
       backupError = 'Passphrases do not match.';
       return;
     }
-    if (backupPassphrase.length < 12) {
+    // Count Unicode codepoints, not UTF-16 code units, so the check matches
+    // the Rust backend's `passphrase.chars().count()` for multibyte input
+    // (emoji, CJK). Spreading a string yields one element per codepoint.
+    if ([...backupPassphrase].length < 12) {
       backupError = 'Passphrase must be at least 12 characters.';
+      return;
+    }
+    // Comment cap is BYTES (matches harmony-owner's hard 256-byte limit on
+    // the underlying field). The maxlength={256} attribute on the input is
+    // a UI hint counting characters, which over-permits for multibyte input;
+    // enforce the byte cap explicitly here so the backend never rejects.
+    const commentBytes = new TextEncoder().encode(backupComment).length;
+    if (commentBytes > 256) {
+      backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
       return;
     }
     let out: string | null;
@@ -306,14 +326,23 @@
           </label>
           <label>
             Comment (optional)
-            <input type="text" bind:value={backupComment} maxlength={256} aria-label="Comment" />
+            <!--
+              No `maxlength` attribute — that counts UTF-16 code units, but
+              the harmony-owner backend cap is 256 bytes. commitBackup
+              validates byte length explicitly via TextEncoder before submit.
+            --><input type="text" bind:value={backupComment} aria-label="Comment" />
           </label>
           {#if backupError}
             <p class="error" role="alert">{backupError}</p>
           {/if}
           <div class="modal-actions">
             <button class="secondary" onclick={closeBackup} disabled={backupInFlight}>Cancel</button>
-            <button class="primary" onclick={commitBackup} disabled={backupInFlight}>
+            <!--
+              Disable Save backup when no token is available (e.g., issue_owner_recovery_token
+              failed during openBackup). Otherwise the user clicks Save and gets a confusing
+              "No recovery token available" inline error instead of the disabled-state hint.
+            -->
+            <button class="primary" onclick={commitBackup} disabled={backupInFlight || recoveryToken === null}>
               {backupInFlight ? 'Encrypting…' : 'Save backup'}
             </button>
           </div>
