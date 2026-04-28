@@ -70,9 +70,7 @@ fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -
             let (kind, reason) = match decision {
                 trust::TrustDecision::Full => (TrustKind::Full, None),
                 trust::TrustDecision::Provisional => (TrustKind::Provisional, None),
-                trust::TrustDecision::Refused(r) => {
-                    (TrustKind::Refused, Some(format!("{r:?}")))
-                }
+                trust::TrustDecision::Refused(r) => (TrustKind::Refused, Some(format!("{r:?}"))),
             };
             DeviceView {
                 device_id: hex::encode(cert.device_id),
@@ -125,9 +123,7 @@ fn resolve_identity_dir() -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub async fn get_owner_state(
-    _app: tauri::AppHandle,
-) -> Result<Option<OwnerStateView>, String> {
+pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerStateView>, String> {
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
@@ -153,8 +149,11 @@ pub async fn mint_owner_identity(
                     .to_string(),
             );
         }
-        let MintResult { state, recovery_artifact, device_signing_key } =
-            mint_owner(now_unix()).map_err(|e| format!("mint_owner: {e}"))?;
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(now_unix()).map_err(|e| format!("mint_owner: {e}"))?;
         let master_seed: Zeroizing<[u8; 32]> = Zeroizing::new(*recovery_artifact.as_bytes());
         save_owner_state_atomic(
             &identity_dir,
@@ -240,11 +239,16 @@ pub async fn issue_owner_recovery_token(
     run_blocking(move || {
         let loaded = load_owner_state(&identity_dir, KeychainStore::new().ok())?
             .ok_or_else(|| "Owner identity has not been minted on this device.".to_string())?;
-        let seed = loaded.master_seed
-            .ok_or_else(|| "Master seed has been wiped from this device — backup is no longer possible.".to_string())?;
+        let seed = loaded.master_seed.ok_or_else(|| {
+            "Master seed has been wiped from this device — backup is no longer possible."
+                .to_string()
+        })?;
         let token = insert_token(seed);
-        Ok(IssueTokenResult { recovery_token: token.to_string() })
-    }).await
+        Ok(IssueTokenResult {
+            recovery_token: token.to_string(),
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -103,7 +103,13 @@ pub fn insert_token(seed: Zeroizing<[u8; 32]>) -> Uuid {
             cache.remove(&k);
         }
     }
-    cache.insert(token, TokenEntry { seed, inserted_at: Instant::now() });
+    cache.insert(
+        token,
+        TokenEntry {
+            seed,
+            inserted_at: Instant::now(),
+        },
+    );
     token
 }
 
@@ -138,7 +144,10 @@ mod token_cache_tests {
         let token = insert_token(Zeroizing::new(seed));
         let taken = take_token(&token).expect("first take must succeed");
         assert_eq!(*taken, seed);
-        assert!(take_token(&token).is_none(), "second take must return None (single-use)");
+        assert!(
+            take_token(&token).is_none(),
+            "second take must return None (single-use)"
+        );
     }
 
     #[test]
@@ -162,7 +171,10 @@ mod token_cache_tests {
         let second_taken = take_token(&tokens[1]);
         let last_taken = take_token(&tokens[MAX_LIVE_TOKENS + 1]);
         assert!(first_taken.is_none(), "oldest must have been evicted");
-        assert!(second_taken.is_none(), "second-oldest must have been evicted");
+        assert!(
+            second_taken.is_none(),
+            "second-oldest must have been evicted"
+        );
         assert!(last_taken.is_some(), "newest must remain");
     }
 }
@@ -175,7 +187,7 @@ mod token_cache_tests {
 // The `.cbor` file's presence is the minted-marker — its absence means the
 // natural un-minted state.
 
-use crate::identity::{write_atomic_0600, EncryptedFileStore, KeychainStore, KeyStore};
+use crate::identity::{write_atomic_0600, EncryptedFileStore, KeyStore, KeychainStore};
 use ed25519_dalek::SigningKey;
 use harmony_owner::cbor;
 use harmony_owner::state::OwnerState;
@@ -217,28 +229,34 @@ pub fn load_owner_state(
     }
     let cbor_bytes = std::fs::read(&cbor_path)
         .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
-    let state: OwnerState = cbor::from_bytes(&cbor_bytes)
-        .map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    let state: OwnerState =
+        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
 
     // Inconsistent-state checks: state present implies signing key MUST be
     // findable; master seed MAY be absent (degraded but functional).
-    let signing_key_bytes = load_secret(
-        &keychain,
-        KEYCHAIN_DEVICE_SK,
-        identity_dir,
-        "device_sk.enc",
-    )?
-    .ok_or_else(|| {
-        "owner_state.cbor present but device_signing_key missing — inconsistent state".to_string()
-    })?;
+    let signing_key_bytes =
+        load_secret(&keychain, KEYCHAIN_DEVICE_SK, identity_dir, "device_sk.enc")?.ok_or_else(
+            || {
+                "owner_state.cbor present but device_signing_key missing — inconsistent state"
+                    .to_string()
+            },
+        )?;
 
     let device_signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
-    let master_seed =
-        load_secret(&keychain, KEYCHAIN_MASTER_SEED, identity_dir, "master_seed.enc")?
-            .map(|s| Zeroizing::new(s));
+    let master_seed = load_secret(
+        &keychain,
+        KEYCHAIN_MASTER_SEED,
+        identity_dir,
+        "master_seed.enc",
+    )?
+    .map(|s| Zeroizing::new(s));
 
-    Ok(Some(LoadedOwnerState { state, device_signing_key, master_seed }))
+    Ok(Some(LoadedOwnerState {
+        state,
+        device_signing_key,
+        master_seed,
+    }))
 }
 
 /// Atomically persist a freshly-minted owner identity.
@@ -269,8 +287,8 @@ pub fn save_owner_state_atomic(
         "master_seed.enc",
         master_seed,
     )?;
-    let cbor_bytes = cbor::to_canonical(state)
-        .map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+    let cbor_bytes =
+        cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
     write_atomic_0600(&cbor_path, &cbor_bytes)
         .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
@@ -317,7 +335,7 @@ fn load_secret(
     };
     match store.load() {
         Ok(Some(seed_bytes)) => Ok(Some(*seed_bytes)),
-        Ok(None) => Ok(None),  // file simply absent — natural un-minted state
+        Ok(None) => Ok(None), // file simply absent — natural un-minted state
         Err(e) => Err(format!("read {fallback_filename}: {e}")),
     }
 }
@@ -339,9 +357,7 @@ fn save_secret(
     let path = identity_dir.join(fallback_filename);
     let store = EncryptedFileStore::from_env(path.clone())
         .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?
-        .ok_or_else(|| {
-            format!("HARMONY_PASSPHRASE not set; cannot encrypt {fallback_filename}")
-        })?;
+        .ok_or_else(|| format!("HARMONY_PASSPHRASE not set; cannot encrypt {fallback_filename}"))?;
     store
         .save(bytes)
         .map_err(|e| format!("write {fallback_filename}: {e}"))?;
@@ -380,8 +396,11 @@ mod persistence_tests {
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-1");
         let dir = tempdir().unwrap();
 
-        let MintResult { state, recovery_artifact, device_signing_key } =
-            mint_owner(1_700_000_000).unwrap();
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_000).unwrap();
         let master_seed = *recovery_artifact.as_bytes();
 
         save_owner_state_atomic(dir.path(), &state, &device_signing_key, &master_seed, None)
@@ -392,7 +411,10 @@ mod persistence_tests {
             .expect("must be Some after save");
         assert_eq!(loaded.state.owner_id, state.owner_id);
         assert_eq!(loaded.state.enrollments.len(), 1);
-        assert_eq!(loaded.device_signing_key.to_bytes(), device_signing_key.to_bytes());
+        assert_eq!(
+            loaded.device_signing_key.to_bytes(),
+            device_signing_key.to_bytes()
+        );
         assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
     }
 
@@ -422,8 +444,11 @@ mod persistence_tests {
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-2");
         let dir = tempdir().unwrap();
 
-        let MintResult { state, recovery_artifact, device_signing_key } =
-            mint_owner(1_700_000_001).unwrap();
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_001).unwrap();
         save_owner_state_atomic(
             dir.path(),
             &state,
@@ -450,8 +475,11 @@ mod persistence_tests {
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp-3");
         let dir = tempdir().unwrap();
 
-        let MintResult { state, recovery_artifact, device_signing_key } =
-            mint_owner(1_700_000_002).unwrap();
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_002).unwrap();
         save_owner_state_atomic(
             dir.path(),
             &state,
@@ -484,11 +512,19 @@ mod persistence_tests {
         let dir = tempdir().unwrap();
 
         // Successful save first (writes both keychain entries + .cbor).
-        let MintResult { state, recovery_artifact, device_signing_key } =
-            mint_owner(1_700_000_999).unwrap();
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_999).unwrap();
         save_owner_state_atomic(
-            dir.path(), &state, &device_signing_key, recovery_artifact.as_bytes(), None,
-        ).unwrap();
+            dir.path(),
+            &state,
+            &device_signing_key,
+            recovery_artifact.as_bytes(),
+            None,
+        )
+        .unwrap();
 
         // Now simulate the partial-failure end state: delete the .cbor minted-marker
         // but leave the device_sk.enc and master_seed.enc files in place. This
@@ -519,7 +555,10 @@ mod tests {
                 device_id: "device-hex".into(),
                 display_name: "KRILE".into(),
                 is_this_device: true,
-                trust_decision: TrustDecisionView { kind: TrustKind::Full, reason: None },
+                trust_decision: TrustDecisionView {
+                    kind: TrustKind::Full,
+                    reason: None,
+                },
                 enrolled_at: 1_700_000_000,
                 fingerprint: "3e2f·7a91".into(),
             }],
@@ -528,12 +567,30 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         // The wire format MUST be camelCase — JS depends on this.
         assert!(json.contains("\"ownerId\""), "expected ownerId, got {json}");
-        assert!(json.contains("\"canBackUp\""), "expected canBackUp, got {json}");
-        assert!(json.contains("\"isThisDevice\""), "expected isThisDevice, got {json}");
-        assert!(json.contains("\"trustDecision\""), "expected trustDecision, got {json}");
-        assert!(!json.contains("owner_id"), "snake_case must not leak: {json}");
+        assert!(
+            json.contains("\"canBackUp\""),
+            "expected canBackUp, got {json}"
+        );
+        assert!(
+            json.contains("\"isThisDevice\""),
+            "expected isThisDevice, got {json}"
+        );
+        assert!(
+            json.contains("\"trustDecision\""),
+            "expected trustDecision, got {json}"
+        );
+        assert!(
+            !json.contains("owner_id"),
+            "snake_case must not leak: {json}"
+        );
         // TrustKind must serialize as lowercase — camelCase does NOT lowercase single-word variants.
-        assert!(json.contains("\"full\""), "expected lowercase \"full\" on wire, got {json}");
-        assert!(!json.contains("\"Full\""), "PascalCase \"Full\" must not appear on wire: {json}");
+        assert!(
+            json.contains("\"full\""),
+            "expected lowercase \"full\" on wire, got {json}"
+        );
+        assert!(
+            !json.contains("\"Full\""),
+            "PascalCase \"Full\" must not appear on wire: {json}"
+        );
     }
 }

@@ -40,8 +40,11 @@ fn mint_save_export_decrypt_roundtrip() {
     let dir = tempdir().unwrap();
 
     // 1. Mint
-    let MintResult { state, recovery_artifact, device_signing_key } =
-        mint_owner(1_700_000_000).expect("mint");
+    let MintResult {
+        state,
+        recovery_artifact,
+        device_signing_key,
+    } = mint_owner(1_700_000_000).expect("mint");
     let master_seed = *recovery_artifact.as_bytes();
 
     // 2. Persist
@@ -49,7 +52,9 @@ fn mint_save_export_decrypt_roundtrip() {
         .expect("save");
 
     // 3. Reload — confirm load round-trip
-    let loaded = load_owner_state(dir.path(), None).expect("load").expect("Some");
+    let loaded = load_owner_state(dir.path(), None)
+        .expect("load")
+        .expect("Some");
     assert_eq!(loaded.state.owner_id, state.owner_id);
 
     // 4. Export via token cache
@@ -59,7 +64,10 @@ fn mint_save_export_decrypt_roundtrip() {
 
     let secret = SecretString::from("integration-test-recovery-pp".to_string());
     let artifact_for_export = RecoveryArtifact::from_seed(*recovered);
-    let metadata = RecoveryMetadata { mint_at: None, comment: Some("integration".into()) };
+    let metadata = RecoveryMetadata {
+        mint_at: None,
+        comment: Some("integration".into()),
+    };
     let encrypted = artifact_for_export
         .to_encrypted_file(&secret, &metadata)
         .expect("encrypt");
