@@ -344,8 +344,13 @@ use harmony_owner::lifecycle::{mint_owner, MintResult};
 use harmony_owner::state::OwnerState;
 use std::path::Path;
 
-const KEYCHAIN_DEVICE_SK: &str = "harmony.owner.device_signing_key";
-const KEYCHAIN_MASTER_SEED: &str = "harmony.owner.master_seed";
+// Keychain entries follow PR-61's two-part keyring::Entry shape
+// (service + account), not a flat single string. PR-61 uses
+// keyring::Entry::new("harmony", "identity") for the per-device seed.
+// We use service "harmony.owner" with two account names below.
+const KEYCHAIN_OWNER_SERVICE: &str = "harmony.owner";
+const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
+const KEYCHAIN_MASTER_SEED: &str = "master_seed";
 const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
 
 /// Load the persisted OwnerState if present. Returns `Ok(None)` for the
