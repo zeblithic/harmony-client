@@ -35,6 +35,9 @@
 
   let wizardState = $state<WizardState>({ kind: 'idle' });
 
+  // Transient UI state for pickType step (not yet committed to wizardState)
+  let selectedBackupType = $state<'mnemonic' | 'file' | null>(null);
+
   onMount(async () => {
     try {
       fullHash = await invoke<string>('current_identity_hash');
@@ -49,6 +52,39 @@
       await navigator.clipboard.writeText(fullHash);
     } catch {
       // Some browsers reject when document is unfocused. User can retry.
+    }
+  }
+
+  function resetToIdle() {
+    wizardState = { kind: 'idle' };
+    selectedBackupType = null;
+  }
+
+  async function advanceFromPickType() {
+    if (!selectedBackupType) return;
+    if (selectedBackupType === 'mnemonic') {
+      // Fetch words then transition
+      let words: string[];
+      let fetchError: string | null = null;
+      try {
+        words = await invoke<string[]>('export_mnemonic_words');
+      } catch (e) {
+        fetchError = `Could not load recovery phrase: ${e}`;
+        wizardState = {
+          kind: 'backup',
+          step: { phase: 'mnemonicReveal', words: [], revealed: false, storedSafely: false, loadError: fetchError },
+        };
+        return;
+      }
+      wizardState = {
+        kind: 'backup',
+        step: { phase: 'mnemonicReveal', words, revealed: false, storedSafely: false, loadError: null },
+      };
+    } else {
+      wizardState = {
+        kind: 'backup',
+        step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false },
+      };
     }
   }
 </script>
@@ -81,11 +117,85 @@
     </p>
   </section>
 {:else if wizardState.kind === 'backup'}
-  <!-- TODO Task 5/6: backup wizard flows -->
-  <section class="identity-panel" aria-label="Identity">
-    <button onclick={() => (wizardState = { kind: 'idle' })}>← Back</button>
-    <p>Backup wizard placeholder.</p>
-  </section>
+  {#if wizardState.step.phase === 'pickType'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Choose backup type</h3>
+      <fieldset class="backup-type-picker">
+        <legend class="visually-hidden">Backup type</legend>
+        <label>
+          <input type="radio" bind:group={selectedBackupType} value="mnemonic" />
+          24-word recovery phrase
+        </label>
+        <label>
+          <input type="radio" bind:group={selectedBackupType} value="file" />
+          Encrypted recovery file
+        </label>
+      </fieldset>
+      <div class="actions">
+        <button onclick={resetToIdle}>Cancel</button>
+        <button disabled={!selectedBackupType} onclick={advanceFromPickType}>Continue</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'mnemonicReveal'}
+    <section class="identity-panel" aria-label="Identity">
+      {#if wizardState.step.loadError}
+        <h3 class="section-title">Backup identity</h3>
+        <p class="error">{wizardState.step.loadError}</p>
+        <div class="actions">
+          <button onclick={resetToIdle}>Back to settings</button>
+        </div>
+      {:else}
+        <h3 class="section-title">Your recovery phrase</h3>
+        <p class="hash-anchor">Backing up identity {displayHash}</p>
+        <p class="explainer">
+          Write these 24 words down. Anyone with them can recover your identity.
+          There is no way to retrieve them later.
+        </p>
+        <div
+          data-testid="mnemonic-grid"
+          class="mnemonic-grid"
+          class:blurred={!wizardState.step.revealed}
+        >
+          {#each wizardState.step.words as w, i}
+            <div class="word"><span class="num">{i + 1}.</span> {w}</div>
+          {/each}
+        </div>
+        {#if !wizardState.step.revealed}
+          <button onclick={() => {
+            if (wizardState.kind === 'backup' && wizardState.step.phase === 'mnemonicReveal') {
+              wizardState = { kind: 'backup', step: { ...wizardState.step, revealed: true } };
+            }
+          }}>Reveal</button>
+        {:else}
+          <label class="confirm-label">
+            <input
+              type="checkbox"
+              checked={wizardState.step.storedSafely}
+              onchange={() => {
+                if (wizardState.kind === 'backup' && wizardState.step.phase === 'mnemonicReveal') {
+                  wizardState = { kind: 'backup', step: { ...wizardState.step, storedSafely: !wizardState.step.storedSafely } };
+                }
+              }}
+            />
+            I've stored this safely
+          </label>
+        {/if}
+        <div class="actions">
+          <button onclick={resetToIdle}>Cancel</button>
+          <button
+            disabled={!wizardState.step.revealed || !wizardState.step.storedSafely}
+            onclick={resetToIdle}
+          >Done</button>
+        </div>
+      {/if}
+    </section>
+  {:else}
+    <!-- fileEntry / fileSaved / fileSaveError — Task 6 placeholder -->
+    <section class="identity-panel" aria-label="Identity">
+      <button onclick={resetToIdle}>← Back</button>
+      <p>Backup wizard placeholder.</p>
+    </section>
+  {/if}
 {:else}
   <!-- TODO Task 7/8/9: restore wizard flows -->
   <section class="identity-panel" aria-label="Identity">
@@ -117,4 +227,36 @@
   .explainer { color: var(--text-secondary); font-size: 0.85em; margin-top: 14px; }
   /* TODO: add --danger token to app.css for semantic error coloring */
   .error { color: var(--text-secondary); }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0;
+    margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0);
+    white-space: nowrap; border: 0;
+  }
+  .backup-type-picker {
+    border: none; padding: 0; margin: 8px 0 16px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .backup-type-picker label {
+    display: flex; align-items: center; gap: 8px;
+    cursor: pointer; color: var(--text-primary);
+  }
+  .mnemonic-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    padding: 12px;
+    font-family: ui-monospace, monospace;
+    font-size: 0.85em;
+    margin: 12px 0;
+  }
+  .mnemonic-grid.blurred { filter: blur(6px); user-select: none; }
+  .word { padding: 2px 0; }
+  .word .num { color: var(--text-muted); margin-right: 4px; }
+  .confirm-label {
+    display: flex; align-items: center; gap: 8px;
+    margin: 12px 0; cursor: pointer; color: var(--text-primary);
+  }
+  .hash-anchor { color: var(--text-secondary); font-size: 0.85em; margin: 4px 0 8px; }
 </style>
