@@ -160,7 +160,7 @@ describe('Backup wizard — step 1 (type picker)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -221,7 +221,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('fetches words and shows them blurred initially', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -242,7 +242,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('Done is disabled until checkbox ticked AND grid revealed', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -269,7 +269,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('Done returns to idle state', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -292,7 +292,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('Cancel from mnemonic reveal returns to idle state', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -313,7 +313,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('shows identity hash anchor on reveal screen', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -331,7 +331,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
 
   it('shows error message when export_mnemonic_words fails', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') throw new Error('key not found');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -349,7 +349,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
   it('grid loses blurred class after Reveal is clicked', async () => {
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return words;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -374,7 +374,7 @@ describe('Backup wizard — step 2a (mnemonic reveal)', () => {
     const exportPromise = new Promise<string[]>((resolve) => { resolveExport = resolve; });
 
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_mnemonic_words') return exportPromise;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -431,7 +431,7 @@ describe('Backup wizard — step 2b (file entry screen)', () => {
     mockInvoke.mockReset();
     mockSave.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -533,7 +533,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') {
         const a = args as { outPath: string; passphrase: string; comment: string | null };
         expect(a.outPath).toBe(savePath);
@@ -562,7 +562,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     mockSave.mockResolvedValue(savePath);
     let capturedComment: string | null | undefined;
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') {
         capturedComment = (args as { comment: string | null }).comment;
         return undefined;
@@ -585,7 +585,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') return undefined;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -606,7 +606,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   it('dialog cancel (null path) silently returns to file entry step', async () => {
     mockSave.mockResolvedValue(null); // user cancelled the dialog
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') throw new Error('should not be called');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -628,7 +628,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -648,7 +648,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -670,7 +670,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -700,7 +700,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const writePromise = new Promise<void>((resolve) => { resolveWrite = resolve; });
 
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'export_recovery_file_to_path') return writePromise;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -740,7 +740,7 @@ describe('Restore wizard — step 1 (pickSource)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -864,7 +864,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -892,9 +892,9 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
   });
 
   it('shows word count, validates on Continue click, and advances to confirm on success', async () => {
-    const newHash = 'b2c3d4e5'.repeat(8);
+    const newHash = 'b2c3d4e5'.repeat(4);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') {
         const a = args as { words: string[] };
         if (a.words.length !== 24) throw new Error(`expected 24 words, got ${a.words.length}`);
@@ -917,7 +917,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
 
   it('renders inline error on bad checksum', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') {
         throw new Error('invalid recovery phrase: failed checksum');
       }
@@ -935,7 +935,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
 
   it('renders inline error on wordlist failure', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') {
         throw new Error('not a word in the BIP39 wordlist');
       }
@@ -953,7 +953,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
 
   it('renders generic inline error for unknown failures', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') {
         throw new Error('some unexpected backend error');
       }
@@ -971,7 +971,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
 
   it('clears validation error when user types again', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') {
         throw new Error('invalid recovery phrase: failed checksum');
       }
@@ -1005,7 +1005,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
     const previewPromise = new Promise<string>((resolve) => { resolvePreview = resolve; });
 
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_mnemonic_identity') return previewPromise;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1026,7 +1026,7 @@ describe('Restore wizard — step 2a (mnemonic textarea)', () => {
     expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
 
     // Now resolve the invoke — wizard should NOT resurrect into confirm.
-    resolvePreview('b2c3d4e5'.repeat(8));
+    resolvePreview('b2c3d4e5'.repeat(4));
     await new Promise((r) => setTimeout(r, 0));
 
     // Assert: still on idle screen, no confirm UI present.
@@ -1062,8 +1062,8 @@ async function arrangeAtConfirmViaMnemonic(newHash: string) {
 }
 
 describe('Restore wizard — step 3 (confirm)', () => {
-  const currentHash = 'a1b2c3d4'.repeat(8);
-  const newHash = 'b2c3d4e5'.repeat(8);
+  const currentHash = 'a1b2c3d4'.repeat(4);
+  const newHash = 'b2c3d4e5'.repeat(4);
 
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1123,7 +1123,7 @@ describe('Restore wizard — step 3 (confirm)', () => {
   });
 
   it('Replace identity (mnemonic) invokes restore_mnemonic_from_words and transitions to done', async () => {
-    const postRestoreHash = 'c3d4e5f6'.repeat(8);
+    const postRestoreHash = 'c3d4e5f6'.repeat(4);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return currentHash;
       if (cmd === 'preview_mnemonic_identity') return newHash;
@@ -1148,7 +1148,7 @@ describe('Restore wizard — step 3 (confirm)', () => {
 
   it('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done', async () => {
     const filePath = '/tmp/identity.recovery';
-    const postRestoreHash = 'c3d4e5f6'.repeat(8);
+    const postRestoreHash = 'c3d4e5f6'.repeat(4);
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return currentHash;
@@ -1236,7 +1236,7 @@ describe('Restore wizard — step 3 (confirm)', () => {
     expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
 
     // Now resolve the commit — wizard should NOT resurrect into done.
-    resolveCommit('c3d4e5f6'.repeat(8));
+    resolveCommit('c3d4e5f6'.repeat(4));
     await new Promise((r) => setTimeout(r, 0));
 
     // Assert: still on idle screen, no done UI present.
@@ -1275,8 +1275,8 @@ async function arrangeAtCommitErrorViaMnemonic() {
 }
 
 describe('Restore wizard — commitError', () => {
-  const currentHash = 'a1b2c3d4'.repeat(8);
-  const newHash = 'b2c3d4e5'.repeat(8);
+  const currentHash = 'a1b2c3d4'.repeat(4);
+  const newHash = 'b2c3d4e5'.repeat(4);
 
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1347,9 +1347,9 @@ async function arrangeAtDoneViaMnemonic() {
 }
 
 describe('Restore wizard — step 4 (done)', () => {
-  const currentHash = 'a1b2c3d4'.repeat(8);
-  const newHash = 'b2c3d4e5'.repeat(8);
-  const postRestoreHash = 'c3d4e5f6'.repeat(8);
+  const currentHash = 'a1b2c3d4'.repeat(4);
+  const newHash = 'b2c3d4e5'.repeat(4);
+  const postRestoreHash = 'c3d4e5f6'.repeat(4);
 
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1370,7 +1370,7 @@ describe('Restore wizard — step 4 (done)', () => {
   });
 
   it('Done button refreshes fullHash via current_identity_hash and returns to idle', async () => {
-    const refreshedHash = 'c3d4e5f6'.repeat(8);
+    const refreshedHash = 'c3d4e5f6'.repeat(4);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return currentHash;
       if (cmd === 'preview_mnemonic_identity') return newHash;
@@ -1529,13 +1529,13 @@ async function arrangeAtRestoreFileDecrypted(filePath: string) {
 
 describe('Restore wizard — step 2b (restore fileEntry)', () => {
   const filePath = '/tmp/identity.recovery';
-  const newHash = 'b2c3d4e5'.repeat(8);
+  const newHash = 'b2c3d4e5'.repeat(4);
 
   beforeEach(() => {
     mockInvoke.mockReset();
     mockOpen.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       throw new Error(`unexpected: ${cmd}`);
     });
     mockOpen.mockResolvedValue(filePath);
@@ -1606,7 +1606,7 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
 
   it('decrypt error shows ambiguous inline error message', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_recovery_file') throw new Error('mac mismatch');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1624,7 +1624,7 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
 
   it('successful decrypt transitions to fileDecrypted step', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1684,14 +1684,14 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
 
 describe('Restore wizard — step 2b (fileDecrypted)', () => {
   const filePath = '/tmp/identity.recovery';
-  const newHash = 'b2c3d4e5'.repeat(8);
+  const newHash = 'b2c3d4e5'.repeat(4);
 
   beforeEach(() => {
     mockInvoke.mockReset();
     mockOpen.mockReset();
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1709,7 +1709,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
 
   it('omits Minted line when minted_at is null', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: null, comment: 'test' };
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1722,7 +1722,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
 
   it('omits Comment line when comment is absent', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
       if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: undefined };
       throw new Error(`unexpected: ${cmd}`);
     });

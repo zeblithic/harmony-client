@@ -88,13 +88,17 @@
     }
   });
 
-  async function copyHash() {
-    if (!fullHash || !navigator.clipboard) return;
+  async function copyText(s: string): Promise<void> {
+    if (!s || !navigator.clipboard) return;
     try {
-      await navigator.clipboard.writeText(fullHash);
+      await navigator.clipboard.writeText(s);
     } catch {
       // Some browsers reject when document is unfocused. User can retry.
     }
+  }
+
+  async function copyHash() {
+    await copyText(fullHash);
   }
 
   function resetToIdle() {
@@ -699,10 +703,7 @@
         <button
           class="hash-display"
           title="Click to copy full identity hash"
-          onclick={async () => {
-            if (!navigator.clipboard) return;
-            try { await navigator.clipboard.writeText(wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted' ? wizardState.step.restoreCandidate.identity_hash : ''); } catch { /* ignore */ }
-          }}
+          onclick={() => copyText(wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted' ? wizardState.step.restoreCandidate.identity_hash : '')}
         >0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</button>
       </p>
       <div class="backup-meta">
@@ -782,10 +783,7 @@
       <button
         class="hash-display"
         title="Click to copy full identity hash"
-        onclick={async () => {
-          if (!navigator.clipboard) return;
-          try { await navigator.clipboard.writeText(restoredHash); } catch { /* ignore */ }
-        }}
+        onclick={() => copyText(restoredHash)}
       >0x{restoredHash.slice(0, 8)}…</button>
       <p class="explainer">
         Verify this matches what you expected. If it does not match your backup's expected hash,
