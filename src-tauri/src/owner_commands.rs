@@ -102,13 +102,20 @@ fn derive_this_device_id(sk: &ed25519_dalek::SigningKey) -> [u8; 16] {
     PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash()
 }
 
+/// Format the first 4 bytes of a 16-byte device_id as `xxxx·xxxx`
+/// for display. The full id is internal plumbing — see the
+/// "Two-address world" section of the design spec.
 fn format_fingerprint(id: &[u8; 16]) -> String {
     let hex = hex::encode(id);
     format!("{}·{}", &hex[..4], &hex[4..8])
 }
 
-/// Resolve the directory that holds owner_state.cbor and companion files.
-/// This is the parent of `~/.harmony/identity.key` (i.e. `~/.harmony/`).
+/// Resolve the directory where owner_state.cbor + companion files live.
+///
+/// Workaround: `crate::identity::identity_dir(AppHandle)` does not exist;
+/// instead, take the parent of the per-device identity key path. Assumes
+/// `identity.key` is never at the filesystem root — true on every Tauri-
+/// supported OS (macOS / Linux / Windows).
 fn resolve_identity_dir() -> Result<PathBuf, String> {
     let key_path = crate::identity::resolve_path(None)?;
     key_path
@@ -148,15 +155,15 @@ pub async fn mint_owner_identity(
         }
         let MintResult { state, recovery_artifact, device_signing_key } =
             mint_owner(now_unix()).map_err(|e| format!("mint_owner: {e}"))?;
-        let master_seed = *recovery_artifact.as_bytes();
+        let master_seed: Zeroizing<[u8; 32]> = Zeroizing::new(*recovery_artifact.as_bytes());
         save_owner_state_atomic(
             &identity_dir,
             &state,
             &device_signing_key,
-            &master_seed,
+            &*master_seed,
             KeychainStore::new().ok(),
         )?;
-        let token = insert_token(Zeroizing::new(master_seed));
+        let token = insert_token(master_seed.clone());
         let loaded = LoadedOwnerState {
             state,
             device_signing_key,

@@ -196,7 +196,9 @@ pub struct LoadedOwnerState {
     /// `None` when the master seed has been wiped from this device but
     /// the rest of the owner state remains. v1 does not ship the wipe
     /// action; this case is reachable only via manual file deletion.
-    pub master_seed: Option<[u8; 32]>,
+    /// Wrapped in `Zeroizing` so the seed is wiped on drop — matches the
+    /// token cache's `Zeroizing<[u8; 32]>` discipline.
+    pub master_seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 /// Load the persisted OwnerState if present. Returns `Ok(None)` for the
@@ -233,7 +235,8 @@ pub fn load_owner_state(
     let device_signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
     let master_seed =
-        load_secret(&keychain, KEYCHAIN_MASTER_SEED, identity_dir, "master_seed.enc")?;
+        load_secret(&keychain, KEYCHAIN_MASTER_SEED, identity_dir, "master_seed.enc")?
+            .map(|s| Zeroizing::new(s));
 
     Ok(Some(LoadedOwnerState { state, device_signing_key, master_seed }))
 }
@@ -390,7 +393,7 @@ mod persistence_tests {
         assert_eq!(loaded.state.owner_id, state.owner_id);
         assert_eq!(loaded.state.enrollments.len(), 1);
         assert_eq!(loaded.device_signing_key.to_bytes(), device_signing_key.to_bytes());
-        assert_eq!(loaded.master_seed, Some(master_seed));
+        assert_eq!(loaded.master_seed.as_deref(), Some(&master_seed));
     }
 
     #[test]
