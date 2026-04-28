@@ -10,7 +10,7 @@
 //! All calls use the `_with_keychain(None)` injected variants so the tests
 //! never read or write the developer's real OS keychain entry.
 
-use harmony_app::{identity, recovery_cli};
+use harmony_app::{identity, identity_commands, recovery_cli};
 use harmony_owner::lifecycle::RecoveryArtifact;
 use serial_test::serial;
 
@@ -221,4 +221,95 @@ fn cross_encoding_equivalence_via_cli() {
 
     std::env::remove_var("HARMONY_PASSPHRASE");
     std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+}
+
+/// GUI helper exports mnemonic words → CLI restores from a word file.
+/// Proves the GUI export path produces words that the CLI restore path accepts
+/// and that identity hashes agree end-to-end.
+#[test]
+#[serial]
+fn gui_export_mnemonic_restored_via_cli_preserves_identity_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let plaintext_path = dir.path().join("identity.key");
+    let mnemonic_path = dir.path().join("mnemonic.txt");
+
+    std::env::set_var("HARMONY_PASSPHRASE", "gui-export-cli-restore");
+
+    let original_seed = [0xE1u8; 32];
+    plant_seed(&plaintext_path, &original_seed);
+    let original_id = RecoveryArtifact::from_seed(original_seed)
+        .master_pubkey_bundle()
+        .identity_hash();
+
+    // GUI path: call the helper directly (no Tauri runtime needed).
+    let words =
+        identity_commands::export_mnemonic_words_helper(&plaintext_path).expect("gui export words");
+    assert_eq!(words.len(), 24);
+
+    // Write words to a file so the CLI restore_mnemonic_with_keychain can read it.
+    std::fs::write(&mnemonic_path, words.join(" ")).unwrap();
+
+    wipe_identity_store(&plaintext_path);
+
+    // CLI path: restore from the mnemonic file.
+    recovery_cli::restore_mnemonic_with_keychain(&plaintext_path, &mnemonic_path, false, None)
+        .expect("cli restore");
+
+    let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+    let reloaded_id = RecoveryArtifact::from_seed(*reloaded)
+        .master_pubkey_bundle()
+        .identity_hash();
+    assert_eq!(
+        reloaded_id, original_id,
+        "identity hash must survive gui-export → cli-restore round-trip"
+    );
+
+    std::env::remove_var("HARMONY_PASSPHRASE");
+}
+
+/// CLI exports mnemonic words → GUI helper restores from the word array.
+/// Proves the CLI export produces words that the GUI restore path accepts and
+/// that identity hashes agree end-to-end.
+#[test]
+#[serial]
+fn cli_export_mnemonic_restored_via_gui_preserves_identity_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let plaintext_path = dir.path().join("identity.key");
+
+    std::env::set_var("HARMONY_PASSPHRASE", "cli-export-gui-restore");
+
+    let original_seed = [0xE2u8; 32];
+    plant_seed(&plaintext_path, &original_seed);
+    let original_id = RecoveryArtifact::from_seed(original_seed)
+        .master_pubkey_bundle()
+        .identity_hash();
+
+    // CLI path: export words via the with_keychain variant (no real keychain).
+    let (words, _id_hash) =
+        recovery_cli::export_mnemonic_words_with_keychain(&plaintext_path, None)
+            .expect("cli export words");
+
+    wipe_identity_store(&plaintext_path);
+
+    // GUI path: restore via the helper (force=true, no Tauri runtime needed).
+    let restored_hash =
+        identity_commands::restore_mnemonic_from_words_helper(&plaintext_path, &words)
+            .expect("gui restore");
+
+    // The helper returns the hash directly; also verify via disk re-read.
+    let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+    let reloaded_id = RecoveryArtifact::from_seed(*reloaded)
+        .master_pubkey_bundle()
+        .identity_hash();
+    assert_eq!(
+        reloaded_id, original_id,
+        "identity hash must survive cli-export → gui-restore round-trip"
+    );
+    assert_eq!(
+        restored_hash,
+        hex::encode(original_id),
+        "helper return value must match on-disk identity hash"
+    );
+
+    std::env::remove_var("HARMONY_PASSPHRASE");
 }

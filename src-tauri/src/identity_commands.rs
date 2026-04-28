@@ -1,4 +1,4 @@
-//! Read-only Tauri commands for the identity backup/restore GUI wizard.
+//! Tauri commands for the identity backup/restore GUI wizard.
 //!
 //! Each command is a thin wrapper around [`crate::recovery_cli`] helpers.
 //! The actual logic lives in `recovery_cli` so it can be tested without a
@@ -6,7 +6,7 @@
 //! a `plaintext_path` argument; tests call the helpers directly.
 
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::identity;
 use crate::recovery_cli;
@@ -87,6 +87,114 @@ pub fn preview_recovery_file_helper(
     })
 }
 
+/// Export the master seed as a passphrase-encrypted recovery file at `out_path`.
+///
+/// The GUI calls this after the user has chosen an output path and typed a
+/// passphrase in the file-backup wizard. The `comment` field is stored in
+/// the backup metadata and shown back to the user on restore.
+///
+/// Wraps `HARMONY_RECOVERY_PASSPHRASE` with the caller-supplied `passphrase`
+/// because `export_recovery_file_with_keychain` resolves the passphrase from
+/// the environment (to share one code path with the headless CLI).
+pub fn export_recovery_file_to_path_helper(
+    plaintext_path: &Path,
+    out_path: &Path,
+    passphrase: &str,
+    comment: Option<String>,
+) -> Result<(), String> {
+    // Set the env var, call the function, then restore the previous value.
+    // This is safe within a single-threaded test context and within Tauri's
+    // async command dispatch (each command call is isolated).
+    let prev = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    let result = recovery_cli::export_recovery_file_with_keychain(
+        plaintext_path,
+        out_path,
+        comment.as_deref(),
+        None,
+    );
+    match prev {
+        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
+        None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
+    }
+    result
+}
+
+/// Restore the on-disk identity from a 24-word mnemonic array and return the
+/// resulting identity hash.
+///
+/// `force` is always `true` on this path: the GUI has already shown the user a
+/// `TypeToConfirmDialog` and received explicit acknowledgement that the current
+/// identity will be overwritten.
+pub fn restore_mnemonic_from_words_helper(
+    plaintext_path: &Path,
+    words: &[String],
+) -> Result<String, String> {
+    // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
+    recovery_cli::restore_mnemonic_from_words_with_keychain(
+        plaintext_path,
+        words,
+        /*force=*/ true,
+        None,
+    )?;
+    // Derive the resulting identity hash from the words (no re-read from disk needed).
+    use harmony_owner::lifecycle::RecoveryArtifact;
+    let phrase = words.join(" ");
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
+}
+
+/// Restore the on-disk identity from a passphrase-encrypted recovery file and
+/// return its metadata.
+///
+/// `force` is always `true` on this path: the GUI has already shown the user a
+/// `TypeToConfirmDialog` and received explicit acknowledgement that the current
+/// identity will be overwritten.
+///
+/// The file is decrypted twice: once by `restore_recovery_file_with_keychain`
+/// to write the seed, and once here to extract the metadata for the returned
+/// `RestoreInfo`. This double-decrypt is acceptable given the ~101-byte file
+/// size; it avoids expanding the `_with_keychain` API surface for a trivial
+/// benefit.
+pub fn restore_recovery_file_from_path_helper(
+    plaintext_path: &Path,
+    in_path: &Path,
+    passphrase: &str,
+) -> Result<RestoreInfo, String> {
+    use harmony_owner::lifecycle::RecoveryArtifact;
+    use secrecy::SecretString;
+
+    // ── First pass: perform the actual restore (writes seed to disk). ──────
+    // Set env var for the duration of the call, then restore.
+    let prev = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
+    let restore_result = recovery_cli::restore_recovery_file_with_keychain(
+        plaintext_path,
+        in_path,
+        /*force=*/ true,
+        None,
+    );
+    match prev {
+        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
+        None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
+    }
+    restore_result?;
+
+    // ── Second pass: decrypt again to extract metadata for RestoreInfo. ────
+    let bytes =
+        std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
+    let pass = SecretString::from(passphrase.to_string());
+    let restored =
+        RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
+    let id_hash = restored.artifact.master_pubkey_bundle().identity_hash();
+    Ok(RestoreInfo {
+        identity_hash: hex::encode(id_hash),
+        minted_at: restored.metadata.mint_at,
+        comment: restored.metadata.comment,
+    })
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────
 
 /// Return the 32-char hex identity hash of the current on-disk identity.
@@ -117,6 +225,45 @@ pub async fn preview_recovery_file(
     passphrase: String,
 ) -> Result<RestoreInfo, String> {
     preview_recovery_file_helper(Path::new(&in_path), &passphrase)
+}
+
+/// Export the master seed as a passphrase-encrypted recovery file at `out_path`.
+///
+/// Called by the GUI file-backup wizard after the user has confirmed the path
+/// and passphrase.
+#[tauri::command]
+pub async fn export_recovery_file_to_path(
+    out_path: PathBuf,
+    passphrase: String,
+    comment: Option<String>,
+) -> Result<(), String> {
+    let plaintext_path = identity::resolve_path(None)?;
+    export_recovery_file_to_path_helper(&plaintext_path, &out_path, &passphrase, comment)
+}
+
+/// Restore the on-disk identity from a 24-word mnemonic array.
+///
+/// Returns the 32-char hex identity hash of the restored identity.
+/// The GUI calls this only after the user has passed the `TypeToConfirmDialog`
+/// gate, so `force=true` is applied unconditionally on this path.
+#[tauri::command]
+pub async fn restore_mnemonic_from_words(words: Vec<String>) -> Result<String, String> {
+    let plaintext_path = identity::resolve_path(None)?;
+    restore_mnemonic_from_words_helper(&plaintext_path, &words)
+}
+
+/// Restore the on-disk identity from a passphrase-encrypted recovery file.
+///
+/// Returns metadata (`identity_hash`, `minted_at`, `comment`) for the restored
+/// identity. The GUI calls this only after the user has passed the
+/// `TypeToConfirmDialog` gate, so `force=true` is applied unconditionally.
+#[tauri::command]
+pub async fn restore_recovery_file_from_path(
+    in_path: PathBuf,
+    passphrase: String,
+) -> Result<RestoreInfo, String> {
+    let plaintext_path = identity::resolve_path(None)?;
+    restore_recovery_file_from_path_helper(&plaintext_path, &in_path, &passphrase)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────
