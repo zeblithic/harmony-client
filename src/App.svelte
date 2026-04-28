@@ -9,6 +9,7 @@
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfileEditor from './lib/components/ProfileEditor.svelte';
+  import IdentityPanel from './lib/components/IdentityPanel.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
   import MailInbox from './lib/components/MailInbox.svelte';
@@ -857,6 +858,7 @@
   {/snippet}
   {#snippet settingsPanel()}
     <ProfileEditor profile={myProfile} onSave={handleProfileSave} />
+    <IdentityPanel />
     <NotificationSettingsPanel
       service={notificationService}
       {trustService}
