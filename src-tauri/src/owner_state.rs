@@ -89,7 +89,7 @@ fn token_cache_lock() -> std::sync::MutexGuard<'static, HashMap<Uuid, TokenEntry
 /// `seed` is `Zeroizing<[u8; 32]>` so the caller holds the zeroize-on-drop
 /// guarantee from the moment the seed is materialized — not only after it
 /// enters the cache. Mirrors PR-61's `insert_preview` signature.
-pub(crate) fn insert_token(seed: Zeroizing<[u8; 32]>) -> Uuid {
+pub fn insert_token(seed: Zeroizing<[u8; 32]>) -> Uuid {
     let token = Uuid::new_v4();
     let mut cache = token_cache_lock();
     evict_expired(&mut cache);
@@ -109,7 +109,7 @@ pub(crate) fn insert_token(seed: Zeroizing<[u8; 32]>) -> Uuid {
 
 /// Consume a token: returns the master seed exactly once. Subsequent
 /// `take_token(same_uuid)` returns `None`.
-pub(crate) fn take_token(token: &Uuid) -> Option<Zeroizing<[u8; 32]>> {
+pub fn take_token(token: &Uuid) -> Option<Zeroizing<[u8; 32]>> {
     let mut cache = token_cache_lock();
     evict_expired(&mut cache);
     cache.remove(token).map(|e| e.seed)
