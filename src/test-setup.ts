@@ -10,6 +10,12 @@
 // setup.  We use that to retrieve the real jsdom Storage objects and install
 // them as the global localStorage/sessionStorage before each test file runs.
 
+// Adds jest-dom matchers (`toBeInTheDocument`, `toBeDisabled`, `toHaveClass`,
+// etc.) to vitest's `expect`. The package is in devDependencies but doesn't
+// auto-wire — this one-line import unblocks idiomatic component-test
+// assertions across the suite.
+import '@testing-library/jest-dom/vitest';
+
 declare const jsdom: { window: Window & typeof globalThis };
 
 if (typeof jsdom !== 'undefined' && jsdom.window) {
