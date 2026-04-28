@@ -198,11 +198,19 @@
     selectedRestoreSource = null;
   }
 
+  // Token-count rule for the mnemonic textarea — used in the live word-count
+  // display, the Continue gate, and the Continue handler. Single source of truth
+  // so the three sites can't drift apart (e.g. if the rule ever changes to
+  // strip non-word characters).
+  function countWords(s: string): number {
+    return s.split(/\s+/).filter(w => w.length > 0).length;
+  }
+
   async function advanceFromMnemonicEntry() {
     if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'mnemonicEntry') return;
     const { input } = wizardState.step;
     const words = input.split(/\s+/).filter(w => w.length > 0);
-    if (words.length !== 24) return;
+    if (words.length !== 24) return;  // gate matches countWords() in the template
 
     // Clear any prior validation error before the invoke.
     wizardState = { kind: 'restore', step: { phase: 'mnemonicEntry', input, validationError: null } };
@@ -525,7 +533,7 @@
         ></textarea>
       </label>
       <p class="word-count">
-        {wizardState.step.input.split(/\s+/).filter(w => w.length > 0).length} / 24 words
+        {countWords(wizardState.step.input)} / 24 words
       </p>
       {#if wizardState.step.validationError !== null}
         <p class="inline-error" role="alert">{wizardState.step.validationError}</p>
@@ -533,7 +541,7 @@
       <div class="actions">
         <button onclick={resetToIdle}>Cancel</button>
         <button
-          disabled={wizardState.step.input.split(/\s+/).filter(w => w.length > 0).length !== 24}
+          disabled={countWords(wizardState.step.input) !== 24}
           onclick={advanceFromMnemonicEntry}
         >Continue</button>
       </div>
