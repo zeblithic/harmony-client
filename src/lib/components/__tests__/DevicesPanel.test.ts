@@ -254,3 +254,91 @@ describe('DevicesPanel — degraded state (canBackUp: false)', () => {
     expect(btn).toHaveAttribute('title');
   });
 });
+
+describe('DevicesPanel — rename overlay survives refresh', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('overlays profile.displayName onto the isThisDevice row after refresh', async () => {
+    // Backend returns the placeholder "this device" — but localStorage holds
+    // a previously-renamed value. The panel must overlay the local value so
+    // the rename survives refresh/restart (Qodo + CodeAnt finding).
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'this device',  // backend placeholder
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this device',  // backend placeholder
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({
+      address: 'addr',
+      displayName: 'KRILE-renamed',
+    });
+
+    render(DevicesPanel);
+    // Both the owner header AND the device row should show the renamed value.
+    const matches = await screen.findAllByText('KRILE-renamed');
+    expect(matches.length).toBe(2);
+    // The "this device" string still appears as the marker label on the row,
+    // confirming the overlay only replaced the displayName, not the marker.
+    expect(screen.queryByText('this device')).toBeInTheDocument();
+  });
+});
+
+describe('DevicesPanel — stale token cleared after export failure', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('clears recoveryToken in finally so next openBackup issues fresh', async () => {
+    // Refresh + populated state
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    // First openBackup → issue token
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    // exportRecoveryFile FAILS (e.g., disk write error). Backend already
+    // consumed the token via take_token before the failure point.
+    mockedInvoke.mockRejectedValueOnce(new Error('disk write failed'));
+    // Next openBackup → must request a FRESH token (not replay tok-1).
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-2' });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    // Fill passphrases and trigger commit (will fail).
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+    await screen.findByText(/disk write failed/i);
+
+    // Cancel → reopen backup. Must call issue_owner_recovery_token AGAIN
+    // because the previous token is now consumed/invalid server-side.
+    const cancelBtn = screen.getByRole('button', { name: /cancel/i });
+    await fireEvent.click(cancelBtn);
+    await fireEvent.click(backupBtn);
+
+    // Assert two issue_owner_recovery_token calls (one before each open),
+    // not one. The single-use semantics require a fresh token per attempt.
+    const issueCalls = mockedInvoke.mock.calls.filter(
+      (c) => c[0] === 'issue_owner_recovery_token',
+    );
+    expect(issueCalls.length).toBe(2);
+  });
+});

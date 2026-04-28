@@ -13,7 +13,32 @@
   let mintError = $state<string | null>(null);
   let recoveryToken = $state<string | null>(null);
 
-  svc.onChange = () => { state = svc.state; };
+  /**
+   * Backend always returns the placeholder name "this device" for the
+   * isThisDevice row (it has no access to localStorage). Overlay the
+   * locally-persisted profile.displayName so the rename survives refresh
+   * and restart. Cross-device names will eventually come via gossip
+   * (deferred); v1 only overlays the local entry.
+   *
+   * Defensive: if loadProfile returns no usable name (e.g., localStorage
+   * unavailable in private-mode browsers), pass the view through unchanged
+   * so the user still sees the backend placeholder rather than a crash.
+   */
+  function applyLocalProfileOverlay(view: OwnerStateView | null): OwnerStateView | null {
+    if (!view) return null;
+    const profile = loadProfile();
+    const localName = profile?.displayName;
+    if (!localName) return view;
+    return {
+      ...view,
+      ownerDisplayName: localName,
+      devices: view.devices.map((d) =>
+        d.isThisDevice ? { ...d, displayName: localName } : d,
+      ),
+    };
+  }
+
+  svc.onChange = () => { state = applyLocalProfileOverlay(svc.state); };
 
   onMount(async () => {
     try {
@@ -91,10 +116,16 @@
       backupError = 'Passphrase must be at least 12 characters.';
       return;
     }
-    const out = await save({
-      defaultPath: 'owner-recovery.bin',
-      filters: [{ name: 'Recovery file', extensions: ['bin'] }],
-    });
+    let out: string | null;
+    try {
+      out = await save({
+        defaultPath: 'owner-recovery.bin',
+        filters: [{ name: 'Recovery file', extensions: ['bin'] }],
+      });
+    } catch (e) {
+      backupError = extractError(e);
+      return;
+    }
     if (!out) return;
     backupInFlight = true;
     backupError = null;
@@ -106,10 +137,14 @@
         backupComment.trim() ? backupComment.trim() : null,
       );
       backupSavedPath = out;
-      recoveryToken = null;
     } catch (e) {
       backupError = extractError(e);
     } finally {
+      // Token is single-use server-side: take_token consumes it on any path
+      // past validation, including disk-write failures. Always null it so
+      // the next openBackup() call issues a fresh token instead of replaying
+      // a stale one (which would error "expired or invalid").
+      recoveryToken = null;
       backupInFlight = false;
     }
   }
@@ -250,9 +285,9 @@
   {/if}
 
   {#if backupOpen}
-    <div class="modal-overlay" role="dialog" aria-modal="true">
+    <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="backup-modal-heading">
       <div class="modal">
-        <h3>Back up owner identity</h3>
+        <h3 id="backup-modal-heading">Back up owner identity</h3>
         {#if backupSavedPath}
           <p>Recovery file written to <code>{backupSavedPath}</code>. Keep it somewhere safe.</p>
           <button class="primary" onclick={closeBackup}>Done</button>

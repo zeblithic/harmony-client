@@ -14,10 +14,17 @@ use harmony_owner::recovery::RecoveryMetadata;
 use harmony_owner::trust;
 use secrecy::SecretString;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// Process-wide mutex for the mint flow. The design spec calls for a
+/// single-flight guard: two concurrent `mint_owner_identity` calls (e.g., via
+/// rapid double-click reaching the `spawn_blocking` thread pool) must not
+/// both pass the file-existence check and race to write competing OwnerStates.
+/// Held across the entire check-and-write window.
+static MINT_OWNER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const ERR_NODE_RUNNING: &str =
     "Stop the node before minting an owner identity (the node must not be holding owner-scoped keys during mint).";
@@ -142,6 +149,12 @@ pub async fn mint_owner_identity(
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
+        // Hold the process-wide mint mutex for the entire check-and-write
+        // window. Without this, concurrent mints could both observe an
+        // absent owner_state.cbor and race to write competing OwnerStates.
+        // Recover from poisoning so a panic in one handler doesn't brick
+        // future mints (mirrors PR-61's preview_cache_lock policy).
+        let _mint_guard = MINT_OWNER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Refuse if already minted (idempotent failure).
         if identity_dir.join("owner_state.cbor").exists() {
             return Err(

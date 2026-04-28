@@ -297,6 +297,11 @@ pub fn save_owner_state_atomic(
 
 /// Load a 32-byte secret from keychain primary, encrypted-file fallback.
 /// Returns `Ok(None)` when neither source has the secret.
+///
+/// Keychain errors other than `NoEntry` (locked keychain, permission denied,
+/// flaky backend) fall through to the encrypted-file fallback rather than
+/// hard-failing — matches the pattern in `crate::identity` which made
+/// keychain integration robust on partially-broken systems.
 fn load_secret(
     keychain: &Option<KeychainStore>,
     keychain_name: &str,
@@ -307,7 +312,10 @@ fn load_secret(
         let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
         match entry.get_secret() {
-            Ok(bytes) => {
+            Ok(raw_bytes) => {
+                // Wrap the heap Vec immediately so it zeroes on drop, matching
+                // the discipline applied to keychain reads in `crate::identity`.
+                let bytes = Zeroizing::new(raw_bytes);
                 if bytes.len() != 32 {
                     return Err(format!(
                         "keychain entry {KEYCHAIN_OWNER_SERVICE}/{keychain_name} length is {} bytes, expected 32",
@@ -319,7 +327,14 @@ fn load_secret(
                 return Ok(Some(arr));
             }
             Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(format!("keychain read {keychain_name}: {e}")),
+            Err(e) => {
+                // Don't hard-fail: a flaky/locked keychain shouldn't break
+                // load when the encrypted-file fallback is configured.
+                tracing::warn!(
+                    "keychain read {KEYCHAIN_OWNER_SERVICE}/{keychain_name} failed ({e}); \
+                     falling through to encrypted-file fallback"
+                );
+            }
         }
     }
     // Fallback: encrypted file under HARMONY_PASSPHRASE.
@@ -350,9 +365,17 @@ fn save_secret(
     if keychain.is_some() {
         let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
-        return entry
-            .set_secret(bytes)
-            .map_err(|e| format!("keychain write {keychain_name}: {e}"));
+        match entry.set_secret(bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Don't hard-fail: a flaky/locked keychain shouldn't block
+                // mint when the encrypted-file fallback is configured.
+                tracing::warn!(
+                    "keychain write {KEYCHAIN_OWNER_SERVICE}/{keychain_name} failed ({e}); \
+                     falling through to encrypted-file fallback"
+                );
+            }
+        }
     }
     let path = identity_dir.join(fallback_filename);
     let store = EncryptedFileStore::from_env(path.clone())
