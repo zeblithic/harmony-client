@@ -88,11 +88,15 @@ fn restore_recovery_file_from_path(
 **Shared response type:**
 
 ```rust
-#[derive(serde::Serialize)]
-struct RestoreInfo {
-    identity_hash: String,    // hex, 64 chars
-    minted_at: String,         // RFC 3339
-    comment: Option<String>,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RestoreInfo {
+    /// 32-char hex (16 bytes truncated BLAKE3 — `identity_hash()` returns `[u8; 16]`).
+    pub identity_hash: String,
+    /// Unix epoch seconds recorded when the backup was created, if present.
+    /// Older backups without a timestamp deserialize to `None`. Svelte side
+    /// formats for display.
+    pub minted_at: Option<u64>,
+    pub comment: Option<String>,
 }
 ```
 
@@ -119,7 +123,7 @@ The restore flows decrypt twice: once for *preview* (read-only, returns `Restore
 ```
 Settings → Identity
 ─────────────────────────────────────
-Identity hash:  0xa1b2c3d4…   ← click to copy full 64-char hex
+Identity hash:  0xa1b2c3d4…   ← click to copy full 32-char hex
 
 [ Backup… ]  [ Restore… ]
 
@@ -290,7 +294,7 @@ Errors render **inline** under the failing field/step, in red, with the previous
   - "Continue" on mnemonic restore disabled until 24 valid BIP39 words
   - "Replace identity" disabled until typed prefix matches current hash
 - Mnemonic-validation logic: word count, BIP39 wordlist membership, checksum, identity_hash preview rendering
-- Identity-hash truncation/copy: 8-char prefix shown; full 64-char hex copied to clipboard on click
+- Identity-hash truncation/copy: 8-char prefix shown; full 32-char hex copied to clipboard on click
 - Blur-to-reveal: pre-reveal state hides words, post-reveal state shows them
 - Error-rendering per the error-handling table
 - Tauri `invoke` calls mocked via the existing pattern in other vitest specs

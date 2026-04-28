@@ -231,8 +231,10 @@ In `src-tauri/src/lib.rs` (or a new `identity_commands.rs`), add:
 ```rust
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct RestoreInfo {
-    pub identity_hash: String,    // hex, 64 chars
-    pub minted_at: String,         // RFC 3339
+    /// 32-char hex (16 bytes truncated BLAKE3 — `identity_hash()` returns `[u8; 16]`).
+    pub identity_hash: String,
+    /// Unix epoch seconds; `None` for older backups without a timestamp.
+    pub minted_at: Option<u64>,
     pub comment: Option<String>,
 }
 ```

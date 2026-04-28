@@ -15,7 +15,7 @@ use crate::recovery_cli;
 
 /// Metadata from a recovery file, returned by `preview_recovery_file`.
 /// Sent across IPC so it must implement `serde::Serialize`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RestoreInfo {
     /// 32-char hex-encoded identity hash derived from the backup's seed.
     /// `identity_hash()` returns `[u8; 16]` (128-bit truncated BLAKE3).
