@@ -93,30 +93,51 @@ pub fn preview_recovery_file_helper(
 /// passphrase in the file-backup wizard. The `comment` field is stored in
 /// the backup metadata and shown back to the user on restore.
 ///
-/// Wraps `HARMONY_RECOVERY_PASSPHRASE` with the caller-supplied `passphrase`
-/// because `export_recovery_file_with_keychain` resolves the passphrase from
-/// the environment (to share one code path with the headless CLI).
+/// Wraps `HARMONY_RECOVERY_PASSPHRASE` and `HARMONY_RECOVERY_PASSPHRASE_FILE`
+/// with the caller-supplied `passphrase` because
+/// `export_recovery_file_with_keychain` resolves the passphrase from the
+/// environment (to share one code path with the headless CLI).
+/// `HARMONY_RECOVERY_PASSPHRASE_FILE` is cleared for the duration so that
+/// `resolve_recovery_passphrase()` does not log a warning about both vars
+/// being set when a user previously configured the CLI file-based path.
+/// Both vars are restored to their prior values on exit (including on error).
+/// The env vars are process-global, so two concurrent calls would race —
+/// the wizard's serial UX (one Backup… or Restore… flow at a time) is
+/// what makes this safe in practice. A future follow-up should thread
+/// the passphrase through `recovery_cli::*_with_keychain` as an
+/// explicit argument to remove this constraint entirely.
 pub fn export_recovery_file_to_path_helper(
     plaintext_path: &Path,
     out_path: &Path,
     passphrase: &str,
     comment: Option<String>,
 ) -> Result<(), String> {
-    // Set the env var, call the function, then restore the previous value.
-    // This is safe within a single-threaded test context and within Tauri's
-    // async command dispatch (each command call is isolated).
-    let prev = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    // Save BOTH env vars on entry.
+    let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
+
+    // Clear the file var so resolve_recovery_passphrase() doesn't log a warning
+    // about both being set, and set the direct var to the GUI-supplied passphrase.
     std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
+
     let result = recovery_cli::export_recovery_file_with_keychain(
         plaintext_path,
         out_path,
         comment.as_deref(),
         None,
     );
-    match prev {
+
+    // Restore both env vars to whatever they were on entry.
+    match prev_pass {
         Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
         None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
     }
+    match prev_file {
+        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", v),
+        None => {} // already removed above
+    }
+
     result
 }
 
@@ -138,9 +159,12 @@ pub fn restore_mnemonic_from_words_helper(
         None,
     )?;
     // Derive the resulting identity hash from the words (no re-read from disk needed).
+    // This re-parse cannot fail: the same phrase was already parsed successfully
+    // inside restore_mnemonic_from_words_with_keychain (same function, same input).
     use harmony_owner::lifecycle::RecoveryArtifact;
     let phrase = words.join(" ");
-    let artifact = RecoveryArtifact::from_mnemonic(&phrase).map_err(|e| e.to_string())?;
+    let artifact = RecoveryArtifact::from_mnemonic(&phrase)
+        .expect("post-restore mnemonic re-parse must succeed; same parse already passed in restore_mnemonic_from_words_with_keychain");
     Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
 }
 
@@ -165,9 +189,21 @@ pub fn restore_recovery_file_from_path_helper(
     use secrecy::SecretString;
 
     // ── First pass: perform the actual restore (writes seed to disk). ──────
-    // Set env var for the duration of the call, then restore.
-    let prev = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    // Env-var wrapping has the same concurrency caveat as
+    // `export_recovery_file_to_path_helper`: process-global, safe only
+    // because the GUI wizard runs flows serially.
+    // Both HARMONY_RECOVERY_PASSPHRASE and HARMONY_RECOVERY_PASSPHRASE_FILE
+    // are saved on entry, the file var is cleared (to suppress the
+    // resolve_recovery_passphrase() dual-set warning), and both are restored
+    // on exit regardless of success or failure.
+    let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
+    let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
+
+    // Clear the file var so resolve_recovery_passphrase() doesn't log a warning
+    // about both being set, and set the direct var to the GUI-supplied passphrase.
     std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
+
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     let restore_result = recovery_cli::restore_recovery_file_with_keychain(
         plaintext_path,
@@ -175,10 +211,17 @@ pub fn restore_recovery_file_from_path_helper(
         /*force=*/ true,
         None,
     );
-    match prev {
+
+    // Restore both env vars to whatever they were on entry.
+    match prev_pass {
         Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
         None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
     }
+    match prev_file {
+        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", v),
+        None => {} // already removed above
+    }
+
     restore_result?;
 
     // ── Second pass: decrypt again to extract metadata for RestoreInfo. ────
@@ -442,5 +485,72 @@ mod tests {
             err.contains("nonexistent.bin"),
             "error must mention file path; got: {err}"
         );
+    }
+
+    // ── export_recovery_file_to_path_helper env-var save/restore ─────────
+
+    /// Pins the load-bearing invariant that both HARMONY_RECOVERY_PASSPHRASE
+    /// and HARMONY_RECOVERY_PASSPHRASE_FILE are restored to their prior values
+    /// after each call — including on error paths.  A future refactor that
+    /// moves `?` before the restore block would cause sub-case 3 or 4 to fail.
+    #[test]
+    #[serial]
+    fn export_recovery_file_to_path_restores_prior_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "outer-pass");
+        let seed = [0xE0u8; 32];
+        plant_seed(&plaintext_path, &seed);
+
+        // Sub-case 1: prior env value is restored after a successful call.
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
+        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
+            .expect("export");
+        assert_eq!(
+            std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
+            Ok("outer-original"),
+            "prior HARMONY_RECOVERY_PASSPHRASE must be restored"
+        );
+
+        // Sub-case 2: when prior was unset, env is removed (not left at "inner-call").
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+        let _ = std::fs::remove_file(&recovery_path);
+        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
+            .expect("export");
+        assert!(
+            std::env::var("HARMONY_RECOVERY_PASSPHRASE").is_err(),
+            "HARMONY_RECOVERY_PASSPHRASE must be unset after the call (was unset before)"
+        );
+
+        // Sub-case 3: env is restored even on error (load-bearing invariant).
+        // Point out_path at a non-existent nested directory so the write fails.
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
+        let bogus_path = dir.path().join("no-such-dir").join("rec.bin");
+        let _ =
+            export_recovery_file_to_path_helper(&plaintext_path, &bogus_path, "inner-call", None);
+        // call may or may not error depending on internal flow; what matters is the env state:
+        assert_eq!(
+            std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
+            Ok("outer-original"),
+            "prior HARMONY_RECOVERY_PASSPHRASE must be restored even on error"
+        );
+
+        // Sub-case 4: HARMONY_RECOVERY_PASSPHRASE_FILE is also save/restored (Fix 1 behavior).
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", "/tmp/some-file");
+        let _ = std::fs::remove_file(&recovery_path);
+        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
+            .expect("export");
+        assert_eq!(
+            std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").as_deref(),
+            Ok("/tmp/some-file"),
+            "HARMONY_RECOVERY_PASSPHRASE_FILE must be restored to its prior value"
+        );
+
+        // Cleanup
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }
