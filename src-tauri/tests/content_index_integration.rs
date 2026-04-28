@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use harmony_app::content_index::{
-    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity,
+    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity, SidecarId,
 };
 use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
+use harmony_compute::InstructionBudget;
 use harmony_content::book::MemoryBookStore;
 use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
-use harmony_compute::InstructionBudget;
 use harmony_runtime::{NodeConfig, NodeRuntime};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -27,8 +27,7 @@ async fn ingest_list_pin_burn_roundtrip() {
     // Fixture: bytes + CID computed via ContentId::for_book — this must
     // match what the event loop's ingest handler routes into the runtime.
     let bytes = b"hello world, this is integration test content!".to_vec();
-    let cid = ContentId::for_book(&bytes, ContentFlags::default())
-        .expect("CID for fixture bytes");
+    let cid = ContentId::for_book(&bytes, ContentFlags::default()).expect("CID for fixture bytes");
     let expected_cid_bytes: [u8; 32] = cid.to_bytes();
     let cid_hex = hex::encode(expected_cid_bytes);
 
@@ -43,16 +42,12 @@ async fn ingest_list_pin_burn_roundtrip() {
     let (_fetch_tx, fetch_rx) = mpsc::channel(4);
     let (_follow_tx, follow_rx) = mpsc::channel(4);
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
-    let (_voice_ch_tx, voice_ch_rx) =
-        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
-    let (_refresh_tx, refresh_rx) =
-        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let followed_set = Arc::new(Mutex::new(
-        std::collections::HashSet::<String>::default(),
-    ));
+    let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -117,8 +112,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                 .expect("tokio runtime for test event loop");
             rt.block_on(async move {
                 // Construct runtime inside the thread — NodeRuntime is !Send.
-                let (runtime, startup_actions) =
-                    NodeRuntime::new(config, MemoryBookStore::new());
+                let (runtime, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
@@ -135,7 +129,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     voice_ch_rx,
                     followed_set,
                     mail_mgr,
-                    None,  // mail_sync — not exercised in this test
+                    None, // mail_sync — not exercised in this test
                     refresh_rx,
                     pin_intent,
                     fetch_completion_tx,
@@ -183,10 +177,12 @@ async fn ingest_list_pin_burn_roundtrip() {
     // ── Step 2: write a sidecar entry for the same CID ───────────────────
     // Mimics what the Tauri ingest_content command does post-ack.
     let index = Arc::new(Mutex::new(ContentIndex::load(&app_data_dir)));
+    let sid = SidecarId::new();
     {
         let mut idx = index.lock().unwrap();
         assert!(
             idx.insert(ContentIndexEntry {
+                sidecar_id: sid,
                 cid: expected_cid_bytes,
                 file_name: "hello.txt".into(),
                 size_bytes: bytes.len() as u64,
@@ -253,7 +249,7 @@ async fn ingest_list_pin_burn_roundtrip() {
     {
         let mut idx = index.lock().unwrap();
         assert!(
-            idx.remove(&expected_cid_bytes),
+            idx.remove(&sid),
             "sidecar should have had an entry to remove"
         );
     }
@@ -272,7 +268,7 @@ async fn ingest_list_pin_burn_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     use harmony_app::chunk_and_bundle;
-    use harmony_app::content_index::{self, ContentIndexEntry, Sensitivity, ReplicationTier};
+    use harmony_app::content_index::{self, ContentIndexEntry, ReplicationTier, Sensitivity};
     use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
     use harmony_content::bundle;
     use harmony_content::cid::{CidType, ContentId};
@@ -288,16 +284,12 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     let (_fetch_tx, fetch_rx) = mpsc::channel(4);
     let (_follow_tx, follow_rx) = mpsc::channel(4);
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
-    let (_voice_ch_tx, voice_ch_rx) =
-        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
-    let (_refresh_tx, refresh_rx) =
-        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let followed_set = Arc::new(Mutex::new(
-        std::collections::HashSet::<String>::default(),
-    ));
+    let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -357,8 +349,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                 .build()
                 .expect("tokio runtime for test event loop");
             rt.block_on(async move {
-                let (runtime, startup_actions) =
-                    NodeRuntime::new(config, MemoryBookStore::new());
+                let (runtime, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
@@ -400,8 +391,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     let bytes: Vec<u8> = (0..3 * 1024 * 1024)
         .map(|i| ((i * 37) % 251) as u8)
         .collect();
-    let (leaves, bundle_payload, root_cid) =
-        chunk_and_bundle(&bytes).expect("chunking");
+    let (leaves, bundle_payload, root_cid) = chunk_and_bundle(&bytes).expect("chunking");
     let leaf_cids: Vec<ContentId> = leaves.iter().map(|(c, _)| *c).collect();
     let expected_descendants: HashSet<[u8; 32]> = std::iter::once(root_cid.to_bytes())
         .chain(leaf_cids.iter().map(|c| c.to_bytes()))
@@ -439,12 +429,12 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     }
 
     // ── Step 3: Sidecar insert for the root CID ───────────────────────
-    let index = Arc::new(Mutex::new(
-        content_index::ContentIndex::load(&app_data_dir),
-    ));
+    let index = Arc::new(Mutex::new(content_index::ContentIndex::load(&app_data_dir)));
+    let root_sid = SidecarId::new();
     {
         let mut idx = index.lock().unwrap();
         assert!(idx.insert(ContentIndexEntry {
+            sidecar_id: root_sid,
             cid: root_cid.to_bytes(),
             file_name: "chunked.bin".into(),
             size_bytes: bytes.len() as u64,
@@ -501,7 +491,10 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         .iter()
         .flat_map(|(_, data)| data.iter().copied())
         .collect();
-    assert_eq!(reassembled, bytes, "concatenated leaves must equal original");
+    assert_eq!(
+        reassembled, bytes,
+        "concatenated leaves must equal original"
+    );
 
     let parsed_children = bundle::parse_bundle(&bundle_payload).unwrap();
     assert_eq!(
@@ -535,7 +528,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     // ── Step 8: Sidecar removal (mirroring the burn_content command) ──
     {
         let mut idx = index.lock().unwrap();
-        assert!(idx.remove(&root_cid.to_bytes()));
+        assert!(idx.remove(&root_sid));
     }
 }
 
@@ -548,10 +541,12 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
 fn pin_intent_survives_reload() {
     let tmp = tempfile::tempdir().unwrap();
     let cid = [0xC1u8; 32];
+    let sid = SidecarId::new();
 
     {
         let mut idx = ContentIndex::load(tmp.path());
         idx.insert(ContentIndexEntry {
+            sidecar_id: sid,
             cid,
             file_name: "persist-me.bin".into(),
             size_bytes: 100,
@@ -563,12 +558,16 @@ fn pin_intent_survives_reload() {
             pinned: false,
             kind: ContentKind::Leaf,
         });
-        assert!(idx.set_pinned(&cid, true), "initial flip should report change");
+        assert!(
+            idx.set_pinned(&sid, true),
+            "initial flip should report change"
+        );
     }
 
-    // Reload — simulates app restart.
+    // Reload — simulates app restart. SidecarId is part of the persisted
+    // file format, so the same `sid` resolves the entry post-reload.
     let reloaded = ContentIndex::load(tmp.path());
-    let entry = reloaded.get(&cid).expect("entry must persist");
+    let entry = reloaded.get(&sid).expect("entry must persist");
     assert!(
         entry.pinned,
         "pinned intent must survive reload (this is the ZEB-155 bug fix)"
@@ -584,8 +583,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
     use std::collections::HashSet;
 
     let bytes = b"zeb-155 fetch-complete repin fixture".to_vec();
-    let cid = ContentId::for_book(&bytes, ContentFlags::default())
-        .expect("fixture CID");
+    let cid = ContentId::for_book(&bytes, ContentFlags::default()).expect("fixture CID");
     let cid_bytes: [u8; 32] = cid.to_bytes();
     let cid_hex = hex::encode(cid_bytes);
 
@@ -598,10 +596,8 @@ async fn fetch_complete_arm_pins_root_in_intent() {
     let (_fetch_tx, fetch_rx) = mpsc::channel(4);
     let (_follow_tx, follow_rx) = mpsc::channel(4);
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
-    let (_voice_ch_tx, voice_ch_rx) =
-        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
-    let (_refresh_tx, refresh_rx) =
-        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -610,9 +606,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
     let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(8);
     let fetch_completion_tx_for_test = fetch_completion_tx.clone();
 
-    let followed_set = Arc::new(Mutex::new(
-        std::collections::HashSet::<String>::default(),
-    ));
+    let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -670,8 +664,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                let (runtime, startup_actions) =
-                    NodeRuntime::new(config, MemoryBookStore::new());
+                let (runtime, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,

@@ -8,7 +8,7 @@
 use tempfile::tempdir;
 
 use harmony_app::content_index::{
-    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity,
+    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity, SidecarId,
 };
 use harmony_app::folders;
 
@@ -22,6 +22,7 @@ fn create_folder_at_root_then_list_shows_it() {
 
     // Insert the sidecar entry that create_folder_at_root would insert.
     let inserted = idx.insert(ContentIndexEntry {
+        sidecar_id: SidecarId::new(),
         cid: built.bundle_cid.to_bytes(),
         file_name: "Photos".into(),
         size_bytes: built.bundle_bytes.len() as u64,
@@ -55,7 +56,9 @@ fn create_nested_folder_updates_top_level_root_cid() {
     let mut idx = ContentIndex::load(dir.path());
     let photos_v1 = folders::build_folder("Photos", &[]).expect("build v1");
 
+    let photos_sid = SidecarId::new();
     idx.insert(ContentIndexEntry {
+        sidecar_id: photos_sid,
         cid: photos_v1.bundle_cid.to_bytes(),
         file_name: "Photos".into(),
         size_bytes: photos_v1.bundle_bytes.len() as u64,
@@ -64,7 +67,7 @@ fn create_nested_folder_updates_top_level_root_cid() {
         replication_tier: ReplicationTier::Default,
         licensed: false,
         archived: false,
-        pinned: true,  // must survive rekey
+        pinned: true, // must survive rekey
         kind: ContentKind::Folder,
     });
 
@@ -85,21 +88,27 @@ fn create_nested_folder_updates_top_level_root_cid() {
     .expect("v2 build");
 
     let rekeyed = idx.rekey(
-        &photos_v1.bundle_cid.to_bytes(),
+        &photos_sid,
+        photos_v1.bundle_cid.to_bytes(),
         photos_v2.bundle_cid.to_bytes(),
         photos_v2.bundle_bytes.len() as u64,
         /* new_stored_at_ms */ 2,
     );
     assert!(rekeyed.is_ok(), "rekey succeeds");
 
-    let after = idx
-        .get(&photos_v2.bundle_cid.to_bytes())
-        .expect("rekeyed entry present");
+    // Under the symlink-style model (ZEB-164), rekey mutates the entry's
+    // CID in place rather than re-keying the map: same SidecarId, new CID.
+    let after = idx.get(&photos_sid).expect("rekeyed entry present");
+    assert_eq!(after.cid, photos_v2.bundle_cid.to_bytes(), "cid is now v2");
     assert!(after.pinned, "pinned survives rekey");
     assert_eq!(after.kind, ContentKind::Folder);
     assert_eq!(after.file_name, "Photos");
-    assert!(idx.get(&photos_v1.bundle_cid.to_bytes()).is_none(),
-        "old entry removed");
+    assert!(
+        idx.entries_for_cid(&photos_v1.bundle_cid.to_bytes())
+            .next()
+            .is_none(),
+        "no sidecar entry references the old CID"
+    );
 }
 
 // ── Task 7: Event-loop harness tests ────────────────────────────────────────
@@ -108,9 +117,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
+use harmony_compute::InstructionBudget;
 use harmony_content::book::MemoryBookStore;
 use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
-use harmony_compute::InstructionBudget;
 use harmony_runtime::{NodeConfig, NodeRuntime};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -146,16 +155,12 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
     let (_fetch_tx, fetch_rx) = mpsc::channel(4);
     let (_follow_tx, follow_rx) = mpsc::channel(4);
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
-    let (_voice_ch_tx, voice_ch_rx) =
-        mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
-    let (_refresh_tx, refresh_rx) =
-        mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let followed_set = Arc::new(Mutex::new(
-        std::collections::HashSet::<String>::default(),
-    ));
+    let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -212,8 +217,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                 .build()
                 .expect("tokio runtime for folder test event loop");
             rt.block_on(async move {
-                let (runtime, startup_actions) =
-                    NodeRuntime::new(config, MemoryBookStore::new());
+                let (runtime, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
                 harmony_app::event_loop::run(
                     runtime,
                     startup_actions,
@@ -284,9 +288,13 @@ async fn pin_folder_cascades_to_nested_leaf() {
         None => return,
     };
 
-    harmony_app::send_ingest(&harness.ingest_tx, hex::encode(leaf_cid.to_bytes()), leaf_bytes)
-        .await
-        .unwrap();
+    harmony_app::send_ingest(
+        &harness.ingest_tx,
+        hex::encode(leaf_cid.to_bytes()),
+        leaf_bytes,
+    )
+    .await
+    .unwrap();
     harmony_app::send_ingest(
         &harness.ingest_tx,
         hex::encode(folder.manifest_cid.to_bytes()),
@@ -347,6 +355,7 @@ fn pin_intent_survives_restart_for_folder() {
         let mut idx = ContentIndex::load(dir.path());
         let built = folders::build_folder("Pinned", &[]).expect("build");
         idx.insert(ContentIndexEntry {
+            sidecar_id: SidecarId::new(),
             cid: built.bundle_cid.to_bytes(),
             file_name: "Pinned".into(),
             size_bytes: built.bundle_bytes.len() as u64,
@@ -487,13 +496,9 @@ async fn list_folder_not_in_cache_returns_empty() {
 
     let random_cid_hex = hex::encode([0x42u8; 32]);
     let empty_pinned = std::collections::HashSet::new();
-    let rows = harmony_app::list_folder(
-        random_cid_hex,
-        harness.verb_tx.clone(),
-        &empty_pinned,
-    )
-    .await
-    .expect("not-in-cache returns Ok(empty), not Err");
+    let rows = harmony_app::list_folder(random_cid_hex, harness.verb_tx.clone(), &empty_pinned)
+        .await
+        .expect("not-in-cache returns Ok(empty), not Err");
 
     assert!(rows.is_empty(), "cold cache returns empty, not an error");
 }
@@ -506,17 +511,14 @@ async fn list_folder_malformed_manifest_returns_error() {
     use harmony_content::cid::{ContentFlags, ContentId};
 
     let bad_manifest = b"definitely not a folder manifest".to_vec();
-    let bad_manifest_cid =
-        ContentId::for_book(&bad_manifest, ContentFlags::default()).unwrap();
+    let bad_manifest_cid = ContentId::for_book(&bad_manifest, ContentFlags::default()).unwrap();
     let leaf_bytes = b"leaf".to_vec();
     let leaf_cid = ContentId::for_book(&leaf_bytes, ContentFlags::default()).unwrap();
 
     let mut builder = BundleBuilder::new();
     builder.add(bad_manifest_cid);
     builder.add(leaf_cid);
-    let (bundle_bytes, bundle_cid) = builder
-        .build_with_flags(ContentFlags::default())
-        .unwrap();
+    let (bundle_bytes, bundle_cid) = builder.build_with_flags(ContentFlags::default()).unwrap();
 
     let harness = match spawn_test_runtime().await {
         Some(h) => h,
