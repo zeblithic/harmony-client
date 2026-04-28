@@ -13,6 +13,7 @@ pub mod event_loop;
 pub mod folders;
 mod follows;
 pub mod identity;
+pub mod identity_commands;
 pub mod mail;
 pub mod mail_sync;
 pub mod recovery_cli;
@@ -2945,6 +2946,10 @@ pub fn run() {
             fetch_mail_body,
             update_mail,
             get_mail_counts,
+            identity_commands::current_identity_hash,
+            identity_commands::export_mnemonic_words,
+            identity_commands::preview_mnemonic_identity,
+            identity_commands::preview_recovery_file,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
