@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::identity;
+use crate::identity::KeychainStore;
 use crate::recovery_cli;
 
 // ── Shared types ─────────────────────────────────────────────────────────
@@ -26,14 +27,57 @@ pub struct RestoreInfo {
     pub comment: Option<String>,
 }
 
+// ── Internal helpers ──────────────────────────────────────────────────────
+
+/// Process-wide lock around `HARMONY_RECOVERY_PASSPHRASE*` env-var mutation.
+/// `recovery_cli::resolve_recovery_passphrase` reads from the environment
+/// (shared code path with the headless CLI), so the GUI must temporarily set
+/// these vars while invoking the helpers. Concurrent calls must serialize or
+/// they will race on the global env. The wizard's UX is serial today, but
+/// any non-UI caller (tests, background tasks) gets the same protection.
+fn recovery_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poisoning is recoverable here: state inside the critical section is
+    // env-var save/restore, not data structures we can't reason about.
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Maximum size of a recovery file the GUI will read.
+/// Recovery files are ~101 bytes today; 1 MiB is a generous upper bound that
+/// rejects accidental selection of a large file (image, video, archive).
+const MAX_RECOVERY_FILE_BYTES: u64 = 1 << 20;
+
+/// Read a recovery file with a size guard. Reject files larger than
+/// [`MAX_RECOVERY_FILE_BYTES`] before allocating.
+fn read_recovery_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+        return Err(format!(
+            "{} is too large to be a recovery file ({} bytes; max {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_RECOVERY_FILE_BYTES
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+}
+
 // ── Helpers (testable without Tauri runtime) ──────────────────────────────
 
 /// Return the 32-char hex identity hash of the on-disk identity.
 ///
 /// Used by the Settings panel header and the restore-confirm gate ("type
-/// the first 8 chars of your CURRENT hash").
-pub fn current_identity_hash_helper(plaintext_path: &Path) -> Result<String, String> {
-    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, None)?;
+/// the first 8 chars of your CURRENT hash"). The Tauri command entry point
+/// passes `KeychainStore::new().ok()` so the GUI reads the same identity
+/// the running node uses (`identity::load_or_generate` calls
+/// `read_seed_from_disk_with_keychain` with the same chain). Tests inject
+/// `None` to stay hermetic.
+pub fn current_identity_hash_helper(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<String, String> {
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
     use harmony_owner::lifecycle::RecoveryArtifact;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
@@ -41,9 +85,15 @@ pub fn current_identity_hash_helper(plaintext_path: &Path) -> Result<String, Str
 }
 
 /// Return the 24 BIP39 words for the backup wizard's blurred-grid display.
-pub fn export_mnemonic_words_helper(plaintext_path: &Path) -> Result<Vec<String>, String> {
+///
+/// Threads `keychain` through to match the running node's identity-resolution
+/// chain. Tests inject `None`.
+pub fn export_mnemonic_words_helper(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<Vec<String>, String> {
     let (words, _id_hash) =
-        recovery_cli::export_mnemonic_words_with_keychain(plaintext_path, None)?;
+        recovery_cli::export_mnemonic_words_with_keychain(plaintext_path, keychain)?;
     Ok(words)
 }
 
@@ -74,8 +124,7 @@ pub fn preview_recovery_file_helper(
     use harmony_owner::lifecycle::RecoveryArtifact;
     use secrecy::SecretString;
 
-    let bytes =
-        std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
+    let bytes = read_recovery_file(in_path)?;
     let pass = SecretString::from(passphrase.to_string());
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
@@ -101,17 +150,23 @@ pub fn preview_recovery_file_helper(
 /// `resolve_recovery_passphrase()` does not log a warning about both vars
 /// being set when a user previously configured the CLI file-based path.
 /// Both vars are restored to their prior values on exit (including on error).
-/// The env vars are process-global, so two concurrent calls would race —
-/// the wizard's serial UX (one Backup… or Restore… flow at a time) is
-/// what makes this safe in practice. A future follow-up should thread
-/// the passphrase through `recovery_cli::*_with_keychain` as an
-/// explicit argument to remove this constraint entirely.
+/// Concurrent calls are serialized through [`recovery_env_lock`]; the lock
+/// is what makes the env-var mutation safe (the wizard's serial UX is
+/// only an additional defense). ZEB-187 will thread the passphrase through
+/// `recovery_cli::*_with_keychain` as an explicit argument and remove the
+/// env-var dance entirely.
 pub fn export_recovery_file_to_path_helper(
     plaintext_path: &Path,
     out_path: &Path,
     passphrase: &str,
     comment: Option<String>,
+    keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    // Serialize concurrent helper calls; env-var mutation is process-global.
+    // The wizard's serial UX makes the unlocked race unreachable today, but
+    // the lock guarantees it for any non-UI caller (CodeRabbit / Qodo flag).
+    let _guard = recovery_env_lock();
+
     // Save BOTH env vars on entry.
     let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
     let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
@@ -125,7 +180,7 @@ pub fn export_recovery_file_to_path_helper(
         plaintext_path,
         out_path,
         comment.as_deref(),
-        None,
+        keychain,
     );
 
     // Restore both env vars to whatever they were on entry.
@@ -150,13 +205,14 @@ pub fn export_recovery_file_to_path_helper(
 pub fn restore_mnemonic_from_words_helper(
     plaintext_path: &Path,
     words: &[String],
+    keychain: Option<KeychainStore>,
 ) -> Result<String, String> {
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     recovery_cli::restore_mnemonic_from_words_with_keychain(
         plaintext_path,
         words,
         /*force=*/ true,
-        None,
+        keychain,
     )?;
     // Derive the resulting identity hash from the words (no re-read from disk needed).
     // This re-parse cannot fail: the same phrase was already parsed successfully
@@ -184,18 +240,17 @@ pub fn restore_recovery_file_from_path_helper(
     plaintext_path: &Path,
     in_path: &Path,
     passphrase: &str,
+    keychain: Option<KeychainStore>,
 ) -> Result<RestoreInfo, String> {
     use harmony_owner::lifecycle::RecoveryArtifact;
     use secrecy::SecretString;
 
     // ── First pass: perform the actual restore (writes seed to disk). ──────
     // Env-var wrapping has the same concurrency caveat as
-    // `export_recovery_file_to_path_helper`: process-global, safe only
-    // because the GUI wizard runs flows serially.
-    // Both HARMONY_RECOVERY_PASSPHRASE and HARMONY_RECOVERY_PASSPHRASE_FILE
-    // are saved on entry, the file var is cleared (to suppress the
-    // resolve_recovery_passphrase() dual-set warning), and both are restored
-    // on exit regardless of success or failure.
+    // `export_recovery_file_to_path_helper`; the lock guarantees serialization
+    // across all callers (UI + non-UI).
+    let _guard = recovery_env_lock();
+
     let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
     let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
 
@@ -209,7 +264,7 @@ pub fn restore_recovery_file_from_path_helper(
         plaintext_path,
         in_path,
         /*force=*/ true,
-        None,
+        keychain,
     );
 
     // Restore both env vars to whatever they were on entry.
@@ -225,8 +280,7 @@ pub fn restore_recovery_file_from_path_helper(
     restore_result?;
 
     // ── Second pass: decrypt again to extract metadata for RestoreInfo. ────
-    let bytes =
-        std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
+    let bytes = read_recovery_file(in_path)?;
     let pass = SecretString::from(passphrase.to_string());
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
@@ -244,14 +298,14 @@ pub fn restore_recovery_file_from_path_helper(
 #[tauri::command]
 pub async fn current_identity_hash() -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    current_identity_hash_helper(&plaintext_path)
+    current_identity_hash_helper(&plaintext_path, KeychainStore::new().ok())
 }
 
 /// Return the 24 BIP39 mnemonic words for the backup wizard.
 #[tauri::command]
 pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    export_mnemonic_words_helper(&plaintext_path)
+    export_mnemonic_words_helper(&plaintext_path, KeychainStore::new().ok())
 }
 
 /// Return the identity hash that would result from restoring the given
@@ -281,7 +335,13 @@ pub async fn export_recovery_file_to_path(
     comment: Option<String>,
 ) -> Result<(), String> {
     let plaintext_path = identity::resolve_path(None)?;
-    export_recovery_file_to_path_helper(&plaintext_path, &out_path, &passphrase, comment)
+    export_recovery_file_to_path_helper(
+        &plaintext_path,
+        &out_path,
+        &passphrase,
+        comment,
+        KeychainStore::new().ok(),
+    )
 }
 
 /// Restore the on-disk identity from a 24-word mnemonic array.
@@ -292,7 +352,7 @@ pub async fn export_recovery_file_to_path(
 #[tauri::command]
 pub async fn restore_mnemonic_from_words(words: Vec<String>) -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    restore_mnemonic_from_words_helper(&plaintext_path, &words)
+    restore_mnemonic_from_words_helper(&plaintext_path, &words, KeychainStore::new().ok())
 }
 
 /// Restore the on-disk identity from a passphrase-encrypted recovery file.
@@ -306,7 +366,12 @@ pub async fn restore_recovery_file_from_path(
     passphrase: String,
 ) -> Result<RestoreInfo, String> {
     let plaintext_path = identity::resolve_path(None)?;
-    restore_recovery_file_from_path_helper(&plaintext_path, &in_path, &passphrase)
+    restore_recovery_file_from_path_helper(
+        &plaintext_path,
+        &in_path,
+        &passphrase,
+        KeychainStore::new().ok(),
+    )
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────
@@ -339,7 +404,7 @@ mod tests {
         std::env::set_var("HARMONY_PASSPHRASE", "cih-test");
         plant_seed(&plaintext_path, &[0x11u8; 32]);
 
-        let hash = current_identity_hash_helper(&plaintext_path).expect("hash");
+        let hash = current_identity_hash_helper(&plaintext_path, None).expect("hash");
         // identity_hash() is [u8; 16] → 32 hex characters.
         assert_eq!(hash.len(), 32, "identity hash is 16 bytes → 32 hex chars");
         assert!(
@@ -365,7 +430,7 @@ mod tests {
                 .master_pubkey_bundle()
                 .identity_hash(),
         );
-        let got = current_identity_hash_helper(&plaintext_path).expect("hash");
+        let got = current_identity_hash_helper(&plaintext_path, None).expect("hash");
         assert_eq!(got, expected);
 
         std::env::remove_var("HARMONY_PASSPHRASE");
@@ -382,7 +447,7 @@ mod tests {
         std::env::set_var("HARMONY_PASSPHRASE", "emw-test");
         plant_seed(&plaintext_path, &[0x33u8; 32]);
 
-        let words = export_mnemonic_words_helper(&plaintext_path).expect("words");
+        let words = export_mnemonic_words_helper(&plaintext_path, None).expect("words");
         assert_eq!(words.len(), 24, "BIP39-24 produces exactly 24 words");
         for w in &words {
             assert!(
@@ -475,6 +540,27 @@ mod tests {
     }
 
     #[test]
+    fn preview_recovery_file_rejects_oversized_file() {
+        // Defense-in-depth: protect against accidental selection of a large
+        // file (image, archive). Pin the size cap (review feedback from Qodo).
+        let dir = tempfile::tempdir().unwrap();
+        let too_big = dir.path().join("too-big.bin");
+        // One byte over the cap — cheaper than writing 1 MiB+ of data and
+        // still exercises the metadata().len() > MAX path.
+        let len = MAX_RECOVERY_FILE_BYTES + 1;
+        let f = std::fs::File::create(&too_big).unwrap();
+        f.set_len(len).unwrap();
+        drop(f);
+
+        let err = preview_recovery_file_helper(&too_big, "any-pass")
+            .expect_err("oversized file must be rejected before decrypt");
+        assert!(
+            err.contains("too large to be a recovery file"),
+            "error must explain the size cap; got: {err}"
+        );
+    }
+
+    #[test]
     fn preview_recovery_file_missing_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nonexistent.bin");
@@ -506,8 +592,14 @@ mod tests {
 
         // Sub-case 1: prior env value is restored after a successful call.
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
-        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
-            .expect("export");
+        export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &recovery_path,
+            "inner-call",
+            None,
+            None,
+        )
+        .expect("export");
         assert_eq!(
             std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
             Ok("outer-original"),
@@ -517,8 +609,14 @@ mod tests {
         // Sub-case 2: when prior was unset, env is removed (not left at "inner-call").
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
         let _ = std::fs::remove_file(&recovery_path);
-        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
-            .expect("export");
+        export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &recovery_path,
+            "inner-call",
+            None,
+            None,
+        )
+        .expect("export");
         assert!(
             std::env::var("HARMONY_RECOVERY_PASSPHRASE").is_err(),
             "HARMONY_RECOVERY_PASSPHRASE must be unset after the call (was unset before)"
@@ -528,8 +626,13 @@ mod tests {
         // Point out_path at a non-existent nested directory so the write fails.
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "outer-original");
         let bogus_path = dir.path().join("no-such-dir").join("rec.bin");
-        let _ =
-            export_recovery_file_to_path_helper(&plaintext_path, &bogus_path, "inner-call", None);
+        let _ = export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &bogus_path,
+            "inner-call",
+            None,
+            None,
+        );
         // call may or may not error depending on internal flow; what matters is the env state:
         assert_eq!(
             std::env::var("HARMONY_RECOVERY_PASSPHRASE").as_deref(),
@@ -540,8 +643,14 @@ mod tests {
         // Sub-case 4: HARMONY_RECOVERY_PASSPHRASE_FILE is also save/restored (Fix 1 behavior).
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", "/tmp/some-file");
         let _ = std::fs::remove_file(&recovery_path);
-        export_recovery_file_to_path_helper(&plaintext_path, &recovery_path, "inner-call", None)
-            .expect("export");
+        export_recovery_file_to_path_helper(
+            &plaintext_path,
+            &recovery_path,
+            "inner-call",
+            None,
+            None,
+        )
+        .expect("export");
         assert_eq!(
             std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").as_deref(),
             Ok("/tmp/some-file"),

@@ -242,8 +242,8 @@ fn gui_export_mnemonic_restored_via_cli_preserves_identity_hash() {
         .identity_hash();
 
     // GUI path: call the helper directly (no Tauri runtime needed).
-    let words =
-        identity_commands::export_mnemonic_words_helper(&plaintext_path).expect("gui export words");
+    let words = identity_commands::export_mnemonic_words_helper(&plaintext_path, None)
+        .expect("gui export words");
     assert_eq!(words.len(), 24);
 
     // Write words to a file so the CLI restore_mnemonic_with_keychain can read it.
@@ -293,7 +293,7 @@ fn cli_export_mnemonic_restored_via_gui_preserves_identity_hash() {
 
     // GUI path: restore via the helper (force=true, no Tauri runtime needed).
     let restored_hash =
-        identity_commands::restore_mnemonic_from_words_helper(&plaintext_path, &words)
+        identity_commands::restore_mnemonic_from_words_helper(&plaintext_path, &words, None)
             .expect("gui restore");
 
     // The helper returns the hash directly; also verify via disk re-read.

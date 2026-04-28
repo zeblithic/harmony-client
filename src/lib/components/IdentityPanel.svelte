@@ -7,9 +7,21 @@
     throw new Error(`unhandled wizard variant: ${JSON.stringify(x)}`);
   }
 
-  let fullHash = $state('');
+  // `fullHash` is `null` until `current_identity_hash` resolves on mount.
+  // Anything that reads/decides on the current identity (the typed-prefix
+  // confirm gate, the Backup/Restore buttons, copy-to-clipboard) must check
+  // for null first — otherwise an empty-string slice can silently bypass the
+  // confirm gate before the hash arrives.
+  let fullHash = $state<string | null>(null);
+  let hashLoaded = $derived(fullHash !== null && fullHash.length === 32);
   let displayHash = $derived(fullHash ? `0x${fullHash.slice(0, 8)}…` : '…');
+  // Empty when the hash is unloaded — paired with `hashLoaded` to keep the
+  // typed-prefix gate uncomparable until the real hash is in hand.
+  let currentPrefix = $derived(fullHash ? fullHash.slice(0, 8) : '');
   let loadError = $state<string | null>(null);
+  // True while a restore IPC call is in flight. Blocks the Replace button so
+  // double-click cannot issue duplicate restore_* requests against the store.
+  let restoreInFlight = $state(false);
 
   interface RestoreCandidate {
     identity_hash: string;
@@ -98,7 +110,7 @@
   }
 
   async function copyHash() {
-    await copyText(fullHash);
+    if (fullHash) await copyText(fullHash);
   }
 
   function resetToIdle() {
@@ -301,12 +313,27 @@
         inPath: step.pendingFilePath,
         passphrase: step.passphrase,
       });
-    } catch {
-      // Deliberate ambiguity per spec — don't leak which field was wrong.
+    } catch (e) {
       if (wizardState !== epoch) return;
+      // The backend prefixes IO failures with "failed to read <path>:". We
+      // surface those verbatim so the user sees the actual filesystem error
+      // (missing file, permissions, file too large) rather than a misleading
+      // "passphrase incorrect" message. Genuine decrypt/AEAD failures keep
+      // the spec's ambiguous text — we don't leak which input was wrong.
+      // Tauri rejects with a string in production, but tests use Error;
+      // unwrap to .message in both paths so the prefix-detection works.
+      const msg = e instanceof Error ? e.message : String(e);
+      const isIoError =
+        msg.startsWith('failed to read ') ||
+        msg.includes(' is too large to be a recovery file');
       wizardState = {
         kind: 'restore',
-        step: { ...wizardState.step, restoreError: 'Could not decrypt — passphrase incorrect or file corrupted.' },
+        step: {
+          ...wizardState.step,
+          restoreError: isIoError
+            ? msg
+            : 'Could not decrypt — passphrase incorrect or file corrupted.',
+        },
       };
       return;
     }
@@ -342,6 +369,16 @@
 
   async function commitRestore() {
     if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'confirm') return;
+    // Reentrancy guard: the button is disabled while in-flight, but a fast
+    // double-click can still queue two synchronous callbacks before Svelte's
+    // disabled state propagates. Returning here (and below) makes the
+    // function effectively idempotent at the function-call boundary.
+    if (restoreInFlight) return;
+    // Defensive: the button is also gated on hashLoaded, but a non-UI caller
+    // (or a future code path) shouldn't be able to commit a restore against
+    // an unloaded current hash — the typed-prefix gate would have compared
+    // against an empty string.
+    if (!hashLoaded) return;
     const step = wizardState.step;
 
     // Option B runtime guard (I-3): the confirm variant has optional
@@ -357,6 +394,7 @@
     }
 
     const epoch = wizardState;
+    restoreInFlight = true;
 
     try {
       let postRestoreHash: string;
@@ -374,6 +412,8 @@
     } catch (e) {
       if (wizardState !== epoch) return;
       wizardState = { kind: 'restore', step: { phase: 'commitError', error: String(e) } };
+    } finally {
+      restoreInFlight = false;
     }
   }
 
@@ -421,8 +461,14 @@
       </button>
     </div>
     <div class="actions">
-      <button onclick={() => (wizardState = { kind: 'backup', step: { phase: 'pickType' } })}>Backup…</button>
-      <button onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}>Restore…</button>
+      <button
+        disabled={!hashLoaded}
+        onclick={() => (wizardState = { kind: 'backup', step: { phase: 'pickType' } })}
+      >Backup…</button>
+      <button
+        disabled={!hashLoaded}
+        onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}
+      >Restore…</button>
     </div>
     <p class="explainer">
       Back up your identity to a 24-word phrase or an encrypted file.
@@ -729,17 +775,17 @@
       </p>
       <div class="hash-diff">
         <span class="hash-diff-label">Current</span>
-        <span class="hash-diff-value hash-diff-current">0x{fullHash.slice(0, 8)}…</span>
+        <span class="hash-diff-value hash-diff-current">0x{currentPrefix}…</span>
         <span class="hash-diff-arrow">→</span>
         <span class="hash-diff-label">Restored</span>
         <span class="hash-diff-value hash-diff-new">0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</span>
       </div>
       <label class="field-label">
-        Type the first 8 chars of your CURRENT identity hash to proceed: ({fullHash.slice(0, 8)})
+        Type the first 8 chars of your CURRENT identity hash to proceed: ({currentPrefix})
         <input
           type="text"
           aria-label="Confirm current identity hash prefix"
-          placeholder={fullHash.slice(0, 8)}
+          placeholder={currentPrefix}
           value={wizardState.step.typedPrefix}
           oninput={(e) => {
             if (wizardState.kind === 'restore' && wizardState.step.phase === 'confirm') {
@@ -750,15 +796,15 @@
           spellcheck={false}
         />
       </label>
-      {#if wizardState.step.typedPrefix.length > 0 && wizardState.step.typedPrefix !== fullHash.slice(0, 8)}
+      {#if wizardState.step.typedPrefix.length > 0 && wizardState.step.typedPrefix !== currentPrefix}
         <p class="inline-error" role="alert">That doesn't match your current identity hash.</p>
       {/if}
       <div class="actions">
-        <button onclick={resetToIdle}>Cancel</button>
+        <button onclick={resetToIdle} disabled={restoreInFlight}>Cancel</button>
         <button
-          disabled={wizardState.step.typedPrefix !== fullHash.slice(0, 8)}
+          disabled={!hashLoaded || restoreInFlight || wizardState.step.typedPrefix !== currentPrefix}
           onclick={commitRestore}
-        >Replace identity</button>
+        >{restoreInFlight ? 'Replacing…' : 'Replace identity'}</button>
       </div>
     </section>
   {:else if wizardState.step.phase === 'commitError'}

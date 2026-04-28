@@ -231,8 +231,13 @@ pub fn restore_mnemonic_with_keychain(
 
     let words: Vec<String> = raw.split_whitespace().map(String::from).collect();
     restore_mnemonic_from_words_with_keychain(plaintext_path, &words, force, keychain)?;
-    // Derive the identity-hash for the confirmation message.
-    let artifact = RecoveryArtifact::from_mnemonic(raw.trim()).map_err(|e| e.to_string())?;
+    // Derive the identity-hash for the confirmation message. The same parse
+    // already succeeded inside `restore_mnemonic_from_words_with_keychain`
+    // (same input, same parser, no I/O between) — so we use `.expect()`
+    // rather than `?`. Otherwise a logging-only step would convert a
+    // succeeded restore (seed already on disk) into a returned `Err`.
+    let artifact = RecoveryArtifact::from_mnemonic(raw.trim())
+        .expect("post-restore mnemonic re-parse must succeed; same parse already passed in restore_mnemonic_from_words_with_keychain");
     eprintln!(
         "restored identity-hash: {}",
         hex::encode(artifact.master_pubkey_bundle().identity_hash())

@@ -53,6 +53,32 @@ describe('IdentityPanel — default state', () => {
     expect(writeText).toHaveBeenCalledWith(fullHash);
   });
 
+  it('disables Backup and Restore buttons until current_identity_hash resolves', async () => {
+    // Hold the invoke promise open so onMount() never resolves during this
+    // test — the panel stays in its pre-load state.
+    let resolveLoad: (v: string) => void = () => {};
+    const pending = new Promise<string>((r) => (resolveLoad = r));
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return pending;
+      throw new Error(`unexpected invoke: ${cmd}`);
+    });
+
+    render(IdentityPanel);
+
+    // Both action buttons must be disabled while the hash is unresolved.
+    // This pins the regression where an empty fullHash made the typed-prefix
+    // gate compare against '' (review feedback from Qodo / CodeAnt / CodeRabbit).
+    const backupBtn = screen.getByRole('button', { name: /backup/i });
+    const restoreBtn = screen.getByRole('button', { name: /restore/i });
+    expect(backupBtn).toBeDisabled();
+    expect(restoreBtn).toBeDisabled();
+
+    // After the hash resolves, both become enabled.
+    resolveLoad('a1b2c3d4'.repeat(4));
+    await waitFor(() => expect(backupBtn).not.toBeDisabled());
+    expect(restoreBtn).not.toBeDisabled();
+  });
+
   it('does not throw when clipboard is unavailable', async () => {
     const fullHash = 'a1b2c3d4'.repeat(4);
     mockInvoke.mockImplementation(async (cmd: string) => {
@@ -69,8 +95,13 @@ describe('IdentityPanel — default state', () => {
     render(IdentityPanel);
     const hashElement = await screen.findByText(/0xa1b2c3d4/);
 
-    // Should not throw
-    await expect(fireEvent.click(hashElement)).resolves.not.toThrow();
+    // copyHash awaits navigator.clipboard.writeText(); when clipboard is
+    // undefined we early-return without throwing. Trigger the click and
+    // wait for the next microtask so any unhandled rejection would surface.
+    fireEvent.click(hashElement);
+    await Promise.resolve();
+    // The hash is still rendered — no error tore down the component.
+    expect(screen.getByText(/0xa1b2c3d4/)).toBeInTheDocument();
   });
 });
 
@@ -1209,6 +1240,50 @@ describe('Restore wizard — step 3 (confirm)', () => {
     expect(screen.getByText(/write failed: disk full/i)).toBeInTheDocument();
   });
 
+  it('reentrancy guard: double-click Replace identity issues only one restore IPC', async () => {
+    // Pins regression where commitRestore did not transition to a busy state
+    // before awaiting; a fast double-click queued two synchronous callbacks
+    // before Svelte's `disabled` propagated, so two restore_* IPCs hit the
+    // store back-to-back. Now: an in-flight flag short-circuits re-entry,
+    // and the button label flips to "Replacing…" + becomes disabled.
+    let resolveCommit!: (hash: string) => void;
+    const commitPromise = new Promise<string>((resolve) => { resolveCommit = resolve; });
+    let restoreCallCount = 0;
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_mnemonic_identity') return newHash;
+      if (cmd === 'restore_mnemonic_from_words') {
+        restoreCallCount += 1;
+        return commitPromise;
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtConfirmViaMnemonic(newHash);
+
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+
+    const replaceBtn = screen.getByRole('button', { name: /replace identity/i });
+
+    // First click — starts the pending invoke.
+    await fireEvent.click(replaceBtn);
+
+    // Button must now be disabled and labelled "Replacing…".
+    const replacingBtn = await screen.findByRole('button', { name: /replacing/i });
+    expect(replacingBtn).toBeDisabled();
+
+    // Second click on the same DOM node — must be ignored.
+    await fireEvent.click(replacingBtn);
+
+    // Settle the pending invoke.
+    resolveCommit('c3d4e5f6'.repeat(4));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(restoreCallCount).toBe(1);
+  });
+
   it('race guard: cancel while commit invoke pending does not resurrect wizard', async () => {
     let resolveCommit!: (hash: string) => void;
     const commitPromise = new Promise<string>((resolve) => { resolveCommit = resolve; });
@@ -1620,6 +1695,30 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
 
     await screen.findByText(/could not decrypt/i);
     expect(screen.getByText(/passphrase incorrect or file corrupted/i)).toBeInTheDocument();
+  });
+
+  it('IO error from preview surfaces verbatim (not ambiguous decrypt text)', async () => {
+    // The backend prefixes IO failures with "failed to read <path>:". The
+    // ambiguous "passphrase incorrect or file corrupted" message would
+    // misdirect the user when the real failure is a missing file or
+    // permission denied. Pin verbatim pass-through (CodeAnt review feedback).
+    const ioErr = 'failed to read /tmp/missing.recovery: No such file or directory (os error 2)';
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
+      if (cmd === 'preview_recovery_file') throw new Error(ioErr);
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'irrelevant' } });
+    await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+
+    await screen.findByText(/no such file or directory/i);
+    // Must NOT show the ambiguous "passphrase incorrect" message for IO errors.
+    expect(screen.queryByText(/passphrase incorrect or file corrupted/i)).not.toBeInTheDocument();
   });
 
   it('successful decrypt transitions to fileDecrypted step', async () => {
