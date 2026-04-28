@@ -177,6 +177,64 @@
       wizardState = { kind: 'backup', step: { phase: 'fileSaveError', error: `Could not save to ${outPath}: ${e}. Try a different location.` } };
     }
   }
+
+  // Transient UI state for pickSource step (not yet committed to wizardState)
+  let selectedRestoreSource = $state<'mnemonic' | 'file' | null>(null);
+
+  function advanceFromPickSource() {
+    if (!selectedRestoreSource) return;
+    if (selectedRestoreSource === 'mnemonic') {
+      wizardState = {
+        kind: 'restore',
+        step: { phase: 'mnemonicEntry', input: '', validationError: null },
+      };
+    } else {
+      wizardState = {
+        kind: 'restore',
+        step: { phase: 'fileEntry', pendingFilePath: '', passphrase: '', showPass: false, restoreError: null },
+      };
+    }
+    selectedRestoreSource = null;
+  }
+
+  async function commitRestore() {
+    if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'confirm') return;
+    const step = wizardState.step;
+
+    const epoch = wizardState;
+
+    try {
+      let postRestoreHash: string;
+      if (step.restoreSource === 'mnemonic') {
+        postRestoreHash = await invoke<string>('restore_mnemonic_from_words', { words: step.pendingWords });
+      } else {
+        const info = await invoke<{ identity_hash: string }>('restore_recovery_file_from_path', {
+          inPath: step.pendingFilePath,
+          passphrase: step.passphrase,
+        });
+        postRestoreHash = info.identity_hash;
+      }
+      if (wizardState !== epoch) return;
+      wizardState = { kind: 'restore', step: { phase: 'done', postRestoreHash } };
+    } catch (e) {
+      if (wizardState !== epoch) return;
+      wizardState = { kind: 'restore', step: { phase: 'commitError', error: String(e) } };
+    }
+  }
+
+  async function finishRestore() {
+    const epoch = wizardState;
+    try {
+      const refreshed = await invoke<string>('current_identity_hash');
+      if (wizardState !== epoch) return;
+      fullHash = refreshed;
+    } catch {
+      // Best-effort refresh — if it fails the panel is still functional.
+    }
+    if (wizardState !== epoch) return;
+    wizardState = { kind: 'idle' };
+    selectedRestoreSource = null;
+  }
 </script>
 
 {#if loadError}
@@ -370,12 +428,132 @@
       </div>
     </section>
   {/if}
-{:else}
-  <!-- TODO Task 7/8/9: restore wizard flows -->
-  <section class="identity-panel" aria-label="Identity">
-    <button onclick={() => (wizardState = { kind: 'idle' })}>← Back</button>
-    <p>Restore wizard placeholder.</p>
-  </section>
+{:else if wizardState.kind === 'restore'}
+  {#if wizardState.step.phase === 'pickSource'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Restore identity</h3>
+      <p class="explainer">Choose how to restore your identity. The current identity will be permanently replaced.</p>
+      <fieldset class="backup-type-picker">
+        <legend class="visually-hidden">Restore source</legend>
+        <label>
+          <input type="radio" bind:group={selectedRestoreSource} value="mnemonic" />
+          24-word recovery phrase
+        </label>
+        <label>
+          <input type="radio" bind:group={selectedRestoreSource} value="file" />
+          Recovery file
+        </label>
+      </fieldset>
+      <div class="actions">
+        <button onclick={resetToIdle}>Cancel</button>
+        <button disabled={!selectedRestoreSource} onclick={advanceFromPickSource}>Continue</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'mnemonicEntry'}
+    <!-- Task 8 placeholder -->
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Enter recovery phrase</h3>
+      <p class="explainer">Task 8 placeholder — mnemonic entry not yet implemented.</p>
+      <div class="actions">
+        <button onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}>Back</button>
+        <button onclick={resetToIdle}>Cancel</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'fileEntry'}
+    <!-- Task 9 placeholder -->
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Select recovery file</h3>
+      <p class="explainer">Task 9 placeholder — file entry not yet implemented.</p>
+      <div class="actions">
+        <button onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}>Back</button>
+        <button onclick={resetToIdle}>Cancel</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'fileDecrypted'}
+    <!-- Task 9 placeholder -->
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">File decrypted</h3>
+      <p class="explainer">Task 9 placeholder — file-decrypted confirmation not yet implemented.</p>
+      <div class="actions">
+        <button onclick={resetToIdle}>Cancel</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'confirm'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Confirm overwrite</h3>
+      <p class="warning-text">
+        Warning: replacing your identity is unrecoverable. Your current identity will be permanently lost.
+        Make sure you have a backup of your current identity before proceeding.
+      </p>
+      <div class="hash-diff">
+        <span class="hash-diff-label">Current</span>
+        <span class="hash-diff-value hash-diff-current">0x{fullHash.slice(0, 8)}…</span>
+        <span class="hash-diff-arrow">→</span>
+        <span class="hash-diff-label">Restored</span>
+        <span class="hash-diff-value hash-diff-new">0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</span>
+      </div>
+      <label class="field-label">
+        Type the first 8 chars of your CURRENT identity hash to proceed: ({fullHash.slice(0, 8)})
+        <input
+          type="text"
+          aria-label="Confirm current identity hash prefix"
+          placeholder={fullHash.slice(0, 8)}
+          value={wizardState.step.typedPrefix}
+          oninput={(e) => {
+            if (wizardState.kind === 'restore' && wizardState.step.phase === 'confirm') {
+              wizardState = { kind: 'restore', step: { ...wizardState.step, typedPrefix: (e.target as HTMLInputElement).value } };
+            }
+          }}
+          autocomplete="off"
+          spellcheck={false}
+        />
+      </label>
+      {#if wizardState.step.typedPrefix.length > 0 && wizardState.step.typedPrefix !== fullHash.slice(0, 8)}
+        <p class="inline-error" role="alert">That doesn't match your current identity hash.</p>
+      {/if}
+      <div class="actions">
+        <button onclick={resetToIdle}>Cancel</button>
+        <button
+          disabled={wizardState.step.typedPrefix !== fullHash.slice(0, 8)}
+          onclick={commitRestore}
+        >Replace identity</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'commitError'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">Restore failed</h3>
+      <p class="error">{wizardState.step.error}</p>
+      <div class="actions">
+        <button onclick={() => {
+          if (wizardState.kind === 'restore' && wizardState.step.phase === 'commitError') {
+            // Go back to source picker so user can retry from scratch
+            wizardState = { kind: 'restore', step: { phase: 'pickSource' } };
+          }
+        }}>Back</button>
+        <button onclick={resetToIdle}>Cancel</button>
+      </div>
+    </section>
+  {:else if wizardState.step.phase === 'done'}
+    <section class="identity-panel" aria-label="Identity">
+      <h3 class="section-title">✓ Identity restored</h3>
+      <p class="hash-anchor">New identity hash:</p>
+      <button
+        class="hash-display"
+        title="Click to copy full identity hash"
+        onclick={async () => {
+          if (!navigator.clipboard) return;
+          try { await navigator.clipboard.writeText(wizardState.kind === 'restore' && wizardState.step.phase === 'done' ? wizardState.step.postRestoreHash : ''); } catch { /* ignore */ }
+        }}
+      >0x{wizardState.step.postRestoreHash.slice(0, 8)}…</button>
+      <p class="explainer">
+        Verify this matches what you expected. If it does not match your backup's expected hash,
+        restore again from the correct backup before performing any other action.
+      </p>
+      <div class="actions">
+        <button onclick={finishRestore}>Done</button>
+      </div>
+    </section>
+  {/if}
 {/if}
 
 <style>
@@ -433,6 +611,30 @@
     margin: 12px 0; cursor: pointer; color: var(--text-primary);
   }
   .hash-anchor { color: var(--text-secondary); font-size: 0.85em; margin: 4px 0 8px; }
+  .warning-text {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    margin: 8px 0 12px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    border-left: 3px solid var(--border);
+  }
+  .hash-diff {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 12px 0;
+    font-family: ui-monospace, monospace;
+    font-size: 0.85em;
+  }
+  .hash-diff-label { color: var(--text-muted); }
+  .hash-diff-value { color: var(--text-primary); }
+  .hash-diff-current { opacity: 0.65; }
+  .hash-diff-new { color: var(--accent); }
+  .hash-diff-arrow { color: var(--text-muted); }
+  .inline-error { color: var(--text-secondary); font-size: 0.85em; margin: 4px 0; }
   .field-label {
     display: flex; flex-direction: column; gap: 4px;
     margin: 8px 0; color: var(--text-primary); font-size: 0.9em;

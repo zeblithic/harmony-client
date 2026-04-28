@@ -93,15 +93,16 @@ describe('IdentityPanel — wizard mode toggles', () => {
     expect(screen.queryByRole('button', { name: /restore/i })).toBeNull();
   });
 
-  it('clicking Restore… shows restore placeholder and hides default buttons', async () => {
+  it('clicking Restore… shows restore source picker and hides default buttons', async () => {
     render(IdentityPanel);
     await screen.findByText(/0xa1b2c3d4/);
 
     await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
 
-    expect(screen.getByText(/restore wizard placeholder/i)).toBeTruthy();
+    expect(screen.getByText(/restore identity/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /backup/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /restore/i })).toBeNull();
+    // The Restore button in idle is gone; Continue appears instead
+    expect(screen.getByRole('button', { name: /continue/i })).toBeTruthy();
   });
 
   it('Cancel button in backup type picker returns to idle state', async () => {
@@ -119,14 +120,14 @@ describe('IdentityPanel — wizard mode toggles', () => {
     expect(screen.getByRole('button', { name: /restore/i })).toBeTruthy();
   });
 
-  it('Back button in restore placeholder returns to idle state', async () => {
+  it('Cancel button in restore source picker returns to idle state', async () => {
     render(IdentityPanel);
     await screen.findByText(/0xa1b2c3d4/);
 
     await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
-    expect(screen.getByText(/restore wizard placeholder/i)).toBeTruthy();
+    expect(screen.getByText(/restore identity/i)).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole('button', { name: /← back/i }));
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
 
     await screen.findByText(/0xa1b2c3d4/);
     expect(screen.getByRole('button', { name: /backup/i })).toBeTruthy();
@@ -727,5 +728,189 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     // Assert: still on idle, no success screen.
     expect(screen.queryByText(/recovery file saved/i)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 7: Restore wizard — step 1 (pickSource)
+// ---------------------------------------------------------------------------
+
+describe('Restore wizard — step 1 (pickSource)', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      throw new Error(`unexpected: ${cmd}`);
+    });
+  });
+
+  it('shows two source options and a disabled Continue button on open', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    expect(screen.getByLabelText(/24-word recovery phrase/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/recovery file/i)).toBeInTheDocument();
+    const continueBtn = screen.getByRole('button', { name: /continue/i });
+    expect(continueBtn).toBeDisabled();
+  });
+
+  it('Continue becomes enabled after selecting "24-word recovery phrase"', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    const continueBtn = screen.getByRole('button', { name: /continue/i });
+    expect(continueBtn).toBeDisabled();
+
+    await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+    expect(continueBtn).not.toBeDisabled();
+  });
+
+  it('Continue becomes enabled after selecting "Recovery file"', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    const continueBtn = screen.getByRole('button', { name: /continue/i });
+    expect(continueBtn).toBeDisabled();
+
+    await fireEvent.click(screen.getByLabelText(/recovery file/i));
+    expect(continueBtn).not.toBeDisabled();
+  });
+
+  it('Cancel from pickSource returns to idle', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xaaaaaaaa/);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
+  });
+
+  it('selecting mnemonic and clicking Continue transitions to mnemonicEntry placeholder', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    await fireEvent.click(screen.getByLabelText(/24-word recovery phrase/i));
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/enter recovery phrase/i);
+    expect(screen.queryByText(/restore identity/i)).not.toBeInTheDocument();
+  });
+
+  it('selecting file and clicking Continue transitions to fileEntry placeholder', async () => {
+    render(IdentityPanel);
+    await screen.findByText(/0xaaaaaaaa/);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+
+    await fireEvent.click(screen.getByLabelText(/recovery file/i));
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/select recovery file/i);
+    expect(screen.queryByText(/restore identity/i)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 7: Restore wizard — step 3 (confirm) — needs Tasks 8/9 to drive into;
+// using it.skip per plan Option B. Un-skip at end of Task 8.
+// ---------------------------------------------------------------------------
+
+describe('Restore wizard — step 3 (confirm)', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      throw new Error(`unexpected: ${cmd}`);
+    });
+  });
+
+  it.skip('renders hash diff, type-to-confirm input, and disabled Replace identity button (needs Task 8/9 to navigate here)', async () => {
+    // Navigate via Task 8's mnemonic entry → confirm transition.
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('Replace identity is disabled until typedPrefix matches current hash prefix (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('inline error shown when typedPrefix is non-empty but mismatching (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('Cancel from confirm returns to idle (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('Replace identity (mnemonic) invokes restore_mnemonic_from_words and transitions to done (needs Task 8)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done (needs Task 9)', async () => {
+    // Un-skip when Task 9 is implemented.
+  });
+
+  it.skip('invoke error transitions to commitError (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('race guard: cancel while commit invoke pending does not resurrect wizard (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 7: Restore wizard — commitError
+// ---------------------------------------------------------------------------
+
+describe('Restore wizard — commitError', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a'.repeat(64);
+      throw new Error(`unexpected: ${cmd}`);
+    });
+  });
+
+  it.skip('shows error message with Back and Cancel buttons (needs Task 8/9 to navigate here)', async () => {
+    // The commitError variant is reachable only after the confirm step, which
+    // requires Tasks 8/9 to build the entry path. Un-skip after Task 8.
+  });
+
+  it.skip('Back from commitError returns to pickSource (needs Task 8/9)', async () => {
+    // Un-skip after Task 8.
+  });
+
+  it.skip('Cancel from commitError returns to idle (needs Task 8/9)', async () => {
+    // Un-skip after Task 8.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 7: Restore wizard — step 4 (done)
+// ---------------------------------------------------------------------------
+
+describe('Restore wizard — step 4 (done)', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it.skip('shows new identity hash prefix with click-to-copy and Done button (needs Task 8/9 to navigate here)', async () => {
+    // The done step is reachable only after confirm, which requires Tasks 8/9.
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('Done button refreshes fullHash via current_identity_hash and returns to idle (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
+  });
+
+  it.skip('race guard: cancel between done render and Done click does not double-transition (needs Task 8/9)', async () => {
+    // Un-skip when Task 8 is implemented.
   });
 });
