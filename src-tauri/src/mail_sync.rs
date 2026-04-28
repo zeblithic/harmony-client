@@ -120,10 +120,7 @@ impl<R: Runtime> MailSync<R> {
                 if let Ok(root) = <[u8; CID_LEN]>::try_from(bytes) {
                     self.start_or_queue_walk(root).await;
                 } else {
-                    tracing::warn!(
-                        len = bytes.len(),
-                        "ignoring malformed startup query reply"
-                    );
+                    tracing::warn!(len = bytes.len(), "ignoring malformed startup query reply");
                 }
             }
         }
@@ -279,7 +276,9 @@ impl<R: Runtime> MailSync<R> {
                 }
             }
         }
-        let Role::Primary(tx) = role else { unreachable!() };
+        let Role::Primary(tx) = role else {
+            unreachable!()
+        };
 
         // RAII guard: removes the in-flight entry when this function returns
         // OR is dropped mid-fetch (cancellation). Ensures a cancelled primary
@@ -867,8 +866,11 @@ mod tests {
 
         // Construct a valid MailRoot pointing at a folder CID we won't serve.
         let folder_cid = [0xF0; CID_LEN];
-        let root = MailRoot::new_empty([0u8; 16], 1700000000)
-            .with_folder(FolderKind::Inbox, folder_cid, 1700000001);
+        let root = MailRoot::new_empty([0u8; 16], 1700000000).with_folder(
+            FolderKind::Inbox,
+            folder_cid,
+            1700000001,
+        );
         let root_bytes = root
             .to_bytes()
             .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -950,8 +952,11 @@ mod tests {
         let folder_bytes = folder.to_bytes().unwrap();
         let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
 
-        let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
-            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root = MailRoot::new_empty([0u8; 16], 1_700_000_000).with_folder(
+            FolderKind::Inbox,
+            folder_cid,
+            1_700_000_001,
+        );
         let root_bytes = root
             .to_bytes()
             .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -1018,8 +1023,11 @@ mod tests {
         let folder_bytes = folder.to_bytes().unwrap();
         let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
 
-        let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
-            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root = MailRoot::new_empty([0u8; 16], 1_700_000_000).with_folder(
+            FolderKind::Inbox,
+            folder_cid,
+            1_700_000_001,
+        );
         let root_bytes = root
             .to_bytes()
             .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -1070,7 +1078,7 @@ mod tests {
             };
             let page = MailPage {
                 version: MAILBOX_VERSION,
-                    entries: vec![entry],
+                entries: vec![entry],
             };
             let page_bytes = page.to_bytes().unwrap();
             let page_cid: [u8; 32] = *blake3::hash(&page_bytes).as_bytes();
@@ -1084,8 +1092,11 @@ mod tests {
             let folder_bytes = folder.to_bytes().unwrap();
             let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
 
-            let root = MailRoot::new_empty([0; 16], 1_700_000_000)
-                .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+            let root = MailRoot::new_empty([0; 16], 1_700_000_000).with_folder(
+                FolderKind::Inbox,
+                folder_cid,
+                1_700_000_001,
+            );
             let root_bytes = root
                 .to_bytes()
                 .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -1366,8 +1377,11 @@ mod tests {
         let folder_bytes = folder.to_bytes().unwrap();
         let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
 
-        let root = MailRoot::new_empty([0; 16], 1_700_000_000)
-            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root = MailRoot::new_empty([0; 16], 1_700_000_000).with_folder(
+            FolderKind::Inbox,
+            folder_cid,
+            1_700_000_001,
+        );
         let root_bytes = root
             .to_bytes()
             .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -1634,8 +1648,11 @@ mod tests {
         };
         let folder_bytes = folder.to_bytes().unwrap();
         let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
-        let root = MailRoot::new_empty([0; 16], 1_700_000_000)
-            .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+        let root = MailRoot::new_empty([0; 16], 1_700_000_000).with_folder(
+            FolderKind::Inbox,
+            folder_cid,
+            1_700_000_001,
+        );
         let root_bytes = root
             .to_bytes()
             .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -1656,7 +1673,11 @@ mod tests {
         // Display order should match wire order: newest (i=2) at index 0.
         assert_eq!(
             ids,
-            vec![hex::encode([2u8; 16]), hex::encode([1u8; 16]), hex::encode([0u8; 16])],
+            vec![
+                hex::encode([2u8; 16]),
+                hex::encode([1u8; 16]),
+                hex::encode([0u8; 16])
+            ],
             "inbox should preserve newest-first wire order"
         );
     }

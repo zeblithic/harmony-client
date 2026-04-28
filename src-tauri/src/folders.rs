@@ -68,10 +68,7 @@ pub struct BuiltFolder {
 /// Empty folders are representable (`children: []`) — the returned bundle
 /// has exactly one child (the manifest), which satisfies BundleBuilder's
 /// ≥1-child requirement.
-pub fn build_folder(
-    _folder_name: &str,
-    children: &[ManifestEntry],
-) -> Result<BuiltFolder, String> {
+pub fn build_folder(_folder_name: &str, children: &[ManifestEntry]) -> Result<BuiltFolder, String> {
     let manifest = FolderManifest {
         folder_manifest: ManifestBody {
             version: MANIFEST_VERSION,
@@ -80,9 +77,8 @@ pub fn build_folder(
     };
     let manifest_bytes =
         serde_json::to_vec(&manifest).map_err(|e| format!("manifest serialize: {e}"))?;
-    let manifest_cid =
-        ContentId::for_book(&manifest_bytes, ContentFlags::default())
-            .map_err(|e| format!("manifest CID: {e:?}"))?;
+    let manifest_cid = ContentId::for_book(&manifest_bytes, ContentFlags::default())
+        .map_err(|e| format!("manifest CID: {e:?}"))?;
 
     let mut builder = BundleBuilder::new();
     builder.add(manifest_cid);
@@ -161,8 +157,7 @@ mod tests {
             },
         };
         let bytes = serde_json::to_vec(&m).expect("serialize");
-        let parsed: FolderManifest =
-            serde_json::from_slice(&bytes).expect("parse");
+        let parsed: FolderManifest = serde_json::from_slice(&bytes).expect("parse");
         assert_eq!(parsed, m);
         assert!(parsed.folder_manifest.entries.is_empty());
     }
@@ -192,13 +187,14 @@ mod tests {
             },
         };
         let bytes = serde_json::to_vec(&m).expect("serialize");
-        let parsed: FolderManifest =
-            serde_json::from_slice(&bytes).expect("parse");
+        let parsed: FolderManifest = serde_json::from_slice(&bytes).expect("parse");
         assert_eq!(parsed, m, "order and fields must survive round-trip");
 
         // Spot-check the wire format contains hex-encoded CIDs and lowercase kinds.
         let json = String::from_utf8(bytes).expect("utf-8");
-        assert!(json.contains("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(
+            json.contains("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")
+        );
         assert!(json.contains("\"kind\":\"folder\""));
         assert!(json.contains("\"kind\":\"leaf\""));
     }
@@ -213,8 +209,8 @@ mod tests {
         assert_eq!(built.bundle_bytes.len(), 32);
         assert_eq!(&built.bundle_bytes[..], &built.manifest_cid.to_bytes()[..]);
         // Manifest must itself be a parseable empty folder manifest.
-        let parsed: FolderManifest = serde_json::from_slice(&built.manifest_bytes)
-            .expect("manifest is valid JSON");
+        let parsed: FolderManifest =
+            serde_json::from_slice(&built.manifest_bytes).expect("manifest is valid JSON");
         assert_eq!(parsed.folder_manifest.version, 1);
         assert!(parsed.folder_manifest.entries.is_empty());
     }
@@ -238,13 +234,15 @@ mod tests {
         // Bundle wire format: raw concatenated 32-byte CIDs, no header — see
         // harmony-content/src/bundle.rs. Layout is [manifest_cid, child_0, child_1].
         assert_eq!(built.bundle_bytes.len(), 96);
-        assert_eq!(&built.bundle_bytes[0..32], &built.manifest_cid.to_bytes()[..]);
+        assert_eq!(
+            &built.bundle_bytes[0..32],
+            &built.manifest_cid.to_bytes()[..]
+        );
         assert_eq!(&built.bundle_bytes[32..64], &[0x11u8; 32]);
         assert_eq!(&built.bundle_bytes[64..96], &[0x22u8; 32]);
 
         // Manifest enumerates children in the same order.
-        let parsed: FolderManifest =
-            serde_json::from_slice(&built.manifest_bytes).expect("parse");
+        let parsed: FolderManifest = serde_json::from_slice(&built.manifest_bytes).expect("parse");
         assert_eq!(parsed.folder_manifest.entries.len(), 2);
         assert_eq!(parsed.folder_manifest.entries[0].cid, [0x11; 32]);
         assert_eq!(parsed.folder_manifest.entries[1].kind, ContentKind::Folder);
@@ -321,7 +319,10 @@ mod tests {
         let bundle_children = vec![[0xFF; 32], [0x11; 32], [0x22; 32]];
         let err = validate_manifest_matches_bundle(&manifest, &bundle_children)
             .expect_err("length mismatch must be rejected");
-        assert!(err.contains("manifest has 1 entries, bundle has 2"), "got: {err}");
+        assert!(
+            err.contains("manifest has 1 entries, bundle has 2"),
+            "got: {err}"
+        );
     }
 
     #[test]

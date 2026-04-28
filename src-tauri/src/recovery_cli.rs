@@ -86,13 +86,13 @@ pub fn export_mnemonic_to_writers<W1: std::io::Write, W2: std::io::Write>(
     let mnemonic = artifact.to_mnemonic();
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    let map_err = |stream: &'static str| {
-        move |e: std::io::Error| format!("{stream}: {e}")
-    };
+    let map_err = |stream: &'static str| move |e: std::io::Error| format!("{stream}: {e}");
 
     writeln!(stderr, "*** Identity recovery mnemonic ***").map_err(map_err("stderr"))?;
-    writeln!(stderr, "Write these 24 words on paper. Anyone with these").map_err(map_err("stderr"))?;
-    writeln!(stderr, "words can impersonate you. Storing in a digital").map_err(map_err("stderr"))?;
+    writeln!(stderr, "Write these 24 words on paper. Anyone with these")
+        .map_err(map_err("stderr"))?;
+    writeln!(stderr, "words can impersonate you. Storing in a digital")
+        .map_err(map_err("stderr"))?;
     writeln!(stderr, "file is dangerous.").map_err(map_err("stderr"))?;
     writeln!(stderr).map_err(map_err("stderr"))?;
     writeln!(stderr, "identity-hash: {}", hex::encode(id_hash)).map_err(map_err("stderr"))?;
@@ -184,8 +184,7 @@ pub fn restore_mnemonic_with_keychain(
         .map_err(|e| format!("failed to read {}: {e}", mnemonic_file.display()))?;
     let raw = Zeroizing::new(raw);
 
-    let artifact = RecoveryArtifact::from_mnemonic(raw.as_str())
-        .map_err(|e| e.to_string())?;
+    let artifact = RecoveryArtifact::from_mnemonic(raw.as_str()).map_err(|e| e.to_string())?;
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
@@ -208,12 +207,7 @@ pub fn restore_recovery_file_cli(
     in_path: &Path,
     force: bool,
 ) -> Result<(), String> {
-    restore_recovery_file_with_keychain(
-        plaintext_path,
-        in_path,
-        force,
-        KeychainStore::new().ok(),
-    )
+    restore_recovery_file_with_keychain(plaintext_path, in_path, force, KeychainStore::new().ok())
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
@@ -224,11 +218,11 @@ pub fn restore_recovery_file_with_keychain(
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
-    let bytes = std::fs::read(in_path)
-        .map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
+    let bytes =
+        std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
     let passphrase = resolve_recovery_passphrase()?;
-    let restored = RecoveryArtifact::from_encrypted_file(&bytes, &passphrase)
-        .map_err(|e| e.to_string())?;
+    let restored =
+        RecoveryArtifact::from_encrypted_file(&bytes, &passphrase).map_err(|e| e.to_string())?;
     let artifact = restored.into_artifact();
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
@@ -296,13 +290,9 @@ mod tests {
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
         assert!(!enc_path.exists(), "test setup: enc file must be absent");
 
-        let err = export_recovery_file_with_keychain(
-            &plaintext_path,
-            &recovery_out,
-            Some("rt"),
-            None,
-        )
-        .expect_err("must fail when recovery passphrase is unset");
+        let err =
+            export_recovery_file_with_keychain(&plaintext_path, &recovery_out, Some("rt"), None)
+                .expect_err("must fail when recovery passphrase is unset");
         assert!(
             err.contains("HARMONY_RECOVERY_PASSPHRASE"),
             "must fail with recovery-passphrase error; got: {err}"
@@ -376,8 +366,13 @@ mod tests {
         std::fs::write(&mnemonic_path, original.to_mnemonic().as_str()).unwrap();
         let original_id = original.master_pubkey_bundle().identity_hash();
 
-        restore_mnemonic_with_keychain(&plaintext_path, &mnemonic_path, /*force=*/ false, None)
-            .expect("restore");
+        restore_mnemonic_with_keychain(
+            &plaintext_path,
+            &mnemonic_path,
+            /*force=*/ false,
+            None,
+        )
+        .expect("restore");
 
         let reloaded_seed =
             identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
@@ -488,11 +483,19 @@ mod tests {
             "stdout must be a single line; got: {line:?}"
         );
         let words: Vec<&str> = line.split(' ').collect();
-        assert_eq!(words.len(), 24, "stdout must be exactly 24 words; got: {line:?}");
+        assert_eq!(
+            words.len(),
+            24,
+            "stdout must be exactly 24 words; got: {line:?}"
+        );
 
         // Stdout must round-trip back to the planted seed via RecoveryArtifact.
         let parsed = RecoveryArtifact::from_mnemonic(line).expect("words parse");
-        assert_eq!(*parsed.as_bytes(), planted, "stdout words must encode the planted seed");
+        assert_eq!(
+            *parsed.as_bytes(),
+            planted,
+            "stdout words must encode the planted seed"
+        );
 
         // Stderr: warning preamble + identity-hash. Don't pin the exact prose
         // (it's user-facing text that may evolve) but pin the load-bearing

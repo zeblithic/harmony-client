@@ -73,8 +73,11 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
     let folder_bytes = folder.to_bytes().unwrap();
     let folder_cid: [u8; 32] = *blake3::hash(&folder_bytes).as_bytes();
 
-    let root = MailRoot::new_empty([0u8; 16], 1_700_000_000)
-        .with_folder(FolderKind::Inbox, folder_cid, 1_700_000_001);
+    let root = MailRoot::new_empty([0u8; 16], 1_700_000_000).with_folder(
+        FolderKind::Inbox,
+        folder_cid,
+        1_700_000_001,
+    );
     let root_bytes = root
         .to_bytes()
         .expect("test fixture root encodes at MAILBOX_VERSION");
@@ -141,8 +144,7 @@ async fn end_to_end_walks_tree_and_lazy_fetches_body() {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let recv_remaining =
-            probe_deadline.saturating_duration_since(std::time::Instant::now());
+        let recv_remaining = probe_deadline.saturating_duration_since(std::time::Instant::now());
         if recv_remaining.is_zero() {
             panic!("CAS queryable never replied within 5s");
         }

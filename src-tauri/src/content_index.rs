@@ -171,9 +171,7 @@ impl ContentIndex {
         // Symmetric with save(): if data_dir is empty, `path` is the bare
         // filename "content-index.json" and would resolve to CWD. Don't read
         // a stray CWD sidecar into the default/uninitialised state.
-        let path_is_bare = path
-            .parent()
-            .map_or(true, |p| p.as_os_str().is_empty());
+        let path_is_bare = path.parent().map_or(true, |p| p.as_os_str().is_empty());
         let entries = if path_is_bare {
             HashMap::new()
         } else {
@@ -335,11 +333,7 @@ impl ContentIndex {
 
     /// Set replication tier on a batch of sidecar_ids. Returns the count
     /// of entries whose tier actually changed.
-    pub fn set_replication_tier(
-        &mut self,
-        ids: &[SidecarId],
-        tier: ReplicationTier,
-    ) -> usize {
+    pub fn set_replication_tier(&mut self, ids: &[SidecarId], tier: ReplicationTier) -> usize {
         let mut changed = 0;
         for id in ids {
             if let Some(entry) = self.entries.get_mut(id) {
@@ -530,7 +524,7 @@ mod tests {
         let id = entry.sidecar_id;
         idx.insert(entry);
 
-        assert!(idx.set_archived(&id, true));  // flipped
+        assert!(idx.set_archived(&id, true)); // flipped
         assert!(idx.get(&id).unwrap().archived);
         assert!(!idx.set_archived(&id, true)); // idempotent
     }
@@ -561,8 +555,7 @@ mod tests {
         assert_eq!(again, 0);
 
         let bogus = SidecarId::new();
-        let with_missing =
-            idx.set_replication_tier(&[a_id, bogus], ReplicationTier::Expendable);
+        let with_missing = idx.set_replication_tier(&[a_id, bogus], ReplicationTier::Expendable);
         assert_eq!(with_missing, 1);
     }
 
@@ -679,7 +672,9 @@ mod tests {
         let result = idx.rekey(&id, [0x01; 32], [0x02; 32], 999, 1234);
         assert!(result.is_ok());
 
-        let after = idx.get(&id).expect("entry still present under same sidecar_id");
+        let after = idx
+            .get(&id)
+            .expect("entry still present under same sidecar_id");
         assert_eq!(after.cid, [0x02; 32], "cid updated");
         assert_eq!(after.size_bytes, 999, "size_bytes updated");
         assert_eq!(after.stored_at_ms, 1234, "stored_at_ms updated");
@@ -699,7 +694,10 @@ mod tests {
         let mut idx = ContentIndex::load(dir.path());
         let bogus = SidecarId::new();
         // OldMissing fires before the expected_old_cid check.
-        assert_eq!(idx.rekey(&bogus, [0x00; 32], [0xEE; 32], 0, 0), Err(RekeyError::OldMissing));
+        assert_eq!(
+            idx.rekey(&bogus, [0x00; 32], [0xEE; 32], 0, 0),
+            Err(RekeyError::OldMissing)
+        );
     }
 
     #[test]
@@ -722,7 +720,10 @@ mod tests {
     fn sidecar_id_new_produces_unique_values() {
         let a = SidecarId::new();
         let b = SidecarId::new();
-        assert_ne!(a, b, "two SidecarId::new() calls must produce distinct values");
+        assert_ne!(
+            a, b,
+            "two SidecarId::new() calls must produce distinct values"
+        );
     }
 
     #[test]
@@ -776,7 +777,10 @@ mod tests {
         }"#;
         std::fs::write(dir.path().join(INDEX_FILE), pre_zeb164).unwrap();
         let idx = ContentIndex::load(dir.path());
-        assert!(idx.entries.is_empty(), "legacy entry without sidecar_id must not load");
+        assert!(
+            idx.entries.is_empty(),
+            "legacy entry without sidecar_id must not load"
+        );
     }
 
     #[test]
@@ -835,7 +839,8 @@ mod tests {
         idx.insert(b.clone());
         idx.insert(c.clone());
 
-        let mut matched: Vec<SidecarId> = idx.entries_for_cid(&[0x10; 32])
+        let mut matched: Vec<SidecarId> = idx
+            .entries_for_cid(&[0x10; 32])
             .map(|e| e.sidecar_id)
             .collect();
         matched.sort_by_key(|id| id.to_string());
@@ -843,12 +848,14 @@ mod tests {
         expected.sort_by_key(|id| id.to_string());
         assert_eq!(matched, expected);
 
-        let lone: Vec<SidecarId> = idx.entries_for_cid(&[0x20; 32])
+        let lone: Vec<SidecarId> = idx
+            .entries_for_cid(&[0x20; 32])
             .map(|e| e.sidecar_id)
             .collect();
         assert_eq!(lone, vec![c.sidecar_id]);
 
-        let none: Vec<SidecarId> = idx.entries_for_cid(&[0x99; 32])
+        let none: Vec<SidecarId> = idx
+            .entries_for_cid(&[0x99; 32])
             .map(|e| e.sidecar_id)
             .collect();
         assert!(none.is_empty());

@@ -69,11 +69,7 @@ impl FollowManager {
 
         // Build a temp path alongside the real path.
         let tmp_path = {
-            let mut name = self
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
+            let mut name = self.path.file_name().unwrap_or_default().to_os_string();
             name.push(".tmp");
             self.path.with_file_name(name)
         };
@@ -164,8 +160,12 @@ mod tests {
         mgr.follow("addr2".to_string(), None);
         let list = mgr.list();
         assert_eq!(list.len(), 2);
-        assert!(list.iter().any(|e| e.address == "addr1" && e.name.as_deref() == Some("Alice")));
-        assert!(list.iter().any(|e| e.address == "addr2" && e.name.is_none()));
+        assert!(list
+            .iter()
+            .any(|e| e.address == "addr1" && e.name.as_deref() == Some("Alice")));
+        assert!(list
+            .iter()
+            .any(|e| e.address == "addr2" && e.name.is_none()));
     }
 
     #[test]
@@ -175,7 +175,10 @@ mod tests {
         let first = mgr.follow("addr1".to_string(), Some("Alice".to_string()));
         let second = mgr.follow("addr1".to_string(), Some("Alice Again".to_string()));
         assert!(first, "first follow should return true");
-        assert!(!second, "second follow should return false (already followed)");
+        assert!(
+            !second,
+            "second follow should return false (already followed)"
+        );
         assert_eq!(mgr.list().len(), 1);
     }
 

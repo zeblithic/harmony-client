@@ -15,13 +15,8 @@ use harmony_owner::lifecycle::RecoveryArtifact;
 use serial_test::serial;
 
 fn plant_seed(plaintext_path: &std::path::Path, seed: &[u8; 32]) {
-    identity::write_seed_to_disk_with_keychain(
-        plaintext_path,
-        seed,
-        /*force=*/ true,
-        None,
-    )
-    .expect("plant");
+    identity::write_seed_to_disk_with_keychain(plaintext_path, seed, /*force=*/ true, None)
+        .expect("plant");
 }
 
 fn wipe_identity_store(plaintext_path: &std::path::Path) {
@@ -90,13 +85,8 @@ fn recovery_file_round_trip_preserves_identity_hash() {
 
     wipe_identity_store(&plaintext_path);
 
-    recovery_cli::restore_recovery_file_with_keychain(
-        &plaintext_path,
-        &recovery_path,
-        false,
-        None,
-    )
-    .expect("restore");
+    recovery_cli::restore_recovery_file_with_keychain(&plaintext_path, &recovery_path, false, None)
+        .expect("restore");
 
     let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
     let reloaded_id = RecoveryArtifact::from_seed(*reloaded)
@@ -129,13 +119,8 @@ fn cross_encoding_equivalence_via_cli() {
     let seed = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
     let mnemonic = RecoveryArtifact::from_seed(*seed).to_mnemonic();
     std::fs::write(&mnemonic_path, mnemonic.as_str()).unwrap();
-    recovery_cli::export_recovery_file_with_keychain(
-        &plaintext_path,
-        &recovery_path,
-        None,
-        None,
-    )
-    .expect("export-recovery");
+    recovery_cli::export_recovery_file_with_keychain(&plaintext_path, &recovery_path, None, None)
+        .expect("export-recovery");
 
     // Wipe + restore from mnemonic.
     wipe_identity_store(&plaintext_path);
@@ -146,25 +131,26 @@ fn cross_encoding_equivalence_via_cli() {
     )
     .master_pubkey_bundle()
     .identity_hash();
-    assert_eq!(id_via_m, original_id, "mnemonic restore preserves identity_hash");
+    assert_eq!(
+        id_via_m, original_id,
+        "mnemonic restore preserves identity_hash"
+    );
 
     // Wipe + restore from recovery file. With the keychain wired out via
     // None, no separate keychain-clear step is needed — wiping the .enc is
     // a complete reset.
     wipe_identity_store(&plaintext_path);
-    recovery_cli::restore_recovery_file_with_keychain(
-        &plaintext_path,
-        &recovery_path,
-        false,
-        None,
-    )
-    .expect("restore-recovery");
+    recovery_cli::restore_recovery_file_with_keychain(&plaintext_path, &recovery_path, false, None)
+        .expect("restore-recovery");
     let id_via_f = RecoveryArtifact::from_seed(
         *identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap(),
     )
     .master_pubkey_bundle()
     .identity_hash();
-    assert_eq!(id_via_f, original_id, "recovery-file restore preserves identity_hash");
+    assert_eq!(
+        id_via_f, original_id,
+        "recovery-file restore preserves identity_hash"
+    );
 
     std::env::remove_var("HARMONY_PASSPHRASE");
     std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
