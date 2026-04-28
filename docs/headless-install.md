@@ -106,14 +106,77 @@ anything here.
 
 ## Backup and recovery
 
-Backup of identity material — including how to recover from device loss,
-how to mint a fresh identity that claims continuity with a lost one, and
-how to export/import a recovery artifact — is the scope of **ZEB-175**
-(Identity backup/restore UX). This document covers encryption-at-rest only.
+`harmony-app` ships two complementary backup formats. Both encode the same
+master 32-byte seed; restoring from either produces a byte-identical identity.
 
-In the meantime: treat `~/.harmony/identity.enc` and your passphrase as
-two halves of a recovery key. Lose either and the other is useless. Back
-both up to separate storage if you can't tolerate identity loss.
+### Mnemonic backup (recommended primary)
+
+24 BIP39 English words. Defends against complete data loss — write the
+words on paper.
+
+```bash
+# Export. The 24 words go to stdout; a warning preamble + identity-hash to stderr.
+harmony-app export mnemonic > backup.txt
+# Restore (refuses if an identity already exists; pass --force to overwrite).
+harmony-app restore mnemonic --mnemonic-file backup.txt
+```
+
+The mnemonic file is whitespace-tolerant, case-insensitive, and
+ASCII-only. Single line, multi-line, indented, mixed case — all valid.
+
+### Encrypted recovery file (secondary, copy-to-USB friendly)
+
+Argon2id + XChaCha20-Poly1305 envelope of the same seed. Defends against
+file leak — without the recovery passphrase the file is useless.
+
+```bash
+# Export — requires HARMONY_RECOVERY_PASSPHRASE or HARMONY_RECOVERY_PASSPHRASE_FILE.
+HARMONY_RECOVERY_PASSPHRASE_FILE=/run/secrets/harmony-recovery \
+    harmony-app export recovery-file --out /mnt/usb/identity.harmony --comment "hostname=$(hostname) date=$(date -I)"
+
+# Restore — same env vars; --force required to overwrite an existing identity.
+HARMONY_RECOVERY_PASSPHRASE_FILE=/run/secrets/harmony-recovery \
+    harmony-app restore recovery-file --in /mnt/usb/identity.harmony
+```
+
+### Recovery passphrase env vars
+
+| Var | Format |
+|---|---|
+| `HARMONY_RECOVERY_PASSPHRASE` | Direct UTF-8 string |
+| `HARMONY_RECOVERY_PASSPHRASE_FILE` | Path to a file containing the passphrase (UTF-8, one trailing newline allowed) |
+
+These are **distinct** from the at-rest `HARMONY_PASSPHRASE` /
+`HARMONY_PASSPHRASE_FILE`. Neither falls back to the other — restoring a
+recovery file with the wrong env var set fails with a docs pointer.
+
+### Identity hash
+
+Every export and restore prints `identity-hash: <hex32>` to stderr. This
+is the operator's eyeball-comparison fingerprint: if the hash on the
+backup matches the hash you see when restoring on a new machine, the
+seeds are byte-identical and the round-trip worked.
+
+### `--force`
+
+Both restore subcommands check whether `~/.harmony/identity.enc` already
+exists. Without `--force`, they refuse and exit 1. With `--force`, the
+existing file is overwritten in place via the same atomic
+tmp-then-rename pattern used elsewhere. **This is destructive** —
+verify the identity-hash before passing `--force` on a machine that has
+a real identity you want to keep.
+
+### Why two formats?
+
+The mnemonic is the catastrophic-loss recovery path: words on paper
+survive everything except the paper itself. The encrypted recovery file
+is the routine-portability path: you can copy it across machines, mail
+it to yourself, store it on a USB stick — and without the passphrase
+it's useless. If both backups have been made, only losing them simultaneously results in identity loss.
+
+The existing "treat `~/.harmony/identity.enc` and your passphrase as
+two halves of a recovery key" guidance still applies for at-rest
+storage — the recovery commands give you an additional layer.
 
 ## Troubleshooting
 
@@ -123,7 +186,12 @@ both up to separate storage if you can't tolerate identity loss.
 | `identity store could not be decrypted: wrong passphrase or corrupted file` | AEAD tag rejected | Verify the passphrase exactly matches what was used to encrypt; do not regenerate identity unless you accept losing it |
 | `identity store is in an unrecognized format` | Old binary, newer file | Upgrade harmony-client |
 | `identity store verify-after-write failed` | The store accepted the write but returned different bytes — keychain/disk corruption | File a bug; do not retry blindly |
-| `plaintext identity at <path> needs a destination but no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set` | Existing plaintext file but no destination to migrate it to | Set `HARMONY_PASSPHRASE` or `HARMONY_PASSPHRASE_FILE`, or run on a system with a keychain — harmony will migrate the plaintext on next launch |
+| `Error: expected 24 BIP39 words, got <N>` | Mnemonic file has wrong word count | Re-check the file; trim partial pastes |
+| `Error: unknown word at position <N>: "<word>"` | Mnemonic typo | Re-check the indicated word against the BIP39 wordlist |
+| `Error: mnemonic checksum mismatch — likely a typo somewhere in the 24 words` | One or more typos | Visually re-verify each word against the source |
+| `Error: wrong passphrase or corrupted recovery file (AEAD tag rejected)` | Bad recovery passphrase OR the file was tampered with | Verify the recovery passphrase matches what was used to export |
+| `identity already exists at <path>; pass --force ...` or `identity already exists in OS keychain; pass --force ...` | Restore policy | If you really want to overwrite, re-run with `--force`; otherwise, this is the safety net |
+| `neither HARMONY_RECOVERY_PASSPHRASE nor HARMONY_RECOVERY_PASSPHRASE_FILE is set — see docs/headless-install.md` | Recovery passphrase missing | Set one; remember it's distinct from the at-rest passphrase |
 
 ## Not yet supported
 

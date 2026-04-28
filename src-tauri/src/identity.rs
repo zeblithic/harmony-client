@@ -1,34 +1,31 @@
 //! Node identity management — Ed25519 + post-quantum key generation and persistence.
 //!
-//! Storage backends (production):
-//! - `KeychainStore`         — OS-native keychain via the `keyring` crate (primary on
-//!                              macOS / Windows / Linux-with-Secret-Service)
-//! - `EncryptedFileStore`    — Argon2id + XChaCha20-Poly1305 envelope at
-//!                              `~/.harmony/identity.enc`, keyed from the
-//!                              `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` env
-//!                              vars (headless installs without a keychain)
-//! - `LegacyPlaintextReader` — one-shot read-only migration helper for
-//!                              `~/.harmony/identity.key` written by older builds;
-//!                              intentionally NOT a `KeyStore` (no save method)
+//! Identity at-rest is a 32-byte master seed; sub-keys are derived deterministically
+//! via `NodeIdentity::from_seed` on every load. Storage backends (production):
 //!
-//! `FileStore` is retained behind `#[cfg(test)]` solely to write legacy plaintext
-//! fixtures — production code never writes plaintext at all.
+//! - `KeychainStore` — OS-native keychain via the `keyring` crate (primary on
+//!   macOS / Windows / Linux-with-Secret-Service)
+//! - `EncryptedFileStore` — Argon2id + XChaCha20-Poly1305 envelope at
+//!   `~/.harmony/identity.enc`, keyed from the
+//!   `HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE` env vars (headless installs)
+//!
+//! `FileStore` is retained behind `#[cfg(test)]` solely to write seed fixtures in
+//! tests — production code never writes plaintext.
 //!
 //! `load_or_generate()` runs the resolution chain: keychain → encrypted file →
-//! legacy plaintext (migrated, then unlinked) → fresh-generate. Hard-fails with a
-//! pointer to `docs/headless-install.md` when no destination is available rather
-//! than silently writing plaintext. Wrong passphrase on the encrypted file is a
-//! hard fail too — never silently regenerates identity.
+//! fresh-generate. Hard-fails with a pointer to `docs/headless-install.md` when no
+//! destination is available. Wrong passphrase on the encrypted file is a hard fail
+//! too — never silently regenerates identity.
 
 use std::path::{Path, PathBuf};
 
 use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
 use zeroize::Zeroizing;
 
-const VERSION: u8 = 0x01;
-const PQ_KEY_LEN: usize = 96;
-const ED25519_KEY_LEN: usize = 64;
-const BLOB_LEN: usize = 1 + PQ_KEY_LEN + ED25519_KEY_LEN; // 161
+/// Plaintext payload protected by the `HRMI` envelope: the master 32-byte
+/// seed. Sub-key derivation is deterministic via `NodeIdentity::from_seed`
+/// — the seed is the only secret on disk.
+const BLOB_LEN: usize = 32;
 
 // ── Encrypted file wire format constants ───────────────────────────────
 
@@ -47,7 +44,16 @@ const HEADER_LEN: usize = 13;   // magic(4) + version(1) + kdf_id(1) + m(4) + t(
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;    // XChaCha20 needs 192-bit nonce
 const TAG_LEN: usize = 16;      // Poly1305 tag
-const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN; // 230
+const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN;
+
+/// Destination chosen by `save_with_fallback`. Returned so force-cleanup
+/// callers can know which backend actually received the write rather than
+/// inferring from the pre-save probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveDestination {
+    Keychain,
+    EncryptedFile,
+}
 
 pub struct NodeIdentity {
     pub pq: PqPrivateIdentity,
@@ -66,39 +72,45 @@ impl std::fmt::Debug for NodeIdentity {
     }
 }
 
+impl NodeIdentity {
+    /// Derive a `NodeIdentity` from a 32-byte master seed.
+    ///
+    /// Thin shim over `PrivateIdentity::from_seed` and
+    /// `PqPrivateIdentity::from_seed` (ZEB-177). Deterministic: the same
+    /// seed produces byte-identical sub-keys on every call. This is the
+    /// load-bearing invariant for the seed-on-disk storage model — every
+    /// launch reads the seed and re-derives the keypairs from scratch.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self {
+            pq: PqPrivateIdentity::from_seed(seed),
+            ed25519: PrivateIdentity::from_seed(seed),
+        }
+    }
+}
+
 // ── Serialization helpers (shared by both backends) ─────────────────────
 
-/// Serialize a `NodeIdentity` into the 161-byte binary format.
-fn identity_to_blob(identity: &NodeIdentity) -> Zeroizing<Vec<u8>> {
-    let pq_bytes = Zeroizing::new(identity.pq.to_private_bytes());
-    let ed_bytes = Zeroizing::new(identity.ed25519.to_private_bytes());
+/// Serialize a 32-byte seed into the on-disk binary format. Identity at this
+/// layer is *just* the seed — the sub-keys are derived deterministically via
+/// `NodeIdentity::from_seed` on every load.
+fn seed_to_blob(seed: &[u8; BLOB_LEN]) -> Zeroizing<Vec<u8>> {
     let mut buf = Zeroizing::new(Vec::with_capacity(BLOB_LEN));
-    buf.push(VERSION);
-    buf.extend_from_slice(&pq_bytes);
-    buf.extend_from_slice(ed_bytes.as_slice());
-    debug_assert_eq!(buf.len(), BLOB_LEN, "identity blob length mismatch");
+    buf.extend_from_slice(seed);
+    debug_assert_eq!(buf.len(), BLOB_LEN, "seed blob length mismatch");
     buf
 }
 
-/// Deserialize a `NodeIdentity` from a 161-byte binary blob.
-fn blob_to_identity(buf: &[u8]) -> Result<NodeIdentity, String> {
+/// Deserialize a 32-byte seed from a binary blob.
+fn blob_to_seed(buf: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     if buf.len() != BLOB_LEN {
         return Err(format!(
-            "Corrupt identity blob: expected {BLOB_LEN} bytes, got {}",
+            "identity store payload length is unexpected: expected {BLOB_LEN} bytes, got {}",
             buf.len()
         ));
     }
-    if buf[0] != VERSION {
-        return Err(format!(
-            "Unsupported identity blob version: {:#04x}",
-            buf[0]
-        ));
-    }
-    let pq = PqPrivateIdentity::from_private_bytes(&buf[1..1 + PQ_KEY_LEN])
-        .map_err(|e| format!("Corrupt PQ identity: {e}"))?;
-    let ed25519 = PrivateIdentity::from_private_bytes(&buf[1 + PQ_KEY_LEN..])
-        .map_err(|e| format!("Corrupt Ed25519 identity: {e}"))?;
-    Ok(NodeIdentity { pq, ed25519 })
+    let mut out: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
+    out.copy_from_slice(buf);
+    Ok(out)
 }
 
 // ── Atomic file write ──────────────────────────────────────────────────
@@ -114,7 +126,7 @@ fn blob_to_identity(buf: &[u8]) -> Result<NodeIdentity, String> {
 /// `TmpGuard` removes the `.tmp` file if anything panics or returns Err
 /// before the rename completes. After successful rename, the guard is
 /// `mem::forget`ed so the renamed file isn't unlinked.
-fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
@@ -197,103 +209,24 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
 // ── Verify-after-write helper ──────────────────────────────────────────
 
 /// After a `KeyStore::save`, immediately re-read and byte-compare against the
-/// expected identity. Constant-time comparison via the `subtle` crate.
+/// expected seed. Constant-time comparison via the `subtle` crate.
 ///
-/// Returns Err if the store doesn't return what was written — never used as a
-/// "should I delete the source?" check on its own; it's a precondition for
-/// any destructive cleanup (legacy plaintext unlink, .bak removal).
-fn verify_round_trip(store: &dyn KeyStore, expected: &NodeIdentity) -> Result<(), String> {
+/// Returns Err if the store doesn't return what was written.
+fn verify_round_trip(store: &dyn KeyStore, expected: &[u8; BLOB_LEN]) -> Result<(), String> {
     let loaded = store
-        .load()?
-        .ok_or_else(|| "verify-after-write returned None from store".to_string())?;
-    let expected_blob = identity_to_blob(expected);
-    let loaded_blob = identity_to_blob(&loaded);
-    if !bool::from(subtle::ConstantTimeEq::ct_eq(
-        expected_blob.as_slice(),
-        loaded_blob.as_slice(),
-    )) {
-        return Err(
-            "identity store verify-after-write failed: store does not return what was written".to_string(),
-        );
+        .load()
+        .map_err(|e| format!("verify-after-write read-back failed: {e}"))?
+        .ok_or_else(|| "verify-after-write read-back returned None".to_string())?;
+    use subtle::ConstantTimeEq;
+    if !bool::from(loaded.as_slice().ct_eq(expected.as_slice())) {
+        return Err("verify-after-write returned a different seed than was just written".to_string());
     }
     Ok(())
 }
 
-// ── Legacy .bak cleanup ────────────────────────────────────────────────
-
-/// Best-effort cleanup of a legacy `identity.key.bak` from the pre-encryption
-/// code path. Removes only when the .bak content matches the in-memory identity
-/// AND the live store's verify-round-trip succeeds.
-///
-/// All failure modes log warnings and leave the .bak in place — this is
-/// defensive cleanup, not a hard guarantee.
-fn cleanup_legacy_bak(plaintext_path: &Path, in_memory: &NodeIdentity, store: &dyn KeyStore) {
-    let bak = plaintext_path.with_extension("key.bak");
-    if !bak.exists() {
-        return;
-    }
-
-    let bak_id = match LegacyPlaintextReader::read_from(&bak) {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            // TOCTOU: file was present at the .exists() check above but gone
-            // by the time read_from() opened it.
-            tracing::warn!(
-                path = %bak.display(),
-                "legacy .bak disappeared between existence check and read — leaving in place"
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %bak.display(),
-                error = %e,
-                "legacy .bak unreadable — leaving in place"
-            );
-            return;
-        }
-    };
-
-    let expected_blob = identity_to_blob(in_memory);
-    let bak_blob = identity_to_blob(&bak_id);
-    let identities_match = bool::from(subtle::ConstantTimeEq::ct_eq(
-        expected_blob.as_slice(),
-        bak_blob.as_slice(),
-    ));
-    if !identities_match {
-        tracing::warn!(
-            path = %bak.display(),
-            "legacy .bak present but identity differs from current — leaving in place; manual review needed"
-        );
-        return;
-    }
-
-    // Verify the live store actually returns the same identity before deleting.
-    if let Err(e) = verify_round_trip(store, in_memory) {
-        tracing::warn!(
-            path = %bak.display(),
-            error = %e,
-            "legacy .bak NOT removed: live store verify failed"
-        );
-        return;
-    }
-
-    match std::fs::remove_file(&bak) {
-        Ok(()) => tracing::info!(
-            path = %bak.display(),
-            "removed legacy plaintext .bak after verifying live store has matching identity"
-        ),
-        Err(e) => tracing::warn!(
-            path = %bak.display(),
-            error = %e,
-            "legacy .bak removal failed — manual cleanup needed"
-        ),
-    }
-}
-
 // ── Encrypted file wire format helpers ─────────────────────────────────
 
-/// Encode a 161-byte identity blob into the 230-byte encrypted-file format.
+/// Encode a 32-byte seed into the 101-byte encrypted-file format.
 ///
 /// Caller supplies salt and nonce explicitly so the function is deterministic
 /// for testing. Production code generates fresh random values per save.
@@ -351,14 +284,14 @@ pub fn encrypt_with_params(
     out
 }
 
-/// Decode a 230-byte encrypted-file blob back into the 161-byte identity blob.
+/// Decode a 101-byte encrypted-file blob back into the 32-byte seed.
 ///
 /// Indistinguishable error for wrong-passphrase vs corrupted-ciphertext to
 /// avoid leaking which case occurred (an attacker who can probe with arbitrary
 /// passphrases gains no signal from the error message).
 ///
 /// Returns `Zeroizing<[u8; BLOB_LEN]>` so the caller's stack-resident copy of
-/// the plaintext key bytes is wiped on drop. The intermediate `Vec<u8>` from
+/// the plaintext seed bytes is wiped on drop. The intermediate `Vec<u8>` from
 /// `cipher.decrypt(...)` is also wrapped in `Zeroizing` before any further use.
 #[doc(hidden)]
 pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
@@ -463,19 +396,19 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
 
 /// Common interface for identity storage backends.
 pub trait KeyStore {
-    /// Load identity from this store. Returns `Ok(None)` if no entry exists.
-    fn load(&self) -> Result<Option<NodeIdentity>, String>;
-    /// Save identity to this store.
-    fn save(&self, identity: &NodeIdentity) -> Result<(), String>;
+    /// Load the master seed from this store. Returns `Ok(None)` if no entry exists.
+    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String>;
+    /// Save the master seed to this store.
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String>;
 }
 
 // ── FileStore ───────────────────────────────────────────────────────────
 
 /// File-based identity storage at a given path.
 ///
-/// Test-only fixture helper for writing legacy plaintext blobs. Production
-/// code reads legacy plaintext through `LegacyPlaintextReader` and writes
-/// only through `KeychainStore` or `EncryptedFileStore`.
+/// Test-only fixture helper for writing seed blobs to a plaintext file at a
+/// given path. Production code never writes plaintext at all — the only
+/// backends are `KeychainStore` and `EncryptedFileStore`.
 #[cfg(test)]
 pub struct FileStore {
     path: PathBuf,
@@ -487,82 +420,29 @@ impl FileStore {
         Self { path }
     }
 
-    /// Rename the identity file to `.bak` (used during migration).
-    ///
-    /// Retained for test fixtures only — production code never renames to .bak
-    /// (the new chain unlinks plaintext directly after verify_round_trip).
-    #[allow(dead_code)]
-    pub fn rename_to_backup(&self) -> Result<(), String> {
-        let bak = self.path.with_extension("key.bak");
-        std::fs::rename(&self.path, &bak).map_err(|e| {
-            format!(
-                "Failed to rename {} → {}: {e}",
-                self.path.display(),
-                bak.display()
-            )
-        })
-    }
 }
 
-// FileStore is retained as a test-only helper for setting up legacy
-// plaintext fixtures. Production code never writes plaintext — see
-// LegacyPlaintextReader for the read-only legacy migration path.
+// FileStore is retained as a test-only helper for setting up seed fixtures.
+// Production code never writes plaintext — all writes go through
+// KeychainStore or EncryptedFileStore.
 #[cfg(test)]
 impl KeyStore for FileStore {
-    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
         let raw = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
         };
         let buf = Zeroizing::new(raw);
-        let identity = blob_to_identity(&buf)?;
+        let seed = blob_to_seed(&buf)?;
         #[cfg(unix)]
         warn_permissions(&self.path);
-        Ok(Some(identity))
+        Ok(Some(seed))
     }
 
-    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
-        let blob = identity_to_blob(identity);
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+        let blob = seed_to_blob(seed);
         write_atomic_0600(&self.path, &blob)
-    }
-}
-
-// ── LegacyPlaintextReader ───────────────────────────────────────────────
-
-/// Read-only reader for legacy plaintext identity files at `~/.harmony/identity.key`.
-///
-/// Deliberately does not implement `KeyStore` — there is no `save` and there
-/// will never be one. This type exists solely to migrate identities written by
-/// the pre-encryption code path into the modern keychain or encrypted-file
-/// backends.
-pub(crate) struct LegacyPlaintextReader {
-    path: PathBuf,
-}
-
-impl LegacyPlaintextReader {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    /// Read the plaintext identity at `self.path`, or `Ok(None)` if missing.
-    pub(crate) fn read(&self) -> Result<Option<NodeIdentity>, String> {
-        Self::read_from(&self.path)
-    }
-
-    /// Free function variant — read plaintext identity from `path`, or
-    /// `Ok(None)` if missing.
-    pub(crate) fn read_from(path: &Path) -> Result<Option<NodeIdentity>, String> {
-        let raw = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
-        };
-        let buf = Zeroizing::new(raw);
-        let identity = blob_to_identity(&buf)?;
-        #[cfg(unix)]
-        warn_permissions(path);
-        Ok(Some(identity))
     }
 }
 
@@ -611,23 +491,33 @@ impl KeychainStore {
         let entry = keyring::Entry::new_with_credential(Box::new(credential));
         Self { entry }
     }
+
+    /// Delete the keychain entry. Returns `Ok(())` if deleted or not present.
+    ///
+    /// Used by `write_seed_to_disk_with_keychain` to best-effort unlink a stale
+    /// keychain entry after a successful force-write to the encrypted-file backend.
+    /// Also used by integration tests (different crate boundary) to clean up
+    /// stale keychain state before exercising `*_cli` functions.
+    pub fn delete(&self) -> Result<(), keyring::Error> {
+        self.entry.delete_credential()
+    }
 }
 
 impl KeyStore for KeychainStore {
-    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
         match self.entry.get_secret() {
             Ok(bytes) => {
                 let buf = Zeroizing::new(bytes);
-                let identity = blob_to_identity(&buf)?;
-                Ok(Some(identity))
+                let seed = blob_to_seed(&buf)?;
+                Ok(Some(seed))
             }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("keychain load failed: {e}")),
         }
     }
 
-    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
-        let blob = identity_to_blob(identity);
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
+        let blob = seed_to_blob(seed);
         self.entry
             .set_secret(&blob)
             .map_err(|e| format!("keychain save failed: {e}"))
@@ -692,9 +582,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 /// Passphrase-encrypted identity file at a given path.
 ///
-/// On-disk format is the 230-byte layout produced by `encrypt_with_params`:
+/// On-disk format is the 101-byte layout produced by `encrypt_with_params`:
 /// Argon2id (m=64MiB, t=3, p=1) derives a 32-byte key for XChaCha20-Poly1305
-/// AEAD over the 161-byte identity blob. The 13-byte header (magic, version,
+/// AEAD over the 32-byte master seed. The 13-byte header (magic, version,
 /// kdf_id, KDF params) is bound as AAD.
 ///
 /// Used as the headless fallback when no OS keychain is reachable. Keyed from
@@ -771,28 +661,20 @@ impl EncryptedFileStore {
 }
 
 impl KeyStore for EncryptedFileStore {
-    fn load(&self) -> Result<Option<NodeIdentity>, String> {
+    fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
         let raw = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", self.path.display())),
         };
-        // `decrypt` returns Zeroizing<[u8; BLOB_LEN]> — the stack array's bytes
-        // are wiped on drop. blob_to_identity reads the slice without copying.
-        let blob = decrypt(self.passphrase.expose_secret().as_bytes(), &raw)?;
-        let identity = blob_to_identity(blob.as_slice())?;
-        Ok(Some(identity))
+        // `decrypt` returns Zeroizing<[u8; BLOB_LEN]> — the underlying [u8; 32]
+        // is wiped on drop. The seed array can be returned directly without
+        // a second deserialization step.
+        let seed = decrypt(self.passphrase.expose_secret().as_bytes(), &raw)?;
+        Ok(Some(seed))
     }
 
-    fn save(&self, identity: &NodeIdentity) -> Result<(), String> {
-        let blob = identity_to_blob(identity);
-        // Wrap the fixed-size copy in Zeroizing so the second plaintext-key
-        // buffer is wiped on drop. The original `blob: Zeroizing<Vec<u8>>` is
-        // already protected; without this, dropping the owned `[u8; BLOB_LEN]`
-        // at end of scope would leave key bytes on the stack.
-        let mut blob_arr: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
-        blob_arr.copy_from_slice(blob.as_slice());
-
+    fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> {
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         use rand::RngCore;
@@ -803,7 +685,7 @@ impl KeyStore for EncryptedFileStore {
             self.passphrase.expose_secret().as_bytes(),
             &salt,
             &nonce,
-            &blob_arr,
+            seed,
         );
         write_atomic_0600(&self.path, &bytes)
     }
@@ -827,131 +709,65 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
 
 /// Internal resolution chain — accepts injected stores for testability.
 ///
-/// See `docs/specs/2026-04-26-headless-encrypted-identity-design.md`
-/// §Resolution chain for the precise step-by-step semantics. Summary:
+/// Resolution order:
+///   1. keychain.load() — return on success; fall through on None or Err
+///   2. encrypted.load() — return on success; HARD FAIL on Err (wrong
+///      passphrase / corruption — never silently regenerate)
+///   3. fresh generate → save 32B seed to keychain (preferred) or encrypted
 ///
-///   1. keychain.load() — return on success; legacy .bak cleanup; fall through on
-///      None or transient Err
-///   2. encrypted.load() — return on success; legacy .bak cleanup; HARD FAIL on Err
-///      (wrong passphrase / corruption — never silently regenerate)
-///   3. legacy plaintext present → migrate to keychain (preferred) or encrypted;
-///      verify_round_trip; unlink plaintext
-///   4. fresh generate → write to keychain (preferred) or encrypted; verify_round_trip
-///
-/// Hard-fails when no destination is available (no keychain, no encrypted store)
-/// for either step 3 or step 4 — refuses to fall back to plaintext writes.
+/// Hard-fails when no destination is available (no keychain, no encrypted store).
+/// Pre-ZEB-176 plaintext `~/.harmony/identity.key` files are no longer
+/// auto-migrated — users with a placeholder pre-ZEB-176 identity hard-fail
+/// and re-mint (acceptable per spec scope).
 fn load_or_generate_with_stores(
     keychain: Option<&KeychainStore>,
     encrypted: Option<&EncryptedFileStore>,
-    plaintext_path: &Path,
-) -> Result<NodeIdentity, String> {
-    // Step 1: keychain probe. Inlined here (rather than delegating to the
-    // shared `_post_probe` below) so callers that already probed don't pay
-    // a second `kc.load()` round-trip — see `load_or_generate_with_keychain`.
+) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     let mut keychain_healthy = false;
     if let Some(kc) = keychain {
         match kc.load() {
-            Ok(Some(id)) => {
-                cleanup_legacy_bak(plaintext_path, &id, kc);
-                return Ok(id);
-            }
-            Ok(None) => {
-                keychain_healthy = true; // present but empty
-            }
+            Ok(Some(seed)) => return Ok(seed),
+            Ok(None) => keychain_healthy = true,
             Err(e) => {
-                // keychain_healthy stays false (its initial value) — we'll fall
-                // through to step 2 / 3 / 4 and use whichever destination is
-                // available, treating the keychain as if it weren't present.
                 tracing::warn!("keychain load failed, trying next store: {e}");
             }
         }
     }
-
-    load_or_generate_with_stores_post_probe(
-        keychain,
-        keychain_healthy,
-        encrypted,
-        plaintext_path,
-    )
+    load_or_generate_with_stores_post_probe(keychain, keychain_healthy, encrypted)
 }
 
-/// Steps 2-4 of the resolution chain. Split from `load_or_generate_with_stores`
-/// so the outer `load_or_generate_with_keychain` entry point can supply its own
-/// probe result without doing the keychain `load()` twice. The caller is
-/// responsible for any `cleanup_legacy_bak` that would have happened in step 1.
 fn load_or_generate_with_stores_post_probe(
     keychain: Option<&KeychainStore>,
     keychain_healthy: bool,
     encrypted: Option<&EncryptedFileStore>,
-    plaintext_path: &Path,
-) -> Result<NodeIdentity, String> {
-    // Step 2: encrypted file (if env var set).
+) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     if let Some(enc) = encrypted {
         match enc.load() {
-            Ok(Some(id)) => {
-                cleanup_legacy_bak(plaintext_path, &id, enc);
-                return Ok(id);
-            }
-            Ok(None) => {
-                // Fall through — fresh-with-passphrase install.
-            }
-            Err(e) => {
-                // HARD FAIL — wrong passphrase or corruption. Do NOT regenerate.
-                return Err(e);
-            }
+            Ok(Some(seed)) => return Ok(seed),
+            Ok(None) => { /* fall through to fresh-generate */ }
+            Err(e) => return Err(e),
         }
     }
 
-    // Step 3: legacy plaintext migration.
-    let legacy = LegacyPlaintextReader::new(plaintext_path.to_path_buf());
-    if let Some(id) = legacy.read()? {
-        save_with_fallback(
-            keychain_healthy,
-            keychain,
-            encrypted,
-            &id,
-            || format!(
-                "plaintext identity at {} needs a destination but no keychain available and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md",
-                plaintext_path.display()
-            ),
-            |e| format!(
-                "plaintext identity at {} could not be migrated: keychain save failed ({e}) and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md",
-                plaintext_path.display()
-            ),
-        )?;
-        // Verified copy is in the destination; unlink the plaintext.
-        if let Err(e) = std::fs::remove_file(plaintext_path) {
-            tracing::warn!(
-                path = %plaintext_path.display(),
-                error = %e,
-                "identity migrated but plaintext file could not be removed — manual cleanup needed"
-            );
-        }
-        return Ok(id);
-    }
-
-    // Step 4: fresh generate.
-    let id = NodeIdentity {
-        pq: PqPrivateIdentity::generate(&mut rand::rngs::OsRng),
-        ed25519: PrivateIdentity::generate(&mut rand::rngs::OsRng),
-    };
-    save_with_fallback(
+    let mut seed_buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(seed_buf.as_mut());
+    let _ = save_with_fallback(
         keychain_healthy,
         keychain,
         encrypted,
-        &id,
+        &seed_buf,
         || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
         |e| format!(
             "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
         ),
     )?;
-    Ok(id)
+    Ok(seed_buf)
 }
 
-/// Save `id` to the preferred destination (keychain > encrypted), with
-/// fallback when the keychain save/verify fails. Used by both the legacy
-/// migration path (step 3) and the fresh-generate path (step 4) so the
-/// destination-selection-with-fallback logic isn't duplicated.
+/// Save `seed` to the preferred destination (keychain > encrypted), with
+/// fallback when the keychain save/verify fails. Used by the fresh-generate
+/// path so the destination-selection-with-fallback logic isn't duplicated.
 ///
 /// `no_dest_err` produces the error returned when no destination is available
 /// at all (no keychain, no encrypted store). `keychain_failed_no_enc_err`
@@ -962,10 +778,10 @@ fn save_with_fallback(
     keychain_healthy: bool,
     keychain: Option<&KeychainStore>,
     encrypted: Option<&EncryptedFileStore>,
-    id: &NodeIdentity,
+    seed: &[u8; BLOB_LEN],
     no_dest_err: impl FnOnce() -> String,
     keychain_failed_no_enc_err: impl FnOnce(&str) -> String,
-) -> Result<(), String> {
+) -> Result<SaveDestination, String> {
     let mut keychain_err: Option<String> = None;
 
     if keychain_healthy {
@@ -977,9 +793,9 @@ fn save_with_fallback(
         // step 1 would prefer on next boot), so we MUST NOT fall back; doing
         // so would mask the corruption and the user's real identity would
         // diverge between the two backends. Verify Err is terminal here.
-        match kc.save(id) {
+        match kc.save(seed) {
             Ok(()) => {
-                if let Err(verify_err) = verify_round_trip(kc, id) {
+                if let Err(verify_err) = verify_round_trip(kc, seed) {
                     tracing::error!(
                         "keychain save succeeded but verify-after-write failed: {verify_err}. \
                          The keychain entry may be corrupt and would be preferred over any \
@@ -990,7 +806,7 @@ fn save_with_fallback(
                     return Err(verify_err);
                 }
                 tracing::info!("identity stored in OS keychain");
-                return Ok(());
+                return Ok(SaveDestination::Keychain);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1002,10 +818,10 @@ fn save_with_fallback(
     }
 
     if let Some(enc) = encrypted {
-        enc.save(id)?;
-        verify_round_trip(enc, id)?;
+        enc.save(seed)?;
+        verify_round_trip(enc, seed)?;
         tracing::info!(path = %enc.path().display(), "identity stored in encrypted file");
-        Ok(())
+        Ok(SaveDestination::EncryptedFile)
     } else if let Some(e) = keychain_err {
         Err(keychain_failed_no_enc_err(&e))
     } else {
@@ -1014,61 +830,51 @@ fn save_with_fallback(
 }
 
 /// Public entry point — resolves env-derived encrypted store, attempts the
-/// keychain, and runs the resolution chain.
-///
-/// Resolution order (see `load_or_generate_with_stores` for the full spec):
-///   1. OS keychain
-///   2. ~/.harmony/identity.enc  (if HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE set)
-///   3. ~/.harmony/identity.key  (legacy plaintext — migrated to (1) or (2), then unlinked)
-///   4. Generate fresh keys (stored in (1) or (2); HARD FAIL if neither available)
-///
-/// Fast-path: if the keychain returns a stored identity, this function returns
-/// immediately *without* probing the env vars. That guarantees a desktop user
-/// with a stale `HARMONY_PASSPHRASE_FILE` pointing at a removed/unreadable file
-/// can still boot — the keychain is the source of truth and `from_env`
-/// configuration errors only matter when the keychain doesn't have the answer.
+/// keychain, and runs the resolution chain. Returns the derived `NodeIdentity`.
 pub fn load_or_generate(plaintext_path: &Path) -> Result<NodeIdentity, String> {
-    load_or_generate_with_keychain(plaintext_path, KeychainStore::new().ok())
+    let seed = read_seed_from_disk_with_keychain(plaintext_path, KeychainStore::new().ok())?;
+    Ok(NodeIdentity::from_seed(&seed))
 }
 
-/// Inner entry point that takes an injected keychain so tests can exercise the
-/// env-var resolution chain with a deterministic keychain backend (typically
-/// `KeychainStore::new_load_failing_mock()` to simulate a keychain that's
-/// constructed but unreadable). Production callers go through `load_or_generate`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_or_generate_with_keychain(
     plaintext_path: &Path,
     keychain: Option<KeychainStore>,
 ) -> Result<NodeIdentity, String> {
-    // Probe the keychain ONCE at the top so the env-var error policy below can
-    // distinguish three states: keychain returned an identity (fast-path),
-    // keychain responded but was empty (probe ok, env errors are non-fatal),
-    // or keychain failed (probe failed, env errors stay fatal because the
-    // env-configured encrypted file may be the user's real identity store).
+    let seed = read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    Ok(NodeIdentity::from_seed(&seed))
+}
+
+/// Read the master seed from disk via the standard resolution chain
+/// (keychain → encrypted file → fresh-generate). Returns the seed bytes
+/// directly so the recovery CLI can encode them without first deriving a
+/// `NodeIdentity`.
+pub fn read_seed_from_disk(plaintext_path: &Path) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
+    read_seed_from_disk_with_keychain(plaintext_path, KeychainStore::new().ok())
+}
+
+/// Inner entry point. Integration tests (across the crate boundary) inject a
+/// deterministic keychain. `pub` rather than `pub(crate)` so
+/// `tests/recovery_cli_integration.rs` can reach it.
+pub fn read_seed_from_disk_with_keychain(
+    plaintext_path: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     let mut keychain_probe_ok = false;
     if let Some(kc) = &keychain {
         match kc.load() {
-            Ok(Some(id)) => {
-                cleanup_legacy_bak(plaintext_path, &id, kc);
-                return Ok(id);
-            }
+            Ok(Some(seed)) => return Ok(seed),
             Ok(None) => keychain_probe_ok = true,
             Err(e) => {
                 tracing::warn!(
-                    "keychain probe failed in load_or_generate ({e}); \
-                     env-var configuration errors will stay fatal"
+                    "keychain probe failed in read_seed_from_disk ({e}); env-var \
+                     configuration errors will stay fatal"
                 );
-                // keychain_probe_ok stays false.
             }
         }
     }
 
     let enc_path = plaintext_path.with_file_name("identity.enc");
-    // Env-var error tolerance, scoped to a successful keychain probe: an
-    // unreadable HARMONY_PASSPHRASE_FILE or empty HARMONY_PASSPHRASE is only a
-    // warning when the keychain itself is reachable and can serve as a
-    // fallback destination. If the keychain probe failed, treating the env
-    // error as non-fatal would silently fall through to fresh-generate and
-    // could overwrite the user's real (encrypted-file-resident) identity.
     let encrypted = match EncryptedFileStore::from_env(enc_path) {
         Ok(opt) => opt,
         Err(e) if keychain_probe_ok => {
@@ -1081,16 +887,161 @@ pub(crate) fn load_or_generate_with_keychain(
         Err(e) => return Err(e),
     };
 
-    // Skip the inner step-1 probe — we already did it above, and on a healthy
-    // boot path the keychain backend is real I/O (Secret Service round-trip
-    // on Linux, OS API on macOS / Windows). Reuse `keychain_probe_ok` as the
-    // `keychain_healthy` flag — both mean "keychain responded with no entry".
-    load_or_generate_with_stores_post_probe(
+    // Use _post_probe variant: we already probed the keychain above (single
+    // round-trip). The non-post-probe variant probes again, which is a real
+    // perf regression on macOS Keychain / Linux Secret Service.
+    load_or_generate_with_stores_post_probe(keychain.as_ref(), keychain_probe_ok, encrypted.as_ref())
+}
+
+/// Write the master seed to disk via the standard resolution chain
+/// (keychain preferred, encrypted-file fallback). Refuses if a destination
+/// already exists unless `force` is true; with `force = true`, overwrites
+/// in place via the existing atomic `create_new` tmp-then-rename pattern in
+/// `save_with_fallback`.
+pub fn write_seed_to_disk(
+    plaintext_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+) -> Result<(), String> {
+    write_seed_to_disk_with_keychain(plaintext_path, seed, force, KeychainStore::new().ok())
+}
+
+/// Documented TOCTOU note (`!force` path): the existence probes (keychain
+/// `load()`, `enc_path.exists()`, `EncryptedFileStore::from_env`) happen
+/// before `save_with_fallback`, so two concurrent processes that both pass
+/// the probe could both proceed to save, with the second silently winning.
+///
+/// We accept this race because:
+///   1. The threat model is a single-user CLI tool; the only realistic
+///      scenario is the same operator invoking `harmony-app restore` twice
+///      in parallel (e.g. by accident). There is no adversarial concurrent
+///      writer.
+///   2. The integrity guarantee that matters most — AEAD authentication of
+///      the encrypted file — is unaffected. A `restore` race ends with one
+///      operator-supplied identity winning; neither half-state nor a
+///      forged identity is reachable.
+///   3. A correct lockfile fix is non-trivial: stdlib has no portable
+///      file-lock primitive (would require `fs2` / `fd-lock`), stale
+///      lockfiles after process crashes need recovery UX, NFS-mounted
+///      `~/.harmony` directories have known fcntl-lock quirks, and the
+///      keychain side of the resolution chain has no atomic
+///      "add-if-absent" primitive exposed by the `keyring` crate — so
+///      locking would only close the file-path race, leaving the keychain
+///      race documented but unfixed.
+///
+/// Tracked as a follow-up; not blocking ZEB-176. If you hit this in
+/// practice, that's a signal we should revisit — please file a bug.
+pub fn write_seed_to_disk_with_keychain(
+    plaintext_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    let enc_path = plaintext_path.with_file_name("identity.enc");
+    let mut keychain_healthy = false;
+
+    if !force {
+        // Refuse if either destination has an existing identity.
+        // Check the keychain first (cheap probe), then the encrypted file path.
+        // The probe also doubles as a connectivity check — Ok(None) means the
+        // backend is responsive AND there's no existing entry, so we can mark
+        // it healthy and skip the second probe below.
+        if let Some(kc) = &keychain {
+            match kc.load() {
+                Ok(Some(_)) => {
+                    return Err(
+                        "identity already exists in OS keychain; pass --force to overwrite (this is destructive)"
+                            .to_string(),
+                    );
+                }
+                Ok(None) => keychain_healthy = true,
+                Err(e) => {
+                    return Err(format!(
+                        "could not determine whether an identity already exists in OS keychain — refusing to overwrite: {e}; pass --force to override"
+                    ));
+                }
+            }
+        }
+        if enc_path.exists() {
+            return Err(format!(
+                "identity already exists at {}; pass --force to overwrite (this is destructive)",
+                enc_path.display()
+            ));
+        }
+    } else if let Some(kc) = &keychain {
+        // Force path: still need a connectivity probe to compute keychain_healthy.
+        if kc.load().is_ok() {
+            keychain_healthy = true;
+        }
+    }
+
+    let encrypted = match EncryptedFileStore::from_env(enc_path.clone()) {
+        Ok(opt) => opt,
+        Err(e) if keychain_healthy => {
+            tracing::warn!(
+                "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE configured but invalid \
+                 ({e}); ignoring — keychain is available as fallback"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    let destination = save_with_fallback(
+        keychain_healthy,
         keychain.as_ref(),
-        keychain_probe_ok,
         encrypted.as_ref(),
-        plaintext_path,
-    )
+        seed,
+        || "no identity store available: keychain unavailable and HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE not set — see docs/headless-install.md".to_string(),
+        |e| format!(
+            "keychain save failed and no encrypted fallback configured: {e} — see docs/headless-install.md"
+        ),
+    )?;
+
+    // After save_with_fallback succeeds, with force=true: best-effort unlink
+    // the non-destination so the user can't be stranded on a stale backup
+    // after a future keychain clear or env-var change. Drive cleanup from the
+    // actual save destination, not from the pre-save probe, to avoid the
+    // data-loss bug where probe-ok + save-fail → fallback writes encrypted file
+    // → cleanup wrongly deletes the freshly-written .enc.
+    if force {
+        match destination {
+            SaveDestination::Keychain => {
+                // Wrote to keychain → unlink the encrypted file if it exists.
+                // A leftover .enc with the pre-restore seed is the silent-failure
+                // scenario this guards against.
+                match std::fs::remove_file(&enc_path) {
+                    Ok(()) => tracing::info!(
+                        path = %enc_path.display(),
+                        "removed stale encrypted-file backend after keychain force-restore"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Nothing to clean up.
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %enc_path.display(),
+                        error = %e,
+                        "could not remove stale encrypted-file backend after keychain force-restore — manual cleanup may be needed"
+                    ),
+                }
+            }
+            SaveDestination::EncryptedFile => {
+                // Wrote to encrypted file → clean up any stale keychain entry.
+                if let Some(kc) = &keychain {
+                    match kc.delete() {
+                        Ok(()) => tracing::info!("removed stale keychain entry after encrypted-file force-restore"),
+                        Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Re-encrypt the identity at `old.path()` with `new_passphrase`.
@@ -1105,7 +1056,7 @@ pub(crate) fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
-    let identity = old
+    let seed = old
         .load()?
         .ok_or_else(|| {
             format!(
@@ -1115,14 +1066,14 @@ pub(crate) fn rotate_passphrase(
         })?;
 
     let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
-    new_store.save(&identity)?;
+    new_store.save(&seed)?;
     // After save() returns Ok, the file at `old.path()` has been atomically
     // replaced and is now decryptable ONLY by the new passphrase. A
     // verify-after-write failure here is a transient I/O / corruption signal,
     // not a "rotation didn't happen" signal — the operator MUST keep the new
     // passphrase or they lose access to their identity. Rewrite the error so
     // a panicked operator doesn't discard the new passphrase file.
-    verify_round_trip(&new_store, &identity).map_err(|e| {
+    verify_round_trip(&new_store, &seed).map_err(|e| {
         format!(
             "{} was rewritten with the new passphrase, but the verify-after-write \
              read-back failed: {e}. The new passphrase is now REQUIRED to decrypt \
@@ -1200,7 +1151,7 @@ impl keyring::credential::CredentialApi for AlwaysFailOnSave {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn warn_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
@@ -1230,6 +1181,7 @@ pub mod test_only {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn file_store_round_trip() {
@@ -1237,20 +1189,13 @@ mod tests {
         let path = dir.path().join("identity.key");
         let store = FileStore::new(path.clone());
 
-        let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-        let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-        let identity = NodeIdentity { pq, ed25519 };
+        let mut original = [0u8; BLOB_LEN];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut original);
 
-        store.save(&identity).unwrap();
-        let loaded = store.load().unwrap().expect("should find saved identity");
-        assert_eq!(
-            loaded.ed25519.public_identity().address_hash,
-            identity.ed25519.public_identity().address_hash,
-        );
-        assert_eq!(
-            loaded.pq.public_identity().address_hash,
-            identity.pq.public_identity().address_hash,
-        );
+        store.save(&original).unwrap();
+        let loaded = store.load().unwrap().expect("should find saved seed");
+        assert_eq!(*loaded, original);
     }
 
     #[test]
@@ -1263,30 +1208,15 @@ mod tests {
 
     #[test]
     fn keychain_store_round_trip() {
-        // PQ keygen (ML-DSA scalar NTT) requires ~2 MB stack — spawn a larger thread.
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let store = KeychainStore::new_mock();
+        let store = KeychainStore::new_mock();
 
-                let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-                let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-                let identity = NodeIdentity { pq, ed25519 };
+        let mut original = [0u8; BLOB_LEN];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut original);
 
-                store.save(&identity).unwrap();
-                let loaded = store.load().unwrap().expect("should find saved identity");
-                assert_eq!(
-                    loaded.ed25519.public_identity().address_hash,
-                    identity.ed25519.public_identity().address_hash,
-                );
-                assert_eq!(
-                    loaded.pq.public_identity().address_hash,
-                    identity.pq.public_identity().address_hash,
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        store.save(&original).unwrap();
+        let loaded = store.load().unwrap().expect("should find saved seed");
+        assert_eq!(*loaded, original);
     }
 
     #[test]
@@ -1295,13 +1225,126 @@ mod tests {
         assert!(store.load().unwrap().is_none());
     }
 
+    #[test]
+    #[serial]
+    fn read_seed_round_trips_via_encrypted_file() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        // Set up an encrypted store with a known passphrase, write a known seed.
+        std::env::set_var("HARMONY_PASSPHRASE", "round-trip-test");
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("round-trip-test".to_string()));
+        let written = [0xCDu8; 32];
+        store.save(&written).expect("save");
+
+        // Read it back through the public seed-shaped helper.
+        let loaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("read");
+        assert_eq!(*loaded, written, "seed must round-trip through the encrypted store");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn write_seed_refuses_when_identity_exists_without_force() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "refuse-test");
+        let existing_seed = [0x11u8; 32];
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("refuse-test".to_string()));
+        store.save(&existing_seed).unwrap();
+
+        let new_seed = [0x22u8; 32];
+        // Pass `None` for the keychain to keep this test hermetic — without it,
+        // write_seed_to_disk would resolve `KeychainStore::new().ok()`, which on
+        // a developer machine reads/writes the real `harmony/identity` keychain
+        // entry and prompts for keychain access.
+        let err = write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &new_seed,
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("must refuse when destination exists");
+        assert!(err.contains("identity already exists"), "actual: {err}");
+        assert!(err.contains("--force"), "actual: {err}");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn write_seed_with_force_overwrites_existing() {
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = dir.path().join("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "force-test");
+        let existing_seed = [0x33u8; 32];
+        let store = EncryptedFileStore::new(enc_path.clone(), SecretString::from("force-test".to_string()));
+        store.save(&existing_seed).unwrap();
+
+        let new_seed = [0x44u8; 32];
+        // Pass `None` so the test stays file-only and never touches the real OS
+        // keychain (see hermeticity comment on the sibling test above).
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &new_seed,
+            /*force=*/ true,
+            None,
+        )
+        .expect("force must succeed");
+
+        let reloaded = read_seed_from_disk_with_keychain(&plaintext_path, None).expect("reload");
+        assert_eq!(*reloaded, new_seed, "after force-overwrite, the new seed must be present");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn force_unlinks_stale_encrypted_file_after_keychain_write() {
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+
+        // Seed both backends with different seeds. We use a healthy mock keychain
+        // for the keychain path; the encrypted file is real on disk.
+        std::env::set_var("HARMONY_PASSPHRASE", "force-cleanup-test");
+        let kc = KeychainStore::new_mock();
+        kc.save(&[0x11u8; 32]).unwrap();
+
+        let store = EncryptedFileStore::new(
+            enc_path.clone(),
+            SecretString::from("force-cleanup-test".to_string()),
+        );
+        store.save(&[0x22u8; 32]).unwrap();
+        assert!(enc_path.exists(), "test setup: enc file present");
+
+        // Force-write a third seed. With keychain healthy, save_with_fallback
+        // writes to keychain; the cleanup logic should unlink the stale .enc.
+        write_seed_to_disk_with_keychain(&plaintext_path, &[0x33u8; 32], true, Some(kc))
+            .expect("force write must succeed");
+        assert!(!enc_path.exists(), "stale enc file must be unlinked after keychain force-restore");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
     mod wire_format {
         use super::*;
 
         const TEST_PASSPHRASE: &[u8] = b"correct horse battery staple";
         const TEST_SALT: [u8; 16] = [0xAB; 16];
         const TEST_NONCE: [u8; 24] = [0xCD; 24];
-        const TEST_BLOB: [u8; 161] = [0x42; 161];
+        const TEST_BLOB: [u8; 32] = [0x42; 32];
 
         #[test]
         fn round_trip_correct_passphrase() {
@@ -1323,7 +1366,7 @@ mod tests {
         #[test]
         fn tampered_ciphertext_fails() {
             let mut bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            bytes[100] ^= 0x01;  // flip one bit in the ciphertext range (53..214)
+            bytes[60] ^= 0x01;  // flip one bit in the ciphertext range (53..85)
             let err = decrypt(TEST_PASSPHRASE, &bytes).unwrap_err();
             assert!(err.contains("wrong passphrase or corrupted file"));
         }
@@ -1363,20 +1406,20 @@ mod tests {
         #[test]
         fn truncated_file_fails() {
             let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            let err = decrypt(TEST_PASSPHRASE, &bytes[..200]).unwrap_err();
-            assert!(err.contains("expected 230 bytes"), "got: {err}");
+            let err = decrypt(TEST_PASSPHRASE, &bytes[..70]).unwrap_err();
+            assert!(err.contains("expected 101 bytes"), "got: {err}");
         }
 
         #[test]
-        fn output_is_exactly_230_bytes() {
+        fn output_is_exactly_101_bytes() {
             let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            assert_eq!(bytes.len(), 230);
+            assert_eq!(bytes.len(), 101);
         }
 
         #[test]
         fn header_layout_is_exact() {
             let bytes = encrypt_with_params(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
-            // 230-byte file: 13-byte header, 16-byte salt, 24-byte nonce, 161-byte ciphertext, 16-byte tag.
+            // 101-byte file: 13-byte header, 16-byte salt, 24-byte nonce, 32-byte ciphertext, 16-byte tag.
             // NOTE: kdf_t is u16 BE (not u32) so the header fits in 13 bytes total.
             assert_eq!(&bytes[0..4], b"HRMI", "magic mismatch");
             assert_eq!(bytes[4], 0x01, "format_version mismatch");
@@ -1386,7 +1429,7 @@ mod tests {
             assert_eq!(bytes[12], 1, "kdf_p (u8) mismatch");
             assert_eq!(&bytes[13..29], &TEST_SALT[..], "salt mismatch");
             assert_eq!(&bytes[29..53], &TEST_NONCE[..], "nonce mismatch");
-            assert_eq!(bytes.len(), 230);
+            assert_eq!(bytes.len(), 101);
         }
     }
 
@@ -1394,10 +1437,11 @@ mod tests {
         use super::*;
         use secrecy::SecretString;
 
-        fn fresh_identity() -> NodeIdentity {
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            NodeIdentity { pq, ed25519 }
+        fn fresh_seed() -> [u8; BLOB_LEN] {
+            let mut buf = [0u8; BLOB_LEN];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            buf
         }
 
         fn fresh_passphrase() -> SecretString {
@@ -1410,12 +1454,10 @@ mod tests {
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
 
-            let original = fresh_identity();
-            let original_addr = original.ed25519.public_identity().address_hash;
-
+            let original = fresh_seed();
             store.save(&original).unwrap();
-            let loaded = store.load().unwrap().expect("should find saved identity");
-            assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
+            let loaded = store.load().unwrap().expect("should find saved seed");
+            assert_eq!(*loaded, original);
         }
 
         #[test]
@@ -1432,7 +1474,7 @@ mod tests {
             let path = dir.path().join("identity.enc");
 
             EncryptedFileStore::new(path.clone(), fresh_passphrase())
-                .save(&fresh_identity())
+                .save(&fresh_seed())
                 .unwrap();
 
             let wrong = EncryptedFileStore::new(path, SecretString::from("wrong".to_string()));
@@ -1445,20 +1487,17 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
-            let id = fresh_identity();
+            let seed = fresh_seed();
 
-            store.save(&id).unwrap();
+            store.save(&seed).unwrap();
             let bytes_a = std::fs::read(&path).unwrap();
-            store.save(&id).unwrap();
+            store.save(&seed).unwrap();
             let bytes_b = std::fs::read(&path).unwrap();
 
             assert_ne!(bytes_a, bytes_b, "salt+nonce must rotate per save");
-            // Both must still load back to the same identity:
+            // Both must still load back to the same seed:
             let loaded = store.load().unwrap().unwrap();
-            assert_eq!(
-                loaded.ed25519.public_identity().address_hash,
-                id.ed25519.public_identity().address_hash,
-            );
+            assert_eq!(*loaded, seed);
         }
 
         #[cfg(unix)]
@@ -1469,19 +1508,19 @@ mod tests {
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
 
-            store.save(&fresh_identity()).unwrap();
+            store.save(&fresh_seed()).unwrap();
 
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "expected 0o600, got {mode:#o}");
         }
 
         #[test]
-        fn file_is_exactly_230_bytes() {
+        fn file_is_exactly_101_bytes() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
-            store.save(&fresh_identity()).unwrap();
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 230);
+            store.save(&fresh_seed()).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 101);
         }
 
         #[test]
@@ -1489,14 +1528,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("identity.enc");
             let store = EncryptedFileStore::new(path.clone(), fresh_passphrase());
-            store.save(&fresh_identity()).unwrap();
+            store.save(&fresh_seed()).unwrap();
 
-            // Truncate to 200 bytes.
+            // Truncate to 70 bytes.
             let bytes = std::fs::read(&path).unwrap();
-            std::fs::write(&path, &bytes[..200]).unwrap();
+            std::fs::write(&path, &bytes[..70]).unwrap();
 
             let err = store.load().unwrap_err();
-            assert!(err.contains("expected 230 bytes"), "got: {err}");
+            assert!(err.contains("expected 101 bytes"), "got: {err}");
         }
     }
 
@@ -1626,63 +1665,15 @@ mod tests {
         }
     }
 
-    mod legacy_plaintext_reader {
-        use super::*;
-
-        #[test]
-        fn read_existing_plaintext() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("identity.key");
-
-            // Pre-populate via FileStore (which writes the same 161-byte format)
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let original = NodeIdentity { pq, ed25519 };
-            let original_addr = original.ed25519.public_identity().address_hash;
-            FileStore::new(path.clone()).save(&original).unwrap();
-
-            // Read back via LegacyPlaintextReader
-            let reader = LegacyPlaintextReader::new(path);
-            let loaded = reader.read().unwrap().expect("should read plaintext");
-            assert_eq!(
-                loaded.ed25519.public_identity().address_hash,
-                original_addr,
-            );
-        }
-
-        #[test]
-        fn read_returns_none_when_missing() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("nonexistent.key");
-            let reader = LegacyPlaintextReader::new(path);
-            assert!(reader.read().unwrap().is_none());
-        }
-
-        #[test]
-        fn read_from_static_method_works() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("identity.key");
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let original = NodeIdentity { pq, ed25519 };
-            let original_addr = original.ed25519.public_identity().address_hash;
-            FileStore::new(path.clone()).save(&original).unwrap();
-
-            let loaded = LegacyPlaintextReader::read_from(&path)
-                .unwrap()
-                .expect("should read plaintext via static method");
-            assert_eq!(loaded.ed25519.public_identity().address_hash, original_addr);
-        }
-    }
-
     mod resolution_chain {
         use super::*;
         use secrecy::SecretString;
 
-        fn fresh_identity() -> NodeIdentity {
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            NodeIdentity { pq, ed25519 }
+        fn fresh_seed() -> [u8; BLOB_LEN] {
+            let mut buf = [0u8; BLOB_LEN];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            buf
         }
 
         fn fresh_passphrase() -> SecretString {
@@ -1691,153 +1682,57 @@ mod tests {
 
         #[test]
         fn keychain_present_returns_keychain() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let original = fresh_identity();
-            let original_addr = original.ed25519.public_identity().address_hash;
-
+            let original = fresh_seed();
             let keychain = KeychainStore::new_mock();
             keychain.save(&original).unwrap();
 
-            let result = load_or_generate_with_stores(Some(&keychain), None, &plaintext_path).unwrap();
-            assert_eq!(result.ed25519.public_identity().address_hash, original_addr);
-            assert!(!plaintext_path.exists(), "no plaintext should be created");
+            let result = load_or_generate_with_stores(Some(&keychain), None).unwrap();
+            assert_eq!(*result, original);
         }
 
         #[test]
         fn fresh_install_writes_to_keychain() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-
             let keychain = KeychainStore::new_mock();
-            let result = load_or_generate_with_stores(Some(&keychain), None, &plaintext_path).unwrap();
+            let result = load_or_generate_with_stores(Some(&keychain), None).unwrap();
 
-            let from_keychain = keychain.load().unwrap().expect("identity should be in keychain");
-            assert_eq!(
-                from_keychain.ed25519.public_identity().address_hash,
-                result.ed25519.public_identity().address_hash,
-            );
-            assert!(!plaintext_path.exists());
-        }
-
-        #[test]
-        fn migrate_plaintext_to_keychain_and_unlink() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-
-            let original = fresh_identity();
-            let original_addr = original.ed25519.public_identity().address_hash;
-            FileStore::new(plaintext_path.clone()).save(&original).unwrap();
-
-            let keychain = KeychainStore::new_mock();
-            let result = load_or_generate_with_stores(Some(&keychain), None, &plaintext_path).unwrap();
-
-            assert_eq!(result.ed25519.public_identity().address_hash, original_addr);
-            assert!(!plaintext_path.exists(), "plaintext should be unlinked after migration");
-            let from_keychain = keychain.load().unwrap().expect("should be in keychain");
-            assert_eq!(
-                from_keychain.ed25519.public_identity().address_hash,
-                original_addr,
-            );
-            // Critically: no .bak created by the new chain.
-            let bak = plaintext_path.with_extension("key.bak");
-            assert!(!bak.exists(), "new chain must not create .bak");
-        }
-
-        #[test]
-        fn migrate_plaintext_prefers_keychain_over_encrypted() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let enc_path = dir.path().join("identity.enc");
-
-            let original = fresh_identity();
-            FileStore::new(plaintext_path.clone()).save(&original).unwrap();
-
-            let keychain = KeychainStore::new_mock();
-            let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
-
-            load_or_generate_with_stores(Some(&keychain), Some(&encrypted), &plaintext_path).unwrap();
-
-            assert!(keychain.load().unwrap().is_some(), "keychain should win as destination");
-            assert!(!enc_path.exists(), ".enc must NOT be created when keychain is healthy");
-            assert!(!plaintext_path.exists());
-        }
-
-        #[test]
-        fn migrate_plaintext_to_encrypted_when_no_keychain() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let enc_path = dir.path().join("identity.enc");
-
-            let original = fresh_identity();
-            let original_addr = original.ed25519.public_identity().address_hash;
-            FileStore::new(plaintext_path.clone()).save(&original).unwrap();
-
-            let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
-            let result = load_or_generate_with_stores(None, Some(&encrypted), &plaintext_path).unwrap();
-
-            assert_eq!(result.ed25519.public_identity().address_hash, original_addr);
-            assert!(enc_path.exists(), ".enc should be the destination");
-            assert!(!plaintext_path.exists(), "plaintext should be unlinked");
+            let from_keychain = keychain.load().unwrap().expect("seed should be in keychain");
+            assert_eq!(*from_keychain, *result);
         }
 
         #[test]
         fn fresh_install_writes_to_encrypted_when_no_keychain() {
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
             let enc_path = dir.path().join("identity.enc");
 
             let encrypted = EncryptedFileStore::new(enc_path.clone(), fresh_passphrase());
-            let result = load_or_generate_with_stores(None, Some(&encrypted), &plaintext_path).unwrap();
+            let result = load_or_generate_with_stores(None, Some(&encrypted)).unwrap();
 
             assert!(enc_path.exists());
             let from_enc = encrypted.load().unwrap().expect("should be in .enc");
-            assert_eq!(
-                from_enc.ed25519.public_identity().address_hash,
-                result.ed25519.public_identity().address_hash,
-            );
+            assert_eq!(*from_enc, *result);
         }
 
         #[test]
         fn headless_no_keychain_no_env_hard_fails_on_fresh() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-
-            let err = load_or_generate_with_stores(None, None, &plaintext_path).unwrap_err();
+            let err = load_or_generate_with_stores(None, None).unwrap_err();
             assert!(err.contains("no identity store available"), "got: {err}");
             assert!(err.contains("docs/headless-install.md"), "should point at docs: {err}");
         }
 
         #[test]
-        fn headless_no_keychain_no_env_hard_fails_with_plaintext() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-
-            let original = fresh_identity();
-            FileStore::new(plaintext_path.clone()).save(&original).unwrap();
-
-            let err = load_or_generate_with_stores(None, None, &plaintext_path).unwrap_err();
-            assert!(err.contains("plaintext identity"), "got: {err}");
-            assert!(err.contains("docs/headless-install.md"));
-            assert!(plaintext_path.exists(), "plaintext must NOT be deleted on hard-fail");
-        }
-
-        #[test]
         fn wrong_passphrase_does_not_regenerate() {
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
             let enc_path = dir.path().join("identity.enc");
 
             // Write an .enc with passphrase A.
-            let original = fresh_identity();
-            let original_addr = original.ed25519.public_identity().address_hash;
+            let original = fresh_seed();
             EncryptedFileStore::new(enc_path.clone(), fresh_passphrase())
                 .save(&original)
                 .unwrap();
 
             // Try to load with wrong passphrase B.
             let wrong = EncryptedFileStore::new(enc_path.clone(), SecretString::from("WRONG".to_string()));
-            let err = load_or_generate_with_stores(None, Some(&wrong), &plaintext_path).unwrap_err();
+            let err = load_or_generate_with_stores(None, Some(&wrong)).unwrap_err();
             assert!(err.contains("wrong passphrase or corrupted file"), "got: {err}");
 
             // Critically: original .enc must still be intact (not regenerated).
@@ -1846,27 +1741,10 @@ mod tests {
                 .unwrap()
                 .expect("original .enc must still be loadable with correct passphrase");
             assert_eq!(
-                recovered.ed25519.public_identity().address_hash,
-                original_addr,
+                *recovered,
+                original,
                 "wrong-passphrase must NOT trigger fresh generate",
             );
-        }
-
-        #[test]
-        fn keychain_present_with_legacy_bak_cleans_up() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let bak_path = dir.path().join("identity.key.bak");
-
-            let id = fresh_identity();
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&id).unwrap();
-            // Pre-existing .bak with matching identity
-            FileStore::new(bak_path.clone()).save(&id).unwrap();
-
-            load_or_generate_with_stores(Some(&keychain), None, &plaintext_path).unwrap();
-
-            assert!(!bak_path.exists(), "matching .bak should be auto-removed");
         }
 
         /// Keychain Err (transient OS-keychain failure) is recoverable: the
@@ -1877,7 +1755,6 @@ mod tests {
         #[test]
         fn keychain_err_falls_through_to_encrypted() {
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
             let enc_path = dir.path().join("identity.enc");
 
             let keychain = KeychainStore::new_load_failing_mock();
@@ -1886,31 +1763,23 @@ mod tests {
             let result = load_or_generate_with_stores(
                 Some(&keychain),
                 Some(&encrypted),
-                &plaintext_path,
             )
             .expect("keychain Err must fall through, not hard-fail");
 
-            // Identity ended up in the encrypted store, not the keychain.
+            // Seed ended up in the encrypted store, not the keychain.
             assert!(enc_path.exists(), "encrypted file should be the destination");
             let from_enc = encrypted
                 .load()
                 .unwrap()
-                .expect("encrypted store should hold the new identity");
-            assert_eq!(
-                from_enc.ed25519.public_identity().address_hash,
-                result.ed25519.public_identity().address_hash,
-            );
+                .expect("encrypted store should hold the new seed");
+            assert_eq!(*from_enc, *result);
         }
 
-        /// Step 4 (fresh generate) used to hard-fail when the keychain accepted
-        /// load (Ok(None)) but rejected save — even when an encrypted store
-        /// was configured. This test covers the post-fix behavior: keychain
-        /// save failure falls back to the encrypted backend rather than
-        /// hard-failing.
+        /// Fresh generate: keychain accepted load (Ok(None)) but rejected save.
+        /// Should fall back to the encrypted backend rather than hard-failing.
         #[test]
         fn keychain_save_failure_falls_back_to_encrypted_on_fresh() {
             let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
             let enc_path = dir.path().join("identity.enc");
 
             // new_failing_mock: load returns NoEntry (so step 1's Ok(None)
@@ -1921,7 +1790,6 @@ mod tests {
             let result = load_or_generate_with_stores(
                 Some(&keychain),
                 Some(&encrypted),
-                &plaintext_path,
             )
             .expect("must fall back to encrypted, not hard-fail");
 
@@ -1929,11 +1797,8 @@ mod tests {
             let from_enc = encrypted
                 .load()
                 .unwrap()
-                .expect("encrypted store should hold the new identity");
-            assert_eq!(
-                from_enc.ed25519.public_identity().address_hash,
-                result.ed25519.public_identity().address_hash,
-            );
+                .expect("encrypted store should hold the new seed");
+            assert_eq!(*from_enc, *result);
             // Sanity: the keychain entry was NOT persisted (mock fails save).
             assert!(
                 keychain.load().unwrap().is_none(),
@@ -1941,37 +1806,25 @@ mod tests {
             );
         }
 
-        /// Legacy plaintext + corrupted destination would cause verify-round-trip
-        /// to fail. The chain must NOT unlink the plaintext in that case.
-        /// Implemented via a wrapper KeyStore whose load returns mutated bytes.
+        /// verify_round_trip: custom store that returns a different seed on load.
         #[test]
-        fn verify_round_trip_failure_aborts_migration() {
-            // Custom KeyStore that drops a bit on load (corrupts post-write).
+        fn verify_round_trip_detects_mismatch() {
             struct CorruptingStore { inner: KeychainStore }
             impl KeyStore for CorruptingStore {
-                fn save(&self, id: &NodeIdentity) -> Result<(), String> { self.inner.save(id) }
-                fn load(&self) -> Result<Option<NodeIdentity>, String> {
-                    // Always return a freshly generated (different) identity to force mismatch.
-                    let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-                    let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-                    Ok(Some(NodeIdentity { pq, ed25519 }))
+                fn save(&self, seed: &[u8; BLOB_LEN]) -> Result<(), String> { self.inner.save(seed) }
+                fn load(&self) -> Result<Option<Zeroizing<[u8; BLOB_LEN]>>, String> {
+                    // Always return a different seed to force mismatch.
+                    let mut buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
+                    use rand::RngCore;
+                    rand::rngs::OsRng.fill_bytes(buf.as_mut());
+                    Ok(Some(buf))
                 }
             }
 
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-
-            let original = fresh_identity();
-            FileStore::new(plaintext_path.clone()).save(&original).unwrap();
-
+            let original = fresh_seed();
             let store = CorruptingStore { inner: KeychainStore::new_mock() };
-            // verify_round_trip is called directly here because load_or_generate_with_stores
-            // takes concrete &KeychainStore / &EncryptedFileStore (not &dyn KeyStore).
-            // The chain delegates to verify_round_trip, so testing it independently
-            // covers the abort-on-mismatch behavior.
             let err = verify_round_trip(&store, &original).unwrap_err();
-            assert!(err.contains("verify-after-write failed"), "got: {err}");
-            assert!(plaintext_path.exists(), "plaintext must be preserved on verify-fail");
+            assert!(err.contains("verify-after-write"), "got: {err}");
         }
 
         // ── from_env error policy: scoped to a successful keychain probe ──
@@ -2036,92 +1889,40 @@ mod tests {
         }
     }
 
-    mod legacy_bak_cleanup {
-        use super::*;
+    #[test]
+    fn seed_round_trip_via_blob() {
+        let seed = [0xABu8; 32];
+        let blob = seed_to_blob(&seed);
+        let recovered = blob_to_seed(blob.as_slice()).unwrap();
+        assert_eq!(seed, *recovered, "seed must round-trip byte-for-byte through blob serialization");
+    }
 
-        fn fresh_identity() -> NodeIdentity {
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            NodeIdentity { pq, ed25519 }
-        }
-
-        #[test]
-        fn matching_bak_deleted_after_keychain_verify() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let bak_path = dir.path().join("identity.key.bak");
-
-            let id = fresh_identity();
-            // Pre-populate .bak with the same identity that's in the keychain.
-            FileStore::new(bak_path.clone()).save(&id).unwrap();
-
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&id).unwrap();
-
-            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
-
-            assert!(!bak_path.exists(), ".bak should be removed");
-        }
-
-        #[test]
-        fn mismatched_bak_left_in_place() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let bak_path = dir.path().join("identity.key.bak");
-
-            let id_in_use = fresh_identity();
-            let id_in_bak = fresh_identity();  // different
-            FileStore::new(bak_path.clone()).save(&id_in_bak).unwrap();
-
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&id_in_use).unwrap();
-
-            cleanup_legacy_bak(&plaintext_path, &id_in_use, &keychain);
-
-            assert!(bak_path.exists(), ".bak with mismatched identity must be preserved");
-        }
-
-        #[test]
-        fn unreadable_bak_left_in_place() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            let bak_path = dir.path().join("identity.key.bak");
-
-            // Write garbage to .bak (not a valid 161-byte identity blob).
-            std::fs::write(&bak_path, b"not a valid identity blob").unwrap();
-
-            let id = fresh_identity();
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&id).unwrap();
-
-            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
-
-            assert!(bak_path.exists(), "unreadable .bak must be preserved");
-        }
-
-        #[test]
-        fn no_bak_no_op() {
-            let dir = tempfile::tempdir().unwrap();
-            let plaintext_path = dir.path().join("identity.key");
-            // No .bak exists.
-
-            let id = fresh_identity();
-            let keychain = KeychainStore::new_mock();
-            keychain.save(&id).unwrap();
-
-            // Should not panic / error.
-            cleanup_legacy_bak(&plaintext_path, &id, &keychain);
-        }
+    #[test]
+    fn from_seed_yields_same_node_identity_across_launches() {
+        let seed = [0x42u8; 32];
+        let id_a = NodeIdentity::from_seed(&seed);
+        let id_b = NodeIdentity::from_seed(&seed);
+        assert_eq!(
+            id_a.ed25519.to_private_bytes().as_slice(),
+            id_b.ed25519.to_private_bytes().as_slice(),
+            "Ed25519 sub-key must be deterministic across calls"
+        );
+        assert_eq!(
+            id_a.pq.to_private_bytes().as_slice(),
+            id_b.pq.to_private_bytes().as_slice(),
+            "PQ sub-key must be deterministic across calls"
+        );
     }
 
     mod rotation {
         use super::*;
         use secrecy::SecretString;
 
-        fn fresh_identity() -> NodeIdentity {
-            let pq = PqPrivateIdentity::generate(&mut rand::rngs::OsRng);
-            let ed25519 = PrivateIdentity::generate(&mut rand::rngs::OsRng);
-            NodeIdentity { pq, ed25519 }
+        fn fresh_seed() -> [u8; BLOB_LEN] {
+            let mut buf = [0u8; BLOB_LEN];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            buf
         }
 
         #[test]
@@ -2132,24 +1933,23 @@ mod tests {
             let pass_a = SecretString::from("pass_a".to_string());
             let pass_b = SecretString::from("pass_b".to_string());
 
-            let id = fresh_identity();
-            let id_addr = id.ed25519.public_identity().address_hash;
+            let seed = fresh_seed();
 
             // Write with A.
             EncryptedFileStore::new(path.clone(), pass_a.clone())
-                .save(&id)
+                .save(&seed)
                 .unwrap();
 
             // Rotate to B.
             let store_a = EncryptedFileStore::new(path.clone(), pass_a.clone());
             rotate_passphrase(&store_a, pass_b.clone()).unwrap();
 
-            // B can decrypt.
+            // B can decrypt and returns the same seed.
             let loaded = EncryptedFileStore::new(path.clone(), pass_b)
                 .load()
                 .unwrap()
                 .unwrap();
-            assert_eq!(loaded.ed25519.public_identity().address_hash, id_addr);
+            assert_eq!(*loaded, seed);
 
             // A can no longer decrypt.
             let err = EncryptedFileStore::new(path, pass_a).load().unwrap_err();
@@ -2162,7 +1962,7 @@ mod tests {
             let path = dir.path().join("identity.enc");
 
             EncryptedFileStore::new(path.clone(), SecretString::from("real".to_string()))
-                .save(&fresh_identity())
+                .save(&fresh_seed())
                 .unwrap();
 
             let bytes_before = std::fs::read(&path).unwrap();
@@ -2183,7 +1983,7 @@ mod tests {
             let pass = SecretString::from("same".to_string());
 
             EncryptedFileStore::new(path.clone(), pass.clone())
-                .save(&fresh_identity())
+                .save(&fresh_seed())
                 .unwrap();
             let bytes_before = std::fs::read(&path).unwrap();
 
@@ -2203,5 +2003,89 @@ mod tests {
             let err = rotate_passphrase(&store, SecretString::from("new".to_string())).unwrap_err();
             assert!(err.contains("no encrypted identity to rotate"), "got: {err}");
         }
+    }
+
+    // ── Bug 1 regression: force-cleanup uses actual save destination ──────
+
+    /// Keychain probe ok, keychain save fails → fallback writes encrypted file.
+    /// The force-cleanup must NOT delete the freshly-written .enc.
+    #[test]
+    #[serial]
+    fn force_does_not_delete_enc_when_keychain_save_fails_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "fallback-test");
+
+        // new_failing_mock: load returns NoEntry (probe succeeds → keychain_healthy = true),
+        // but save always returns Err → save_with_fallback falls back to encrypted file.
+        let kc = KeychainStore::new_failing_mock();
+
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0xBEu8; 32],
+            /*force=*/ true,
+            Some(kc),
+        )
+        .expect("force write must succeed via encrypted-file fallback");
+
+        assert!(enc_path.exists(), "the freshly-written encrypted file must NOT be deleted");
+        let raw = std::fs::read(&enc_path).unwrap();
+        assert_eq!(raw.len(), ENC_FILE_LEN, "the encrypted file must hold the new envelope");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── Bug 2 regression: write path tolerates bad env var when keychain is healthy ──
+
+    /// Malformed HARMONY_PASSPHRASE must not break the write path when the keychain is healthy.
+    #[test]
+    #[serial]
+    fn force_write_succeeds_via_keychain_when_at_rest_passphrase_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        // Empty HARMONY_PASSPHRASE → EncryptedFileStore::from_env returns Err.
+        // With a healthy keychain the write should still succeed.
+        std::env::set_var("HARMONY_PASSPHRASE", "");
+        let kc = KeychainStore::new_mock();
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0xCEu8; 32],
+            /*force=*/ true,
+            Some(kc),
+        )
+        .expect("force write must succeed via keychain even with bad HARMONY_PASSPHRASE");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── Bug 3 regression: !force probe fails closed on keychain Err ───────
+
+    /// Keychain probe Err (unreachable keychain) must refuse without --force.
+    #[test]
+    #[serial]
+    fn write_seed_refuses_when_keychain_probe_fails_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "probe-fail-test");
+        // new_load_failing_mock returns Err on load(), simulating an unreachable keychain.
+        let kc = KeychainStore::new_load_failing_mock();
+
+        let err = write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0x55u8; 32],
+            /*force=*/ false,
+            Some(kc),
+        )
+        .expect_err("must refuse when keychain probe fails (fail-closed)");
+        assert!(
+            err.contains("could not determine") || err.contains("refusing"),
+            "actual: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }
