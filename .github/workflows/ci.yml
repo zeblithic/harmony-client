@@ -71,15 +71,17 @@ jobs:
       # tests/content_index_integration.rs and tests/folder_primitive_integration.rs
       # but main stayed "green" for two days because contributors only
       # ran `cargo test --lib` locally.
-      - name: cargo clippy --all-targets
-        run: cargo clippy --all-targets --no-deps
+      #
+      # `--locked` ensures we test against the exact Cargo.lock dep graph
+      # the repo committed. Without it, cargo can silently re-resolve
+      # patched/yanked deps and CI would be testing a different graph than
+      # contributors run locally. The MSRV job already uses --locked; the
+      # main gate should match.
+      - name: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets --no-deps
 
-      # `--all-targets` here matches the clippy step above: the comment
-      # block on the clippy invocation explains why this is load-bearing.
-      # Tests in benches/examples (none today, but the gate is the right
-      # shape for when they appear) are otherwise skipped.
-      - name: cargo test --workspace --all-targets
-        run: cargo test --workspace --all-targets
+      - name: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust` job
   # above runs on stable for newer clippy lints + fastest iteration; this job
@@ -116,13 +118,19 @@ jobs:
             libayatana-appindicator3-dev \
             build-essential
 
+      # Use cargo's own TOML parser via `cargo metadata` so single-quoted
+      # strings, multi-line definitions, and any other valid TOML form all
+      # parse correctly — a regex against Cargo.toml would not. `--no-deps`
+      # skips dep resolution so this is a fast local-manifest read.
+      # `cargo` is preinstalled on the GitHub-hosted ubuntu runner image,
+      # so this step runs before any toolchain install.
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
-          set -euo pipefail
-          msrv=$(grep -E '^rust-version' Cargo.toml | sed -E 's/rust-version *= *"(.*)"/\1/')
-          if [ -z "$msrv" ]; then
-            echo "::error::Cargo.toml has no rust-version field; the MSRV gate has nothing to enforce" >&2
+          set -uo pipefail
+          msrv=$(cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml | jq -r '.packages[0].rust_version' || echo '')
+          if [ -z "$msrv" ] || [ "$msrv" = "null" ]; then
+            echo "::error::Cargo.toml has no [package].rust-version field; the MSRV gate has nothing to enforce" >&2
             exit 1
           fi
           echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
