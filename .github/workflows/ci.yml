@@ -15,6 +15,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege GITHUB_TOKEN: this workflow only checks out code and runs
+# local validation commands — it never writes to the repo, opens PRs, posts
+# comments, or pushes packages. Locking to read-only here means a compromised
+# action or step can't escalate beyond what CI legitimately needs.
+permissions:
+  contents: read
+
 # All third-party actions are pinned to full commit SHAs (not moving tags) so
 # a compromised upstream or moved tag can't silently change what runs in CI.
 # The trailing comment names the original tag for auditability — bump both
@@ -67,8 +74,12 @@ jobs:
       - name: cargo clippy --all-targets
         run: cargo clippy --all-targets --no-deps
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      # `--all-targets` here matches the clippy step above: the comment
+      # block on the clippy invocation explains why this is load-bearing.
+      # Tests in benches/examples (none today, but the gate is the right
+      # shape for when they appear) are otherwise skipped.
+      - name: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust` job
   # above runs on stable for newer clippy lints + fastest iteration; this job

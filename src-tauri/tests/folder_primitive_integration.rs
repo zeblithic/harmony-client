@@ -50,8 +50,9 @@ fn create_folder_at_root_then_list_shows_it() {
 
 #[test]
 fn create_nested_folder_updates_top_level_root_cid() {
-    // Build root "Photos" folder at depth 0. Sidecar has entry keyed by
-    // Photos's bundle CID (call it root_v1).
+    // Build root "Photos" folder at depth 0. Sidecar entry is keyed by
+    // a fresh SidecarId; its `cid` field holds Photos's bundle CID
+    // (call that root_v1).
     let dir = tempdir().unwrap();
     let mut idx = ContentIndex::load(dir.path());
     let photos_v1 = folders::build_folder("Photos", &[]).expect("build v1");
