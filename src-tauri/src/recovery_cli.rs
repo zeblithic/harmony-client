@@ -104,7 +104,7 @@ pub fn export_recovery_file_cli(
         .map_err(|e| e.to_string())?;
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
 
-    std::fs::write(out, &bytes)
+    crate::identity::write_atomic_0600(out, &bytes)
         .map_err(|e| format!("failed to write {}: {e}", out.display()))?;
 
     eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());

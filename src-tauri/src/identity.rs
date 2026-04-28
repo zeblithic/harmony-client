@@ -46,6 +46,15 @@ const NONCE_LEN: usize = 24;    // XChaCha20 needs 192-bit nonce
 const TAG_LEN: usize = 16;      // Poly1305 tag
 const ENC_FILE_LEN: usize = HEADER_LEN + SALT_LEN + NONCE_LEN + BLOB_LEN + TAG_LEN;
 
+/// Destination chosen by `save_with_fallback`. Returned so force-cleanup
+/// callers can know which backend actually received the write rather than
+/// inferring from the pre-save probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveDestination {
+    Keychain,
+    EncryptedFile,
+}
+
 pub struct NodeIdentity {
     pub pq: PqPrivateIdentity,
     pub ed25519: PrivateIdentity,
@@ -117,7 +126,7 @@ fn blob_to_seed(buf: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
 /// `TmpGuard` removes the `.tmp` file if anything panics or returns Err
 /// before the rename completes. After successful rename, the guard is
 /// `mem::forget`ed so the renamed file isn't unlinked.
-fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
@@ -743,7 +752,7 @@ fn load_or_generate_with_stores_post_probe(
     let mut seed_buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(seed_buf.as_mut());
-    save_with_fallback(
+    let _ = save_with_fallback(
         keychain_healthy,
         keychain,
         encrypted,
@@ -772,7 +781,7 @@ fn save_with_fallback(
     seed: &[u8; BLOB_LEN],
     no_dest_err: impl FnOnce() -> String,
     keychain_failed_no_enc_err: impl FnOnce(&str) -> String,
-) -> Result<(), String> {
+) -> Result<SaveDestination, String> {
     let mut keychain_err: Option<String> = None;
 
     if keychain_healthy {
@@ -797,7 +806,7 @@ fn save_with_fallback(
                     return Err(verify_err);
                 }
                 tracing::info!("identity stored in OS keychain");
-                return Ok(());
+                return Ok(SaveDestination::Keychain);
             }
             Err(e) => {
                 tracing::warn!(
@@ -812,7 +821,7 @@ fn save_with_fallback(
         enc.save(seed)?;
         verify_round_trip(enc, seed)?;
         tracing::info!(path = %enc.path().display(), "identity stored in encrypted file");
-        Ok(())
+        Ok(SaveDestination::EncryptedFile)
     } else if let Some(e) = keychain_err {
         Err(keychain_failed_no_enc_err(&e))
     } else {
@@ -904,10 +913,19 @@ pub fn write_seed_to_disk_with_keychain(
         // Refuse if either destination has an existing identity.
         // Check the keychain first (cheap probe), then the encrypted file path.
         if let Some(kc) = &keychain {
-            if matches!(kc.load(), Ok(Some(_))) {
-                return Err(format!(
-                    "identity already exists in OS keychain; pass --force to overwrite (this is destructive)"
-                ));
+            match kc.load() {
+                Ok(Some(_)) => {
+                    return Err(
+                        "identity already exists in OS keychain; pass --force to overwrite (this is destructive)"
+                            .to_string(),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "could not determine whether an identity already exists in OS keychain — refusing to overwrite: {e}; pass --force to override"
+                    ));
+                }
             }
         }
         let enc_path = plaintext_path.with_file_name("identity.enc");
@@ -928,9 +946,19 @@ pub fn write_seed_to_disk_with_keychain(
     }
 
     let enc_path = plaintext_path.with_file_name("identity.enc");
-    let encrypted = EncryptedFileStore::from_env(enc_path)?;
+    let encrypted = match EncryptedFileStore::from_env(enc_path) {
+        Ok(opt) => opt,
+        Err(e) if keychain_healthy => {
+            tracing::warn!(
+                "HARMONY_PASSPHRASE / HARMONY_PASSPHRASE_FILE configured but invalid \
+                 ({e}); ignoring — keychain is available as fallback"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
 
-    save_with_fallback(
+    let destination = save_with_fallback(
         keychain_healthy,
         keychain.as_ref(),
         encrypted.as_ref(),
@@ -943,39 +971,44 @@ pub fn write_seed_to_disk_with_keychain(
 
     // After save_with_fallback succeeds, with force=true: best-effort unlink
     // the non-destination so the user can't be stranded on a stale backup
-    // after a future keychain clear or env-var change. save_with_fallback's
-    // preference order is keychain (if healthy) → encrypted file; we replicate
-    // that here to pick the OTHER side.
+    // after a future keychain clear or env-var change. Drive cleanup from the
+    // actual save destination, not from the pre-save probe, to avoid the
+    // data-loss bug where probe-ok + save-fail → fallback writes encrypted file
+    // → cleanup wrongly deletes the freshly-written .enc.
     if force {
-        let wrote_to_keychain = keychain_healthy && keychain.is_some();
-        if wrote_to_keychain {
-            // Unlink the encrypted file if it exists. A leftover .enc with the
-            // pre-restore seed is the silent-failure scenario this guards against.
-            let enc_path = plaintext_path.with_file_name("identity.enc");
-            match std::fs::remove_file(&enc_path) {
-                Ok(()) => tracing::info!(
-                    path = %enc_path.display(),
-                    "removed stale encrypted-file backend after keychain force-restore"
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Nothing to clean up.
+        match destination {
+            SaveDestination::Keychain => {
+                // Wrote to keychain → unlink the encrypted file if it exists.
+                // A leftover .enc with the pre-restore seed is the silent-failure
+                // scenario this guards against.
+                let enc_path = plaintext_path.with_file_name("identity.enc");
+                match std::fs::remove_file(&enc_path) {
+                    Ok(()) => tracing::info!(
+                        path = %enc_path.display(),
+                        "removed stale encrypted-file backend after keychain force-restore"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Nothing to clean up.
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %enc_path.display(),
+                        error = %e,
+                        "could not remove stale encrypted-file backend after keychain force-restore — manual cleanup may be needed"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    path = %enc_path.display(),
-                    error = %e,
-                    "could not remove stale encrypted-file backend after keychain force-restore — manual cleanup may be needed"
-                ),
             }
-        } else if let Some(kc) = &keychain {
-            // We wrote to the encrypted file; clean up the keychain if it
-            // had a previous entry.
-            match kc.delete() {
-                Ok(()) => tracing::info!("removed stale keychain entry after encrypted-file force-restore"),
-                Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
-                ),
+            SaveDestination::EncryptedFile => {
+                // Wrote to encrypted file → clean up any stale keychain entry.
+                if let Some(kc) = &keychain {
+                    match kc.delete() {
+                        Ok(()) => tracing::info!("removed stale keychain entry after encrypted-file force-restore"),
+                        Err(keyring::Error::NoEntry) => { /* nothing to clean */ }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not remove stale keychain entry after encrypted-file force-restore — manual cleanup may be needed"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1925,5 +1958,89 @@ mod tests {
             let err = rotate_passphrase(&store, SecretString::from("new".to_string())).unwrap_err();
             assert!(err.contains("no encrypted identity to rotate"), "got: {err}");
         }
+    }
+
+    // ── Bug 1 regression: force-cleanup uses actual save destination ──────
+
+    /// Keychain probe ok, keychain save fails → fallback writes encrypted file.
+    /// The force-cleanup must NOT delete the freshly-written .enc.
+    #[test]
+    #[serial]
+    fn force_does_not_delete_enc_when_keychain_save_fails_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "fallback-test");
+
+        // new_failing_mock: load returns NoEntry (probe succeeds → keychain_healthy = true),
+        // but save always returns Err → save_with_fallback falls back to encrypted file.
+        let kc = KeychainStore::new_failing_mock();
+
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0xBEu8; 32],
+            /*force=*/ true,
+            Some(kc),
+        )
+        .expect("force write must succeed via encrypted-file fallback");
+
+        assert!(enc_path.exists(), "the freshly-written encrypted file must NOT be deleted");
+        let raw = std::fs::read(&enc_path).unwrap();
+        assert_eq!(raw.len(), ENC_FILE_LEN, "the encrypted file must hold the new envelope");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── Bug 2 regression: write path tolerates bad env var when keychain is healthy ──
+
+    /// Malformed HARMONY_PASSPHRASE must not break the write path when the keychain is healthy.
+    #[test]
+    #[serial]
+    fn force_write_succeeds_via_keychain_when_at_rest_passphrase_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        // Empty HARMONY_PASSPHRASE → EncryptedFileStore::from_env returns Err.
+        // With a healthy keychain the write should still succeed.
+        std::env::set_var("HARMONY_PASSPHRASE", "");
+        let kc = KeychainStore::new_mock();
+        write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0xCEu8; 32],
+            /*force=*/ true,
+            Some(kc),
+        )
+        .expect("force write must succeed via keychain even with bad HARMONY_PASSPHRASE");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    // ── Bug 3 regression: !force probe fails closed on keychain Err ───────
+
+    /// Keychain probe Err (unreachable keychain) must refuse without --force.
+    #[test]
+    #[serial]
+    fn write_seed_refuses_when_keychain_probe_fails_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "probe-fail-test");
+        // new_load_failing_mock returns Err on load(), simulating an unreachable keychain.
+        let kc = KeychainStore::new_load_failing_mock();
+
+        let err = write_seed_to_disk_with_keychain(
+            &plaintext_path,
+            &[0x55u8; 32],
+            /*force=*/ false,
+            Some(kc),
+        )
+        .expect_err("must refuse when keychain probe fails (fail-closed)");
+        assert!(
+            err.contains("could not determine") || err.contains("refusing"),
+            "actual: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 }

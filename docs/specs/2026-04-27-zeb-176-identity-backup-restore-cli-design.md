@@ -234,7 +234,7 @@ Dispatch into `recovery_cli` in the `Some(Command::Export { ... })` / `Some(Comm
 
 ### `src/lib.rs` — module declaration
 
-Add `mod recovery_cli;`.
+Add `pub mod recovery_cli;`.
 
 ## Documentation updates
 
