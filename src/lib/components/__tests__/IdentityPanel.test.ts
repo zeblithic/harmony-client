@@ -5,10 +5,11 @@ import * as dialog from '@tauri-apps/plugin-dialog';
 import IdentityPanel from '../IdentityPanel.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
-vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn(), open: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
 const mockSave = vi.mocked(dialog.save);
+const mockOpen = vi.mocked(dialog.open);
 
 describe('IdentityPanel — default state', () => {
   beforeEach(() => {
@@ -826,7 +827,7 @@ describe('Restore wizard — step 1 (pickSource)', () => {
     expect(screen.queryByText(/restore identity/i)).not.toBeInTheDocument();
   });
 
-  it('selecting file and clicking Continue transitions to fileEntry placeholder', async () => {
+  it('selecting file and clicking Continue transitions to fileEntry step', async () => {
     render(IdentityPanel);
     await screen.findByText(/0xaaaaaaaa/);
     await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
@@ -834,7 +835,7 @@ describe('Restore wizard — step 1 (pickSource)', () => {
     await fireEvent.click(screen.getByLabelText(/recovery file/i));
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
-    await screen.findByText(/select recovery file/i);
+    await screen.findByText(/restore from recovery file/i);
     expect(screen.queryByText(/restore identity/i)).not.toBeInTheDocument();
   });
 });
@@ -1145,8 +1146,49 @@ describe('Restore wizard — step 3 (confirm)', () => {
     expect(screen.getByText(/0xc3d4e5f6/i)).toBeInTheDocument();
   });
 
-  it.skip('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done (needs Task 9)', async () => {
-    // Un-skip when Task 9 is implemented.
+  it('Replace identity (file) invokes restore_recovery_file_from_path and transitions to done', async () => {
+    const filePath = '/tmp/identity.recovery';
+    const postRestoreHash = 'c3d4e5f6'.repeat(8);
+    mockOpen.mockResolvedValue(filePath);
+    mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'current_identity_hash') return currentHash;
+      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: null, comment: null };
+      if (cmd === 'restore_recovery_file_from_path') {
+        const a = args as { inPath: string; passphrase: string };
+        expect(a.inPath).toBe(filePath);
+        expect(a.passphrase).toBe('hunter2');
+        return { identity_hash: postRestoreHash };
+      }
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    render(IdentityPanel);
+    await screen.findByText(/0xa1b2c3d4/i);
+    await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+    await fireEvent.click(screen.getByLabelText(/recovery file/i));
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    await screen.findByText(/restore from recovery file/i);
+
+    // Pick file via dialog
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+
+    // Enter passphrase and decrypt
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
+    await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+
+    // fileDecrypted screen
+    await screen.findByText(/✓ decrypted/i);
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    // confirm step
+    await screen.findByText(/confirm overwrite/i);
+    const confirmInput = screen.getByLabelText(/confirm current identity hash prefix/i);
+    await fireEvent.input(confirmInput, { target: { value: 'a1b2c3d4' } });
+    await fireEvent.click(screen.getByRole('button', { name: /replace identity/i }));
+
+    await screen.findByText(/identity restored/i);
+    expect(screen.getByText(/0xc3d4e5f6/i)).toBeInTheDocument();
   });
 
   it('invoke error transitions to commitError', async () => {
@@ -1451,5 +1493,264 @@ describe('Restore wizard — step 4 (done)', () => {
     await screen.findByRole('button', { name: /backup/i });  // we're at idle
     const expectedPrefix = `0x${'e'.repeat(8)}`;
     await screen.findByRole('button', { name: new RegExp(expectedPrefix, 'i') });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 9: Restore wizard — step 2b (file entry + decrypt)
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper: navigate to the restore fileEntry step.
+ * Caller must set up mockInvoke and mockOpen BEFORE calling.
+ */
+async function arrangeAtRestoreFileEntry() {
+  render(IdentityPanel);
+  await screen.findByText(/0xa1b2c3d4/i);
+  await fireEvent.click(screen.getByRole('button', { name: /restore/i }));
+  await fireEvent.click(screen.getByLabelText(/recovery file/i));
+  await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+  await screen.findByText(/restore from recovery file/i);
+}
+
+/**
+ * Helper: navigate all the way to the fileDecrypted step.
+ * Caller must set up mockInvoke (handle current_identity_hash, preview_recovery_file)
+ * and mockOpen BEFORE calling.
+ */
+async function arrangeAtRestoreFileDecrypted(filePath: string) {
+  await arrangeAtRestoreFileEntry();
+  await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+  await screen.findByText(new RegExp(filePath.replace(/[/\\]/g, '.'), 'i'));
+  await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
+  await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+  await screen.findByText(/✓ decrypted/i);
+}
+
+describe('Restore wizard — step 2b (restore fileEntry)', () => {
+  const filePath = '/tmp/identity.recovery';
+  const newHash = 'b2c3d4e5'.repeat(8);
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockOpen.mockReset();
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      throw new Error(`unexpected: ${cmd}`);
+    });
+    mockOpen.mockResolvedValue(filePath);
+  });
+
+  it('renders Pick recovery file button and disabled Decrypt button on open', async () => {
+    await arrangeAtRestoreFileEntry();
+
+    expect(screen.getByRole('button', { name: /pick recovery file/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /decrypt/i })).toBeDisabled();
+  });
+
+  it('Decrypt is disabled until both file picked AND passphrase non-empty', async () => {
+    await arrangeAtRestoreFileEntry();
+
+    const decryptBtn = screen.getByRole('button', { name: /decrypt/i });
+    expect(decryptBtn).toBeDisabled();
+
+    // Pick file — Decrypt still disabled (no passphrase)
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+    expect(decryptBtn).toBeDisabled();
+
+    // Type passphrase — Decrypt now enabled
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'secret' } });
+    expect(decryptBtn).not.toBeDisabled();
+  });
+
+  it('shows the picked file path after dialog resolves', async () => {
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+
+    await screen.findByText(/identity\.recovery/i);
+  });
+
+  it('shows passphrase input with show/hide toggle after file is picked', async () => {
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+
+    const passInput = screen.getByLabelText(/^passphrase$/i);
+    expect(passInput).toHaveAttribute('type', 'password');
+
+    await fireEvent.click(screen.getByRole('button', { name: /show passphrase/i }));
+    expect(passInput).toHaveAttribute('type', 'text');
+
+    await fireEvent.click(screen.getByRole('button', { name: /hide passphrase/i }));
+    expect(passInput).toHaveAttribute('type', 'password');
+  });
+
+  it('dialog cancel (null path) is silent — stays on fileEntry', async () => {
+    mockOpen.mockResolvedValue(null);
+
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+
+    // Give Svelte a tick to process
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Should still be on fileEntry with no file path shown
+    expect(screen.getByText(/restore from recovery file/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/^passphrase$/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /decrypt/i })).toBeDisabled();
+  });
+
+  it('decrypt error shows ambiguous inline error message', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_recovery_file') throw new Error('mac mismatch');
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'wrong' } });
+    await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+
+    await screen.findByText(/could not decrypt/i);
+    expect(screen.getByText(/passphrase incorrect or file corrupted/i)).toBeInTheDocument();
+  });
+
+  it('successful decrypt transitions to fileDecrypted step', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+    await screen.findByText(/identity\.recovery/i);
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
+    await fireEvent.click(screen.getByRole('button', { name: /decrypt/i }));
+
+    await screen.findByText(/✓ decrypted/i);
+    expect(screen.getByText(/0xb2c3d4e5/i)).toBeInTheDocument();
+    expect(screen.getByText(/laptop-2026-04-15/i)).toBeInTheDocument();
+  });
+
+  it('Cancel from fileEntry returns to idle', async () => {
+    await arrangeAtRestoreFileEntry();
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
+  });
+
+  // Race regression: dialog-cancel during a pending open() that completes
+  // after the user has already cancelled the wizard must not resurrect it.
+  // The OS-level open dialog can be slow, so this is the more interesting race.
+  it('race guard: cancel-wizard during pending open() does not resurrect wizard', async () => {
+    let resolveOpen!: (path: string) => void;
+    const openPromise = new Promise<string>((resolve) => { resolveOpen = resolve; });
+    mockOpen.mockReturnValue(openPromise as ReturnType<typeof dialog.open>);
+
+    await arrangeAtRestoreFileEntry();
+
+    // Start the dialog — it's now pending (OS-level, slow).
+    // We click the button but don't await the result.
+    fireEvent.click(screen.getByRole('button', { name: /pick recovery file/i }));
+
+    // Cancel the wizard before the dialog resolves.
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    // Sanity-check: idle screen visible right after cancel.
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+
+    // Now the OS dialog resolves with a path — wizard must NOT resurrect.
+    resolveOpen('/tmp/identity.recovery');
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Assert: still on idle, no fileEntry re-rendered.
+    expect(screen.queryByText(/pick recovery file/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+  });
+});
+
+describe('Restore wizard — step 2b (fileDecrypted)', () => {
+  const filePath = '/tmp/identity.recovery';
+  const newHash = 'b2c3d4e5'.repeat(8);
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockOpen.mockReset();
+    mockOpen.mockResolvedValue(filePath);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
+      throw new Error(`unexpected: ${cmd}`);
+    });
+  });
+
+  it('shows success message, identity hash prefix, minted_at, and comment', async () => {
+    await arrangeAtRestoreFileDecrypted(filePath);
+
+    expect(screen.getByText(/✓ decrypted/i)).toBeInTheDocument();
+    expect(screen.getByText(/0xb2c3d4e5/i)).toBeInTheDocument();
+    expect(screen.getByText(/laptop-2026-04-15/i)).toBeInTheDocument();
+    // minted_at as ISO string (1744999931 → 2025-04-18T...)
+    expect(screen.getByText(/minted:/i)).toBeInTheDocument();
+  });
+
+  it('omits Minted line when minted_at is null', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: null, comment: 'test' };
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileDecrypted(filePath);
+
+    expect(screen.queryByText(/minted:/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/test/i)).toBeInTheDocument();
+  });
+
+  it('omits Comment line when comment is absent', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(8);
+      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: undefined };
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtRestoreFileDecrypted(filePath);
+
+    expect(screen.queryByText(/comment:/i)).not.toBeInTheDocument();
+    // minted_at still shown (1744999931 → 2025-04-18T...)
+    expect(screen.getByText(/minted:/i)).toBeInTheDocument();
+  });
+
+  it('Continue transitions to confirm step with restoreSource=file', async () => {
+    await arrangeAtRestoreFileDecrypted(filePath);
+
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    await screen.findByText(/confirm overwrite/i);
+    // The confirm step shows the hash diff with the new hash
+    expect(screen.getByText(/0xb2c3d4e5/i)).toBeInTheDocument();
+  });
+
+  it('Cancel from fileDecrypted returns to idle', async () => {
+    await arrangeAtRestoreFileDecrypted(filePath);
+
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    await screen.findByText(/0xa1b2c3d4/i);
+    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
   });
 });

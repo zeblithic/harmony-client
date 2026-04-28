@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { save } from '@tauri-apps/plugin-dialog';
+  import { save, open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
 
   function assertNever(x: never): never {
@@ -249,9 +249,108 @@
     };
   }
 
+  async function advanceFromRestoreFileEntry() {
+    if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'fileEntry') return;
+
+    // Capture epoch before the first await (open dialog).
+    const epoch = wizardState;
+
+    let pickedPath: string | string[] | null;
+    try {
+      pickedPath = await open({
+        title: 'Open recovery file',
+        filters: [{ name: 'Recovery file', extensions: ['recovery'] }],
+        multiple: false,
+      });
+    } catch {
+      // Treat dialog error the same as cancel — silent return.
+      return;
+    }
+
+    // Guard: did the wizard change while the dialog was open?
+    if (wizardState !== epoch) return;
+
+    // User cancelled the dialog — silent return per spec.
+    if (!pickedPath) return;
+
+    // open() with multiple: false returns string | null (not string[]).
+    const filePath = Array.isArray(pickedPath) ? pickedPath[0] : pickedPath;
+
+    // Reflect the picked path into wizardState.
+    wizardState = {
+      kind: 'restore',
+      step: { ...wizardState.step, pendingFilePath: filePath },
+    };
+  }
+
+  async function decryptRestoreFile() {
+    if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'fileEntry') return;
+    const step = wizardState.step;
+    if (!step.pendingFilePath || !step.passphrase) return;
+
+    // Capture epoch before the await (invoke).
+    const epoch = wizardState;
+
+    let candidate: RestoreCandidate;
+    try {
+      candidate = await invoke<RestoreCandidate>('preview_recovery_file', {
+        inPath: step.pendingFilePath,
+        passphrase: step.passphrase,
+      });
+    } catch {
+      // Deliberate ambiguity per spec — don't leak which field was wrong.
+      if (wizardState !== epoch) return;
+      wizardState = {
+        kind: 'restore',
+        step: { ...wizardState.step, restoreError: 'Could not decrypt — passphrase incorrect or file corrupted.' },
+      };
+      return;
+    }
+
+    if (wizardState !== epoch) return;
+    wizardState = {
+      kind: 'restore',
+      step: {
+        phase: 'fileDecrypted',
+        pendingFilePath: step.pendingFilePath,
+        passphrase: step.passphrase,
+        restoreCandidate: candidate,
+      },
+    };
+  }
+
+  function advanceFromFileDecrypted() {
+    if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'fileDecrypted') return;
+    const step = wizardState.step;
+    wizardState = {
+      kind: 'restore',
+      step: {
+        phase: 'confirm',
+        restoreSource: 'file',
+        pendingWords: [],
+        pendingFilePath: step.pendingFilePath,
+        passphrase: step.passphrase,
+        restoreCandidate: step.restoreCandidate,
+        typedPrefix: '',
+      },
+    };
+  }
+
   async function commitRestore() {
     if (wizardState.kind !== 'restore' || wizardState.step.phase !== 'confirm') return;
     const step = wizardState.step;
+
+    // Option B runtime guard (I-3): the confirm variant has optional
+    // pendingFilePath/passphrase to avoid a full variant split, but they are
+    // required when restoreSource === 'file'. Catch the invariant violation at
+    // runtime rather than relying on TypeScript's structural types alone.
+    if (step.restoreSource === 'file' && (!step.pendingFilePath || step.passphrase === undefined)) {
+      wizardState = {
+        kind: 'restore',
+        step: { phase: 'commitError', error: 'Internal error: file path or passphrase missing.' },
+      };
+      return;
+    }
 
     const epoch = wizardState;
 
@@ -547,22 +646,77 @@
       </div>
     </section>
   {:else if wizardState.step.phase === 'fileEntry'}
-    <!-- Task 9 placeholder -->
     <section class="identity-panel" aria-label="Identity">
-      <h3 class="section-title">Select recovery file</h3>
-      <p class="explainer">Task 9 placeholder — file entry not yet implemented.</p>
+      <h3 class="section-title">Restore from recovery file</h3>
       <div class="actions">
-        <button onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}>Back</button>
+        <button onclick={advanceFromRestoreFileEntry}>Pick recovery file…</button>
+      </div>
+      {#if wizardState.step.pendingFilePath}
+        <p class="file-path-display">File: <code>{wizardState.step.pendingFilePath}</code></p>
+        <label class="field-label">
+          Passphrase
+          <div class="passphrase-row">
+            <input
+              type={wizardState.step.showPass ? 'text' : 'password'}
+              aria-label="Passphrase"
+              value={wizardState.step.passphrase}
+              oninput={(e) => {
+                if (wizardState.kind === 'restore' && wizardState.step.phase === 'fileEntry') {
+                  wizardState = { kind: 'restore', step: { ...wizardState.step, passphrase: (e.target as HTMLInputElement).value, restoreError: null } };
+                }
+              }}
+              autocomplete="current-password"
+            />
+            <button
+              type="button"
+              aria-label={wizardState.step.showPass ? 'Hide passphrase' : 'Show passphrase'}
+              onclick={() => {
+                if (wizardState.kind === 'restore' && wizardState.step.phase === 'fileEntry') {
+                  wizardState = { kind: 'restore', step: { ...wizardState.step, showPass: !wizardState.step.showPass } };
+                }
+              }}
+            >{wizardState.step.showPass ? '🙈' : '👁'}</button>
+          </div>
+        </label>
+        {#if wizardState.step.restoreError !== null}
+          <p class="inline-error" role="alert">{wizardState.step.restoreError}</p>
+        {/if}
+      {/if}
+      <div class="actions">
         <button onclick={resetToIdle}>Cancel</button>
+        <button
+          disabled={!wizardState.step.pendingFilePath || !wizardState.step.passphrase}
+          onclick={decryptRestoreFile}
+        >Decrypt</button>
       </div>
     </section>
   {:else if wizardState.step.phase === 'fileDecrypted'}
-    <!-- Task 9 placeholder -->
     <section class="identity-panel" aria-label="Identity">
-      <h3 class="section-title">File decrypted</h3>
-      <p class="explainer">Task 9 placeholder — file-decrypted confirmation not yet implemented.</p>
+      <h3 class="section-title">Restore from recovery file</h3>
+      <p class="success-text">✓ Decrypted <code>{wizardState.step.pendingFilePath}</code></p>
+      <p class="field-label">
+        Restored identity hash:
+        <button
+          class="hash-display"
+          title="Click to copy full identity hash"
+          onclick={async () => {
+            if (!navigator.clipboard) return;
+            try { await navigator.clipboard.writeText(wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted' ? wizardState.step.restoreCandidate.identity_hash : ''); } catch { /* ignore */ }
+          }}
+        >0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</button>
+      </p>
+      <div class="backup-meta">
+        <p class="field-label">Backup metadata:</p>
+        {#if wizardState.step.restoreCandidate.minted_at != null}
+          <p class="meta-row">Minted: {new Date(wizardState.step.restoreCandidate.minted_at * 1000).toISOString()}</p>
+        {/if}
+        {#if wizardState.step.restoreCandidate.comment}
+          <p class="meta-row">Comment: {wizardState.step.restoreCandidate.comment}</p>
+        {/if}
+      </div>
       <div class="actions">
         <button onclick={resetToIdle}>Cancel</button>
+        <button onclick={advanceFromFileDecrypted}>Continue</button>
       </div>
     </section>
   {:else if wizardState.step.phase === 'confirm'}
@@ -756,5 +910,24 @@
     color: var(--text-secondary);
     font-size: 0.85em;
     margin: 4px 0;
+  }
+  .file-path-display {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    margin: 8px 0;
+  }
+  .success-text {
+    color: var(--text-secondary);
+    font-size: 0.9em;
+    margin: 8px 0;
+  }
+  .backup-meta {
+    margin: 8px 0 12px;
+  }
+  .meta-row {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+    margin: 2px 0;
+    padding-left: 8px;
   }
 </style>
