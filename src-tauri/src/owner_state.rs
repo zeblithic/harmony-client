@@ -167,6 +167,293 @@ mod token_cache_tests {
     }
 }
 
+// ── Persistence layer (load + atomic save) ────────────────────────────────
+//
+// Encapsulates the atomicity contract from the spec:
+//   1. Keychain writes first (device_signing_key, master_seed)
+//   2. `.cbor` file last via `write_atomic_0600`
+// The `.cbor` file's presence is the minted-marker — its absence means the
+// natural un-minted state.
+
+use crate::identity::{write_atomic_0600, EncryptedFileStore, KeychainStore};
+use crate::identity::KeyStore;
+use ed25519_dalek::SigningKey;
+use harmony_owner::cbor;
+use harmony_owner::state::OwnerState;
+use std::path::Path;
+
+const KEYCHAIN_OWNER_SERVICE: &str = "harmony.owner";
+const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
+const KEYCHAIN_MASTER_SEED: &str = "master_seed";
+const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
+
+/// Returned by `load_owner_state` when a persisted identity is found.
+// Debug is derived so test assertions can use `.expect_err()` / `.expect()`.
+// OwnerState: Debug (derived), SigningKey: Debug (manual impl in ed25519-dalek).
+#[derive(Debug)]
+pub struct LoadedOwnerState {
+    pub state: OwnerState,
+    pub device_signing_key: SigningKey,
+    /// `None` when the master seed has been wiped from this device but
+    /// the rest of the owner state remains. v1 does not ship the wipe
+    /// action; this case is reachable only via manual file deletion.
+    pub master_seed: Option<[u8; 32]>,
+}
+
+/// Load the persisted OwnerState if present. Returns `Ok(None)` for the
+/// natural un-minted state (no `.cbor` file). Returns `Err` for corrupt
+/// files or inconsistent state (`.cbor` present but signing key missing).
+///
+/// `keychain`: `Some(_)` enables the OS keychain primary store; `None`
+/// falls through directly to the encrypted-file fallback (used in tests).
+pub fn load_owner_state(
+    identity_dir: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<Option<LoadedOwnerState>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    if !cbor_path.exists() {
+        return Ok(None);
+    }
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let state: OwnerState = cbor::from_bytes(&cbor_bytes)
+        .map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+
+    // Inconsistent-state checks: state present implies signing key MUST be
+    // findable; master seed MAY be absent (degraded but functional).
+    let signing_key_bytes = load_secret(
+        &keychain,
+        KEYCHAIN_DEVICE_SK,
+        identity_dir,
+        "device_sk.enc",
+    )?
+    .ok_or_else(|| {
+        "owner_state.cbor present but device_signing_key missing — inconsistent state".to_string()
+    })?;
+
+    let device_signing_key = SigningKey::from_bytes(&signing_key_bytes);
+
+    let master_seed =
+        load_secret(&keychain, KEYCHAIN_MASTER_SEED, identity_dir, "master_seed.enc")?;
+
+    Ok(Some(LoadedOwnerState { state, device_signing_key, master_seed }))
+}
+
+/// Atomically persist a freshly-minted owner identity.
+///
+/// Order: keychain entries first, `.cbor` last. The `.cbor` file's
+/// presence is the minted-marker for `load_owner_state`. If a keychain
+/// write fails, no `.cbor` file is created and the next launch sees
+/// the natural empty state. If `.cbor` write fails, keychain entries
+/// remain; tolerated and overwritten on next mint attempt.
+pub fn save_owner_state_atomic(
+    identity_dir: &Path,
+    state: &OwnerState,
+    device_signing_key: &SigningKey,
+    master_seed: &[u8; 32],
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    save_secret(
+        &keychain,
+        KEYCHAIN_DEVICE_SK,
+        identity_dir,
+        "device_sk.enc",
+        &device_signing_key.to_bytes(),
+    )?;
+    save_secret(
+        &keychain,
+        KEYCHAIN_MASTER_SEED,
+        identity_dir,
+        "master_seed.enc",
+        master_seed,
+    )?;
+    let cbor_bytes = cbor::to_canonical(state)
+        .map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    write_atomic_0600(&cbor_path, &cbor_bytes)
+        .map_err(|e| format!("failed to write {}: {e}", cbor_path.display()))?;
+    Ok(())
+}
+
+/// Load a 32-byte secret from keychain primary, encrypted-file fallback.
+/// Returns `Ok(None)` when neither source has the secret.
+fn load_secret(
+    keychain: &Option<KeychainStore>,
+    keychain_name: &str,
+    identity_dir: &Path,
+    fallback_filename: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    if keychain.is_some() {
+        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
+            .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
+        match entry.get_secret() {
+            Ok(bytes) => {
+                if bytes.len() != 32 {
+                    return Err(format!(
+                        "keychain entry {keychain_name} length is {} bytes, expected 32",
+                        bytes.len()
+                    ));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                return Ok(Some(arr));
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("keychain read {keychain_name}: {e}")),
+        }
+    }
+    // Fallback: encrypted file under HARMONY_PASSPHRASE.
+    let path = identity_dir.join(fallback_filename);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let store = EncryptedFileStore::from_env(path.clone())
+        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?
+        .ok_or_else(|| {
+            format!("HARMONY_PASSPHRASE not set; cannot decrypt {fallback_filename}")
+        })?;
+    let seed = store
+        .load()
+        .map_err(|e| format!("read {fallback_filename}: {e}"))?
+        .ok_or_else(|| format!("{fallback_filename} disappeared between exists() and read()"))?;
+    Ok(Some(*seed))
+}
+
+fn save_secret(
+    keychain: &Option<KeychainStore>,
+    keychain_name: &str,
+    identity_dir: &Path,
+    fallback_filename: &str,
+    bytes: &[u8; 32],
+) -> Result<(), String> {
+    if keychain.is_some() {
+        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
+            .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
+        return entry
+            .set_secret(bytes)
+            .map_err(|e| format!("keychain write {keychain_name}: {e}"));
+    }
+    let path = identity_dir.join(fallback_filename);
+    let store = EncryptedFileStore::from_env(path.clone())
+        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?
+        .ok_or_else(|| {
+            format!("HARMONY_PASSPHRASE not set; cannot encrypt {fallback_filename}")
+        })?;
+    store
+        .save(bytes)
+        .map_err(|e| format!("write {fallback_filename}: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use harmony_owner::lifecycle::{mint_owner, MintResult};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn save_then_load_roundtrip_preserves_state() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-1");
+        let dir = tempdir().unwrap();
+
+        let MintResult { state, recovery_artifact, device_signing_key } =
+            mint_owner(1_700_000_000).unwrap();
+        let master_seed = *recovery_artifact.as_bytes();
+
+        save_owner_state_atomic(dir.path(), &state, &device_signing_key, &master_seed, None)
+            .expect("save");
+
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("load")
+            .expect("must be Some after save");
+        assert_eq!(loaded.state.owner_id, state.owner_id);
+        assert_eq!(loaded.state.enrollments.len(), 1);
+        assert_eq!(loaded.device_signing_key.to_bytes(), device_signing_key.to_bytes());
+        assert_eq!(loaded.master_seed, Some(master_seed));
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn load_returns_none_when_no_cbor_present() {
+        let dir = tempdir().unwrap();
+        let result = load_owner_state(dir.path(), None).expect("load");
+        assert!(result.is_none(), "un-minted state must be None, not Err");
+    }
+
+    #[test]
+    #[serial]
+    fn load_returns_err_when_cbor_corrupt() {
+        let dir = tempdir().unwrap();
+        let cbor_path = dir.path().join(OWNER_STATE_FILENAME);
+        std::fs::write(&cbor_path, b"not-cbor-bytes").unwrap();
+        let err = load_owner_state(dir.path(), None).expect_err("must be Err");
+        assert!(err.contains("corrupt"), "actual: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn load_returns_err_when_signing_key_missing() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-2");
+        let dir = tempdir().unwrap();
+
+        let MintResult { state, recovery_artifact, device_signing_key } =
+            mint_owner(1_700_000_001).unwrap();
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            recovery_artifact.as_bytes(),
+            None,
+        )
+        .unwrap();
+
+        // Manually wipe the device_sk.enc fallback file to simulate the
+        // "inconsistent state" condition.
+        let _ = std::fs::remove_file(dir.path().join("device_sk.enc"));
+
+        let err = load_owner_state(dir.path(), None).expect_err("must be Err");
+        assert!(
+            err.contains("device_signing_key missing") || err.contains("inconsistent"),
+            "actual: {err}"
+        );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn load_returns_some_with_none_master_seed_when_only_seed_missing() {
+        std::env::set_var("HARMONY_PASSPHRASE", "test-pp-3");
+        let dir = tempdir().unwrap();
+
+        let MintResult { state, recovery_artifact, device_signing_key } =
+            mint_owner(1_700_000_002).unwrap();
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            recovery_artifact.as_bytes(),
+            None,
+        )
+        .unwrap();
+
+        // Wipe ONLY the master seed fallback — simulates the future "wipe master" action.
+        let _ = std::fs::remove_file(dir.path().join("master_seed.enc"));
+
+        let loaded = load_owner_state(dir.path(), None)
+            .expect("load")
+            .expect("must be Some");
+        assert!(
+            loaded.master_seed.is_none(),
+            "degraded state: master seed gone, signing key present"
+        );
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
