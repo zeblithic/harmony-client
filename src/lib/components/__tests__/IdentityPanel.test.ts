@@ -697,6 +697,37 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     expect(screen.getByRole('button', { name: /continue/i })).toBeInTheDocument();
   });
 
+  it('Back from fileSaveError preserves the user\'s prior passphrase and comment input', async () => {
+    // Pins regression where Back rebuilt fileEntry with empty fields, forcing
+    // the user to retype passphrase + confirm + comment from scratch (Cursor
+    // review feedback).
+    const savePath = '/tmp/identity.recovery';
+    mockSave.mockResolvedValue(savePath);
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtFileEntry();
+
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'hunter2' } });
+    await fireEvent.input(screen.getByLabelText(/comment/i), { target: { value: 'laptop-2026-04-15' } });
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+    await screen.findByText(/could not save to/i);
+
+    await fireEvent.click(screen.getByRole('button', { name: /back/i }));
+
+    // Form should be back at fileEntry with all three fields pre-populated.
+    const passInput = await screen.findByLabelText(/^passphrase$/i) as HTMLInputElement;
+    const confirmInput = screen.getByLabelText(/confirm passphrase/i) as HTMLInputElement;
+    const commentInput = screen.getByLabelText(/comment/i) as HTMLInputElement;
+    expect(passInput.value).toBe('hunter2');
+    expect(confirmInput.value).toBe('hunter2');
+    expect(commentInput.value).toBe('laptop-2026-04-15');
+  });
+
   it('Cancel from fileSaveError returns to idle', async () => {
     const savePath = '/tmp/identity.recovery';
     mockSave.mockResolvedValue(savePath);
@@ -1183,12 +1214,12 @@ describe('Restore wizard — step 3 (confirm)', () => {
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return currentHash;
-      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: null, comment: null };
+      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: null, comment: null };
       if (cmd === 'restore_recovery_file_from_path') {
         const a = args as { inPath: string; passphrase: string };
         expect(a.inPath).toBe(filePath);
         expect(a.passphrase).toBe('hunter2');
-        return { identity_hash: postRestoreHash };
+        return { identityHash: postRestoreHash };
       }
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -1724,7 +1755,7 @@ describe('Restore wizard — step 2b (restore fileEntry)', () => {
   it('successful decrypt transitions to fileDecrypted step', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
+      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -1791,7 +1822,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
     mockOpen.mockResolvedValue(filePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: 'laptop-2026-04-15' };
+      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: 'laptop-2026-04-15' };
       throw new Error(`unexpected: ${cmd}`);
     });
   });
@@ -1809,7 +1840,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
   it('omits Minted line when minted_at is null', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: null, comment: 'test' };
+      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: null, comment: 'test' };
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -1822,7 +1853,7 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
   it('omits Comment line when comment is absent', async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a1b2c3d4'.repeat(4);
-      if (cmd === 'preview_recovery_file') return { identity_hash: newHash, minted_at: 1744999931, comment: undefined };
+      if (cmd === 'preview_recovery_file') return { identityHash: newHash, mintedAt: 1744999931, comment: undefined };
       throw new Error(`unexpected: ${cmd}`);
     });
 

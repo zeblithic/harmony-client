@@ -23,9 +23,12 @@
   // double-click cannot issue duplicate restore_* requests against the store.
   let restoreInFlight = $state(false);
 
+  // Wire-format from Rust `RestoreInfo` (camelCase per project convention —
+  // see `src-tauri/src/identity_commands.rs` and every other IPC payload
+  // struct in `lib.rs`).
   interface RestoreCandidate {
-    identity_hash: string;
-    minted_at?: number;
+    identityHash: string;
+    mintedAt?: number;
     comment?: string;
   }
 
@@ -34,7 +37,7 @@
     | { phase: 'mnemonicReveal'; words: string[]; revealed: boolean; storedSafely: boolean; loadError: string | null }   // step 2a
     | { phase: 'fileEntry'; passphrase: string; passphraseConfirm: string; comment: string; showPass: boolean }          // step 2b
     | { phase: 'fileSaved'; savedPath: string }                                                                           // step 3b success
-    | { phase: 'fileSaveError'; error: string };                                                                          // step 3b error
+    | { phase: 'fileSaveError'; error: string; passphrase: string; passphraseConfirm: string; comment: string };          // step 3b error — carries prior input so Back can restore the form
 
   type RestoreStep =
     | { phase: 'pickSource' }                                                                                             // step 1
@@ -191,7 +194,18 @@
       wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath: outPath } };
     } catch (e) {
       if (wizardState !== epoch2) return;
-      wizardState = { kind: 'backup', step: { phase: 'fileSaveError', error: `Could not save to ${outPath}: ${e}. Try a different location.` } };
+      // Carry the form input forward so Back returns the user to a populated
+      // form rather than blank fields (Cursor review feedback).
+      wizardState = {
+        kind: 'backup',
+        step: {
+          phase: 'fileSaveError',
+          error: `Could not save to ${outPath}: ${e}. Try a different location.`,
+          passphrase,
+          passphraseConfirm,
+          comment,
+        },
+      };
     }
   }
 
@@ -259,7 +273,7 @@
         phase: 'confirm',
         restoreSource: 'mnemonic',
         pendingWords: words,
-        restoreCandidate: { identity_hash: candidateHash },
+        restoreCandidate: { identityHash: candidateHash },
         typedPrefix: '',
       },
     };
@@ -401,11 +415,11 @@
       if (step.restoreSource === 'mnemonic') {
         postRestoreHash = await invoke<string>('restore_mnemonic_from_words', { words: step.pendingWords });
       } else {
-        const info = await invoke<{ identity_hash: string }>('restore_recovery_file_from_path', {
+        const info = await invoke<{ identityHash: string }>('restore_recovery_file_from_path', {
           inPath: step.pendingFilePath,
           passphrase: step.passphrase,
         });
-        postRestoreHash = info.identity_hash;
+        postRestoreHash = info.identityHash;
       }
       if (wizardState !== epoch) return;
       wizardState = { kind: 'restore', step: { phase: 'done', postRestoreHash } };
@@ -633,7 +647,13 @@
       <p class="error">{wizardState.step.error}</p>
       <div class="actions">
         <button onclick={() => {
-          wizardState = { kind: 'backup', step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false } };
+          if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileSaveError') {
+            const { passphrase, passphraseConfirm, comment } = wizardState.step;
+            wizardState = {
+              kind: 'backup',
+              step: { phase: 'fileEntry', passphrase, passphraseConfirm, comment, showPass: false },
+            };
+          }
         }}>Back</button>
         <button onclick={resetToIdle}>Cancel</button>
       </div>
@@ -749,13 +769,13 @@
         <button
           class="hash-display"
           title="Click to copy full identity hash"
-          onclick={() => copyText(wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted' ? wizardState.step.restoreCandidate.identity_hash : '')}
-        >0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</button>
+          onclick={() => copyText(wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted' ? wizardState.step.restoreCandidate.identityHash : '')}
+        >0x{wizardState.step.restoreCandidate.identityHash.slice(0, 8)}…</button>
       </p>
       <div class="backup-meta">
         <p class="field-label">Backup metadata:</p>
-        {#if wizardState.step.restoreCandidate.minted_at != null}
-          <p class="meta-row">Minted: {new Date(wizardState.step.restoreCandidate.minted_at * 1000).toISOString()}</p>
+        {#if wizardState.step.restoreCandidate.mintedAt != null}
+          <p class="meta-row">Minted: {new Date(wizardState.step.restoreCandidate.mintedAt * 1000).toISOString()}</p>
         {/if}
         {#if wizardState.step.restoreCandidate.comment}
           <p class="meta-row">Comment: {wizardState.step.restoreCandidate.comment}</p>
@@ -778,7 +798,7 @@
         <span class="hash-diff-value hash-diff-current">0x{currentPrefix}…</span>
         <span class="hash-diff-arrow">→</span>
         <span class="hash-diff-label">Restored</span>
-        <span class="hash-diff-value hash-diff-new">0x{wizardState.step.restoreCandidate.identity_hash.slice(0, 8)}…</span>
+        <span class="hash-diff-value hash-diff-new">0x{wizardState.step.restoreCandidate.identityHash.slice(0, 8)}…</span>
       </div>
       <label class="field-label">
         Type the first 8 chars of your CURRENT identity hash to proceed: ({currentPrefix})

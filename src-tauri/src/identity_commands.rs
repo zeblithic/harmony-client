@@ -15,8 +15,12 @@ use crate::recovery_cli;
 // ── Shared types ─────────────────────────────────────────────────────────
 
 /// Metadata from a recovery file, returned by `preview_recovery_file`.
-/// Sent across IPC so it must implement `serde::Serialize`.
+/// Sent across IPC so it must implement `serde::Serialize`. Wire format is
+/// `camelCase` to match every other IPC payload struct in `lib.rs`
+/// (ProfilePayload, ChannelMessagePayload, etc.) — the JS side reads
+/// `identityHash` / `mintedAt` / `comment`.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreInfo {
     /// 32-char hex-encoded identity hash derived from the backup's seed.
     /// `identity_hash()` returns `[u8; 16]` (128-bit truncated BLAKE3).
@@ -35,11 +39,47 @@ pub struct RestoreInfo {
 /// these vars while invoking the helpers. Concurrent calls must serialize or
 /// they will race on the global env. The wizard's UX is serial today, but
 /// any non-UI caller (tests, background tasks) gets the same protection.
+///
+/// Poison recovery is genuinely safe because env-var cleanup is performed by
+/// [`EnvVarGuard`] in `Drop`, which runs during stack unwinding even when a
+/// panic poisons this lock. Without the guard, accepting a poisoned lock
+/// would leak the prior call's passphrase into the environment for the next
+/// caller — but with it, the env state is always restored.
 fn recovery_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Poisoning is recoverable here: state inside the critical section is
-    // env-var save/restore, not data structures we can't reason about.
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// RAII guard for an environment variable. On construction, captures the
+/// prior value and applies a new value (or removes it). On drop, restores
+/// the prior value. Restoration runs on panic-unwind too — load-bearing for
+/// poison-safe interaction with [`recovery_env_lock`].
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 /// Maximum size of a recovery file the GUI will read.
@@ -149,12 +189,16 @@ pub fn preview_recovery_file_helper(
 /// `HARMONY_RECOVERY_PASSPHRASE_FILE` is cleared for the duration so that
 /// `resolve_recovery_passphrase()` does not log a warning about both vars
 /// being set when a user previously configured the CLI file-based path.
-/// Both vars are restored to their prior values on exit (including on error).
-/// Concurrent calls are serialized through [`recovery_env_lock`]; the lock
-/// is what makes the env-var mutation safe (the wizard's serial UX is
-/// only an additional defense). ZEB-187 will thread the passphrase through
-/// `recovery_cli::*_with_keychain` as an explicit argument and remove the
-/// env-var dance entirely.
+///
+/// Concurrent calls are serialized through [`recovery_env_lock`]; env-var
+/// restoration uses [`EnvVarGuard`] (RAII) so cleanup runs even on panic.
+///
+/// ZEB-187 (security): passing the passphrase through a process-global
+/// `String` env var leaves it transiently readable by any debugger or tool
+/// attached to this process, and `secrecy::SecretString` zeroing does not
+/// apply. The follow-up will thread the passphrase through
+/// `recovery_cli::*_with_keychain` as `Option<&SecretString>` and delete
+/// the env-var dance entirely.
 pub fn export_recovery_file_to_path_helper(
     plaintext_path: &Path,
     out_path: &Path,
@@ -163,37 +207,18 @@ pub fn export_recovery_file_to_path_helper(
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
     // Serialize concurrent helper calls; env-var mutation is process-global.
-    // The wizard's serial UX makes the unlocked race unreachable today, but
-    // the lock guarantees it for any non-UI caller (CodeRabbit / Qodo flag).
-    let _guard = recovery_env_lock();
+    let _lock = recovery_env_lock();
+    // Drop order is reverse declaration: `_file` restores first, then
+    // `_pass`, then the mutex guard releases. Each Drop runs even on panic.
+    let _pass = EnvVarGuard::set("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    let _file = EnvVarGuard::unset("HARMONY_RECOVERY_PASSPHRASE_FILE");
 
-    // Save BOTH env vars on entry.
-    let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
-    let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
-
-    // Clear the file var so resolve_recovery_passphrase() doesn't log a warning
-    // about both being set, and set the direct var to the GUI-supplied passphrase.
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
-
-    let result = recovery_cli::export_recovery_file_with_keychain(
+    recovery_cli::export_recovery_file_with_keychain(
         plaintext_path,
         out_path,
         comment.as_deref(),
         keychain,
-    );
-
-    // Restore both env vars to whatever they were on entry.
-    match prev_pass {
-        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
-        None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
-    }
-    match prev_file {
-        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", v),
-        None => {} // already removed above
-    }
-
-    result
+    )
 }
 
 /// Restore the on-disk identity from a 24-word mnemonic array and return the
@@ -231,11 +256,20 @@ pub fn restore_mnemonic_from_words_helper(
 /// `TypeToConfirmDialog` and received explicit acknowledgement that the current
 /// identity will be overwritten.
 ///
-/// The file is decrypted twice: once by `restore_recovery_file_with_keychain`
-/// to write the seed, and once here to extract the metadata for the returned
-/// `RestoreInfo`. This double-decrypt is acceptable given the ~101-byte file
-/// size; it avoids expanding the `_with_keychain` API surface for a trivial
-/// benefit.
+/// **Ordering is load-bearing.** Metadata extraction runs FIRST (read-only
+/// decrypt). Only after it succeeds do we run the irreversible write via
+/// `restore_recovery_file_with_keychain`. If anything in step 1 fails (file
+/// missing, wrong passphrase, corrupted), the on-disk identity is untouched
+/// and the caller can safely retry. If we did it the other way around, a
+/// transient failure between the write and the metadata extraction (e.g.
+/// USB drive ejected) would surface as `Err` to the UI even though the
+/// identity had already been replaced — leaving the user thinking the
+/// restore failed, potentially restoring a different backup over the
+/// (correctly-restored) identity (Greptile P1).
+///
+/// The recovery file is read and decrypted twice in total (once for
+/// metadata, once inside the inner restore). Recovery files are ~101 bytes,
+/// so the cost is negligible.
 pub fn restore_recovery_file_from_path_helper(
     plaintext_path: &Path,
     in_path: &Path,
@@ -245,51 +279,36 @@ pub fn restore_recovery_file_from_path_helper(
     use harmony_owner::lifecycle::RecoveryArtifact;
     use secrecy::SecretString;
 
-    // ── First pass: perform the actual restore (writes seed to disk). ──────
-    // Env-var wrapping has the same concurrency caveat as
-    // `export_recovery_file_to_path_helper`; the lock guarantees serialization
-    // across all callers (UI + non-UI).
-    let _guard = recovery_env_lock();
-
-    let prev_pass = std::env::var("HARMONY_RECOVERY_PASSPHRASE").ok();
-    let prev_file = std::env::var("HARMONY_RECOVERY_PASSPHRASE_FILE").ok();
-
-    // Clear the file var so resolve_recovery_passphrase() doesn't log a warning
-    // about both being set, and set the direct var to the GUI-supplied passphrase.
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", passphrase);
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE_FILE");
-
-    // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
-    let restore_result = recovery_cli::restore_recovery_file_with_keychain(
-        plaintext_path,
-        in_path,
-        /*force=*/ true,
-        keychain,
-    );
-
-    // Restore both env vars to whatever they were on entry.
-    match prev_pass {
-        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", v),
-        None => std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE"),
-    }
-    match prev_file {
-        Some(v) => std::env::set_var("HARMONY_RECOVERY_PASSPHRASE_FILE", v),
-        None => {} // already removed above
-    }
-
-    restore_result?;
-
-    // ── Second pass: decrypt again to extract metadata for RestoreInfo. ────
+    // ── Step 1: extract metadata BEFORE touching disk. ─────────────────────
+    // If this fails, the on-disk identity is untouched; caller can retry.
     let bytes = read_recovery_file(in_path)?;
     let pass = SecretString::from(passphrase.to_string());
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &pass).map_err(|e| e.to_string())?;
     let id_hash = restored.artifact.master_pubkey_bundle().identity_hash();
-    Ok(RestoreInfo {
+    let info = RestoreInfo {
         identity_hash: hex::encode(id_hash),
         minted_at: restored.metadata.mint_at,
         comment: restored.metadata.comment,
-    })
+    };
+
+    // ── Step 2: perform the irreversible restore (writes seed to disk). ────
+    // Env-var wrapping for CLI passphrase parity. Same locking + RAII
+    // semantics as `export_recovery_file_to_path_helper`. ZEB-187 will
+    // remove this dance.
+    let _lock = recovery_env_lock();
+    let _pass_guard = EnvVarGuard::set("HARMONY_RECOVERY_PASSPHRASE", passphrase);
+    let _file_guard = EnvVarGuard::unset("HARMONY_RECOVERY_PASSPHRASE_FILE");
+
+    // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
+    recovery_cli::restore_recovery_file_with_keychain(
+        plaintext_path,
+        in_path,
+        /*force=*/ true,
+        keychain,
+    )?;
+
+    Ok(info)
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────
@@ -537,6 +556,71 @@ mod tests {
         let err = preview_recovery_file_helper(&recovery_path, "wrong-pass")
             .expect_err("wrong passphrase must fail");
         assert!(!err.is_empty(), "error must be non-empty; got: {err}");
+    }
+
+    /// Pin the load-bearing invariant from Greptile P1: if metadata
+    /// extraction fails (file missing, corrupted, wrong passphrase), the
+    /// on-disk identity must NOT be overwritten. The function must return
+    /// `Err` BEFORE touching disk.
+    #[test]
+    #[serial]
+    fn restore_recovery_file_failure_leaves_identity_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "metadata-first-test");
+        let original_seed = [0xC1u8; 32];
+        plant_seed(&plaintext_path, &original_seed);
+
+        // Capture original on-disk encrypted bytes for content equality.
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let original_enc = std::fs::read(&enc_path).expect("read original enc");
+
+        // Point at a non-existent recovery file. Step 1 (read metadata)
+        // must fail before step 2 (write seed) is ever invoked.
+        let bogus_recovery = dir.path().join("does-not-exist.recovery");
+        let err = restore_recovery_file_from_path_helper(
+            &plaintext_path,
+            &bogus_recovery,
+            "any-pass",
+            None,
+        )
+        .expect_err("missing recovery file must fail");
+        assert!(
+            err.contains("failed to read") || err.contains("does-not-exist"),
+            "error must mention the missing file; got: {err}"
+        );
+
+        // Bytes on disk must be byte-for-byte identical to before the call.
+        let after_enc = std::fs::read(&enc_path).expect("read after enc");
+        assert_eq!(
+            original_enc, after_enc,
+            "identity must NOT be overwritten when metadata extraction fails"
+        );
+
+        // ── Same invariant for wrong-passphrase failure (file exists but
+        // can't decrypt). ──
+        use secrecy::SecretString;
+        let recovery_path = dir.path().join("good.recovery");
+        let artifact = RecoveryArtifact::from_seed([0xB7u8; 32]);
+        let pass = SecretString::from("correct-pass".to_string());
+        let bytes = artifact
+            .to_encrypted_file(&pass, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes).unwrap();
+
+        let err =
+            restore_recovery_file_from_path_helper(&plaintext_path, &recovery_path, "WRONG", None)
+                .expect_err("wrong passphrase must fail");
+        assert!(!err.is_empty(), "error must be non-empty; got: {err}");
+
+        let after_enc = std::fs::read(&enc_path).expect("read after wrong-pass");
+        assert_eq!(
+            original_enc, after_enc,
+            "identity must NOT be overwritten when passphrase is wrong"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
     }
 
     #[test]
