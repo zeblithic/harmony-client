@@ -178,6 +178,83 @@ The existing "treat `~/.harmony/identity.enc` and your passphrase as
 two halves of a recovery key" guidance still applies for at-rest
 storage — the recovery commands give you an additional layer.
 
+## Backup and recovery (GUI)
+
+Most desktop users will use the GUI wizard. The CLI walkthrough above is for
+headless installs (server, Docker, CI). The two are interchangeable — a backup
+exported via the GUI restores fine via the CLI and vice versa.
+
+### Open the Identity panel
+
+Navigate to **Settings → Identity**. The panel shows your current identity hash
+(8-char prefix displayed; click to copy the full 32-char hex).
+
+### Back up to a 24-word recovery phrase
+
+1. Click **Backup…** → choose **24-word recovery phrase** → **Continue**.
+2. Click **Reveal** to show all 24 words. Write every word down on paper. Anyone
+   who has this phrase can recover your identity.
+3. Tick **I've stored this safely**, then click **Done**.
+
+The mnemonic phrase produced by the GUI is identical in format to the one
+produced by `harmony-app export mnemonic`. Either can be restored via the other
+path.
+
+### Back up to an encrypted recovery file
+
+1. Click **Backup…** → choose **Encrypted recovery file** → **Continue**.
+2. Type a passphrase (entered twice). Optionally fill in the **Comment** field
+   (e.g. `laptop-2026-04-15`) — it is stored in plaintext in the file envelope
+   and shown during restore.
+3. Click **Save** to open the system save dialog. Choose a name and location for
+   the `.recovery` file (a USB stick or off-device storage is recommended).
+4. The wizard confirms the saved path. Click **Done**.
+
+The `.recovery` file is the same Argon2id + XChaCha20-Poly1305 envelope that
+`harmony-app export recovery-file` produces. You can restore it with either the
+GUI or the CLI.
+
+### Restore from a 24-word recovery phrase
+
+1. Click **Restore…** → choose **24-word recovery phrase** → **Continue**.
+2. Paste or type your 24 words into the text area. The wizard validates the
+   BIP39 checksum and shows the resulting identity hash.
+3. Click **Continue** to reach the confirmation step. The wizard shows your
+   **current** identity hash and the **to-be-restored** identity hash side by
+   side. Type the first 8 characters of your **current** identity hash into the
+   confirmation field to proceed.
+4. Click **Replace identity**. This is destructive — your previous identity is
+   gone after this step.
+5. The done screen shows the new identity hash. Verify it matches what you
+   expected (compare to the hash shown during export).
+
+### Restore from an encrypted recovery file
+
+1. Click **Restore…** → choose **Recovery file** → **Continue**.
+2. Click **Pick recovery file…** to open the system file picker. Select your
+   `.recovery` file.
+3. Type the passphrase you set at backup time. Click **Decrypt**.
+4. The wizard shows the restored identity hash along with the backup's **Minted**
+   timestamp and **Comment** (if you set one at export). Click **Continue**.
+5. Confirmation step — same as the mnemonic flow: type the first 8 chars of your
+   current identity hash, then click **Replace identity**.
+6. Verify the new identity hash on the done screen.
+
+### Cross-format compatibility
+
+A mnemonic exported via the GUI is restorable via the CLI:
+
+```bash
+# Paste your 24 words into a file, one per line or space-separated.
+harmony-app restore mnemonic --mnemonic-file /tmp/mnemonic.txt
+```
+
+A recovery file exported via the CLI is restorable via the GUI: open
+**Restore… → Recovery file** and pick the file from the system file picker.
+
+Cross-format round-trips are tested by the CLI↔GUI integration tests; both
+export formats are byte-for-byte compatible.
+
 ## Troubleshooting
 
 | Error | Meaning | Fix |
