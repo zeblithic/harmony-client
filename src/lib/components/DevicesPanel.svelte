@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
+  import { save } from '@tauri-apps/plugin-dialog';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -24,7 +25,14 @@
     }
   });
 
-  let backupRequested = $state(false);
+  let backupOpen = $state(false);
+  let backupPassphrase = $state('');
+  let backupPassphraseConfirm = $state('');
+  let backupComment = $state('');
+  let backupInFlight = $state(false);
+  let backupError = $state<string | null>(null);
+  let backupSavedPath = $state<string | null>(null);
+
   let renamingDeviceId = $state<string | null>(null);
   let renameDraft = $state('');
 
@@ -52,6 +60,62 @@
 
   function cancelRename() {
     renamingDeviceId = null;
+  }
+
+  async function openBackup() {
+    backupOpen = true;
+    backupPassphrase = '';
+    backupPassphraseConfirm = '';
+    backupComment = '';
+    backupError = null;
+    backupSavedPath = null;
+    if (recoveryToken === null) {
+      try {
+        recoveryToken = await svc.issueRecoveryToken();
+      } catch (e) {
+        backupError = extractError(e);
+      }
+    }
+  }
+
+  async function commitBackup() {
+    if (recoveryToken === null) {
+      backupError = 'No recovery token available.';
+      return;
+    }
+    if (backupPassphrase !== backupPassphraseConfirm) {
+      backupError = 'Passphrases do not match.';
+      return;
+    }
+    if (backupPassphrase.length < 12) {
+      backupError = 'Passphrase must be at least 12 characters.';
+      return;
+    }
+    const out = await save({
+      defaultPath: 'owner-recovery.bin',
+      filters: [{ name: 'Recovery file', extensions: ['bin'] }],
+    });
+    if (!out) return;
+    backupInFlight = true;
+    backupError = null;
+    try {
+      await svc.exportRecoveryFile(
+        recoveryToken,
+        out,
+        backupPassphrase,
+        backupComment.trim() ? backupComment.trim() : null,
+      );
+      backupSavedPath = out;
+      recoveryToken = null;
+    } catch (e) {
+      backupError = extractError(e);
+    } finally {
+      backupInFlight = false;
+    }
+  }
+
+  function closeBackup() {
+    backupOpen = false;
   }
 
   function formatOwnerFingerprint(hex: string): string {
@@ -116,7 +180,7 @@
             <div class="owner-name">{state.ownerDisplayName}</div>
             <div class="owner-fingerprint">{formatOwnerFingerprint(state.ownerId)}</div>
           </div>
-          <button class="primary" onclick={() => { backupRequested = true; }}>
+          <button class="primary" onclick={openBackup}>
             Back up owner identity →
           </button>
         </div>
@@ -176,6 +240,44 @@
           <code>enroll_via_master</code> flow which ships in a follow-up. Currently
           only one device is bound under your owner identity.
         </p>
+      </div>
+    </div>
+  {/if}
+
+  {#if backupOpen}
+    <div class="modal-overlay" role="dialog" aria-modal="true">
+      <div class="modal">
+        <h3>Back up owner identity</h3>
+        {#if backupSavedPath}
+          <p>Recovery file written to <code>{backupSavedPath}</code>. Keep it somewhere safe.</p>
+          <button class="primary" onclick={closeBackup}>Done</button>
+        {:else}
+          <p>
+            Choose a strong passphrase. The encrypted file alone cannot be opened
+            without it.
+          </p>
+          <label>
+            Passphrase
+            <input type="password" bind:value={backupPassphrase} aria-label="Passphrase" />
+          </label>
+          <label>
+            Confirm passphrase
+            <input type="password" bind:value={backupPassphraseConfirm} aria-label="Confirm passphrase" />
+          </label>
+          <label>
+            Comment (optional)
+            <input type="text" bind:value={backupComment} maxlength={256} aria-label="Comment" />
+          </label>
+          {#if backupError}
+            <p class="error" role="alert">{backupError}</p>
+          {/if}
+          <div class="modal-actions">
+            <button class="secondary" onclick={closeBackup} disabled={backupInFlight}>Cancel</button>
+            <button class="primary" onclick={commitBackup} disabled={backupInFlight}>
+              {backupInFlight ? 'Encrypting…' : 'Save backup'}
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

@@ -55,6 +55,11 @@ export class OwnerService {
     return result;
   }
 
+  async issueRecoveryToken(): Promise<string> {
+    const result = await invoke<{ recoveryToken: string }>('issue_owner_recovery_token');
+    return result.recoveryToken;
+  }
+
   async exportRecoveryFile(
     recoveryToken: string,
     path: string,

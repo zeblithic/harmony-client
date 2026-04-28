@@ -2968,6 +2968,7 @@ pub fn run() {
             owner_commands::get_owner_state,
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
+            owner_commands::issue_owner_recovery_token,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

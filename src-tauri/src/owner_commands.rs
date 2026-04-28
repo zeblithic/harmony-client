@@ -226,6 +226,27 @@ pub async fn export_owner_recovery_file_to_path(
     .await
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueTokenResult {
+    pub recovery_token: String,
+}
+
+#[tauri::command]
+pub async fn issue_owner_recovery_token(
+    _app: tauri::AppHandle,
+) -> Result<IssueTokenResult, String> {
+    let identity_dir = resolve_identity_dir()?;
+    run_blocking(move || {
+        let loaded = load_owner_state(&identity_dir, KeychainStore::new().ok())?
+            .ok_or_else(|| "Owner identity has not been minted on this device.".to_string())?;
+        let seed = loaded.master_seed
+            .ok_or_else(|| "Master seed has been wiped from this device — backup is no longer possible.".to_string())?;
+        let token = insert_token(seed);
+        Ok(IssueTokenResult { recovery_token: token.to_string() })
+    }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +346,19 @@ mod tests {
             take_token(&token).is_some(),
             "comment-over-cap rejection must not consume token"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn issue_token_errors_when_owner_state_does_not_exist() {
+        clear_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "issue-test-pp");
+        let _dir = tempfile::tempdir().unwrap();
+        // Note: this test cannot easily call issue_owner_recovery_token directly
+        // because that command resolves identity_dir from real OS paths. Instead,
+        // we test the underlying invariant: load_owner_state on an empty dir
+        // returns Ok(None), and the command errors when None.
+        let result = crate::owner_state::load_owner_state(_dir.path(), None);
+        assert!(matches!(result, Ok(None)), "empty dir → Ok(None)");
     }
 }

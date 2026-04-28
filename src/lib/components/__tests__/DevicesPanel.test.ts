@@ -6,6 +6,11 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
 }));
 
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  save: vi.fn().mockResolvedValue('/tmp/owner-recovery.bin'),
+  open: vi.fn(),
+}));
+
 import { invoke } from '@tauri-apps/api/core';
 
 import { loadProfile, saveProfile } from '../../profile-service';
@@ -185,6 +190,49 @@ describe('DevicesPanel — rename', () => {
     await fireEvent.click(saveBtn);
     expect(saveProfile).toHaveBeenCalledWith(
       expect.objectContaining({ displayName: 'KRILE-prime' })
+    );
+  });
+});
+
+describe('DevicesPanel — backup wiring', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('clicking Back up opens the backup modal and issues a token if needed', async () => {
+    mockedInvoke
+      .mockResolvedValueOnce({ ownerId: 'x', ownerDisplayName: 'me',
+        devices: [{ deviceId: 'd', displayName: 'this', isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000, fingerprint: 'd·x' }],
+        canBackUp: true })
+      .mockResolvedValueOnce({ recoveryToken: 'fresh-tok' });
+
+    render(DevicesPanel);
+    const btn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(btn);
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith('issue_owner_recovery_token');
+  });
+
+  it('passphrase mismatch shows inline error and does not call export', async () => {
+    mockedInvoke.mockResolvedValueOnce({ ownerId: 'x', ownerDisplayName: 'me',
+      devices: [{ deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x' }],
+      canBackUp: true });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok' });
+    render(DevicesPanel);
+    const btn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(btn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'first-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'second-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+    expect(screen.getByText(/do not match/i)).toBeInTheDocument();
+    expect(invoke).not.toHaveBeenCalledWith(
+      'export_owner_recovery_file_to_path',
+      expect.anything(),
     );
   });
 });
