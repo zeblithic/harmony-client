@@ -2609,36 +2609,47 @@ mod tests {
         // collision probability after N=5 retries to ~10⁻³⁰, effectively
         // zero. A regression that fixed SAS to a constant would collide
         // every time and panic with the message below.
+        //
+        // CRITICAL: each ScriptedTransport's `in_tx` (the inbound channel
+        // sender) MUST stay alive until after the Cancel assertions
+        // complete. Dropping it closes the transport's recv channel, which
+        // makes `transport.recv()` return None. In `run_state_machine`'s
+        // tokio::select!, `transport.recv() = None` causes the SM task to
+        // `return` (L179-191), racing with the about-to-be-processed
+        // Cancel — the CI failure on commit 47fb953 was exactly this race.
+        // We keep the senders alongside the handles in the Option tuple so
+        // they live for the rest of the test.
         const MAX_ATTEMPTS: usize = 5;
-        let mut sm_inviter_opt: Option<PairingHandle> = None;
-        let mut sm_joiner_opt: Option<PairingHandle> = None;
+        type SmAndSender = (PairingHandle, mpsc::Sender<PairingWireMessage>);
+        let mut sm_inviter_opt: Option<SmAndSender> = None;
+        let mut sm_joiner_opt: Option<SmAndSender> = None;
         let mut sas_inviter = String::new();
         let mut sas_joiner = String::new();
         for attempt in 0..MAX_ATTEMPTS {
             let fake_peer_a = X25519Sec::random_from_rng(OsRng);
             let fake_peer_b = X25519Sec::random_from_rng(OsRng);
-            let (h_a, _in_tx_a, sas_a) = drive_to_handshaking(
+            let (h_a, in_tx_a, sas_a) = drive_to_handshaking(
                 PairingRole::Inviter,
                 &fake_peer_a,
                 1_700_000_001 + attempt as u64,
             )
             .await;
-            let (h_b, _in_tx_b, sas_b) = drive_to_handshaking(
+            let (h_b, in_tx_b, sas_b) = drive_to_handshaking(
                 PairingRole::Joiner,
                 &fake_peer_b,
                 1_700_000_500 + attempt as u64,
             )
             .await;
             if sas_a != sas_b {
-                sm_inviter_opt = Some(h_a);
-                sm_joiner_opt = Some(h_b);
+                sm_inviter_opt = Some((h_a, in_tx_a));
+                sm_joiner_opt = Some((h_b, in_tx_b));
                 sas_inviter = sas_a;
                 sas_joiner = sas_b;
                 break;
             }
-            // Collision (~10⁻⁶) — drop the SMs and retry. On the last
-            // attempt, exhausting the retry budget means SAS is always
-            // equal, which is the regression we want to catch.
+            // Collision (~10⁻⁶) — drop SMs (and their senders) and retry.
+            // On the last attempt, exhausting the retry budget means SAS
+            // is always equal, which is the regression we want to catch.
             if attempt == MAX_ATTEMPTS - 1 {
                 panic!(
                     "SAS values collided across {MAX_ATTEMPTS} attempts \
@@ -2648,8 +2659,9 @@ mod tests {
                 );
             }
         }
-        let mut sm_inviter = sm_inviter_opt.expect("inviter handle assigned in loop");
-        let mut sm_joiner = sm_joiner_opt.expect("joiner handle assigned in loop");
+        let (mut sm_inviter, _inviter_in_tx) =
+            sm_inviter_opt.expect("inviter handle assigned in loop");
+        let (mut sm_joiner, _joiner_in_tx) = sm_joiner_opt.expect("joiner handle assigned in loop");
         // Belt-and-suspenders: the loop only exits via `break` when SAS
         // values differ, but make the invariant explicit.
         assert_ne!(sas_inviter, sas_joiner);
