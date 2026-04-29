@@ -127,7 +127,7 @@ pub async fn export_owner_recovery_file_to_path(
 
 ### `src-tauri/src/identity_commands.rs::export_recovery_file_to_path` (modified)
 
-Signature change: `out_path: PathBuf` → `path_token: String`. The per-device transport identity is resolved from disk (no seed-token), so only the path token is consumed.
+Signature change: `out_path: PathBuf` → `path_token: String`. The per-device transport identity is resolved from disk (no seed-token), so only the path token is consumed. Returns `String` (the path written to) so the renderer — which no longer knows the path — can keep its existing "saved to X" feedback.
 
 ```rust
 #[tauri::command]
@@ -135,13 +135,14 @@ pub async fn export_recovery_file_to_path(
     path_token: String,
     passphrase: String,
     comment: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
     let path_uuid: Uuid = path_token.parse().map_err(…)?;
     run_blocking(move || {
         let out_path = take_path_token(&path_uuid)
             .ok_or_else(|| "Save path token expired or invalid. Please re-trigger backup.".to_string())?;
-        export_recovery_file_to_path_helper(&plaintext_path, &out_path, &passphrase, comment, KeychainStore::new().ok())
+        export_recovery_file_to_path_helper(&plaintext_path, &out_path, &passphrase, comment, KeychainStore::new().ok())?;
+        Ok(out_path.display().to_string())
     }).await
 }
 ```
