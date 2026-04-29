@@ -515,14 +515,14 @@ pub async fn run<R: Runtime>(
                         // — formatting `format!("{}/", PAIRING_KEY_PREFIX)` would
                         // heap-allocate a fresh `String` every event.
                         if key_expr.starts_with(crate::pairing::PAIRING_KEY_PREFIX_SLASH) {
-                            if payload.len() > crate::pairing::MAX_PAIRING_WIRE_BYTES {
-                                tracing::warn!(
-                                    "rejecting oversized pairing payload on {key_expr}: {} bytes > {}",
-                                    payload.len(),
-                                    crate::pairing::MAX_PAIRING_WIRE_BYTES,
-                                );
-                                continue;
-                            }
+                            // Note: oversized pairing payloads are dropped at the
+                            // producer (the Zenoh subscriber callback for
+                            // PAIRING_KEY_GLOB) before they enter zenoh_rx, so
+                            // by the time we get here the size cap is guaranteed
+                            // to hold. We don't re-check here — Cursor flagged
+                            // the duplicate as dead code, and a stale defensive
+                            // check is worse than none because it suggests the
+                            // invariant is enforced where it isn't.
                             if let Some(tx) = pairing_in_tx.as_ref() {
                                 match ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(payload.as_slice()) {
                                     Ok(msg) => {
