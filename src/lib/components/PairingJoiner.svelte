@@ -55,7 +55,7 @@
     {#if state.kind === 'idle'}
       <label>
         Give this device a name
-        <input type="text" bind:value={displayName} aria-label="Give this device a name" />
+        <input type="text" bind:value={displayName} />
       </label>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       <div class="modal-actions">
@@ -102,6 +102,9 @@
       </div>
     {:else if state.kind === 'enrolling'}
       <p>Installing your enrollment…</p>
+      <div class="modal-actions">
+        <button class="secondary" onclick={handleCancel}>Cancel</button>
+      </div>
     {:else if state.kind === 'complete'}
       <p>Done! This device is now part of the owner identity.</p>
       <div class="modal-actions">
