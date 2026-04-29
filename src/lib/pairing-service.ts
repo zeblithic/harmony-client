@@ -29,16 +29,24 @@ export class PairingService {
   private unlistener: (() => void) | null = null;
 
   async init(): Promise<void> {
-    this.state = (await invoke<PairingState>('get_pairing_state'));
-    // Notify after initial load so a UI bound only to onChange (e.g. one
-    // that doesn't snapshot `state` at construction time) renders the
-    // backend-authoritative state on first paint, not just after the next
-    // event arrives.
-    this.onChange?.();
-    this.unlistener = await listen('pairing-state-changed', (event) => {
-      this.state = event.payload as PairingState;
+    // Listener-first pattern: if init() fetched the snapshot before
+    // registering the listener, any backend transition that landed during
+    // that window would be lost (the wizard would skip past Discovering →
+    // Discovered, etc). Subscribe first, capture whether any event landed
+    // during the snapshot fetch, then only apply the snapshot if no event
+    // arrived — otherwise the live event payload is authoritative.
+    let sawEvent = false;
+    this.unlistener = await listen<PairingState>('pairing-state-changed', (event) => {
+      sawEvent = true;
+      this.state = event.payload;
       this.onChange?.();
     });
+
+    const snapshot = await invoke<PairingState>('get_pairing_state');
+    if (!sawEvent) {
+      this.state = snapshot;
+      this.onChange?.();
+    }
   }
 
   dispose(): void {
@@ -67,6 +75,8 @@ export class PairingService {
   }
 }
 
-export function extractError(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+// Re-export the canonical extractError from owner-service so wizards
+// can keep importing it from this module without a divergent copy. PR #63
+// review: a duplicated helper would silently drift from the original
+// (e.g. when the Tauri error format changes).
+export { extractError } from './owner-service';

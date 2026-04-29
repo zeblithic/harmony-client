@@ -24,6 +24,25 @@ use std::time::Duration;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
+/// RAII guard mirroring the unit-test pattern in `pairing/persist.rs`:
+/// sets an env var on construction and removes it on drop, including on
+/// panic. Without this, a panicking test leaks `HARMONY_PASSPHRASE` into
+/// any later test in the same process.
+struct EnvVarGuard {
+    name: &'static str,
+}
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        std::env::set_var(name, value);
+        Self { name }
+    }
+}
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.name);
+    }
+}
+
 /// A wrapping transport that captures every published wire message for
 /// post-test inspection.
 struct CapturingTransport {
@@ -125,27 +144,28 @@ async fn end_to_end_pair_two_devices() {
 }
 
 async fn drive_to_handshake(inviter_handle: &PairingHandle, joiner_handle: &PairingHandle) {
+    // Use `wait_for` rather than `changed-then-check`: a freshly-cloned
+    // watch::Receiver hasn't observed the current value, so if the SM has
+    // already advanced past the target state before clone+await, the
+    // changed-then-check loop blocks for the NEXT transition and the test
+    // hangs (or times out). `wait_for` checks the current value first.
     let mut inviter_state = inviter_handle.state_rx.clone();
     let mut joiner_state = joiner_handle.state_rx.clone();
 
     timeout(Duration::from_secs(2), async {
-        loop {
-            inviter_state.changed().await.unwrap();
-            if matches!(*inviter_state.borrow(), PairingState::Discovered { .. }) {
-                break;
-            }
-        }
+        inviter_state
+            .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("inviter discovers");
 
     timeout(Duration::from_secs(2), async {
-        loop {
-            joiner_state.changed().await.unwrap();
-            if matches!(*joiner_state.borrow(), PairingState::Discovered { .. }) {
-                break;
-            }
-        }
+        joiner_state
+            .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("joiner discovers");
@@ -174,22 +194,18 @@ async fn drive_to_handshake(inviter_handle: &PairingHandle, joiner_handle: &Pair
         .unwrap();
 
     timeout(Duration::from_secs(2), async {
-        loop {
-            inviter_state.changed().await.unwrap();
-            if matches!(*inviter_state.borrow(), PairingState::Handshaking { .. }) {
-                break;
-            }
-        }
+        inviter_state
+            .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("inviter handshake");
     timeout(Duration::from_secs(2), async {
-        loop {
-            joiner_state.changed().await.unwrap();
-            if matches!(*joiner_state.borrow(), PairingState::Handshaking { .. }) {
-                break;
-            }
-        }
+        joiner_state
+            .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("joiner handshake");
@@ -216,7 +232,7 @@ async fn end_to_end_persists_state_to_disk() {
 
     // Inviter side: fresh mint persisted to disk so install_inviter_state
     // has something to update. The encrypted-file fallback needs a passphrase.
-    std::env::set_var("HARMONY_PASSPHRASE", "test-pp");
+    let _pp_guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "test-pp");
     let inviter_dir = tempdir().unwrap();
     let joiner_dir = tempdir().unwrap();
 
@@ -357,26 +373,23 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
         .await
         .unwrap();
 
+    // wait_for checks the current value first — see drive_to_handshake.
     let mut joiner_state = joiner_handle.state_rx.clone();
     timeout(Duration::from_secs(3), async {
-        loop {
-            joiner_state.changed().await.unwrap();
-            if matches!(*joiner_state.borrow(), PairingState::Complete { .. }) {
-                break;
-            }
-        }
+        joiner_state
+            .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("joiner completes");
 
     let mut inviter_state = inviter_handle.state_rx.clone();
     timeout(Duration::from_secs(3), async {
-        loop {
-            inviter_state.changed().await.unwrap();
-            if matches!(*inviter_state.borrow(), PairingState::Complete { .. }) {
-                break;
-            }
-        }
+        inviter_state
+            .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+            .await
+            .unwrap();
     })
     .await
     .expect("inviter completes");

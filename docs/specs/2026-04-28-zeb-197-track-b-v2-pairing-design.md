@@ -78,7 +78,7 @@ When a device enters pairing mode (Inviter or Joiner), it:
 4. Subscribes to DISCOVER messages from the OTHER role.
 5. On receiving a peer DISCOVER, adds the peer to the discovered list.
 
-The user sees the discovered list in real-time and clicks the peer they want to pair with. The clicked side becomes the "initiating side" for the handshake (sends the first HANDSHAKE message). The other side's matching click is the "confirming side" — both sides must independently click to claim the pairing, which prevents accidental cross-pairing on a busy LAN.
+The user sees the discovered list in real-time and clicks the peer they want to pair with. Each click publishes a SELECT message naming the chosen peer's session ID. Both sides must independently SELECT each other before either advances to the local HANDSHAKE phase (where SAS is derived from the ECDH shared secret); the mutual-selection requirement prevents accidental cross-pairing on a busy LAN. HANDSHAKE itself produces no wire message — the phase exists purely to render the SAS for the user.
 
 Once both sides have selected each other, the SAS is computed and displayed. Both sides see the same digits because ECDH is symmetric.
 
@@ -113,6 +113,10 @@ Once both sides have selected each other, the SAS is computed and displayed. Bot
 
 ### Key types (Rust, mirrored 1:1 in TS via serde camelCase)
 
+The canonical source is `src-tauri/src/pairing/types.rs`; this snippet is a
+faithful summary, not a duplicate. Field names here match the wire format
+(camelCase via serde `rename_all_fields = "camelCase"`).
+
 ```rust
 pub enum PairingRole { Inviter, Joiner }
 
@@ -120,10 +124,14 @@ pub enum PairingState {
     Idle,
     Discovering { role: PairingRole, ephemeral_pubkey_hex: String, session_id: Uuid },
     Discovered { peers: Vec<DiscoveredPeer> },
-    Handshaking { peer_id: [u8; 16], sas_digits: String },  // "012845" not raw bytes
-    WaitingPeerConfirm { peer_id: [u8; 16] },
+    // peer_session_id identifies the chosen peer's wire session, not a
+    // device_id; sas_digits is exactly 6 ASCII chars ("012845").
+    Handshaking { peer_session_id: Uuid, sas_digits: String },
+    WaitingPeerConfirm { peer_session_id: Uuid },
     Enrolling,
-    Complete { device_id: [u8; 16] },
+    // device_id_hex is the Joiner's identity_hash (32 hex chars from a
+    // 16-byte hash); used by the UI to acknowledge "device <hex> paired".
+    Complete { device_id_hex: String },
     Failed { reason: String },
 }
 
@@ -131,8 +139,13 @@ pub struct DiscoveredPeer {
     pub session_id: Uuid,
     pub role: PairingRole,
     pub display_name: String,
-    pub owner_id_if_inviter: Option<[u8; 16]>,
-    pub ephemeral_pubkey_hex: String,
+    pub owner_id_if_inviter: Option<String>, // hex
+    pub ephemeral_pubkey_hex: String,         // X25519 ephemeral
+    // Joiner-only: ed25519 verifying key (hex). Present iff role == Joiner.
+    // The Inviter consumes this to sign the EnrollmentCert against the
+    // Joiner's signing identity (cert-only model — Joiner never ships its
+    // private key over the wire).
+    pub joiner_ed25519_verify_hex: Option<String>,
     pub seen_at_unix: u64,
 }
 ```
