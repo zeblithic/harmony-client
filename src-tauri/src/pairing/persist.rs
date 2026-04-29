@@ -1,3 +1,4 @@
+use crate::identity::KeychainStore;
 use crate::pairing::state_machine::{InviterEnrollResult, JoinerEnrollResult};
 use std::path::Path;
 
@@ -9,16 +10,40 @@ use std::path::Path;
 /// re-pairing will overwrite the keychain entry.
 ///
 /// The Joiner has NO master_seed (cert-only model — see ZEB-197 design).
-/// Passing `master_seed: None` to save_owner_state_atomic ensures the
-/// master_seed.enc file is never written, so load_owner_state correctly
-/// reports `canBackUp: false` for this device.
+/// Passing `master_seed: None` ensures `save_owner_state_atomic` clears any
+/// stale `master_seed.enc`/keychain entry from a previous identity, so
+/// `load_owner_state` correctly reports `canBackUp: false` for this device.
+///
+/// Production callers go through this function, which acquires a real
+/// `KeychainStore::new().ok()` — mirroring the mint path in
+/// `owner_commands.rs`. PR #63 review found the prior `keychain: None`
+/// caller forced the encrypted-file fallback on every desktop, silently
+/// failing without `HARMONY_PASSPHRASE`.
+///
+/// Tests bypass this wrapper and call [`install_joiner_state_inner`]
+/// directly with `keychain: None`, since the real keychain is a single
+/// global shared resource and would leak state across `#[tokio::test]`
+/// invocations even with per-test tempdirs.
 pub fn install_joiner_state(identity_dir: &Path, result: JoinerEnrollResult) -> Result<(), String> {
+    install_joiner_state_inner(identity_dir, result, KeychainStore::new().ok())
+}
+
+/// Test seam for [`install_joiner_state`]: the public wrapper hard-codes
+/// `KeychainStore::new().ok()` (the real OS keychain), but tests need to
+/// pass `None` so they exercise the encrypted-file fallback under
+/// `HARMONY_PASSPHRASE` without polluting the developer's actual keychain.
+#[doc(hidden)]
+pub fn install_joiner_state_inner(
+    identity_dir: &Path,
+    result: JoinerEnrollResult,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     crate::owner_state::save_owner_state_atomic(
         identity_dir,
         &result.owner_state,
         &result.our_signing_key,
-        None, // no master_seed on Joiner
-        None, // no KeychainStore — fall back to encrypted-file via HARMONY_PASSPHRASE
+        None, // no master_seed on Joiner — clears any stale prior seed
+        keychain,
     )?;
     Ok(())
 }
@@ -33,21 +58,40 @@ pub fn install_joiner_state(identity_dir: &Path, result: JoinerEnrollResult) -> 
 /// Errors if no existing owner state is on disk: an Inviter that never
 /// minted should never have reached `Complete`, so this is an inconsistent
 /// state that surfaces as a hard failure.
+///
+/// Production wrapper: each call site (load + save) acquires a fresh
+/// `KeychainStore::new().ok()`. `KeychainStore` is not `Clone`, so we can't
+/// reuse a single instance across both calls.
 pub fn install_inviter_state(
     identity_dir: &Path,
     result: InviterEnrollResult,
 ) -> Result<(), String> {
+    install_inviter_state_inner(
+        identity_dir,
+        result,
+        KeychainStore::new().ok(),
+        KeychainStore::new().ok(),
+    )
+}
+
+/// Test seam for [`install_inviter_state`]. See
+/// [`install_joiner_state_inner`] for the rationale.
+#[doc(hidden)]
+pub fn install_inviter_state_inner(
+    identity_dir: &Path,
+    result: InviterEnrollResult,
+    load_keychain: Option<KeychainStore>,
+    save_keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     // Reload the existing signing key (the Inviter already has its keys on disk).
-    // No KeychainStore — fall back to encrypted-file via HARMONY_PASSPHRASE,
-    // matching the Joiner path's discipline.
-    let loaded = crate::owner_state::load_owner_state(identity_dir, None)?
+    let loaded = crate::owner_state::load_owner_state(identity_dir, load_keychain)?
         .ok_or_else(|| "no existing owner state to update".to_string())?;
     crate::owner_state::save_owner_state_atomic(
         identity_dir,
         &result.owner_state,        // the FRESH state with the new enrollment
         &loaded.device_signing_key, // the EXISTING signing key
         Some(&*result.master_seed), // Inviter keeps master
-        None,                       // no KeychainStore — fall back to encrypted-file
+        save_keychain,
     )?;
     Ok(())
 }
@@ -95,7 +139,10 @@ mod tests {
             owner_state: state,
             our_device_id: joiner_id,
         };
-        install_joiner_state(dir.path(), result).unwrap();
+        // Use the inner variant with `keychain: None` so the encrypted-file
+        // fallback under `HARMONY_PASSPHRASE` is exercised — the production
+        // wrapper would write to the developer's actual OS keychain.
+        install_joiner_state_inner(dir.path(), result, None).unwrap();
 
         let cbor_path = dir.path().join("owner_state.cbor");
         assert!(cbor_path.exists(), "OwnerState cbor written");
@@ -107,7 +154,7 @@ mod tests {
             "master_seed must not exist on Joiner"
         );
 
-        // The Joiner's device_sk.enc MUST exist (signing key persisted).
+        // The Joiner's device_sk.enc MUST exist (signing key persisted via fallback).
         let device_path = dir.path().join("device_sk.enc");
         assert!(device_path.exists(), "device_sk.enc written");
     }
@@ -178,7 +225,8 @@ mod tests {
             owner_state: mutated_state,
             master_seed: Zeroizing::new(master_seed_bytes),
         };
-        install_inviter_state(dir.path(), result).unwrap();
+        // Use the inner variant — see install_writes_owner_state_cbor for why.
+        install_inviter_state_inner(dir.path(), result, None, None).unwrap();
 
         // Reload from disk and assert the new enrollment is present.
         let reloaded = load_owner_state(dir.path(), None)
@@ -218,7 +266,8 @@ mod tests {
             owner_state: state,
             master_seed: Zeroizing::new([0u8; 32]),
         };
-        let err = install_inviter_state(dir.path(), result).expect_err("must error");
+        let err =
+            install_inviter_state_inner(dir.path(), result, None, None).expect_err("must error");
         assert!(
             err.contains("no existing owner state"),
             "expected 'no existing owner state' error, got: {err}"

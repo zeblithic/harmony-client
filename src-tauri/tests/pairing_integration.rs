@@ -12,7 +12,7 @@
 
 use ed25519_dalek::SigningKey;
 use harmony_app::pairing::{
-    persist::{install_inviter_state, install_joiner_state},
+    persist::{install_inviter_state_inner, install_joiner_state_inner},
     state_machine::{spawn_state_machine, PairingCommand, PairingHandle},
     transport::{InMemoryBroker, PairingTransport},
     types::{PairingState, PairingWireMessage},
@@ -280,10 +280,15 @@ async fn end_to_end_persists_state_to_disk() {
         .expect("inviter result arrives")
         .expect("not None");
 
-    // Persist both sides to their respective tempdirs.
+    // Persist both sides to their respective tempdirs. Use the *_inner
+    // variants with `keychain: None` so we exercise the encrypted-file
+    // fallback (HARMONY_PASSPHRASE) without polluting the developer's real
+    // OS keychain — see persist.rs for why the public wrappers can't be
+    // used here.
     let new_device_id = joiner_result.our_device_id;
-    install_joiner_state(joiner_dir.path(), joiner_result).expect("joiner persist");
-    install_inviter_state(inviter_dir.path(), inviter_result).expect("inviter persist");
+    install_joiner_state_inner(joiner_dir.path(), joiner_result, None).expect("joiner persist");
+    install_inviter_state_inner(inviter_dir.path(), inviter_result, None, None)
+        .expect("inviter persist");
 
     // ── Inviter side assertions ───────────────────────────────────────
     let reloaded_inviter = load_owner_state(inviter_dir.path(), None)

@@ -515,7 +515,24 @@ pub async fn run<R: Runtime>(
                             }
                             if let Some(tx) = pairing_in_tx.as_ref() {
                                 match ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(payload.as_slice()) {
-                                    Ok(msg) => { let _ = tx.send(msg).await; }
+                                    Ok(msg) => {
+                                        // CRITICAL: must NOT await on a bounded channel here.
+                                        // The pairing state machine intentionally does not poll
+                                        // its receive end while idle (see state_machine.rs select!
+                                        // guard). On an always-on subscription with no consumer,
+                                        // `send().await` would block once the buffer fills (~64
+                                        // messages of LAN pairing chatter from peer devices),
+                                        // stalling the entire node event loop. Use try_send and
+                                        // drop on Full — pairing tolerates loss (peers re-emit
+                                        // Discover periodically; SAS verification surfaces any
+                                        // mid-handshake drop as a state-machine timeout).
+                                        if let Err(e) = tx.try_send(msg) {
+                                            tracing::warn!(
+                                                "pairing channel full or closed, dropping wire \
+                                                 message on key {key_expr}: {e}"
+                                            );
+                                        }
+                                    }
                                     Err(e) => tracing::warn!("invalid pairing wire message on key {key_expr}: {e}"),
                                 }
                             }
