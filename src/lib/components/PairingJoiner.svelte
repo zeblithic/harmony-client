@@ -55,7 +55,11 @@
     {#if state.kind === 'idle'}
       <label>
         Give this device a name
-        <input type="text" bind:value={displayName} />
+        <!-- maxlength=64: device names are broadcast in plaintext on every
+             DISCOVER. The 64KB MAX_PAIRING_WIRE_BYTES backend cap would
+             still reject a malicious payload, but a 60KB legitimate name
+             would silently bloat every emit until that wire-level rejection. -->
+        <input type="text" bind:value={displayName} maxlength={64} />
       </label>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       <div class="modal-actions">

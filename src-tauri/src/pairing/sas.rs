@@ -30,7 +30,13 @@ pub fn derive_sas(local_sk: &StaticSecret, peer_pk: &PublicKey) -> Result<SasDer
     if !shared.was_contributory() {
         return Err("peer X25519 pubkey is low-order; refusing to derive session key".to_string());
     }
-    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    // PR #63 review: use a protocol-specific HKDF salt for domain binding.
+    // The default zero-salt is technically fine here (the IKM is an
+    // ephemeral, never-reused ECDH shared secret), but tying the derived
+    // keys to "this is harmony-pairing v2 over LAN" makes a future cross-
+    // protocol confusion (e.g., a hypothetical v3 LAN protocol or non-LAN
+    // transport reusing the same X25519 pair) inert by construction.
+    let hk = Hkdf::<Sha256>::new(Some(b"harmony-pairing-v2-lan"), shared.as_bytes());
 
     let mut session_key = [0u8; 32];
     hk.expand(b"session-v2", &mut session_key)

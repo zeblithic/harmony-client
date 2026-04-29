@@ -304,24 +304,29 @@ pub async fn run<R: Runtime>(
     )
     .await;
 
-    // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing).
-    // Always-on receive: idle devices subscribe but the pairing state
-    // machine only acts on inbound messages when a session is active.
-    // The publish side is opt-in (DISCOVER only flows after StartInviter
-    // or StartJoiner), so this satisfies the "no idle broadcasting" spec.
-    dispatch_action(
-        RuntimeAction::Subscribe {
-            key_expr: crate::pairing::PAIRING_KEY_GLOB.to_string(),
-        },
-        &session,
-        &zenoh_tx,
-        &udp,
-        &broadcast_addr,
-        &app,
-        &closing,
-        &own_zid,
-    )
-    .await;
+    // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing) ONLY when
+    // a pairing consumer (`pairing_in_tx`) was wired into this event loop.
+    // PR #63 review: an unconditional subscribe paid the Zenoh subscription
+    // cost (and exercised the ingress hot-path branch on every sample) for
+    // nodes that don't even host the pairing state machine. Idle devices
+    // still subscribe when the SM is wired — the SM's select! gate ensures
+    // we don't ACT on inbound messages outside an active session, but we
+    // need to be RECEIVING so the buffer is populated when a session starts.
+    if pairing_in_tx.is_some() {
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: crate::pairing::PAIRING_KEY_GLOB.to_string(),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    }
 
     // Subscribe to inbound mail for this node's address, plus the /root
     // pointer that the Phase 2 MailSync walker consumes. Both keys are
@@ -955,7 +960,27 @@ async fn dispatch_action<R: Runtime>(
                     tokio::spawn(async move {
                         while let Ok(sample) = sub.recv_async().await {
                             let skey = sample.key_expr().to_string();
-                            let payload = sample.payload().to_bytes().to_vec();
+                            // PR #63 review (CodeRabbit): pairing-scope size
+                            // cap MUST run BEFORE the heap allocation, not
+                            // after. Earlier code did the check in the
+                            // consumer (event-loop) path, by which point a
+                            // hostile peer could fill the 256-slot zenoh_rx
+                            // channel with oversized buffers. Doing the
+                            // check on the bytes view skips both the .to_vec
+                            // allocation and the channel queue when the
+                            // payload is over-cap.
+                            let bytes = sample.payload().to_bytes();
+                            if skey.starts_with(crate::pairing::PAIRING_KEY_PREFIX_SLASH)
+                                && bytes.len() > crate::pairing::MAX_PAIRING_WIRE_BYTES
+                            {
+                                tracing::warn!(
+                                    "rejecting oversized pairing payload on {skey}: {} bytes > {}",
+                                    bytes.len(),
+                                    crate::pairing::MAX_PAIRING_WIRE_BYTES,
+                                );
+                                continue;
+                            }
+                            let payload = bytes.to_vec();
                             // Extract publisher's ZenohId from attachment (if present).
                             let source_zid = sample
                                 .attachment()
