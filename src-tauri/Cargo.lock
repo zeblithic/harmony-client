@@ -1931,7 +1931,6 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "rand 0.8.5",
- "rand_core 0.6.4",
  "secrecy 0.10.3",
  "serde",
  "serde_json",

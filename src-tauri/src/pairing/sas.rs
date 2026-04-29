@@ -37,7 +37,7 @@ pub fn derive_sas(local_sk: &StaticSecret, peer_pk: &PublicKey) -> SasDerivation
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core::OsRng;
+    use rand::rngs::OsRng;
 
     #[test]
     fn sas_is_symmetric() {
@@ -56,12 +56,7 @@ mod tests {
     #[test]
     fn sas_is_deterministic() {
         // Same inputs always produce the same outputs.
-        let a_sk = StaticSecret::from([7u8; 32]);
-        let b_sk = StaticSecret::from([42u8; 32]);
-        let b_pk = PublicKey::from(&b_sk);
-        let _ = a_sk; // silence unused if compiler complains
-        let a_pk_clone = PublicKey::from(&StaticSecret::from([7u8; 32]));
-        let _ = a_pk_clone;
+        let b_pk = PublicKey::from(&StaticSecret::from([42u8; 32]));
         let r1 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk);
         let r2 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk);
         assert_eq!(r1.session_key, r2.session_key);

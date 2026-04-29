@@ -58,7 +58,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
 sha2 = "0.10"
-rand_core = { version = "0.6", features = ["std", "getrandom"] }
 
 [dev-dependencies]
 serial_test = "3"
