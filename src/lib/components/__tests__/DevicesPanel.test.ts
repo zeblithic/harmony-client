@@ -450,6 +450,107 @@ describe('DevicesPanel — mint→backup token reuse', () => {
   });
 });
 
+describe('DevicesPanel — closeBackup wipes sensitive state', () => {
+  it('clears passphrase fields when modal is closed and on reopen', async () => {
+    // Cursor round-6 finding: closeBackup was leaving backupPassphrase /
+    // backupPassphraseConfirm / backupComment populated in component state.
+    // openBackup wipes them on the NEXT open, but in between sessions they
+    // sit in JS heap unnecessarily. The fix wipes in closeBackup too so
+    // they don't linger in the panel's lifetime between opens.
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-2' });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    const commentInput = screen.getByLabelText('Comment');
+    await fireEvent.input(passInput, { target: { value: 'my-secret-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'my-secret-passphrase' } });
+    await fireEvent.input(commentInput, { target: { value: 'a note' } });
+
+    // Cancel — must clear sensitive fields so they don't sit in component
+    // state until the next openBackup. Reopen and verify the inputs are
+    // empty (which is the user-observable proxy for "not in state").
+    const cancelBtn = screen.getByRole('button', { name: /cancel/i });
+    await fireEvent.click(cancelBtn);
+    await fireEvent.click(backupBtn);
+
+    const passInput2 = await screen.findByLabelText('Passphrase');
+    const confirmInput2 = screen.getByLabelText('Confirm passphrase');
+    const commentInput2 = screen.getByLabelText('Comment');
+    expect((passInput2 as HTMLInputElement).value).toBe('');
+    expect((confirmInput2 as HTMLInputElement).value).toBe('');
+    expect((commentInput2 as HTMLInputElement).value).toBe('');
+  });
+});
+
+describe('DevicesPanel — comment byte-cap validates trimmed value', () => {
+  it('accepts a comment whose untrimmed bytes exceed 256 but trimmed bytes fit', async () => {
+    // Cursor round-6 finding: the validator was checking byte length of the
+    // raw input but sending backupComment.trim() to the backend. So a
+    // comment like "abc" + 254 trailing spaces would falsely reject (raw =
+    // 257 bytes, trimmed = 3). Fix validates the same string sent to backend.
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    // Successful export → returns ExportInfo (shape doesn't matter for assertion).
+    mockedInvoke.mockResolvedValueOnce({});
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    const commentInput = screen.getByLabelText('Comment');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    // 3 chars + 270 trailing spaces = 273 bytes raw, 3 bytes trimmed. The
+    // pre-fix validator rejected on raw bytes; the post-fix validator
+    // accepts because the trimmed form fits well under 256.
+    const commentWithTrailingSpaces = 'abc' + ' '.repeat(270);
+    await fireEvent.input(commentInput, { target: { value: commentWithTrailingSpaces } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+
+    // No "at most 256 bytes" error.
+    expect(screen.queryByText(/at most 256 bytes/i)).not.toBeInTheDocument();
+    // The export call MUST have been made, with the trimmed comment passed
+    // (not the untrimmed-with-trailing-spaces version).
+    const exportCalls = mockedInvoke.mock.calls.filter(
+      (c) => c[0] === 'export_owner_recovery_file_to_path',
+    );
+    expect(exportCalls.length).toBe(1);
+    expect(exportCalls[0][1]).toMatchObject({ comment: 'abc' });
+  });
+});
+
 describe('DevicesPanel — stale backupError cleared between attempts', () => {
   it('clears prior commit error before re-validating on the next click', async () => {
     // Cursor round-5 finding: a backupError from a previous failed commit

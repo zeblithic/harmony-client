@@ -160,7 +160,13 @@
     // the underlying field). The maxlength={256} attribute on the input is
     // a UI hint counting characters, which over-permits for multibyte input;
     // enforce the byte cap explicitly here so the backend never rejects.
-    const commentBytes = new TextEncoder().encode(backupComment).length;
+    //
+    // Validate the SAME string we send to the backend — backupComment.trim().
+    // Validating the raw (untrimmed) string falsely rejects comments where
+    // leading/trailing whitespace pushes the byte count past 256 even though
+    // the trimmed form fits.
+    const trimmedComment = backupComment.trim();
+    const commentBytes = new TextEncoder().encode(trimmedComment).length;
     if (commentBytes > 256) {
       backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
       return;
@@ -182,7 +188,7 @@
         recoveryToken,
         out,
         backupPassphrase,
-        backupComment.trim() ? backupComment.trim() : null,
+        trimmedComment ? trimmedComment : null,
       );
       backupSavedPath = out;
     } catch (e) {
@@ -201,6 +207,16 @@
     backupOpen = false;
     // Tokens are single-use server-side; don't carry across opens.
     recoveryToken = null;
+    // Wipe sensitive passphrase material from component state instead of
+    // letting it linger between modal sessions. JS strings are immutable so
+    // we can't actually zero the underlying buffer (the original allocations
+    // remain in V8's heap until GC), but dropping our references at least
+    // makes them eligible for collection rather than holding them indefinitely
+    // across the panel's lifetime.
+    backupPassphrase = '';
+    backupPassphraseConfirm = '';
+    backupComment = '';
+    backupError = null;
   }
 
   function formatOwnerFingerprint(hex: string): string {
