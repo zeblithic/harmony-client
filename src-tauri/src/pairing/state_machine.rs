@@ -515,7 +515,11 @@ async fn maybe_advance_to_enroll(
     }
     let _ = state_tx.send(PairingState::Enrolling);
 
-    let owner_state = ctx.owner_state.as_mut().expect("inviter has owner_state");
+    // PR #63 review: build a PROSPECTIVE state on a clone, publish first,
+    // then commit on success. Mutating ctx.owner_state before publish meant
+    // a transport failure left the Inviter persistently bound to a Joiner
+    // device that never received the cert (a "phantom device" on disk).
+    let mut prospective_state = ctx.owner_state.clone().expect("inviter has owner_state");
     let master_seed = ctx.master_seed.as_ref().expect("inviter has master_seed");
 
     // Caveat 2: real ed25519 verify key from the Joiner's DISCOVER message.
@@ -529,18 +533,23 @@ async fn maybe_advance_to_enroll(
     let joiner_pubkey = PubKeyBundle::classical_only(joiner_ed25519_verify);
 
     let now = (now_fn)();
-    let cert =
-        match sign_enrollment_for_joiner(master_seed, owner_state, joiner_pubkey.clone(), now) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = state_tx.send(PairingState::Failed {
-                    reason: format!("sign cert: {e}"),
-                });
-                return;
-            }
-        };
+    let cert = match sign_enrollment_for_joiner(
+        master_seed,
+        &prospective_state,
+        joiner_pubkey.clone(),
+        now,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = state_tx.send(PairingState::Failed {
+                reason: format!("sign cert: {e}"),
+            });
+            return;
+        }
+    };
 
-    if let Err(e) = owner_state.add_enrollment(cert.clone(), now, DEFAULT_ACTIVE_WINDOW_SECS) {
+    if let Err(e) = prospective_state.add_enrollment(cert.clone(), now, DEFAULT_ACTIVE_WINDOW_SECS)
+    {
         let _ = state_tx.send(PairingState::Failed {
             reason: format!("add enrollment: {e}"),
         });
@@ -555,7 +564,7 @@ async fn maybe_advance_to_enroll(
         return;
     }
     let mut state_cbor = Vec::new();
-    if let Err(e) = ciborium::into_writer(&*owner_state, &mut state_cbor) {
+    if let Err(e) = ciborium::into_writer(&prospective_state, &mut state_cbor) {
         let _ = state_tx.send(PairingState::Failed {
             reason: format!("encode owner_state: {e}"),
         });
@@ -583,15 +592,26 @@ async fn maybe_advance_to_enroll(
             return;
         }
     };
-    let _ = transport
+    if let Err(e) = transport
         .publish(PairingWireMessage::Encrypted {
             my_session_id: ctx.session_id,
             peer_session_id: ctx.selected_peer_session_id.expect("set"),
             nonce_hex: hex::encode(nonce),
             ciphertext_hex: hex::encode(ct),
         })
-        .await;
+        .await
+    {
+        // Publish failed → DO NOT commit. The Joiner never received the
+        // cert; persisting the new enrollment locally would leave the
+        // Inviter bound to a phantom device.
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("publish enroll: {e}"),
+        });
+        return;
+    }
 
+    // Publish succeeded → commit prospective state into ctx.
+    ctx.owner_state = Some(prospective_state.clone());
     ctx.cert_sent = true;
 
     // Emit the InviterEnrollResult so the persistence layer (drained in
@@ -600,7 +620,7 @@ async fn maybe_advance_to_enroll(
     // DevicesPanel reverts to showing only itself on next start_node.
     let _ = inviter_result_tx
         .send(InviterEnrollResult {
-            owner_state: owner_state.clone(),
+            owner_state: prospective_state,
             master_seed: master_seed.clone(),
         })
         .await;
@@ -766,21 +786,30 @@ async fn handle_wire_message(
             .await;
         }
         PairingWireMessage::Cancel { my_session_id, .. } => {
-            // React if the sender is our selected peer OR a peer we have
-            // discovered but not yet selected (pre-selection cancel).
-            let is_our_peer = ctx
-                .as_ref()
-                .map(|c| {
-                    // Post-selection: they are our chosen peer.
-                    c.selected_peer_session_id == Some(my_session_id)
-                    // Pre-selection: they appear in our discovered list.
-                    || c.discovered_peers.iter().any(|p| p.session_id == my_session_id)
-                })
-                .unwrap_or(false);
-            if is_our_peer {
-                // Drop the session context (mirrors the local-Cancel path).
+            // PR #63 review: only the SELECTED peer can tear down the session.
+            // Treating any discovered peer's Cancel as a session kill let an
+            // unselected LAN device grief our active handshake just by having
+            // been visible in our discovered list. A non-selected peer
+            // cancelling means "I'm leaving the discovery pool" — we drop
+            // them from our list and re-emit Discovered, but stay in-session.
+            let Some(c) = ctx.as_mut() else {
+                return;
+            };
+            if c.selected_peer_session_id == Some(my_session_id) {
+                // Selected peer is leaving: drop ctx (mirrors local-Cancel).
                 *ctx = None;
                 let _ = state_tx.send(PairingState::Idle);
+                return;
+            }
+            // Non-selected peer leaving: prune from discovery list.
+            let before = c.discovered_peers.len();
+            c.discovered_peers.retain(|p| p.session_id != my_session_id);
+            if c.discovered_peers.len() < before {
+                // Also forget any pending received-SELECT from that peer.
+                c.received_selects_from.retain(|s| *s != my_session_id);
+                let _ = state_tx.send(PairingState::Discovered {
+                    peers: c.discovered_peers.clone(),
+                });
             }
         }
     }
@@ -823,6 +852,18 @@ async fn on_encrypted_payload(
             // Joiner-side: install the cert and state.
             if !matches!(ctx.role, PairingRole::Joiner) {
                 // Inviter doesn't accept ENROLL.
+                return;
+            }
+            // PR #63 review: gate ENROLL on mutual SAS confirmation. The
+            // session_key already authenticates that the sender holds the
+            // shared key, but that is NOT a substitute for the user-driven
+            // SAS step — without this gate, a selected peer could complete
+            // pairing without the user ever seeing or confirming the SAS,
+            // collapsing protocol verification into a pure transport check.
+            if !(ctx.our_confirmed && ctx.peer_confirmed) {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: "received ENROLL before mutual SAS confirm".to_string(),
+                });
                 return;
             }
             let cert_bytes = match hex::decode(&enrollment_cert_cbor_hex) {
@@ -1231,11 +1272,14 @@ mod tests {
         .expect("must advance once peer A (chosen) selects us");
     }
 
-    /// Regression test for Fix 2: when the remote peer sends Cancel, the
-    /// receiving state machine must clear its ctx so no further wire messages
-    /// can advance it (e.g. re-emit Discovered from a stale peer list).
+    /// Regression test: when the SELECTED remote peer sends Cancel, the
+    /// receiving state machine must clear its ctx and emit Idle so no
+    /// further wire messages can advance it (e.g. re-emit Discovered from
+    /// a stale peer list). The "selected" gate is load-bearing — see
+    /// `unselected_peer_cancel_only_prunes_discovered` below for why an
+    /// unselected peer must NOT have this power.
     #[tokio::test]
-    async fn cancel_drops_ctx_on_remote_cancel() {
+    async fn cancel_drops_ctx_on_selected_peer_cancel() {
         let MintResult {
             state,
             recovery_artifact,
@@ -1278,15 +1322,29 @@ mod tests {
         .await
         .expect("inviter reaches Discovered");
 
-        // Joiner sends Cancel — this publishes a CANCEL wire message that the
-        // Inviter will receive.
+        // Inviter SELECTs the Joiner — making the Joiner the selected peer.
+        let inviter_peer_session = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!("expected Discovered"),
+        };
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: inviter_peer_session,
+            })
+            .await
+            .unwrap();
+        // Give the SM a moment to process the SELECT cmd before the Cancel
+        // arrives (otherwise selected_peer_session_id may not be set yet).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now Joiner cancels. Joiner is the SELECTED peer → Inviter must Idle.
         joiner_handle
             .cmd_tx
             .send(PairingCommand::Cancel)
             .await
             .unwrap();
 
-        // Inviter must transition to Idle.
         timeout(Duration::from_secs(2), async {
             inviter_state
                 .wait_for(|s| matches!(s, PairingState::Idle))
@@ -1294,7 +1352,7 @@ mod tests {
                 .unwrap();
         })
         .await
-        .expect("inviter reaches Idle after remote cancel");
+        .expect("inviter reaches Idle after selected-peer cancel");
 
         // Verify ctx has been cleared: send a local Cancel from the Inviter.
         // Because ctx is None, the Cancel handler should skip publishing and
@@ -1312,6 +1370,137 @@ mod tests {
         assert!(
             matches!(*inviter_handle.state_rx.borrow(), PairingState::Idle),
             "inviter remains Idle after no-op Cancel (ctx was already None)"
+        );
+    }
+
+    /// Multi-peer LAN regression (PR #63 review): an UNSELECTED peer
+    /// cancelling must NOT tear down our session. Otherwise any device
+    /// that ever appeared in our discovered list could grief our active
+    /// pairing just by sending Cancel. Instead, the unselected peer must
+    /// only be pruned from our discovered list.
+    #[tokio::test]
+    async fn unselected_peer_cancel_only_prunes_discovered() {
+        use crate::pairing::transport::PairingTransport;
+        use crate::pairing::types::PairingWireMessage;
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Mutex as AsyncMutex;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
+
+        struct ScriptedTransport {
+            publish_tx: mpsc::Sender<PairingWireMessage>,
+            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
+            published: StdMutex<Vec<PairingWireMessage>>,
+        }
+        #[async_trait]
+        impl PairingTransport for ScriptedTransport {
+            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                self.published.lock().unwrap().push(message.clone());
+                let _ = self.publish_tx.send(message).await;
+                Ok(())
+            }
+            async fn recv(&self) -> Option<PairingWireMessage> {
+                self.recv_rx.lock().await.recv().await
+            }
+        }
+
+        let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
+        let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
+        let transport = Arc::new(ScriptedTransport {
+            publish_tx: out_tx,
+            recv_rx: AsyncMutex::new(in_rx),
+            published: StdMutex::new(Vec::new()),
+        });
+
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+        let inviter_handle = spawn_state_machine(transport.clone(), fixed_clock(1_700_000_001));
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "krile".to_string(),
+                owner_state: state,
+                master_seed,
+            })
+            .await
+            .unwrap();
+
+        // Inject DISCOVER from two distinct Joiner peers.
+        let peer_a_session = Uuid::new_v4();
+        let peer_b_session = Uuid::new_v4();
+        let peer_a_x_pk = X25519Pub::from(&X25519Sec::random_from_rng(rand::rngs::OsRng));
+        let peer_b_x_pk = X25519Pub::from(&X25519Sec::random_from_rng(rand::rngs::OsRng));
+        let peer_a_ed = SigningKey::generate(&mut OsRng);
+        let peer_b_ed = SigningKey::generate(&mut OsRng);
+        for (sid, pk, ed, name) in [
+            (peer_a_session, peer_a_x_pk, &peer_a_ed, "alpha"),
+            (peer_b_session, peer_b_x_pk, &peer_b_ed, "bravo"),
+        ] {
+            in_tx
+                .send(PairingWireMessage::Discover {
+                    session_id: sid,
+                    role: PairingRole::Joiner,
+                    ephemeral_pubkey_hex: hex::encode(pk.as_bytes()),
+                    display_name: name.to_string(),
+                    owner_id_if_inviter: None,
+                    joiner_ed25519_verify_hex: Some(hex::encode(ed.verifying_key().to_bytes())),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut state_rx = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            state_rx
+                .wait_for(|s| matches!(s, PairingState::Discovered { peers } if peers.len() == 2))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("both peers discovered within 2s");
+
+        // Select peer A.
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: peer_a_session,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Peer B (unselected) sends Cancel. Must NOT tear down our session
+        // with peer A; must only prune peer B from the discovered list.
+        in_tx
+            .send(PairingWireMessage::Cancel {
+                my_session_id: peer_b_session,
+                peer_session_id: None,
+                reason: "unrelated session ending".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Wait for the Discovered re-emit to land.
+        timeout(Duration::from_secs(1), async {
+            state_rx
+                .wait_for(|s| {
+                    matches!(s, PairingState::Discovered { peers }
+                                 if peers.len() == 1 && peers[0].session_id == peer_a_session)
+                })
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("peer B pruned, peer A still in list");
+
+        // Critical: state must NOT be Idle. Our session with peer A survived.
+        assert!(
+            !matches!(*inviter_handle.state_rx.borrow(), PairingState::Idle),
+            "unselected peer's Cancel must not drop our ctx"
         );
     }
 }

@@ -461,10 +461,13 @@ fn save_secret(
 /// `master_seed.enc` (or keychain entry), we must wipe it so subsequent
 /// `load_owner_state` correctly reports no master and `canBackUp: false`.
 ///
-/// A keychain delete error other than `NoEntry` is logged and tolerated —
-/// removing the encrypted-file fallback is the bigger lever (it's what
-/// `load_owner_state` reads first when keychain is unavailable), and we
-/// don't want a flaky/locked keychain to brick a Joiner pairing flow.
+/// A keychain delete failure (other than `NoEntry`) is propagated as Err.
+/// PR #63 review noted that an earlier draft logged-and-continued here:
+/// `load_secret` reads the keychain BEFORE the encrypted-file fallback
+/// whenever a `KeychainStore` is configured, so a stale keychain entry —
+/// even with the fallback file successfully removed — would resurrect the
+/// master_seed on the next load and flip `canBackUp` back to true. We must
+/// fail the entire save if the keychain side cannot be cleared.
 fn clear_secret(
     keychain: &Option<KeychainStore>,
     keychain_name: &str,
@@ -477,10 +480,9 @@ fn clear_secret(
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(e) => {
-                tracing::warn!(
-                    "keychain delete {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}; \
-                     falling through to encrypted-file removal"
-                );
+                return Err(format!(
+                    "keychain delete {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}"
+                ));
             }
         }
     }
