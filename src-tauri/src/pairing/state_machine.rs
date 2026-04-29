@@ -2399,12 +2399,20 @@ mod tests {
         // Drive a SM to Handshaking by injecting a fake peer (with a known
         // X25519 secret so the test could derive the same session_key, though
         // we don't need it here — we only need the SAS to be observable).
-        // Returns (handle, in_tx, sas_digits).
+        // Returns (handle, in_tx, sas_digits, transport). The transport is
+        // returned as `Arc<ScriptedTransport>` (not the trait object) so the
+        // caller can read `transport.published` to verify wire-publish side
+        // effects of subsequent commands.
         async fn drive_to_handshaking(
             role: PairingRole,
             fake_x_sk: &X25519Sec,
             clock_t: u64,
-        ) -> (PairingHandle, mpsc::Sender<PairingWireMessage>, String) {
+        ) -> (
+            PairingHandle,
+            mpsc::Sender<PairingWireMessage>,
+            String,
+            Arc<ScriptedTransport>,
+        ) {
             let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
             let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
             let transport = Arc::new(ScriptedTransport {
@@ -2534,7 +2542,7 @@ mod tests {
                 PairingState::Handshaking { sas_digits, .. } => sas_digits.clone(),
                 other => panic!("expected Handshaking, got {other:?}"),
             };
-            (handle, in_tx, sas)
+            (handle, in_tx, sas, transport)
         }
 
         // Two independent SMs each talking to their own fake peer with a
@@ -2556,29 +2564,33 @@ mod tests {
         // We keep the senders alongside the handles in the Option tuple so
         // they live for the rest of the test.
         const MAX_ATTEMPTS: usize = 5;
-        type SmAndSender = (PairingHandle, mpsc::Sender<PairingWireMessage>);
-        let mut sm_inviter_opt: Option<SmAndSender> = None;
-        let mut sm_joiner_opt: Option<SmAndSender> = None;
+        type SmFixture = (
+            PairingHandle,
+            mpsc::Sender<PairingWireMessage>,
+            Arc<ScriptedTransport>,
+        );
+        let mut sm_inviter_opt: Option<SmFixture> = None;
+        let mut sm_joiner_opt: Option<SmFixture> = None;
         let mut sas_inviter = String::new();
         let mut sas_joiner = String::new();
         for attempt in 0..MAX_ATTEMPTS {
             let fake_peer_a = X25519Sec::random_from_rng(OsRng);
             let fake_peer_b = X25519Sec::random_from_rng(OsRng);
-            let (h_a, in_tx_a, sas_a) = drive_to_handshaking(
+            let (h_a, in_tx_a, sas_a, transport_a) = drive_to_handshaking(
                 PairingRole::Inviter,
                 &fake_peer_a,
                 1_700_000_001 + attempt as u64,
             )
             .await;
-            let (h_b, in_tx_b, sas_b) = drive_to_handshaking(
+            let (h_b, in_tx_b, sas_b, transport_b) = drive_to_handshaking(
                 PairingRole::Joiner,
                 &fake_peer_b,
                 1_700_000_500 + attempt as u64,
             )
             .await;
             if sas_a != sas_b {
-                sm_inviter_opt = Some((h_a, in_tx_a));
-                sm_joiner_opt = Some((h_b, in_tx_b));
+                sm_inviter_opt = Some((h_a, in_tx_a, transport_a));
+                sm_joiner_opt = Some((h_b, in_tx_b, transport_b));
                 sas_inviter = sas_a;
                 sas_joiner = sas_b;
                 break;
@@ -2595,16 +2607,20 @@ mod tests {
                 );
             }
         }
-        let (mut sm_inviter, _inviter_in_tx) =
+        let (mut sm_inviter, _inviter_in_tx, inviter_transport) =
             sm_inviter_opt.expect("inviter handle assigned in loop");
-        let (mut sm_joiner, _joiner_in_tx) = sm_joiner_opt.expect("joiner handle assigned in loop");
+        let (mut sm_joiner, _joiner_in_tx, joiner_transport) =
+            sm_joiner_opt.expect("joiner handle assigned in loop");
         // Belt-and-suspenders: the loop only exits via `break` when SAS
         // values differ, but make the invariant explicit.
         assert_ne!(sas_inviter, sas_joiner);
 
         // User clicks "no don't match" on each device. Both must Cancel
-        // cleanly back to Idle without leaving stale ctx (no-op second
-        // Cancel keeps state at Idle).
+        // cleanly back to Idle. The first Cancel publishes a wire Cancel
+        // (ctx is Some); a follow-up no-op Cancel must NOT (ctx is None,
+        // and the handler at L166-176 gates the publish on ctx.is_some()).
+        // Mirrors the assert_idle_and_clean pattern in
+        // state_machine_cancel_at_each_stage.
         sm_inviter
             .cmd_tx
             .send(PairingCommand::Cancel)
@@ -2612,7 +2628,10 @@ mod tests {
             .unwrap();
         sm_joiner.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
 
-        for (label, handle) in [("inviter", &mut sm_inviter), ("joiner", &mut sm_joiner)] {
+        for (label, handle, transport) in [
+            ("inviter", &mut sm_inviter, &inviter_transport),
+            ("joiner", &mut sm_joiner, &joiner_transport),
+        ] {
             let mut rx = handle.state_rx.clone();
             timeout(Duration::from_secs(2), async {
                 rx.wait_for(|s| matches!(s, PairingState::Idle))
@@ -2622,11 +2641,36 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("{label} SM did not reach Idle within 2s"));
 
+            // Snapshot the count of wire Cancels published so far. The
+            // first user-Cancel above should already have produced one (ctx
+            // was Some). The follow-up no-op Cancel below must NOT bump it.
+            let cancels_before = transport
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, PairingWireMessage::Cancel { .. }))
+                .count();
+
             handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
+
             assert!(
                 matches!(*handle.state_rx.borrow(), PairingState::Idle),
-                "{label}: ctx must be cleared (no-op second Cancel keeps Idle)"
+                "{label}: state must remain Idle"
+            );
+            let cancels_after = transport
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, PairingWireMessage::Cancel { .. }))
+                .count();
+            assert_eq!(
+                cancels_before, cancels_after,
+                "{label}: no-op second Cancel must NOT publish a wire Cancel \
+                 (ctx must already be None); was {cancels_before} cancels, \
+                 now {cancels_after} — stale-ctx regression?"
             );
         }
     }
