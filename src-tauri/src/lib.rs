@@ -726,6 +726,7 @@ async fn start_node(
                             .map(|d| d.as_secs())
                             .unwrap_or(0)
                     }),
+                    crate::pairing::state_machine::DEFAULT_DISCOVER_REBROADCAST_INTERVAL,
                 );
                 // Bridge pairing state changes to a Tauri frontend event.
                 // Clone state_rx before moving the handle into NodeState.

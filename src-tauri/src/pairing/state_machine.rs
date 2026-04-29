@@ -10,8 +10,18 @@ use harmony_owner::pubkey_bundle::PubKeyBundle;
 use harmony_owner::state::OwnerState;
 use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
+
+/// Default interval between DISCOVER re-broadcasts while we're still in
+/// the discovery phase (no peer selected yet). Zenoh pub/sub doesn't
+/// replay past publications to late-joining subscribers — without periodic
+/// re-emit, an Inviter that started its wizard before the Joiner subscribed
+/// would be invisible to the Joiner forever, breaking the documented
+/// "Inviter clicks Add another device first, Joiner second" flow. Tests
+/// use shorter values via [`spawn_state_machine`]'s parameter.
+pub const DEFAULT_DISCOVER_REBROADCAST_INTERVAL: Duration = Duration::from_millis(2500);
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
 use zeroize::Zeroizing;
 
@@ -67,6 +77,7 @@ pub struct PairingHandle {
 pub fn spawn_state_machine(
     transport: Arc<dyn PairingTransport>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    discover_rebroadcast_interval: Duration,
 ) -> PairingHandle {
     let (state_tx, state_rx) = watch::channel(PairingState::Idle);
     let (cmd_tx, cmd_rx) = mpsc::channel::<PairingCommand>(16);
@@ -80,6 +91,7 @@ pub fn spawn_state_machine(
         result_tx,
         inviter_result_tx,
         now_fn,
+        discover_rebroadcast_interval,
     ));
 
     PairingHandle {
@@ -98,9 +110,19 @@ async fn run_state_machine(
     result_tx: mpsc::Sender<JoinerEnrollResult>,
     inviter_result_tx: mpsc::Sender<InviterEnrollResult>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    discover_rebroadcast_interval: Duration,
 ) {
     // Per-session local context. Reset each time we leave a session.
     let mut ctx: Option<SessionCtx> = None;
+
+    // Periodic DISCOVER re-broadcast: see DEFAULT_DISCOVER_REBROADCAST_INTERVAL.
+    // `tokio::time::interval` fires the first tick immediately by default;
+    // we consume that tick before entering the loop because start_inviter /
+    // start_joiner already publishes the initial DISCOVER. MissedTickBehavior::Skip
+    // ensures a sleeping system that wakes up doesn't burst many catch-up emits.
+    let mut rebroadcast = tokio::time::interval(discover_rebroadcast_interval);
+    rebroadcast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    rebroadcast.tick().await;
 
     loop {
         // Race fix: when ctx is None, do NOT poll transport.recv. Otherwise an
@@ -167,17 +189,52 @@ async fn run_state_machine(
                 )
                 .await;
             }
+            // Periodic DISCOVER re-broadcast for late-joining peers (P1 fix).
+            // Gate: only fire while we're in a session AND haven't selected a
+            // peer yet. Once selected_peer_session_id is set, continued
+            // re-broadcast would mislead other LAN devices into thinking we're
+            // still available. Best-effort publish — transport errors here are
+            // non-fatal because the periodic retry handles transient drops.
+            _ = rebroadcast.tick(), if ctx.as_ref().is_some_and(|c| c.selected_peer_session_id.is_none()) => {
+                if let Some(c) = ctx.as_ref() {
+                    let _ = transport.publish(build_discover(c)).await;
+                }
+            }
         }
+    }
+}
+
+/// Reconstruct the DISCOVER wire message from the current SessionCtx.
+/// Used both by start_inviter / start_joiner for the initial publish and
+/// by the periodic rebroadcast in run_state_machine.
+fn build_discover(ctx: &SessionCtx) -> PairingWireMessage {
+    let owner_id_if_inviter = match ctx.role {
+        PairingRole::Inviter => ctx.owner_state.as_ref().map(|s| hex::encode(s.owner_id)),
+        PairingRole::Joiner => None,
+    };
+    let joiner_ed25519_verify_hex = match ctx.role {
+        PairingRole::Joiner => ctx
+            .our_signing_key
+            .as_ref()
+            .map(|sk| hex::encode(sk.verifying_key().to_bytes())),
+        PairingRole::Inviter => None,
+    };
+    PairingWireMessage::Discover {
+        session_id: ctx.session_id,
+        role: ctx.role,
+        ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
+        display_name: ctx.display_name.clone(),
+        owner_id_if_inviter,
+        joiner_ed25519_verify_hex,
     }
 }
 
 struct SessionCtx {
     role: PairingRole,
     session_id: Uuid,
-    /// Our local display name (for diagnostics + future advisory display in
-    /// follow-up tasks). Stored on the ctx so future commands can re-emit
-    /// without the caller re-supplying it.
-    #[allow(dead_code)]
+    /// Our local display name. Stored on the ctx so the periodic DISCOVER
+    /// rebroadcast in `run_state_machine` (and `build_discover`) can
+    /// re-emit it without the caller re-supplying.
     display_name: String,
     eph_sk: X25519Sec,
     eph_pk: X25519Pub,
@@ -201,6 +258,15 @@ struct SessionCtx {
     /// `DiscoveredPeer::joiner_ed25519_verify_hex`). Used to sign the
     /// EnrollmentCert. None on the Joiner's own session ctx.
     selected_peer_ed25519_verify: Option<[u8; 32]>,
+    /// Joiner-side: the owner_id (16 bytes, decoded from
+    /// `DiscoveredPeer::owner_id_if_inviter`) the Inviter advertised at
+    /// DISCOVER time. The Joiner cross-checks the ENROLL payload's
+    /// `owner_state.owner_id` against this on receipt — defense in depth
+    /// alongside the SAS, ensuring the identity we agreed to enroll under
+    /// matches the one advertised at discovery. None on the Inviter's
+    /// own session ctx, and None when SELECTing a peer with no
+    /// `owner_id_if_inviter` (which the SM rejects elsewhere).
+    selected_peer_owner_id: Option<[u8; 16]>,
     sent_select: bool,
     received_select: bool,
     /// All peers that have published a SELECT addressed to our session_id.
@@ -243,6 +309,7 @@ impl SessionCtx {
             selected_peer_pubkey: None,
             selected_peer_display_name: None,
             selected_peer_ed25519_verify: None,
+            selected_peer_owner_id: None,
             sent_select: false,
             received_select: false,
             received_selects_from: Vec::new(),
@@ -263,8 +330,8 @@ async fn start_inviter(
     master_seed: Zeroizing<[u8; 32]>,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
-    let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name.clone());
-    ctx.owner_state = Some(owner_state.clone());
+    let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name);
+    ctx.owner_state = Some(owner_state);
     ctx.master_seed = Some(master_seed);
 
     let _ = state_tx.send(PairingState::Discovering {
@@ -277,17 +344,7 @@ async fn start_inviter(
     // is no recovery from inside the SM (no retry, no alternate transport),
     // so emit Failed and return None. The caller leaves ctx as None, and
     // the user must Cancel to clear and retry.
-    if let Err(e) = transport
-        .publish(PairingWireMessage::Discover {
-            session_id: ctx.session_id,
-            role: PairingRole::Inviter,
-            ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
-            display_name,
-            owner_id_if_inviter: Some(hex::encode(owner_state.owner_id)),
-            joiner_ed25519_verify_hex: None,
-        })
-        .await
-    {
+    if let Err(e) = transport.publish(build_discover(&ctx)).await {
         let _ = state_tx.send(PairingState::Failed {
             reason: format!("publish discover: {e}"),
         });
@@ -304,7 +361,7 @@ async fn start_joiner(
     signing_key: SigningKey,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Option<SessionCtx> {
-    let mut ctx = SessionCtx::new(PairingRole::Joiner, display_name.clone());
+    let mut ctx = SessionCtx::new(PairingRole::Joiner, display_name);
     let verify_bytes = signing_key.verifying_key().to_bytes();
     let pubkey = PubKeyBundle::classical_only(verify_bytes);
     ctx.our_signing_key = Some(signing_key);
@@ -317,17 +374,7 @@ async fn start_joiner(
     });
 
     // See start_inviter for rationale on returning None on publish failure.
-    if let Err(e) = transport
-        .publish(PairingWireMessage::Discover {
-            session_id: ctx.session_id,
-            role: PairingRole::Joiner,
-            ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
-            display_name,
-            owner_id_if_inviter: None,
-            joiner_ed25519_verify_hex: Some(hex::encode(verify_bytes)),
-        })
-        .await
-    {
+    if let Err(e) = transport.publish(build_discover(&ctx)).await {
         let _ = state_tx.send(PairingState::Failed {
             reason: format!("publish discover: {e}"),
         });
@@ -367,6 +414,43 @@ async fn on_select_peer(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&pk_bytes);
     ctx.selected_peer_pubkey = Some(X25519Pub::from(arr));
+
+    // If our peer is an Inviter, capture their advertised owner_id so the
+    // Joiner can cross-check it against the owner_id in the ENROLL payload
+    // (defense in depth alongside the SAS — we want the identity we
+    // enrolled under to match what was advertised at discovery time).
+    if matches!(peer.role, PairingRole::Inviter) {
+        match peer.owner_id_if_inviter.as_deref() {
+            Some(hex_str) => match hex::decode(hex_str) {
+                Ok(bytes) if bytes.len() == 16 => {
+                    let mut oid = [0u8; 16];
+                    oid.copy_from_slice(&bytes);
+                    ctx.selected_peer_owner_id = Some(oid);
+                }
+                Ok(other) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!(
+                            "inviter owner_id wrong length: {} (expected 16)",
+                            other.len()
+                        ),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("inviter owner_id hex decode: {e}"),
+                    });
+                    return;
+                }
+            },
+            None => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: "inviter peer missing owner_id_if_inviter".to_string(),
+                });
+                return;
+            }
+        }
+    }
 
     // If our peer is a Joiner, capture their ed25519 verifying key so the
     // Inviter can sign the EnrollmentCert against it. (X25519 ephemeral above
@@ -974,6 +1058,27 @@ async fn on_encrypted_payload(
                 }
             };
 
+            // Cross-check: the owner_id in the ENROLL payload MUST match the
+            // owner_id_if_inviter the Inviter advertised at DISCOVER time.
+            // PR #63 review (Greptile): the SAS catches MitM attacks at the
+            // session level, but binding ENROLL's identity to the discovery-
+            // time advertisement closes the residual gap where a selected
+            // Inviter could (after passing SAS) try to enroll us under a
+            // DIFFERENT owner — defense in depth. Failure here is a hard
+            // protocol violation, not a network glitch.
+            if let Some(advertised_owner_id) = ctx.selected_peer_owner_id {
+                if owner_state.owner_id != advertised_owner_id {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!(
+                            "ENROLL owner_id mismatch: advertised {} at DISCOVER, got {} in ENROLL",
+                            hex::encode(advertised_owner_id),
+                            hex::encode(owner_state.owner_id),
+                        ),
+                    });
+                    return;
+                }
+            }
+
             let our_pubkey = ctx.our_pubkey.as_ref().expect("joiner has pubkey");
             let now = (now_fn)();
             if let Err(e) = verify_cert_for_self(
@@ -1044,8 +1149,20 @@ mod tests {
 
         // Two transports linked back-to-back.
         let (inviter_t, joiner_t) = InMemoryBroker::pair();
-        let inviter_handle = spawn_state_machine(Arc::new(inviter_t), fixed_clock(1_700_000_001));
-        let joiner_handle = spawn_state_machine(Arc::new(joiner_t), fixed_clock(1_700_000_002));
+        // Long rebroadcast interval so periodic re-emit doesn't fire during
+        // these short-lived tests (tests complete in ~1-3s; pickng 60s ensures
+        // we never see more than the initial DISCOVER).
+        let test_interval = Duration::from_secs(60);
+        let inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
 
         // Both start.
         inviter_handle
@@ -1234,7 +1351,11 @@ mod tests {
         } = mint_owner(1_700_000_000).unwrap();
         let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
 
-        let inviter_handle = spawn_state_machine(transport.clone(), fixed_clock(1_700_000_001));
+        let inviter_handle = spawn_state_machine(
+            transport.clone(),
+            fixed_clock(1_700_000_001),
+            Duration::from_secs(60),
+        );
 
         inviter_handle
             .cmd_tx
@@ -1369,8 +1490,20 @@ mod tests {
         let joiner_sk = SigningKey::generate(&mut OsRng);
 
         let (inviter_t, joiner_t) = InMemoryBroker::pair();
-        let inviter_handle = spawn_state_machine(Arc::new(inviter_t), fixed_clock(1_700_000_001));
-        let joiner_handle = spawn_state_machine(Arc::new(joiner_t), fixed_clock(1_700_000_002));
+        // Long rebroadcast interval so periodic re-emit doesn't fire during
+        // these short-lived tests (tests complete in ~1-3s; pickng 60s ensures
+        // we never see more than the initial DISCOVER).
+        let test_interval = Duration::from_secs(60);
+        let inviter_handle = spawn_state_machine(
+            Arc::new(inviter_t),
+            fixed_clock(1_700_000_001),
+            test_interval,
+        );
+        let joiner_handle = spawn_state_machine(
+            Arc::new(joiner_t),
+            fixed_clock(1_700_000_002),
+            test_interval,
+        );
 
         inviter_handle
             .cmd_tx
@@ -1498,7 +1631,11 @@ mod tests {
             ..
         } = mint_owner(1_700_000_000).unwrap();
         let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
-        let inviter_handle = spawn_state_machine(transport.clone(), fixed_clock(1_700_000_001));
+        let inviter_handle = spawn_state_machine(
+            transport.clone(),
+            fixed_clock(1_700_000_001),
+            Duration::from_secs(60),
+        );
         inviter_handle
             .cmd_tx
             .send(PairingCommand::StartInviter {
@@ -1581,6 +1718,153 @@ mod tests {
         assert!(
             !matches!(*inviter_handle.state_rx.borrow(), PairingState::Idle),
             "unselected peer's Cancel must not drop our ctx"
+        );
+    }
+
+    /// P1 regression (Greptile): DISCOVER must be re-broadcast periodically
+    /// while we're in pre-selection state. Zenoh pub/sub does NOT replay past
+    /// publications, so without periodic re-emit, a Joiner that subscribes
+    /// after the Inviter's initial DISCOVER would never see it. This test
+    /// captures every published message and asserts that within a short
+    /// window we observe MULTIPLE DISCOVERs from a still-discovering Inviter,
+    /// then SELECTs a peer and asserts NO further DISCOVER fires (continued
+    /// broadcast post-selection would mislead other LAN devices).
+    #[tokio::test]
+    async fn discover_is_rebroadcast_until_select() {
+        use crate::pairing::transport::PairingTransport;
+        use crate::pairing::types::PairingWireMessage;
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Mutex as AsyncMutex;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
+
+        struct ScriptedTransport {
+            publish_tx: mpsc::Sender<PairingWireMessage>,
+            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
+            published: StdMutex<Vec<PairingWireMessage>>,
+        }
+        #[async_trait]
+        impl PairingTransport for ScriptedTransport {
+            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                self.published.lock().unwrap().push(message.clone());
+                let _ = self.publish_tx.send(message).await;
+                Ok(())
+            }
+            async fn recv(&self) -> Option<PairingWireMessage> {
+                self.recv_rx.lock().await.recv().await
+            }
+        }
+
+        let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
+        let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(64);
+        let transport = Arc::new(ScriptedTransport {
+            publish_tx: out_tx,
+            recv_rx: AsyncMutex::new(in_rx),
+            published: StdMutex::new(Vec::new()),
+        });
+
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+
+        // Short interval so the test is fast; stays >> tokio scheduler jitter.
+        let rebroadcast_interval = Duration::from_millis(80);
+        let inviter_handle = spawn_state_machine(
+            transport.clone(),
+            fixed_clock(1_700_000_001),
+            rebroadcast_interval,
+        );
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "krile".to_string(),
+                owner_state: state,
+                master_seed,
+            })
+            .await
+            .unwrap();
+
+        // Wait ~5x the interval so we'd expect ≥4 rebroadcasts on top of the
+        // initial publish. The exact number depends on scheduling, but ≥3
+        // total Discover messages is a safe lower bound — the bug version
+        // would publish exactly 1.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let discover_count_pre_select = transport
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, PairingWireMessage::Discover { .. }))
+            .count();
+        assert!(
+            discover_count_pre_select >= 3,
+            "expected ≥3 DISCOVER messages over ~500ms with 80ms rebroadcast interval, \
+             got {discover_count_pre_select} (one-shot DISCOVER bug?)"
+        );
+
+        // Inject a peer DISCOVER so we have someone to SELECT.
+        let peer_session = Uuid::new_v4();
+        let peer_x_pk = X25519Pub::from(&X25519Sec::random_from_rng(rand::rngs::OsRng));
+        let peer_ed = SigningKey::generate(&mut OsRng);
+        in_tx
+            .send(PairingWireMessage::Discover {
+                session_id: peer_session,
+                role: PairingRole::Joiner,
+                ephemeral_pubkey_hex: hex::encode(peer_x_pk.as_bytes()),
+                display_name: "avalon".to_string(),
+                owner_id_if_inviter: None,
+                joiner_ed25519_verify_hex: Some(hex::encode(peer_ed.verifying_key().to_bytes())),
+            })
+            .await
+            .unwrap();
+
+        let mut state_rx = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            state_rx
+                .wait_for(|s| matches!(s, PairingState::Discovered { peers } if !peers.is_empty()))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("peer discovered");
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: peer_session,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Snapshot the count immediately after SELECT lands.
+        let discover_count_at_select = transport
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, PairingWireMessage::Discover { .. }))
+            .count();
+
+        // Wait again — rebroadcast should now be SUPPRESSED (selected_peer_session_id
+        // is Some, so the select! `if` guard skips the tick branch).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let discover_count_after_select = transport
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m, PairingWireMessage::Discover { .. }))
+            .count();
+        assert_eq!(
+            discover_count_at_select, discover_count_after_select,
+            "DISCOVER must NOT continue broadcasting after SelectPeer; \
+             was {discover_count_at_select}, after another 500ms it's \
+             {discover_count_after_select} — rebroadcast guard regressed?"
         );
     }
 }

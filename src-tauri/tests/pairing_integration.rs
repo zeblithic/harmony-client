@@ -86,8 +86,13 @@ async fn end_to_end_pair_two_devices() {
     });
 
     let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 1_700_000_001);
-    let inviter_handle = spawn_state_machine(inviter_t.clone(), now_fn.clone());
-    let joiner_handle = spawn_state_machine(joiner_t.clone(), now_fn.clone());
+    // Long interval — these tests don't exercise rebroadcast; the per-event
+    // master-seed leak scan would still trip on a re-emitted DISCOVER but
+    // we'd rather not trade correctness checks for incidental message
+    // volume in this test.
+    let test_interval = Duration::from_secs(60);
+    let inviter_handle = spawn_state_machine(inviter_t.clone(), now_fn.clone(), test_interval);
+    let joiner_handle = spawn_state_machine(joiner_t.clone(), now_fn.clone(), test_interval);
 
     inviter_handle
         .cmd_tx
@@ -279,8 +284,9 @@ async fn end_to_end_persists_state_to_disk() {
     let inviter_t_arc: Arc<dyn PairingTransport> = Arc::new(inviter_t);
     let joiner_t_arc: Arc<dyn PairingTransport> = Arc::new(joiner_t);
     let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 1_700_000_001);
-    let inviter_handle = spawn_state_machine(inviter_t_arc, now_fn.clone());
-    let joiner_handle = spawn_state_machine(joiner_t_arc, now_fn.clone());
+    let test_interval = Duration::from_secs(60);
+    let inviter_handle = spawn_state_machine(inviter_t_arc, now_fn.clone(), test_interval);
+    let joiner_handle = spawn_state_machine(joiner_t_arc, now_fn.clone(), test_interval);
 
     inviter_handle
         .cmd_tx
