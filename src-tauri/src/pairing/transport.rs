@@ -74,6 +74,7 @@ mod tests {
             ephemeral_pubkey_hex: "00".repeat(32),
             display_name: "test".to_string(),
             owner_id_if_inviter: None,
+            joiner_ed25519_verify_hex: None,
         };
         a.publish(msg.clone()).await.unwrap();
         let received = b.recv().await.unwrap();

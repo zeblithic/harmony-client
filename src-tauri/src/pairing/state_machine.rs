@@ -1,0 +1,922 @@
+use crate::pairing::cert::{sign_enrollment_for_joiner, verify_cert_for_self};
+use crate::pairing::sas::derive_sas;
+use crate::pairing::session::{decrypt as session_decrypt, encrypt as session_encrypt};
+use crate::pairing::transport::PairingTransport;
+use crate::pairing::types::{
+    DiscoveredPeer, EncryptedPayload, PairingRole, PairingState, PairingWireMessage,
+};
+use ed25519_dalek::SigningKey;
+use harmony_owner::pubkey_bundle::PubKeyBundle;
+use harmony_owner::state::OwnerState;
+use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
+use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
+use zeroize::Zeroizing;
+
+/// Inputs to the state machine from the UI layer.
+pub enum PairingCommand {
+    StartInviter {
+        display_name: String,
+        owner_state: OwnerState,
+        master_seed: Zeroizing<[u8; 32]>,
+    },
+    StartJoiner {
+        display_name: String,
+        signing_key: SigningKey,
+    },
+    SelectPeer {
+        peer_session_id: Uuid,
+    },
+    ConfirmSas,
+    Cancel,
+}
+
+/// Output from the state machine for the Joiner side, when enrollment succeeds.
+/// The persistence layer (Task 7) consumes this to write keys + state to disk.
+pub struct JoinerEnrollResult {
+    pub our_signing_key: SigningKey,
+    pub owner_state: OwnerState,
+    pub our_device_id: [u8; 16],
+}
+
+/// Handle the UI talks to. Drops the state machine on drop.
+pub struct PairingHandle {
+    pub state_rx: watch::Receiver<PairingState>,
+    pub cmd_tx: mpsc::Sender<PairingCommand>,
+    pub joiner_result_rx: Option<mpsc::Receiver<JoinerEnrollResult>>,
+    _shutdown: tokio::task::JoinHandle<()>,
+}
+
+pub fn spawn_state_machine(
+    transport: Arc<dyn PairingTransport>,
+    now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> PairingHandle {
+    let (state_tx, state_rx) = watch::channel(PairingState::Idle);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<PairingCommand>(16);
+    let (result_tx, result_rx) = mpsc::channel::<JoinerEnrollResult>(1);
+
+    let task = tokio::spawn(run_state_machine(
+        transport, state_tx, cmd_rx, result_tx, now_fn,
+    ));
+
+    PairingHandle {
+        state_rx,
+        cmd_tx,
+        joiner_result_rx: Some(result_rx),
+        _shutdown: task,
+    }
+}
+
+async fn run_state_machine(
+    transport: Arc<dyn PairingTransport>,
+    state_tx: watch::Sender<PairingState>,
+    mut cmd_rx: mpsc::Receiver<PairingCommand>,
+    result_tx: mpsc::Sender<JoinerEnrollResult>,
+    now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+) {
+    // Per-session local context. Reset each time we leave a session.
+    let mut ctx: Option<SessionCtx> = None;
+
+    loop {
+        // Race fix: when ctx is None, do NOT poll transport.recv. Otherwise an
+        // early-arriving wire message (e.g. peer's Discover landing in our
+        // transport buffer before our own Start* cmd has been processed) gets
+        // grabbed by the transport branch, sees ctx=None, and is silently
+        // dropped — leaving us deaf to the peer for the rest of the session.
+        //
+        // The tokio::select! `if` guard disables the transport branch entirely
+        // when ctx is None, so cmd_rx is the only ready branch.
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { return; };
+                match cmd {
+                    PairingCommand::StartInviter { display_name, owner_state, master_seed } => {
+                        ctx = Some(start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, &now_fn).await);
+                    }
+                    PairingCommand::StartJoiner { display_name, signing_key } => {
+                        ctx = Some(start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await);
+                    }
+                    PairingCommand::SelectPeer { peer_session_id } => {
+                        if let Some(c) = ctx.as_mut() {
+                            on_select_peer(&transport, &state_tx, c, peer_session_id).await;
+                        }
+                    }
+                    PairingCommand::ConfirmSas => {
+                        if let Some(c) = ctx.as_mut() {
+                            on_confirm_sas(&transport, &state_tx, c, &now_fn, &result_tx).await;
+                        }
+                    }
+                    PairingCommand::Cancel => {
+                        if let Some(c) = ctx.as_mut() {
+                            let _ = transport.publish(PairingWireMessage::Cancel {
+                                my_session_id: c.session_id,
+                                peer_session_id: c.selected_peer_session_id,
+                                reason: "user cancelled".to_string(),
+                            }).await;
+                        }
+                        ctx = None;
+                        let _ = state_tx.send(PairingState::Idle);
+                    }
+                }
+            }
+            msg = transport.recv(), if ctx.is_some() => {
+                let Some(msg) = msg else { return; };
+                // ctx.is_some() is the precondition; unwrap is safe here.
+                let c = ctx.as_mut().expect("ctx checked by select guard");
+                handle_wire_message(&transport, &state_tx, c, msg, &now_fn, &result_tx).await;
+            }
+        }
+    }
+}
+
+struct SessionCtx {
+    role: PairingRole,
+    session_id: Uuid,
+    /// Our local display name (for diagnostics + future advisory display in
+    /// follow-up tasks). Stored on the ctx so future commands can re-emit
+    /// without the caller re-supplying it.
+    #[allow(dead_code)]
+    display_name: String,
+    eph_sk: X25519Sec,
+    eph_pk: X25519Pub,
+
+    // Joiner-only:
+    our_signing_key: Option<SigningKey>,
+    our_pubkey: Option<PubKeyBundle>,
+
+    // Inviter-only:
+    owner_state: Option<OwnerState>,
+    master_seed: Option<Zeroizing<[u8; 32]>>,
+
+    // After Discovery:
+    discovered_peers: Vec<DiscoveredPeer>,
+
+    // After Select (mutual):
+    selected_peer_session_id: Option<Uuid>,
+    selected_peer_pubkey: Option<X25519Pub>,
+    selected_peer_display_name: Option<String>,
+    /// Inviter-side: the Joiner's ed25519 verifying key (decoded from
+    /// `DiscoveredPeer::joiner_ed25519_verify_hex`). Used to sign the
+    /// EnrollmentCert. None on the Joiner's own session ctx.
+    selected_peer_ed25519_verify: Option<[u8; 32]>,
+    sent_select: bool,
+    received_select: bool,
+
+    // After Handshake:
+    session_key: Option<[u8; 32]>,
+    sas_digits: Option<String>,
+
+    // After Confirm:
+    our_confirmed: bool,
+    peer_confirmed: bool,
+}
+
+impl SessionCtx {
+    fn new(role: PairingRole, display_name: String) -> Self {
+        let eph_sk = X25519Sec::random_from_rng(rand::rngs::OsRng);
+        let eph_pk = X25519Pub::from(&eph_sk);
+        Self {
+            role,
+            session_id: Uuid::new_v4(),
+            display_name,
+            eph_sk,
+            eph_pk,
+            our_signing_key: None,
+            our_pubkey: None,
+            owner_state: None,
+            master_seed: None,
+            discovered_peers: Vec::new(),
+            selected_peer_session_id: None,
+            selected_peer_pubkey: None,
+            selected_peer_display_name: None,
+            selected_peer_ed25519_verify: None,
+            sent_select: false,
+            received_select: false,
+            session_key: None,
+            sas_digits: None,
+            our_confirmed: false,
+            peer_confirmed: false,
+        }
+    }
+}
+
+async fn start_inviter(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    display_name: String,
+    owner_state: OwnerState,
+    master_seed: Zeroizing<[u8; 32]>,
+    _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> SessionCtx {
+    let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name.clone());
+    ctx.owner_state = Some(owner_state.clone());
+    ctx.master_seed = Some(master_seed);
+
+    let _ = state_tx.send(PairingState::Discovering {
+        role: PairingRole::Inviter,
+        ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
+        session_id: ctx.session_id,
+    });
+
+    let _ = transport
+        .publish(PairingWireMessage::Discover {
+            session_id: ctx.session_id,
+            role: PairingRole::Inviter,
+            ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
+            display_name,
+            owner_id_if_inviter: Some(hex::encode(owner_state.owner_id)),
+            joiner_ed25519_verify_hex: None,
+        })
+        .await;
+
+    ctx
+}
+
+async fn start_joiner(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    display_name: String,
+    signing_key: SigningKey,
+    _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> SessionCtx {
+    let mut ctx = SessionCtx::new(PairingRole::Joiner, display_name.clone());
+    let verify_bytes = signing_key.verifying_key().to_bytes();
+    let pubkey = PubKeyBundle::classical_only(verify_bytes);
+    ctx.our_signing_key = Some(signing_key);
+    ctx.our_pubkey = Some(pubkey);
+
+    let _ = state_tx.send(PairingState::Discovering {
+        role: PairingRole::Joiner,
+        ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
+        session_id: ctx.session_id,
+    });
+
+    let _ = transport
+        .publish(PairingWireMessage::Discover {
+            session_id: ctx.session_id,
+            role: PairingRole::Joiner,
+            ephemeral_pubkey_hex: hex::encode(ctx.eph_pk.as_bytes()),
+            display_name,
+            owner_id_if_inviter: None,
+            joiner_ed25519_verify_hex: Some(hex::encode(verify_bytes)),
+        })
+        .await;
+
+    ctx
+}
+
+async fn on_select_peer(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    peer_session_id: Uuid,
+) {
+    // Find the peer in the discovered list.
+    let Some(peer) = ctx
+        .discovered_peers
+        .iter()
+        .find(|p| p.session_id == peer_session_id)
+        .cloned()
+    else {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("unknown peer session_id: {peer_session_id}"),
+        });
+        return;
+    };
+    ctx.selected_peer_session_id = Some(peer_session_id);
+    ctx.selected_peer_display_name = Some(peer.display_name.clone());
+    let pk_bytes = hex::decode(&peer.ephemeral_pubkey_hex).unwrap_or_default();
+    if pk_bytes.len() != 32 {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("peer pubkey has wrong length: {}", pk_bytes.len()),
+        });
+        return;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&pk_bytes);
+    ctx.selected_peer_pubkey = Some(X25519Pub::from(arr));
+
+    // If our peer is a Joiner, capture their ed25519 verifying key so the
+    // Inviter can sign the EnrollmentCert against it. (X25519 ephemeral above
+    // is for SAS / session_key only.) The Joiner's own session has None here.
+    if matches!(peer.role, PairingRole::Joiner) {
+        match peer.joiner_ed25519_verify_hex.as_deref() {
+            Some(hex_str) => match hex::decode(hex_str) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut vk = [0u8; 32];
+                    vk.copy_from_slice(&bytes);
+                    ctx.selected_peer_ed25519_verify = Some(vk);
+                }
+                Ok(other) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("joiner ed25519 verify key wrong length: {}", other.len()),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("joiner ed25519 verify key hex decode: {e}"),
+                    });
+                    return;
+                }
+            },
+            None => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: "joiner peer missing ed25519 verifying key".to_string(),
+                });
+                return;
+            }
+        }
+    }
+
+    // Publish SELECT.
+    ctx.sent_select = true;
+    let _ = transport
+        .publish(PairingWireMessage::Select {
+            my_session_id: ctx.session_id,
+            peer_session_id,
+        })
+        .await;
+
+    // If we've already received the peer's SELECT, transition to Handshaking.
+    maybe_advance_to_handshake(state_tx, ctx);
+}
+
+fn maybe_advance_to_handshake(state_tx: &watch::Sender<PairingState>, ctx: &mut SessionCtx) {
+    if ctx.sent_select && ctx.received_select && ctx.session_key.is_none() {
+        let peer_pk = ctx
+            .selected_peer_pubkey
+            .as_ref()
+            .expect("peer pubkey set on select");
+        let derivation = derive_sas(&ctx.eph_sk, peer_pk);
+        ctx.session_key = Some(derivation.session_key);
+        ctx.sas_digits = Some(derivation.sas_digits.clone());
+        let _ = state_tx.send(PairingState::Handshaking {
+            peer_session_id: ctx.selected_peer_session_id.expect("set on select"),
+            sas_digits: derivation.sas_digits,
+        });
+    }
+}
+
+async fn on_confirm_sas(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+    result_tx: &mpsc::Sender<JoinerEnrollResult>,
+) {
+    let Some(session_key) = ctx.session_key else {
+        return;
+    };
+    let Some(sas_digits) = ctx.sas_digits.clone() else {
+        return;
+    };
+    let Some(peer_session_id) = ctx.selected_peer_session_id else {
+        return;
+    };
+
+    ctx.our_confirmed = true;
+
+    // Encrypt + publish CONFIRM.
+    let payload = EncryptedPayload::Confirm {
+        sas_digits: sas_digits.clone(),
+    };
+    let pt = {
+        let mut b = Vec::new();
+        ciborium::into_writer(&payload, &mut b).expect("CBOR encode cannot fail");
+        b
+    };
+    let (nonce, ct) = match session_encrypt(&session_key, &pt) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = state_tx.send(PairingState::Failed {
+                reason: format!("encrypt confirm: {e}"),
+            });
+            return;
+        }
+    };
+    let _ = transport
+        .publish(PairingWireMessage::Encrypted {
+            my_session_id: ctx.session_id,
+            peer_session_id,
+            nonce_hex: hex::encode(nonce),
+            ciphertext_hex: hex::encode(ct),
+        })
+        .await;
+
+    let _ = state_tx.send(PairingState::WaitingPeerConfirm { peer_session_id });
+
+    maybe_advance_to_enroll(transport, state_tx, ctx, now_fn).await;
+    // Joiner waits for the ENROLL message; the receive path emits Enrolling and
+    // then completes. result_tx is only consumed on the Joiner side via
+    // on_encrypted_payload::Enroll.
+    let _ = result_tx;
+}
+
+/// Inviter-only: once both sides have confirmed the SAS, sign the
+/// EnrollmentCert + ship ENROLL. The Joiner's path through both-confirmed
+/// emits `Enrolling` from the receiving handler and then transitions to
+/// `Complete` when ENROLL arrives.
+async fn maybe_advance_to_enroll(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+) {
+    if !(ctx.our_confirmed && ctx.peer_confirmed) {
+        return;
+    }
+    if !matches!(ctx.role, PairingRole::Inviter) {
+        // Joiner waits for the ENROLL wire message; surface Enrolling so the
+        // UI reflects progress.
+        let _ = state_tx.send(PairingState::Enrolling);
+        return;
+    }
+    // Idempotency: if we've already shipped the cert, do not re-enter.
+    // (Once the Inviter has signed + sent ENROLL, owner_state has the new
+    // enrollment installed; arriving late peer-CONFIRM should be a no-op.)
+    let _ = state_tx.send(PairingState::Enrolling);
+
+    let owner_state = ctx.owner_state.as_mut().expect("inviter has owner_state");
+    let master_seed = ctx.master_seed.as_ref().expect("inviter has master_seed");
+
+    // Caveat 2: real ed25519 verify key from the Joiner's DISCOVER message.
+    // Fail-fast if missing — the Inviter cannot sign without it.
+    let Some(joiner_ed25519_verify) = ctx.selected_peer_ed25519_verify else {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: "missing joiner ed25519 verifying key — cannot sign cert".to_string(),
+        });
+        return;
+    };
+    let joiner_pubkey = PubKeyBundle::classical_only(joiner_ed25519_verify);
+
+    let now = (now_fn)();
+    let cert =
+        match sign_enrollment_for_joiner(master_seed, owner_state, joiner_pubkey.clone(), now) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("sign cert: {e}"),
+                });
+                return;
+            }
+        };
+
+    if let Err(e) = owner_state.add_enrollment(cert.clone(), now, DEFAULT_ACTIVE_WINDOW_SECS) {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("add enrollment: {e}"),
+        });
+        return;
+    }
+
+    let cert_cbor = {
+        let mut b = Vec::new();
+        ciborium::into_writer(&cert, &mut b).expect("cert serializable");
+        b
+    };
+    let state_cbor = {
+        let mut b = Vec::new();
+        ciborium::into_writer(&*owner_state, &mut b).expect("state serializable");
+        b
+    };
+    let payload = EncryptedPayload::Enroll {
+        enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
+        owner_state_cbor_hex: hex::encode(&state_cbor),
+        joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
+    };
+    let pt = {
+        let mut b = Vec::new();
+        ciborium::into_writer(&payload, &mut b).expect("payload serializable");
+        b
+    };
+    let session_key = ctx.session_key.expect("session key after handshake");
+    let (nonce, ct) = match session_encrypt(&session_key, &pt) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = state_tx.send(PairingState::Failed {
+                reason: format!("encrypt enroll: {e}"),
+            });
+            return;
+        }
+    };
+    let _ = transport
+        .publish(PairingWireMessage::Encrypted {
+            my_session_id: ctx.session_id,
+            peer_session_id: ctx.selected_peer_session_id.expect("set"),
+            nonce_hex: hex::encode(nonce),
+            ciphertext_hex: hex::encode(ct),
+        })
+        .await;
+
+    let device_id = joiner_pubkey.identity_hash();
+    let _ = state_tx.send(PairingState::Complete {
+        device_id_hex: hex::encode(device_id),
+    });
+}
+
+async fn handle_wire_message(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    msg: PairingWireMessage,
+    now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+    result_tx: &mpsc::Sender<JoinerEnrollResult>,
+) {
+    match msg {
+        PairingWireMessage::Discover {
+            session_id,
+            role,
+            ephemeral_pubkey_hex,
+            display_name,
+            owner_id_if_inviter,
+            joiner_ed25519_verify_hex,
+        } => {
+            // Ignore our own discoveries (echo).
+            if session_id == ctx.session_id {
+                return;
+            }
+            // Only collect peers of the OPPOSITE role.
+            if role == ctx.role {
+                return;
+            }
+            // De-dup by session_id.
+            if ctx
+                .discovered_peers
+                .iter()
+                .any(|p| p.session_id == session_id)
+            {
+                return;
+            }
+            let now = (now_fn)();
+            ctx.discovered_peers.push(DiscoveredPeer {
+                session_id,
+                role,
+                display_name,
+                owner_id_if_inviter,
+                ephemeral_pubkey_hex,
+                joiner_ed25519_verify_hex,
+                seen_at_unix: now,
+            });
+            let _ = state_tx.send(PairingState::Discovered {
+                peers: ctx.discovered_peers.clone(),
+            });
+        }
+        PairingWireMessage::Select {
+            my_session_id,
+            peer_session_id,
+        } => {
+            // Only act if the peer is selecting US.
+            if peer_session_id != ctx.session_id {
+                return;
+            }
+            // Only act if we have already discovered this peer.
+            if !ctx
+                .discovered_peers
+                .iter()
+                .any(|p| p.session_id == my_session_id)
+            {
+                return;
+            }
+            // Track that the peer has selected us. We might see this BEFORE we
+            // have selected them locally; in that case we wait for the local
+            // user's tap. `maybe_advance_to_handshake` enforces both sides.
+            ctx.received_select = true;
+            maybe_advance_to_handshake(state_tx, ctx);
+        }
+        PairingWireMessage::Encrypted {
+            my_session_id,
+            peer_session_id,
+            nonce_hex,
+            ciphertext_hex,
+        } => {
+            if peer_session_id != ctx.session_id {
+                return;
+            }
+            if Some(my_session_id) != ctx.selected_peer_session_id {
+                return;
+            }
+            let Some(session_key) = ctx.session_key else {
+                return;
+            };
+            let nonce = match hex::decode(&nonce_hex) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("nonce hex: {e}"),
+                    });
+                    return;
+                }
+            };
+            let ct = match hex::decode(&ciphertext_hex) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("ct hex: {e}"),
+                    });
+                    return;
+                }
+            };
+            let pt = match session_decrypt(&session_key, &nonce, &ct) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("decrypt: {e}"),
+                    });
+                    return;
+                }
+            };
+            let payload: EncryptedPayload = match ciborium::from_reader(pt.as_slice()) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("payload decode: {e}"),
+                    });
+                    return;
+                }
+            };
+            on_encrypted_payload(transport, state_tx, ctx, payload, now_fn, result_tx).await;
+        }
+        PairingWireMessage::Cancel { my_session_id, .. } => {
+            if Some(my_session_id) == ctx.selected_peer_session_id {
+                let _ = state_tx.send(PairingState::Idle);
+            }
+        }
+    }
+}
+
+async fn on_encrypted_payload(
+    transport: &Arc<dyn PairingTransport>,
+    state_tx: &watch::Sender<PairingState>,
+    ctx: &mut SessionCtx,
+    payload: EncryptedPayload,
+    now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+    result_tx: &mpsc::Sender<JoinerEnrollResult>,
+) {
+    match payload {
+        EncryptedPayload::Confirm { sas_digits } => {
+            // Defense-in-depth: the SAS in the message must match what we
+            // computed locally. (Session_key already authenticates this, but
+            // the explicit equality check makes the intent obvious.)
+            if Some(&sas_digits) != ctx.sas_digits.as_ref() {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: "SAS mismatch in CONFIRM".to_string(),
+                });
+                return;
+            }
+            ctx.peer_confirmed = true;
+            // Caveat 1: when we receive peer-CONFIRM AFTER we have already
+            // locally confirmed, we must drive the post-confirm transition
+            // ourselves. Previously the scaffold tried to do this without
+            // `transport` in scope; we now thread it through.
+            if ctx.our_confirmed {
+                maybe_advance_to_enroll(transport, state_tx, ctx, now_fn).await;
+            }
+        }
+        EncryptedPayload::Enroll {
+            enrollment_cert_cbor_hex,
+            owner_state_cbor_hex,
+            ..
+        } => {
+            // Joiner-side: install the cert and state.
+            if !matches!(ctx.role, PairingRole::Joiner) {
+                // Inviter doesn't accept ENROLL.
+                return;
+            }
+            let cert_bytes = match hex::decode(&enrollment_cert_cbor_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("cert hex: {e}"),
+                    });
+                    return;
+                }
+            };
+            let state_bytes = match hex::decode(&owner_state_cbor_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("state hex: {e}"),
+                    });
+                    return;
+                }
+            };
+            let cert: harmony_owner::certs::EnrollmentCert =
+                match ciborium::from_reader(cert_bytes.as_slice()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = state_tx.send(PairingState::Failed {
+                            reason: format!("cert decode: {e}"),
+                        });
+                        return;
+                    }
+                };
+            let owner_state: OwnerState = match ciborium::from_reader(state_bytes.as_slice()) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = state_tx.send(PairingState::Failed {
+                        reason: format!("state decode: {e}"),
+                    });
+                    return;
+                }
+            };
+
+            let our_pubkey = ctx.our_pubkey.as_ref().expect("joiner has pubkey");
+            let now = (now_fn)();
+            if let Err(e) = verify_cert_for_self(
+                &cert,
+                owner_state.owner_id,
+                our_pubkey,
+                now,
+                DEFAULT_ACTIVE_WINDOW_SECS,
+            ) {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("verify cert: {e}"),
+                });
+                return;
+            }
+
+            let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
+            let our_device_id = our_pubkey.identity_hash();
+            let _ = result_tx
+                .send(JoinerEnrollResult {
+                    our_signing_key: our_sk,
+                    owner_state,
+                    our_device_id,
+                })
+                .await;
+            let _ = state_tx.send(PairingState::Complete {
+                device_id_hex: hex::encode(our_device_id),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pairing::transport::InMemoryBroker;
+    use ed25519_dalek::SigningKey;
+    use harmony_owner::lifecycle::{mint_owner, MintResult};
+    use rand::rngs::OsRng;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use zeroize::Zeroizing;
+
+    fn fixed_clock(t: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+        Arc::new(move || t)
+    }
+
+    #[tokio::test]
+    async fn happy_path_two_devices_pair() {
+        // Setup: mint owner on Inviter side; generate a Joiner signing key.
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+
+        // Two transports linked back-to-back.
+        let (inviter_t, joiner_t) = InMemoryBroker::pair();
+        let inviter_handle = spawn_state_machine(Arc::new(inviter_t), fixed_clock(1_700_000_001));
+        let joiner_handle = spawn_state_machine(Arc::new(joiner_t), fixed_clock(1_700_000_002));
+
+        // Both start.
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "KRILE".to_string(),
+                owner_state: state.clone(),
+                master_seed,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::StartJoiner {
+                display_name: "AVALON".to_string(),
+                signing_key: joiner_sk,
+            })
+            .await
+            .unwrap();
+
+        // Wait for both to discover each other. Use `wait_for` which checks
+        // the current value first (handles the case where the SM has already
+        // transitioned past Idle by the time we start waiting).
+        let mut inviter_state = inviter_handle.state_rx.clone();
+        let mut joiner_state = joiner_handle.state_rx.clone();
+
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter sees joiner within 2s");
+
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner sees inviter within 2s");
+
+        // Each side selects the other.
+        let inviter_peer_id = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        let joiner_peer_id = match &*joiner_handle.state_rx.borrow() {
+            PairingState::Discovered { peers } => peers[0].session_id,
+            _ => panic!(),
+        };
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: inviter_peer_id,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: joiner_peer_id,
+            })
+            .await
+            .unwrap();
+
+        // Wait for both to reach Handshaking with same SAS.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter handshakes within 2s");
+        timeout(Duration::from_secs(2), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner handshakes within 2s");
+
+        let inviter_sas = match &*inviter_handle.state_rx.borrow() {
+            PairingState::Handshaking { sas_digits, .. } => sas_digits.clone(),
+            _ => panic!(),
+        };
+        let joiner_sas = match &*joiner_handle.state_rx.borrow() {
+            PairingState::Handshaking { sas_digits, .. } => sas_digits.clone(),
+            _ => panic!(),
+        };
+        assert_eq!(inviter_sas, joiner_sas, "both sides see same SAS");
+
+        // Both confirm.
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::ConfirmSas)
+            .await
+            .unwrap();
+
+        // Joiner reaches Complete.
+        timeout(Duration::from_secs(3), async {
+            joiner_state
+                .wait_for(|s| matches!(s, PairingState::Complete { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("joiner completes within 3s");
+
+        // The joiner_result_rx should have a JoinerEnrollResult.
+        let mut jrx = joiner_handle.joiner_result_rx.expect("joiner result rx");
+        let result = timeout(Duration::from_secs(1), jrx.recv())
+            .await
+            .expect("joiner result arrives")
+            .expect("result not None");
+
+        // The Joiner's OwnerState now contains its enrollment.
+        let our_id = result.our_device_id;
+        assert!(result.owner_state.enrollments.contains_key(&our_id));
+        // And contains the original Inviter's enrollment.
+        let original_inviter_device_id = *state.enrollments.keys().next().unwrap();
+        assert!(result
+            .owner_state
+            .enrollments
+            .contains_key(&original_inviter_device_id));
+    }
+}

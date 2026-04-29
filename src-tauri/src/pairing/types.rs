@@ -17,6 +17,10 @@ pub struct DiscoveredPeer {
     /// Set only when the peer is an Inviter — the owner identity hash.
     pub owner_id_if_inviter: Option<String>, // 32-hex
     pub ephemeral_pubkey_hex: String,
+    /// Set only when the peer is a Joiner — the ed25519 verifying key the
+    /// Inviter must sign the EnrollmentCert against. Different curve, different
+    /// key from `ephemeral_pubkey_hex` (which is X25519 for SAS / session key).
+    pub joiner_ed25519_verify_hex: Option<String>, // 64-hex (32 bytes)
     pub seen_at_unix: u64,
 }
 
@@ -71,6 +75,9 @@ pub enum PairingWireMessage {
         ephemeral_pubkey_hex: String,
         display_name: String,
         owner_id_if_inviter: Option<String>,
+        /// Joiner publishes its ed25519 verifying key here so the Inviter can
+        /// sign the EnrollmentCert against it. Inviter omits (None).
+        joiner_ed25519_verify_hex: Option<String>,
     },
     /// Sent when the local user clicks the peer's row.
     Select {
@@ -147,6 +154,7 @@ mod tests {
             ephemeral_pubkey_hex: "00".repeat(32),
             display_name: "AVALON".to_string(),
             owner_id_if_inviter: None,
+            joiner_ed25519_verify_hex: None,
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&m, &mut bytes).unwrap();
