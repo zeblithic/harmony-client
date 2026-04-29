@@ -309,6 +309,16 @@ pub fn save_owner_state_atomic(
             "master_seed.enc",
             seed,
         )?;
+    } else {
+        // Joiner case: cert-only model. We must NOT leave a stale master_seed
+        // from a previous identity behind; if we did, `load_owner_state` would
+        // pick it up and `canBackUp` would lie about backup eligibility.
+        clear_secret(
+            &keychain,
+            KEYCHAIN_MASTER_SEED,
+            identity_dir,
+            "master_seed.enc",
+        )?;
     }
     let cbor_bytes =
         cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
@@ -441,6 +451,45 @@ fn save_secret(
         .save(bytes)
         .map_err(|e| format!("write {fallback_filename}: {e}"))?;
     Ok(())
+}
+
+/// Remove a previously-persisted secret from BOTH the keychain primary AND
+/// the encrypted-file fallback. Idempotent: NoEntry / NotFound are silent.
+///
+/// Used for the `master_seed = None` branch of `save_owner_state_atomic`
+/// (cert-only model — Joiner enrollment): if a prior identity left a
+/// `master_seed.enc` (or keychain entry), we must wipe it so subsequent
+/// `load_owner_state` correctly reports no master and `canBackUp: false`.
+///
+/// A keychain delete error other than `NoEntry` is logged and tolerated —
+/// removing the encrypted-file fallback is the bigger lever (it's what
+/// `load_owner_state` reads first when keychain is unavailable), and we
+/// don't want a flaky/locked keychain to brick a Joiner pairing flow.
+fn clear_secret(
+    keychain: &Option<KeychainStore>,
+    keychain_name: &str,
+    identity_dir: &Path,
+    fallback_filename: &str,
+) -> Result<(), String> {
+    if keychain.is_some() {
+        let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
+            .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "keychain delete {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}; \
+                     falling through to encrypted-file removal"
+                );
+            }
+        }
+    }
+    let path = identity_dir.join(fallback_filename);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete {}: {e}", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +632,57 @@ mod persistence_tests {
         assert!(
             loaded.master_seed.is_none(),
             "degraded state: master seed gone, signing key present"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_with_none_master_seed_clears_existing_seed() {
+        // Regression: PR #63 review found that `save_owner_state_atomic`
+        // with `master_seed: None` skipped writing but did NOT delete a
+        // prior `master_seed.enc`, so a Joiner-style overwrite of a
+        // previously-minted identity would silently retain the master
+        // and report `canBackUp: true` — violating the cert-only model.
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "stale-test-pp");
+        let dir = tempdir().unwrap();
+
+        // Step 1: persist a fresh mint WITH master_seed.
+        let MintResult {
+            state,
+            recovery_artifact,
+            device_signing_key,
+        } = mint_owner(1_700_000_500).unwrap();
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(recovery_artifact.as_bytes()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            dir.path().join("master_seed.enc").exists(),
+            "sanity: master_seed.enc written by initial save"
+        );
+
+        // Step 2: simulate the Joiner-style overwrite — same identity_dir,
+        // master_seed = None.
+        save_owner_state_atomic(dir.path(), &state, &device_signing_key, None, None).unwrap();
+
+        // The encrypted-file fallback MUST be gone; otherwise reload would
+        // happily resurrect it and lie about backup eligibility.
+        assert!(
+            !dir.path().join("master_seed.enc").exists(),
+            "master_seed.enc must be removed when save is called with None"
+        );
+
+        // Reload: master_seed must be None.
+        let loaded = load_owner_state(dir.path(), None)
+            .unwrap()
+            .expect("must be Some");
+        assert!(
+            loaded.master_seed.is_none(),
+            "loaded master_seed must be None after Joiner-style save"
         );
     }
 

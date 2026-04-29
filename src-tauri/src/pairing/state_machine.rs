@@ -201,6 +201,14 @@ struct SessionCtx {
     selected_peer_ed25519_verify: Option<[u8; 32]>,
     sent_select: bool,
     received_select: bool,
+    /// All peers that have published a SELECT addressed to our session_id.
+    /// Tracked per-peer so a multi-peer LAN race can't false-trigger
+    /// `received_select`: if peer B selects us while we have chosen peer A,
+    /// the SELECT from B lands here but does not flip the boolean. Once
+    /// the local user runs `SelectPeer` against a peer present in this list,
+    /// `received_select` becomes true and `maybe_advance_to_handshake`
+    /// uses the correct mutually-selected pubkey.
+    received_selects_from: Vec<Uuid>,
 
     // After Handshake:
     session_key: Option<[u8; 32]>,
@@ -235,6 +243,7 @@ impl SessionCtx {
             selected_peer_ed25519_verify: None,
             sent_select: false,
             received_select: false,
+            received_selects_from: Vec::new(),
             session_key: None,
             sas_digits: None,
             our_confirmed: false,
@@ -382,7 +391,14 @@ async fn on_select_peer(
         })
         .await;
 
-    // If we've already received the peer's SELECT, transition to Handshaking.
+    // If we previously saw the SELECT-of-us from THIS specific peer (the one
+    // we just chose), set the mutual-selection flag. Per-peer matching is
+    // load-bearing: a SELECT from a different LAN peer (e.g. B) that already
+    // landed in `received_selects_from` does NOT count toward A — otherwise we
+    // would derive SAS using A's pubkey while only B has actually selected us.
+    if ctx.received_selects_from.contains(&peer_session_id) {
+        ctx.received_select = true;
+    }
     maybe_advance_to_handshake(state_tx, ctx);
 }
 
@@ -392,7 +408,18 @@ fn maybe_advance_to_handshake(state_tx: &watch::Sender<PairingState>, ctx: &mut 
             .selected_peer_pubkey
             .as_ref()
             .expect("peer pubkey set on select");
-        let derivation = derive_sas(&ctx.eph_sk, peer_pk);
+        // `derive_sas` Errs on a low-order peer pubkey (non-contributory ECDH).
+        // Surface as Failed — never derive a key from a publicly-known shared
+        // secret.
+        let derivation = match derive_sas(&ctx.eph_sk, peer_pk) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("derive sas: {e}"),
+                });
+                return;
+            }
+        };
         ctx.session_key = Some(derivation.session_key);
         ctx.sas_digits = Some(derivation.sas_digits.clone());
         let _ = state_tx.send(PairingState::Handshaking {
@@ -656,10 +683,21 @@ async fn handle_wire_message(
             {
                 return;
             }
-            // Track that the peer has selected us. We might see this BEFORE we
-            // have selected them locally; in that case we wait for the local
-            // user's tap. `maybe_advance_to_handshake` enforces both sides.
-            c.received_select = true;
+            // Record the SELECT per-peer. The mutual-selection flag
+            // (`received_select`) is only flipped if this peer is the one we
+            // chose ourselves; without that gate, a multi-peer LAN race —
+            // peer B selects us while we selected peer A — would prematurely
+            // flip the flag and `maybe_advance_to_handshake` would derive the
+            // SAS using A's pubkey while only B has actually selected us.
+            //
+            // De-dup defensively in case a peer re-emits SELECT (network
+            // retries / re-runs of their wizard).
+            if !c.received_selects_from.contains(&my_session_id) {
+                c.received_selects_from.push(my_session_id);
+            }
+            if c.selected_peer_session_id == Some(my_session_id) {
+                c.received_select = true;
+            }
             maybe_advance_to_handshake(state_tx, c);
         }
         PairingWireMessage::Encrypted {
@@ -1021,6 +1059,176 @@ mod tests {
             .owner_state
             .enrollments
             .contains_key(&original_inviter_device_id));
+    }
+
+    /// Multi-peer LAN race regression (PR #63 review): a SELECT addressed to
+    /// us from a peer we did NOT select must NOT flip `received_select` and
+    /// advance to Handshaking. The bug let peer B's SELECT count toward our
+    /// having-chosen-A state, producing a SAS derived from A's pubkey while
+    /// only B had mutually selected us.
+    ///
+    /// We model this with a one-way "scripted" transport: we drive the SM
+    /// from outside by injecting wire messages directly, so we can simulate
+    /// two distinct peers without spawning two more state machines.
+    #[tokio::test]
+    async fn select_from_unchosen_peer_does_not_advance() {
+        use crate::pairing::transport::PairingTransport;
+        use crate::pairing::types::PairingWireMessage;
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Mutex as AsyncMutex;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
+
+        struct ScriptedTransport {
+            publish_tx: mpsc::Sender<PairingWireMessage>,
+            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
+            published: StdMutex<Vec<PairingWireMessage>>,
+        }
+        #[async_trait]
+        impl PairingTransport for ScriptedTransport {
+            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                self.published.lock().unwrap().push(message.clone());
+                let _ = self.publish_tx.send(message).await;
+                Ok(())
+            }
+            async fn recv(&self) -> Option<PairingWireMessage> {
+                self.recv_rx.lock().await.recv().await
+            }
+        }
+
+        let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
+        // out_tx is the SM's publish sink; we don't actually consume from
+        // out_rx — `published` captures the messages directly.
+        let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
+        let transport = Arc::new(ScriptedTransport {
+            publish_tx: out_tx,
+            recv_rx: AsyncMutex::new(in_rx),
+            published: StdMutex::new(Vec::new()),
+        });
+
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+
+        let inviter_handle = spawn_state_machine(transport.clone(), fixed_clock(1_700_000_001));
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "krile".to_string(),
+                owner_state: state,
+                master_seed,
+            })
+            .await
+            .unwrap();
+
+        // Wait for our DISCOVER to be published, then read our session_id
+        // out of it.
+        let our_session_id = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(PairingWireMessage::Discover { session_id, .. }) =
+                    transport.published.lock().unwrap().first().cloned()
+                {
+                    return session_id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("inviter publishes its DISCOVER within 2s");
+
+        // Inject DISCOVER from two distinct Joiner peers.
+        let peer_a_session = Uuid::new_v4();
+        let peer_b_session = Uuid::new_v4();
+        let peer_a_x_sk = X25519Sec::random_from_rng(rand::rngs::OsRng);
+        let peer_b_x_sk = X25519Sec::random_from_rng(rand::rngs::OsRng);
+        let peer_a_x_pk = X25519Pub::from(&peer_a_x_sk);
+        let peer_b_x_pk = X25519Pub::from(&peer_b_x_sk);
+        let peer_a_ed = SigningKey::generate(&mut OsRng);
+        let peer_b_ed = SigningKey::generate(&mut OsRng);
+
+        in_tx
+            .send(PairingWireMessage::Discover {
+                session_id: peer_a_session,
+                role: PairingRole::Joiner,
+                ephemeral_pubkey_hex: hex::encode(peer_a_x_pk.as_bytes()),
+                display_name: "alpha".to_string(),
+                owner_id_if_inviter: None,
+                joiner_ed25519_verify_hex: Some(hex::encode(peer_a_ed.verifying_key().to_bytes())),
+            })
+            .await
+            .unwrap();
+        in_tx
+            .send(PairingWireMessage::Discover {
+                session_id: peer_b_session,
+                role: PairingRole::Joiner,
+                ephemeral_pubkey_hex: hex::encode(peer_b_x_pk.as_bytes()),
+                display_name: "bravo".to_string(),
+                owner_id_if_inviter: None,
+                joiner_ed25519_verify_hex: Some(hex::encode(peer_b_ed.verifying_key().to_bytes())),
+            })
+            .await
+            .unwrap();
+
+        // Wait for both peers in our discovered list.
+        let mut state_rx = inviter_handle.state_rx.clone();
+        timeout(Duration::from_secs(2), async {
+            state_rx
+                .wait_for(|s| matches!(s, PairingState::Discovered { peers } if peers.len() == 2))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("both peers visible within 2s");
+
+        // SELECT peer A locally.
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::SelectPeer {
+                peer_session_id: peer_a_session,
+            })
+            .await
+            .unwrap();
+        // Let the SM process the cmd.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // BUG SCENARIO: peer B sends SELECT addressed to us, but we chose A.
+        in_tx
+            .send(PairingWireMessage::Select {
+                my_session_id: peer_b_session,
+                peer_session_id: our_session_id,
+            })
+            .await
+            .unwrap();
+
+        // Give the SM enough time that, with the bug, it would have advanced
+        // to Handshaking.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let observed = inviter_handle.state_rx.borrow().clone();
+        assert!(
+            !matches!(observed, PairingState::Handshaking { .. }),
+            "must NOT advance to Handshaking from peer B's SELECT — we chose A; got: {observed:?}"
+        );
+
+        // Sanity: peer A's SELECT (the legitimate one) MUST advance us.
+        in_tx
+            .send(PairingWireMessage::Select {
+                my_session_id: peer_a_session,
+                peer_session_id: our_session_id,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            state_rx
+                .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("must advance once peer A (chosen) selects us");
     }
 
     /// Regression test for Fix 2: when the remote peer sends Cancel, the

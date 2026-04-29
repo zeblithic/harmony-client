@@ -13,8 +13,23 @@ pub struct SasDerivation {
 ///
 /// Both sides MUST pass the same role-symmetric inputs (i.e., the function
 /// is symmetric: `derive(a_sk, b_pk) == derive(b_sk, a_pk)`).
-pub fn derive_sas(local_sk: &StaticSecret, peer_pk: &PublicKey) -> SasDerivation {
+///
+/// Returns `Err` if the peer pubkey is a low-order point (the resulting
+/// shared secret would be all-zero, which both sides would derive the same
+/// publicly-known session_key from — letting an active attacker decrypt
+/// CONFIRM/ENROLL traffic and forge an ENROLL the Joiner installs). The
+/// caller MUST surface this as a hard pairing failure (Failed state) and
+/// not fall back to a derived key.
+pub fn derive_sas(local_sk: &StaticSecret, peer_pk: &PublicKey) -> Result<SasDerivation, String> {
     let shared = local_sk.diffie_hellman(peer_pk);
+    // Constant-time check that the peer's pubkey is non-low-order. If a peer
+    // sends a low-order point (e.g. order 1, 2, 4, 8) the shared secret is in
+    // a small public set; HKDF over a public input gives a public session key
+    // — a complete handshake compromise. `was_contributory` is the
+    // x25519-dalek 2.x API for this check (see crate docs).
+    if !shared.was_contributory() {
+        return Err("peer X25519 pubkey is low-order; refusing to derive session key".to_string());
+    }
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
 
     let mut session_key = [0u8; 32];
@@ -28,10 +43,10 @@ pub fn derive_sas(local_sk: &StaticSecret, peer_pk: &PublicKey) -> SasDerivation
     let sas_int = u32::from_be_bytes(sas_bytes) % 1_000_000;
     let sas_digits = format!("{:06}", sas_int);
 
-    SasDerivation {
+    Ok(SasDerivation {
         session_key,
         sas_digits,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -46,8 +61,8 @@ mod tests {
         let a_pk = PublicKey::from(&a_sk);
         let b_pk = PublicKey::from(&b_sk);
 
-        let from_a = derive_sas(&a_sk, &b_pk);
-        let from_b = derive_sas(&b_sk, &a_pk);
+        let from_a = derive_sas(&a_sk, &b_pk).unwrap();
+        let from_b = derive_sas(&b_sk, &a_pk).unwrap();
 
         assert_eq!(from_a.session_key, from_b.session_key);
         assert_eq!(from_a.sas_digits, from_b.sas_digits);
@@ -57,8 +72,8 @@ mod tests {
     fn sas_is_deterministic() {
         // Same inputs always produce the same outputs.
         let b_pk = PublicKey::from(&StaticSecret::from([42u8; 32]));
-        let r1 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk);
-        let r2 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk);
+        let r1 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk).unwrap();
+        let r2 = derive_sas(&StaticSecret::from([7u8; 32]), &b_pk).unwrap();
         assert_eq!(r1.session_key, r2.session_key);
         assert_eq!(r1.sas_digits, r2.sas_digits);
     }
@@ -71,8 +86,8 @@ mod tests {
         let mitm_sk = StaticSecret::random_from_rng(OsRng);
         let mitm_pk = PublicKey::from(&mitm_sk);
 
-        let a_view = derive_sas(&a_sk, &mitm_pk); // A thinks it's talking to mitm_pk
-        let b_view = derive_sas(&b_sk, &mitm_pk); // B same
+        let a_view = derive_sas(&a_sk, &mitm_pk).unwrap(); // A thinks it's talking to mitm_pk
+        let b_view = derive_sas(&b_sk, &mitm_pk).unwrap(); // B same
 
         // The user looking at both screens sees DIFFERENT 6-digit codes
         // and clicks "no don't match" → MitM detected.
@@ -82,11 +97,32 @@ mod tests {
     #[test]
     fn sas_digits_format() {
         // Always exactly 6 ASCII digits, even when the int is < 100000.
-        let a_sk = StaticSecret::from([0u8; 32]);
-        let b_sk = StaticSecret::from([0u8; 32]);
+        // Use a real (non-low-order) keypair on both sides so we don't trip
+        // the contributory-check Err path.
+        let a_sk = StaticSecret::from([1u8; 32]);
+        let b_sk = StaticSecret::from([2u8; 32]);
         let b_pk = PublicKey::from(&b_sk);
-        let result = derive_sas(&a_sk, &b_pk);
+        let result = derive_sas(&a_sk, &b_pk).unwrap();
         assert_eq!(result.sas_digits.len(), 6);
         assert!(result.sas_digits.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// Security regression (PR #63): a peer that sends a low-order X25519
+    /// pubkey (here, the all-zero point of order 1) produces a non-
+    /// contributory shared secret. Without rejection, both sides would
+    /// derive the same publicly-known session_key — a complete handshake
+    /// compromise. `derive_sas` MUST return Err.
+    #[test]
+    fn sas_rejects_low_order_pubkey() {
+        let a_sk = StaticSecret::random_from_rng(OsRng);
+        // The all-zero point is order 1 → low-order. Other low-order points
+        // exist (RFC 7748 lists 7); the all-zero one is the simplest to
+        // construct and is sufficient to exercise the rejection path.
+        let low_order_pk = PublicKey::from([0u8; 32]);
+        let err = derive_sas(&a_sk, &low_order_pk).expect_err("must reject low-order");
+        assert!(
+            err.contains("low-order"),
+            "expected low-order rejection, got: {err}"
+        );
     }
 }
