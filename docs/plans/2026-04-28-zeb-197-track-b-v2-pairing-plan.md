@@ -252,16 +252,18 @@ mod tests {
             display_name: "AVALON".to_string(),
             owner_id_if_inviter: None,
         };
-        let bytes = serde_cbor::to_vec(&m).unwrap();
-        let back: PairingWireMessage = serde_cbor::from_slice(&bytes).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&m, &mut bytes).unwrap();
+        let back: PairingWireMessage = ciborium::from_reader(bytes.as_slice()).unwrap();
         assert!(matches!(back, PairingWireMessage::Discover { .. }));
     }
 
     #[test]
     fn encrypted_payload_roundtrips() {
         let p = EncryptedPayload::Confirm { sas_digits: "012845".to_string() };
-        let bytes = serde_cbor::to_vec(&p).unwrap();
-        let back: EncryptedPayload = serde_cbor::from_slice(&bytes).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&p, &mut bytes).unwrap();
+        let back: EncryptedPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
         match back {
             EncryptedPayload::Confirm { sas_digits } => assert_eq!(sas_digits, "012845"),
             _ => panic!("wrong variant"),
@@ -1254,7 +1256,7 @@ async fn on_confirm_sas(
 
     // Encrypt + publish CONFIRM.
     let payload = EncryptedPayload::Confirm { sas_digits: sas_digits.clone() };
-    let pt = serde_cbor::to_vec(&payload).expect("CBOR encode cannot fail");
+    let pt = { let mut b = Vec::new(); ciborium::into_writer(&payload, &mut b).expect("CBOR encode cannot fail"); b };
     let (nonce, ct) = match session_encrypt(&session_key, &pt) {
         Ok(p) => p,
         Err(e) => {
@@ -1336,14 +1338,14 @@ async fn maybe_advance_to_enroll(
         return;
     }
 
-    let cert_cbor = serde_cbor::to_vec(&cert).expect("cert serializable");
-    let state_cbor = serde_cbor::to_vec(&owner_state).expect("state serializable");
+    let cert_cbor = { let mut b = Vec::new(); ciborium::into_writer(&cert, &mut b).expect("cert serializable"); b };
+    let state_cbor = { let mut b = Vec::new(); ciborium::into_writer(&owner_state, &mut b).expect("state serializable"); b };
     let payload = EncryptedPayload::Enroll {
         enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
         owner_state_cbor_hex: hex::encode(&state_cbor),
         joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
     };
-    let pt = serde_cbor::to_vec(&payload).expect("payload serializable");
+    let pt = { let mut b = Vec::new(); ciborium::into_writer(&payload, &mut b).expect("payload serializable"); b };
     let session_key = ctx.session_key.expect("session key after handshake");
     let (nonce, ct) = match session_encrypt(&session_key, &pt) {
         Ok(p) => p,
@@ -1439,7 +1441,7 @@ async fn handle_wire_message(
                     return;
                 }
             };
-            let payload: EncryptedPayload = match serde_cbor::from_slice(&pt) {
+            let payload: EncryptedPayload = match ciborium::from_reader(&pt.as_slice()) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed { reason: format!("payload decode: {e}") });
@@ -1508,11 +1510,11 @@ async fn on_encrypted_payload(
                 Ok(b) => b,
                 Err(e) => { let _ = state_tx.send(PairingState::Failed { reason: format!("state hex: {e}") }); return; }
             };
-            let cert: harmony_owner::certs::EnrollmentCert = match serde_cbor::from_slice(&cert_bytes) {
+            let cert: harmony_owner::certs::EnrollmentCert = match ciborium::from_reader(&cert_bytes.as_slice()) {
                 Ok(c) => c,
                 Err(e) => { let _ = state_tx.send(PairingState::Failed { reason: format!("cert decode: {e}") }); return; }
             };
-            let owner_state: OwnerState = match serde_cbor::from_slice(&state_bytes) {
+            let owner_state: OwnerState = match ciborium::from_reader(&state_bytes.as_slice()) {
                 Ok(s) => s,
                 Err(e) => { let _ = state_tx.send(PairingState::Failed { reason: format!("state decode: {e}") }); return; }
             };
@@ -1926,7 +1928,8 @@ fn key_for(message: &PairingWireMessage) -> String {
 impl PairingTransport for ZenohPairingTransport {
     async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
         let key = key_for(&message);
-        let payload = serde_cbor::to_vec(&message).map_err(|e| format!("cbor: {e}"))?;
+        let mut payload = Vec::new();
+        ciborium::into_writer(&message, &mut payload).map_err(|e| format!("cbor: {e}"))?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.publish_tx
             .send(crate::event_loop::PublishRequest {
@@ -1979,7 +1982,7 @@ In the `ZenohEvent::Subscription { key, payload, .. }` match arm (search for the
 ```rust
 if key.starts_with("harmony/pairing/v2/lan/") {
     if let Some(tx) = pairing_in_tx.as_ref() {
-        if let Ok(msg) = serde_cbor::from_slice::<crate::pairing::types::PairingWireMessage>(&payload) {
+        if let Ok(msg) = ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(&payload.as_slice()) {
             let _ = tx.send(msg).await;
         } else {
             tracing::warn!("invalid pairing wire message on key {key}");
@@ -3073,7 +3076,8 @@ async fn end_to_end_pair_two_devices() {
     let inviter_msgs = inviter_captured.lock().unwrap().clone();
     let joiner_msgs = joiner_captured.lock().unwrap().clone();
     for msg in inviter_msgs.iter().chain(joiner_msgs.iter()) {
-        let bytes = serde_cbor::to_vec(msg).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(msg, &mut bytes).unwrap();
         assert!(
             !bytes.windows(32).any(|w| w == master_seed_bytes),
             "master_seed leaked in {msg:?}"
