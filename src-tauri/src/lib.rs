@@ -165,6 +165,10 @@ pub struct NodeState {
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+    /// ZEB-197 v2 pairing state-machine handle. `Some` while the node is
+    /// running; the inner task drives the abstract pairing state machine
+    /// against a `ZenohPairingTransport` bound to the running event loop.
+    pairing_handle: Option<crate::pairing::state_machine::PairingHandle>,
 }
 
 impl NodeState {
@@ -198,6 +202,7 @@ impl Default for NodeState {
             )),
             generation: 0,
             node_addr: String::new(),
+            pairing_handle: None,
         }
     }
 }
@@ -357,6 +362,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _follow_mgr,
         _followed_set,
         _mail_sync,
+        pairing_handle,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -385,10 +391,17 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             // already gone above; the MailSync handle would just yield
             // "channel closed" errors until next start.
             guard.mail_sync.take(),
+            guard.pairing_handle.take(),
         )
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
+    // Drop the pairing handle BEFORE the publish_tx so the state machine
+    // task observes its mpsc shutdown cleanly: the handle owns the JoinHandle
+    // for the SM task; once dropped, the task's transport.recv path exits
+    // when its owned receiver hits None. We then drop publish_tx, which
+    // closes the event-loop publish channel.
+    drop(pairing_handle);
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
@@ -431,6 +444,11 @@ async fn start_node(
     // mail-root queryable.
     let (mail_refresh_tx, mail_refresh_rx) =
         tokio::sync::mpsc::channel::<crate::mail_sync::RefreshRequest>(8);
+    // ZEB-197 pairing wire-message inbound channel. The event loop fills
+    // this from `harmony/pairing/v2/lan/**` Zenoh subscription samples;
+    // the ZenohPairingTransport (constructed after ready_rx) drains it.
+    let (pairing_in_tx, pairing_in_rx) =
+        tokio::sync::mpsc::channel::<crate::pairing::types::PairingWireMessage>(64);
 
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
@@ -475,7 +493,12 @@ async fn start_node(
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
+        let old_pairing_handle = guard.pairing_handle.take();
         drop(guard);
+        // Drop pairing_handle BEFORE publish_tx so the SM task's transport
+        // sees its receiver close after the publish channel is gone — same
+        // ordering as stop_inner.
+        drop(old_pairing_handle);
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
@@ -641,6 +664,7 @@ async fn start_node(
                         pin_intent,
                         fetch_completion_tx,
                         fetch_completion_rx,
+                        Some(pairing_in_tx),
                     )
                     .await;
                 });
@@ -669,6 +693,46 @@ async fn start_node(
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
         Ok(Ok(())) => {
+            // ZEB-197: spawn the pairing state machine now that the
+            // event loop is up. Construct ZenohPairingTransport with
+            // a clone of publish_tx (publishes go through the running
+            // event loop) and the receiver half of pairing_in. Stash
+            // the handle on NodeState so stop_node can drop it.
+            let install_pairing = {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                if guard.generation != our_gen {
+                    // A newer start_node has raced us; do not install.
+                    None
+                } else {
+                    guard.publish_tx.as_ref().cloned()
+                }
+            };
+            if let Some(publish_tx_clone) = install_pairing {
+                let pairing_transport: std::sync::Arc<
+                    dyn crate::pairing::transport::PairingTransport,
+                > = std::sync::Arc::new(
+                    crate::pairing::zenoh_transport::ZenohPairingTransport::new(
+                        publish_tx_clone,
+                        pairing_in_rx,
+                    ),
+                );
+                let pairing_handle = crate::pairing::state_machine::spawn_state_machine(
+                    pairing_transport,
+                    std::sync::Arc::new(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    }),
+                );
+                if let Ok(mut guard) = state.lock() {
+                    if guard.generation == our_gen {
+                        guard.pairing_handle = Some(pairing_handle);
+                    }
+                    // else: a newer start_node has replaced us; drop the
+                    // freshly spawned handle by letting it fall out of scope.
+                }
+            }
             let _ = app.emit(
                 "zenoh-status",
                 &ZenohStatus {

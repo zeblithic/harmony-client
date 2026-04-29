@@ -135,6 +135,7 @@ pub async fn run<R: Runtime>(
     mut pin_intent: std::collections::HashSet<[u8; 32]>,
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
     mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
+    pairing_in_tx: Option<mpsc::Sender<crate::pairing::types::PairingWireMessage>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -291,6 +292,25 @@ pub async fn run<R: Runtime>(
     dispatch_action(
         RuntimeAction::Subscribe {
             key_expr: "harmony/announce/*".to_string(),
+        },
+        &session,
+        &zenoh_tx,
+        &udp,
+        &broadcast_addr,
+        &app,
+        &closing,
+        &own_zid,
+    )
+    .await;
+
+    // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing).
+    // Always-on receive: idle devices subscribe but the pairing state
+    // machine only acts on inbound messages when a session is active.
+    // The publish side is opt-in (DISCOVER only flows after StartInviter
+    // or StartJoiner), so this satisfies the "no idle broadcasting" spec.
+    dispatch_action(
+        RuntimeAction::Subscribe {
+            key_expr: "harmony/pairing/v2/lan/**".to_string(),
         },
         &session,
         &zenoh_tx,
@@ -480,6 +500,20 @@ pub async fn run<R: Runtime>(
                         });
                     }
                     ZenohEvent::Subscription { key_expr, payload, source_zid } => {
+                        // Pairing keys are routed to the pairing state machine
+                        // (when present) and NOT forwarded to mail/vines/channels
+                        // handlers. Pairing samples don't need to drive the
+                        // runtime tick, so we `continue` the outer loop to skip
+                        // `should_tick` for these.
+                        if key_expr.starts_with("harmony/pairing/v2/lan/") {
+                            if let Some(tx) = pairing_in_tx.as_ref() {
+                                match ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(payload.as_slice()) {
+                                    Ok(msg) => { let _ = tx.send(msg).await; }
+                                    Err(e) => tracing::warn!("invalid pairing wire message on key {key_expr}: {e}"),
+                                }
+                            }
+                            continue;
+                        }
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });

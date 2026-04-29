@@ -243,6 +243,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
+                    None,
                 )
                 .await;
             });
