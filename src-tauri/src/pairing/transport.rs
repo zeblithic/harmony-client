@@ -29,6 +29,8 @@ pub struct InMemoryTransport {
 
 impl InMemoryBroker {
     pub fn pair() -> (InMemoryTransport, InMemoryTransport) {
+        // Channel capacity 64 is generous for the test scenario (a happy path
+        // involves <10 messages); the real Zenoh transport has no fixed buffer.
         let (a_tx, a_rx) = mpsc::channel(64);
         let (b_tx, b_rx) = mpsc::channel(64);
         let side_a = InMemoryTransport {
@@ -82,9 +84,10 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         // Confirm A didn't echo back to itself.
-        tokio::select! {
-            r = a.recv() => panic!("A should not receive its own message: {:?}", r),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        match tokio::time::timeout(std::time::Duration::from_millis(1), a.recv()).await {
+            Ok(Some(msg)) => panic!("A should not receive its own message: {:?}", msg),
+            Ok(None) => panic!("A's transport closed unexpectedly"),
+            Err(_) => {} // expected: timed out, no echo
         }
     }
 }
