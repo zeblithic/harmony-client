@@ -763,16 +763,33 @@ async fn start_node(
                 // Receivers are taken out of the handle (mpsc receivers are
                 // single-consumer, not Clone like watch::Receiver). The
                 // drainer task owns each receiver until the SM shuts down.
+                // ZEB-199: install_*_state acquires OWNER_STATE_WRITE_LOCK
+                // (a std::sync::Mutex). Awaiting the persist call directly on
+                // the runtime would block the executor thread for the full
+                // load+merge+save window — measured at ~5-50ms per pair, but
+                // longer under contention with mint or other persist callers.
+                // Run the sync work on the dedicated blocking pool via
+                // spawn_blocking so the runtime stays responsive (zenoh sync,
+                // IPC, UI events). Mirrors the run_blocking pattern used by
+                // mint in owner_commands.rs.
                 if let Some(mut rx) = pairing_handle.joiner_result_rx.take() {
                     let id_dir = identity_dir.clone();
                     tokio::spawn(async move {
                         while let Some(result) = rx.recv().await {
-                            match crate::pairing::persist::install_joiner_state(&id_dir, result) {
-                                Ok(()) => {
+                            let id_dir = id_dir.clone();
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                crate::pairing::persist::install_joiner_state(&id_dir, result)
+                            })
+                            .await;
+                            match outcome {
+                                Ok(Ok(())) => {
                                     tracing::info!("joiner pairing persisted successfully");
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::error!("failed to persist joiner pairing result: {e}");
+                                }
+                                Err(e) => {
+                                    tracing::error!("joiner persist task join failed: {e}");
                                 }
                             }
                         }
@@ -782,14 +799,22 @@ async fn start_node(
                     let id_dir = identity_dir.clone();
                     tokio::spawn(async move {
                         while let Some(result) = rx.recv().await {
-                            match crate::pairing::persist::install_inviter_state(&id_dir, result) {
-                                Ok(()) => {
+                            let id_dir = id_dir.clone();
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                crate::pairing::persist::install_inviter_state(&id_dir, result)
+                            })
+                            .await;
+                            match outcome {
+                                Ok(Ok(())) => {
                                     tracing::info!("inviter pairing persisted successfully");
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::error!(
                                         "failed to persist inviter pairing result: {e}"
                                     );
+                                }
+                                Err(e) => {
+                                    tracing::error!("inviter persist task join failed: {e}");
                                 }
                             }
                         }

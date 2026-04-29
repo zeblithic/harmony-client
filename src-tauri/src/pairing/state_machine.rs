@@ -6,6 +6,7 @@ use crate::pairing::types::{
     DiscoveredPeer, EncryptedPayload, PairingRole, PairingState, PairingWireMessage,
 };
 use ed25519_dalek::SigningKey;
+use harmony_owner::certs::EnrollmentCert;
 use harmony_owner::pubkey_bundle::PubKeyBundle;
 use harmony_owner::state::OwnerState;
 use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
@@ -52,16 +53,30 @@ pub struct JoinerEnrollResult {
 }
 
 /// Output from the state machine for the Inviter side, when enrollment of a
-/// new peer device succeeds. The persistence layer consumes this to write
-/// the freshly-mutated `OwnerState` to disk so the new enrollment survives
-/// restarts. Unlike the Joiner result, this carries no signing key — the
-/// Inviter already has its own signing key persisted on disk; the persistence
-/// layer reloads it via `load_owner_state` and rewrites the state file
-/// atomically alongside the existing key.
+/// new peer device succeeds. The persistence layer consumes this to merge
+/// the new enrollment into the freshest on-disk `OwnerState` and write back
+/// to disk so the new enrollment survives restarts. Unlike the Joiner
+/// result, this carries no signing key — the Inviter already has its own
+/// signing key persisted on disk; the persistence layer reloads it via
+/// `load_owner_state` and rewrites the state file atomically alongside the
+/// existing key.
+///
+/// ZEB-199: this carries the signed cert + the timestamp the SM used at
+/// signing time, NOT the SM's mutated `OwnerState`. The persist layer
+/// (`install_inviter_state_inner`) re-applies the cert against the freshly-
+/// loaded disk state under `OWNER_STATE_WRITE_LOCK`. Doing so on a snapshot
+/// the SM produced earlier would silently drop any other enrollment that
+/// landed on disk between the SM's snapshot and our write — see ZEB-199 for
+/// the corresponding test that pins this invariant.
 pub struct InviterEnrollResult {
-    pub owner_state: OwnerState,
-    /// The master seed — Inviter HAS this (cert-only model only restricts the
-    /// Joiner). Persisting it via `Some(seed)` keeps `canBackUp: true`.
+    /// The freshly-signed enrollment cert for the new peer device.
+    pub cert: EnrollmentCert,
+    /// Timestamp (unix seconds) the SM used when signing the cert. Reused
+    /// at persist time so `add_enrollment`'s active-window calculation is
+    /// consistent with the cert's `issued_at`.
+    pub now: u64,
+    /// The master seed — Inviter HAS this (cert-only model only restricts
+    /// the Joiner). Persisting it via `Some(seed)` keeps `canBackUp: true`.
     pub master_seed: Zeroizing<[u8; 32]>,
 }
 
@@ -741,14 +756,11 @@ async fn maybe_advance_to_enroll(
         return;
     }
 
-    // Publish succeeded → commit prospective state into ctx.
-    ctx.owner_state = Some(prospective_state.clone());
-    ctx.cert_sent = true;
-
     // Emit the InviterEnrollResult so the persistence layer (drained in
-    // start_node) can write the freshly-mutated OwnerState back to disk.
-    // Without this, the new enrollment lives only in RAM and the Inviter's
-    // DevicesPanel reverts to showing only itself on next start_node.
+    // start_node) can merge the new enrollment into the freshest on-disk
+    // OwnerState. Without this, the new enrollment lives only in RAM and
+    // the Inviter's DevicesPanel reverts to showing only itself on next
+    // start_node.
     //
     // PR #63 review: a closed channel here means the drainer task is gone
     // (start_node teardown, identity_dir resolution failure, etc). If we
@@ -756,9 +768,24 @@ async fn maybe_advance_to_enroll(
     // pairing succeeded but the on-disk state would never update — the
     // new enrollment would silently disappear on next launch. Surface as
     // Failed instead.
+    //
+    // ZEB-199: send the cert + signing-time `now`, NOT the mutated
+    // owner_state. The persist layer applies the cert to the freshest
+    // disk state under OWNER_STATE_WRITE_LOCK so a concurrent writer
+    // (mint, future parallel pair flows) cannot silently lose this
+    // enrollment by overwriting with a stale snapshot.
+    //
+    // PR #65 review: the local commit (ctx.owner_state / cert_sent)
+    // happens AFTER this send so a closed-channel failure doesn't leave
+    // the session locally committed against a persistence handoff that
+    // never landed. If a late peer-CONFIRM arrives in that window, the
+    // Joiner's ENROLL idempotency guard
+    // (`our_signing_key.is_none()` sentinel) absorbs the duplicate
+    // ENROLL re-publish.
     if let Err(e) = inviter_result_tx
         .send(InviterEnrollResult {
-            owner_state: prospective_state,
+            cert,
+            now,
             master_seed: master_seed.clone(),
         })
         .await
@@ -768,6 +795,12 @@ async fn maybe_advance_to_enroll(
         });
         return;
     }
+
+    // Persistence handoff accepted → commit prospective state into ctx.
+    // This must come AFTER the send so a failed handoff doesn't leave the
+    // local session committed (see comment above).
+    ctx.owner_state = Some(prospective_state);
+    ctx.cert_sent = true;
 
     let device_id = joiner_pubkey.identity_hash();
     let _ = state_tx.send(PairingState::Complete {
