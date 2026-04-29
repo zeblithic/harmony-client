@@ -1124,15 +1124,39 @@ async fn on_encrypted_payload(
 mod tests {
     use super::*;
     use crate::pairing::transport::InMemoryBroker;
+    use async_trait::async_trait;
     use ed25519_dalek::SigningKey;
     use harmony_owner::lifecycle::{mint_owner, MintResult};
     use rand::rngs::OsRng;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+    use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::timeout;
     use zeroize::Zeroizing;
 
     fn fixed_clock(t: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(move || t)
+    }
+
+    /// Test transport that lets the test inject inbound wire messages
+    /// (via `publish_tx` outside) and capture every outbound publish (via
+    /// `published`). Used in tests where the SM needs to run against a
+    /// scripted peer rather than another live SM.
+    struct ScriptedTransport {
+        publish_tx: mpsc::Sender<PairingWireMessage>,
+        recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
+        published: StdMutex<Vec<PairingWireMessage>>,
+    }
+    #[async_trait]
+    impl PairingTransport for ScriptedTransport {
+        async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+            self.published.lock().unwrap().push(message.clone());
+            let _ = self.publish_tx.send(message).await;
+            Ok(())
+        }
+        async fn recv(&self) -> Option<PairingWireMessage> {
+            self.recv_rx.lock().await.recv().await
+        }
     }
 
     #[tokio::test]
@@ -1310,29 +1334,7 @@ mod tests {
     /// two distinct peers without spawning two more state machines.
     #[tokio::test]
     async fn select_from_unchosen_peer_does_not_advance() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         // out_tx is the SM's publish sink; we don't actually consume from
@@ -1593,29 +1595,7 @@ mod tests {
     /// only be pruned from our discovered list.
     #[tokio::test]
     async fn unselected_peer_cancel_only_prunes_discovered() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
@@ -1731,29 +1711,7 @@ mod tests {
     /// broadcast post-selection would mislead other LAN devices).
     #[tokio::test]
     async fn discover_is_rebroadcast_until_select() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(64);
@@ -1866,5 +1824,878 @@ mod tests {
              was {discover_count_at_select}, after another 500ms it's \
              {discover_count_after_select} — rebroadcast guard regressed?"
         );
+    }
+
+    /// ZEB-198: Cancel from every reachable phase must clean up ctx and
+    /// emit Idle. Today the Cancel handler is uniform (`run_state_machine`
+    /// at L166-176: clear ctx, send Idle, regardless of current state) — but
+    /// that uniformity is load-bearing for safety. This regression test
+    /// pins it down so any future per-phase Cancel logic is forced to
+    /// preserve the no-stale-ctx invariant.
+    ///
+    /// The "ctx is clean" check exploits the *only* observable side effect
+    /// that distinguishes Cancel-with-ctx from Cancel-without-ctx: at
+    /// L166-176 the handler publishes a wire `Cancel` only when
+    /// `ctx.is_some()`. We wrap the cancelled side's transport with
+    /// `CountCancelTransport`, snapshot the publish count, send a follow-up
+    /// no-op Cancel, and assert the count is unchanged. Asserting only
+    /// that the *state* stayed Idle is too weak — the SM emits Idle on
+    /// Cancel either way, even with stale ctx (per CodeRabbit/Qodo review
+    /// on PR #64).
+    #[tokio::test]
+    async fn state_machine_cancel_at_each_stage() {
+        use crate::pairing::transport::PairingTransport;
+        use crate::pairing::types::PairingWireMessage;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountCancelTransport {
+            inner: Arc<dyn PairingTransport>,
+            cancel_count: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl PairingTransport for CountCancelTransport {
+            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                if matches!(message, PairingWireMessage::Cancel { .. }) {
+                    self.cancel_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.publish(message).await
+            }
+            async fn recv(&self) -> Option<PairingWireMessage> {
+                self.inner.recv().await
+            }
+        }
+
+        async fn assert_idle_and_clean(
+            handle: &mut PairingHandle,
+            label: &str,
+            cancel_count: &AtomicUsize,
+        ) {
+            let mut rx = handle.state_rx.clone();
+            timeout(Duration::from_secs(2), async {
+                rx.wait_for(|s| matches!(s, PairingState::Idle))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("[{label}] SM did not reach Idle within 2s"));
+
+            // Snapshot AFTER first Cancel has settled. The first Cancel
+            // (ctx was Some) should already have bumped the count; the
+            // second Cancel (ctx is None) must NOT bump it again.
+            let count_before = cancel_count.load(Ordering::Relaxed);
+
+            handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            // Deterministic ack: Cancel handler at L175 unconditionally calls
+            // state_tx.send(Idle), even when ctx is None. tokio::watch bumps
+            // its version on every send (regardless of value equality), so
+            // rx.changed() fires once the SM has actually processed this
+            // command. After wait_for above marked the post-first-Cancel
+            // Idle as "seen", the next changed() blocks until the second
+            // send — proving the SM picked up our message before we sample.
+            timeout(Duration::from_secs(2), rx.changed())
+                .await
+                .unwrap_or_else(|_| panic!("[{label}] SM did not process second Cancel within 2s"))
+                .unwrap();
+
+            assert!(
+                matches!(*handle.state_rx.borrow(), PairingState::Idle),
+                "[{label}] no-op second Cancel must leave state Idle"
+            );
+            let count_after = cancel_count.load(Ordering::Relaxed);
+            assert_eq!(
+                count_before, count_after,
+                "[{label}] no-op second Cancel must NOT publish a wire \
+                 Cancel (ctx must already be None); was {count_before} \
+                 cancels, now {count_after} — stale-ctx regression?"
+            );
+        }
+
+        // Phase 1: Discovering. Start a solo Inviter — drop the joiner side
+        // of the broker pair so the SM never receives a peer DISCOVER and
+        // sits at Discovering until we Cancel.
+        {
+            let MintResult {
+                state,
+                recovery_artifact,
+                ..
+            } = mint_owner(1_700_000_000).unwrap();
+            let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+            // CRITICAL: bind the joiner side to a named keepalive — the
+            // underscore prefix silences "unused" but the variable is
+            // load-bearing. Dropping it closes the broker's joiner→inviter
+            // channel, which makes inviter.recv() return None and trips
+            // run_state_machine's `return` arm at L180, killing the SM
+            // before we can observe the cancel sequence below.
+            let (inviter_t, _joiner_broker_keepalive) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
+            let mut inviter = spawn_state_machine(
+                inviter_t_wrapped,
+                fixed_clock(1_700_000_001),
+                Duration::from_secs(60),
+            );
+            inviter
+                .cmd_tx
+                .send(PairingCommand::StartInviter {
+                    display_name: "krile".to_string(),
+                    owner_state: state,
+                    master_seed,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovering { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 1: reach Discovering");
+
+            inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            assert_idle_and_clean(&mut inviter, "Discovering", &cancel_count).await;
+        }
+
+        // Phase 2: Discovered. Pair two SMs; cancel the Inviter once it
+        // sees the Joiner.
+        {
+            let MintResult {
+                state,
+                recovery_artifact,
+                ..
+            } = mint_owner(1_700_000_000).unwrap();
+            let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+            let joiner_sk = SigningKey::generate(&mut OsRng);
+            let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
+            let mut inviter = spawn_state_machine(
+                inviter_t_wrapped,
+                fixed_clock(1_700_000_001),
+                Duration::from_secs(60),
+            );
+            let _joiner = spawn_state_machine(
+                Arc::new(joiner_t),
+                fixed_clock(1_700_000_002),
+                Duration::from_secs(60),
+            );
+            inviter
+                .cmd_tx
+                .send(PairingCommand::StartInviter {
+                    display_name: "krile".to_string(),
+                    owner_state: state,
+                    master_seed,
+                })
+                .await
+                .unwrap();
+            _joiner
+                .cmd_tx
+                .send(PairingCommand::StartJoiner {
+                    display_name: "avalon".to_string(),
+                    signing_key: joiner_sk,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 2: reach Discovered");
+
+            inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            assert_idle_and_clean(&mut inviter, "Discovered", &cancel_count).await;
+        }
+
+        // Phase 3: Handshaking. Drive both sides through SELECT so each
+        // derives the SAS, then cancel the Inviter.
+        {
+            let MintResult {
+                state,
+                recovery_artifact,
+                ..
+            } = mint_owner(1_700_000_000).unwrap();
+            let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+            let joiner_sk = SigningKey::generate(&mut OsRng);
+            let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
+            let mut inviter = spawn_state_machine(
+                inviter_t_wrapped,
+                fixed_clock(1_700_000_001),
+                Duration::from_secs(60),
+            );
+            let joiner = spawn_state_machine(
+                Arc::new(joiner_t),
+                fixed_clock(1_700_000_002),
+                Duration::from_secs(60),
+            );
+            inviter
+                .cmd_tx
+                .send(PairingCommand::StartInviter {
+                    display_name: "krile".to_string(),
+                    owner_state: state,
+                    master_seed,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::StartJoiner {
+                    display_name: "avalon".to_string(),
+                    signing_key: joiner_sk,
+                })
+                .await
+                .unwrap();
+
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+                joiner
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 3: both reach Discovered");
+
+            let inv_peer = match &*inviter.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!("inviter not Discovered"),
+            };
+            let joi_peer = match &*joiner.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!("joiner not Discovered"),
+            };
+            inviter
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: inv_peer,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: joi_peer,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 3: reach Handshaking");
+
+            inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            assert_idle_and_clean(&mut inviter, "Handshaking", &cancel_count).await;
+        }
+
+        // Phase 4: WaitingPeerConfirm. Drive both to Handshaking; only the
+        // Inviter ConfirmsSas, so it sits at WaitingPeerConfirm. Cancel
+        // from there.
+        {
+            let MintResult {
+                state,
+                recovery_artifact,
+                ..
+            } = mint_owner(1_700_000_000).unwrap();
+            let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+            let joiner_sk = SigningKey::generate(&mut OsRng);
+            let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
+            let mut inviter = spawn_state_machine(
+                inviter_t_wrapped,
+                fixed_clock(1_700_000_001),
+                Duration::from_secs(60),
+            );
+            let joiner = spawn_state_machine(
+                Arc::new(joiner_t),
+                fixed_clock(1_700_000_002),
+                Duration::from_secs(60),
+            );
+            inviter
+                .cmd_tx
+                .send(PairingCommand::StartInviter {
+                    display_name: "krile".to_string(),
+                    owner_state: state,
+                    master_seed,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::StartJoiner {
+                    display_name: "avalon".to_string(),
+                    signing_key: joiner_sk,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+                joiner
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 4: both reach Discovered");
+            let inv_peer = match &*inviter.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!(),
+            };
+            let joi_peer = match &*joiner.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!(),
+            };
+            inviter
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: inv_peer,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: joi_peer,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 4: inviter reaches Handshaking");
+
+            // Inviter alone confirms — Joiner remains at Handshaking, so
+            // the Inviter sits at WaitingPeerConfirm.
+            inviter
+                .cmd_tx
+                .send(PairingCommand::ConfirmSas)
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::WaitingPeerConfirm { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 4: inviter reaches WaitingPeerConfirm");
+
+            inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            assert_idle_and_clean(&mut inviter, "WaitingPeerConfirm", &cancel_count).await;
+        }
+
+        // Phase 5: Enrolling — cancel the JOINER from Enrolling.
+        //
+        // Pick the Joiner side because it sits stably at Enrolling waiting
+        // for ENROLL: the Inviter's "Enrolling" is transient (auto-advances
+        // to Complete the moment publish() returns Ok). To keep the Joiner
+        // at Enrolling deterministically we silently drop the Inviter's
+        // ENROLL — the second `Encrypted` payload it publishes (the first
+        // is CONFIRM, which must reach the Joiner so peer_confirmed flips).
+        {
+            struct DropNthEncryptedTransport {
+                inner: Arc<dyn PairingTransport>,
+                encrypted_count: Arc<AtomicUsize>,
+                drop_at: usize,
+            }
+            #[async_trait]
+            impl PairingTransport for DropNthEncryptedTransport {
+                async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                    if matches!(message, PairingWireMessage::Encrypted { .. }) {
+                        let n = self.encrypted_count.fetch_add(1, Ordering::Relaxed);
+                        if n == self.drop_at {
+                            // Silent drop: report success so the Inviter
+                            // commits + emits Complete normally; only the
+                            // Joiner side is starved of the wire message.
+                            return Ok(());
+                        }
+                    }
+                    self.inner.publish(message).await
+                }
+                async fn recv(&self) -> Option<PairingWireMessage> {
+                    self.inner.recv().await
+                }
+            }
+
+            let MintResult {
+                state,
+                recovery_artifact,
+                ..
+            } = mint_owner(1_700_000_000).unwrap();
+            let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+            let joiner_sk = SigningKey::generate(&mut OsRng);
+            let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let wrapped_inviter_t: Arc<dyn PairingTransport> =
+                Arc::new(DropNthEncryptedTransport {
+                    inner: Arc::new(inviter_t),
+                    encrypted_count: Arc::new(AtomicUsize::new(0)),
+                    drop_at: 1, // drop the SECOND Encrypted publish == ENROLL
+                });
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let joiner_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(joiner_t),
+                cancel_count: cancel_count.clone(),
+            });
+            let inviter = spawn_state_machine(
+                wrapped_inviter_t,
+                fixed_clock(1_700_000_001),
+                Duration::from_secs(60),
+            );
+            let mut joiner = spawn_state_machine(
+                joiner_t_wrapped,
+                fixed_clock(1_700_000_002),
+                Duration::from_secs(60),
+            );
+            inviter
+                .cmd_tx
+                .send(PairingCommand::StartInviter {
+                    display_name: "krile".to_string(),
+                    owner_state: state,
+                    master_seed,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::StartJoiner {
+                    display_name: "avalon".to_string(),
+                    signing_key: joiner_sk,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                inviter
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+                joiner
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 5: both reach Discovered");
+            let inv_peer = match &*inviter.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!(),
+            };
+            let joi_peer = match &*joiner.state_rx.borrow() {
+                PairingState::Discovered { peers } => peers[0].session_id,
+                _ => panic!(),
+            };
+            inviter
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: inv_peer,
+                })
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: joi_peer,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                joiner
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 5: joiner reaches Handshaking");
+
+            inviter
+                .cmd_tx
+                .send(PairingCommand::ConfirmSas)
+                .await
+                .unwrap();
+            joiner
+                .cmd_tx
+                .send(PairingCommand::ConfirmSas)
+                .await
+                .unwrap();
+            // Joiner reaches Enrolling once both confirms have processed.
+            // ENROLL never arrives (dropped), so this is stable.
+            timeout(Duration::from_secs(3), async {
+                joiner
+                    .state_rx
+                    .clone()
+                    .wait_for(|s| matches!(s, PairingState::Enrolling))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("Phase 5: joiner reaches Enrolling (and stays there)");
+
+            joiner.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            assert_idle_and_clean(&mut joiner, "Enrolling", &cancel_count).await;
+        }
+    }
+
+    /// ZEB-198: SAS-mismatch user flow (the MitM-detection path).
+    ///
+    /// In a real MitM, the attacker runs two separate ECDHs (one with each
+    /// real peer). Each real peer's `derive_sas` against the attacker's
+    /// pubkey yields a different shared secret, and therefore a different
+    /// 6-digit SAS. The user sees DIFFERENT digits on the two screens and
+    /// clicks "no don't match" — both sides Cancel and return to Idle.
+    ///
+    /// We simulate this by running two independent SMs, each driven via a
+    /// ScriptedTransport with a *different* fake peer X25519 pubkey. ECDH
+    /// is mathematically the same operation as in a real MitM:
+    ///   SM_A's session_key = ECDH(SM_A.eph_sk, fake_peer_A.pk)
+    ///   SM_B's session_key = ECDH(SM_B.eph_sk, fake_peer_B.pk)
+    /// With high probability these differ, so the SAS digits differ.
+    ///
+    /// `sas.rs::sas_differs_under_mitm` already proves the cryptographic
+    /// property; this test pins down the *state machine's* end-to-end UX:
+    /// reach Handshaking, observe the mismatch, Cancel-on-both-sides
+    /// returns both to Idle without leaving stale ctx.
+    #[tokio::test]
+    async fn sas_mismatch_path() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
+
+        // Drive a SM to Handshaking by injecting a fake peer (with a known
+        // X25519 secret so the test could derive the same session_key, though
+        // we don't need it here — we only need the SAS to be observable).
+        // Returns (handle, in_tx, sas_digits, transport). The transport is
+        // returned as `Arc<ScriptedTransport>` (not the trait object) so the
+        // caller can read `transport.published` to verify wire-publish side
+        // effects of subsequent commands.
+        async fn drive_to_handshaking(
+            role: PairingRole,
+            fake_x_sk: &X25519Sec,
+            clock_t: u64,
+        ) -> (
+            PairingHandle,
+            mpsc::Sender<PairingWireMessage>,
+            String,
+            Arc<ScriptedTransport>,
+        ) {
+            let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
+            let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
+            let transport = Arc::new(ScriptedTransport {
+                publish_tx: out_tx,
+                recv_rx: AsyncMutex::new(in_rx),
+                published: StdMutex::new(Vec::new()),
+            });
+
+            let handle = spawn_state_machine(
+                transport.clone(),
+                fixed_clock(clock_t),
+                Duration::from_secs(60),
+            );
+
+            // Start the SM in the requested role.
+            match role {
+                PairingRole::Inviter => {
+                    let MintResult {
+                        state,
+                        recovery_artifact,
+                        ..
+                    } = mint_owner(clock_t).unwrap();
+                    let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+                    handle
+                        .cmd_tx
+                        .send(PairingCommand::StartInviter {
+                            display_name: "krile".to_string(),
+                            owner_state: state,
+                            master_seed,
+                        })
+                        .await
+                        .unwrap();
+                }
+                PairingRole::Joiner => {
+                    let joiner_sk = SigningKey::generate(&mut OsRng);
+                    handle
+                        .cmd_tx
+                        .send(PairingCommand::StartJoiner {
+                            display_name: "avalon".to_string(),
+                            signing_key: joiner_sk,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            // Capture our session_id from the SM's own published DISCOVER.
+            let our_session_id = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(PairingWireMessage::Discover { session_id, .. }) =
+                        transport.published.lock().unwrap().first().cloned()
+                    {
+                        return session_id;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("SM publishes its DISCOVER within 2s");
+
+            // Inject a fake peer DISCOVER. The fake peer is the OPPOSITE role.
+            let fake_session = Uuid::new_v4();
+            let fake_x_pk = X25519Pub::from(fake_x_sk);
+            let fake_ed = SigningKey::generate(&mut OsRng);
+            let (fake_role, fake_owner_id_if_inviter, fake_joiner_ed25519_verify_hex) = match role {
+                PairingRole::Inviter => (
+                    PairingRole::Joiner,
+                    None,
+                    Some(hex::encode(fake_ed.verifying_key().to_bytes())),
+                ),
+                PairingRole::Joiner => {
+                    (PairingRole::Inviter, Some(hex::encode([0xABu8; 16])), None)
+                }
+            };
+            in_tx
+                .send(PairingWireMessage::Discover {
+                    session_id: fake_session,
+                    role: fake_role,
+                    ephemeral_pubkey_hex: hex::encode(fake_x_pk.as_bytes()),
+                    display_name: "fake-peer".to_string(),
+                    owner_id_if_inviter: fake_owner_id_if_inviter,
+                    joiner_ed25519_verify_hex: fake_joiner_ed25519_verify_hex,
+                })
+                .await
+                .unwrap();
+
+            // Wait for SM to observe the fake peer in Discovered.
+            let mut state_rx = handle.state_rx.clone();
+            timeout(Duration::from_secs(2), async {
+                state_rx
+                    .wait_for(
+                        |s| matches!(s, PairingState::Discovered { peers } if !peers.is_empty()),
+                    )
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("SM reaches Discovered with fake peer");
+
+            // SelectPeer + inject the matching fake SELECT to advance to
+            // Handshaking (which triggers SAS derivation).
+            handle
+                .cmd_tx
+                .send(PairingCommand::SelectPeer {
+                    peer_session_id: fake_session,
+                })
+                .await
+                .unwrap();
+            in_tx
+                .send(PairingWireMessage::Select {
+                    my_session_id: fake_session,
+                    peer_session_id: our_session_id,
+                })
+                .await
+                .unwrap();
+
+            timeout(Duration::from_secs(2), async {
+                state_rx
+                    .wait_for(|s| matches!(s, PairingState::Handshaking { .. }))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("SM reaches Handshaking");
+
+            let sas = match &*handle.state_rx.borrow() {
+                PairingState::Handshaking { sas_digits, .. } => sas_digits.clone(),
+                other => panic!("expected Handshaking, got {other:?}"),
+            };
+            (handle, in_tx, sas, transport)
+        }
+
+        // Two independent SMs each talking to their own fake peer with a
+        // fresh X25519 keypair. SAS = uniform-random mod 1_000_000, so a
+        // single random pair has ~10⁻⁶ chance of accidentally colliding.
+        // PR #64 review (Qodo/CodeRabbit) flagged the original single-shot
+        // assert_ne! as a low-rate flake; a bounded retry pushes the
+        // collision probability after N=5 retries to ~10⁻³⁰, effectively
+        // zero. A regression that fixed SAS to a constant would collide
+        // every time and panic with the message below.
+        //
+        // CRITICAL: each ScriptedTransport's `in_tx` (the inbound channel
+        // sender) MUST stay alive until after the Cancel assertions
+        // complete. Dropping it closes the transport's recv channel, which
+        // makes `transport.recv()` return None. In `run_state_machine`'s
+        // tokio::select!, `transport.recv() = None` causes the SM task to
+        // `return` (L179-191), racing with the about-to-be-processed
+        // Cancel — the CI failure on commit 47fb953 was exactly this race.
+        // We keep the senders alongside the handles in the Option tuple so
+        // they live for the rest of the test.
+        const MAX_ATTEMPTS: usize = 5;
+        type SmFixture = (
+            PairingHandle,
+            mpsc::Sender<PairingWireMessage>,
+            Arc<ScriptedTransport>,
+        );
+        let mut sm_inviter_opt: Option<SmFixture> = None;
+        let mut sm_joiner_opt: Option<SmFixture> = None;
+        let mut sas_inviter = String::new();
+        let mut sas_joiner = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            let fake_peer_a = X25519Sec::random_from_rng(OsRng);
+            let fake_peer_b = X25519Sec::random_from_rng(OsRng);
+            let (h_a, in_tx_a, sas_a, transport_a) = drive_to_handshaking(
+                PairingRole::Inviter,
+                &fake_peer_a,
+                1_700_000_001 + attempt as u64,
+            )
+            .await;
+            let (h_b, in_tx_b, sas_b, transport_b) = drive_to_handshaking(
+                PairingRole::Joiner,
+                &fake_peer_b,
+                1_700_000_500 + attempt as u64,
+            )
+            .await;
+            if sas_a != sas_b {
+                sm_inviter_opt = Some((h_a, in_tx_a, transport_a));
+                sm_joiner_opt = Some((h_b, in_tx_b, transport_b));
+                sas_inviter = sas_a;
+                sas_joiner = sas_b;
+                break;
+            }
+            // Collision (~10⁻⁶) — drop SMs (and their senders) and retry.
+            // On the last attempt, exhausting the retry budget means SAS
+            // is always equal, which is the regression we want to catch.
+            if attempt == MAX_ATTEMPTS - 1 {
+                panic!(
+                    "SAS values collided across {MAX_ATTEMPTS} attempts \
+                     (probability ~10⁻{} under correct derive_sas) — likely \
+                     derive_sas regressed to ignore the peer key. Both = {sas_a}",
+                    MAX_ATTEMPTS * 6
+                );
+            }
+        }
+        let (mut sm_inviter, _inviter_in_tx, inviter_transport) =
+            sm_inviter_opt.expect("inviter handle assigned in loop");
+        let (mut sm_joiner, _joiner_in_tx, joiner_transport) =
+            sm_joiner_opt.expect("joiner handle assigned in loop");
+        // Belt-and-suspenders: the loop only exits via `break` when SAS
+        // values differ, but make the invariant explicit.
+        assert_ne!(sas_inviter, sas_joiner);
+
+        // User clicks "no don't match" on each device. Both must Cancel
+        // cleanly back to Idle. The first Cancel publishes a wire Cancel
+        // (ctx is Some); a follow-up no-op Cancel must NOT (ctx is None,
+        // and the handler at L166-176 gates the publish on ctx.is_some()).
+        // Mirrors the assert_idle_and_clean pattern in
+        // state_machine_cancel_at_each_stage.
+        sm_inviter
+            .cmd_tx
+            .send(PairingCommand::Cancel)
+            .await
+            .unwrap();
+        sm_joiner.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+
+        for (label, handle, transport) in [
+            ("inviter", &mut sm_inviter, &inviter_transport),
+            ("joiner", &mut sm_joiner, &joiner_transport),
+        ] {
+            let mut rx = handle.state_rx.clone();
+            timeout(Duration::from_secs(2), async {
+                rx.wait_for(|s| matches!(s, PairingState::Idle))
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} SM did not reach Idle within 2s"));
+
+            // Snapshot the count of wire Cancels published so far. The
+            // first user-Cancel above should already have produced one (ctx
+            // was Some). The follow-up no-op Cancel below must NOT bump it.
+            let cancels_before = transport
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, PairingWireMessage::Cancel { .. }))
+                .count();
+
+            handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
+            // Deterministic ack: see assert_idle_and_clean for the
+            // watch::Sender version-bump rationale. Cancel handler always
+            // calls state_tx.send(Idle), so rx.changed() fires when the SM
+            // has actually picked up this no-op command — no fixed sleep
+            // and no race even on a loaded CI runner.
+            timeout(Duration::from_secs(2), rx.changed())
+                .await
+                .unwrap_or_else(|_| panic!("{label}: SM did not process second Cancel within 2s"))
+                .unwrap();
+
+            assert!(
+                matches!(*handle.state_rx.borrow(), PairingState::Idle),
+                "{label}: state must remain Idle"
+            );
+            let cancels_after = transport
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, PairingWireMessage::Cancel { .. }))
+                .count();
+            assert_eq!(
+                cancels_before, cancels_after,
+                "{label}: no-op second Cancel must NOT publish a wire Cancel \
+                 (ctx must already be None); was {cancels_before} cancels, \
+                 now {cancels_after} — stale-ctx regression?"
+            );
+        }
     }
 }

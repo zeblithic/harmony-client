@@ -694,7 +694,7 @@ async fn start_node(
     // Wait for the event loop to report startup success or failure.
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
-        Ok(Ok(())) => {
+        Ok(Ok(())) => 'arm: {
             // ZEB-197: spawn the pairing state machine now that the
             // event loop is up. Construct ZenohPairingTransport with
             // a clone of publish_tx (publishes go through the running
@@ -710,6 +710,19 @@ async fn start_node(
                 }
             };
             if let Some(publish_tx_clone) = install_pairing {
+                // ZEB-200: pairing without persistence is the exact UX hole
+                // ZEB-197 closed — a successful pair would be silently
+                // dropped on next start_node. Resolve up front and surface
+                // any failure as a hard start_node error so the cleanup
+                // hook below tears down the running event loop.
+                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        break 'arm Err(format!(
+                            "cannot resolve identity_dir for pairing persistence: {e}"
+                        ));
+                    }
+                };
                 let pairing_transport: std::sync::Arc<
                     dyn crate::pairing::transport::PairingTransport,
                 > = std::sync::Arc::new(
@@ -750,51 +763,37 @@ async fn start_node(
                 // Receivers are taken out of the handle (mpsc receivers are
                 // single-consumer, not Clone like watch::Receiver). The
                 // drainer task owns each receiver until the SM shuts down.
-                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        tracing::error!("cannot resolve identity_dir for pairing persistence: {e}");
-                        None
-                    }
-                };
-                if let Some(identity_dir) = identity_dir {
-                    if let Some(mut rx) = pairing_handle.joiner_result_rx.take() {
-                        let id_dir = identity_dir.clone();
-                        tokio::spawn(async move {
-                            while let Some(result) = rx.recv().await {
-                                match crate::pairing::persist::install_joiner_state(&id_dir, result)
-                                {
-                                    Ok(()) => {
-                                        tracing::info!("joiner pairing persisted successfully");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "failed to persist joiner pairing result: {e}"
-                                        );
-                                    }
+                if let Some(mut rx) = pairing_handle.joiner_result_rx.take() {
+                    let id_dir = identity_dir.clone();
+                    tokio::spawn(async move {
+                        while let Some(result) = rx.recv().await {
+                            match crate::pairing::persist::install_joiner_state(&id_dir, result) {
+                                Ok(()) => {
+                                    tracing::info!("joiner pairing persisted successfully");
+                                }
+                                Err(e) => {
+                                    tracing::error!("failed to persist joiner pairing result: {e}");
                                 }
                             }
-                        });
-                    }
-                    if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
-                        let id_dir = identity_dir.clone();
-                        tokio::spawn(async move {
-                            while let Some(result) = rx.recv().await {
-                                match crate::pairing::persist::install_inviter_state(
-                                    &id_dir, result,
-                                ) {
-                                    Ok(()) => {
-                                        tracing::info!("inviter pairing persisted successfully");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "failed to persist inviter pairing result: {e}"
-                                        );
-                                    }
+                        }
+                    });
+                }
+                if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
+                    let id_dir = identity_dir.clone();
+                    tokio::spawn(async move {
+                        while let Some(result) = rx.recv().await {
+                            match crate::pairing::persist::install_inviter_state(&id_dir, result) {
+                                Ok(()) => {
+                                    tracing::info!("inviter pairing persisted successfully");
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "failed to persist inviter pairing result: {e}"
+                                    );
                                 }
                             }
-                        });
-                    }
+                        }
+                    });
                 }
 
                 if let Ok(mut guard) = state.lock() {
