@@ -19,6 +19,7 @@ pub mod mail_sync;
 pub mod owner_commands;
 pub mod owner_state;
 pub mod pairing;
+pub mod pairing_commands;
 pub mod recovery_cli;
 pub mod voice;
 
@@ -725,6 +726,19 @@ async fn start_node(
                             .unwrap_or(0)
                     }),
                 );
+                // Bridge pairing state changes to a Tauri frontend event.
+                // Clone state_rx before moving the handle into NodeState.
+                let mut prx = pairing_handle.state_rx.clone();
+                let app_clone = app.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if prx.changed().await.is_err() {
+                            break;
+                        }
+                        let s = prx.borrow().clone();
+                        let _ = app_clone.emit("pairing-state-changed", s);
+                    }
+                });
                 if let Ok(mut guard) = state.lock() {
                     if guard.generation == our_gen {
                         guard.pairing_handle = Some(pairing_handle);
@@ -3034,6 +3048,12 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            pairing_commands::start_inviter_pairing,
+            pairing_commands::start_joiner_pairing,
+            pairing_commands::select_pairing_peer,
+            pairing_commands::confirm_pairing_sas,
+            pairing_commands::cancel_pairing,
+            pairing_commands::get_pairing_state,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

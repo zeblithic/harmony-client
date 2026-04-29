@@ -122,7 +122,7 @@ fn format_fingerprint(id: &[u8; 16]) -> String {
 /// instead, take the parent of the per-device identity key path. Assumes
 /// `identity.key` is never at the filesystem root — true on every Tauri-
 /// supported OS (macOS / Linux / Windows).
-fn resolve_identity_dir() -> Result<PathBuf, String> {
+pub(crate) fn resolve_identity_dir() -> Result<PathBuf, String> {
     let key_path = crate::identity::resolve_path(None)?;
     key_path
         .parent()
