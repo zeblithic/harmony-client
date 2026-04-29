@@ -1875,15 +1875,44 @@ mod tests {
     /// pins it down so any future per-phase Cancel logic is forced to
     /// preserve the no-stale-ctx invariant.
     ///
-    /// The "ctx is clean" check is a follow-up no-op Cancel: with ctx=None,
-    /// the handler skips publishing and the state stays Idle. Stale ctx
-    /// would either re-publish a Cancel wire message or transition the
-    /// state again.
+    /// The "ctx is clean" check exploits the *only* observable side effect
+    /// that distinguishes Cancel-with-ctx from Cancel-without-ctx: at
+    /// L166-176 the handler publishes a wire `Cancel` only when
+    /// `ctx.is_some()`. We wrap the cancelled side's transport with
+    /// `CountCancelTransport`, snapshot the publish count, send a follow-up
+    /// no-op Cancel, and assert the count is unchanged. Asserting only
+    /// that the *state* stayed Idle is too weak — the SM emits Idle on
+    /// Cancel either way, even with stale ctx (per CodeRabbit/Qodo review
+    /// on PR #64).
     #[tokio::test]
     async fn state_machine_cancel_at_each_stage() {
-        // Helper: assert SM is Idle, then send a second Cancel and assert
-        // it stays Idle (proves ctx was cleared).
-        async fn assert_idle_and_clean(handle: &mut PairingHandle, label: &str) {
+        use crate::pairing::transport::PairingTransport;
+        use crate::pairing::types::PairingWireMessage;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountCancelTransport {
+            inner: Arc<dyn PairingTransport>,
+            cancel_count: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl PairingTransport for CountCancelTransport {
+            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+                if matches!(message, PairingWireMessage::Cancel { .. }) {
+                    self.cancel_count.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.publish(message).await
+            }
+            async fn recv(&self) -> Option<PairingWireMessage> {
+                self.inner.recv().await
+            }
+        }
+
+        async fn assert_idle_and_clean(
+            handle: &mut PairingHandle,
+            label: &str,
+            cancel_count: &AtomicUsize,
+        ) {
             let mut rx = handle.state_rx.clone();
             timeout(Duration::from_secs(2), async {
                 rx.wait_for(|s| matches!(s, PairingState::Idle))
@@ -1893,11 +1922,24 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("[{label}] SM did not reach Idle within 2s"));
 
+            // Snapshot AFTER first Cancel has settled. The first Cancel
+            // (ctx was Some) should already have bumped the count; the
+            // second Cancel (ctx is None) must NOT bump it again.
+            let count_before = cancel_count.load(Ordering::Relaxed);
+
             handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
+
             assert!(
                 matches!(*handle.state_rx.borrow(), PairingState::Idle),
-                "[{label}] no-op second Cancel must leave state Idle (ctx already None)"
+                "[{label}] no-op second Cancel must leave state Idle"
+            );
+            let count_after = cancel_count.load(Ordering::Relaxed);
+            assert_eq!(
+                count_before, count_after,
+                "[{label}] no-op second Cancel must NOT publish a wire \
+                 Cancel (ctx must already be None); was {count_before} \
+                 cancels, now {count_after} — stale-ctx regression?"
             );
         }
 
@@ -1912,8 +1954,13 @@ mod tests {
             } = mint_owner(1_700_000_000).unwrap();
             let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
             let (inviter_t, _joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
             let mut inviter = spawn_state_machine(
-                Arc::new(inviter_t),
+                inviter_t_wrapped,
                 fixed_clock(1_700_000_001),
                 Duration::from_secs(60),
             );
@@ -1938,7 +1985,7 @@ mod tests {
             .expect("Phase 1: reach Discovering");
 
             inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            assert_idle_and_clean(&mut inviter, "Discovering").await;
+            assert_idle_and_clean(&mut inviter, "Discovering", &cancel_count).await;
         }
 
         // Phase 2: Discovered. Pair two SMs; cancel the Inviter once it
@@ -1952,8 +1999,13 @@ mod tests {
             let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
             let joiner_sk = SigningKey::generate(&mut OsRng);
             let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
             let mut inviter = spawn_state_machine(
-                Arc::new(inviter_t),
+                inviter_t_wrapped,
                 fixed_clock(1_700_000_001),
                 Duration::from_secs(60),
             );
@@ -1991,7 +2043,7 @@ mod tests {
             .expect("Phase 2: reach Discovered");
 
             inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            assert_idle_and_clean(&mut inviter, "Discovered").await;
+            assert_idle_and_clean(&mut inviter, "Discovered", &cancel_count).await;
         }
 
         // Phase 3: Handshaking. Drive both sides through SELECT so each
@@ -2005,8 +2057,13 @@ mod tests {
             let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
             let joiner_sk = SigningKey::generate(&mut OsRng);
             let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
             let mut inviter = spawn_state_machine(
-                Arc::new(inviter_t),
+                inviter_t_wrapped,
                 fixed_clock(1_700_000_001),
                 Duration::from_secs(60),
             );
@@ -2084,7 +2141,7 @@ mod tests {
             .expect("Phase 3: reach Handshaking");
 
             inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            assert_idle_and_clean(&mut inviter, "Handshaking").await;
+            assert_idle_and_clean(&mut inviter, "Handshaking", &cancel_count).await;
         }
 
         // Phase 4: WaitingPeerConfirm. Drive both to Handshaking; only the
@@ -2099,8 +2156,13 @@ mod tests {
             let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
             let joiner_sk = SigningKey::generate(&mut OsRng);
             let (inviter_t, joiner_t) = InMemoryBroker::pair();
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(inviter_t),
+                cancel_count: cancel_count.clone(),
+            });
             let mut inviter = spawn_state_machine(
-                Arc::new(inviter_t),
+                inviter_t_wrapped,
                 fixed_clock(1_700_000_001),
                 Duration::from_secs(60),
             );
@@ -2194,7 +2256,7 @@ mod tests {
             .expect("Phase 4: inviter reaches WaitingPeerConfirm");
 
             inviter.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            assert_idle_and_clean(&mut inviter, "WaitingPeerConfirm").await;
+            assert_idle_and_clean(&mut inviter, "WaitingPeerConfirm", &cancel_count).await;
         }
 
         // Phase 5: Enrolling — cancel the JOINER from Enrolling.
@@ -2206,10 +2268,6 @@ mod tests {
         // ENROLL — the second `Encrypted` payload it publishes (the first
         // is CONFIRM, which must reach the Joiner so peer_confirmed flips).
         {
-            use crate::pairing::types::PairingWireMessage;
-            use async_trait::async_trait;
-            use std::sync::atomic::{AtomicUsize, Ordering};
-
             struct DropNthEncryptedTransport {
                 inner: Arc<dyn PairingTransport>,
                 encrypted_count: Arc<AtomicUsize>,
@@ -2248,13 +2306,18 @@ mod tests {
                     encrypted_count: Arc::new(AtomicUsize::new(0)),
                     drop_at: 1, // drop the SECOND Encrypted publish == ENROLL
                 });
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            let joiner_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
+                inner: Arc::new(joiner_t),
+                cancel_count: cancel_count.clone(),
+            });
             let inviter = spawn_state_machine(
                 wrapped_inviter_t,
                 fixed_clock(1_700_000_001),
                 Duration::from_secs(60),
             );
             let mut joiner = spawn_state_machine(
-                Arc::new(joiner_t),
+                joiner_t_wrapped,
                 fixed_clock(1_700_000_002),
                 Duration::from_secs(60),
             );
@@ -2348,7 +2411,7 @@ mod tests {
             .expect("Phase 5: joiner reaches Enrolling (and stays there)");
 
             joiner.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            assert_idle_and_clean(&mut joiner, "Enrolling").await;
+            assert_idle_and_clean(&mut joiner, "Enrolling", &cancel_count).await;
         }
     }
 
@@ -2538,27 +2601,58 @@ mod tests {
             (handle, in_tx, sas)
         }
 
-        // Two completely independent SMs, each talking to its own fake peer
-        // with a fresh X25519 keypair. Different fake peers ⇒ different
-        // shared secrets ⇒ different SAS digits.
-        let fake_peer_a = X25519Sec::random_from_rng(OsRng);
-        let fake_peer_b = X25519Sec::random_from_rng(OsRng);
-
-        let (mut sm_inviter, _in_tx_a, sas_inviter) =
-            drive_to_handshaking(PairingRole::Inviter, &fake_peer_a, 1_700_000_001).await;
-        let (mut sm_joiner, _in_tx_b, sas_joiner) =
-            drive_to_handshaking(PairingRole::Joiner, &fake_peer_b, 1_700_000_002).await;
-
-        // The MitM-detection assertion: both sides see DIFFERENT 6-digit
-        // codes. Cryptographically this holds with overwhelming probability
-        // (~1 in 10^6 collision); a regression that fixed the SAS to a
-        // constant would tilt this to always-equal.
-        assert_ne!(
-            sas_inviter, sas_joiner,
-            "SAS digits must differ across two SMs with distinct fake peer \
-             pubkeys (got both = {sas_inviter}); did derive_sas regress to \
-             ignore the peer key?"
-        );
+        // Two independent SMs each talking to their own fake peer with a
+        // fresh X25519 keypair. SAS = uniform-random mod 1_000_000, so a
+        // single random pair has ~10⁻⁶ chance of accidentally colliding.
+        // PR #64 review (Qodo/CodeRabbit) flagged the original single-shot
+        // assert_ne! as a low-rate flake; a bounded retry pushes the
+        // collision probability after N=5 retries to ~10⁻³⁰, effectively
+        // zero. A regression that fixed SAS to a constant would collide
+        // every time and panic with the message below.
+        const MAX_ATTEMPTS: usize = 5;
+        let mut sm_inviter_opt: Option<PairingHandle> = None;
+        let mut sm_joiner_opt: Option<PairingHandle> = None;
+        let mut sas_inviter = String::new();
+        let mut sas_joiner = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            let fake_peer_a = X25519Sec::random_from_rng(OsRng);
+            let fake_peer_b = X25519Sec::random_from_rng(OsRng);
+            let (h_a, _in_tx_a, sas_a) = drive_to_handshaking(
+                PairingRole::Inviter,
+                &fake_peer_a,
+                1_700_000_001 + attempt as u64,
+            )
+            .await;
+            let (h_b, _in_tx_b, sas_b) = drive_to_handshaking(
+                PairingRole::Joiner,
+                &fake_peer_b,
+                1_700_000_500 + attempt as u64,
+            )
+            .await;
+            if sas_a != sas_b {
+                sm_inviter_opt = Some(h_a);
+                sm_joiner_opt = Some(h_b);
+                sas_inviter = sas_a;
+                sas_joiner = sas_b;
+                break;
+            }
+            // Collision (~10⁻⁶) — drop the SMs and retry. On the last
+            // attempt, exhausting the retry budget means SAS is always
+            // equal, which is the regression we want to catch.
+            if attempt == MAX_ATTEMPTS - 1 {
+                panic!(
+                    "SAS values collided across {MAX_ATTEMPTS} attempts \
+                     (probability ~10⁻{} under correct derive_sas) — likely \
+                     derive_sas regressed to ignore the peer key. Both = {sas_a}",
+                    MAX_ATTEMPTS * 6
+                );
+            }
+        }
+        let mut sm_inviter = sm_inviter_opt.expect("inviter handle assigned in loop");
+        let mut sm_joiner = sm_joiner_opt.expect("joiner handle assigned in loop");
+        // Belt-and-suspenders: the loop only exits via `break` when SAS
+        // values differ, but make the invariant explicit.
+        assert_ne!(sas_inviter, sas_joiner);
 
         // User clicks "no don't match" on each device. Both must Cancel
         // cleanly back to Idle without leaving stale ctx (no-op second

@@ -487,7 +487,6 @@ async fn network_drop_during_enroll() {
         recovery_artifact,
         ..
     } = mint_owner(1_700_000_000).unwrap();
-    let original_inviter_enrollments = original_state.enrollments.len();
     let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
     let joiner_sk = SigningKey::generate(&mut OsRng);
 
@@ -563,10 +562,17 @@ async fn network_drop_during_enroll() {
     // The drainer task in start_node persists this struct to disk; emitting
     // it on a failed publish would re-introduce the phantom-device bug at
     // the persistence layer.
+    //
+    // The 1500ms window is well above tokio scheduling jitter on slow CI
+    // (PR #64 review/Qodo flagged the original 200ms as too aggressive for
+    // proving a negative). Anything emitted here within 1.5s would be a
+    // genuine post-Failed leak; missing a leak that arrives >1.5s late is
+    // possible but exceedingly unlikely given the SM has no async wait
+    // between Failed-emit and the would-be inviter_result_tx.send.
     let mut inviter_result_rx = inviter_handle
         .inviter_result_rx
         .expect("inviter_result_rx present");
-    match tokio::time::timeout(Duration::from_millis(200), inviter_result_rx.recv()).await {
+    match tokio::time::timeout(Duration::from_millis(1500), inviter_result_rx.recv()).await {
         Err(_) => {
             // Timeout — no result emitted. This is the desired behavior.
         }
@@ -581,27 +587,37 @@ async fn network_drop_during_enroll() {
         }
     }
 
-    // Sanity: original_state untouched (Inviter shouldn't have committed).
-    // We assert this via the snapshot we captured before the run, since
-    // ctx.owner_state isn't directly observable. The strongest check is
-    // Assertion 2 above (no InviterEnrollResult) plus this static one.
-    assert_eq!(
-        original_state.enrollments.len(),
-        original_inviter_enrollments,
-        "snapshot sanity"
-    );
+    // (No "snapshot sanity" assert here — comparing original_state.len() to
+    // a value derived from the same snapshot is tautological; PR #64 review
+    // (CodeAnt) called this out. The Assertion-2 check above is the real
+    // proof that no phantom commit happened.)
 
-    // ── Assertion 3: Joiner is stuck at Enrolling, not Complete ───────
+    // ── Assertion 3: Joiner settles at Enrolling, not Complete ────────
     // The Joiner has both confirms and emitted Enrolling, then waits for
-    // the ENROLL wire message that never arrives. No built-in timeout (a
-    // separate follow-up); the user's recovery path is to manually Cancel.
-    let joiner_state_now = joiner_handle.state_rx.borrow().clone();
+    // the ENROLL wire message that never arrives. With no built-in
+    // timeout (separate follow-up), the Joiner's only recovery path is
+    // user Cancel — which we exercise below.
+    //
+    // A bare `matches!` snapshot at this instant would race: the Joiner
+    // may briefly be at WaitingPeerConfirm before the Inviter's CONFIRM
+    // (already in flight on the channel) bumps peer_confirmed and lands
+    // it at Enrolling. Wait for the settled state instead. Cursor flagged
+    // this race on PR #64.
+    let mut joiner_state_rx = joiner_handle.state_rx.clone();
+    timeout(Duration::from_secs(2), async {
+        joiner_state_rx
+            .wait_for(|s| matches!(s, PairingState::Enrolling))
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("Joiner settles at Enrolling within 2s of the Inviter going Failed");
+    // Follow-up snapshot: after settling, verify Joiner has NOT advanced
+    // past Enrolling (no ENROLL ever arrived; Complete would mean a
+    // phantom delivery slipped past the FailNthEncryptedTransport).
     assert!(
-        matches!(
-            joiner_state_now,
-            PairingState::Enrolling | PairingState::Handshaking { .. }
-        ),
-        "Joiner must NOT be Complete (no ENROLL arrived); got {joiner_state_now:?}"
+        matches!(*joiner_handle.state_rx.borrow(), PairingState::Enrolling),
+        "Joiner must remain at Enrolling (Complete would mean ENROLL slipped past the drop wrapper)"
     );
 
     // ── Recovery: Cancel allows the user to retry ─────────────────────
