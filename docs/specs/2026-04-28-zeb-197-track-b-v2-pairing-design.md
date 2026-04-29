@@ -59,13 +59,13 @@ The `<session-id>` is a fresh UUID generated at `start_inviter` / `start_joiner`
 
 | Phase | Wire? | Direction | Payload |
 |---|---|---|---|
-| 1. **DISCOVER** | yes | both → pairing scope | `{ role: Inviter\|Joiner, ephemeral_x25519_pubkey, display_name, owner_id_if_inviter, session_id }` (plaintext — needed for discovery) |
+| 1. **DISCOVER** | yes | both → pairing scope | `{ role: Inviter\|Joiner, ephemeral_x25519_pubkey, display_name, owner_id_if_inviter, joiner_ed25519_verify_hex, session_id }` (plaintext — needed for discovery; the Joiner's ed25519 verify key rides along so the Inviter can sign a cert against it) |
 | 2. **SELECT** | yes | each side → peer | `{ peer_session_id, my_session_id }` — sent when user clicks the peer's row in the discovered list. Plaintext. The "I want to pair with this specific peer" claim. |
 | 3. **HANDSHAKE** | no (local) | n/a | Once a side has both SENT a SELECT and RECEIVED the matching SELECT from that peer, it computes locally: `shared = ECDH(eph_sk, peer_eph_pk)`, `session_key = HKDF(shared, "session-v2")`, `sas = format!("{:06}", HKDF(shared, "sas-v2") % 1_000_000)`. UI then renders the SAS. |
-| 4. **CONFIRM** | yes | each side → peer | `{ user_confirmed: true }` — sent only after the local user clicks "Yes, codes match." Encrypted under `session_key`. |
-| 5. **ENROLL** | yes | inviter → joiner | `{ enrollment_cert, owner_state_snapshot, joiner_advisory_display_name }` — encrypted under `session_key`. |
+| 4. **CONFIRM** | yes | each side → peer | `{ sas_digits }` — the locally-derived 6-digit SAS, sent only after the local user clicks "Yes, codes match." Encrypted under `session_key`. The receiver re-checks that the digits match its own derivation as defense-in-depth (`session_key` already authenticates the sender). |
+| 5. **ENROLL** | yes | inviter → joiner | `{ enrollment_cert, owner_state_snapshot, joiner_advisory_display_name }` — encrypted under `session_key`. The Joiner accepts ENROLL only after **mutual SAS confirm** (both sides have sent and received CONFIRM); ENROLL before mutual confirm is rejected as `Failed { reason: "received ENROLL before mutual SAS confirm" }`. |
 
-`CANCEL` is a separate cross-cutting wire message that may be sent at any phase by either side; recipient transitions to Idle.
+`CANCEL` is a separate cross-cutting wire message that may be sent at any phase. The recipient drops the session and transitions to Idle **only when the sender is the recipient's selected peer**; a CANCEL from a non-selected peer (still in the discovered list, or unknown entirely) only prunes that peer from the discovered list. This prevents an unrelated LAN device from griefing an active handshake.
 
 **Why mutual SELECT before HANDSHAKE:** ensures both users explicitly opted into pairing with this specific peer before any SAS is computed. Prevents the "I clicked one row, they're now in my pairing flow without their consent" pattern.
 
@@ -216,16 +216,24 @@ DevicesPanel populated
        └─ artifact = RecoveryArtifact::from_seed(master_seed)
        └─ master_sk = artifact.master_signing_key()
        └─ master_pk = artifact.master_pubkey_bundle()
+       └─ prospective_state = state.clone()
        └─ cert = EnrollmentCert::sign_master(
                    &master_sk, master_pk,
                    joiner_device_id, joiner_pubkey,
                    now, None)
        └─ drop(master_sk) — wipe from RAM
-       └─ state.add_enrollment(cert.clone(), now, active_window)
-       └─ persist updated OwnerState locally
-       └─ encrypt ENROLL payload {cert, full_state_snapshot, name}
+       └─ prospective_state.add_enrollment(cert.clone(), now,
+                                           active_window)
+       └─ encrypt ENROLL payload {cert, prospective_state, name}
             under session_key
-       └─ publish ENROLL
+       └─ publish ENROLL  ── on Err: state = Failed; return
+                                     (no commit, no persist —
+                                      avoids "phantom device" if
+                                      transport failed)
+       └─ commit: state = prospective_state
+       └─ enqueue InviterEnrollResult to persistence drainer
+            (drainer writes OwnerState.cbor with .cbor LAST per
+             ZEB-170 atomicity contract)
 
                                               ◄──── ENROLL received ───
                                                    └─ decrypt under session_key

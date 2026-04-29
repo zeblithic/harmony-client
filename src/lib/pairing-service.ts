@@ -29,6 +29,12 @@ export class PairingService {
   private unlistener: (() => void) | null = null;
 
   async init(): Promise<void> {
+    // Idempotent on re-init: drop any previous subscription before
+    // registering a new one. Without this, calling init() twice would
+    // overwrite this.unlistener and leak the prior subscription.
+    this.unlistener?.();
+    this.unlistener = null;
+
     // Listener-first pattern: if init() fetched the snapshot before
     // registering the listener, any backend transition that landed during
     // that window would be lost (the wizard would skip past Discovering →
@@ -36,16 +42,26 @@ export class PairingService {
     // during the snapshot fetch, then only apply the snapshot if no event
     // arrived — otherwise the live event payload is authoritative.
     let sawEvent = false;
-    this.unlistener = await listen<PairingState>('pairing-state-changed', (event) => {
+    const unlisten = await listen<PairingState>('pairing-state-changed', (event) => {
       sawEvent = true;
       this.state = event.payload;
       this.onChange?.();
     });
+    this.unlistener = unlisten;
 
-    const snapshot = await invoke<PairingState>('get_pairing_state');
-    if (!sawEvent) {
-      this.state = snapshot;
-      this.onChange?.();
+    // If the snapshot fetch throws, the listener we just registered would
+    // leak — Tauri keeps it active until the page reloads. Roll back on
+    // error so dispose() / next init() are still well-defined.
+    try {
+      const snapshot = await invoke<PairingState>('get_pairing_state');
+      if (!sawEvent) {
+        this.state = snapshot;
+        this.onChange?.();
+      }
+    } catch (err) {
+      unlisten();
+      this.unlistener = null;
+      throw err;
     }
   }
 

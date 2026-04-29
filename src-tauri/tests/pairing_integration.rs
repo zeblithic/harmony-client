@@ -133,12 +133,32 @@ async fn end_to_end_pair_two_devices() {
         "expected at least one captured wire message"
     );
 
+    // PR #63 review: scan for BOTH the raw 32-byte form AND the 64-char
+    // hex form. The pairing wire model hex-encodes binary fields (cert
+    // payload, ephemeral pubkeys, nonces, ciphertexts), so a leak that
+    // serialises master_seed as hex would slip past the raw-window check.
+    // We check both lowercase and uppercase to cover any hex casing
+    // accidentally introduced by future formatting changes.
+    let master_seed_hex_lower = hex::encode(master_seed_bytes);
+    let master_seed_hex_upper = hex::encode_upper(master_seed_bytes);
     for msg in inviter_msgs.iter().chain(joiner_msgs.iter()) {
         let mut bytes = Vec::new();
         ciborium::into_writer(msg, &mut bytes).unwrap();
         assert!(
             !bytes.windows(32).any(|w| w == master_seed_bytes),
-            "master_seed leaked in {msg:?}"
+            "master_seed leaked in raw 32-byte form in {msg:?}"
+        );
+        assert!(
+            !bytes
+                .windows(master_seed_hex_lower.len())
+                .any(|w| w == master_seed_hex_lower.as_bytes()),
+            "master_seed leaked in lowercase hex form in {msg:?}"
+        );
+        assert!(
+            !bytes
+                .windows(master_seed_hex_upper.len())
+                .any(|w| w == master_seed_hex_upper.as_bytes()),
+            "master_seed leaked in uppercase hex form in {msg:?}"
         );
     }
 }
