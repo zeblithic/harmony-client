@@ -756,10 +756,6 @@ async fn maybe_advance_to_enroll(
         return;
     }
 
-    // Publish succeeded → commit prospective state into ctx.
-    ctx.owner_state = Some(prospective_state.clone());
-    ctx.cert_sent = true;
-
     // Emit the InviterEnrollResult so the persistence layer (drained in
     // start_node) can merge the new enrollment into the freshest on-disk
     // OwnerState. Without this, the new enrollment lives only in RAM and
@@ -778,6 +774,14 @@ async fn maybe_advance_to_enroll(
     // disk state under OWNER_STATE_WRITE_LOCK so a concurrent writer
     // (mint, future parallel pair flows) cannot silently lose this
     // enrollment by overwriting with a stale snapshot.
+    //
+    // PR #65 review: the local commit (ctx.owner_state / cert_sent)
+    // happens AFTER this send so a closed-channel failure doesn't leave
+    // the session locally committed against a persistence handoff that
+    // never landed. If a late peer-CONFIRM arrives in that window, the
+    // Joiner's ENROLL idempotency guard
+    // (`our_signing_key.is_none()` sentinel) absorbs the duplicate
+    // ENROLL re-publish.
     if let Err(e) = inviter_result_tx
         .send(InviterEnrollResult {
             cert,
@@ -791,6 +795,12 @@ async fn maybe_advance_to_enroll(
         });
         return;
     }
+
+    // Persistence handoff accepted → commit prospective state into ctx.
+    // This must come AFTER the send so a failed handoff doesn't leave the
+    // local session committed (see comment above).
+    ctx.owner_state = Some(prospective_state);
+    ctx.cert_sent = true;
 
     let device_id = joiner_pubkey.identity_hash();
     let _ = state_tx.send(PairingState::Complete {
