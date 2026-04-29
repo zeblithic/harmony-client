@@ -181,7 +181,7 @@ pub async fn mint_owner_identity(
             &identity_dir,
             &state,
             &device_signing_key,
-            &*master_seed,
+            Some(&*master_seed),
             KeychainStore::new().ok(),
         )?;
         let token = insert_token(master_seed.clone());

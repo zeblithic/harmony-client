@@ -291,7 +291,7 @@ pub fn save_owner_state_atomic(
     identity_dir: &Path,
     state: &OwnerState,
     device_signing_key: &SigningKey,
-    master_seed: &[u8; 32],
+    master_seed: Option<&[u8; 32]>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
     save_secret(
@@ -301,13 +301,15 @@ pub fn save_owner_state_atomic(
         "device_sk.enc",
         &device_signing_key.to_bytes(),
     )?;
-    save_secret(
-        &keychain,
-        KEYCHAIN_MASTER_SEED,
-        identity_dir,
-        "master_seed.enc",
-        master_seed,
-    )?;
+    if let Some(seed) = master_seed {
+        save_secret(
+            &keychain,
+            KEYCHAIN_MASTER_SEED,
+            identity_dir,
+            "master_seed.enc",
+            seed,
+        )?;
+    }
     let cbor_bytes =
         cbor::to_canonical(state).map_err(|e| format!("CBOR encode of OwnerState failed: {e}"))?;
     let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
@@ -480,8 +482,14 @@ mod persistence_tests {
         } = mint_owner(1_700_000_000).unwrap();
         let master_seed = *recovery_artifact.as_bytes();
 
-        save_owner_state_atomic(dir.path(), &state, &device_signing_key, &master_seed, None)
-            .expect("save");
+        save_owner_state_atomic(
+            dir.path(),
+            &state,
+            &device_signing_key,
+            Some(&master_seed),
+            None,
+        )
+        .expect("save");
 
         let loaded = load_owner_state(dir.path(), None)
             .expect("load")
@@ -530,7 +538,7 @@ mod persistence_tests {
             dir.path(),
             &state,
             &device_signing_key,
-            recovery_artifact.as_bytes(),
+            Some(recovery_artifact.as_bytes()),
             None,
         )
         .unwrap();
@@ -561,7 +569,7 @@ mod persistence_tests {
             dir.path(),
             &state,
             &device_signing_key,
-            recovery_artifact.as_bytes(),
+            Some(recovery_artifact.as_bytes()),
             None,
         )
         .unwrap();
@@ -598,7 +606,7 @@ mod persistence_tests {
             dir.path(),
             &state,
             &device_signing_key,
-            recovery_artifact.as_bytes(),
+            Some(recovery_artifact.as_bytes()),
             None,
         )
         .unwrap();
