@@ -402,6 +402,11 @@ fn save_secret(
     fallback_filename: &str,
     bytes: &[u8; 32],
 ) -> Result<(), String> {
+    // Mirror load_secret's error-preservation: if the keychain WRITE fails AND
+    // no encrypted-file fallback is configured, surface the keychain error
+    // (locked / permission denied / etc) instead of the generic "HARMONY_PASSPHRASE
+    // not set" message — otherwise mint reports the wrong remediation.
+    let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
         let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
@@ -410,17 +415,26 @@ fn save_secret(
             Err(e) => {
                 // Don't hard-fail: a flaky/locked keychain shouldn't block
                 // mint when the encrypted-file fallback is configured.
-                tracing::warn!(
-                    "keychain write {KEYCHAIN_OWNER_SERVICE}/{keychain_name} failed ({e}); \
-                     falling through to encrypted-file fallback"
-                );
+                let msg = format!("keychain write {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}");
+                tracing::warn!("{msg}; falling through to encrypted-file fallback");
+                keychain_err = Some(msg);
             }
         }
     }
     let path = identity_dir.join(fallback_filename);
-    let store = EncryptedFileStore::from_env(path.clone())
-        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?
-        .ok_or_else(|| format!("HARMONY_PASSPHRASE not set; cannot encrypt {fallback_filename}"))?;
+    let store_opt = EncryptedFileStore::from_env(path.clone())
+        .map_err(|e| format!("encrypted-file fallback for {fallback_filename}: {e}"))?;
+    let store = match store_opt {
+        Some(s) => s,
+        None => {
+            return match keychain_err {
+                Some(e) => Err(e),
+                None => Err(format!(
+                    "HARMONY_PASSPHRASE not set; cannot encrypt {fallback_filename}"
+                )),
+            };
+        }
+    };
     store
         .save(bytes)
         .map_err(|e| format!("write {fallback_filename}: {e}"))?;

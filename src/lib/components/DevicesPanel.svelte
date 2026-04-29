@@ -106,10 +106,15 @@
     backupComment = '';
     backupError = null;
     backupSavedPath = null;
-    // Recovery tokens are single-use AND TTL-bounded (5min server-side).
-    // Always discard any cached value and issue a fresh one — a token from
-    // a previous open could be expired, consumed, or LRU-evicted.
-    recoveryToken = null;
+    // Token-reuse policy: if a token is already in hand (e.g., handleConfirmMint
+    // just minted and stashed one), use it. Otherwise issue a fresh one. This
+    // preserves the happy mint→backup path (one token, one consume) while still
+    // healing post-failure paths because commitBackup nulls the token in finally
+    // (whether export succeeded or failed) — so a second openBackup always
+    // re-issues. Tokens ARE TTL-bounded (5min) and LRU-evictable, so a stale
+    // post-mint token will surface as "expired or invalid" on commit, which is
+    // recoverable via the inline Retry button.
+    if (recoveryToken !== null) return;
     try {
       recoveryToken = await svc.issueRecoveryToken();
     } catch (e) {

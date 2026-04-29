@@ -23,19 +23,19 @@ vi.mock('../../profile-service', () => ({
 
 const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
+// File-level beforeEach: runs before EVERY test in this file, including those
+// in nested describe blocks. resetAllMocks (not clearAllMocks) wipes
+// mockReturnValue/mockResolvedValue implementations so stubs from one suite
+// don't leak into the next (e.g., loadProfile.mockReturnValue from rename
+// suites bleeding into populated-state suites via applyLocalProfileOverlay).
+// The save() default is reapplied because resetAllMocks wiped the vi.mock
+// factory's mockResolvedValue too.
+beforeEach(() => {
+  vi.resetAllMocks();
+  vi.mocked(save).mockResolvedValue('/tmp/owner-recovery.bin');
+});
+
 describe('DevicesPanel — empty + bootstrap states', () => {
-  beforeEach(() => {
-    // resetAllMocks (not clearAllMocks) to clear mockReturnValue/mockResolvedValue
-    // implementations between suites — otherwise stubs set in one describe block
-    // leak into later suites that don't explicitly mock the same fn (e.g.,
-    // loadProfile.mockReturnValue from rename suites would affect populated-state
-    // suites that rely on the no-op default).
-    vi.resetAllMocks();
-    // Re-establish defaults that file-level vi.mock factories set, since
-    // resetAllMocks wiped them too. The save dialog default keeps tests that
-    // don't care about its exact return value working.
-    vi.mocked(save).mockResolvedValue('/tmp/owner-recovery.bin');
-  });
 
   it('renders empty state when get_owner_state returns null', async () => {
     mockedInvoke.mockResolvedValueOnce(null);
@@ -94,8 +94,6 @@ describe('DevicesPanel — empty + bootstrap states', () => {
 });
 
 describe('DevicesPanel — populated state', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('renders owner header with display name and fingerprint', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1c8239b7dd809abcdef0123456789',
@@ -158,8 +156,6 @@ describe('DevicesPanel — populated state', () => {
 });
 
 describe('DevicesPanel — rename', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('clicking Rename shows inline edit field with current name pre-filled', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1', ownerDisplayName: 'zeblith',
@@ -205,8 +201,6 @@ describe('DevicesPanel — rename', () => {
 });
 
 describe('DevicesPanel — backup wiring', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('clicking Back up opens the backup modal and issues a token if needed', async () => {
     mockedInvoke
       .mockResolvedValueOnce({ ownerId: 'x', ownerDisplayName: 'me',
@@ -248,8 +242,6 @@ describe('DevicesPanel — backup wiring', () => {
 });
 
 describe('DevicesPanel — degraded state (canBackUp: false)', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('Back-up CTA is disabled when canBackUp is false', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'x', ownerDisplayName: 'me',
@@ -266,8 +258,6 @@ describe('DevicesPanel — degraded state (canBackUp: false)', () => {
 });
 
 describe('DevicesPanel — rename overlay survives refresh', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('overlays profile.displayName onto the isThisDevice row after refresh', async () => {
     // Backend returns the placeholder "this device" — but localStorage holds
     // a previously-renamed value. The panel must overlay the local value so
@@ -301,8 +291,6 @@ describe('DevicesPanel — rename overlay survives refresh', () => {
 });
 
 describe('DevicesPanel — byte-cap on backup comment', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('rejects backup comment that exceeds 256 bytes (multibyte aware)', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'x', ownerDisplayName: 'me',
@@ -338,8 +326,6 @@ describe('DevicesPanel — byte-cap on backup comment', () => {
 });
 
 describe('DevicesPanel — Save backup disabled when token unavailable', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('disables Save backup if issue_owner_recovery_token fails on openBackup', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'x', ownerDisplayName: 'me',
@@ -363,8 +349,6 @@ describe('DevicesPanel — Save backup disabled when token unavailable', () => {
 });
 
 describe('DevicesPanel — stale token cleared after export failure', () => {
-  beforeEach(() => { vi.clearAllMocks(); });
-
   it('clears recoveryToken in finally so next openBackup issues fresh', async () => {
     // Refresh + populated state
     mockedInvoke.mockResolvedValueOnce({
@@ -412,5 +396,56 @@ describe('DevicesPanel — stale token cleared after export failure', () => {
       (c) => c[0] === 'issue_owner_recovery_token',
     );
     expect(issueCalls.length).toBe(2);
+  });
+});
+
+describe('DevicesPanel — mint→backup token reuse', () => {
+  it('reuses the mint-issued token instead of issuing a fresh one on first openBackup', async () => {
+    // Cursor finding: after handleConfirmMint sets recoveryToken, the user
+    // immediately clicking "Back up owner identity →" should consume that
+    // token, not discard it and issue another one. Two reasons:
+    //   1) the second issue_owner_recovery_token call is wasted work and
+    //      occupies a second slot in the server-side LRU cache (cap=8);
+    //   2) it adds an unnecessary failure mode (issue can fail on locked
+    //      keychain) to the happy mint→backup path even when a perfectly
+    //      valid token is already in hand.
+    // 1st invoke: get_owner_state (initial refresh) — returns null (un-minted).
+    mockedInvoke.mockResolvedValueOnce(null);
+    // 2nd invoke: mint_owner_identity → returns state + recoveryToken.
+    mockedInvoke.mockResolvedValueOnce({
+      state: {
+        ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+        ownerDisplayName: 'this device',
+        devices: [{
+          deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+          displayName: 'this device',
+          isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000,
+          fingerprint: 'aa11·bb22',
+        }],
+        canBackUp: true,
+      },
+      recoveryToken: 'mint-tok',
+    });
+    // No issue_owner_recovery_token mock set up — the test asserts the call
+    // is NOT made. (If the regression returns, the unmocked invoke would
+    // resolve undefined and the test would still detect it via the filter.)
+
+    render(DevicesPanel);
+    const bindBtn = await screen.findByRole('button', { name: /bind this device/i });
+    await fireEvent.click(bindBtn);
+    const confirmBtn = await screen.findByRole('button', { name: /^create owner identity/i });
+    await fireEvent.click(confirmBtn);
+    // Wait for transition to populated state.
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    // Modal should be open, but no extra issue_owner_recovery_token call —
+    // the cached mint-issued token is reused.
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    const issueCalls = mockedInvoke.mock.calls.filter(
+      (c) => c[0] === 'issue_owner_recovery_token',
+    );
+    expect(issueCalls.length).toBe(0);
   });
 });
