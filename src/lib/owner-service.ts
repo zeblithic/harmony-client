@@ -29,6 +29,14 @@ export interface MintIpcResult {
 export interface ExportInfo {
   identityHash: string;
   byteLen: number;
+  path: string;
+}
+
+export interface ExportSavePathRequest {
+  title?: string;
+  defaultFilename: string;
+  filterName: string;
+  filterExtensions: string[];
 }
 
 /**
@@ -62,16 +70,20 @@ export class OwnerService {
 
   async exportRecoveryFile(
     recoveryToken: string,
-    path: string,
+    pathToken: string,
     passphrase: string,
     comment: string | null,
   ): Promise<ExportInfo> {
     return invoke<ExportInfo>('export_owner_recovery_file_to_path', {
       recoveryToken,
-      path,
+      pathToken,
       passphrase,
       comment,
     });
+  }
+
+  async requestExportSavePath(req: ExportSavePathRequest): Promise<string | null> {
+    return invoke<string | null>('request_export_save_path', { request: req });
   }
 }
 
