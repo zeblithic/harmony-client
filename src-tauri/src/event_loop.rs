@@ -504,7 +504,12 @@ pub async fn run<R: Runtime>(
                         // handlers. Pairing samples don't need to drive the
                         // runtime tick, so we `continue` the outer loop to skip
                         // `should_tick` for these.
-                        if key_expr.starts_with(&format!("{}/", crate::pairing::PAIRING_KEY_PREFIX)) {
+                        // Hot-path: this branch fires on every Zenoh subscription
+                        // sample (community updates, mail, voice, etc.), not just
+                        // pairing. The starts_with target must be a `&'static str`
+                        // — formatting `format!("{}/", PAIRING_KEY_PREFIX)` would
+                        // heap-allocate a fresh `String` every event.
+                        if key_expr.starts_with(crate::pairing::PAIRING_KEY_PREFIX_SLASH) {
                             if payload.len() > crate::pairing::MAX_PAIRING_WIRE_BYTES {
                                 tracing::warn!(
                                     "rejecting oversized pairing payload on {key_expr}: {} bytes > {}",
