@@ -122,7 +122,7 @@ fn format_fingerprint(id: &[u8; 16]) -> String {
 /// instead, take the parent of the per-device identity key path. Assumes
 /// `identity.key` is never at the filesystem root — true on every Tauri-
 /// supported OS (macOS / Linux / Windows).
-fn resolve_identity_dir() -> Result<PathBuf, String> {
+pub(crate) fn resolve_identity_dir() -> Result<PathBuf, String> {
     let key_path = crate::identity::resolve_path(None)?;
     key_path
         .parent()
@@ -181,7 +181,7 @@ pub async fn mint_owner_identity(
             &identity_dir,
             &state,
             &device_signing_key,
-            &*master_seed,
+            Some(&*master_seed),
             KeychainStore::new().ok(),
         )?;
         let token = insert_token(master_seed.clone());
@@ -219,7 +219,7 @@ pub async fn export_owner_recovery_file_to_path(
     // 256-BYTE cap matches harmony-owner's hard limit on the underlying
     // field. Frontend mirrors with a TextEncoder byte count before submit.
     let comment_validated = match comment {
-        Some(c) if c.as_bytes().len() > 256 => {
+        Some(c) if c.len() > 256 => {
             return Err("Recovery comment must be at most 256 bytes.".to_string());
         }
         c => c,

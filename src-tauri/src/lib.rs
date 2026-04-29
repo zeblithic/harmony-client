@@ -18,6 +18,8 @@ pub mod mail;
 pub mod mail_sync;
 pub mod owner_commands;
 pub mod owner_state;
+pub mod pairing;
+pub mod pairing_commands;
 pub mod recovery_cli;
 pub mod voice;
 
@@ -83,6 +85,7 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 /// crate and break `content_index_integration::chunked_ingest_pin_cascade_
 /// fetch_burn_roundtrip`. Treat this as crate-internal — no external
 /// consumers are expected.
+#[allow(clippy::type_complexity)] // pre-existing; tracked for cleanup
 pub fn chunk_and_bundle(
     bytes: &[u8],
 ) -> Result<
@@ -164,6 +167,10 @@ pub struct NodeState {
     generation: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
+    /// ZEB-197 v2 pairing state-machine handle. `Some` while the node is
+    /// running; the inner task drives the abstract pairing state machine
+    /// against a `ZenohPairingTransport` bound to the running event loop.
+    pairing_handle: Option<crate::pairing::state_machine::PairingHandle>,
 }
 
 impl NodeState {
@@ -197,6 +204,7 @@ impl Default for NodeState {
             )),
             generation: 0,
             node_addr: String::new(),
+            pairing_handle: None,
         }
     }
 }
@@ -356,6 +364,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _follow_mgr,
         _followed_set,
         _mail_sync,
+        pairing_handle,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -384,10 +393,17 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             // already gone above; the MailSync handle would just yield
             // "channel closed" errors until next start.
             guard.mail_sync.take(),
+            guard.pairing_handle.take(),
         )
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
+    // Drop the pairing handle BEFORE the publish_tx so the state machine
+    // task observes its mpsc shutdown cleanly: the handle owns the JoinHandle
+    // for the SM task; once dropped, the task's transport.recv path exits
+    // when its owned receiver hits None. We then drop publish_tx, which
+    // closes the event-loop publish channel.
+    drop(pairing_handle);
     drop(publish_tx); // drop sender so event loop's recv returns None
     drop(fetch_tx);
     drop(ingest_tx);
@@ -430,6 +446,11 @@ async fn start_node(
     // mail-root queryable.
     let (mail_refresh_tx, mail_refresh_rx) =
         tokio::sync::mpsc::channel::<crate::mail_sync::RefreshRequest>(8);
+    // ZEB-197 pairing wire-message inbound channel. The event loop fills
+    // this from `harmony/pairing/v2/lan/**` Zenoh subscription samples;
+    // the ZenohPairingTransport (constructed after ready_rx) drains it.
+    let (pairing_in_tx, pairing_in_rx) =
+        tokio::sync::mpsc::channel::<crate::pairing::types::PairingWireMessage>(64);
 
     // Load the follow list from disk and create the shared followed set.
     let app_data_dir = {
@@ -474,7 +495,12 @@ async fn start_node(
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
+        let old_pairing_handle = guard.pairing_handle.take();
         drop(guard);
+        // Drop pairing_handle BEFORE publish_tx so the SM task's transport
+        // sees its receiver close after the publish channel is gone — same
+        // ordering as stop_inner.
+        drop(old_pairing_handle);
         drop(old_publish);
         drop(old_fetch);
         drop(old_ingest);
@@ -640,6 +666,7 @@ async fn start_node(
                         pin_intent,
                         fetch_completion_tx,
                         fetch_completion_rx,
+                        Some(pairing_in_tx),
                     )
                     .await;
                 });
@@ -668,6 +695,116 @@ async fn start_node(
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
         Ok(Ok(())) => {
+            // ZEB-197: spawn the pairing state machine now that the
+            // event loop is up. Construct ZenohPairingTransport with
+            // a clone of publish_tx (publishes go through the running
+            // event loop) and the receiver half of pairing_in. Stash
+            // the handle on NodeState so stop_node can drop it.
+            let install_pairing = {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                if guard.generation != our_gen {
+                    // A newer start_node has raced us; do not install.
+                    None
+                } else {
+                    guard.publish_tx.as_ref().cloned()
+                }
+            };
+            if let Some(publish_tx_clone) = install_pairing {
+                let pairing_transport: std::sync::Arc<
+                    dyn crate::pairing::transport::PairingTransport,
+                > = std::sync::Arc::new(
+                    crate::pairing::zenoh_transport::ZenohPairingTransport::new(
+                        publish_tx_clone,
+                        pairing_in_rx,
+                    ),
+                );
+                let mut pairing_handle = crate::pairing::state_machine::spawn_state_machine(
+                    pairing_transport,
+                    std::sync::Arc::new(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    }),
+                    crate::pairing::state_machine::DEFAULT_DISCOVER_REBROADCAST_INTERVAL,
+                );
+                // Bridge pairing state changes to a Tauri frontend event.
+                // Clone state_rx before moving the handle into NodeState.
+                let mut prx = pairing_handle.state_rx.clone();
+                let app_clone = app.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if prx.changed().await.is_err() {
+                            break;
+                        }
+                        let s = prx.borrow().clone();
+                        let _ = app_clone.emit("pairing-state-changed", s);
+                    }
+                });
+
+                // ZEB-197 persistence drainers. The pairing state machine
+                // emits {Joiner,Inviter}EnrollResult on Complete; without
+                // these drainers the post-Complete state lives only in RAM
+                // and the user's DevicesPanel reverts on next start_node.
+                //
+                // Receivers are taken out of the handle (mpsc receivers are
+                // single-consumer, not Clone like watch::Receiver). The
+                // drainer task owns each receiver until the SM shuts down.
+                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::error!("cannot resolve identity_dir for pairing persistence: {e}");
+                        None
+                    }
+                };
+                if let Some(identity_dir) = identity_dir {
+                    if let Some(mut rx) = pairing_handle.joiner_result_rx.take() {
+                        let id_dir = identity_dir.clone();
+                        tokio::spawn(async move {
+                            while let Some(result) = rx.recv().await {
+                                match crate::pairing::persist::install_joiner_state(&id_dir, result)
+                                {
+                                    Ok(()) => {
+                                        tracing::info!("joiner pairing persisted successfully");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "failed to persist joiner pairing result: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
+                        let id_dir = identity_dir.clone();
+                        tokio::spawn(async move {
+                            while let Some(result) = rx.recv().await {
+                                match crate::pairing::persist::install_inviter_state(
+                                    &id_dir, result,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!("inviter pairing persisted successfully");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "failed to persist inviter pairing result: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
+                if let Ok(mut guard) = state.lock() {
+                    if guard.generation == our_gen {
+                        guard.pairing_handle = Some(pairing_handle);
+                    }
+                    // else: a newer start_node has replaced us; drop the
+                    // freshly spawned handle by letting it fall out of scope.
+                }
+            }
             let _ = app.emit(
                 "zenoh-status",
                 &ZenohStatus {
@@ -2969,6 +3106,12 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            pairing_commands::start_inviter_pairing,
+            pairing_commands::start_joiner_pairing,
+            pairing_commands::select_pairing_peer,
+            pairing_commands::confirm_pairing_sas,
+            pairing_commands::cancel_pairing,
+            pairing_commands::get_pairing_state,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

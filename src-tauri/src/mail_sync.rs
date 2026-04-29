@@ -26,6 +26,7 @@ pub struct SyncStatusEvent {
 
 /// Internal walker state.
 #[derive(Debug)]
+#[allow(dead_code)] // pre-existing; tracked for cleanup
 enum SyncState {
     Idle {
         last_walked_root: Option<[u8; CID_LEN]>,
@@ -1067,6 +1068,7 @@ mod tests {
         let (fetch_tx, fetch_rx) = mpsc::channel(32);
 
         // Build TWO different roots, each with one entry.
+        #[allow(clippy::type_complexity)] // pre-existing test helper; tracked for cleanup
         fn make_tree(seed: u8) -> ([u8; 32], Vec<([u8; 32], Vec<u8>)>) {
             let entry = MessageEntry {
                 message_cid: [seed; 32],
@@ -1352,6 +1354,7 @@ mod tests {
 
     /// Builds a one-entry mailbox tree keyed by `seed`. Returns the root CID
     /// and every CAS blob the walker will need to reach the entry.
+    #[allow(clippy::type_complexity)] // pre-existing test helper; tracked for cleanup
     fn make_one_entry_tree(seed: u8) -> ([u8; 32], Vec<([u8; 32], Vec<u8>)>) {
         let entry = MessageEntry {
             message_cid: [seed; 32],

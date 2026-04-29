@@ -135,7 +135,7 @@ describe('DevicesPanel — populated state', () => {
     expect(screen.getByText(/aa11·bb22/i)).toBeInTheDocument();
   });
 
-  it('renders educational footer for adding another device', async () => {
+  it('renders footer for adding another device', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1c8239b7dd809abcdef0123456789',
       ownerDisplayName: 'zeblith',
@@ -150,8 +150,7 @@ describe('DevicesPanel — populated state', () => {
       canBackUp: true,
     });
     render(DevicesPanel);
-    await screen.findByText(/add another device/i);
-    expect(screen.getByText(/pairing UI is coming/i)).toBeInTheDocument();
+    await screen.findByRole('button', { name: /add another device/i });
   });
 });
 
@@ -548,6 +547,35 @@ describe('DevicesPanel — comment byte-cap validates trimmed value', () => {
     );
     expect(exportCalls.length).toBe(1);
     expect(exportCalls[0][1]).toMatchObject({ comment: 'abc' });
+  });
+});
+
+describe('DevicesPanel — Track B v2 pairing CTAs', () => {
+  it('empty state renders both Bind and Join CTAs', async () => {
+    mockedInvoke.mockResolvedValueOnce(null); // get_owner_state -> null
+    render(DevicesPanel);
+    expect(await screen.findByRole('button', { name: /bind this device/i })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /join existing identity/i })).toBeInTheDocument();
+  });
+
+  it('populated state renders an active "Add another device" button', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    render(DevicesPanel);
+    const btn = await screen.findByRole('button', { name: /add another device/i });
+    expect(btn).toBeInTheDocument();
+    expect(btn).not.toBeDisabled();
   });
 });
 

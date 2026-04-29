@@ -556,7 +556,7 @@ impl MailManager {
             attachments,
             is_reply: msg.flags.is_reply(),
             is_forward: msg.flags.is_forward(),
-            in_reply_to: msg.in_reply_to.map(|id| hex::encode(id)),
+            in_reply_to: msg.in_reply_to.map(hex::encode),
             body_state: BodyState::Local,
         })
     }

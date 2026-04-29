@@ -3,6 +3,8 @@
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
   import { save } from '@tauri-apps/plugin-dialog';
+  import PairingInviter from './PairingInviter.svelte';
+  import PairingJoiner from './PairingJoiner.svelte';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -57,6 +59,9 @@
       loading = false;
     }
   });
+
+  let inviterOpen = $state(false);
+  let joinerOpen = $state(false);
 
   let backupOpen = $state(false);
   let backupPassphrase = $state('');
@@ -267,12 +272,17 @@
   {:else if state === null}
     <div class="empty">
       <p class="explainer">
-        You haven't created an owner identity yet. Once you do, this device will be
-        bound to it, and any other devices you add later will appear here.
+        You haven't created an owner identity yet. Either start a new one for this
+        device, or join an existing one already running on another of your devices.
       </p>
-      <button class="primary" onclick={() => { modalOpen = true; }}>
-        Bind this device to a new owner identity →
-      </button>
+      <div class="empty-actions">
+        <button class="primary" onclick={() => { modalOpen = true; }}>
+          Bind this device to a new owner identity →
+        </button>
+        <button class="secondary" onclick={() => { joinerOpen = true; }}>
+          Join existing identity →
+        </button>
+      </div>
     </div>
   {:else}
     <div class="populated">
@@ -341,14 +351,23 @@
         {/each}
       </div>
 
-      <!-- ③ Educational footer -->
+      <!-- ③ Add-another-device footer -->
       <div class="add-another-footer">
         <div class="label">ADD ANOTHER DEVICE</div>
-        <p class="explainer">
-          Pairing UI is coming. For now, multi-device coexistence requires the
-          <code>enroll_via_master</code> flow which ships in a follow-up. Currently
-          only one device is bound under your owner identity.
-        </p>
+        {#if state.canBackUp}
+          <button class="primary" onclick={() => { inviterOpen = true; }}>
+            Add another device →
+          </button>
+          <p class="explainer">
+            Both devices need to be on the same Wi-Fi network and in pairing mode.
+            The new device will join under your existing owner identity.
+          </p>
+        {:else}
+          <p class="explainer">
+            This device cannot enroll others — its master seed has been wiped.
+            Use a device that holds the master seed to add new devices.
+          </p>
+        {/if}
       </div>
     </div>
   {/if}
@@ -407,6 +426,19 @@
     </div>
   {/if}
 
+  {#if joinerOpen}
+    <PairingJoiner onClose={async () => {
+      joinerOpen = false;
+      await svc.refresh();
+    }} />
+  {/if}
+  {#if inviterOpen}
+    <PairingInviter hostname={state?.ownerDisplayName ?? 'this device'} onClose={async () => {
+      inviterOpen = false;
+      await svc.refresh();
+    }} />
+  {/if}
+
   {#if modalOpen}
     <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
       <div class="modal">
@@ -449,6 +481,7 @@
     font-size: 13px;
     margin-bottom: 12px;
   }
+  .empty-actions { display: flex; flex-direction: column; gap: 8px; }
   .primary, .secondary {
     padding: 6px 12px;
     border-radius: 4px;
@@ -587,13 +620,6 @@
     color: var(--text-secondary);
     line-height: 1.5;
     margin: 0;
-  }
-  .add-another-footer code {
-    font-family: monospace;
-    font-size: 11px;
-    background: var(--bg-tertiary);
-    padding: 1px 4px;
-    border-radius: 3px;
   }
   .rename-btn {
     font-size: 11px;

@@ -48,8 +48,14 @@ fn mint_save_export_decrypt_roundtrip() {
     let master_seed = *recovery_artifact.as_bytes();
 
     // 2. Persist
-    save_owner_state_atomic(dir.path(), &state, &device_signing_key, &master_seed, None)
-        .expect("save");
+    save_owner_state_atomic(
+        dir.path(),
+        &state,
+        &device_signing_key,
+        Some(&master_seed),
+        None,
+    )
+    .expect("save");
 
     // 3. Reload — confirm load round-trip
     let loaded = load_owner_state(dir.path(), None)

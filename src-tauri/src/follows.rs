@@ -114,6 +114,7 @@ impl FollowManager {
     }
 
     /// Returns `true` if the address is currently followed.
+    #[allow(dead_code)] // pre-existing; tracked for cleanup
     pub fn is_followed(&self, address: &str) -> bool {
         self.follows.iter().any(|e| e.address == address)
     }

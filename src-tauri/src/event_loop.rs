@@ -114,6 +114,7 @@ enum ZenohEvent {
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
 /// all initialized, or `Err(msg)` if any startup step fails.
 /// Returns when shutdown signal fires.
+#[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
 pub async fn run<R: Runtime>(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -135,6 +136,7 @@ pub async fn run<R: Runtime>(
     mut pin_intent: std::collections::HashSet<[u8; 32]>,
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
     mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
+    pairing_in_tx: Option<mpsc::Sender<crate::pairing::types::PairingWireMessage>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -302,6 +304,30 @@ pub async fn run<R: Runtime>(
     )
     .await;
 
+    // Subscribe to LAN pairing wire messages (ZEB-197 v2 pairing) ONLY when
+    // a pairing consumer (`pairing_in_tx`) was wired into this event loop.
+    // PR #63 review: an unconditional subscribe paid the Zenoh subscription
+    // cost (and exercised the ingress hot-path branch on every sample) for
+    // nodes that don't even host the pairing state machine. Idle devices
+    // still subscribe when the SM is wired — the SM's select! gate ensures
+    // we don't ACT on inbound messages outside an active session, but we
+    // need to be RECEIVING so the buffer is populated when a session starts.
+    if pairing_in_tx.is_some() {
+        dispatch_action(
+            RuntimeAction::Subscribe {
+                key_expr: crate::pairing::PAIRING_KEY_GLOB.to_string(),
+            },
+            &session,
+            &zenoh_tx,
+            &udp,
+            &broadcast_addr,
+            &app,
+            &closing,
+            &own_zid,
+        )
+        .await;
+    }
+
     // Subscribe to inbound mail for this node's address, plus the /root
     // pointer that the Phase 2 MailSync walker consumes. Both keys are
     // hoisted to the loop scope so the emit_frontend_event filter can
@@ -401,7 +427,6 @@ pub async fn run<R: Runtime>(
         .info()
         .peers_zid()
         .await
-        .into_iter()
         .map(|z| z.to_string())
         .collect();
     let mut peer_refresh_counter: u64 = 0;
@@ -451,12 +476,11 @@ pub async fn run<R: Runtime>(
                 // Driven by timer only (not Zenoh events) to avoid excessive
                 // peers_zid() calls under high message traffic.
                 peer_refresh_counter += 1;
-                if peer_refresh_counter % 20 == 0 {
+                if peer_refresh_counter.is_multiple_of(20) {
                     direct_peer_zids = session
                         .info()
                         .peers_zid()
                         .await
-                        .into_iter()
                         .map(|z| z.to_string())
                         .collect();
                 }
@@ -480,6 +504,50 @@ pub async fn run<R: Runtime>(
                         });
                     }
                     ZenohEvent::Subscription { key_expr, payload, source_zid } => {
+                        // Pairing keys are routed to the pairing state machine
+                        // (when present) and NOT forwarded to mail/vines/channels
+                        // handlers. Pairing samples don't need to drive the
+                        // runtime tick, so we `continue` the outer loop to skip
+                        // `should_tick` for these.
+                        // Hot-path: this branch fires on every Zenoh subscription
+                        // sample (community updates, mail, voice, etc.), not just
+                        // pairing. The starts_with target must be a `&'static str`
+                        // — formatting `format!("{}/", PAIRING_KEY_PREFIX)` would
+                        // heap-allocate a fresh `String` every event.
+                        if key_expr.starts_with(crate::pairing::PAIRING_KEY_PREFIX_SLASH) {
+                            // Note: oversized pairing payloads are dropped at the
+                            // producer (the Zenoh subscriber callback for
+                            // PAIRING_KEY_GLOB) before they enter zenoh_rx, so
+                            // by the time we get here the size cap is guaranteed
+                            // to hold. We don't re-check here — Cursor flagged
+                            // the duplicate as dead code, and a stale defensive
+                            // check is worse than none because it suggests the
+                            // invariant is enforced where it isn't.
+                            if let Some(tx) = pairing_in_tx.as_ref() {
+                                match ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(payload.as_slice()) {
+                                    Ok(msg) => {
+                                        // CRITICAL: must NOT await on a bounded channel here.
+                                        // The pairing state machine intentionally does not poll
+                                        // its receive end while idle (see state_machine.rs select!
+                                        // guard). On an always-on subscription with no consumer,
+                                        // `send().await` would block once the buffer fills (~64
+                                        // messages of LAN pairing chatter from peer devices),
+                                        // stalling the entire node event loop. Use try_send and
+                                        // drop on Full — pairing tolerates loss (peers re-emit
+                                        // Discover periodically; SAS verification surfaces any
+                                        // mid-handshake drop as a state-machine timeout).
+                                        if let Err(e) = tx.try_send(msg) {
+                                            tracing::warn!(
+                                                "pairing channel full or closed, dropping wire \
+                                                 message on key {key_expr}: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!("invalid pairing wire message on key {key_expr}: {e}"),
+                                }
+                            }
+                            continue;
+                        }
                         let hop_distance = source_zid.as_ref().map(|zid| {
                             if direct_peer_zids.contains(zid) { 1u8 } else { 2u8 }
                         });
@@ -797,6 +865,7 @@ pub async fn run<R: Runtime>(
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
+#[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
 async fn dispatch_action<R: Runtime>(
     action: RuntimeAction,
     session: &zenoh::Session,
@@ -891,7 +960,27 @@ async fn dispatch_action<R: Runtime>(
                     tokio::spawn(async move {
                         while let Ok(sample) = sub.recv_async().await {
                             let skey = sample.key_expr().to_string();
-                            let payload = sample.payload().to_bytes().to_vec();
+                            // PR #63 review (CodeRabbit): pairing-scope size
+                            // cap MUST run BEFORE the heap allocation, not
+                            // after. Earlier code did the check in the
+                            // consumer (event-loop) path, by which point a
+                            // hostile peer could fill the 256-slot zenoh_rx
+                            // channel with oversized buffers. Doing the
+                            // check on the bytes view skips both the .to_vec
+                            // allocation and the channel queue when the
+                            // payload is over-cap.
+                            let bytes = sample.payload().to_bytes();
+                            if skey.starts_with(crate::pairing::PAIRING_KEY_PREFIX_SLASH)
+                                && bytes.len() > crate::pairing::MAX_PAIRING_WIRE_BYTES
+                            {
+                                tracing::warn!(
+                                    "rejecting oversized pairing payload on {skey}: {} bytes > {}",
+                                    bytes.len(),
+                                    crate::pairing::MAX_PAIRING_WIRE_BYTES,
+                                );
+                                continue;
+                            }
+                            let payload = bytes.to_vec();
                             // Extract publisher's ZenohId from attachment (if present).
                             let source_zid = sample
                                 .attachment()

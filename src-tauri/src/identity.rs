@@ -722,6 +722,7 @@ pub fn resolve_path(override_path: Option<&Path>) -> Result<PathBuf, String> {
 /// Pre-ZEB-176 plaintext `~/.harmony/identity.key` files are no longer
 /// auto-migrated — users with a placeholder pre-ZEB-176 identity hard-fail
 /// and re-mint (acceptable per spec scope).
+#[allow(dead_code)] // pre-existing; tracked for cleanup
 fn load_or_generate_with_stores(
     keychain: Option<&KeychainStore>,
     encrypted: Option<&EncryptedFileStore>,
