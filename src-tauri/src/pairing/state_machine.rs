@@ -1124,15 +1124,39 @@ async fn on_encrypted_payload(
 mod tests {
     use super::*;
     use crate::pairing::transport::InMemoryBroker;
+    use async_trait::async_trait;
     use ed25519_dalek::SigningKey;
     use harmony_owner::lifecycle::{mint_owner, MintResult};
     use rand::rngs::OsRng;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+    use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::timeout;
     use zeroize::Zeroizing;
 
     fn fixed_clock(t: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(move || t)
+    }
+
+    /// Test transport that lets the test inject inbound wire messages
+    /// (via `publish_tx` outside) and capture every outbound publish (via
+    /// `published`). Used in tests where the SM needs to run against a
+    /// scripted peer rather than another live SM.
+    struct ScriptedTransport {
+        publish_tx: mpsc::Sender<PairingWireMessage>,
+        recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
+        published: StdMutex<Vec<PairingWireMessage>>,
+    }
+    #[async_trait]
+    impl PairingTransport for ScriptedTransport {
+        async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+            self.published.lock().unwrap().push(message.clone());
+            let _ = self.publish_tx.send(message).await;
+            Ok(())
+        }
+        async fn recv(&self) -> Option<PairingWireMessage> {
+            self.recv_rx.lock().await.recv().await
+        }
     }
 
     #[tokio::test]
@@ -1310,29 +1334,7 @@ mod tests {
     /// two distinct peers without spawning two more state machines.
     #[tokio::test]
     async fn select_from_unchosen_peer_does_not_advance() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         // out_tx is the SM's publish sink; we don't actually consume from
@@ -1593,29 +1595,7 @@ mod tests {
     /// only be pruned from our discovered list.
     #[tokio::test]
     async fn unselected_peer_cancel_only_prunes_discovered() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(16);
@@ -1731,29 +1711,7 @@ mod tests {
     /// broadcast post-selection would mislead other LAN devices).
     #[tokio::test]
     async fn discover_is_rebroadcast_until_select() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         let (in_tx, in_rx) = mpsc::channel::<PairingWireMessage>(16);
         let (out_tx, _out_rx) = mpsc::channel::<PairingWireMessage>(64);
@@ -2436,29 +2394,7 @@ mod tests {
     /// returns both to Idle without leaving stale ctx.
     #[tokio::test]
     async fn sas_mismatch_path() {
-        use crate::pairing::transport::PairingTransport;
-        use crate::pairing::types::PairingWireMessage;
-        use async_trait::async_trait;
-        use std::sync::Mutex as StdMutex;
-        use tokio::sync::Mutex as AsyncMutex;
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Sec};
-
-        struct ScriptedTransport {
-            publish_tx: mpsc::Sender<PairingWireMessage>,
-            recv_rx: AsyncMutex<mpsc::Receiver<PairingWireMessage>>,
-            published: StdMutex<Vec<PairingWireMessage>>,
-        }
-        #[async_trait]
-        impl PairingTransport for ScriptedTransport {
-            async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
-                self.published.lock().unwrap().push(message.clone());
-                let _ = self.publish_tx.send(message).await;
-                Ok(())
-            }
-            async fn recv(&self) -> Option<PairingWireMessage> {
-                self.recv_rx.lock().await.recv().await
-            }
-        }
 
         // Drive a SM to Handshaking by injecting a fake peer (with a known
         // X25519 secret so the test could derive the same session_key, though
