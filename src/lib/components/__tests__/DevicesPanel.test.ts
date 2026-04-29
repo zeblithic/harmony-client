@@ -449,3 +449,47 @@ describe('DevicesPanel — mint→backup token reuse', () => {
     expect(issueCalls.length).toBe(0);
   });
 });
+
+describe('DevicesPanel — stale backupError cleared between attempts', () => {
+  it('clears prior commit error before re-validating on the next click', async () => {
+    // Cursor round-5 finding: a backupError from a previous failed commit
+    // attempt within the same modal session would render alongside (or
+    // instead of) the current attempt's outcome unless cleared. The fix is
+    // backupError = null at the top of commitBackup before re-validating.
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd',
+        displayName: 'this',
+        isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000,
+        fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+
+    // First attempt: too short → renders length error.
+    await fireEvent.input(passInput, { target: { value: 'short' } });
+    await fireEvent.input(confirmInput, { target: { value: 'short' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+    expect(screen.getByText(/at least 12 characters/i)).toBeInTheDocument();
+
+    // Second attempt: long enough but mismatched. The "at least 12 characters"
+    // string MUST be gone; only "do not match" should render.
+    await fireEvent.input(passInput, { target: { value: 'twelve-char-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'different-passphrase' } });
+    await fireEvent.click(saveBtn);
+    expect(screen.queryByText(/at least 12 characters/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/do not match/i)).toBeInTheDocument();
+  });
+});

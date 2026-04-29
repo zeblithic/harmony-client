@@ -132,6 +132,15 @@
   }
 
   async function commitBackup() {
+    // Clear any error from a prior commit attempt in this same modal session
+    // BEFORE re-validating. Without this, a stale error string from the
+    // previous click can render alongside (or instead of) the current
+    // validation outcome — e.g., user fixes a passphrase mismatch but the
+    // "Passphrases do not match" string lingers because no early-return path
+    // resets backupError. The token/dialog/export path below has its own
+    // backupError = null (line above the export try block); this guards the
+    // pre-validation early-return paths.
+    backupError = null;
     if (recoveryToken === null) {
       backupError = 'No recovery token available.';
       return;
@@ -168,7 +177,6 @@
     }
     if (!out) return;
     backupInFlight = true;
-    backupError = null;
     try {
       await svc.exportRecoveryFile(
         recoveryToken,
