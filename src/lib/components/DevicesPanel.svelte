@@ -80,9 +80,13 @@
     const profile = loadProfile();
     saveProfile({ ...profile, displayName: trimmed });
     if (state) {
-      // Optimistic local update — refresh from backend on next mount.
+      // Optimistic local update — must mirror what applyLocalProfileOverlay
+      // does on refresh, so the owner header doesn't show the OLD name
+      // while the device row already shows the new one. v1 sources both
+      // names from profile.displayName (single field; see overlay docs).
       state = {
         ...state,
+        ownerDisplayName: trimmed,
         devices: state.devices.map((d) =>
           d.deviceId === deviceId ? { ...d, displayName: trimmed } : d,
         ),
@@ -102,12 +106,23 @@
     backupComment = '';
     backupError = null;
     backupSavedPath = null;
-    if (recoveryToken === null) {
-      try {
-        recoveryToken = await svc.issueRecoveryToken();
-      } catch (e) {
-        backupError = extractError(e);
-      }
+    // Recovery tokens are single-use AND TTL-bounded (5min server-side).
+    // Always discard any cached value and issue a fresh one — a token from
+    // a previous open could be expired, consumed, or LRU-evicted.
+    recoveryToken = null;
+    try {
+      recoveryToken = await svc.issueRecoveryToken();
+    } catch (e) {
+      backupError = extractError(e);
+    }
+  }
+
+  async function retryIssueToken() {
+    backupError = null;
+    try {
+      recoveryToken = await svc.issueRecoveryToken();
+    } catch (e) {
+      backupError = extractError(e);
     }
   }
 
@@ -171,12 +186,17 @@
 
   function closeBackup() {
     backupOpen = false;
+    // Tokens are single-use server-side; don't carry across opens.
+    recoveryToken = null;
   }
 
   function formatOwnerFingerprint(hex: string): string {
-    // 32 hex chars → "xxxx·xxxx·xxxx·xxxx" for readability
-    if (hex.length < 16) return hex;
-    return `${hex.slice(0,4)}·${hex.slice(4,8)}·${hex.slice(8,12)}·${hex.slice(12,16)}`;
+    // 32 hex chars (16 bytes) → eight groups of 4 hex chars separated by ·.
+    // Renders the FULL 16-byte owner identity hash so users can disambiguate
+    // their own owner identity from another's (truncating to 8 of 16 bytes
+    // would only cover half the entropy and weaken visual disambiguation).
+    if (hex.length < 32) return hex;
+    return hex.match(/.{4}/g)!.slice(0, 8).join('·');
   }
 
   function deviceInitial(name: string): string {
@@ -337,6 +357,13 @@
           {/if}
           <div class="modal-actions">
             <button class="secondary" onclick={closeBackup} disabled={backupInFlight}>Cancel</button>
+            {#if recoveryToken === null && backupError}
+              <!--
+                Token-issuance failed (e.g., locked keychain). Inline retry
+                avoids forcing the user to close + reopen the modal.
+              -->
+              <button class="secondary" onclick={retryIssueToken} disabled={backupInFlight}>Retry</button>
+            {/if}
             <!--
               Disable Save backup when no token is available (e.g., issue_owner_recovery_token
               failed during openBackup). Otherwise the user clicks Save and gets a confusing

@@ -12,6 +12,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 }));
 
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 
 import { loadProfile, saveProfile } from '../../profile-service';
 
@@ -24,7 +25,16 @@ const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 describe('DevicesPanel — empty + bootstrap states', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    // resetAllMocks (not clearAllMocks) to clear mockReturnValue/mockResolvedValue
+    // implementations between suites — otherwise stubs set in one describe block
+    // leak into later suites that don't explicitly mock the same fn (e.g.,
+    // loadProfile.mockReturnValue from rename suites would affect populated-state
+    // suites that rely on the no-op default).
+    vi.resetAllMocks();
+    // Re-establish defaults that file-level vi.mock factories set, since
+    // resetAllMocks wiped them too. The save dialog default keeps tests that
+    // don't care about its exact return value working.
+    vi.mocked(save).mockResolvedValue('/tmp/owner-recovery.bin');
   });
 
   it('renders empty state when get_owner_state returns null', async () => {

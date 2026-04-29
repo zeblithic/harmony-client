@@ -16,6 +16,7 @@ use secrecy::SecretString;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -142,9 +143,12 @@ pub async fn get_owner_state(_app: tauri::AppHandle) -> Result<Option<OwnerState
 
 #[tauri::command]
 pub async fn mint_owner_identity(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<MintIpcResult, String> {
+    // Fast-fail outside the blocking pool: gives the user a quick error if
+    // the node is already running, without waiting on the spawn_blocking
+    // queue. The authoritative check happens INSIDE the mint mutex below.
     require_node_stopped(&state)?;
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
@@ -155,6 +159,11 @@ pub async fn mint_owner_identity(
         // Recover from poisoning so a panic in one handler doesn't brick
         // future mints (mirrors PR-61's preview_cache_lock policy).
         let _mint_guard = MINT_OWNER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-check node status under the mint lock to close the TOCTOU
+        // window between the outer fast-fail check and acquiring the lock:
+        // another command could have started the node in that gap.
+        let node_state = app.state::<Mutex<crate::NodeState>>();
+        require_node_stopped(node_state.inner())?;
         // Refuse if already minted (idempotent failure).
         if identity_dir.join("owner_state.cbor").exists() {
             return Err(
