@@ -1,7 +1,10 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { save, open } from '@tauri-apps/plugin-dialog';
+  import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
+  import { OwnerService } from '../owner-service';
+
+  const svc = new OwnerService();
 
   function assertNever(x: never): never {
     throw new Error(`unhandled wizard variant: ${JSON.stringify(x)}`);
@@ -171,12 +174,13 @@
     // Capture epoch before first await (save dialog).
     const epoch = wizardState;
 
-    let outPath: string | null;
+    let pathToken: string | null;
     try {
-      outPath = await save({
+      pathToken = await svc.requestExportSavePath({
         title: 'Save recovery file',
-        defaultPath: 'identity.recovery',
-        filters: [{ name: 'Recovery file', extensions: ['recovery'] }],
+        defaultFilename: 'identity.recovery',
+        filterName: 'Recovery file',
+        filterExtensions: ['recovery'],
       });
     } catch {
       // Treat a dialog error the same as cancel — silent return to fileEntry.
@@ -187,20 +191,20 @@
     if (wizardState !== epoch) return;
 
     // User cancelled the dialog — silent return per spec.
-    if (!outPath) return;
+    if (pathToken === null) return;
 
     // Capture epoch again before the second await (file write).
     const epoch2 = wizardState;
 
     try {
-      await invoke('export_recovery_file_to_path', {
-        outPath,
+      const savedPath = await invoke<string>('export_recovery_file_to_path', {
+        pathToken,
         passphrase,
         comment: comment || null,
       });
 
       if (wizardState !== epoch2) return;
-      wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath: outPath } };
+      wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath } };
     } catch (e) {
       if (wizardState !== epoch2) return;
       // Carry the form input forward so Back returns the user to a populated
@@ -209,7 +213,7 @@
         kind: 'backup',
         step: {
           phase: 'fileSaveError',
-          error: `Could not save to ${outPath}: ${e}. Try a different location.`,
+          error: `Could not save to the chosen location: ${e}. Try a different location.`,
           passphrase,
           passphraseConfirm,
           comment,
