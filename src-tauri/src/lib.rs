@@ -18,6 +18,7 @@ pub mod mail;
 pub mod mail_sync;
 pub mod owner_commands;
 pub mod owner_state;
+pub mod pairing;
 pub mod recovery_cli;
 pub mod voice;
 
