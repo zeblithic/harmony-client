@@ -1886,7 +1886,17 @@ mod tests {
             let count_before = cancel_count.load(Ordering::Relaxed);
 
             handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Deterministic ack: Cancel handler at L175 unconditionally calls
+            // state_tx.send(Idle), even when ctx is None. tokio::watch bumps
+            // its version on every send (regardless of value equality), so
+            // rx.changed() fires once the SM has actually processed this
+            // command. After wait_for above marked the post-first-Cancel
+            // Idle as "seen", the next changed() blocks until the second
+            // send — proving the SM picked up our message before we sample.
+            timeout(Duration::from_secs(2), rx.changed())
+                .await
+                .unwrap_or_else(|_| panic!("[{label}] SM did not process second Cancel within 2s"))
+                .unwrap();
 
             assert!(
                 matches!(*handle.state_rx.borrow(), PairingState::Idle),
@@ -1911,7 +1921,13 @@ mod tests {
                 ..
             } = mint_owner(1_700_000_000).unwrap();
             let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
-            let (inviter_t, _joiner_t) = InMemoryBroker::pair();
+            // CRITICAL: bind the joiner side to a named keepalive — the
+            // underscore prefix silences "unused" but the variable is
+            // load-bearing. Dropping it closes the broker's joiner→inviter
+            // channel, which makes inviter.recv() return None and trips
+            // run_state_machine's `return` arm at L180, killing the SM
+            // before we can observe the cancel sequence below.
+            let (inviter_t, _joiner_broker_keepalive) = InMemoryBroker::pair();
             let cancel_count = Arc::new(AtomicUsize::new(0));
             let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(CountCancelTransport {
                 inner: Arc::new(inviter_t),
@@ -2653,7 +2669,15 @@ mod tests {
                 .count();
 
             handle.cmd_tx.send(PairingCommand::Cancel).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Deterministic ack: see assert_idle_and_clean for the
+            // watch::Sender version-bump rationale. Cancel handler always
+            // calls state_tx.send(Idle), so rx.changed() fires when the SM
+            // has actually picked up this no-op command — no fixed sleep
+            // and no race even on a loaded CI runner.
+            timeout(Duration::from_secs(2), rx.changed())
+                .await
+                .unwrap_or_else(|_| panic!("{label}: SM did not process second Cancel within 2s"))
+                .unwrap();
 
             assert!(
                 matches!(*handle.state_rx.borrow(), PairingState::Idle),
