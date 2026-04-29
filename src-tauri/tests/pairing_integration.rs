@@ -12,6 +12,7 @@
 
 use ed25519_dalek::SigningKey;
 use harmony_app::pairing::{
+    persist::{install_inviter_state, install_joiner_state},
     state_machine::{spawn_state_machine, PairingCommand, PairingHandle},
     transport::{InMemoryBroker, PairingTransport},
     types::{PairingState, PairingWireMessage},
@@ -192,6 +193,151 @@ async fn drive_to_handshake(inviter_handle: &PairingHandle, joiner_handle: &Pair
     })
     .await
     .expect("joiner handshake");
+}
+
+/// Critical regression test for the post-Complete persistence wiring.
+///
+/// Reproduces the bug found by the final ZEB-197 reviewer: the SM emitted
+/// {Joiner,Inviter}EnrollResult, but nothing in `start_node` drained the
+/// receivers, so the on-disk `.cbor` was never updated. The integration
+/// test below pairs two devices, drains BOTH receivers, calls the
+/// persistence helpers against per-side tempdirs, and asserts that:
+///
+///   - Inviter side: `owner_state.cbor` reflects the new enrollment;
+///     `master_seed.enc` is preserved (Inviter keeps master);
+///     `device_sk.enc` is preserved (existing signing key untouched).
+///   - Joiner side: `owner_state.cbor` exists with both enrollments;
+///     `device_sk.enc` exists; `master_seed.enc` does NOT exist
+///     (cert-only model — Joiner has no master).
+#[tokio::test]
+async fn end_to_end_persists_state_to_disk() {
+    use harmony_app::owner_state::{load_owner_state, save_owner_state_atomic};
+    use tempfile::tempdir;
+
+    // Inviter side: fresh mint persisted to disk so install_inviter_state
+    // has something to update. The encrypted-file fallback needs a passphrase.
+    std::env::set_var("HARMONY_PASSPHRASE", "test-pp");
+    let inviter_dir = tempdir().unwrap();
+    let joiner_dir = tempdir().unwrap();
+
+    let MintResult {
+        state: original_state,
+        recovery_artifact,
+        device_signing_key: inviter_signing_key,
+    } = mint_owner(1_700_000_000).unwrap();
+    let master_seed_bytes: [u8; 32] = *recovery_artifact.as_bytes();
+    save_owner_state_atomic(
+        inviter_dir.path(),
+        &original_state,
+        &inviter_signing_key,
+        Some(&master_seed_bytes),
+        None,
+    )
+    .unwrap();
+    let original_inviter_signing_bytes = inviter_signing_key.to_bytes();
+
+    let master_seed = Zeroizing::new(master_seed_bytes);
+    let joiner_sk = SigningKey::generate(&mut OsRng);
+
+    let (inviter_t, joiner_t) = InMemoryBroker::pair();
+    let inviter_t_arc: Arc<dyn PairingTransport> = Arc::new(inviter_t);
+    let joiner_t_arc: Arc<dyn PairingTransport> = Arc::new(joiner_t);
+    let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 1_700_000_001);
+    let inviter_handle = spawn_state_machine(inviter_t_arc, now_fn.clone());
+    let joiner_handle = spawn_state_machine(joiner_t_arc, now_fn.clone());
+
+    inviter_handle
+        .cmd_tx
+        .send(PairingCommand::StartInviter {
+            display_name: "KRILE".to_string(),
+            owner_state: original_state.clone(),
+            master_seed,
+        })
+        .await
+        .unwrap();
+    joiner_handle
+        .cmd_tx
+        .send(PairingCommand::StartJoiner {
+            display_name: "AVALON".to_string(),
+            signing_key: joiner_sk,
+        })
+        .await
+        .unwrap();
+
+    drive_to_handshake(&inviter_handle, &joiner_handle).await;
+    drive_to_complete(&inviter_handle, &joiner_handle).await;
+
+    // Drain BOTH result receivers — this is exactly what the start_node
+    // drainer tasks do in production.
+    let mut joiner_rx = joiner_handle.joiner_result_rx.expect("joiner result rx");
+    let joiner_result = timeout(Duration::from_secs(2), joiner_rx.recv())
+        .await
+        .expect("joiner result arrives")
+        .expect("not None");
+    let mut inviter_rx = inviter_handle.inviter_result_rx.expect("inviter result rx");
+    let inviter_result = timeout(Duration::from_secs(2), inviter_rx.recv())
+        .await
+        .expect("inviter result arrives")
+        .expect("not None");
+
+    // Persist both sides to their respective tempdirs.
+    let new_device_id = joiner_result.our_device_id;
+    install_joiner_state(joiner_dir.path(), joiner_result).expect("joiner persist");
+    install_inviter_state(inviter_dir.path(), inviter_result).expect("inviter persist");
+
+    // ── Inviter side assertions ───────────────────────────────────────
+    let reloaded_inviter = load_owner_state(inviter_dir.path(), None)
+        .expect("load inviter")
+        .expect("inviter state present");
+    assert!(
+        reloaded_inviter
+            .state
+            .enrollments
+            .contains_key(&new_device_id),
+        "Inviter's persisted state contains the new joiner's enrollment"
+    );
+    assert_eq!(
+        reloaded_inviter.state.enrollments.len(),
+        original_state.enrollments.len() + 1,
+        "Inviter's persisted state has exactly one new enrollment"
+    );
+    assert_eq!(
+        reloaded_inviter.device_signing_key.to_bytes(),
+        original_inviter_signing_bytes,
+        "Inviter's signing key preserved across pairing+persist"
+    );
+    let reloaded_inviter_seed = reloaded_inviter
+        .master_seed
+        .expect("Inviter master seed preserved");
+    assert_eq!(
+        *reloaded_inviter_seed, master_seed_bytes,
+        "Inviter's master seed preserved across pairing+persist"
+    );
+
+    // ── Joiner side assertions ────────────────────────────────────────
+    let joiner_cbor = joiner_dir.path().join("owner_state.cbor");
+    assert!(joiner_cbor.exists(), "Joiner owner_state.cbor written");
+    let joiner_master = joiner_dir.path().join("master_seed.enc");
+    assert!(
+        !joiner_master.exists(),
+        "Joiner master_seed.enc must NOT exist (cert-only model)"
+    );
+    let joiner_device_sk = joiner_dir.path().join("device_sk.enc");
+    assert!(joiner_device_sk.exists(), "Joiner device_sk.enc written");
+    let reloaded_joiner = load_owner_state(joiner_dir.path(), None)
+        .expect("load joiner")
+        .expect("joiner state present");
+    assert!(
+        reloaded_joiner
+            .state
+            .enrollments
+            .contains_key(&new_device_id),
+        "Joiner's persisted state contains its own enrollment"
+    );
+    assert!(
+        reloaded_joiner.master_seed.is_none(),
+        "Joiner has no master seed on disk"
+    );
 }
 
 async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &PairingHandle) {

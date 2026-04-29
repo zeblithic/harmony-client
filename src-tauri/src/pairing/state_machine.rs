@@ -41,11 +41,26 @@ pub struct JoinerEnrollResult {
     pub our_device_id: [u8; 16],
 }
 
+/// Output from the state machine for the Inviter side, when enrollment of a
+/// new peer device succeeds. The persistence layer consumes this to write
+/// the freshly-mutated `OwnerState` to disk so the new enrollment survives
+/// restarts. Unlike the Joiner result, this carries no signing key — the
+/// Inviter already has its own signing key persisted on disk; the persistence
+/// layer reloads it via `load_owner_state` and rewrites the state file
+/// atomically alongside the existing key.
+pub struct InviterEnrollResult {
+    pub owner_state: OwnerState,
+    /// The master seed — Inviter HAS this (cert-only model only restricts the
+    /// Joiner). Persisting it via `Some(seed)` keeps `canBackUp: true`.
+    pub master_seed: Zeroizing<[u8; 32]>,
+}
+
 /// Handle the UI talks to. Drops the state machine on drop.
 pub struct PairingHandle {
     pub state_rx: watch::Receiver<PairingState>,
     pub cmd_tx: mpsc::Sender<PairingCommand>,
     pub joiner_result_rx: Option<mpsc::Receiver<JoinerEnrollResult>>,
+    pub inviter_result_rx: Option<mpsc::Receiver<InviterEnrollResult>>,
     _shutdown: tokio::task::JoinHandle<()>,
 }
 
@@ -56,15 +71,22 @@ pub fn spawn_state_machine(
     let (state_tx, state_rx) = watch::channel(PairingState::Idle);
     let (cmd_tx, cmd_rx) = mpsc::channel::<PairingCommand>(16);
     let (result_tx, result_rx) = mpsc::channel::<JoinerEnrollResult>(1);
+    let (inviter_result_tx, inviter_result_rx) = mpsc::channel::<InviterEnrollResult>(1);
 
     let task = tokio::spawn(run_state_machine(
-        transport, state_tx, cmd_rx, result_tx, now_fn,
+        transport,
+        state_tx,
+        cmd_rx,
+        result_tx,
+        inviter_result_tx,
+        now_fn,
     ));
 
     PairingHandle {
         state_rx,
         cmd_tx,
         joiner_result_rx: Some(result_rx),
+        inviter_result_rx: Some(inviter_result_rx),
         _shutdown: task,
     }
 }
@@ -74,6 +96,7 @@ async fn run_state_machine(
     state_tx: watch::Sender<PairingState>,
     mut cmd_rx: mpsc::Receiver<PairingCommand>,
     result_tx: mpsc::Sender<JoinerEnrollResult>,
+    inviter_result_tx: mpsc::Sender<InviterEnrollResult>,
     now_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) {
     // Per-session local context. Reset each time we leave a session.
@@ -105,7 +128,15 @@ async fn run_state_machine(
                     }
                     PairingCommand::ConfirmSas => {
                         if let Some(c) = ctx.as_mut() {
-                            on_confirm_sas(&transport, &state_tx, c, &now_fn, &result_tx).await;
+                            on_confirm_sas(
+                                &transport,
+                                &state_tx,
+                                c,
+                                &now_fn,
+                                &result_tx,
+                                &inviter_result_tx,
+                            )
+                            .await;
                         }
                     }
                     PairingCommand::Cancel => {
@@ -123,7 +154,16 @@ async fn run_state_machine(
             }
             msg = transport.recv(), if ctx.is_some() => {
                 let Some(msg) = msg else { return; };
-                handle_wire_message(&transport, &state_tx, &mut ctx, msg, &now_fn, &result_tx).await;
+                handle_wire_message(
+                    &transport,
+                    &state_tx,
+                    &mut ctx,
+                    msg,
+                    &now_fn,
+                    &result_tx,
+                    &inviter_result_tx,
+                )
+                .await;
             }
         }
     }
@@ -368,6 +408,7 @@ async fn on_confirm_sas(
     ctx: &mut SessionCtx,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
 ) {
     let Some(session_key) = ctx.session_key else {
         return;
@@ -412,7 +453,7 @@ async fn on_confirm_sas(
 
     let _ = state_tx.send(PairingState::WaitingPeerConfirm { peer_session_id });
 
-    maybe_advance_to_enroll(transport, state_tx, ctx, now_fn).await;
+    maybe_advance_to_enroll(transport, state_tx, ctx, now_fn, inviter_result_tx).await;
     // Joiner waits for the ENROLL message; the receive path emits Enrolling and
     // then completes. result_tx is only consumed on the Joiner side via
     // on_encrypted_payload::Enroll.
@@ -428,6 +469,7 @@ async fn maybe_advance_to_enroll(
     state_tx: &watch::Sender<PairingState>,
     ctx: &mut SessionCtx,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
 ) {
     if !(ctx.our_confirmed && ctx.peer_confirmed) {
         return;
@@ -524,6 +566,18 @@ async fn maybe_advance_to_enroll(
         .await;
 
     ctx.cert_sent = true;
+
+    // Emit the InviterEnrollResult so the persistence layer (drained in
+    // start_node) can write the freshly-mutated OwnerState back to disk.
+    // Without this, the new enrollment lives only in RAM and the Inviter's
+    // DevicesPanel reverts to showing only itself on next start_node.
+    let _ = inviter_result_tx
+        .send(InviterEnrollResult {
+            owner_state: owner_state.clone(),
+            master_seed: master_seed.clone(),
+        })
+        .await;
+
     let device_id = joiner_pubkey.identity_hash();
     let _ = state_tx.send(PairingState::Complete {
         device_id_hex: hex::encode(device_id),
@@ -537,6 +591,7 @@ async fn handle_wire_message(
     msg: PairingWireMessage,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
 ) {
     // Safety: callers only invoke this when ctx.is_some() (enforced by the
     // select! guard), EXCEPT the Cancel arm which explicitly sets ctx to None.
@@ -661,7 +716,16 @@ async fn handle_wire_message(
                     return;
                 }
             };
-            on_encrypted_payload(transport, state_tx, c, payload, now_fn, result_tx).await;
+            on_encrypted_payload(
+                transport,
+                state_tx,
+                c,
+                payload,
+                now_fn,
+                result_tx,
+                inviter_result_tx,
+            )
+            .await;
         }
         PairingWireMessage::Cancel { my_session_id, .. } => {
             // React if the sender is our selected peer OR a peer we have
@@ -691,6 +755,7 @@ async fn on_encrypted_payload(
     payload: EncryptedPayload,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
+    inviter_result_tx: &mpsc::Sender<InviterEnrollResult>,
 ) {
     match payload {
         EncryptedPayload::Confirm { sas_digits } => {
@@ -709,7 +774,7 @@ async fn on_encrypted_payload(
             // ourselves. Previously the scaffold tried to do this without
             // `transport` in scope; we now thread it through.
             if ctx.our_confirmed {
-                maybe_advance_to_enroll(transport, state_tx, ctx, now_fn).await;
+                maybe_advance_to_enroll(transport, state_tx, ctx, now_fn, inviter_result_tx).await;
             }
         }
         EncryptedPayload::Enroll {

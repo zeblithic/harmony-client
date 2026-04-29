@@ -718,7 +718,7 @@ async fn start_node(
                         pairing_in_rx,
                     ),
                 );
-                let pairing_handle = crate::pairing::state_machine::spawn_state_machine(
+                let mut pairing_handle = crate::pairing::state_machine::spawn_state_machine(
                     pairing_transport,
                     std::sync::Arc::new(|| {
                         std::time::SystemTime::now()
@@ -740,6 +740,62 @@ async fn start_node(
                         let _ = app_clone.emit("pairing-state-changed", s);
                     }
                 });
+
+                // ZEB-197 persistence drainers. The pairing state machine
+                // emits {Joiner,Inviter}EnrollResult on Complete; without
+                // these drainers the post-Complete state lives only in RAM
+                // and the user's DevicesPanel reverts on next start_node.
+                //
+                // Receivers are taken out of the handle (mpsc receivers are
+                // single-consumer, not Clone like watch::Receiver). The
+                // drainer task owns each receiver until the SM shuts down.
+                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::error!("cannot resolve identity_dir for pairing persistence: {e}");
+                        None
+                    }
+                };
+                if let Some(identity_dir) = identity_dir {
+                    if let Some(mut rx) = pairing_handle.joiner_result_rx.take() {
+                        let id_dir = identity_dir.clone();
+                        tokio::spawn(async move {
+                            while let Some(result) = rx.recv().await {
+                                match crate::pairing::persist::install_joiner_state(&id_dir, result)
+                                {
+                                    Ok(()) => {
+                                        tracing::info!("joiner pairing persisted successfully");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "failed to persist joiner pairing result: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    if let Some(mut rx) = pairing_handle.inviter_result_rx.take() {
+                        let id_dir = identity_dir.clone();
+                        tokio::spawn(async move {
+                            while let Some(result) = rx.recv().await {
+                                match crate::pairing::persist::install_inviter_state(
+                                    &id_dir, result,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!("inviter pairing persisted successfully");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "failed to persist inviter pairing result: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
                 if let Ok(mut guard) = state.lock() {
                     if guard.generation == our_gen {
                         guard.pairing_handle = Some(pairing_handle);
