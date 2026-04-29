@@ -171,7 +171,7 @@ impl ContentIndex {
         // Symmetric with save(): if data_dir is empty, `path` is the bare
         // filename "content-index.json" and would resolve to CWD. Don't read
         // a stray CWD sidecar into the default/uninitialised state.
-        let path_is_bare = path.parent().map_or(true, |p| p.as_os_str().is_empty());
+        let path_is_bare = path.parent().is_none_or(|p| p.as_os_str().is_empty());
         let entries = if path_is_bare {
             HashMap::new()
         } else {
@@ -202,10 +202,7 @@ impl ContentIndex {
         // bare filename "content-index.json", which would land in the
         // process's current working directory. A properly-initialised path
         // always has a non-empty parent; we use that as the liveness check.
-        let path_is_bare = self
-            .path
-            .parent()
-            .map_or(true, |p| p.as_os_str().is_empty());
+        let path_is_bare = self.path.parent().is_none_or(|p| p.as_os_str().is_empty());
         if path_is_bare {
             tracing::warn!(
                 "content-index save called before start_node initialised the sidecar path; \

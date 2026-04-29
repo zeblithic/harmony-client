@@ -114,6 +114,7 @@ enum ZenohEvent {
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
 /// all initialized, or `Err(msg)` if any startup step fails.
 /// Returns when shutdown signal fires.
+#[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
 pub async fn run<R: Runtime>(
     mut runtime: NodeRuntime<MemoryBookStore>,
     startup_actions: Vec<RuntimeAction>,
@@ -421,7 +422,6 @@ pub async fn run<R: Runtime>(
         .info()
         .peers_zid()
         .await
-        .into_iter()
         .map(|z| z.to_string())
         .collect();
     let mut peer_refresh_counter: u64 = 0;
@@ -471,12 +471,11 @@ pub async fn run<R: Runtime>(
                 // Driven by timer only (not Zenoh events) to avoid excessive
                 // peers_zid() calls under high message traffic.
                 peer_refresh_counter += 1;
-                if peer_refresh_counter % 20 == 0 {
+                if peer_refresh_counter.is_multiple_of(20) {
                     direct_peer_zids = session
                         .info()
                         .peers_zid()
                         .await
-                        .into_iter()
                         .map(|z| z.to_string())
                         .collect();
                 }
@@ -839,6 +838,7 @@ pub async fn run<R: Runtime>(
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.
+#[allow(clippy::too_many_arguments)] // pre-existing; tracked for refactor
 async fn dispatch_action<R: Runtime>(
     action: RuntimeAction,
     session: &zenoh::Session,

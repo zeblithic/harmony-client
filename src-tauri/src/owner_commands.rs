@@ -219,7 +219,7 @@ pub async fn export_owner_recovery_file_to_path(
     // 256-BYTE cap matches harmony-owner's hard limit on the underlying
     // field. Frontend mirrors with a TextEncoder byte count before submit.
     let comment_validated = match comment {
-        Some(c) if c.as_bytes().len() > 256 => {
+        Some(c) if c.len() > 256 => {
             return Err("Recovery comment must be at most 256 bytes.".to_string());
         }
         c => c,

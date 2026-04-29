@@ -1,5 +1,5 @@
 use harmony_owner::certs::EnrollmentCert;
-use harmony_owner::lifecycle::{mint_owner, RecoveryArtifact};
+use harmony_owner::lifecycle::RecoveryArtifact;
 use harmony_owner::pubkey_bundle::PubKeyBundle;
 use harmony_owner::state::OwnerState;
 use zeroize::Zeroizing;
@@ -89,7 +89,7 @@ pub fn verify_cert_for_self(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use harmony_owner::lifecycle::MintResult;
+    use harmony_owner::lifecycle::{mint_owner, MintResult};
     use harmony_owner::trust::DEFAULT_ACTIVE_WINDOW_SECS;
     use rand::rngs::OsRng;
 

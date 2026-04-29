@@ -85,6 +85,7 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 /// crate and break `content_index_integration::chunked_ingest_pin_cascade_
 /// fetch_burn_roundtrip`. Treat this as crate-internal — no external
 /// consumers are expected.
+#[allow(clippy::type_complexity)] // pre-existing; tracked for cleanup
 pub fn chunk_and_bundle(
     bytes: &[u8],
 ) -> Result<

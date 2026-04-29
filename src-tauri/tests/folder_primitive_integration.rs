@@ -325,7 +325,7 @@ async fn pin_folder_cascades_to_nested_leaf() {
         })
         .await
         .unwrap();
-    assert_eq!(reply_rx.await.unwrap().unwrap(), true);
+    assert!(reply_rx.await.unwrap().unwrap());
 
     // Inspect the pinned set — cascade should include all three CIDs.
     let (reply_tx, reply_rx) = oneshot::channel();
