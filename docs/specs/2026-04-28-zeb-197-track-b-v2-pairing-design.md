@@ -51,7 +51,7 @@ Both are explicit, user-driven mode entries. Pairing mode is opt-in and ephemera
 
 All messages flow over a Zenoh key-prefix scoped to a per-pairing-attempt session ID:
 
-```
+```text
 harmony/pairing/v2/lan/<session-id>/{discover,select,confirm,enroll,cancel}
 ```
 
@@ -147,7 +147,7 @@ None during pairing — sessions are entirely RAM-resident. The Joiner's POST-En
 
 ## Data flow (happy path)
 
-```
+```text
 Inviter (OLD)                            Joiner (NEW)
 ─────────────                            ────────────
 DevicesPanel populated

@@ -30,6 +30,11 @@ export class PairingService {
 
   async init(): Promise<void> {
     this.state = (await invoke<PairingState>('get_pairing_state'));
+    // Notify after initial load so a UI bound only to onChange (e.g. one
+    // that doesn't snapshot `state` at construction time) renders the
+    // backend-authoritative state on first paint, not just after the next
+    // event arrives.
+    this.onChange?.();
     this.unlistener = await listen('pairing-state-changed', (event) => {
       this.state = event.payload as PairingState;
       this.onChange?.();

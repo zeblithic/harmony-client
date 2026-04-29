@@ -85,7 +85,9 @@ pub enum PairingWireMessage {
         peer_session_id: Uuid,
     },
     /// Encrypted-payload envelope. Inner bytes are XChaCha20-Poly1305
-    /// ciphertext; the inner plaintext is `EncryptedPayload` JSON.
+    /// ciphertext; the inner plaintext is `EncryptedPayload` encoded with
+    /// CBOR via ciborium (matches the wire encoding used everywhere else
+    /// in this crate; the roundtrip tests below verify it).
     Encrypted {
         my_session_id: Uuid,
         peer_session_id: Uuid,
