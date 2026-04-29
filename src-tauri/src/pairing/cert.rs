@@ -39,14 +39,20 @@ pub fn sign_enrollment_for_joiner(
     )
     .map_err(|e| format!("sign_master: {e}"))?;
     drop(master_sk);
+    drop(artifact); // defense-in-depth: bound master key material lifetime regardless of RecoveryArtifact's internal Zeroize impl
 
     Ok(cert)
 }
 
 /// Verify a received EnrollmentCert before persisting it on the Joiner side.
 /// Checks: cert.owner_id matches expected, cert.device_id matches our pubkey,
-/// signature verifies against the embedded master pubkey (via add_enrollment's
-/// internal check — we just call add_enrollment on a temp clone of state).
+/// signature verifies against the embedded master pubkey.
+///
+/// The signature check is performed by calling `OwnerState::add_enrollment`
+/// on a fresh throwaway state. This works because `add_enrollment` validates
+/// the cert against the master pubkey embedded in the cert itself — it does
+/// not depend on any prior enrollments existing in the state. The probe
+/// state is discarded; only the verification result matters.
 pub fn verify_cert_for_self(
     cert: &EnrollmentCert,
     expected_owner_id: [u8; 16],
