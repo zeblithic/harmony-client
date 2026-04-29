@@ -217,4 +217,16 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
     })
     .await
     .expect("joiner completes");
+
+    let mut inviter_state = inviter_handle.state_rx.clone();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            inviter_state.changed().await.unwrap();
+            if matches!(*inviter_state.borrow(), PairingState::Complete { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("inviter completes");
 }
