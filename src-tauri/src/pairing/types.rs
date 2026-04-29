@@ -148,8 +148,9 @@ mod tests {
             display_name: "AVALON".to_string(),
             owner_id_if_inviter: None,
         };
-        let bytes = serde_cbor::to_vec(&m).unwrap();
-        let back: PairingWireMessage = serde_cbor::from_slice(&bytes).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&m, &mut bytes).unwrap();
+        let back: PairingWireMessage = ciborium::from_reader(bytes.as_slice()).unwrap();
         assert!(matches!(back, PairingWireMessage::Discover { .. }));
     }
 
@@ -158,8 +159,9 @@ mod tests {
         let p = EncryptedPayload::Confirm {
             sas_digits: "012845".to_string(),
         };
-        let bytes = serde_cbor::to_vec(&p).unwrap();
-        let back: EncryptedPayload = serde_cbor::from_slice(&bytes).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&p, &mut bytes).unwrap();
+        let back: EncryptedPayload = ciborium::from_reader(bytes.as_slice()).unwrap();
         match back {
             EncryptedPayload::Confirm { sas_digits } => assert_eq!(sas_digits, "012845"),
             _ => panic!("wrong variant"),
