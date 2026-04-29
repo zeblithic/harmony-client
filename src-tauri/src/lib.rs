@@ -21,6 +21,7 @@ pub mod owner_state;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod recovery_cli;
+mod save_dialog;
 pub mod voice;
 
 // ── Chunked ingest (ZEB-154) ──────────────────────────────────────────────
@@ -3130,6 +3131,7 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
             pairing_commands::start_joiner_pairing,
             pairing_commands::select_pairing_peer,
