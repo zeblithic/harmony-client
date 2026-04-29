@@ -115,7 +115,7 @@ mod tests {
 
 - [ ] **Step 4: Run the test — must fail with "type not found"**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::types::tests`
+Run: `cargo test -p harmony-app --lib pairing::types::tests`
 Expected: compile error citing `PairingState`, `PairingRole`, etc. not found.
 
 - [ ] **Step 5: Implement the types**
@@ -272,12 +272,12 @@ mod tests {
 
 - [ ] **Step 6: Run all four tests — must pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::types::tests`
+Run: `cargo test -p harmony-app --lib pairing::types::tests`
 Expected: 4 passed.
 
 - [ ] **Step 7: cargo fmt**
 
-Run: `cargo fmt -p harmony-client-tauri` (run from `src-tauri/`)
+Run: `cargo fmt -p harmony-app` (run from `src-tauri/`)
 
 - [ ] **Step 8: Commit**
 
@@ -308,7 +308,7 @@ chacha20poly1305 = "0.10"
 
 (Most likely `sha2` is already present transitively; explicit is OK.)
 
-Run `cargo build -p harmony-client-tauri` to confirm the deps resolve.
+Run `cargo build -p harmony-app` to confirm the deps resolve.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -422,7 +422,7 @@ pub use types::*;
 
 - [ ] **Step 3: Run the tests — must fail with "missing dep" or compile error first time**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::sas::tests`
+Run: `cargo test -p harmony-app --lib pairing::sas::tests`
 Expected: clean run if deps resolved; otherwise compile error pointing at missing crates.
 
 - [ ] **Step 4: If tests fail because deps need updating**
@@ -436,7 +436,7 @@ Expected: 4 passed.
 - [ ] **Step 6: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/pairing/sas.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): X25519 ECDH + HKDF + 6-digit SAS derivation (ZEB-197)"
 ```
@@ -527,13 +527,13 @@ Add `pub mod session;` to `src-tauri/src/pairing/mod.rs`.
 
 - [ ] **Step 2: Run the tests — must compile and pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::session::tests`
+Run: `cargo test -p harmony-app --lib pairing::session::tests`
 Expected: 4 passed.
 
 - [ ] **Step 3: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing/session.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): XChaCha20-Poly1305 session encryption helpers (ZEB-197)"
 ```
@@ -774,13 +774,13 @@ pub use types::*;
 
 - [ ] **Step 2: Run the tests — must pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::cert::tests`
+Run: `cargo test -p harmony-app --lib pairing::cert::tests`
 Expected: 4 passed.
 
 - [ ] **Step 3: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing/cert.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): cert sign (Inviter) + verify (Joiner) helpers (ZEB-197)"
 ```
@@ -905,13 +905,13 @@ async-trait = "0.1"
 
 - [ ] **Step 2: Run the test — must pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::transport::tests`
+Run: `cargo test -p harmony-app --lib pairing::transport::tests`
 Expected: 1 passed.
 
 - [ ] **Step 3: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/pairing/transport.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): PairingTransport trait + InMemoryTransport for tests (ZEB-197)"
 ```
@@ -1727,7 +1727,7 @@ mod tests {
 
 - [ ] **Step 4: Run the test — must pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::state_machine::tests::happy_path_two_devices_pair`
+Run: `cargo test -p harmony-app --lib pairing::state_machine::tests::happy_path_two_devices_pair`
 Expected: 1 passed.
 
 (If it fails, the most likely culprit is the `Confirm` echo timing — review the `peer_confirmed` propagation logic in `on_encrypted_payload` and ensure the inviter's `maybe_advance_to_enroll` runs after `peer_confirmed = true`. May need to refactor the cross-call communication; see comment in `on_encrypted_payload` for the workaround spot.)
@@ -1735,7 +1735,7 @@ Expected: 1 passed.
 - [ ] **Step 5: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing/state_machine.rs src-tauri/src/pairing/types.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): transport-agnostic state machine + happy-path test (ZEB-197)"
 ```
@@ -1849,13 +1849,13 @@ Add `pub mod persist;` to `src-tauri/src/pairing/mod.rs`.
 
 - [ ] **Step 2: Run the test — must pass**
 
-Run: `cargo test -p harmony-client-tauri --lib pairing::persist::tests --test-threads=1`
+Run: `cargo test -p harmony-app --lib pairing::persist::tests --test-threads=1`
 Expected: 1 passed.
 
 - [ ] **Step 3: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing/persist.rs src-tauri/src/pairing/mod.rs
 git commit -m "feat(pairing): joiner persistence wires JoinerEnrollResult to atomic disk write (ZEB-197)"
 ```
@@ -2014,13 +2014,13 @@ In `stop_node` (the inner stop):
 
 - [ ] **Step 5: Verify the integration compiles**
 
-Run: `cargo build -p harmony-client-tauri`
+Run: `cargo build -p harmony-app`
 Expected: clean build.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing/zenoh_transport.rs src-tauri/src/pairing/mod.rs src-tauri/src/lib.rs src-tauri/src/event_loop.rs
 git commit -m "feat(pairing): wire Zenoh transport + pairing handle into NodeState (ZEB-197)"
 ```
@@ -2181,13 +2181,13 @@ Also add `pub mod pairing_commands;` near the other pub-mods at the top of `src-
 
 - [ ] **Step 4: Verify the build**
 
-Run: `cargo build -p harmony-client-tauri`
+Run: `cargo build -p harmony-app`
 Expected: clean build.
 
 - [ ] **Step 5: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/src/pairing_commands.rs src-tauri/src/lib.rs
 git commit -m "feat(pairing): six Tauri IPC commands + state-changed event (ZEB-197)"
 ```
@@ -2993,7 +2993,7 @@ Create `src-tauri/tests/pairing_integration.rs`:
 //! captured during the run.
 
 use ed25519_dalek::SigningKey;
-use harmony_client_tauri::pairing::{
+use harmony_app::pairing::{
     state_machine::{spawn_state_machine, PairingCommand, PairingHandle},
     transport::{InMemoryBroker, PairingTransport},
     types::{PairingState, PairingWireMessage},
@@ -3144,17 +3144,17 @@ async fn drive_to_complete(
 }
 ```
 
-> **Note:** the test imports `harmony_client_tauri::pairing::*` — confirm the crate name in `src-tauri/Cargo.toml` (could be `harmony_client_tauri` or similar; adjust the use statements).
+> **Note:** the test imports `harmony_app::pairing::*` — confirm the crate name in `src-tauri/Cargo.toml` (could be `harmony_client_tauri` or similar; adjust the use statements).
 
 - [ ] **Step 2: Run the integration test**
 
-Run: `cargo test -p harmony-client-tauri --test pairing_integration`
+Run: `cargo test -p harmony-app --test pairing_integration`
 Expected: 1 passed.
 
 - [ ] **Step 3: cargo fmt + commit**
 
 ```bash
-cargo fmt -p harmony-client-tauri
+cargo fmt -p harmony-app
 git add src-tauri/tests/pairing_integration.rs
 git commit -m "test(pairing): end-to-end integration test with master-seed-leak assertion (ZEB-197)"
 ```
@@ -3169,7 +3169,7 @@ git commit -m "test(pairing): end-to-end integration test with master-seed-leak 
 - [ ] **Step 1: Run `cargo fmt --check`**
 
 Run: `cd src-tauri && cargo fmt --check && cd ..`
-Expected: no diff. If not, run `cargo fmt -p harmony-client-tauri` and commit the fmt fix.
+Expected: no diff. If not, run `cargo fmt -p harmony-app` and commit the fmt fix.
 
 - [ ] **Step 2: Run all backend tests**
 
