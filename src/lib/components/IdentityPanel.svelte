@@ -22,6 +22,11 @@
   // typed-prefix gate uncomparable until the real hash is in hand.
   let currentPrefix = $derived(fullHash ? fullHash.slice(0, 8) : '');
   let loadError = $state<string | null>(null);
+  // True while a backup save dialog or export IPC call is in flight. Blocks
+  // the Continue button so a fast double-click cannot queue parallel save
+  // dialogs and parallel export_recovery_file_to_path writes (CodeRabbit,
+  // PR #66 review). Cleared in advanceFromFileEntry's outer finally.
+  let backupInFlight = $state(false);
   // True while a restore IPC call is in flight. Blocks the Replace button so
   // double-click cannot issue duplicate restore_* requests against the store.
   let restoreInFlight = $state(false);
@@ -171,54 +176,64 @@
     const { passphrase, passphraseConfirm, comment } = wizardState.step;
     if (!passphrase || passphrase !== passphraseConfirm) return;
 
-    // Capture epoch before first await (save dialog).
-    const epoch = wizardState;
-
-    let pathToken: string | null;
+    // Set busy flag BEFORE the save dialog opens so a fast double-click on
+    // Continue cannot queue parallel dialogs and parallel exports
+    // (CodeRabbit, PR #66 review). Outer try/finally guarantees the flag
+    // is cleared on every exit path — including the epoch-cancel returns
+    // where wizardState changed under us during a pending await.
+    backupInFlight = true;
     try {
-      pathToken = await svc.requestExportSavePath({
-        title: 'Save recovery file',
-        defaultFilename: 'identity.recovery',
-        filterName: 'Recovery file',
-        filterExtensions: ['recovery'],
-      });
-    } catch {
-      // Treat a dialog error the same as cancel — silent return to fileEntry.
-      return;
-    }
+      // Capture epoch before first await (save dialog).
+      const epoch = wizardState;
 
-    // Guard: did the user cancel the wizard while the dialog was open?
-    if (wizardState !== epoch) return;
+      let pathToken: string | null;
+      try {
+        pathToken = await svc.requestExportSavePath({
+          title: 'Save recovery file',
+          defaultFilename: 'identity.recovery',
+          filterName: 'Recovery file',
+          filterExtensions: ['recovery'],
+        });
+      } catch {
+        // Treat a dialog error the same as cancel — silent return to fileEntry.
+        return;
+      }
 
-    // User cancelled the dialog — silent return per spec.
-    if (pathToken === null) return;
+      // Guard: did the user cancel the wizard while the dialog was open?
+      if (wizardState !== epoch) return;
 
-    // Capture epoch again before the second await (file write).
-    const epoch2 = wizardState;
+      // User cancelled the dialog — silent return per spec.
+      if (pathToken === null) return;
 
-    try {
-      const savedPath = await invoke<string>('export_recovery_file_to_path', {
-        pathToken,
-        passphrase,
-        comment: comment || null,
-      });
+      // Capture epoch again before the second await (file write).
+      const epoch2 = wizardState;
 
-      if (wizardState !== epoch2) return;
-      wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath } };
-    } catch (e) {
-      if (wizardState !== epoch2) return;
-      // Carry the form input forward so Back returns the user to a populated
-      // form rather than blank fields (Cursor review feedback).
-      wizardState = {
-        kind: 'backup',
-        step: {
-          phase: 'fileSaveError',
-          error: `Could not save to the chosen location: ${e}. Try a different location.`,
+      try {
+        const savedPath = await invoke<string>('export_recovery_file_to_path', {
+          pathToken,
           passphrase,
-          passphraseConfirm,
-          comment,
-        },
-      };
+          comment: comment || null,
+        });
+
+        if (wizardState !== epoch2) return;
+        wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath } };
+      } catch (e) {
+        if (wizardState !== epoch2) return;
+        // Carry the form input forward so Back returns the user to a populated
+        // form rather than blank fields (Cursor review feedback).
+        wizardState = {
+          kind: 'backup',
+          step: {
+            phase: 'fileSaveError',
+            error: `Could not save to the chosen location: ${e}. Try a different location.`,
+            passphrase,
+            passphraseConfirm,
+            comment,
+          },
+        };
+      }
+    } finally {
+      backupInFlight = false;
     }
   }
 
@@ -644,7 +659,7 @@
       <div class="actions">
         <button onclick={resetToIdle}>Cancel</button>
         <button
-          disabled={!wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
+          disabled={backupInFlight || !wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
           onclick={advanceFromFileEntry}
         >Continue</button>
       </div>

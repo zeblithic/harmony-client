@@ -175,6 +175,10 @@
       backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
       return;
     }
+    // Set busy flag BEFORE the save dialog opens so a fast double-click
+    // on Save backup cannot queue a second dialog and consume the
+    // single-use recovery token twice (CodeRabbit, PR #66 review).
+    backupInFlight = true;
     let pathToken: string | null;
     try {
       pathToken = await svc.requestExportSavePath({
@@ -184,10 +188,13 @@
       });
     } catch (e) {
       backupError = extractError(e);
+      backupInFlight = false;
       return;
     }
-    if (pathToken === null) return;  // user cancelled
-    backupInFlight = true;
+    if (pathToken === null) {
+      backupInFlight = false;  // user cancelled
+      return;
+    }
     try {
       const info = await svc.exportRecoveryFile(
         recoveryToken,
@@ -195,6 +202,12 @@
         backupPassphrase,
         trimmedComment ? trimmedComment : null,
       );
+      // Wipe passphrase fields immediately on success — shortens secret
+      // retention in the renderer between this point and closeBackup
+      // (CodeRabbit, PR #66 review). closeBackup also wipes them; this
+      // is belt-and-braces.
+      backupPassphrase = '';
+      backupPassphraseConfirm = '';
       backupSavedPath = info.path;
     } catch (e) {
       backupError = extractError(e);

@@ -474,6 +474,19 @@ pub async fn export_recovery_file_to_path(
     comment: Option<String>,
 ) -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
+    // Validate comment length BEFORE consuming the single-use path token.
+    // Otherwise a too-long comment burns the token and forces the user
+    // to re-pick a save path for a purely local validation error.
+    // Mirrors the equivalent pre-take guards in
+    // `owner_commands::export_owner_recovery_file_to_path`.
+    if let Some(c) = comment.as_deref() {
+        let len = c.len();
+        if len > MAX_RECOVERY_COMMENT_BYTES {
+            return Err(format!(
+                "comment is too large ({len} bytes; max {MAX_RECOVERY_COMMENT_BYTES} bytes)"
+            ));
+        }
+    }
     let path_uuid: Uuid = path_token
         .parse()
         .map_err(|e| format!("invalid path token: {e}"))?;

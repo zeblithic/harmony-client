@@ -144,8 +144,12 @@ pub(crate) fn clear_token_cache() {
 // `PathBuf` and don't. Type-level separation prevents "wrong token type"
 // runtime bugs.
 
-const PATH_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
-const MAX_LIVE_PATH_TOKENS: usize = 8;
+// Couple to TOKEN_TTL/MAX_LIVE_TOKENS so the two caches age and evict in
+// lockstep — separate constants invite silent drift if one is updated
+// later without the other. If path tokens ever warrant a different
+// lifetime (e.g., shorter because paths are non-secret), decouple here.
+const PATH_TOKEN_TTL: Duration = TOKEN_TTL;
+const MAX_LIVE_PATH_TOKENS: usize = MAX_LIVE_TOKENS;
 
 struct PathTokenEntry {
     path: std::path::PathBuf,
