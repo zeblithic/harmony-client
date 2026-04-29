@@ -123,9 +123,7 @@ async fn run_state_machine(
             }
             msg = transport.recv(), if ctx.is_some() => {
                 let Some(msg) = msg else { return; };
-                // ctx.is_some() is the precondition; unwrap is safe here.
-                let c = ctx.as_mut().expect("ctx checked by select guard");
-                handle_wire_message(&transport, &state_tx, c, msg, &now_fn, &result_tx).await;
+                handle_wire_message(&transport, &state_tx, &mut ctx, msg, &now_fn, &result_tx).await;
             }
         }
     }
@@ -171,6 +169,9 @@ struct SessionCtx {
     // After Confirm:
     our_confirmed: bool,
     peer_confirmed: bool,
+
+    // Inviter idempotency: true once ENROLL has been signed and published.
+    cert_sent: bool,
 }
 
 impl SessionCtx {
@@ -198,6 +199,7 @@ impl SessionCtx {
             sas_digits: None,
             our_confirmed: false,
             peer_confirmed: false,
+            cert_sent: false,
         }
     }
 }
@@ -383,11 +385,13 @@ async fn on_confirm_sas(
     let payload = EncryptedPayload::Confirm {
         sas_digits: sas_digits.clone(),
     };
-    let pt = {
-        let mut b = Vec::new();
-        ciborium::into_writer(&payload, &mut b).expect("CBOR encode cannot fail");
-        b
-    };
+    let mut pt = Vec::new();
+    if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("encode payload: {e}"),
+        });
+        return;
+    }
     let (nonce, ct) = match session_encrypt(&session_key, &pt) {
         Ok(p) => p,
         Err(e) => {
@@ -437,6 +441,9 @@ async fn maybe_advance_to_enroll(
     // Idempotency: if we've already shipped the cert, do not re-enter.
     // (Once the Inviter has signed + sent ENROLL, owner_state has the new
     // enrollment installed; arriving late peer-CONFIRM should be a no-op.)
+    if ctx.cert_sent {
+        return;
+    }
     let _ = state_tx.send(PairingState::Enrolling);
 
     let owner_state = ctx.owner_state.as_mut().expect("inviter has owner_state");
@@ -471,26 +478,32 @@ async fn maybe_advance_to_enroll(
         return;
     }
 
-    let cert_cbor = {
-        let mut b = Vec::new();
-        ciborium::into_writer(&cert, &mut b).expect("cert serializable");
-        b
-    };
-    let state_cbor = {
-        let mut b = Vec::new();
-        ciborium::into_writer(&*owner_state, &mut b).expect("state serializable");
-        b
-    };
+    let mut cert_cbor = Vec::new();
+    if let Err(e) = ciborium::into_writer(&cert, &mut cert_cbor) {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("encode cert: {e}"),
+        });
+        return;
+    }
+    let mut state_cbor = Vec::new();
+    if let Err(e) = ciborium::into_writer(&*owner_state, &mut state_cbor) {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("encode owner_state: {e}"),
+        });
+        return;
+    }
     let payload = EncryptedPayload::Enroll {
         enrollment_cert_cbor_hex: hex::encode(&cert_cbor),
         owner_state_cbor_hex: hex::encode(&state_cbor),
         joiner_advisory_display_name: ctx.selected_peer_display_name.clone().unwrap_or_default(),
     };
-    let pt = {
-        let mut b = Vec::new();
-        ciborium::into_writer(&payload, &mut b).expect("payload serializable");
-        b
-    };
+    let mut pt = Vec::new();
+    if let Err(e) = ciborium::into_writer(&payload, &mut pt) {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("encode payload: {e}"),
+        });
+        return;
+    }
     let session_key = ctx.session_key.expect("session key after handshake");
     let (nonce, ct) = match session_encrypt(&session_key, &pt) {
         Ok(p) => p,
@@ -510,6 +523,7 @@ async fn maybe_advance_to_enroll(
         })
         .await;
 
+    ctx.cert_sent = true;
     let device_id = joiner_pubkey.identity_hash();
     let _ = state_tx.send(PairingState::Complete {
         device_id_hex: hex::encode(device_id),
@@ -519,11 +533,14 @@ async fn maybe_advance_to_enroll(
 async fn handle_wire_message(
     transport: &Arc<dyn PairingTransport>,
     state_tx: &watch::Sender<PairingState>,
-    ctx: &mut SessionCtx,
+    ctx: &mut Option<SessionCtx>,
     msg: PairingWireMessage,
     now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
     result_tx: &mpsc::Sender<JoinerEnrollResult>,
 ) {
+    // Safety: callers only invoke this when ctx.is_some() (enforced by the
+    // select! guard), EXCEPT the Cancel arm which explicitly sets ctx to None.
+    // We borrow the inner ctx for all non-Cancel arms.
     match msg {
         PairingWireMessage::Discover {
             session_id,
@@ -533,24 +550,26 @@ async fn handle_wire_message(
             owner_id_if_inviter,
             joiner_ed25519_verify_hex,
         } => {
+            let Some(c) = ctx.as_mut() else {
+                return;
+            };
             // Ignore our own discoveries (echo).
-            if session_id == ctx.session_id {
+            if session_id == c.session_id {
                 return;
             }
             // Only collect peers of the OPPOSITE role.
-            if role == ctx.role {
+            if role == c.role {
                 return;
             }
             // De-dup by session_id.
-            if ctx
-                .discovered_peers
+            if c.discovered_peers
                 .iter()
                 .any(|p| p.session_id == session_id)
             {
                 return;
             }
             let now = (now_fn)();
-            ctx.discovered_peers.push(DiscoveredPeer {
+            c.discovered_peers.push(DiscoveredPeer {
                 session_id,
                 role,
                 display_name,
@@ -560,19 +579,22 @@ async fn handle_wire_message(
                 seen_at_unix: now,
             });
             let _ = state_tx.send(PairingState::Discovered {
-                peers: ctx.discovered_peers.clone(),
+                peers: c.discovered_peers.clone(),
             });
         }
         PairingWireMessage::Select {
             my_session_id,
             peer_session_id,
         } => {
+            let Some(c) = ctx.as_mut() else {
+                return;
+            };
             // Only act if the peer is selecting US.
-            if peer_session_id != ctx.session_id {
+            if peer_session_id != c.session_id {
                 return;
             }
             // Only act if we have already discovered this peer.
-            if !ctx
+            if !c
                 .discovered_peers
                 .iter()
                 .any(|p| p.session_id == my_session_id)
@@ -582,8 +604,8 @@ async fn handle_wire_message(
             // Track that the peer has selected us. We might see this BEFORE we
             // have selected them locally; in that case we wait for the local
             // user's tap. `maybe_advance_to_handshake` enforces both sides.
-            ctx.received_select = true;
-            maybe_advance_to_handshake(state_tx, ctx);
+            c.received_select = true;
+            maybe_advance_to_handshake(state_tx, c);
         }
         PairingWireMessage::Encrypted {
             my_session_id,
@@ -591,13 +613,16 @@ async fn handle_wire_message(
             nonce_hex,
             ciphertext_hex,
         } => {
-            if peer_session_id != ctx.session_id {
+            let Some(c) = ctx.as_mut() else {
+                return;
+            };
+            if peer_session_id != c.session_id {
                 return;
             }
-            if Some(my_session_id) != ctx.selected_peer_session_id {
+            if Some(my_session_id) != c.selected_peer_session_id {
                 return;
             }
-            let Some(session_key) = ctx.session_key else {
+            let Some(session_key) = c.session_key else {
                 return;
             };
             let nonce = match hex::decode(&nonce_hex) {
@@ -610,7 +635,7 @@ async fn handle_wire_message(
                 }
             };
             let ct = match hex::decode(&ciphertext_hex) {
-                Ok(c) => c,
+                Ok(ct) => ct,
                 Err(e) => {
                     let _ = state_tx.send(PairingState::Failed {
                         reason: format!("ct hex: {e}"),
@@ -636,10 +661,23 @@ async fn handle_wire_message(
                     return;
                 }
             };
-            on_encrypted_payload(transport, state_tx, ctx, payload, now_fn, result_tx).await;
+            on_encrypted_payload(transport, state_tx, c, payload, now_fn, result_tx).await;
         }
         PairingWireMessage::Cancel { my_session_id, .. } => {
-            if Some(my_session_id) == ctx.selected_peer_session_id {
+            // React if the sender is our selected peer OR a peer we have
+            // discovered but not yet selected (pre-selection cancel).
+            let is_our_peer = ctx
+                .as_ref()
+                .map(|c| {
+                    // Post-selection: they are our chosen peer.
+                    c.selected_peer_session_id == Some(my_session_id)
+                    // Pre-selection: they appear in our discovered list.
+                    || c.discovered_peers.iter().any(|p| p.session_id == my_session_id)
+                })
+                .unwrap_or(false);
+            if is_our_peer {
+                // Drop the session context (mirrors the local-Cancel path).
+                *ctx = None;
                 let _ = state_tx.send(PairingState::Idle);
             }
         }
@@ -918,5 +956,89 @@ mod tests {
             .owner_state
             .enrollments
             .contains_key(&original_inviter_device_id));
+    }
+
+    /// Regression test for Fix 2: when the remote peer sends Cancel, the
+    /// receiving state machine must clear its ctx so no further wire messages
+    /// can advance it (e.g. re-emit Discovered from a stale peer list).
+    #[tokio::test]
+    async fn cancel_drops_ctx_on_remote_cancel() {
+        let MintResult {
+            state,
+            recovery_artifact,
+            ..
+        } = mint_owner(1_700_000_000).unwrap();
+        let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+
+        let (inviter_t, joiner_t) = InMemoryBroker::pair();
+        let inviter_handle = spawn_state_machine(Arc::new(inviter_t), fixed_clock(1_700_000_001));
+        let joiner_handle = spawn_state_machine(Arc::new(joiner_t), fixed_clock(1_700_000_002));
+
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::StartInviter {
+                display_name: "KRILE".to_string(),
+                owner_state: state,
+                master_seed,
+            })
+            .await
+            .unwrap();
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::StartJoiner {
+                display_name: "AVALON".to_string(),
+                signing_key: joiner_sk,
+            })
+            .await
+            .unwrap();
+
+        let mut inviter_state = inviter_handle.state_rx.clone();
+
+        // Wait for Inviter to reach Discovered.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Discovered { .. }))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches Discovered");
+
+        // Joiner sends Cancel — this publishes a CANCEL wire message that the
+        // Inviter will receive.
+        joiner_handle
+            .cmd_tx
+            .send(PairingCommand::Cancel)
+            .await
+            .unwrap();
+
+        // Inviter must transition to Idle.
+        timeout(Duration::from_secs(2), async {
+            inviter_state
+                .wait_for(|s| matches!(s, PairingState::Idle))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("inviter reaches Idle after remote cancel");
+
+        // Verify ctx has been cleared: send a local Cancel from the Inviter.
+        // Because ctx is None, the Cancel handler should skip publishing and
+        // the state stays Idle (no panic, no state change).
+        inviter_handle
+            .cmd_tx
+            .send(PairingCommand::Cancel)
+            .await
+            .unwrap();
+
+        // Give the state machine a moment to process the command.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // State must still be Idle — not Discovered, not Failed.
+        assert!(
+            matches!(*inviter_handle.state_rx.borrow(), PairingState::Idle),
+            "inviter remains Idle after no-op Cancel (ctx was already None)"
+        );
     }
 }
