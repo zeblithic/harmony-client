@@ -20,12 +20,26 @@ use tauri::Manager;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// Process-wide mutex for the mint flow. The design spec calls for a
-/// single-flight guard: two concurrent `mint_owner_identity` calls (e.g., via
-/// rapid double-click reaching the `spawn_blocking` thread pool) must not
-/// both pass the file-existence check and race to write competing OwnerStates.
-/// Held across the entire check-and-write window.
-static MINT_OWNER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// Process-wide mutex for **all writers of `owner_state.cbor` and its
+/// companion seed/key entries** — mint plus the pairing-persist drainer
+/// that calls `install_inviter_state` / `install_joiner_state` after a
+/// successful pair. Without this serialization (ZEB-199), two concurrent
+/// pairing-Completes can both load the pre-mutation OwnerState, each add
+/// their own enrollment, and one writer's enrollment is silently lost
+/// when the second `save_owner_state_atomic` overwrites the first.
+///
+/// Originally introduced as `MINT_OWNER_LOCK` in PR #62 to guard the
+/// mint check-and-write window against rapid double-click; renamed to
+/// reflect its broader role during ZEB-199 review. Held across each
+/// caller's entire load+save window. Recover from poisoning so a panic
+/// in one handler doesn't brick future writes (mirrors PR-61's
+/// preview_cache_lock policy).
+///
+/// Note: this lock does NOT cover `rotate_passphrase` /
+/// `restore_recovery_from_preview_token`, which write the encrypted-file
+/// fallback (`identity.key.enc`) but not `owner_state.cbor`. See ZEB-201
+/// for the parallel race on those paths.
+pub(crate) static OWNER_STATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const ERR_NODE_RUNNING: &str =
     "Stop the node before minting an owner identity (the node must not be holding owner-scoped keys during mint).";
@@ -153,12 +167,16 @@ pub async fn mint_owner_identity(
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
     run_blocking(move || {
-        // Hold the process-wide mint mutex for the entire check-and-write
-        // window. Without this, concurrent mints could both observe an
-        // absent owner_state.cbor and race to write competing OwnerStates.
-        // Recover from poisoning so a panic in one handler doesn't brick
-        // future mints (mirrors PR-61's preview_cache_lock policy).
-        let _mint_guard = MINT_OWNER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Hold the process-wide owner-state write mutex for the entire
+        // check-and-write window. Without this, concurrent mints could both
+        // observe an absent owner_state.cbor and race to write competing
+        // OwnerStates; pairing-persist callers (ZEB-199) take the same lock
+        // for the same reason on the load+save side. Recover from
+        // poisoning so a panic in one handler doesn't brick future writes
+        // (mirrors PR-61's preview_cache_lock policy).
+        let _owner_write_guard = OWNER_STATE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Re-check node status under the mint lock to close the TOCTOU
         // window between the outer fast-fail check and acquiring the lock:
         // another command could have started the node in that gap.
