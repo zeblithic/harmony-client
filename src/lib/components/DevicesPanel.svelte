@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
-  import { save } from '@tauri-apps/plugin-dialog';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
 
@@ -176,26 +175,27 @@
       backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
       return;
     }
-    let out: string | null;
+    let pathToken: string | null;
     try {
-      out = await save({
-        defaultPath: 'owner-recovery.bin',
-        filters: [{ name: 'Recovery file', extensions: ['bin'] }],
+      pathToken = await svc.requestExportSavePath({
+        defaultFilename: 'owner-recovery.bin',
+        filterName: 'Recovery file',
+        filterExtensions: ['bin'],
       });
     } catch (e) {
       backupError = extractError(e);
       return;
     }
-    if (!out) return;
+    if (pathToken === null) return;  // user cancelled
     backupInFlight = true;
     try {
-      await svc.exportRecoveryFile(
+      const info = await svc.exportRecoveryFile(
         recoveryToken,
-        out,
+        pathToken,
         backupPassphrase,
         trimmedComment ? trimmedComment : null,
       );
-      backupSavedPath = out;
+      backupSavedPath = info.path;
     } catch (e) {
       backupError = extractError(e);
     } finally {

@@ -6,13 +6,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
 }));
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({
-  save: vi.fn().mockResolvedValue('/tmp/owner-recovery.bin'),
-  open: vi.fn(),
-}));
-
 import { invoke } from '@tauri-apps/api/core';
-import { save } from '@tauri-apps/plugin-dialog';
 
 import { loadProfile, saveProfile } from '../../profile-service';
 
@@ -28,11 +22,8 @@ const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 // mockReturnValue/mockResolvedValue implementations so stubs from one suite
 // don't leak into the next (e.g., loadProfile.mockReturnValue from rename
 // suites bleeding into populated-state suites via applyLocalProfileOverlay).
-// The save() default is reapplied because resetAllMocks wiped the vi.mock
-// factory's mockResolvedValue too.
 beforeEach(() => {
   vi.resetAllMocks();
-  vi.mocked(save).mockResolvedValue('/tmp/owner-recovery.bin');
 });
 
 describe('DevicesPanel — empty + bootstrap states', () => {
@@ -365,6 +356,9 @@ describe('DevicesPanel — stale token cleared after export failure', () => {
     });
     // First openBackup → issue token
     mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    // request_export_save_path → returns opaque path token. (User picked a
+    // location in the native dialog; backend cached the path under this UUID.)
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid');
     // exportRecoveryFile FAILS (e.g., disk write error). Backend already
     // consumed the token via take_token before the failure point.
     mockedInvoke.mockRejectedValueOnce(new Error('disk write failed'));
@@ -519,8 +513,15 @@ describe('DevicesPanel — comment byte-cap validates trimmed value', () => {
       canBackUp: true,
     });
     mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
-    // Successful export → returns ExportInfo (shape doesn't matter for assertion).
-    mockedInvoke.mockResolvedValueOnce({});
+    // request_export_save_path → opaque path token from backend dialog.
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid');
+    // Successful export → returns ExportInfo. path field is required by the
+    // post-Task-6 caller (backupSavedPath = info.path).
+    mockedInvoke.mockResolvedValueOnce({
+      identityHash: 'hash',
+      byteLen: 0,
+      path: '/tmp/owner-recovery.bin',
+    });
 
     render(DevicesPanel);
     const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
@@ -541,12 +542,16 @@ describe('DevicesPanel — comment byte-cap validates trimmed value', () => {
     // No "at most 256 bytes" error.
     expect(screen.queryByText(/at most 256 bytes/i)).not.toBeInTheDocument();
     // The export call MUST have been made, with the trimmed comment passed
-    // (not the untrimmed-with-trailing-spaces version).
+    // (not the untrimmed-with-trailing-spaces version) and with the opaque
+    // path token rather than a literal filesystem path.
     const exportCalls = mockedInvoke.mock.calls.filter(
       (c) => c[0] === 'export_owner_recovery_file_to_path',
     );
     expect(exportCalls.length).toBe(1);
-    expect(exportCalls[0][1]).toMatchObject({ comment: 'abc' });
+    expect(exportCalls[0][1]).toMatchObject({
+      comment: 'abc',
+      pathToken: 'path-token-uuid',
+    });
   });
 });
 
@@ -620,5 +625,157 @@ describe('DevicesPanel — stale backupError cleared between attempts', () => {
     await fireEvent.click(saveBtn);
     expect(screen.queryByText(/at least 12 characters/i)).not.toBeInTheDocument();
     expect(screen.getByText(/do not match/i)).toBeInTheDocument();
+  });
+});
+
+describe('DevicesPanel — backend save dialog (request_export_save_path)', () => {
+  it('invokes request_export_save_path with the recovery-file dialog descriptor', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid');
+    mockedInvoke.mockResolvedValueOnce({
+      identityHash: 'hash',
+      byteLen: 4096,
+      path: '/tmp/owner-recovery.bin',
+    });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+
+    // The renderer no longer touches @tauri-apps/plugin-dialog directly; it
+    // delegates dialog presentation to the backend via request_export_save_path.
+    expect(invoke).toHaveBeenCalledWith('request_export_save_path', {
+      request: {
+        defaultFilename: 'owner-recovery.bin',
+        filterName: 'Recovery file',
+        filterExtensions: ['bin'],
+      },
+    });
+  });
+
+  it('skips export when request_export_save_path returns null (user cancelled)', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    // User cancelled the native save dialog → backend returns null.
+    mockedInvoke.mockResolvedValueOnce(null);
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+
+    // Cancellation is a silent no-op: no error, no export call.
+    expect(invoke).not.toHaveBeenCalledWith(
+      'export_owner_recovery_file_to_path',
+      expect.anything(),
+    );
+  });
+
+  it('passes the opaque pathToken (not a filesystem path) to export_owner_recovery_file_to_path', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid');
+    mockedInvoke.mockResolvedValueOnce({
+      identityHash: 'hash',
+      byteLen: 4096,
+      path: '/tmp/owner-recovery.bin',
+    });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+
+    expect(invoke).toHaveBeenCalledWith(
+      'export_owner_recovery_file_to_path',
+      expect.objectContaining({
+        recoveryToken: 'tok-1',
+        pathToken: 'path-token-uuid',
+        passphrase: 'a-strong-passphrase',
+      }),
+    );
+  });
+
+  it('renders the saved-path affordance using ExportInfo.path from the backend', async () => {
+    // Closes the loop on the path-token redesign: the renderer no longer
+    // chooses or even knows the final filesystem path until the backend
+    // returns ExportInfo. The "saved" banner must source from info.path so
+    // the UI reflects exactly what was written, not what we asked for.
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'x',
+      ownerDisplayName: 'me',
+      devices: [{
+        deviceId: 'd', displayName: 'this', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+      }],
+      canBackUp: true,
+    });
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid');
+    mockedInvoke.mockResolvedValueOnce({
+      identityHash: 'hash',
+      byteLen: 4096,
+      // Distinct from the dialog's defaultFilename so a regression that
+      // re-introduces the renderer-chosen path would surface here.
+      path: '/Users/test/Desktop/owner-recovery.bin',
+    });
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    await fireEvent.click(saveBtn);
+
+    // The success banner must echo the backend-reported path verbatim.
+    await screen.findByText('/Users/test/Desktop/owner-recovery.bin');
   });
 });
