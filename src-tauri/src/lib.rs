@@ -772,9 +772,7 @@ async fn start_node(
                                     tracing::info!("joiner pairing persisted successfully");
                                 }
                                 Err(e) => {
-                                    tracing::error!(
-                                        "failed to persist joiner pairing result: {e}"
-                                    );
+                                    tracing::error!("failed to persist joiner pairing result: {e}");
                                 }
                             }
                         }
@@ -784,8 +782,7 @@ async fn start_node(
                     let id_dir = identity_dir.clone();
                     tokio::spawn(async move {
                         while let Some(result) = rx.recv().await {
-                            match crate::pairing::persist::install_inviter_state(&id_dir, result)
-                            {
+                            match crate::pairing::persist::install_inviter_state(&id_dir, result) {
                                 Ok(()) => {
                                     tracing::info!("inviter pairing persisted successfully");
                                 }

@@ -420,3 +420,203 @@ async fn drive_to_complete(inviter_handle: &PairingHandle, joiner_handle: &Pairi
     .await
     .expect("inviter completes");
 }
+
+/// Transport wrapper that returns Err on the Nth `Encrypted` publish, to
+/// simulate a network drop right at ENROLL time. The Inviter's outgoing
+/// publishes during the happy path are: DISCOVER (×N), SELECT, then two
+/// `Encrypted` payloads — CONFIRM (#0) and ENROLL (#1). Letting CONFIRM
+/// through and failing ENROLL exercises exactly the post-CONFIRM /
+/// pre-ENROLL drop the spec calls out.
+struct FailNthEncryptedTransport {
+    inner: Arc<dyn PairingTransport>,
+    encrypted_count: Arc<std::sync::atomic::AtomicUsize>,
+    fail_at: usize,
+}
+
+#[async_trait::async_trait]
+impl PairingTransport for FailNthEncryptedTransport {
+    async fn publish(&self, message: PairingWireMessage) -> Result<(), String> {
+        if matches!(message, PairingWireMessage::Encrypted { .. }) {
+            let n = self
+                .encrypted_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == self.fail_at {
+                return Err("simulated network drop at ENROLL".to_string());
+            }
+        }
+        self.inner.publish(message).await
+    }
+    async fn recv(&self) -> Option<PairingWireMessage> {
+        self.inner.recv().await
+    }
+}
+
+/// ZEB-198: network drop during ENROLL.
+///
+/// Both sides confirm the SAS; the Inviter's CONFIRM lands successfully so
+/// the Joiner's `peer_confirmed` flips and it advances to `Enrolling`. The
+/// Inviter then signs and tries to publish ENROLL — but the wire channel
+/// is "dropped" at that exact instant (we simulate this with a transport
+/// wrapper that returns Err on the second Encrypted publish).
+///
+/// What we want to pin down:
+///
+/// 1. **Inviter surfaces a recoverable Failed state** rather than silently
+///    half-committing. Pre-PR-#63 the Inviter would have already mutated
+///    `ctx.owner_state` (added the new enrollment) before publishing ENROLL,
+///    so a failed publish left the Inviter persistently bound to a
+///    "phantom device" the Joiner never received the cert for. PR #63's
+///    publish-then-commit ordering moved the local mutation strictly AFTER
+///    a successful publish; this test pins that down so a future refactor
+///    can't regress to the old order.
+///
+/// 2. **No `InviterEnrollResult` is emitted** when publish fails. The
+///    `inviter_result_rx` drainer in `start_node` would otherwise persist
+///    the freshly-mutated OwnerState to disk, re-introducing the phantom-
+///    device bug at the persistence layer.
+///
+/// 3. **Joiner remains at Enrolling, not Complete.** Without a built-in
+///    Joiner-side timeout (a follow-up — the SM has no wall-clock-based
+///    expiry today), the Joiner sits indefinitely until the user manually
+///    cancels. Cancel from this state must transition cleanly to Idle —
+///    that's what makes "retry" possible.
+#[tokio::test]
+async fn network_drop_during_enroll() {
+    let MintResult {
+        state: original_state,
+        recovery_artifact,
+        ..
+    } = mint_owner(1_700_000_000).unwrap();
+    let original_inviter_enrollments = original_state.enrollments.len();
+    let master_seed = Zeroizing::new(*recovery_artifact.as_bytes());
+    let joiner_sk = SigningKey::generate(&mut OsRng);
+
+    let (inviter_t, joiner_t) = InMemoryBroker::pair();
+    // Wrap the Inviter side so its SECOND Encrypted publish (== ENROLL)
+    // returns Err, while CONFIRM (the first Encrypted publish) goes through
+    // normally and reaches the Joiner.
+    let inviter_t_wrapped: Arc<dyn PairingTransport> = Arc::new(FailNthEncryptedTransport {
+        inner: Arc::new(inviter_t),
+        encrypted_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_at: 1,
+    });
+    let joiner_t_arc: Arc<dyn PairingTransport> = Arc::new(joiner_t);
+    let now_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 1_700_000_001);
+    let test_interval = Duration::from_secs(60);
+    let inviter_handle = spawn_state_machine(inviter_t_wrapped, now_fn.clone(), test_interval);
+    let joiner_handle = spawn_state_machine(joiner_t_arc, now_fn.clone(), test_interval);
+
+    inviter_handle
+        .cmd_tx
+        .send(PairingCommand::StartInviter {
+            display_name: "KRILE".to_string(),
+            owner_state: original_state.clone(),
+            master_seed,
+        })
+        .await
+        .unwrap();
+    joiner_handle
+        .cmd_tx
+        .send(PairingCommand::StartJoiner {
+            display_name: "AVALON".to_string(),
+            signing_key: joiner_sk,
+        })
+        .await
+        .unwrap();
+
+    drive_to_handshake(&inviter_handle, &joiner_handle).await;
+
+    // Both confirm. CONFIRM publishes succeed; the Inviter's ENROLL publish
+    // is the one we drop.
+    inviter_handle
+        .cmd_tx
+        .send(PairingCommand::ConfirmSas)
+        .await
+        .unwrap();
+    joiner_handle
+        .cmd_tx
+        .send(PairingCommand::ConfirmSas)
+        .await
+        .unwrap();
+
+    // ── Assertion 1: Inviter surfaces Failed with the right reason ────
+    let mut inviter_state = inviter_handle.state_rx.clone();
+    timeout(Duration::from_secs(3), async {
+        inviter_state
+            .wait_for(|s| matches!(s, PairingState::Failed { .. }))
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("inviter surfaces Failed within 3s of ENROLL drop");
+    let inviter_failed_reason = match &*inviter_handle.state_rx.borrow() {
+        PairingState::Failed { reason } => reason.clone(),
+        other => panic!("expected Failed, got {other:?}"),
+    };
+    assert!(
+        inviter_failed_reason.contains("publish enroll"),
+        "Failed reason must call out the ENROLL publish failure so the user \
+         can interpret the recovery path; got: {inviter_failed_reason}"
+    );
+
+    // ── Assertion 2: No InviterEnrollResult was emitted ───────────────
+    // The drainer task in start_node persists this struct to disk; emitting
+    // it on a failed publish would re-introduce the phantom-device bug at
+    // the persistence layer.
+    let mut inviter_result_rx = inviter_handle
+        .inviter_result_rx
+        .expect("inviter_result_rx present");
+    match tokio::time::timeout(Duration::from_millis(200), inviter_result_rx.recv()).await {
+        Err(_) => {
+            // Timeout — no result emitted. This is the desired behavior.
+        }
+        Ok(Some(_)) => {
+            panic!(
+                "InviterEnrollResult was emitted despite ENROLL publish \
+                 failing — would persist a phantom-device enrollment to disk"
+            );
+        }
+        Ok(None) => {
+            // Channel closed without a value. Also acceptable (no leak).
+        }
+    }
+
+    // Sanity: original_state untouched (Inviter shouldn't have committed).
+    // We assert this via the snapshot we captured before the run, since
+    // ctx.owner_state isn't directly observable. The strongest check is
+    // Assertion 2 above (no InviterEnrollResult) plus this static one.
+    assert_eq!(
+        original_state.enrollments.len(),
+        original_inviter_enrollments,
+        "snapshot sanity"
+    );
+
+    // ── Assertion 3: Joiner is stuck at Enrolling, not Complete ───────
+    // The Joiner has both confirms and emitted Enrolling, then waits for
+    // the ENROLL wire message that never arrives. No built-in timeout (a
+    // separate follow-up); the user's recovery path is to manually Cancel.
+    let joiner_state_now = joiner_handle.state_rx.borrow().clone();
+    assert!(
+        matches!(
+            joiner_state_now,
+            PairingState::Enrolling | PairingState::Handshaking { .. }
+        ),
+        "Joiner must NOT be Complete (no ENROLL arrived); got {joiner_state_now:?}"
+    );
+
+    // ── Recovery: Cancel allows the user to retry ─────────────────────
+    joiner_handle
+        .cmd_tx
+        .send(PairingCommand::Cancel)
+        .await
+        .unwrap();
+    let mut joiner_state_rx = joiner_handle.state_rx.clone();
+    timeout(Duration::from_secs(2), async {
+        joiner_state_rx
+            .wait_for(|s| matches!(s, PairingState::Idle))
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("joiner Cancel transitions to Idle (retry possible)");
+}
