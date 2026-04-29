@@ -32,7 +32,7 @@ impl ZenohPairingTransport {
     }
 }
 
-const PAIRING_KEY_PREFIX: &str = "harmony/pairing/v2/lan";
+use crate::pairing::PAIRING_KEY_PREFIX;
 
 fn key_for(message: &PairingWireMessage) -> String {
     let session_id = match message {
@@ -70,6 +70,12 @@ impl PairingTransport for ZenohPairingTransport {
             .map_err(|_| "publish reply dropped".to_string())?
     }
 
+    /// SINGLE-CONSUMER CONTRACT: the trait signature is `&self` to satisfy
+    /// transport-agnostic code, but messages are pulled from a single
+    /// `mpsc::Receiver` behind a `Mutex`. If two callers concurrently invoke
+    /// `recv()`, messages will alternate between them non-deterministically.
+    /// Today's only consumer is the state machine's main `tokio::select!`
+    /// loop — do not spawn a parallel reader.
     async fn recv(&self) -> Option<PairingWireMessage> {
         self.pairing_in_rx.lock().await.recv().await
     }

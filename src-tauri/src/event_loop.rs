@@ -310,7 +310,7 @@ pub async fn run<R: Runtime>(
     // or StartJoiner), so this satisfies the "no idle broadcasting" spec.
     dispatch_action(
         RuntimeAction::Subscribe {
-            key_expr: "harmony/pairing/v2/lan/**".to_string(),
+            key_expr: crate::pairing::PAIRING_KEY_GLOB.to_string(),
         },
         &session,
         &zenoh_tx,
@@ -505,7 +505,15 @@ pub async fn run<R: Runtime>(
                         // handlers. Pairing samples don't need to drive the
                         // runtime tick, so we `continue` the outer loop to skip
                         // `should_tick` for these.
-                        if key_expr.starts_with("harmony/pairing/v2/lan/") {
+                        if key_expr.starts_with(&format!("{}/", crate::pairing::PAIRING_KEY_PREFIX)) {
+                            if payload.len() > crate::pairing::MAX_PAIRING_WIRE_BYTES {
+                                tracing::warn!(
+                                    "rejecting oversized pairing payload on {key_expr}: {} bytes > {}",
+                                    payload.len(),
+                                    crate::pairing::MAX_PAIRING_WIRE_BYTES,
+                                );
+                                continue;
+                            }
                             if let Some(tx) = pairing_in_tx.as_ref() {
                                 match ciborium::from_reader::<crate::pairing::types::PairingWireMessage, _>(payload.as_slice()) {
                                     Ok(msg) => { let _ = tx.send(msg).await; }
