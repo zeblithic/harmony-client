@@ -461,26 +461,30 @@ fn save_secret(
 /// `master_seed.enc` (or keychain entry), we must wipe it so subsequent
 /// `load_owner_state` correctly reports no master and `canBackUp: false`.
 ///
-/// A keychain delete failure (other than `NoEntry`) is propagated as Err.
-/// PR #63 review noted that an earlier draft logged-and-continued here:
-/// `load_secret` reads the keychain BEFORE the encrypted-file fallback
-/// whenever a `KeychainStore` is configured, so a stale keychain entry —
-/// even with the fallback file successfully removed — would resurrect the
-/// master_seed on the next load and flip `canBackUp` back to true. We must
-/// fail the entire save if the keychain side cannot be cleared.
+/// On keychain delete failure (other than `NoEntry`): we still try
+/// best-effort to remove the encrypted-file fallback before propagating
+/// the keychain error. PR #63 review pointed out that returning early on
+/// keychain Err meant the fallback file was left untouched on disk —
+/// `load_secret` falls through to the file when keychain is unavailable
+/// (locked, removed credential), so a stale `master_seed.enc` resurrects
+/// the master on the next "no keychain" load. The combined attempt
+/// minimises residue: at least one of the two stores ends up clean even
+/// when the other fails. The function still ultimately returns the
+/// keychain error so callers know the keychain side wasn't fully cleared.
 fn clear_secret(
     keychain: &Option<KeychainStore>,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
 ) -> Result<(), String> {
+    let mut keychain_err: Option<String> = None;
     if keychain.is_some() {
         let entry = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(e) => {
-                return Err(format!(
+                keychain_err = Some(format!(
                     "keychain delete {KEYCHAIN_OWNER_SERVICE}/{keychain_name}: {e}"
                 ));
             }
@@ -488,9 +492,13 @@ fn clear_secret(
     }
     let path = identity_dir.join(fallback_filename);
     match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("delete {}: {e}", path.display())),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("delete {}: {e}", path.display())),
+    }
+    match keychain_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 

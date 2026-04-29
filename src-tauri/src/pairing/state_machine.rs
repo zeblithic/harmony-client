@@ -116,10 +116,12 @@ async fn run_state_machine(
                 let Some(cmd) = cmd else { return; };
                 match cmd {
                     PairingCommand::StartInviter { display_name, owner_state, master_seed } => {
-                        ctx = Some(start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, &now_fn).await);
+                        // start_inviter returns None on publish failure (state already
+                        // pushed to Failed); leave ctx as None so the user must Cancel.
+                        ctx = start_inviter(&transport, &state_tx, display_name, owner_state, master_seed, &now_fn).await;
                     }
                     PairingCommand::StartJoiner { display_name, signing_key } => {
-                        ctx = Some(start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await);
+                        ctx = start_joiner(&transport, &state_tx, display_name, signing_key, &now_fn).await;
                     }
                     PairingCommand::SelectPeer { peer_session_id } => {
                         if let Some(c) = ctx.as_mut() {
@@ -260,7 +262,7 @@ async fn start_inviter(
     owner_state: OwnerState,
     master_seed: Zeroizing<[u8; 32]>,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
-) -> SessionCtx {
+) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Inviter, display_name.clone());
     ctx.owner_state = Some(owner_state.clone());
     ctx.master_seed = Some(master_seed);
@@ -271,7 +273,11 @@ async fn start_inviter(
         session_id: ctx.session_id,
     });
 
-    let _ = transport
+    // PR #63 review: if DISCOVER publish fails, peers can't see us — there
+    // is no recovery from inside the SM (no retry, no alternate transport),
+    // so emit Failed and return None. The caller leaves ctx as None, and
+    // the user must Cancel to clear and retry.
+    if let Err(e) = transport
         .publish(PairingWireMessage::Discover {
             session_id: ctx.session_id,
             role: PairingRole::Inviter,
@@ -280,9 +286,15 @@ async fn start_inviter(
             owner_id_if_inviter: Some(hex::encode(owner_state.owner_id)),
             joiner_ed25519_verify_hex: None,
         })
-        .await;
+        .await
+    {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("publish discover: {e}"),
+        });
+        return None;
+    }
 
-    ctx
+    Some(ctx)
 }
 
 async fn start_joiner(
@@ -291,7 +303,7 @@ async fn start_joiner(
     display_name: String,
     signing_key: SigningKey,
     _now_fn: &Arc<dyn Fn() -> u64 + Send + Sync>,
-) -> SessionCtx {
+) -> Option<SessionCtx> {
     let mut ctx = SessionCtx::new(PairingRole::Joiner, display_name.clone());
     let verify_bytes = signing_key.verifying_key().to_bytes();
     let pubkey = PubKeyBundle::classical_only(verify_bytes);
@@ -304,7 +316,8 @@ async fn start_joiner(
         session_id: ctx.session_id,
     });
 
-    let _ = transport
+    // See start_inviter for rationale on returning None on publish failure.
+    if let Err(e) = transport
         .publish(PairingWireMessage::Discover {
             session_id: ctx.session_id,
             role: PairingRole::Joiner,
@@ -313,9 +326,15 @@ async fn start_joiner(
             owner_id_if_inviter: None,
             joiner_ed25519_verify_hex: Some(hex::encode(verify_bytes)),
         })
-        .await;
+        .await
+    {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("publish discover: {e}"),
+        });
+        return None;
+    }
 
-    ctx
+    Some(ctx)
 }
 
 async fn on_select_peer(
@@ -382,14 +401,24 @@ async fn on_select_peer(
         }
     }
 
-    // Publish SELECT.
-    ctx.sent_select = true;
-    let _ = transport
+    // Publish SELECT. PR #63 review: set `sent_select = true` ONLY after a
+    // successful publish. Setting the flag first meant a transport failure
+    // would leave us locally believing we'd told the peer; arrival of the
+    // peer's matching SELECT would then advance us into Handshaking with a
+    // SAS the peer never derived.
+    if let Err(e) = transport
         .publish(PairingWireMessage::Select {
             my_session_id: ctx.session_id,
             peer_session_id,
         })
-        .await;
+        .await
+    {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("publish select: {e}"),
+        });
+        return;
+    }
+    ctx.sent_select = true;
 
     // If we previously saw the SELECT-of-us from THIS specific peer (the one
     // we just chose), set the mutual-selection flag. Per-peer matching is
@@ -447,9 +476,12 @@ async fn on_confirm_sas(
         return;
     };
 
-    ctx.our_confirmed = true;
-
-    // Encrypt + publish CONFIRM.
+    // Encrypt + publish CONFIRM. PR #63 review: set `our_confirmed = true`
+    // ONLY after the publish succeeds. The previous flag-then-publish
+    // ordering meant a transport failure would leave us locally believing
+    // the peer had been told (so maybe_advance_to_enroll could fire on
+    // peer-CONFIRM arrival) while the peer was still waiting for our SAS
+    // confirmation.
     let payload = EncryptedPayload::Confirm {
         sas_digits: sas_digits.clone(),
     };
@@ -469,16 +501,31 @@ async fn on_confirm_sas(
             return;
         }
     };
-    let _ = transport
+    if let Err(e) = transport
         .publish(PairingWireMessage::Encrypted {
             my_session_id: ctx.session_id,
             peer_session_id,
             nonce_hex: hex::encode(nonce),
             ciphertext_hex: hex::encode(ct),
         })
-        .await;
+        .await
+    {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("publish confirm: {e}"),
+        });
+        return;
+    }
+    ctx.our_confirmed = true;
 
-    let _ = state_tx.send(PairingState::WaitingPeerConfirm { peer_session_id });
+    // PR #63 review: only emit WaitingPeerConfirm if we are actually
+    // waiting on the peer. When the peer's CONFIRM landed FIRST,
+    // `peer_confirmed` is already true and `maybe_advance_to_enroll` will
+    // immediately transition to Enrolling/Complete; emitting
+    // WaitingPeerConfirm here would have made the UI flash through a
+    // misleading intermediate state.
+    if !ctx.peer_confirmed {
+        let _ = state_tx.send(PairingState::WaitingPeerConfirm { peer_session_id });
+    }
 
     maybe_advance_to_enroll(transport, state_tx, ctx, now_fn, inviter_result_tx).await;
     // Joiner waits for the ENROLL message; the receive path emits Enrolling and
@@ -618,12 +665,25 @@ async fn maybe_advance_to_enroll(
     // start_node) can write the freshly-mutated OwnerState back to disk.
     // Without this, the new enrollment lives only in RAM and the Inviter's
     // DevicesPanel reverts to showing only itself on next start_node.
-    let _ = inviter_result_tx
+    //
+    // PR #63 review: a closed channel here means the drainer task is gone
+    // (start_node teardown, identity_dir resolution failure, etc). If we
+    // ignored the error and proceeded to Complete, the user would be told
+    // pairing succeeded but the on-disk state would never update — the
+    // new enrollment would silently disappear on next launch. Surface as
+    // Failed instead.
+    if let Err(e) = inviter_result_tx
         .send(InviterEnrollResult {
             owner_state: prospective_state,
             master_seed: master_seed.clone(),
         })
-        .await;
+        .await
+    {
+        let _ = state_tx.send(PairingState::Failed {
+            reason: format!("inviter persistence channel closed: {e}"),
+        });
+        return;
+    }
 
     let device_id = joiner_pubkey.identity_hash();
     let _ = state_tx.send(PairingState::Complete {
@@ -866,6 +926,16 @@ async fn on_encrypted_payload(
                 });
                 return;
             }
+            // Idempotency: a duplicate ENROLL (network re-delivery, replay)
+            // arriving after we've already installed must be a no-op. We
+            // already took our_signing_key on the first install, so its
+            // absence is the natural sentinel — without this guard, the
+            // earlier `take().expect()` would panic the SM task on a second
+            // ENROLL even though all prior guards (role, mutual confirm)
+            // still pass.
+            if ctx.our_signing_key.is_none() {
+                return;
+            }
             let cert_bytes = match hex::decode(&enrollment_cert_cbor_hex) {
                 Ok(b) => b,
                 Err(e) => {
@@ -921,13 +991,23 @@ async fn on_encrypted_payload(
 
             let our_sk = ctx.our_signing_key.take().expect("joiner has signing key");
             let our_device_id = our_pubkey.identity_hash();
-            let _ = result_tx
+            // See the Inviter side for rationale on send() error → Failed:
+            // a closed channel here means the persistence drainer is gone,
+            // and reporting Complete would tell the user pairing worked
+            // when the on-disk state will silently revert on next launch.
+            if let Err(e) = result_tx
                 .send(JoinerEnrollResult {
                     our_signing_key: our_sk,
                     owner_state,
                     our_device_id,
                 })
-                .await;
+                .await
+            {
+                let _ = state_tx.send(PairingState::Failed {
+                    reason: format!("joiner persistence channel closed: {e}"),
+                });
+                return;
+            }
             let _ = state_tx.send(PairingState::Complete {
                 device_id_hex: hex::encode(our_device_id),
             });
