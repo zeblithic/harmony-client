@@ -627,4 +627,57 @@ mod tests {
         let result = canonical_cbor_decode::<Hlc>(b"not cbor at all");
         assert!(matches!(result, Err(CryptoError::CborDecode(_))));
     }
+
+    #[test]
+    fn integration_full_round_trip_with_replay_protection() {
+        // Simulate the end-to-end happy path that Phase 2 will rely on:
+        // 1. Two bound devices derive identical KeyTrees from the same seed.
+        // 2. Device A encrypts a Space entry; produces a deterministic
+        //    storage_blob and cipher_cid.
+        // 3. Device B (via DAG-sync) fetches the storage_blob and
+        //    decrypts to the same cleartext.
+        // 4. Device A also publishes a state-root-publish payload with
+        //    its current HLC; Device B accepts via the replay tracker.
+        // 5. A captured-and-replayed copy of the same publish is rejected.
+
+        let master_seed = [42u8; 32];
+        let kt_a = KeyTree::derive(&master_seed).expect("device a");
+        let kt_b = KeyTree::derive(&master_seed).expect("device b");
+
+        // Encrypt a Space entry on device A.
+        let space_id = b"some-channel-id";
+        let lookup = space_lookup_key(&kt_a, space_id);
+        let cleartext = b"channel #general at update_at=t1".to_vec();
+        let blob = encrypt_entry(&kt_a, &lookup, &cleartext).expect("encrypt-a");
+        let cipher_cid = blake3::hash(&blob);
+
+        // Device B derives the same lookup key independently and decrypts.
+        let lookup_b = space_lookup_key(&kt_b, space_id);
+        assert_eq!(lookup, lookup_b);
+        let recovered = decrypt_entry(&kt_b, &lookup_b, &blob).expect("decrypt-b");
+        assert_eq!(recovered, cleartext);
+
+        // Device A publishes a state-root pointer.
+        let publish_at = hlc(1000, 0, "device-a");
+        let publish_payload =
+            canonical_cbor_encode(&(cipher_cid.as_bytes().to_vec(), publish_at.clone()))
+                .expect("encode publish");
+        let publish_blob = encrypt_root_publish(&kt_a, &publish_payload).expect("encrypt-publish");
+
+        // Device B's replay tracker accepts the first publish from device-a.
+        let mut tracker_b = RootReplayTracker::default();
+        let recovered_publish =
+            decrypt_root_publish(&kt_b, &publish_blob).expect("decrypt-publish");
+        let (_recovered_cid, recovered_at): (Vec<u8>, Hlc) =
+            canonical_cbor_decode(&recovered_publish).expect("decode publish");
+        tracker_b.try_accept(&recovered_at).expect("accept first");
+
+        // Adversary captures and replays the SAME blob — even though AEAD
+        // verifies (it's a valid blob), the replay tracker rejects it.
+        let recovered_replay = decrypt_root_publish(&kt_b, &publish_blob).expect("decrypt-replay");
+        let (_, recovered_at_2): (Vec<u8>, Hlc) =
+            canonical_cbor_decode(&recovered_replay).expect("decode replay");
+        let result = tracker_b.try_accept(&recovered_at_2);
+        assert!(matches!(result, Err(CryptoError::ReplayRejected(d)) if d == "device-a"));
+    }
 }
