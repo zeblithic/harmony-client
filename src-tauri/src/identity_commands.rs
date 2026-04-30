@@ -145,7 +145,6 @@ fn clear_preview_cache() {
 /// rejects accidental selection of a large file (image, video, archive).
 const MAX_RECOVERY_FILE_BYTES: u64 = 1 << 20;
 
-
 /// Read a recovery file with a size guard.
 ///
 /// Opens the path **once** and uses the same descriptor for both the size

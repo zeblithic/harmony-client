@@ -5,11 +5,11 @@
 
 use crate::identity::KeychainStore;
 use crate::identity_commands::run_blocking;
-use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 use crate::owner_state::{
     insert_token, load_owner_state, save_owner_state_atomic, take_token, DeviceView,
     LoadedOwnerState, OwnerStateView, TrustDecisionView, TrustKind,
 };
+use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 use harmony_owner::lifecycle::{mint_owner, MintResult, RecoveryArtifact};
 use harmony_owner::recovery::RecoveryMetadata;
 use harmony_owner::trust;
@@ -44,7 +44,6 @@ pub(crate) static OWNER_STATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(||
 
 const ERR_NODE_RUNNING: &str =
     "Stop the node before minting an owner identity (the node must not be holding owner-scoped keys during mint).";
-
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

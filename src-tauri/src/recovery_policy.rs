@@ -11,6 +11,11 @@
 /// (matches the JS frontend's `[...str].length` check).
 pub const MIN_RECOVERY_PASSPHRASE_LEN: usize = 12;
 
-/// Maximum recovery comment length, in bytes. Mirrors
-/// harmony-owner's hard cap on the underlying field.
+/// Maximum recovery comment length, in bytes. Mirrors harmony-owner's
+/// hard cap on the underlying `comment` field; both the GUI IPC and
+/// the encryption layer enforce this. The GUI pre-validates against
+/// this constant so the user sees a friendly error before any I/O
+/// rather than a generic encryption-layer error. The TS mirror MUST
+/// equal this value — the drift detector in
+/// `src/lib/recovery-policy.test.ts` enforces parity.
 pub const MAX_RECOVERY_COMMENT_BYTES: usize = 256;
