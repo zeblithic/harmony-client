@@ -42,11 +42,19 @@ const INFO_NONCE_DERIV: &[u8] = b"nonce-deriv";
 
 /// Four owner-state keys derived deterministically from the master seed.
 /// Every bound device that holds the seed computes identical keys.
+///
+/// Fields are private intentionally: callers should never need raw key
+/// bytes. All consumers go through `space_lookup_key`, `encrypt_entry`,
+/// `decrypt_entry`, `encrypt_root_publish`, and `decrypt_root_publish`,
+/// which take `&KeyTree` and select the appropriate sub-key internally.
+/// This shrinks the surface where key material can leak into logs,
+/// debug formatting, or accidental copies — `Zeroizing` only protects
+/// the memory at drop time, not against unintended use.
 pub struct KeyTree {
-    pub entry_aead: Zeroizing<[u8; 32]>,
-    pub root_aead: Zeroizing<[u8; 32]>,
-    pub lookup: Zeroizing<[u8; 32]>,
-    pub nonce: Zeroizing<[u8; 32]>,
+    entry_aead: Zeroizing<[u8; 32]>,
+    root_aead: Zeroizing<[u8; 32]>,
+    lookup: Zeroizing<[u8; 32]>,
+    nonce: Zeroizing<[u8; 32]>,
 }
 
 impl KeyTree {
@@ -277,19 +285,50 @@ pub struct Hlc {
     pub device_id: String,
 }
 
-/// Canonical CBOR encoder. Produces deterministic output per RFC 8949 §4.2
-/// when the input value's structure is canonical (sorted-key maps,
-/// definite-length collections, no floats). The CRDT's deterministic
-/// encryption property depends on byte-identical output across bound
-/// devices — types crossing this boundary MUST use `BTreeMap` (which
-/// `serde` serializes in sorted order) instead of `HashMap`.
+/// Deterministic CBOR encoder for the owner-state crypto surface.
+///
+/// **Contract (current scope — Phase 1):** produces byte-identical output
+/// across instances of *this* crate version when the caller's serde tree
+/// satisfies all of:
+/// - Map types are `BTreeMap` (NOT `HashMap`) — `serde`'s `BTreeMap`
+///   serializer iterates in `BTreeMap` order, which is `K::Ord`
+/// - All map keys at every nesting level have the same encoded length
+///   (e.g., all-ULID, all-UUID, all-`u64`); see "Why same-length keys"
+/// - No `f32` / `f64` fields anywhere in the tree
+/// - No CBOR tags (`#[serde(...)]` attributes that emit tag 6)
+/// - All collections are definite-length (Rust standard collections give
+///   this for free; only custom `Serialize` impls can break it)
+///
+/// **Why same-length keys:** RFC 8949 §4.2.1 requires bytewise
+/// lexicographic ordering of map keys *as encoded*, which prepends a
+/// CBOR length byte. For text strings of equal length the CBOR length
+/// byte is identical and bytewise-of-encoded matches Rust's `String` Ord
+/// (bytewise of UTF-8). For text strings of *different* length the
+/// length byte differs, so RFC 8949 sorts shorter-first while Rust's
+/// `String` Ord sorts character-wise — and the two disagree.
+/// As long as every map at a given nesting level uses keys with the
+/// same encoded length, ciborium + BTreeMap produces output that is
+/// (a) deterministic across bound devices running this code, and
+/// (b) coincidentally compliant with RFC 8949 §4.2.1 for that level.
+///
+/// **What we do NOT yet enforce:**
+/// - Strict RFC 8949 §4.2.1 length-first key ordering for mixed-length
+///   keys at the encoder level (ciborium 0.2 has no canonical writer)
+/// - Type-level prevention of `HashMap` / `f64` / etc. — currently
+///   relies on the per-call review checklist above
+///
+/// Both belong to the followup that locks down canonical CBOR once
+/// Phase 2 fixes the type universe (the actual `Space`, `OutboxEntry`
+/// CBOR shapes). See ZEB-220 (filed as part of PR #72 review).
 pub fn canonical_cbor_encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CryptoError> {
     let mut buf = Vec::new();
     ciborium::into_writer(value, &mut buf).map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
     Ok(buf)
 }
 
-/// Canonical CBOR decoder. Symmetric inverse of `canonical_cbor_encode`.
+/// Decoder paired with `canonical_cbor_encode`. Round-tripping is
+/// symmetric for any value that encoded successfully under the
+/// encoder's contract above.
 pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, CryptoError> {
