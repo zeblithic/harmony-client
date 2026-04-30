@@ -194,8 +194,24 @@
           filterName: 'Recovery file',
           filterExtensions: ['recovery'],
         });
-      } catch {
-        // Treat a dialog error the same as cancel — silent return to fileEntry.
+      } catch (e) {
+        // Pre-refactor this swallowed silently — but the new wider IPC
+        // surface (request_export_save_path) can fail for reasons that
+        // user-cancel doesn't cover (dispatch error, plugin error, etc.),
+        // so genuine failures need to be surfaced. `null` still signals
+        // user-cancel (Ok(None) over Tauri serde) — that branch below
+        // returns silently. (CodeRabbit, PR #66 review.)
+        if (wizardState !== epoch) return;
+        wizardState = {
+          kind: 'backup',
+          step: {
+            phase: 'fileSaveError',
+            error: `Could not open the save dialog: ${e}. Try again.`,
+            passphrase,
+            passphraseConfirm,
+            comment,
+          },
+        };
         return;
       }
 
