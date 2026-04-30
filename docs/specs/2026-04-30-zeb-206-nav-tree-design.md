@@ -31,7 +31,7 @@ These principles came out of brainstorming and shape every architectural choice 
 
 Four layers, each with a distinct authority and transport choice.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │ UI Layer:        NavTree.svelte ← NavService (Svelte 5)     │
 ├─────────────────────────────────────────────────────────────┤
@@ -40,7 +40,8 @@ Four layers, each with a distinct authority and transport choice.
 ├─────────────────────────────────────────────────────────────┤
 │ State Layer:     Owner-State Prolly Tree CRDT (per owner)   │
 │                  ├─ spaces[]    (unified Space entries)      │
-│                  ├─ outbox[]    (pending DM deliveries)      │
+│                  ├─ outbox[]    (pending outgoing DMs)       │
+│                  ├─ inbox[]     (received DM messages)       │
 │                  └─ markers{}   (per-space last_read_at)     │
 │                                                              │
 │                  Community Membership CRDTs (per community)  │
@@ -58,10 +59,10 @@ Four layers, each with a distinct authority and transport choice.
 
 | State | Authority | Replicated to |
 |---|---|---|
-| My spaces, folders, read markers, DM outbox | Owner-state Prolly Tree | This owner's bound devices (ZEB-197) |
+| My spaces, folders, read markers, DM outbox + inbox | Owner-state Prolly Tree | This owner's bound devices (ZEB-197) |
 | Community membership / power levels | Per-community CRDT | All members of that community |
 | Public channel "membership" | Transport-derived | Anyone subscribed to the Zenoh topic |
-| DM "membership" | Fixed at creation | Embedded in OutboxEntry and Space.members |
+| DM "membership" | Mutable up to 16 cap (current participants can add); each Space has authoritative member list | Embedded in `Space.members`; mirrored in OutboxEntry/InboxEntry recipients |
 | Library directory entries | Per-library | Subscribers to that library's directory topic |
 | Profile membership broadcast | Owner | Subscribers to that owner's profile topic |
 
@@ -87,17 +88,17 @@ type SpaceKind =
   | 'community'      // moderated org; has its own membership CRDT
   | 'channel'        // pub/sub inside a community
   | 'public-channel' // pub/sub, no community wrapper
-  | 'dm'             // exactly 2 members, Reticulum
-  | 'group-dm';      // 2-16 members, Reticulum
+  | 'dm'             // exactly 2 members total (sender + 1 recipient), Reticulum
+  | 'group-dm';      // 3-16 members total (sender + 2-15 recipients), Reticulum
 
 interface Space {
-  id: SpaceId;                    // ULID-style
+  id: SpaceId;                    // ULID-style; locally unique per creation
   kind: SpaceKind;
   parent: SpaceId | null;         // folder/community parent ref
   community_id: SpaceId | null;   // for channels: which community owns this
   name: string;
   transport: TransportBinding | null;   // null only for folders
-  members: OwnerAddr[];           // for DMs only; communities use separate CRDT
+  members: OwnerAddr[];           // for DM/group-DM only — INCLUDES sender; communities use separate CRDT
   custom_name: string | null;     // owner's local rename, applies only on this owner's devices
   notification_pref: 'all' | 'mentions' | 'muted' | null;
   created_at: HybridLogicalClock;
@@ -152,12 +153,28 @@ interface MemberState {
 ```typescript
 interface OutboxEntry {
   id: string;
-  recipient_owners: OwnerAddr[];   // 1 for DM, 2-15 for group-DM
+  recipient_owners: OwnerAddr[];   // EXCLUDES sender — 1 for DM, 2-15 for group-DM
   message_cid: ContentId;          // message blob lives in CAS
   created_at: HLC;
   delivered_to: OwnerAddr[];       // ack list — entry GC'd when complete
 }
 ```
+
+### `InboxEntry` — received DM (in owner-state CRDT)
+
+When a DM arrives via Reticulum on any of the recipient's bound devices, that device writes an `InboxEntry` into its owner-state CRDT. Owner-state sync (Flow A) replicates the entry across the recipient's other bound devices, so all of them see the new message without needing direct Reticulum delivery to each.
+
+```typescript
+interface InboxEntry {
+  id: string;                      // unique inbox entry id (ULID)
+  space_id: SpaceId;               // the DM/group-DM Space this belongs to
+  message_cid: ContentId;          // message blob lives in CAS
+  from: OwnerAddr;                 // sender's owner address
+  received_at: HLC;
+}
+```
+
+UI message rendering for a DM Space joins (`OutboxEntry` filtered by `space_id` for outgoing) ∪ (`InboxEntry` filtered by `space_id` for incoming), ordered by HLC. Read state lives in `ReadMarker`.
 
 ### `ReadMarker` — per-space (in owner-state CRDT)
 
@@ -217,7 +234,7 @@ Four load-bearing flows. Profile-based discovery and read-marker sync are minor 
 
 ### Flow A — Owner-state CRDT sync across bound devices
 
-```
+```text
 Device A:                                  Device B (same owner):
 ─────────                                  ──────────
 1. User joins #general
@@ -260,10 +277,11 @@ Device A:                                  Device B (same owner):
    - Walks outbox every N seconds
    - For each pending entry, attempts Reticulum link to each unack'd recipient
    - On successful link: delivers `message_cid` (recipient fetches blob from CAS via `fetch_content`)
+   - **Recipient device writes a new `InboxEntry` to its owner-state CRDT** — `{id, space_id, message_cid, from: sender_addr, received_at: HLC}`
    - Recipient acks via the same link → sender updates `delivered_to[]`
 6. When `delivered_to.length === recipient_owners.length`, GC the OutboxEntry
 
-**Subtlety:** the recipient also has multiple bound devices. Delivery succeeds when **any** of the recipient's devices acks (because that device replicates the message into the recipient's owner-state, and the recipient's CRDT sync delivers it to their other devices automatically).
+**Multi-device convergence on the recipient side:** the recipient also has multiple bound devices. Delivery succeeds when **any** of the recipient's devices acks. The receiving device's owner-state CRDT now contains the new `InboxEntry`; Flow A replicates it to the recipient's other bound devices, which then see the new message without needing direct Reticulum delivery. Each of the recipient's other devices runs DAG-sync to fetch the `message_cid` blob from CAS as needed for rendering.
 
 ### Flow D — Library-federated discovery
 
@@ -358,12 +376,34 @@ redeem_invite(invite_link) -> Result<SpaceId>
 
 ### CRDT convergence semantics
 
+#### Dedupe key per Space kind
+
+`Space.id` is a ULID — locally unique per creation. ULIDs **do not** dedupe two devices that independently create what the user thinks of as "the same Space." For each kind, the CRDT identifies "same Space" via a kind-specific dedupe key. When two devices write entries that collide on the dedupe key, the CRDT merges them (last `updated_at` HLC wins per field; tombstones win over re-adds; see below).
+
+| Kind | Dedupe key | Rationale |
+|---|---|---|
+| `folder` | none | Folders are owner-private UX organization. Same name on different devices = genuinely different folders. User can manually consolidate later. |
+| `community` | `id` | Community ID is assigned at community creation and broadcast in the community membership CRDT events. All members reference the same id. |
+| `channel` | `id` | Channel ID is assigned by community admin at channel creation and embedded in the community CRDT. Members joining reference the existing id. |
+| `public-channel` | `transport.topic` | Natural identity is the Zenoh topic name. Two devices joining the same public channel reference the same topic string. |
+| `dm` | sorted `members[]` | Two-person DMs uniquely identified by their participants. Both devices "starting a DM with Alice" produce the same sorted member set. |
+| `group-dm` | sorted `members[]` | Same logic as DM. The full sorted participant list is the natural identity. |
+
+When the dedupe key matches across two device-local writes, the merged Space takes:
+- `id`: the lexicographically smaller of the two ULIDs (deterministic tie-break)
+- `created_at`: earlier HLC
+- All other fields: last `updated_at` HLC wins per field
+
+#### Convergence cases
+
 | Case | Resolution |
 |---|---|
-| Two of my devices both add the same channel while disconnected | Dedupe by `id`. Last `updated_at` HLC wins for any conflicting fields (`name`, `parent`, etc.). |
-| One device adds, another removes the same channel | Tombstone wins. Removal is explicit; we err on the side of "user wanted this gone." |
+| Two of my devices both join the same channel while disconnected | Both write `Space {kind: 'channel', id: <admin-assigned channel id>, ...}`. Same `id` → CRDT merges. Last `updated_at` HLC wins for `custom_name`/`parent`/`notification_pref`. |
+| Two of my devices both create a DM with the same person while disconnected | Both write `Space {kind: 'dm', members: [me, peer]}`. Same sorted member set → CRDT merges via the dedupe-key rule above. |
+| Two of my devices both create folders named "Work" while disconnected | Folders never dedupe → two distinct folders. User can manually merge if they want. |
+| One device adds, another removes the same Space | Tombstone wins. Removal is explicit; we err on the side of "user wanted this gone." |
 | Two devices set different `custom_name` | Last-writer-wins on `updated_at` HLC. (No merge — a UI rename is opaque.) |
-| Same channel moved to two different folders | Last-writer-wins on `updated_at`. |
+| Same Space moved to two different folders | Last-writer-wins on `updated_at`. |
 | Bound device clock skew → HLC drift | HLC's logical counter dominates wall-clock; correct ordering preserved up to bounded skew. |
 
 ### Signature & power-level verification
@@ -393,11 +433,18 @@ redeem_invite(invite_link) -> Result<SpaceId>
 | Community admin loses private key | Meta-governance failure. **Out of scope for v1.** Mitigation path: M-of-N admin power model (followup ticket). |
 | Local DB corruption on one device | DAG-sync re-fetches owner-state from a peer bound device. |
 | All bound devices corrupted | Hard recovery via ZEB-173 identity backup (extend backup to include owner-state CRDT root — followup ticket). |
-| Group DM hits 17 members | UI blocks the add. User must convert to community. "Keep history?" UX flow deferred to implementation. |
+| Group DM at 16 members tries to add a 17th | UI blocks the add. Prompt offers "Convert this group DM to a community" (carrying members forward) or "Create a new community separately" (fresh start). User decides per case. |
+
+### Group DM mutability (resolves earlier ambiguity)
+
+- **Membership is mutable in the 2-16 range.** Any current member can invite a new member (open join — no admin tier within group DMs, consistent with the no-global-moderation principle).
+- **Members can leave themselves at any time.** Leaving stops new InboxEntries from being delivered to that owner; existing history on their devices stays.
+- **No "kick" primitive.** Kicking is a community-level moderation action; group DMs deliberately don't have it. If kicking someone matters to you, the relationship has already outgrown a group DM.
+- **At 17 → must convert.** UI blocks the add and prompts: "Convert to community" (membership carries forward, history retention is a separate UX choice) or "Create a new community" (fresh, no history).
 
 ### Locked-in YAGNI calls
 
-- **Group DM membership is fixed at creation.** No add/remove members. To change membership, create a new group. (Departure from Signal/Matrix.)
+- **No "kick" or admin tier inside group DMs.** Use a community if you need moderation.
 - **No global blocklist.** Each user blocks libraries and peers locally; no federated reputation.
 - **No community-to-community migration tools in v1.** If you want to "rebrand" or fork a community, you create a new one and post about it.
 
