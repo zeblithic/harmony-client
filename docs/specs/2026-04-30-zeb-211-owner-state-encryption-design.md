@@ -39,7 +39,7 @@ Define a concrete encryption scheme for the owner-state CRDT that:
 
 ## Architecture
 
-Encryption is purely at the harmony-client application layer. Cleartext Space CBOR → encrypted bytes → handed to harmony-content for CAS storage. harmony-content is unmodified; it sees ciphertext blobs and computes BLAKE3 CIDs over them.
+Encryption is purely at the harmony-client application layer. Cleartext Space CBOR → encrypted bytes → handed to harmony-content for CAS storage. harmony-content is unmodified; it sees only opaque storage blobs and computes BLAKE3 CIDs over them — where each storage blob is `nonce_12 || ciphertext_with_tag` (see "Per-entry encryption scheme" for the construction).
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -49,7 +49,8 @@ Encryption is purely at the harmony-client application layer. Cleartext Space CB
 │   └─ derive_nonce()       ← BLAKE3-keyed-MAC                 │
 ├─────────────────────────────────────────────────────────────┤
 │ harmony-content (unmodified, upstream harmony repo)         │
-│   stores ciphertext blobs at BLAKE3(ciphertext) CIDs        │
+│   stores storage_blob (nonce_12 || ciphertext_with_tag)     │
+│   at cipher_cid = BLAKE3(storage_blob)                      │
 ├─────────────────────────────────────────────────────────────┤
 │ Zenoh transport (vanilla)                                    │
 │   topic: harmony/owner/{addr}/state-root-v1                 │
@@ -286,7 +287,16 @@ state_root_payload = {
 
 **Receiver parsing:** read the first 12 bytes as the nonce; the remainder is the AEAD ciphertext-with-tag. Decrypt with `owner_state_root_aead_key` and `aad = b"state-root-pointer"`. On AEAD failure, drop the publish (could be unauthenticated injection).
 
-**Replay/rollback protection — REQUIRED:** after successful AEAD decryption, the receiver MUST compare the decrypted `at` HLC to the last accepted `at` for this owner (per-publisher tracked in local state). If the new `at` is **not strictly newer** than the last accepted, drop the publish. Without this check, an active adversary could capture a valid past publish and replay it on the topic — the AEAD would verify, and the receiver would silently accept a rolled-back `root_cid`, regressing the owner-state to a stale snapshot until a fresh publish from another bound device arrives. The CRDT does eventually self-heal in that scenario, but the rollback window is long enough to cause user-visible misbehavior. The HLC monotonicity check closes this window and makes the `at` field load-bearing rather than informational.
+**Replay/rollback protection — REQUIRED:** after successful AEAD decryption, the receiver MUST verify the decrypted `at` HLC is **strictly newer** than the last accepted `at` from the same publisher (keyed by `at.device_id`). If not, drop the publish.
+
+**Definition of "strictly newer".** Two HLCs `A` and `B` are compared as a lexicographic tuple `(wall_ms, logical, device_id)`:
+- `wall_ms` and `logical` are unsigned integers, compared with standard integer ordering.
+- `device_id` is a UTF-8 string, compared bytewise (lexicographic on the underlying bytes).
+- `A` is strictly newer than `B` iff `A > B` under that tuple ordering — i.e., `A.wall_ms > B.wall_ms`, OR (`A.wall_ms == B.wall_ms` AND `A.logical > B.logical`), OR (both `wall_ms` and `logical` equal AND `A.device_id > B.device_id` bytewise).
+
+**Tracking scope.** "Last accepted `at`" is per-publisher, keyed by `at.device_id`: the receiver maintains a small `Map<device_id, HLC>` of the most recently accepted publish from each device under this owner. A new publish from device X must be strictly newer than the last accepted publish *from device X*, not the global last-accepted across all of the owner's devices. Per-publisher tracking is required because legitimate publishes from device A and device B can interleave with arbitrary `wall_ms` ordering due to clock drift; a global rule would falsely reject legitimate publishes from a device whose clock is behind another's.
+
+**Why this matters.** Without this check, an active adversary could capture a valid past publish from device X and replay it on the topic — the AEAD would verify (still cryptographically valid for that publisher's key + nonce), and the receiver would silently accept a rolled-back `root_cid`, regressing the owner-state to a stale snapshot until a fresh publish from device X (or another of the owner's devices) arrives. The CRDT does eventually self-heal in that scenario, but the rollback window is long enough to cause user-visible misbehavior. The HLC monotonicity check closes this window and makes the `at` field load-bearing rather than informational.
 
 **AEAD parameters:**
 
