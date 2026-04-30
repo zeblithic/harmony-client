@@ -571,7 +571,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
       if (cmd === 'export_recovery_file_to_path') {
         const a = args as { pathToken: string; passphrase: string; comment: string | null };
         expect(a.pathToken).toBe('path-tok');
-        expect(a.passphrase).toBe('hunter2');
+        expect(a.passphrase).toBe('long-enough-pass');
         expect(a.comment).toBe('laptop-2026-04-15');
         return savePath;
       }
@@ -580,8 +580,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'hunter2' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.input(screen.getByRole('textbox', { name: /comment/i }), { target: { value: 'laptop-2026-04-15' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
@@ -606,8 +606,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'abc' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'abc' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     // Leave comment empty
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
@@ -626,8 +626,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     await screen.findByText(/recovery file saved/i);
 
@@ -647,8 +647,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
     // After dialog cancel: should stay on fileEntry (no error, no success)
@@ -668,8 +668,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
 
     await screen.findByText(/could not save to/i);
@@ -687,8 +687,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     await screen.findByText(/could not save to/i);
 
@@ -711,8 +711,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'hunter2' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'hunter2' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.input(screen.getByLabelText(/comment/i), { target: { value: 'laptop-2026-04-15' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     await screen.findByText(/could not save to/i);
@@ -723,8 +723,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     const passInput = await screen.findByLabelText(/^passphrase$/i) as HTMLInputElement;
     const confirmInput = screen.getByLabelText(/confirm passphrase/i) as HTMLInputElement;
     const commentInput = screen.getByLabelText(/comment/i) as HTMLInputElement;
-    expect(passInput.value).toBe('hunter2');
-    expect(confirmInput.value).toBe('hunter2');
+    expect(passInput.value).toBe('long-enough-pass');
+    expect(confirmInput.value).toBe('long-enough-pass');
     expect(commentInput.value).toBe('laptop-2026-04-15');
   });
 
@@ -738,8 +738,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
     await screen.findByText(/could not save to/i);
 
@@ -772,8 +772,8 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
     await arrangeAtFileEntry();
 
-    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
-    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
+    await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'long-enough-pass' } });
+    await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'long-enough-pass' } });
 
     // Click Continue — save dialog resolves immediately; file write hangs.
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
@@ -786,6 +786,37 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     // Resolve the pending write — wizard transitions to the success state.
     resolveWrite(savePath);
     await screen.findByText(/recovery file saved/i);
+  });
+
+  it('rejects under-length passphrase before opening the save dialog', async () => {
+    // ZEB-202: advanceFromFileEntry must check length BEFORE opening the OS
+    // save dialog. An 11-codepoint passphrase (one short of
+    // MIN_RECOVERY_PASSPHRASE_LEN = 12) must be rejected with the fileSaveError
+    // phase and must NOT invoke request_export_save_path or
+    // export_recovery_file_to_path.
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') throw new Error('should not be called');
+      if (cmd === 'export_recovery_file_to_path') throw new Error('should not be called');
+      throw new Error(`unexpected: ${cmd}`);
+    });
+
+    await arrangeAtFileEntry();
+
+    // 'shortpass11' is exactly 11 codepoints — one short of the 12-codepoint floor.
+    const passphraseInput = screen.getByLabelText(/^passphrase$/i);
+    const confirmInput = screen.getByLabelText(/confirm passphrase/i);
+    await fireEvent.input(passphraseInput, { target: { value: 'shortpass11' } });
+    await fireEvent.input(confirmInput, { target: { value: 'shortpass11' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
+
+    // The IPC must not be invoked.
+    expect(mockInvoke).not.toHaveBeenCalledWith('request_export_save_path', expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith('export_recovery_file_to_path', expect.anything());
+
+    // The error message must be visible — wording mirrors the backend verbatim.
+    await screen.findByText(/recovery passphrase must be at least 12 characters/i);
   });
 });
 

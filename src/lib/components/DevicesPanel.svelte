@@ -2,6 +2,10 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
+  import {
+    MAX_RECOVERY_COMMENT_BYTES,
+    MIN_RECOVERY_PASSPHRASE_LEN,
+  } from '../recovery-policy';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
 
@@ -168,8 +172,8 @@
     // Count Unicode codepoints, not UTF-16 code units, so the check matches
     // the Rust backend's `passphrase.chars().count()` for multibyte input
     // (emoji, CJK). Spreading a string yields one element per codepoint.
-    if ([...backupPassphrase].length < 12) {
-      backupError = 'Passphrase must be at least 12 characters.';
+    if ([...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
+      backupError = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
     }
     // Comment cap is BYTES (matches harmony-owner's hard 256-byte limit on
@@ -183,8 +187,8 @@
     // the trimmed form fits.
     const trimmedComment = backupComment.trim();
     const commentBytes = new TextEncoder().encode(trimmedComment).length;
-    if (commentBytes > 256) {
-      backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
+    if (commentBytes > MAX_RECOVERY_COMMENT_BYTES) {
+      backupError = `Comment must be at most ${MAX_RECOVERY_COMMENT_BYTES} bytes (currently ${commentBytes}).`;
       return;
     }
     // Mark dialog-in-flight BEFORE the save dialog opens so a fast double-
