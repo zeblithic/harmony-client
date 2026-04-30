@@ -101,6 +101,10 @@ interface Space {
   members: OwnerAddr[];           // for DM/group-DM only — INCLUDES sender; communities use separate CRDT
   custom_name: string | null;     // owner's local rename, applies only on this owner's devices
   notification_pref: 'all' | 'mentions' | 'muted' | null;
+  left_at: HLC | null;            // dm/group-dm only: HLC of when *I* left this Space.
+                                  // Owner-local field — never propagates to other members.
+                                  // Receive layer drops incoming DMs when non-null.
+                                  // Re-invitation clears back to null (NOT a tombstone).
   created_at: HLC;
   updated_at: HLC;
 }
@@ -129,8 +133,16 @@ interface CommunityMembership {
   events: SignedMembershipEvent[];   // append-only DAG
   // Materialized views derived from event log:
   //   members:      Map<OwnerAddr, MemberState>
-  //   power_levels: Map<OwnerAddr, number>
+  //   power_levels: Map<OwnerAddr, number>  // power 0..100 per member; default 0 on join
 }
+
+// Hardcoded power thresholds for v1 — see "Power-level thresholds" below.
+const POWER_THRESHOLDS = {
+  invite:    0,    // any member can invite
+  kick:      50,   // moderator-tier
+  set_power: 100,  // owner/admin-tier (must already have power 100 to grant power)
+  max:       100,
+};
 
 type SignedMembershipEvent =
   | { kind: 'join';      actor: OwnerAddr; at: HLC; sig: Signature }
@@ -148,18 +160,32 @@ interface MemberState {
 }
 ```
 
-### `OutboxEntry` — pending DM delivery (in owner-state CRDT)
+### `OutboxEntry` — outgoing DM record (in owner-state CRDT)
+
+OutboxEntries are the **persistent log of DMs I've sent**, not just a delivery queue. The active delivery loop drives entries with `delivery_status: 'pending'`; once complete (or expired), the entry stays in the CRDT as sent-message history. This is what the UI renders for outgoing messages.
 
 ```typescript
 interface OutboxEntry {
-  id: string;
+  id: string;                      // ULID
   space_id: SpaceId;               // DM/group-DM Space this outgoing message belongs to
-  recipient_owners: OwnerAddr[];   // EXCLUDES sender — 1 for DM, 2-15 for group-DM
-  message_cid: ContentId;          // message blob lives in CAS
+  recipient_owners: OwnerAddr[];   // EXCLUDES sender — 1 for DM, 2-15 for group-DM (snapshot at send time)
+  message_cid: ContentId;          // encrypted message blob lives in CAS (per "DM content confidentiality")
   created_at: HLC;
-  delivered_to: OwnerAddr[];       // ack list — entry GC'd when complete
+  delivered_to: OwnerAddr[];       // ack list (subset of recipient_owners)
+  delivery_status: 'pending' | 'partial' | 'complete' | 'expired';
+                                   // pending: delivery loop still active for unack'd recipients
+                                   // partial: at least one recipient acked, others pending
+                                   // complete: all recipient_owners are in delivered_to
+                                   // expired: 30-day timer fired with one or more unacked recipients
+                                   //          (silent leavers indistinguishable from genuinely-offline)
 }
 ```
+
+**OutboxEntries are NEVER GC'd** in v1 — they're chat history. Long-term archival/pruning is a deliberate followup. The `delivery_status` field's transitions:
+
+- New → `pending`
+- Each ack → updates `delivered_to[]`; `delivery_status` becomes `partial` (or `complete` when all acked)
+- After 30 days with at least one unacked recipient → `expired`. The delivery loop stops retrying. UI shows "undeliverable" badge for the unacked recipient(s).
 
 ### `InboxEntry` — received DM (in owner-state CRDT)
 
@@ -167,13 +193,15 @@ When a DM arrives via Reticulum on any of the recipient's bound devices, that de
 
 ```typescript
 interface InboxEntry {
-  id: string;                      // unique inbox entry id (ULID)
+  // Lookup key: (space_id, message_cid) — see "Idempotency" below.
   space_id: SpaceId;               // the DM/group-DM Space this belongs to
-  message_cid: ContentId;          // message blob lives in CAS
+  message_cid: ContentId;          // encrypted message blob in CAS — content-addressed, unique per message
   from: OwnerAddr;                 // sender's owner address
-  received_at: HLC;
+  received_at: HLC;                // first device's receive time (CRDT picks earliest on merge)
 }
 ```
+
+**Idempotency:** Inbox writes are **upsert by `(space_id, message_cid)`**, not append-by-ULID. Reticulum delivery may retry (sender's loop) and the same message may arrive on multiple bound devices via overlapping links. The lookup key `(space_id, message_cid)` is naturally unique per message because `message_cid` is a content-addressed BLAKE3 hash of the (encrypted) blob — duplicates collapse into a single InboxEntry on CRDT merge. Implementations MUST check for an existing InboxEntry with the same `(space_id, message_cid)` before writing.
 
 UI message rendering for a DM Space joins (`OutboxEntry` filtered by `space_id` for outgoing) ∪ (`InboxEntry` filtered by `space_id` for incoming), ordered by HLC. Read state lives in `ReadMarker`.
 
@@ -313,7 +341,7 @@ The per-DM-Space content key is established at Space creation, distributed to in
 |---|---|
 | `owner_state_crdt.rs` | Prolly Tree CRDT for owner-state: spaces, outbox, inbox, read markers. Read/write API for all four collections, plus sync via encrypted Zenoh topic (Flow A). InboxEntry writes from Flow C land here; Flow A propagates them to other bound devices. |
 | `community_membership.rs` | Per-community signed-event CRDT. Join/leave/kick/power-level event composition + verification. Materialized-state computation. |
-| `dm_outbox.rs` | Outbox drain loop. Walks pending entries, attempts Reticulum delivery, handles acks, GCs delivered entries. |
+| `dm_outbox.rs` | Outbox delivery loop. Walks `delivery_status: 'pending'` and `'partial'` entries, attempts Reticulum delivery, handles acks, transitions entries to `'complete'` (all acked) or `'expired'` (30-day timeout). Does NOT GC; OutboxEntry is the persistent sent-message log. |
 | `library_directory.rs` | Subscribe to known libraries' directory topics. Aggregate + dedupe entries. Handle federated republication signatures. |
 | `space_commands.rs` | Tauri command handlers (the public API surface below). Pure orchestration over the modules above. |
 
@@ -325,12 +353,25 @@ The per-DM-Space content key is established at Space creation, distributed to in
 
 ### IPC command surface (public API)
 
+#### `remove_space` semantics (resolves earlier ambiguity)
+
+`remove_space(space_id)` is **explicit, irreversible, local tombstone**. Behavior depends on `kind`:
+
+| Kind | Behavior |
+|---|---|
+| `folder` | Removes from owner-state CRDT. Children are NOT cascade-deleted; they get `parent: null` and become top-level. |
+| `dm` / `group-dm` | Tombstones the local Space. **Caller likely wanted `leave_space()` instead** — that sets `left_at` (reversible). `remove_space()` writes a permanent tombstone, blocking re-creation via the same dedupe key (sorted-members or `id`) until the user manually clears the tombstone. UI MUST distinguish "leave" vs "delete forever." |
+| `community` | **Returns `Err` directing caller to use `leave_community(community_id)` first.** Calling `remove_space` directly on a community Space without a corresponding leave event would leave the caller as a "ghost member" in the community CRDT (other members still see them, admins can still kick them, messages still try to route). After `leave_community` completes, `remove_space` may be called to clean up the local Space entry — at that point the leave event has been broadcast and the caller has correctly disenrolled. |
+| `channel` | Tombstones the local Space (you stop subscribing). Doesn't propagate; channels are subscription-based, not membership-based. |
+| `public-channel` | Same as `channel`. |
+
 ```rust
 // Owner-state mutations
 list_spaces() -> Vec<Space>
 get_space_detail(space_id) -> SpaceDetail            // includes membership for communities
 add_space(kind, name, parent?, members?, transport?) -> SpaceId
-remove_space(space_id) -> Result<()>
+remove_space(space_id) -> Result<()>                 // explicit local tombstone — see semantics below
+leave_space(space_id) -> Result<()>                  // dm/group-dm only — sets Space.left_at; reversible
 move_space(space_id, new_parent) -> Result<()>
 rename_space(space_id, custom_name) -> Result<()>
 set_notification_pref(space_id, pref) -> Result<()>
@@ -391,7 +432,7 @@ redeem_invite(invite_link) -> Result<SpaceId>
 
 #### Dedupe key per Space kind
 
-`Space.id` is a ULID — locally unique per creation. ULIDs **do not** dedupe two devices that independently create what the user thinks of as "the same Space." For each kind, the CRDT identifies "same Space" via a kind-specific dedupe key. When two devices write entries that collide on the dedupe key, the CRDT merges them (last `updated_at` HLC wins per field; tombstones win over re-adds; see below).
+`Space.id` is a ULID — locally unique per creation. ULIDs **do not** dedupe two devices that independently create what the user thinks of as "the same Space." For each kind, the CRDT identifies "same Space" via a kind-specific dedupe key. When two devices write entries that collide on the dedupe key, the CRDT merges them (last `updated_at` HLC wins per field; explicit-delete tombstones win over re-adds — see "Tombstones vs leaves" below).
 
 | Kind | Dedupe key | Rationale |
 |---|---|---|
@@ -407,6 +448,22 @@ When the dedupe key matches across two device-local writes, the merged Space tak
 - `created_at`: earlier HLC
 - All other fields: last `updated_at` HLC wins per field
 
+**Dependent-record canonicalization on merge.** When the winning `id` differs from a duplicate's losing `id`, the local owner-state CRDT MUST atomically rewrite all dependent records that reference the losing `id` so they reference the winning `id`:
+- `OutboxEntry.space_id`: rewritten
+- `InboxEntry.space_id`: rewritten
+- `ReadMarker.space_id`: rewritten
+
+The rewrite happens as part of the same merge transaction; partial application would orphan messages and read state. This is a per-device local operation (each bound device runs the rewrite when it processes the merge).
+
+#### Tombstones vs leaves
+
+Two distinct concepts that the spec previously conflated:
+
+- **Tombstone** = explicit deletion. Result of `remove_space(space_id)`. Permanent; CRDT's "tombstone wins over re-add" rule applies. Re-creating a Space with the same dedupe key after tombstone is **blocked** until the user manually clears the tombstone (or for community-kind spaces, joins the community fresh — which produces a new `id` if the original community itself is gone).
+- **Leave** (DM/group-DM only) = sets `Space.left_at: HLC` to mark "I'm not actively in this conversation right now." NOT a tombstone. Re-invitation clears `left_at` back to `null`. The Space's `id` is preserved, so chat history (OutboxEntry/InboxEntry) is intact and visible if/when you rejoin.
+
+**This means leaving a group-DM is reversible** if you're re-invited (with the same `id`). Tombstoning via explicit `remove_space` is not. UI should make the distinction obvious — the standard "leave" action sets `left_at`; only an explicit "delete this conversation forever" gesture writes a tombstone.
+
 #### Convergence cases
 
 | Case | Resolution |
@@ -414,20 +471,38 @@ When the dedupe key matches across two device-local writes, the merged Space tak
 | Two of my devices both join the same channel while disconnected | Both write `Space {kind: 'channel', id: <admin-assigned channel id>, ...}`. Same `id` → CRDT merges. Last `updated_at` HLC wins for `custom_name`/`parent`/`notification_pref`. |
 | Two of my devices both create a DM with the same person while disconnected | Both write `Space {kind: 'dm', members: [me, peer]}`. Same sorted member set → CRDT merges via the dedupe-key rule above. |
 | Two of my devices both create folders named "Work" while disconnected | Folders never dedupe → two distinct folders. User can manually merge if they want. |
-| One device adds, another removes the same Space | Tombstone wins. Removal is explicit; we err on the side of "user wanted this gone." |
+| One device tombstones (explicit `remove_space`), another re-adds the same Space | Tombstone wins. Removal is explicit; we err on the side of "user wanted this gone." Different from leave (`left_at`) which is reversible. |
 | Two devices set different `custom_name` | Last-writer-wins on `updated_at` HLC. (No merge — a UI rename is opaque.) |
 | Same Space moved to two different folders | Last-writer-wins on `updated_at`. |
+| Two devices' Spaces dedupe with different ULIDs | Lexicographically-smaller ULID wins. Dependent records (OutboxEntry/InboxEntry/ReadMarker) atomically rewrite their `space_id` on the local merge. |
 | Bound device clock skew → HLC drift | HLC's logical counter dominates wall-clock; correct ordering preserved up to bounded skew. |
 
 ### Signature & power-level verification
 
 - Every `SignedMembershipEvent` verified at receive time:
   1. Signature valid against `actor`'s owner pubkey
-  2. `actor` has required power level for this action (e.g., `kick` requires `power ≥ kick_threshold`)
+  2. `actor` has required power level for this action — see **Power-level thresholds** below
   3. If either check fails → reject + do not replicate
 - Library directory entries have **two** signatures:
   - Community admin's sig over the manifest (required, always verified)
   - Library's sig over the listing (verified for trusted libraries; absent or wrong → entry shown but flagged "unattested")
+
+#### Power-level thresholds (v1: hardcoded defaults)
+
+```typescript
+const POWER_THRESHOLDS = {
+  invite:    0,    // any joined member can invite
+  kick:      50,   // moderator-tier; can kick members at lower power
+  set_power: 100,  // owner/admin-tier; required to grant power to others
+  max:       100,
+};
+```
+
+Rules:
+- **Default power on join is 0.** New joiners can invite (threshold 0) but can't moderate.
+- **Power level is monotone-comparable**: an action requiring power N is allowed only if the actor's current power is ≥ N. Additionally, `kick` requires the actor's power to be **strictly greater** than the target's power (you can't kick someone at your own level), preventing kick wars at the same tier.
+- **Community creator starts at power 100** (set by an initial `set_power` event signed by the creator at community creation).
+- **No per-community customization in v1.** Per-community threshold overrides (e.g., a community where `invite` requires power 25) are a deliberate followup; not blocking ZEB-217 Sub-C.
 
 ### Privacy mitigations
 
@@ -440,8 +515,7 @@ When the dedupe key matches across two device-local writes, the merged Space tak
 | Failure | Behavior |
 |---|---|
 | Reticulum link to recipient fails (NAT/firewall/offline) | Retry with exponential backoff. Don't surface transient errors to UI. |
-| Recipient genuinely offline for >30 days | Surface "undeliverable" badge. User can manually delete the OutboxEntry or wait. |
-| DM to non-existent owner_addr (typo) | Indistinguishable from offline; same queue + 30-day fallback. |
+| Recipient genuinely offline for >30 days, OR silently left a group-DM, OR typo'd owner_addr | All indistinguishable in v1. After 30 days, the OutboxEntry's `delivery_status` flips from `pending`/`partial` to `expired`; the delivery loop stops retrying for the unacked recipients. UI shows an "undeliverable" badge for those recipients but the OutboxEntry stays in chat history (it's the persistent sent-message log, not GC'd). User can manually delete the entry if they want it gone. **This resolves the GC-stall liveness gap that pure equality-based GC would have.** |
 | Library publishes spam | User-revocable trust — `remove_library(addr)`. No global blocklist. |
 | Community admin loses private key | Meta-governance failure. **Out of scope for v1.** Mitigation path: M-of-N admin power model (followup ticket). |
 | Local DB corruption on one device | DAG-sync re-fetches owner-state from a peer bound device. |
@@ -451,16 +525,19 @@ When the dedupe key matches across two device-local writes, the merged Space tak
 ### Group DM mutability (resolves earlier ambiguity)
 
 - **`members[]` is grow-only in the CRDT (3–16 cap).** Any current member can invite another, growing the list up to 16. The `id` (ULID) is stable for the lifetime of the conversation regardless of membership changes — sorted-members would shift on every add and corrupt conversation identity, which is why group-dm dedupes by `id` (see dedupe table above).
-- **Leaving is owner-local, not a broadcast event.** When you leave, you remove the Space from your own owner-state CRDT. Other participants see no change to their `members[]` view (no shrink, no "X left" indicator) — they may continue trying to deliver via Reticulum, but your receive layer will silently drop incoming DMs for the removed Space. This trades subtle staleness on others' devices for CRDT-primitive simplicity in v1; broadcast leave events are a deliberate followup if it becomes a user need.
+- **Leaving sets `Space.left_at`, not a tombstone.** When you leave, your local Space gets `left_at: HLC` set on this device (and replicates to your other bound devices via Flow A — your other devices see "left at HLC X" too). This is owner-local in the social sense: other participants see no change to their `members[]` view. Your receive layer drops incoming DMs while `left_at !== null`. **Re-invitation clears `left_at` back to `null`** (because dedupe by `id` means the re-invite collides with the existing left Space), so leaving a group-DM is reversible if someone re-invites you. Distinct from explicit `remove_space` (tombstone) which is irreversible — see "Tombstones vs leaves" above.
 - **No "kick" primitive.** Kicking is a community-level moderation action; group DMs deliberately don't have it. If kicking someone matters to you, the relationship has already outgrown a group DM.
-- **`members.length` cannot drop below 3 via the CRDT** (because `members[]` is grow-only — adds only, never CRDT-level removes). It only "appears" to drop on a particular owner's nav when they leave (locally), not for other participants.
+- **`members.length` cannot drop below 3 via the CRDT** (because `members[]` is grow-only — adds only, never CRDT-level removes). It only "appears" to drop on a particular owner's nav when their `left_at` is set, which doesn't propagate to other members' view.
 - **At 17 → must convert.** UI blocks the add and prompts: "Convert to community" (membership carries forward, history retention is a separate UX choice) or "Create a new community" (fresh, no history).
 
 ### Locked-in YAGNI calls
 
+- **One DM Space per pair forever.** Because `dm` dedupes by sorted `members[]`, there is exactly one DM Space per pair of people across all my devices and all time. There is no "start a fresh DM with Alice" flow that produces a separate Space — the existing one always wins by dedupe. This matches Signal/iMessage/WhatsApp behavior; "New DM" UI should disable when a DM with that peer already exists. Consciously different from systems like Discord where you can have multiple separate DMs with the same person.
 - **No "kick" or admin tier inside group DMs.** Use a community if you need moderation.
 - **No global blocklist.** Each user blocks libraries and peers locally; no federated reputation.
 - **No community-to-community migration tools in v1.** If you want to "rebrand" or fork a community, you create a new one and post about it.
+- **OutboxEntry not GC'd in v1.** Outbox is the persistent sent-message log; long-term archival/pruning is a deliberate followup. The active delivery loop only drives entries with `delivery_status: 'pending'` or `'partial'`; `complete`/`expired` entries stay for chat history but don't consume retry cycles.
+- **Per-community power-threshold customization.** v1 hardcodes the power thresholds (see "Power-level thresholds"); per-community overrides are a deliberate followup.
 
 ## Decomposition into sub-tickets
 
