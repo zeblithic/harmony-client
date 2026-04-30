@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 use crate::identity;
 use crate::identity::KeychainStore;
 use crate::recovery_cli;
-use crate::recovery_policy::MAX_RECOVERY_COMMENT_BYTES;
+use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 
 // ── Shared types ─────────────────────────────────────────────────────────
 
@@ -466,6 +466,17 @@ pub async fn export_recovery_file_to_path(
     passphrase: String,
     comment: Option<String>,
 ) -> Result<String, String> {
+    // ZEB-202: reject under-length passphrases BEFORE any I/O or
+    // token consumption. Codepoint count (`.chars().count()`)
+    // matches the JS frontend's `[...str].length` check so
+    // multibyte passphrases (emoji, CJK) round-trip identically.
+    // Wording is verbatim with `owner_commands::export_owner_recovery_file_to_path`
+    // so a user sees identical copy regardless of which side rejected.
+    if passphrase.chars().count() < MIN_RECOVERY_PASSPHRASE_LEN {
+        return Err(format!(
+            "Recovery passphrase must be at least {MIN_RECOVERY_PASSPHRASE_LEN} characters."
+        ));
+    }
     let plaintext_path = identity::resolve_path(None)?;
     // Validate comment length BEFORE consuming the single-use path token.
     // Otherwise a too-long comment burns the token and forces the user
@@ -900,6 +911,78 @@ mod tests {
             err.to_lowercase().contains("path token")
                 && (err.contains("expired") || err.contains("invalid")),
             "error must mention path token expired/invalid; got: {err}"
+        );
+    }
+
+    /// ZEB-202: an under-length passphrase must be rejected BEFORE the
+    /// path token is consumed, so the user does not have to re-pick a
+    /// save location for a purely local validation error.
+    ///
+    /// This mirrors the existing pre-take guards for path-token UUID
+    /// parsing and comment length, and the established
+    /// `owner_commands` pattern for the same validation.
+    #[test]
+    #[serial]
+    fn export_recovery_rejects_short_passphrase_without_consuming_token() {
+        use crate::owner_state::{clear_path_token_cache, insert_path_token, take_path_token};
+        clear_path_token_cache();
+
+        // Mint a real path token so we can prove the rejection didn't
+        // consume it. The path itself is irrelevant — the test never
+        // reaches the file-write step.
+        let dir = tempfile::tempdir().unwrap();
+        let recovery_path = dir.path().join("rec.bin");
+        let token = insert_path_token(recovery_path);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(export_recovery_file_to_path(
+            token.to_string(),
+            "short-pass".into(), // 10 codepoints, < MIN_RECOVERY_PASSPHRASE_LEN
+            None,
+        ));
+        let err = result.expect_err("under-length passphrase must be rejected");
+        assert!(
+            err.contains("at least") && err.contains("characters"),
+            "error must explain the minimum length; got: {err}"
+        );
+
+        // The load-bearing assertion: the token survives the rejection.
+        // If the guard ran AFTER `take_path_token`, this take would
+        // return None and the test would fail.
+        assert!(
+            take_path_token(&token).is_some(),
+            "rejection must NOT consume the path token (TOCTOU/UX invariant)"
+        );
+    }
+
+    /// ZEB-202: pin the codepoint-vs-byte distinction the guard relies on.
+    /// A 12-codepoint multibyte passphrase has > 12 *bytes* — under a
+    /// naive `passphrase.len() < MIN` byte-count guard it would still
+    /// pass, but under `passphrase.chars().count() < MIN` (what the IPC
+    /// actually uses) it also passes. The danger is if someone "fixes"
+    /// the guard to use byte count: a user who picks a 12-character
+    /// English passphrase would still pass, but the multibyte case
+    /// would silently change semantics. This test fails the moment
+    /// someone refactors `.chars().count()` to `.len()` AND a fixture
+    /// with the codepoint-vs-byte gap is exercised against the new
+    /// predicate.
+    #[test]
+    fn min_passphrase_len_check_uses_codepoint_count_not_byte_count() {
+        // 12 CJK codepoints, 36 bytes.
+        let multibyte = "日本語日本語日本語日本語";
+        assert_eq!(
+            multibyte.chars().count(),
+            MIN_RECOVERY_PASSPHRASE_LEN,
+            "fixture must be exactly MIN_RECOVERY_PASSPHRASE_LEN codepoints"
+        );
+        assert!(
+            multibyte.len() > MIN_RECOVERY_PASSPHRASE_LEN,
+            "fixture must exceed MIN_RECOVERY_PASSPHRASE_LEN BYTES — \
+             that's the property that distinguishes codepoint vs byte counting"
+        );
+        assert!(
+            multibyte.chars().count() >= MIN_RECOVERY_PASSPHRASE_LEN,
+            "multibyte fixture must clear the codepoint-count guard"
         );
     }
 
