@@ -41,7 +41,7 @@ Define a concrete encryption scheme for the owner-state CRDT that:
 
 Encryption is purely at the harmony-client application layer. Cleartext Space CBOR → encrypted bytes → handed to harmony-content for CAS storage. harmony-content is unmodified; it sees ciphertext blobs and computes BLAKE3 CIDs over them.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │ harmony-client::owner_state_crdt                            │
 │   ├─ encrypt_value()      ← ChaCha20-Poly1305 AEAD          │
@@ -61,7 +61,7 @@ Encryption is purely at the harmony-client application layer. Cleartext Space CB
 
 Three keys, all deterministically derived from the master seed (already exists per ZEB-173 + shared across bound devices per ZEB-197).
 
-```
+```text
 master_seed: [u8; 32]
    │
    └── HKDF-SHA256-Extract(IKM=master_seed,
@@ -104,20 +104,35 @@ hk.expand(b"nonce-deriv", &mut nonce_key)?;
 
 All three keys MUST be wrapped in `Zeroizing<[u8; 32]>` (the `zeroize` crate is already a dep) so they don't linger in freed memory.
 
+## Canonical CBOR encoding (required)
+
+All `serialize_cbor(...)` calls in this scheme MUST use **deterministic CBOR encoding** per RFC 8949 §4.2 ("Core Deterministic Encoding Requirements"):
+
+- Bytewise lexicographic ordering of map keys (sort keys before encoding)
+- Shortest-form integer encoding (no leading zeros)
+- Definite-length collections only (no indefinite-length encoding)
+- No CBOR tags on owner-state types
+- Floats are not used in owner-state types (avoid float canonicalization edge cases)
+
+This is **load-bearing** for the deterministic-encryption property below: the same logical Space entry MUST produce the same `cleartext_cbor` byte sequence on any bound device, otherwise nonces and cipher-CIDs diverge and CRDT convergence breaks. Use `ciborium` (or equivalent) with deterministic mode explicitly enabled. Verify via the cross-encoder gate in [Verification gates](#verification-gates).
+
 ## Per-entry encryption scheme
 
 For each Space-entry write:
 
-```
+```text
 space_lookup_key = HMAC-SHA256(key=owner_state_lookup_key, message=space_id_bytes)  // 32 bytes; see "Tree-lookup-key scheme" below
-cleartext_cbor   = serialize_cbor(space_entry)
-nonce_12         = BLAKE3-keyed-MAC(key=owner_state_nonce_key, message=cleartext_cbor)[..12]
+cleartext_cbor   = serialize_cbor(space_entry)                                       // canonical CBOR; see above
+nonce_12         = BLAKE3-keyed-MAC(
+                     key=owner_state_nonce_key,
+                     message=b"owner-state-entry-v1" || space_lookup_key || cleartext_cbor
+                   )[..12]
 ciphertext       = ChaCha20Poly1305-encrypt(
                      key=owner_state_aead_key,
                      nonce=nonce_12,
                      aad=space_lookup_key,
                      plaintext=cleartext_cbor)
-storage_blob     = nonce_12 || ciphertext
+storage_blob     = nonce_12 || ciphertext_with_tag
 cipher_cid       = BLAKE3(storage_blob)
 ```
 
@@ -125,17 +140,22 @@ cipher_cid       = BLAKE3(storage_blob)
 
 ChaCha20-Poly1305 normally uses random nonces, but for owner-state we need **deterministic encryption**: the same cleartext + same key MUST produce the same ciphertext, so that the cipher-CID is stable across bound devices. Without that, two devices encrypting the same Space entry would produce different CIDs and the CRDT would treat them as conflicting writes.
 
-The nonce is derived from the cleartext via `BLAKE3-keyed-MAC(nonce_key, cleartext)` — a 12-byte MAC truncation. This is safe because:
+The nonce is derived from `b"owner-state-entry-v1" || space_lookup_key || cleartext_cbor` via a keyed BLAKE3 MAC truncated to 12 bytes. This is safe and sufficient because:
 
-- Different cleartexts produce different nonces (cryptographic MAC, no observable collisions in practice).
-- Same cleartext produces the same nonce → same ciphertext (intentional).
-- An attacker cannot derive valid nonces without `owner_state_nonce_key`.
+- **Different (space, cleartext) pairs produce different nonces.** Cross-space nonce reuse is prevented because `space_lookup_key` (which is per-space, per the Tree-lookup-key scheme) is mixed into the nonce derivation.
+- **Same (space, cleartext) pair produces the same nonce → same ciphertext** (intentional, deterministic across all bound devices).
+- **An attacker cannot derive valid nonces** without `owner_state_nonce_key` (a keyed MAC, not a public hash).
+- **Domain-separation prefix** `b"owner-state-entry-v1"` versions the construction and prevents collisions with any future MAC computation that happens to take the same inputs.
 
-The "leak" of deterministic encryption — that observers can detect "two entries with identical ciphertext = identical cleartext" — is acceptable because Space-entry cleartexts naturally vary on every write (HLC `updated_at` advances). True repeats would only occur if the application wrote the same exact CBOR twice, which is a no-op the application should already deduplicate.
+### Why `space_lookup_key` MUST be in the nonce input (not just AAD)
 
-### Why AAD = space_lookup_key
+ChaCha20-Poly1305's Poly1305 authenticator key `(r, s)` is derived from `(aead_key, nonce, counter=0)` only — **AAD is not part of the (r, s) derivation**. If two different Space entries end up with the same `cleartext_cbor` (a pathological but possible application bug), and the nonce were derived only from the cleartext, both encryptions would use identical `(aead_key, nonce)` pairs. ChaCha20 would generate the same keystream, and XOR'ing the two ciphertexts would reveal the XOR of plaintexts — full confidentiality break, regardless of AAD differences.
 
-Binding the ciphertext to its tree position via the Additional Authenticated Data field prevents a **relocation attack**: an adversary who somehow obtains a valid Space-A ciphertext cannot move it into Space-B's tree slot. The AEAD verification will fail because the AAD bound at encryption (Space-A's lookup key) won't match the AAD presented at decryption (Space-B's lookup key).
+Mixing `space_lookup_key` into the nonce derivation makes nonces a function of `(space, cleartext)`, so cross-space cleartext collisions can never collide nonces. Determinism for the same `(space, cleartext)` pair is preserved (CRDT convergence still works).
+
+### Why AAD = `space_lookup_key`
+
+Even with the nonce binding above, AAD is still useful: binding ciphertext to its tree position via AAD prevents a **relocation attack**, where an adversary who obtains a valid Space-A ciphertext cannot move it into Space-B's tree slot. The AEAD verification fails because the AAD bound at encryption (Space-A's lookup key) won't match the AAD presented at decryption (Space-B's lookup key). This is defense-in-depth on top of the nonce binding.
 
 ### Implementation note
 
@@ -145,9 +165,11 @@ use blake3;
 
 let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)?;
 
-// Derive nonce
+// Derive nonce — bind to space_lookup_key to prevent cross-space nonce reuse
 let mut nonce_bytes = [0u8; 12];
 let mut hasher = blake3::Hasher::new_keyed(&nonce_key);
+hasher.update(b"owner-state-entry-v1");
+hasher.update(&space_lookup_key);
 hasher.update(&cleartext_cbor);
 hasher.finalize_xof().fill(&mut nonce_bytes);
 let nonce = Nonce::from_slice(&nonce_bytes);
@@ -155,12 +177,12 @@ let nonce = Nonce::from_slice(&nonce_bytes);
 // Encrypt in place (space_lookup_key derived per the "Tree-lookup-key scheme" section)
 let mut buffer = cleartext_cbor;
 cipher.encrypt_in_place(nonce, &space_lookup_key, &mut buffer)?;
-let ciphertext = buffer;
+let ciphertext_with_tag = buffer;  // includes appended Poly1305 tag
 
-// Storage blob
-let mut storage_blob = Vec::with_capacity(12 + ciphertext.len());
+// Storage blob: nonce(12) || ciphertext_with_tag
+let mut storage_blob = Vec::with_capacity(12 + ciphertext_with_tag.len());
 storage_blob.extend_from_slice(&nonce_bytes);
-storage_blob.extend_from_slice(&ciphertext);
+storage_blob.extend_from_slice(&ciphertext_with_tag);
 let cipher_cid = blake3::hash(&storage_blob);
 ```
 
@@ -168,9 +190,9 @@ let cipher_cid = blake3::hash(&storage_blob);
 
 Prolly Tree keys (the keys used to find a Space in the tree) are MAC'd:
 
-```
-lookup_key_bytes = HMAC-SHA256(key=owner_state_lookup_key, message=space_id_bytes)
-                                                                                   // 32 bytes
+```text
+space_lookup_key = HMAC-SHA256(key=owner_state_lookup_key, message=space_id_bytes)
+                                                                                  // 32 bytes
 ```
 
 A passive observer of the tree structure sees opaque 32-byte lookup keys with no recoverable Space-ID information. Only a holder of `owner_state_lookup_key` can compute the lookup key for a given Space ID.
@@ -200,7 +222,7 @@ The `hmac` crate is not yet in Cargo.toml — needs to be added: `hmac = "0.12"`
 Sees:
 
 - The owner is publishing state-root updates (timing observable)
-- Encrypted root-CID pointers as opaque AEAD blobs (24 bytes nonce+tag overhead + actual CID bytes)
+- Encrypted root-CID pointers as opaque AEAD blobs (28 bytes nonce+tag overhead — 12 nonce + 16 Poly1305 tag — + canonical-CBOR plaintext bytes)
 - Update frequency (potentially correlatable with user activity — fundamental to pub/sub)
 
 Cannot see:
@@ -230,21 +252,38 @@ Full read/write access. Same threat surface as ZEB-173 backup file unlocked: ful
 ### Zenoh topic
 
 - Name: `harmony/owner/{addr_hex}/state-root-v1`
-- Payload format:
+- Payload byte layout (the entire Zenoh payload, no outer framing):
 
+```text
+state_root_publish_bytes = nonce(12) || ChaCha20-Poly1305-ciphertext-with-tag
 ```
-state_root_publish = {
-  encrypted_root: bytes,         // AEAD-encrypted current root CID + HLC stamp
+
+Where the **plaintext** is the canonical-CBOR encoding of:
+
+```text
+state_root_payload = {
+  "root_cid": bstr,              // 32 bytes; BLAKE3 of the owner-state Prolly Tree root block
+  "at":       HLC,               // publishing device's HLC at the moment of this publish
 }
 ```
 
-The encrypted-root payload uses the same `owner_state_aead_key` with `aad = b"state-root-pointer"` (domain-separated from per-Space-entry encryption via different AAD).
+(`HLC` is a CBOR map with sorted keys: `{"wall_ms": uint, "logical": uint, "device_id": tstr}`. Canonical-CBOR rules apply.)
+
+**Nonce generation:** cryptographically-random 12 bytes from the OS CSPRNG, fresh per publish. Determinism is **not** required for root publishes — they are pub/sub events, not content-addressed (different from per-Space-entry encryption above). Random nonces eliminate any chance of cross-publish nonce reuse.
+
+**Receiver parsing:** read the first 12 bytes as the nonce; the remainder is the AEAD ciphertext-with-tag. Decrypt with `owner_state_aead_key` and `aad = b"state-root-pointer"`. On AEAD failure, drop the publish (could be unauthenticated injection).
+
+**AEAD parameters:**
+
+- Key: `owner_state_aead_key`
+- AAD: `b"state-root-pointer"` (domain-separated from per-Space-entry encryption via different AAD)
+- Nonce: random per publish (above)
 
 ### Storage blob format
 
 Stored in harmony-content CAS at CID `BLAKE3(blob)`:
 
-```
+```text
 storage_blob = nonce(12 bytes) || ChaCha20-Poly1305-ciphertext-with-tag
 ```
 
@@ -292,8 +331,11 @@ Before ZEB-211 implementation lands (note: this spec is design-only; implementat
 - All key-derivation, encryption, and decryption paths covered by Rust unit tests
 - Round-trip test: encrypt 100 random Space entries, decrypt, verify cleartext match
 - Stability test: encrypt the same cleartext on two simulated bound devices (same master seed), verify identical cipher-CIDs
+- **Canonical-CBOR cross-encoder test:** serialize the same logical `space_entry` value with two independent encoder configurations (or two separate processes); assert byte-identical CBOR output. Load-bearing for deterministic encryption.
+- **Cross-space nonce-binding test:** craft two Space entries A and B with identical `cleartext_cbor` (artificial — bypass HLC variance for the test) but different `space_id`s; assert their derived `nonce_12` values differ. Verifies the nonce-binding fix to the cross-space nonce-reuse vulnerability.
 - Negative test: ciphertext from Space-A cannot be decrypted as Space-B (AAD binding works)
 - Negative test: Space ID enumeration via tree-lookup-key brute force is computationally infeasible (assert HMAC, not plain hash, used for lookup keys)
+- Round-trip test for state-root publish: encrypt random `(root_cid, HLC)` payloads with random nonces and `aad=b"state-root-pointer"`, decrypt, verify cleartext match
 - `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` clean
 - `cargo fmt --all -- --check` clean
 
