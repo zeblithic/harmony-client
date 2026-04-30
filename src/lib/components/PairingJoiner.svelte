@@ -53,6 +53,13 @@
   }
 </script>
 
+<!--
+  canCancel intentionally omitted (defaults to true). Pairing's existing
+  Cancel button is enabled in every non-terminal state — even during
+  active operations like enroll/start — so Esc mirrors that always-
+  available dismissal. The terminal-state IPC skip lives in handleCancel
+  above; this Modal stays permissive on Esc.
+-->
 <Modal
   onCancel={handleCancel}
   ariaLabelledby="join-heading"

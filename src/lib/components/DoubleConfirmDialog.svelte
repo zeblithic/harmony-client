@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Modal from './Modal.svelte';
+
   let {
     title,
     firstMessage,
@@ -19,17 +21,21 @@
 
   let gate = $state(1);
   const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
-  let dialogEl: HTMLElement;
+  let contentEl: HTMLElement;
 
+  // Re-focus first button when gate transitions 1→2 — trapFocus only acts
+  // on mount/unmount, not on internal state changes that swap the visible
+  // button set. On mount this no-ops because trapFocus already focused the
+  // first button.
   $effect(() => {
     void gate;
-    dialogEl?.querySelector<HTMLElement>('button')?.focus();
+    contentEl?.querySelector<HTMLElement>('button')?.focus();
   });
 </script>
 
-<div class="dialog-overlay" onkeydown={(e) => { if (e.key === 'Escape') onCancel(); }}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} bind:this={dialogEl}>
-    <h2 class="dialog-title" id={titleId}>{title}</h2>
+<Modal onCancel={onCancel} ariaLabelledby={titleId}>
+  <h2 class="dialog-title" id={titleId}>{title}</h2>
+  <div bind:this={contentEl}>
     {#if gate === 1}
       <p class="dialog-message">{firstMessage}</p>
       <div class="dialog-actions">
@@ -50,28 +56,9 @@
       </div>
     {/if}
   </div>
-</div>
+</Modal>
 
 <style>
-  .dialog-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 24px;
-    max-width: 480px;
-    width: 100%;
-  }
-
   .dialog-title {
     color: var(--text-primary);
     font-size: 1.1rem;

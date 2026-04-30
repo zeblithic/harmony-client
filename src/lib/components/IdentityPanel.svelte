@@ -546,7 +546,7 @@
 {#if loadError}
   <section class="identity-panel" aria-label="Identity">
     <h3 class="section-title">Your Identity</h3>
-    <p class="error">{loadError}</p>
+    <p class="error" role="alert">{loadError}</p>
   </section>
 {:else if wizardState.kind === 'idle'}
   <section class="identity-panel" aria-label="Identity">
@@ -600,7 +600,7 @@
     <section class="identity-panel" aria-label="Identity">
       {#if wizardState.step.loadError}
         <h3 class="section-title">Backup identity</h3>
-        <p class="error">{wizardState.step.loadError}</p>
+        <p class="error" role="alert">{wizardState.step.loadError}</p>
         <div class="actions">
           <button onclick={resetToIdle}>Back to settings</button>
         </div>
@@ -731,7 +731,7 @@
   {:else if wizardState.step.phase === 'fileSaveError'}
     <section class="identity-panel" aria-label="Identity">
       <h3 class="section-title">Recovery file save failed</h3>
-      <p class="error">{wizardState.step.error}</p>
+      <p class="error" role="alert">{wizardState.step.error}</p>
       <div class="actions">
         <button onclick={() => {
           if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileSaveError') {
@@ -917,7 +917,7 @@
   {:else if wizardState.step.phase === 'commitError'}
     <section class="identity-panel" aria-label="Identity">
       <h3 class="section-title">Restore failed</h3>
-      <p class="error">{wizardState.step.error}</p>
+      <p class="error" role="alert">{wizardState.step.error}</p>
       <div class="actions">
         <button onclick={() => {
           if (wizardState.kind === 'restore' && wizardState.step.phase === 'commitError') {

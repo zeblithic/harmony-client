@@ -71,4 +71,20 @@ describe('DoubleConfirmDialog', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onCancel).toHaveBeenCalledOnce();
   });
+
+  it('renders inside <Modal> with correct a11y attributes', () => {
+    const { getByRole } = render(DoubleConfirmDialog, {
+      props: {
+        title: 'Double confirm',
+        firstMessage: 'Are you sure?',
+        secondMessage: 'Really really sure?',
+        confirmLabel: 'Yes',
+        onConfirm: () => {},
+        onCancel: () => {},
+      },
+    });
+    const dialog = getByRole('dialog');
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    expect(dialog.getAttribute('aria-labelledby')).toMatch(/^dialog-title-/);
+  });
 });

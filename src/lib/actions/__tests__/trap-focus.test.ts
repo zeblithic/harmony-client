@@ -42,6 +42,20 @@ describe('trap-focus action', () => {
     expect(modal.getAttribute('tabindex')).toBe('-1');
   });
 
+  it('focuses elements in DOM order regardless of selector-list order (jsdom bug guard)', () => {
+    document.body.innerHTML = `
+      <button id="trigger">Open</button>
+      <div id="modal">
+        <input id="i1" type="text" aria-label="i1" />
+        <button id="b1">B1</button>
+      </div>
+    `;
+    document.querySelector<HTMLButtonElement>('#trigger')!.focus();
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    cleanup = trapFocus(modal, {});
+    expect(document.activeElement?.id).toBe('i1');
+  });
+
   it('skips disabled buttons when picking the first focusable', () => {
     document.body.innerHTML = `
       <button id="trigger">Open</button>

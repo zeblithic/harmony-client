@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import Modal from './Modal.svelte';
 
   let {
     title,
@@ -22,59 +22,32 @@
   let typed = $state('');
   let matches = $derived(typed === confirmText);
   const titleId = `dialog-title-${Math.random().toString(36).slice(2)}`;
-  let inputEl: HTMLInputElement;
-
-  onMount(() => {
-    inputEl?.focus();
-  });
 </script>
 
-<div class="dialog-overlay" onkeydown={(e) => { if (e.key === 'Escape') onCancel(); }}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
-    <h2 class="dialog-title" id={titleId}>{title}</h2>
-    <p class="dialog-message">{message}</p>
-    <p class="dialog-hint">Type <code>{confirmText}</code> to confirm</p>
-    <input
-      class="dialog-input"
-      type="text"
-      aria-label="Type to confirm"
-      bind:value={typed}
-      bind:this={inputEl}
-    />
-    <div class="dialog-actions">
-      <button class="cancel-btn" onclick={onCancel}>Cancel</button>
-      <button
-        class="confirm-btn"
-        class:destructive
-        disabled={!matches}
-        onclick={onConfirm}
-      >
-        {confirmLabel}
-      </button>
-    </div>
+<Modal onCancel={onCancel} ariaLabelledby={titleId}>
+  <h2 class="dialog-title" id={titleId}>{title}</h2>
+  <p class="dialog-message">{message}</p>
+  <p class="dialog-hint">Type <code>{confirmText}</code> to confirm</p>
+  <input
+    class="dialog-input"
+    type="text"
+    aria-label="Type to confirm"
+    bind:value={typed}
+  />
+  <div class="dialog-actions">
+    <button class="cancel-btn" onclick={onCancel}>Cancel</button>
+    <button
+      class="confirm-btn"
+      class:destructive
+      disabled={!matches}
+      onclick={onConfirm}
+    >
+      {confirmLabel}
+    </button>
   </div>
-</div>
+</Modal>
 
 <style>
-  .dialog-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 24px;
-    max-width: 480px;
-    width: 100%;
-  }
-
   .dialog-title {
     color: var(--text-primary);
     font-size: 1.1rem;

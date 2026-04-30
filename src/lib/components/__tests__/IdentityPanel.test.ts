@@ -179,7 +179,10 @@ describe('IdentityPanel — error state', () => {
 
     render(IdentityPanel);
 
-    await screen.findByText(/could not read identity store/i);
+    const errorEl = await screen.findByText(/could not read identity store/i);
+    // ZEB-186: top-level error displays carry role="alert" so screen
+    // readers announce them.
+    expect(errorEl.getAttribute('role')).toBe('alert');
     // Buttons should not be present in error state
     expect(screen.queryByRole('button', { name: /backup/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /restore/i })).toBeNull();

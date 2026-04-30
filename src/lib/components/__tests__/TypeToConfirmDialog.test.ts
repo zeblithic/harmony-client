@@ -51,4 +51,23 @@ describe('TypeToConfirmDialog', () => {
     const confirmBtn = screen.getByRole('button', { name: 'Burn' });
     expect(confirmBtn.hasAttribute('disabled')).toBe(true);
   });
+
+  it('renders inside <Modal> with correct a11y attributes and focuses the input', async () => {
+    const { getByRole, getByLabelText } = render(TypeToConfirmDialog, {
+      props: {
+        title: 'Confirm',
+        message: 'Type to confirm',
+        confirmText: 'DELETE',
+        confirmLabel: 'Delete',
+        onConfirm: () => {},
+        onCancel: () => {},
+      },
+    });
+    const dialog = getByRole('dialog');
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    expect(dialog.getAttribute('aria-labelledby')).toMatch(/^dialog-title-/);
+    // Verify input is first-focused (preserves the existing UX).
+    const input = getByLabelText('Type to confirm');
+    expect(document.activeElement).toBe(input);
+  });
 });
