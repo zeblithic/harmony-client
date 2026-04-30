@@ -3,6 +3,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
   import { OwnerService } from '../owner-service';
+  import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
 
   const svc = new OwnerService();
 
@@ -188,6 +189,25 @@
     if (backupInFlight) return;
     const { passphrase, passphraseConfirm, comment } = wizardState.step;
     if (!passphrase || passphrase !== passphraseConfirm) return;
+
+    // ZEB-202: enforce passphrase length floor BEFORE opening the OS
+    // save dialog. `[...str].length` counts Unicode codepoints to
+    // match the Rust backend's `passphrase.chars().count()` check.
+    // Wording mirrors the backend message verbatim so a future engineer
+    // reading either side sees identical copy.
+    if ([...passphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
+      wizardState = {
+        kind: 'backup',
+        step: {
+          phase: 'fileSaveError',
+          error: `Recovery passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`,
+          passphrase,
+          passphraseConfirm,
+          comment,
+        },
+      };
+      return;
+    }
 
     // Set busy flag BEFORE the save dialog opens so a fast double-click on
     // Continue cannot queue parallel dialogs and parallel exports

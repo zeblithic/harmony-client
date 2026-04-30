@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
+  import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
 
@@ -168,7 +169,7 @@
     // Count Unicode codepoints, not UTF-16 code units, so the check matches
     // the Rust backend's `passphrase.chars().count()` for multibyte input
     // (emoji, CJK). Spreading a string yields one element per codepoint.
-    if ([...backupPassphrase].length < 12) {
+    if ([...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
       backupError = 'Passphrase must be at least 12 characters.';
       return;
     }
