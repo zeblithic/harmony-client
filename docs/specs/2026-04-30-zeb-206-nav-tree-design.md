@@ -153,6 +153,7 @@ interface MemberState {
 ```typescript
 interface OutboxEntry {
   id: string;
+  space_id: SpaceId;               // DM/group-DM Space this outgoing message belongs to
   recipient_owners: OwnerAddr[];   // EXCLUDES sender — 1 for DM, 2-15 for group-DM
   message_cid: ContentId;          // message blob lives in CAS
   created_at: HLC;
@@ -271,7 +272,7 @@ Device A:                                  Device B (same owner):
 2. Rust stores message blob in CAS → gets CID
 3. Attempts Reticulum link to recipient's owner (tries known device endpoints)
 4. **Link fails / no endpoints reachable:**
-   - Writes `OutboxEntry` to owner-state CRDT with `recipient_owners + message_cid`
+   - Writes `OutboxEntry {id, space_id, recipient_owners, message_cid, created_at, delivered_to: []}` to owner-state CRDT
    - Owner-state sync replicates outbox to *sender's* other bound devices
 5. **Delivery loop** (any of sender's bound devices, whichever is online):
    - Walks outbox every N seconds
@@ -298,7 +299,7 @@ Device A:                                  Device B (same owner):
 
 | Module | Responsibility |
 |---|---|
-| `owner_state_crdt.rs` | Prolly Tree CRDT for owner-state: spaces, outbox, read markers. Read/write API. Sync via encrypted Zenoh topic. |
+| `owner_state_crdt.rs` | Prolly Tree CRDT for owner-state: spaces, outbox, inbox, read markers. Read/write API for all four collections, plus sync via encrypted Zenoh topic (Flow A). InboxEntry writes from Flow C land here; Flow A propagates them to other bound devices. |
 | `community_membership.rs` | Per-community signed-event CRDT. Join/leave/kick/power-level event composition + verification. Materialized-state computation. |
 | `dm_outbox.rs` | Outbox drain loop. Walks pending entries, attempts Reticulum delivery, handles acks, GCs delivered entries. |
 | `library_directory.rs` | Subscribe to known libraries' directory topics. Aggregate + dedupe entries. Handle federated republication signatures. |
@@ -386,8 +387,8 @@ redeem_invite(invite_link) -> Result<SpaceId>
 | `community` | `id` | Community ID is assigned at community creation and broadcast in the community membership CRDT events. All members reference the same id. |
 | `channel` | `id` | Channel ID is assigned by community admin at channel creation and embedded in the community CRDT. Members joining reference the existing id. |
 | `public-channel` | `transport.topic` | Natural identity is the Zenoh topic name. Two devices joining the same public channel reference the same topic string. |
-| `dm` | sorted `members[]` | Two-person DMs uniquely identified by their participants. Both devices "starting a DM with Alice" produce the same sorted member set. |
-| `group-dm` | sorted `members[]` | Same logic as DM. The full sorted participant list is the natural identity. |
+| `dm` | sorted `members[]` | Two-person DMs have **immutable** membership (a DM is forever a DM with the same two people). Sorted-members is a stable identity. Both my devices "starting a DM with Alice" produce the same sorted member set → CRDT merges. |
+| `group-dm` | `id` (ULID, assigned at creation, propagated via invite) | Group-DM membership is **mutable** (grow-only, see "Group DM mutability" below). Sorted-members would change when members are added, splitting the conversation identity. The ULID `id` is the durable conversation identity; invitees receive it as part of the Reticulum invite payload and create their Space with the same `id`. |
 
 When the dedupe key matches across two device-local writes, the merged Space takes:
 - `id`: the lexicographically smaller of the two ULIDs (deterministic tie-break)
@@ -437,9 +438,10 @@ When the dedupe key matches across two device-local writes, the merged Space tak
 
 ### Group DM mutability (resolves earlier ambiguity)
 
-- **Membership is mutable in the 2-16 range.** Any current member can invite a new member (open join — no admin tier within group DMs, consistent with the no-global-moderation principle).
-- **Members can leave themselves at any time.** Leaving stops new InboxEntries from being delivered to that owner; existing history on their devices stays.
+- **`members[]` is grow-only in the CRDT (3–16 cap).** Any current member can invite another, growing the list up to 16. The `id` (ULID) is stable for the lifetime of the conversation regardless of membership changes — sorted-members would shift on every add and corrupt conversation identity, which is why group-dm dedupes by `id` (see dedupe table above).
+- **Leaving is owner-local, not a broadcast event.** When you leave, you remove the Space from your own owner-state CRDT. Other participants see no change to their `members[]` view (no shrink, no "X left" indicator) — they may continue trying to deliver via Reticulum, but your receive layer will silently drop incoming DMs for the removed Space. This trades subtle staleness on others' devices for CRDT-primitive simplicity in v1; broadcast leave events are a deliberate followup if it becomes a user need.
 - **No "kick" primitive.** Kicking is a community-level moderation action; group DMs deliberately don't have it. If kicking someone matters to you, the relationship has already outgrown a group DM.
+- **`members.length` cannot drop below 3 via the CRDT** (because `members[]` is grow-only — adds only, never CRDT-level removes). It only "appears" to drop on a particular owner's nav when they leave (locally), not for other participants.
 - **At 17 → must convert.** UI blocks the add and prompts: "Convert to community" (membership carries forward, history retention is a separate UX choice) or "Create a new community" (fresh, no history).
 
 ### Locked-in YAGNI calls
