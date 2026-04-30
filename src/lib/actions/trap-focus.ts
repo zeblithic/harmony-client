@@ -24,11 +24,12 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
     document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
   const focusables = focusableIn(node);
-  if (focusables.length > 0) {
-    focusables[0].focus();
-  } else {
+  const setTabindexFallback = focusables.length === 0;
+  if (setTabindexFallback) {
     node.setAttribute('tabindex', '-1');
     node.focus();
+  } else {
+    focusables[0].focus();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -40,7 +41,11 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
     }
     if (e.key !== 'Tab') return;
     const items = focusableIn(node);
-    if (items.length === 0) return;
+    if (items.length === 0) {
+      e.preventDefault();
+      node.focus();
+      return;
+    }
     const first = items[0];
     const last = items[items.length - 1];
     if (e.shiftKey && document.activeElement === first) {
@@ -60,6 +65,7 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
     },
     destroy() {
       node.removeEventListener('keydown', onKeydown);
+      if (setTabindexFallback) node.removeAttribute('tabindex');
       try {
         previouslyFocused?.focus({ preventScroll: true });
       } catch {

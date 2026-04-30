@@ -193,6 +193,48 @@ describe('trap-focus action', () => {
     expect(() => handle.destroy()).not.toThrow();
   });
 
+  it('traps Tab inside an empty-focusables modal', () => {
+    document.body.innerHTML = `
+      <button id="trigger">Open</button>
+      <div id="modal"><p>No focusables here.</p></div>
+    `;
+    document.querySelector<HTMLButtonElement>('#trigger')!.focus();
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    cleanup = trapFocus(modal, {});
+    expect(document.activeElement).toBe(modal);
+    const event = pressKey(modal, 'Tab');
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(modal);
+  });
+
+  it('removes the tabindex attribute on destroy when the action set it', () => {
+    document.body.innerHTML = `
+      <button id="trigger">Open</button>
+      <div id="modal"><p>No focusables here.</p></div>
+    `;
+    document.querySelector<HTMLButtonElement>('#trigger')!.focus();
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    const handle = trapFocus(modal, {});
+    expect(modal.getAttribute('tabindex')).toBe('-1');
+    handle.destroy();
+    expect(modal.hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('preserves a consumer-authored tabindex on destroy', () => {
+    document.body.innerHTML = `
+      <button id="trigger">Open</button>
+      <div id="modal" tabindex="0">
+        <button id="b1">B1</button>
+      </div>
+    `;
+    document.querySelector<HTMLButtonElement>('#trigger')!.focus();
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    const handle = trapFocus(modal, {});
+    expect(modal.getAttribute('tabindex')).toBe('0');
+    handle.destroy();
+    expect(modal.getAttribute('tabindex')).toBe('0');
+  });
+
   it('honors canCancel changes via update()', () => {
     document.body.innerHTML = `
       <div id="modal"><button id="b1">B1</button></div>
