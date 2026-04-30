@@ -11,7 +11,7 @@ Define a concrete encryption scheme for the owner-state CRDT that:
 1. Hides Space-entry contents and tree structure from any party without the owner master seed.
 2. Lives entirely at the harmony-client application layer — no modifications to harmony-core (harmony-runtime, harmony-content, harmony-identity).
 3. Preserves Prolly Tree CRDT semantics (per-entry granularity, structural sharing on DAG-sync).
-4. Is implementable using the crypto primitives already in `src-tauri/Cargo.toml`: `chacha20poly1305`, `hkdf`, `sha2`, `blake3`.
+4. Is implementable using the crypto primitives `chacha20poly1305`, `hkdf`, `sha2`, `blake3` (already in `src-tauri/Cargo.toml`) plus one new dependency: `hmac = "0.12"` (compatible with the existing `sha2 = "0.10"`).
 
 ## Threat model
 
@@ -312,7 +312,7 @@ Per Space-entry write (typical 200-byte CBOR):
 - BLAKE3-hash (228 bytes for cipher-CID): ~1 μs
 - HMAC-SHA256 (Space ID, ~16 bytes): ~1 μs
 
-Total: ~5 μs per Space-entry write, after one-time ~10 μs key derivation. Negligible vs. CRDT bookkeeping.
+Total: ~5 μs per Space-entry write, after the one-time ~12 μs key derivation. Negligible vs. CRDT bookkeeping.
 
 ## Migration path
 
