@@ -95,15 +95,19 @@ impl KeyTree {
 /// — a keyed MAC, NOT a plain hash, so observers without the lookup key
 /// cannot enumerate the tree by precomputing hashes of known space IDs.
 ///
-/// Returns 32 bytes for use as a Prolly Tree key AND as AAD when
-/// encrypting that space's value (defense-in-depth against ciphertext
-/// relocation; see ZEB-211 spec).
-pub fn space_lookup_key(keys: &KeyTree, space_id_bytes: &[u8]) -> [u8; 32] {
+/// Returns 32 bytes (wrapped in `Zeroizing`) for use as a Prolly Tree key
+/// AND as AAD when encrypting that space's value (defense-in-depth against
+/// ciphertext relocation; see ZEB-211 spec). The `Zeroizing` wrapper
+/// matches the protection on the source `KeyTree.lookup` material —
+/// callers that store this in a struct field will get drop-time scrubbing
+/// for free. AEAD calls take `&[u8; 32]`; pass `&*lookup` (Deref) or
+/// `lookup.as_ref()` (AsRef).
+pub fn space_lookup_key(keys: &KeyTree, space_id_bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(keys.lookup.as_ref())
         .expect("HMAC accepts any key length");
     mac.update(space_id_bytes);
-    mac.finalize().into_bytes().into()
+    Zeroizing::new(mac.finalize().into_bytes().into())
 }
 
 /// Domain-separation prefix for per-entry nonce derivation. Versions the
@@ -258,6 +262,30 @@ pub fn decrypt_root_publish(keys: &KeyTree, blob: &[u8]) -> Result<Vec<u8>, Cryp
 ///
 /// Receivers call `try_accept` after AEAD-decrypting a state-root publish
 /// payload but BEFORE applying the new `root_cid`.
+///
+/// # Persistence (Phase 3 responsibility)
+///
+/// This tracker is in-memory only. On process restart it resets to empty,
+/// which means a previously-captured AEAD-valid publish blob is accepted
+/// again on the next boot. **Phase 3 (Zenoh transport integration) MUST
+/// persist `last_accepted` durably** alongside the rest of owner-state,
+/// otherwise an adversary who captures one valid publish can replay it
+/// after every restart. A natural place is the same on-disk owner-state
+/// store, written under a transactional barrier with the new `root_cid`
+/// it gates so the two cannot diverge on crash.
+///
+/// # Bounded growth (Phase 3 responsibility)
+///
+/// `last_accepted` gains one entry per distinct `device_id`. The growth
+/// is bounded in practice by the AEAD authentication gate before
+/// `try_accept` is called: only publishes signed under the owner's
+/// `root_aead` key (held by bound devices per ZEB-173/ZEB-197) reach the
+/// tracker. The legitimate device set is therefore bounded by the
+/// owner's bound-devices roster (typically <100), not by the public.
+/// However, if Phase 3 ever decides to keep a long history of retired
+/// device IDs (e.g., for audit), it should add LRU eviction or a
+/// retention-window policy here to prevent slow growth from rotated
+/// devices over years.
 #[derive(Debug, Default)]
 pub struct RootReplayTracker {
     last_accepted: HashMap<String, Hlc>,
@@ -282,10 +310,25 @@ impl RootReplayTracker {
 ///
 /// Phase 2 of ZEB-215 will move this to a shared types module; Phase 1
 /// keeps it here so the crypto module is self-contained for testing.
+///
+/// **Wire format:** serialized as a CBOR map with single-char field
+/// names (`w`/`l`/`d`) so all three keys have the same encoded length
+/// (1-byte CBOR length prefix + 1 ASCII byte). This satisfies the
+/// `canonical_cbor_encode` "all keys same encoded length" precondition
+/// — without the renames, `wall_ms` (7) / `logical` (7) / `device_id`
+/// (9) would mix encoded-length 8/8/10, silently violating the
+/// invariant every other type relies on. The rename also keeps the
+/// wire form ~22 bytes smaller per Hlc, which matters because every
+/// state-root-publish payload carries one. Locked in by the
+/// `hlc_cbor_uses_single_char_field_names_per_canonical_precondition`
+/// regression test.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hlc {
+    #[serde(rename = "w")]
     pub wall_ms: u64,
+    #[serde(rename = "l")]
     pub logical: u32,
+    #[serde(rename = "d")]
     pub device_id: String,
 }
 
@@ -297,7 +340,12 @@ pub struct Hlc {
 /// - Map types are `BTreeMap` (NOT `HashMap`) — `serde`'s `BTreeMap`
 ///   serializer iterates in `BTreeMap` order, which is `K::Ord`
 /// - All map keys at every nesting level have the same encoded length
-///   (e.g., all-ULID, all-UUID, all-`u64`); see "Why same-length keys"
+///   (e.g., all-ULID, all-UUID, all-`u64`); see "Why same-length keys".
+///   This applies to struct-as-map encoding too: a struct's field names
+///   become CBOR map keys, so all field names of a single struct must
+///   have the same encoded length. `#[serde(rename = "x")]` is the
+///   conventional fix (see `Hlc` for an example: `wall_ms`/`logical`/
+///   `device_id` → `w`/`l`/`d`)
 /// - No `f32` / `f64` fields anywhere in the tree
 /// - No CBOR tags (`#[serde(...)]` attributes that emit tag 6)
 /// - All collections are definite-length (Rust standard collections give
@@ -685,6 +733,42 @@ mod tests {
     fn canonical_cbor_decode_rejects_garbage() {
         let result = canonical_cbor_decode::<Hlc>(b"not cbor at all");
         assert!(matches!(result, Err(CryptoError::CborDecode(_))));
+    }
+
+    #[test]
+    fn hlc_cbor_uses_single_char_field_names_per_canonical_precondition() {
+        // The canonical_cbor_encode docstring requires "all map keys at every
+        // nesting level have the same encoded length." Hlc's struct-as-map
+        // CBOR form must therefore use single-char field names so all three
+        // keys encode to identical 2-byte (1 length-prefix + 1 char) sequences.
+        // Without this, Hlc itself would silently violate the precondition
+        // every other type relies on.
+        let value = Hlc {
+            wall_ms: 7,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        let bytes = canonical_cbor_encode(&value).expect("encode");
+
+        // CBOR layout we lock in for Hlc forever (changing it is a wire-format
+        // break): map(3) { "w": 7, "l": 0, "d": "alice" }
+        let expected: &[u8] = &[
+            0xa3, // map of 3 pairs
+            0x61, b'w', // text(1) "w"
+            0x07, // unsigned 7
+            0x61, b'l', // text(1) "l"
+            0x00, // unsigned 0
+            0x61, b'd', // text(1) "d"
+            0x65, b'a', b'l', b'i', b'c', b'e', // text(5) "alice"
+        ];
+        assert_eq!(
+            bytes, expected,
+            "Hlc CBOR wire format drifted — bound devices will fail to decode"
+        );
+
+        // Round-trip still works.
+        let recovered: Hlc = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(value, recovered);
     }
 
     #[test]
