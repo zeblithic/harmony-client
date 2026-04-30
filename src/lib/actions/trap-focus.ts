@@ -13,9 +13,11 @@ const FOCUSABLE_SELECTOR = [
 ].join(', ');
 
 function focusableIn(node: HTMLElement): HTMLElement[] {
-  return Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (el) => !el.hasAttribute('hidden') && el.getAttribute('aria-hidden') !== 'true',
-  );
+  return Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+    .filter((el) => !el.hasAttribute('hidden') && el.getAttribute('aria-hidden') !== 'true')
+    .sort((a, b) =>
+      a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1,
+    );
 }
 
 export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
