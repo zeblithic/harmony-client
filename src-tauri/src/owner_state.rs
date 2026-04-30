@@ -131,6 +131,81 @@ pub(crate) fn clear_token_cache() {
     token_cache_lock().clear();
 }
 
+// ── Path token cache for export-save-dialog confirmations ────────────────
+//
+// Mirror of TOKEN_CACHE but for user-confirmed save paths. The
+// `request_export_save_path` IPC opens the OS save dialog server-side and
+// inserts the chosen PathBuf here; `export_*_to_path` consumes the token
+// at commit time. The renderer never names a write path directly.
+//
+// Two separate caches (rather than one polymorphic enum) because the value
+// types are semantically different: master-seed tokens hold
+// `Zeroizing<[u8; 32]>` and need zeroize-on-drop; path tokens hold
+// `PathBuf` and don't. Type-level separation prevents "wrong token type"
+// runtime bugs.
+
+// Couple to TOKEN_TTL/MAX_LIVE_TOKENS so the two caches age and evict in
+// lockstep — separate constants invite silent drift if one is updated
+// later without the other. If path tokens ever warrant a different
+// lifetime (e.g., shorter because paths are non-secret), decouple here.
+const PATH_TOKEN_TTL: Duration = TOKEN_TTL;
+const MAX_LIVE_PATH_TOKENS: usize = MAX_LIVE_TOKENS;
+
+struct PathTokenEntry {
+    path: std::path::PathBuf,
+    inserted_at: Instant,
+}
+
+static PATH_TOKEN_CACHE: LazyLock<Mutex<HashMap<Uuid, PathTokenEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn path_token_cache_lock() -> std::sync::MutexGuard<'static, HashMap<Uuid, PathTokenEntry>> {
+    PATH_TOKEN_CACHE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Insert a save path into the path-token cache, returning a fresh
+/// single-use token. Caller hands the token to the GUI; GUI presents it
+/// back via `take_path_token` on commit.
+pub fn insert_path_token(path: std::path::PathBuf) -> Uuid {
+    let token = Uuid::new_v4();
+    let mut cache = path_token_cache_lock();
+    evict_expired_paths(&mut cache);
+    if cache.len() >= MAX_LIVE_PATH_TOKENS {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, e)| e.inserted_at)
+            .map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(
+        token,
+        PathTokenEntry {
+            path,
+            inserted_at: Instant::now(),
+        },
+    );
+    token
+}
+
+/// Consume a path token: returns the user-confirmed save path exactly once.
+pub fn take_path_token(token: &Uuid) -> Option<std::path::PathBuf> {
+    let mut cache = path_token_cache_lock();
+    evict_expired_paths(&mut cache);
+    cache.remove(token).map(|e| e.path)
+}
+
+fn evict_expired_paths(cache: &mut HashMap<Uuid, PathTokenEntry>) {
+    cache.retain(|_, e| e.inserted_at.elapsed() < PATH_TOKEN_TTL);
+}
+
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn clear_path_token_cache() {
+    path_token_cache_lock().clear();
+}
+
 #[cfg(test)]
 mod token_cache_tests {
     use super::*;
@@ -195,6 +270,63 @@ mod token_cache_tests {
             remaining,
             MAX_LIVE_TOKENS - 1,
             "after MAX_LIVE_TOKENS+2 inserts, exactly MAX_LIVE_TOKENS must survive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod path_token_cache_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    #[test]
+    #[serial]
+    fn insert_then_take_returns_path_once() {
+        clear_path_token_cache();
+        let path = PathBuf::from("/tmp/example-recovery.bin");
+        let token = insert_path_token(path.clone());
+        let taken = take_path_token(&token).expect("first take must succeed");
+        assert_eq!(taken, path);
+        assert!(
+            take_path_token(&token).is_none(),
+            "second take must return None (single-use)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn nonexistent_token_returns_none() {
+        clear_path_token_cache();
+        let bogus = Uuid::new_v4();
+        assert!(take_path_token(&bogus).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn lru_evicts_when_max_live_path_tokens_exceeded() {
+        // Mirrors the seed-token test: newest-preserving + cap invariant.
+        // Same Instant::now() non-determinism caveat — we don't assert which
+        // tokens were evicted, only that the cap holds and the newest survives.
+        clear_path_token_cache();
+        let mut tokens = Vec::new();
+        for i in 0..(MAX_LIVE_PATH_TOKENS + 2) {
+            tokens.push(insert_path_token(PathBuf::from(format!("/tmp/{i}.bin"))));
+        }
+        let last_token = tokens[MAX_LIVE_PATH_TOKENS + 1];
+        assert!(
+            take_path_token(&last_token).is_some(),
+            "newest-inserted token must remain after cap-exceed insert"
+        );
+        let remaining: usize = tokens
+            .iter()
+            .filter(|t| **t != last_token)
+            .filter(|t| take_path_token(t).is_some())
+            .count();
+        assert_eq!(
+            remaining,
+            MAX_LIVE_PATH_TOKENS - 1,
+            "after MAX_LIVE_PATH_TOKENS+2 inserts, exactly MAX_LIVE_PATH_TOKENS must survive"
         );
     }
 }

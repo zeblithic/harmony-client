@@ -52,16 +52,50 @@ describe('OwnerService', () => {
 
   it('exportRecoveryFile passes args verbatim', async () => {
     (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-      identityHash: 'abc', byteLen: 1234,
+      identityHash: 'abc', byteLen: 1234, path: '/tmp/r',
     });
     const svc = new OwnerService();
-    await svc.exportRecoveryFile('tok', '/tmp/r', 'a-strong-passphrase', 'comment');
+    const got = await svc.exportRecoveryFile('tok', 'path-tok', 'a-strong-passphrase', 'comment');
     expect(invoke).toHaveBeenCalledWith('export_owner_recovery_file_to_path', {
       recoveryToken: 'tok',
-      path: '/tmp/r',
+      pathToken: 'path-tok',
       passphrase: 'a-strong-passphrase',
       comment: 'comment',
     });
+    expect(got.path).toBe('/tmp/r');
+    expect(got.identityHash).toBe('abc');
+    expect(got.byteLen).toBe(1234);
+  });
+
+  it('requestExportSavePath forwards the dialog request shape', async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce('path-token-uuid');
+    const svc = new OwnerService();
+    const got = await svc.requestExportSavePath({
+      title: 'Save backup',
+      defaultFilename: 'owner-recovery.bin',
+      filterName: 'Recovery file',
+      filterExtensions: ['bin'],
+    });
+    expect(got).toBe('path-token-uuid');
+    expect(invoke).toHaveBeenCalledWith('request_export_save_path', {
+      request: {
+        title: 'Save backup',
+        defaultFilename: 'owner-recovery.bin',
+        filterName: 'Recovery file',
+        filterExtensions: ['bin'],
+      },
+    });
+  });
+
+  it('requestExportSavePath returns null when user cancels', async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+    const svc = new OwnerService();
+    const got = await svc.requestExportSavePath({
+      defaultFilename: 'x',
+      filterName: 'y',
+      filterExtensions: ['z'],
+    });
+    expect(got).toBeNull();
   });
 });
 

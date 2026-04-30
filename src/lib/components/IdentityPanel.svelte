@@ -1,7 +1,10 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { save, open } from '@tauri-apps/plugin-dialog';
+  import { open } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
+  import { OwnerService } from '../owner-service';
+
+  const svc = new OwnerService();
 
   function assertNever(x: never): never {
     throw new Error(`unhandled wizard variant: ${JSON.stringify(x)}`);
@@ -19,6 +22,11 @@
   // typed-prefix gate uncomparable until the real hash is in hand.
   let currentPrefix = $derived(fullHash ? fullHash.slice(0, 8) : '');
   let loadError = $state<string | null>(null);
+  // True while a backup save dialog or export IPC call is in flight. Blocks
+  // the Continue button so a fast double-click cannot queue parallel save
+  // dialogs and parallel export_recovery_file_to_path writes (CodeRabbit,
+  // PR #66 review). Cleared in advanceFromFileEntry's outer finally.
+  let backupInFlight = $state(false);
   // True while a restore IPC call is in flight. Blocks the Replace button so
   // double-click cannot issue duplicate restore_* requests against the store.
   let restoreInFlight = $state(false);
@@ -126,6 +134,13 @@
   }
 
   function resetToIdle() {
+    // Defensive guard against concurrent close-while-export-running:
+    // even with the Cancel button disabled in the fileEntry phase, a
+    // future caller (e.g., a different view's Cancel) might invoke
+    // resetToIdle while the export IPC is mid-flight. Closing the
+    // wizard would let the backend write complete unobserved by the
+    // user. (CodeRabbit, PR #66 review.)
+    if (backupInFlight) return;
     wizardState = { kind: 'idle' };
     selectedBackupType = null;
     selectedRestoreSource = null;
@@ -165,56 +180,95 @@
 
   async function advanceFromFileEntry() {
     if (wizardState.kind !== 'backup' || wizardState.step.phase !== 'fileEntry') return;
+    // Function-level reentrancy guard: even with the Continue button gated
+    // on `backupInFlight`, two click handlers can be queued in the same
+    // event-loop turn before Svelte's reactivity propagates `disabled` to
+    // the DOM. Mirrors the existing guard in commitRestore.
+    // (CodeRabbit, PR #66 review.)
+    if (backupInFlight) return;
     const { passphrase, passphraseConfirm, comment } = wizardState.step;
     if (!passphrase || passphrase !== passphraseConfirm) return;
 
-    // Capture epoch before first await (save dialog).
-    const epoch = wizardState;
-
-    let outPath: string | null;
+    // Set busy flag BEFORE the save dialog opens so a fast double-click on
+    // Continue cannot queue parallel dialogs and parallel exports
+    // (CodeRabbit, PR #66 review). Outer try/finally guarantees the flag
+    // is cleared on every exit path — including the epoch-cancel returns
+    // where wizardState changed under us during a pending await.
+    backupInFlight = true;
     try {
-      outPath = await save({
-        title: 'Save recovery file',
-        defaultPath: 'identity.recovery',
-        filters: [{ name: 'Recovery file', extensions: ['recovery'] }],
-      });
-    } catch {
-      // Treat a dialog error the same as cancel — silent return to fileEntry.
-      return;
-    }
+      // Capture epoch before first await (save dialog).
+      const epoch = wizardState;
 
-    // Guard: did the user cancel the wizard while the dialog was open?
-    if (wizardState !== epoch) return;
+      let pathToken: string | null;
+      try {
+        pathToken = await svc.requestExportSavePath({
+          title: 'Save recovery file',
+          defaultFilename: 'identity.recovery',
+          filterName: 'Recovery file',
+          filterExtensions: ['recovery'],
+        });
+      } catch (e) {
+        // Pre-refactor this swallowed silently — but the new wider IPC
+        // surface (request_export_save_path) can fail for reasons that
+        // user-cancel doesn't cover (dispatch error, plugin error, etc.),
+        // so genuine failures need to be surfaced. `null` still signals
+        // user-cancel (Ok(None) over Tauri serde) — that branch below
+        // returns silently. (CodeRabbit, PR #66 review.)
+        if (wizardState !== epoch) return;
+        wizardState = {
+          kind: 'backup',
+          step: {
+            phase: 'fileSaveError',
+            error: `Could not open the save dialog: ${e}. Try again.`,
+            passphrase,
+            passphraseConfirm,
+            comment,
+          },
+        };
+        return;
+      }
 
-    // User cancelled the dialog — silent return per spec.
-    if (!outPath) return;
+      // Guard: did the user cancel the wizard while the dialog was open?
+      if (wizardState !== epoch) return;
 
-    // Capture epoch again before the second await (file write).
-    const epoch2 = wizardState;
+      // User cancelled the dialog — silent return per spec.
+      if (pathToken === null) return;
 
-    try {
-      await invoke('export_recovery_file_to_path', {
-        outPath,
-        passphrase,
-        comment: comment || null,
-      });
+      // Capture epoch again before the second await (file write).
+      const epoch2 = wizardState;
 
-      if (wizardState !== epoch2) return;
-      wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath: outPath } };
-    } catch (e) {
-      if (wizardState !== epoch2) return;
-      // Carry the form input forward so Back returns the user to a populated
-      // form rather than blank fields (Cursor review feedback).
-      wizardState = {
-        kind: 'backup',
-        step: {
-          phase: 'fileSaveError',
-          error: `Could not save to ${outPath}: ${e}. Try a different location.`,
+      try {
+        // NOTE: this IPC returns `String` (the saved path), NOT `ExportInfo`.
+        // The owner-export sibling (`export_owner_recovery_file_to_path`)
+        // returns `ExportInfo { identityHash, byteLen, path }` because
+        // DevicesPanel's success banner uses the metadata fields. This
+        // wizard only needs the path, so the IPC stays a bare String —
+        // see Task 4 of `docs/plans/2026-04-29-zeb-194-export-path-capability-token-plan.md`.
+        const savedPath = await invoke<string>('export_recovery_file_to_path', {
+          pathToken,
           passphrase,
-          passphraseConfirm,
-          comment,
-        },
-      };
+          comment: comment || null,
+        });
+
+        if (wizardState !== epoch2) return;
+        wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath } };
+      } catch (e) {
+        if (wizardState !== epoch2) return;
+        // Carry the form input forward so Back returns the user to a populated
+        // form rather than blank fields (Cursor review feedback).
+        wizardState = {
+          kind: 'backup',
+          step: {
+            phase: 'fileSaveError',
+            error: `Could not save to the chosen location: ${e}. Try a different location.`,
+            passphrase,
+            passphraseConfirm,
+            comment,
+          },
+        };
+      }
+    } finally {
+      backupInFlight = false;
     }
   }
 
@@ -638,9 +692,9 @@
         />
       </label>
       <div class="actions">
-        <button onclick={resetToIdle}>Cancel</button>
+        <button disabled={backupInFlight} onclick={resetToIdle}>Cancel</button>
         <button
-          disabled={!wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
+          disabled={backupInFlight || !wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
           onclick={advanceFromFileEntry}
         >Continue</button>
       </div>

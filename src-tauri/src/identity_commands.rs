@@ -12,7 +12,7 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -460,25 +460,48 @@ pub async fn preview_recovery_file(
     run_blocking(move || preview_recovery_file_helper(Path::new(&in_path), &passphrase)).await
 }
 
-/// Export the master seed as a passphrase-encrypted recovery file at `out_path`.
+/// Export the master seed as a passphrase-encrypted recovery file at the
+/// path the user confirmed via `request_export_save_path`. The renderer
+/// passes back the opaque token from that dialog command — it never names
+/// the path directly.
 ///
-/// Called by the GUI file-backup wizard after the user has confirmed the path
-/// and passphrase.
+/// Returns the path that was actually written to, so the renderer (which
+/// no longer knows the path) can display "saved to X" feedback.
 #[tauri::command]
 pub async fn export_recovery_file_to_path(
-    out_path: PathBuf,
+    path_token: String,
     passphrase: String,
     comment: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let plaintext_path = identity::resolve_path(None)?;
+    // Validate comment length BEFORE consuming the single-use path token.
+    // Otherwise a too-long comment burns the token and forces the user
+    // to re-pick a save path for a purely local validation error.
+    // Mirrors the equivalent pre-take guards in
+    // `owner_commands::export_owner_recovery_file_to_path`.
+    if let Some(c) = comment.as_deref() {
+        let len = c.len();
+        if len > MAX_RECOVERY_COMMENT_BYTES {
+            return Err(format!(
+                "comment is too large ({len} bytes; max {MAX_RECOVERY_COMMENT_BYTES} bytes)"
+            ));
+        }
+    }
+    let path_uuid: Uuid = path_token
+        .parse()
+        .map_err(|e| format!("invalid path token: {e}"))?;
     run_blocking(move || {
+        let out_path = crate::owner_state::take_path_token(&path_uuid).ok_or_else(|| {
+            "Save path token expired or invalid. Please re-trigger backup.".to_string()
+        })?;
         export_recovery_file_to_path_helper(
             &plaintext_path,
             &out_path,
             &passphrase,
             comment,
             KeychainStore::new().ok(),
-        )
+        )?;
+        Ok(out_path.display().to_string())
     })
     .await
 }
@@ -860,6 +883,31 @@ mod tests {
         .expect("comment at exactly the cap is allowed");
 
         std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// ZEB-194 Task 4: the IPC wrapper now consumes a `path_token` from
+    /// `PATH_TOKEN_CACHE` instead of a renderer-supplied path. A bogus UUID
+    /// must surface the "path token expired/invalid" error, NOT silently
+    /// fall through to a write at an attacker-chosen location.
+    #[test]
+    #[serial]
+    fn export_recovery_with_invalid_path_token_errors() {
+        use crate::owner_state::clear_path_token_cache;
+        clear_path_token_cache();
+        let bogus = Uuid::new_v4();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(export_recovery_file_to_path(
+            bogus.to_string(),
+            "passphrase-12+".into(),
+            None,
+        ));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("path token")
+                && (err.contains("expired") || err.contains("invalid")),
+            "error must mention path token expired/invalid; got: {err}"
+        );
     }
 
     // ── token-cache TOCTOU regression (round 4) ──────────────────────────

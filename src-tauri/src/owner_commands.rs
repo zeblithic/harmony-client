@@ -58,6 +58,7 @@ pub struct MintIpcResult {
 pub struct ExportInfo {
     pub identity_hash: String,
     pub byte_len: u64,
+    pub path: String,
 }
 
 fn now_unix() -> u64 {
@@ -219,11 +220,11 @@ pub async fn mint_owner_identity(
 #[tauri::command]
 pub async fn export_owner_recovery_file_to_path(
     recovery_token: String,
-    path: String,
+    path_token: String,
     passphrase: String,
     comment: Option<String>,
 ) -> Result<ExportInfo, String> {
-    // Validate passphrase length BEFORE consuming the token.
+    // Validate passphrase length BEFORE consuming any token (existing).
     // Use Unicode codepoint count (not byte count) so the "characters"
     // error wording matches the check, and so multibyte passphrases
     // (emoji, CJK) round-trip identically with the JS frontend's
@@ -233,7 +234,7 @@ pub async fn export_owner_recovery_file_to_path(
             "Recovery passphrase must be at least {MIN_RECOVERY_PASSPHRASE_LEN} characters."
         ));
     }
-    // Validate comment length BEFORE consuming the token.
+    // Validate comment length BEFORE consuming any token (existing).
     // 256-BYTE cap matches harmony-owner's hard limit on the underlying
     // field. Frontend mirrors with a TextEncoder byte count before submit.
     let comment_validated = match comment {
@@ -242,12 +243,21 @@ pub async fn export_owner_recovery_file_to_path(
         }
         c => c,
     };
-    let token: Uuid = recovery_token
+    let recovery_uuid: Uuid = recovery_token
         .parse()
         .map_err(|e| format!("invalid recovery token: {e}"))?;
-    let out = PathBuf::from(path);
+    let path_uuid: Uuid = path_token
+        .parse()
+        .map_err(|e| format!("invalid path token: {e}"))?;
     run_blocking(move || {
-        let seed = take_token(&token).ok_or_else(|| {
+        // Consume path_token FIRST so a downstream seed-token consumption
+        // failure does not leave a path token live in the cache pointing
+        // at the user's chosen file (ZEB-194 ordering invariant — see test
+        // `export_consumes_path_token_even_when_seed_token_invalid`).
+        let out = crate::owner_state::take_path_token(&path_uuid).ok_or_else(|| {
+            "Save path token expired or invalid. Please re-trigger backup.".to_string()
+        })?;
+        let seed = take_token(&recovery_uuid).ok_or_else(|| {
             "Recovery token expired or invalid. Please re-trigger backup from the Devices panel."
                 .to_string()
         })?;
@@ -266,6 +276,7 @@ pub async fn export_owner_recovery_file_to_path(
         Ok(ExportInfo {
             identity_hash: hex::encode(id_hash),
             byte_len: bytes.len() as u64,
+            path: out.display().to_string(),
         })
     })
     .await
@@ -300,7 +311,9 @@ pub async fn issue_owner_recovery_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_state::clear_token_cache;
+    use crate::owner_state::{
+        clear_path_token_cache, clear_token_cache, insert_path_token, take_path_token,
+    };
     use serial_test::serial;
 
     /// RAII guard: sets an env var on construction, removes it on drop (even on panic).
@@ -327,13 +340,15 @@ mod tests {
     #[serial]
     fn export_with_too_short_passphrase_errors_without_consuming_token() {
         clear_token_cache();
+        clear_path_token_cache();
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
-        let token = insert_token(Zeroizing::new([0xCDu8; 32]));
+        let recovery_uuid = insert_token(Zeroizing::new([0xCDu8; 32]));
+        let path_uuid = insert_path_token(PathBuf::from("/tmp/should-not-write"));
         // Use a too-short passphrase.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(export_owner_recovery_file_to_path(
-            token.to_string(),
-            "/tmp/should-not-write".into(),
+            recovery_uuid.to_string(),
+            path_uuid.to_string(),
             "short".into(),
             None,
         ));
@@ -345,8 +360,14 @@ mod tests {
         );
         // Token must NOT have been consumed (validation precedes take).
         assert!(
-            take_token(&token).is_some(),
+            take_token(&recovery_uuid).is_some(),
             "weak-passphrase rejection must not consume token"
+        );
+        // Path token must ALSO survive: validation runs before any cache
+        // consumption, so neither token must be consumed on this path.
+        assert!(
+            take_path_token(&path_uuid).is_some(),
+            "weak-passphrase rejection must not consume path token"
         );
     }
 
@@ -354,17 +375,21 @@ mod tests {
     #[serial]
     fn export_with_invalid_token_errors() {
         clear_token_cache();
+        clear_path_token_cache();
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
         let bogus = Uuid::new_v4();
+        let path_uuid = insert_path_token(PathBuf::from("/tmp/should-not-write"));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(export_owner_recovery_file_to_path(
             bogus.to_string(),
-            "/tmp/should-not-write".into(),
+            path_uuid.to_string(),
             "passphrase-12+".into(),
             None,
         ));
         assert!(result.is_err());
         let err = result.unwrap_err();
+        // Path token consumes first and succeeds, so this error originates
+        // from the recovery_token consumption.
         assert!(
             err.contains("expired") || err.contains("invalid"),
             "actual: {err}"
@@ -375,13 +400,15 @@ mod tests {
     #[serial]
     fn comment_over_cap_rejected() {
         clear_token_cache();
+        clear_path_token_cache();
         let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
-        let token = insert_token(Zeroizing::new([0xEEu8; 32]));
+        let recovery_uuid = insert_token(Zeroizing::new([0xEEu8; 32]));
+        let path_uuid = insert_path_token(PathBuf::from("/tmp/should-not-write"));
         let comment = "x".repeat(257);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(export_owner_recovery_file_to_path(
-            token.to_string(),
-            "/tmp/should-not-write".into(),
+            recovery_uuid.to_string(),
+            path_uuid.to_string(),
             "passphrase-12+".into(),
             Some(comment),
         ));
@@ -393,9 +420,109 @@ mod tests {
         );
         // Token must NOT have been consumed.
         assert!(
-            take_token(&token).is_some(),
+            take_token(&recovery_uuid).is_some(),
             "comment-over-cap rejection must not consume token"
         );
+        // Path token must ALSO survive: validation runs before any cache
+        // consumption, so neither token must be consumed on this path.
+        assert!(
+            take_path_token(&path_uuid).is_some(),
+            "comment-over-cap rejection must not consume path token"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn export_with_invalid_path_token_errors() {
+        clear_token_cache();
+        clear_path_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
+        let recovery_uuid = insert_token(Zeroizing::new([0xAAu8; 32]));
+        let bogus_path_uuid = Uuid::new_v4();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(export_owner_recovery_file_to_path(
+            recovery_uuid.to_string(),
+            bogus_path_uuid.to_string(),
+            "passphrase-12+".into(),
+            None,
+        ));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("path token")
+                && (err.contains("expired") || err.contains("invalid")),
+            "error must mention path token expired/invalid; got: {err}"
+        );
+        // Recovery token MUST survive: path-token consumption happens first
+        // and fails, so seed-token consumption never runs.
+        assert!(
+            take_token(&recovery_uuid).is_some(),
+            "invalid path-token must not consume recovery token"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn export_consumes_path_token_even_when_seed_token_invalid() {
+        // Pins the consumption ORDER: path_token taken first; if that succeeds
+        // and seed-token consumption fails, the path token is still gone (so a
+        // later replay of either token is impossible). This documents the
+        // invariant against future refactors that might reorder consumption.
+        clear_token_cache();
+        clear_path_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
+        let bogus_recovery_uuid = Uuid::new_v4();
+        let path_uuid = insert_path_token(PathBuf::from("/tmp/zeb194-ordering-test.bin"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(export_owner_recovery_file_to_path(
+            bogus_recovery_uuid.to_string(),
+            path_uuid.to_string(),
+            "passphrase-12+".into(),
+            None,
+        ));
+        assert!(result.is_err());
+        // Path token MUST have been consumed (taken first) even though the
+        // overall command failed.
+        assert!(
+            take_path_token(&path_uuid).is_none(),
+            "path token must be consumed even when subsequent seed-token consumption fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn export_consumes_both_tokens_on_success() {
+        // Drives a real write_atomic_0600 into a tempdir to verify the
+        // happy path end-to-end: both tokens consumed AND ExportInfo.path
+        // echoes the user-confirmed save location. The tempdir Drop
+        // cleans up at scope exit.
+        clear_token_cache();
+        clear_path_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("recovery.bin");
+        let recovery_uuid = insert_token(Zeroizing::new([0xBBu8; 32]));
+        let path_uuid = insert_path_token(out.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(export_owner_recovery_file_to_path(
+            recovery_uuid.to_string(),
+            path_uuid.to_string(),
+            "passphrase-12+".into(),
+            None,
+        ));
+        assert!(result.is_ok(), "export must succeed; got: {result:?}");
+        // Both caches must no longer hold the consumed UUIDs.
+        assert!(
+            take_token(&recovery_uuid).is_none(),
+            "recovery token must be consumed"
+        );
+        assert!(
+            take_path_token(&path_uuid).is_none(),
+            "path token must be consumed"
+        );
+        // ExportInfo.path must echo the chosen path.
+        let info = result.unwrap();
+        assert_eq!(info.path, out.display().to_string());
     }
 
     #[test]

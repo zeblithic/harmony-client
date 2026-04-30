@@ -5,10 +5,9 @@ import * as dialog from '@tauri-apps/plugin-dialog';
 import IdentityPanel from '../IdentityPanel.svelte';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
-vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn(), open: vi.fn() }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 
 const mockInvoke = vi.mocked(invoke);
-const mockSave = vi.mocked(dialog.save);
 const mockOpen = vi.mocked(dialog.open);
 
 describe('IdentityPanel — default state', () => {
@@ -460,7 +459,6 @@ async function arrangeAtFileEntry() {
 describe('Backup wizard — step 2b (file entry screen)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
-    mockSave.mockReset();
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       throw new Error(`unexpected: ${cmd}`);
@@ -557,20 +555,25 @@ describe('Backup wizard — step 2b (file entry screen)', () => {
 describe('Backup wizard — step 3b (save recovery file)', () => {
   beforeEach(() => {
     mockInvoke.mockReset();
-    mockSave.mockReset();
   });
 
   it('writes the file and shows the saved path on success', async () => {
     const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') {
+        const a = args as { request: { defaultFilename: string; filterName: string; filterExtensions: string[] } };
+        expect(a.request.defaultFilename).toBe('identity.recovery');
+        expect(a.request.filterName).toBe('Recovery file');
+        expect(a.request.filterExtensions).toEqual(['recovery']);
+        return 'path-tok';
+      }
       if (cmd === 'export_recovery_file_to_path') {
-        const a = args as { outPath: string; passphrase: string; comment: string | null };
-        expect(a.outPath).toBe(savePath);
+        const a = args as { pathToken: string; passphrase: string; comment: string | null };
+        expect(a.pathToken).toBe('path-tok');
         expect(a.passphrase).toBe('hunter2');
         expect(a.comment).toBe('laptop-2026-04-15');
-        return undefined;
+        return savePath;
       }
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -590,13 +593,13 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
   it('null comment (empty string) passes comment: null to invoke', async () => {
     const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     let capturedComment: string | null | undefined;
     mockInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') {
         capturedComment = (args as { comment: string | null }).comment;
-        return undefined;
+        return savePath;
       }
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -614,10 +617,10 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
 
   it('Done from fileSaved returns to idle', async () => {
     const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
-      if (cmd === 'export_recovery_file_to_path') return undefined;
+      if (cmd === 'request_export_save_path') return 'path-tok';
+      if (cmd === 'export_recovery_file_to_path') return savePath;
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -635,9 +638,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   });
 
   it('dialog cancel (null path) silently returns to file entry step', async () => {
-    mockSave.mockResolvedValue(null); // user cancelled the dialog
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return null; // user cancelled the dialog
       if (cmd === 'export_recovery_file_to_path') throw new Error('should not be called');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -656,10 +659,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   });
 
   it('invoke failure shows error screen with Back and Cancel buttons', async () => {
-    const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -676,10 +678,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   });
 
   it('Back from fileSaveError returns to fileEntry step', async () => {
-    const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -701,10 +702,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     // Pins regression where Back rebuilt fileEntry with empty fields, forcing
     // the user to retype passphrase + confirm + comment from scratch (Cursor
     // review feedback).
-    const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -729,10 +729,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   });
 
   it('Cancel from fileSaveError returns to idle', async () => {
-    const savePath = '/tmp/identity.recovery';
-    mockSave.mockResolvedValue(savePath);
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') throw new Error('disk full');
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -750,19 +749,23 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
   });
 
-  // Race regression: cancel during pending file write must not resurrect the wizard.
-  // Mirrors the pattern from Task 5's "cancel during pending export" test.
-  it('cancel during pending file write does not resurrect the wizard', async () => {
+  // The Cancel button is disabled while the file write is pending so the
+  // user cannot close the wizard while the backend is mid-write — closing
+  // would let the write complete unobserved with no saved-path
+  // confirmation (CodeRabbit, PR #66 review). Replaces the earlier
+  // "cancel does not resurrect the wizard" race-regression test: with
+  // Cancel disabled during the busy phase, that race is unreachable from
+  // the UI. The defensive `if (backupInFlight) return` guard at the top
+  // of `resetToIdle` is a backstop for any non-UI caller.
+  it('cancel button is disabled while file write is pending', async () => {
     const savePath = '/tmp/identity.recovery';
-    // save() dialog resolves immediately with a path.
-    mockSave.mockResolvedValue(savePath);
 
-    // Make the file write hang via a promise we control.
-    let resolveWrite!: () => void;
-    const writePromise = new Promise<void>((resolve) => { resolveWrite = resolve; });
+    let resolveWrite!: (path: string) => void;
+    const writePromise = new Promise<string>((resolve) => { resolveWrite = resolve; });
 
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
+      if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') return writePromise;
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -772,25 +775,17 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
     await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
 
-    // Click Continue — save dialog resolves immediately, then file write starts (pending).
-    // The component is still in fileEntry state while the write is pending.
+    // Click Continue — save dialog resolves immediately; file write hangs.
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
-
-    // Cancel while write is pending. The Cancel button is still visible since
-    // fileEntry is still rendered (no transition until write completes).
-    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
-
-    // Sanity-check: idle screen visible right after cancel.
-    await screen.findByText(/0xaaaaaaaa/);
-    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
-
-    // Now resolve the write — wizard should NOT transition to fileSaved.
-    resolveWrite();
+    // Drain microtasks so the post-dialog `backupInFlight = true` propagates
+    // to the DOM before we check the Cancel button's disabled state.
     await new Promise((r) => setTimeout(r, 0));
 
-    // Assert: still on idle, no success screen.
-    expect(screen.queryByText(/recovery file saved/i)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeDisabled();
+
+    // Resolve the pending write — wizard transitions to the success state.
+    resolveWrite(savePath);
+    await screen.findByText(/recovery file saved/i);
   });
 });
 

@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
-  import { save } from '@tauri-apps/plugin-dialog';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
 
@@ -67,6 +66,12 @@
   let backupPassphrase = $state('');
   let backupPassphraseConfirm = $state('');
   let backupComment = $state('');
+  // Two flags so the button label can distinguish phases (the export IPC
+  // is the only "Encrypting…" phase; the OS save dialog is "Choosing
+  // location…"). Both flags gate the disabled predicate; only the
+  // export-phase flag gates the "Encrypting…" label.
+  // (Cursor Bugbot, PR #66 review.)
+  let backupDialogInFlight = $state(false);
   let backupInFlight = $state(false);
   let backupError = $state<string | null>(null);
   let backupSavedPath = $state<string | null>(null);
@@ -137,6 +142,12 @@
   }
 
   async function commitBackup() {
+    // Function-level reentrancy guard: even with the Save backup button
+    // gated on the in-flight flags, two click handlers can be queued in
+    // the same event-loop turn before Svelte's reactivity propagates
+    // `disabled` to the DOM. Symmetric with IdentityPanel's
+    // advanceFromFileEntry guard. (CodeRabbit, PR #66 review.)
+    if (backupDialogInFlight || backupInFlight) return;
     // Clear any error from a prior commit attempt in this same modal session
     // BEFORE re-validating. Without this, a stale error string from the
     // previous click can render alongside (or instead of) the current
@@ -176,26 +187,43 @@
       backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
       return;
     }
-    let out: string | null;
+    // Mark dialog-in-flight BEFORE the save dialog opens so a fast double-
+    // click on Save backup cannot queue a second dialog and consume the
+    // single-use recovery token twice (CodeRabbit, PR #66 review).
+    // The two flags are deliberately separate: backupDialogInFlight gates
+    // disable; only backupInFlight (the export-phase flag) drives the
+    // "Encrypting…" label, which would otherwise lie during the dialog
+    // phase (Cursor Bugbot, PR #66 review).
+    backupDialogInFlight = true;
+    let pathToken: string | null;
     try {
-      out = await save({
-        defaultPath: 'owner-recovery.bin',
-        filters: [{ name: 'Recovery file', extensions: ['bin'] }],
+      pathToken = await svc.requestExportSavePath({
+        defaultFilename: 'owner-recovery.bin',
+        filterName: 'Recovery file',
+        filterExtensions: ['bin'],
       });
     } catch (e) {
       backupError = extractError(e);
       return;
+    } finally {
+      backupDialogInFlight = false;
     }
-    if (!out) return;
+    if (pathToken === null) return;  // user cancelled
     backupInFlight = true;
     try {
-      await svc.exportRecoveryFile(
+      const info = await svc.exportRecoveryFile(
         recoveryToken,
-        out,
+        pathToken,
         backupPassphrase,
         trimmedComment ? trimmedComment : null,
       );
-      backupSavedPath = out;
+      // Wipe passphrase fields immediately on success — shortens secret
+      // retention in the renderer between this point and closeBackup
+      // (CodeRabbit, PR #66 review). closeBackup also wipes them; this
+      // is belt-and-braces.
+      backupPassphrase = '';
+      backupPassphraseConfirm = '';
+      backupSavedPath = info.path;
     } catch (e) {
       backupError = extractError(e);
     } finally {
@@ -404,21 +432,21 @@
             <p class="error" role="alert">{backupError}</p>
           {/if}
           <div class="modal-actions">
-            <button class="secondary" onclick={closeBackup} disabled={backupInFlight}>Cancel</button>
+            <button class="secondary" onclick={closeBackup} disabled={backupDialogInFlight || backupInFlight}>Cancel</button>
             {#if recoveryToken === null && backupError}
               <!--
                 Token-issuance failed (e.g., locked keychain). Inline retry
                 avoids forcing the user to close + reopen the modal.
               -->
-              <button class="secondary" onclick={retryIssueToken} disabled={backupInFlight}>Retry</button>
+              <button class="secondary" onclick={retryIssueToken} disabled={backupDialogInFlight || backupInFlight}>Retry</button>
             {/if}
             <!--
               Disable Save backup when no token is available (e.g., issue_owner_recovery_token
               failed during openBackup). Otherwise the user clicks Save and gets a confusing
               "No recovery token available" inline error instead of the disabled-state hint.
             -->
-            <button class="primary" onclick={commitBackup} disabled={backupInFlight || recoveryToken === null}>
-              {backupInFlight ? 'Encrypting…' : 'Save backup'}
+            <button class="primary" onclick={commitBackup} disabled={backupDialogInFlight || backupInFlight || recoveryToken === null}>
+              {#if backupInFlight}Encrypting…{:else if backupDialogInFlight}Choose location…{:else}Save backup{/if}
             </button>
           </div>
         {/if}
