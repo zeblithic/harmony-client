@@ -182,6 +182,61 @@ pub fn decrypt_entry(
         .map_err(|_| CryptoError::AeadDecrypt)
 }
 
+/// AAD for state-root-publish AEAD. Domain-separated from per-entry AAD
+/// (which is the per-space lookup key). Note: AAD alone does not provide
+/// keystream separation — that's why we ALSO use a separate AEAD key
+/// (`root_aead` vs `entry_aead`). See ZEB-211 round-2 "Key separation".
+const AAD_ROOT_PUBLISH: &[u8] = b"state-root-pointer";
+
+/// Encrypt a state-root-publish payload for the Zenoh topic.
+///
+/// Layout: `nonce(12) || ChaCha20-Poly1305-ciphertext-with-tag`. Nonce is
+/// fresh-random per publish (CSPRNG). Determinism is intentionally NOT
+/// required here — root publishes are pub/sub events, not content-addressed.
+///
+/// `payload` is typically the canonical-CBOR encoding of `{root_cid, at}`,
+/// but this function is bytes-in/bytes-out — Phase 2 owns the CBOR shape.
+pub fn encrypt_root_publish(keys: &KeyTree, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.root_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: payload,
+                aad: AAD_ROOT_PUBLISH,
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Decrypt a state-root-publish blob produced by `encrypt_root_publish`.
+pub fn decrypt_root_publish(keys: &KeyTree, blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if blob.len() < 12 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.root_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: AAD_ROOT_PUBLISH,
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +371,55 @@ mod tests {
         let lookup = space_lookup_key(&kt, b"some-space");
         // Less than 12+16=28 bytes can never be a valid blob.
         let result = decrypt_entry(&kt, &lookup, &[0u8; 27]);
+        assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
+    }
+
+    #[test]
+    fn encrypt_root_publish_round_trip() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let payload = b"any cbor-encoded plaintext".to_vec();
+
+        let blob = encrypt_root_publish(&kt, &payload).expect("encrypt");
+        let recovered = decrypt_root_publish(&kt, &blob).expect("decrypt");
+
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn encrypt_root_publish_uses_random_nonces() {
+        // Random nonces — two encryptions of the same plaintext must
+        // produce different blobs. (Different from per-entry deterministic.)
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let payload = b"identical".to_vec();
+
+        let blob1 = encrypt_root_publish(&kt, &payload).expect("e1");
+        let blob2 = encrypt_root_publish(&kt, &payload).expect("e2");
+        assert_ne!(blob1, blob2);
+    }
+
+    #[test]
+    fn decrypt_root_publish_rejects_wrong_key() {
+        // A blob encrypted with one owner's key must not decrypt with
+        // another owner's key.
+        let kt_a = KeyTree::derive(&[0u8; 32]).expect("derive a");
+        let kt_b = KeyTree::derive(&[1u8; 32]).expect("derive b");
+        let payload = b"private".to_vec();
+
+        let blob = encrypt_root_publish(&kt_a, &payload).expect("encrypt-a");
+        let result = decrypt_root_publish(&kt_b, &blob);
+        assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
+    }
+
+    #[test]
+    fn decrypt_root_publish_rejects_per_entry_blob() {
+        // Domain separation: a blob encrypted as a per-entry value
+        // (different AAD) must not decrypt as a root-publish payload.
+        // This protects the key-separation invariant.
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup = space_lookup_key(&kt, b"some-space");
+        let payload = b"not a root payload".to_vec();
+        let entry_blob = encrypt_entry(&kt, &lookup, &payload).expect("encrypt-entry");
+        let result = decrypt_root_publish(&kt, &entry_blob);
         assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
     }
 }
