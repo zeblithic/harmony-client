@@ -17,7 +17,7 @@ const rustSource = readFileSync(RUST_PATH, 'utf-8');
 describe('recovery-policy: Rust ↔ TS drift detector', () => {
   it('MIN_RECOVERY_PASSPHRASE_LEN matches the Rust source', () => {
     const m = rustSource.match(
-      /pub const MIN_RECOVERY_PASSPHRASE_LEN: usize = (\d+);/
+      /^pub const MIN_RECOVERY_PASSPHRASE_LEN: usize = (\d+);/m
     );
     expect(
       m,
@@ -31,7 +31,7 @@ describe('recovery-policy: Rust ↔ TS drift detector', () => {
 
   it('MAX_RECOVERY_COMMENT_BYTES matches the Rust source', () => {
     const m = rustSource.match(
-      /pub const MAX_RECOVERY_COMMENT_BYTES: usize = (\d+);/
+      /^pub const MAX_RECOVERY_COMMENT_BYTES: usize = (\d+);/m
     );
     expect(
       m,
