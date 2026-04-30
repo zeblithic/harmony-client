@@ -21,6 +21,7 @@ pub mod owner_state;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod recovery_cli;
+pub mod recovery_policy;
 mod save_dialog;
 pub mod voice;
 
