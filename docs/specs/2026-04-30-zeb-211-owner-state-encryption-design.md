@@ -59,7 +59,7 @@ Encryption is purely at the harmony-client application layer. Cleartext Space CB
 
 ## Key derivation tree
 
-Three keys, all deterministically derived from the master seed (already exists per ZEB-173 + shared across bound devices per ZEB-197).
+Four keys, all deterministically derived from the master seed (already exists per ZEB-173 + shared across bound devices per ZEB-197).
 
 ```text
 master_seed: [u8; 32]
@@ -68,10 +68,17 @@ master_seed: [u8; 32]
                             salt=b"harmony-owner-state-v1-epoch-0")
         │
         └── PRK
-             ├── HKDF-Expand(PRK, info=b"aead-key",     L=32) → owner_state_aead_key
-             ├── HKDF-Expand(PRK, info=b"tree-lookup",  L=32) → owner_state_lookup_key
-             └── HKDF-Expand(PRK, info=b"nonce-deriv",  L=32) → owner_state_nonce_key
+             ├── HKDF-Expand(PRK, info=b"entry-aead-key", L=32) → owner_state_entry_aead_key
+             ├── HKDF-Expand(PRK, info=b"root-aead-key",  L=32) → owner_state_root_aead_key
+             ├── HKDF-Expand(PRK, info=b"tree-lookup",    L=32) → owner_state_lookup_key
+             └── HKDF-Expand(PRK, info=b"nonce-deriv",    L=32) → owner_state_nonce_key
 ```
+
+### Key separation: why two AEAD keys
+
+Per-entry encryption uses deterministic nonces (BLAKE3-derived from cleartext + space_lookup_key). State-root publishes use random nonces (CSPRNG per publish). These two nonce strategies share a 12-byte nonce space. If they shared a single AEAD key, a deterministic per-entry nonce could (with vanishingly low but non-zero probability) collide with a random root nonce, producing nonce reuse under the same key — which catastrophically breaks ChaCha20-Poly1305 confidentiality (see "Why `space_lookup_key` MUST be in the nonce input" below for the underlying mechanic).
+
+AAD does NOT provide effective domain separation here because Poly1305's `(r, s)` authenticator key derives from `(aead_key, nonce, counter=0)` only — AAD is not part of the keystream derivation. The clean fix is **separate AEAD keys per cryptographic context**: `owner_state_entry_aead_key` for per-entry encryption, `owner_state_root_aead_key` for state-root publishes. The two contexts now have entirely independent nonce spaces, eliminating the collision concern at design time.
 
 ### Salt versioning + epoch reservation
 
@@ -80,7 +87,7 @@ The salt embeds two version dimensions:
 - `v1` is the wire-format version. Bump if the encryption scheme itself changes (e.g., switch primitives).
 - `epoch-0` is reserved for future key rotation. v1 hard-codes `epoch-0`; bumping requires an offline re-encryption migration. **No active rotation in v1**, but the salt structure is forward-compatible.
 
-When ZEB-197 grows a "wipe master from device" action, a separate followup will bump the epoch on every revocation. See Future Work.
+When ZEB-197 grows a "wipe master from device" action, a separate follow-up will bump the epoch on every revocation. See Future Work.
 
 ### Implementation note
 
@@ -94,15 +101,17 @@ let hk = Hkdf::<Sha256>::new(
     Some(b"harmony-owner-state-v1-epoch-0"),
     master_seed.as_ref(),
 );
-let mut aead_key = [0u8; 32];
-hk.expand(b"aead-key", &mut aead_key)?;
+let mut entry_aead_key = [0u8; 32];
+hk.expand(b"entry-aead-key", &mut entry_aead_key)?;
+let mut root_aead_key = [0u8; 32];
+hk.expand(b"root-aead-key", &mut root_aead_key)?;
 let mut lookup_key = [0u8; 32];
 hk.expand(b"tree-lookup", &mut lookup_key)?;
 let mut nonce_key = [0u8; 32];
 hk.expand(b"nonce-deriv", &mut nonce_key)?;
 ```
 
-All three keys MUST be wrapped in `Zeroizing<[u8; 32]>` (the `zeroize` crate is already a dep) so they don't linger in freed memory.
+All four keys MUST be wrapped in `Zeroizing<[u8; 32]>` (the `zeroize` crate is already a dep) so they don't linger in freed memory.
 
 ## Canonical CBOR encoding (required)
 
@@ -128,7 +137,7 @@ nonce_12         = BLAKE3-keyed-MAC(
                      message=b"owner-state-entry-v1" || space_lookup_key || cleartext_cbor
                    )[..12]
 ciphertext       = ChaCha20Poly1305-encrypt(
-                     key=owner_state_aead_key,
+                     key=owner_state_entry_aead_key,
                      nonce=nonce_12,
                      aad=space_lookup_key,
                      plaintext=cleartext_cbor)
@@ -149,7 +158,7 @@ The nonce is derived from `b"owner-state-entry-v1" || space_lookup_key || cleart
 
 ### Why `space_lookup_key` MUST be in the nonce input (not just AAD)
 
-ChaCha20-Poly1305's Poly1305 authenticator key `(r, s)` is derived from `(aead_key, nonce, counter=0)` only — **AAD is not part of the (r, s) derivation**. If two different Space entries end up with the same `cleartext_cbor` (a pathological but possible application bug), and the nonce were derived only from the cleartext, both encryptions would use identical `(aead_key, nonce)` pairs. ChaCha20 would generate the same keystream, and XOR'ing the two ciphertexts would reveal the XOR of plaintexts — full confidentiality break, regardless of AAD differences.
+ChaCha20-Poly1305's Poly1305 authenticator key `(r, s)` is derived from `(aead_key, nonce, counter=0)` only — **AAD is not part of the (r, s) derivation**. If two different Space entries end up with the same `cleartext_cbor` (a pathological but possible application bug), and the nonce were derived only from the cleartext, both encryptions would use identical `(owner_state_entry_aead_key, nonce)` pairs. ChaCha20 would generate the same keystream, and XOR'ing the two ciphertexts would reveal the XOR of plaintexts — full confidentiality break, regardless of AAD differences.
 
 Mixing `space_lookup_key` into the nonce derivation makes nonces a function of `(space, cleartext)`, so cross-space cleartext collisions can never collide nonces. Determinism for the same `(space, cleartext)` pair is preserved (CRDT convergence still works).
 
@@ -163,7 +172,7 @@ Even with the nonce binding above, AAD is still useful: binding ciphertext to it
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, KeyInit, AeadInPlace};
 use blake3;
 
-let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)?;
+let cipher = ChaCha20Poly1305::new_from_slice(&entry_aead_key)?;
 
 // Derive nonce — bind to space_lookup_key to prevent cross-space nonce reuse
 let mut nonce_bytes = [0u8; 12];
@@ -241,7 +250,7 @@ Sees:
 
 - Opaque ciphertext blobs at unguessable CIDs
 - Cannot enumerate (BLAKE3 CIDs are 32-byte unguessable; tree-lookup keys are HMACs)
-- Cannot decrypt without `owner_state_aead_key`
+- Cannot decrypt without `owner_state_entry_aead_key` (per-entry CAS blobs) or `owner_state_root_aead_key` (state-root publishes)
 
 ### Bound device with master seed
 
@@ -271,12 +280,12 @@ state_root_payload = {
 
 **Nonce generation:** cryptographically-random 12 bytes from the OS CSPRNG, fresh per publish. Determinism is **not** required for root publishes — they are pub/sub events, not content-addressed (different from per-Space-entry encryption above). Random nonces eliminate any chance of cross-publish nonce reuse.
 
-**Receiver parsing:** read the first 12 bytes as the nonce; the remainder is the AEAD ciphertext-with-tag. Decrypt with `owner_state_aead_key` and `aad = b"state-root-pointer"`. On AEAD failure, drop the publish (could be unauthenticated injection).
+**Receiver parsing:** read the first 12 bytes as the nonce; the remainder is the AEAD ciphertext-with-tag. Decrypt with `owner_state_root_aead_key` and `aad = b"state-root-pointer"`. On AEAD failure, drop the publish (could be unauthenticated injection).
 
 **AEAD parameters:**
 
-- Key: `owner_state_aead_key`
-- AAD: `b"state-root-pointer"` (domain-separated from per-Space-entry encryption via different AAD)
+- Key: `owner_state_root_aead_key` (separate from `owner_state_entry_aead_key` — see "Key separation: why two AEAD keys" above)
+- AAD: `b"state-root-pointer"`
 - Nonce: random per publish (above)
 
 ### Storage blob format
@@ -297,7 +306,7 @@ Prolly Tree keys are 32 bytes (SHA-256 output size). harmony-content's existing 
 
 Per Space-entry write (typical 200-byte CBOR):
 
-- HKDF-Extract + 3× HKDF-Expand: ~10 μs (one-time per session)
+- HKDF-Extract + 4× HKDF-Expand: ~12 μs (one-time per session)
 - BLAKE3-keyed-MAC (200 bytes): ~1 μs
 - ChaCha20-Poly1305 encrypt (200 bytes): ~2 μs
 - BLAKE3-hash (228 bytes for cipher-CID): ~1 μs
@@ -318,11 +327,11 @@ If we later need to change primitives or rotate keys:
 
 This is **offline migration** — runs on bound-device boot, not in real time. Fine for v1 since rotation isn't actively triggered.
 
-## Future work (followup tickets)
+## Future work (follow-up tickets)
 
-- **Forward secrecy via key chaining post-master-wipe.** When ZEB-197 grows a "wipe master from device" action, file a followup ticket to bump epoch on revocation events. The salt's `epoch-N` reservation is the schema hook.
-- **Topic-name privacy.** Today the Zenoh topic name embeds the owner address, leaking "owner X is active" to any subscriber who knows the address. A followup could explore deriving a topic name from `HMAC(some_topic_key, addr)` so observers without `topic_key` can't even subscribe. Cost: breaks public discovery of "is this owner reachable?" if we later need it.
-- **Side-channel hardening.** Currently update timing leaks user activity patterns. Could be mitigated by batching publishes on a fixed cadence + dummy traffic; cost is real-time convergence latency.
+- **Forward secrecy via key chaining post-master-wipe.** When ZEB-197 grows a "wipe master from device" action, file a follow-up ticket to bump epoch on revocation events. The salt's `epoch-N` reservation is the schema hook.
+- **Topic-name privacy.** Today the Zenoh topic name embeds the owner address, leaking "owner X is active" to any subscriber who knows the address. A follow-up could explore deriving a topic name from `HMAC(some_topic_key, addr)` so observers without `topic_key` can't even subscribe. Cost: breaks public discovery of "is this owner reachable?" if we later need it.
+- **Side-channel hardening.** Currently update timing leaks user activity patterns. This could be mitigated by batching publishes on a fixed cadence plus dummy traffic; the cost is increased real-time convergence latency.
 
 ## Verification gates
 
