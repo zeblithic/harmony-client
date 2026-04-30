@@ -238,6 +238,12 @@
       const epoch2 = wizardState;
 
       try {
+        // NOTE: this IPC returns `String` (the saved path), NOT `ExportInfo`.
+        // The owner-export sibling (`export_owner_recovery_file_to_path`)
+        // returns `ExportInfo { identityHash, byteLen, path }` because
+        // DevicesPanel's success banner uses the metadata fields. This
+        // wizard only needs the path, so the IPC stays a bare String —
+        // see Task 4 of `docs/plans/2026-04-29-zeb-194-export-path-capability-token-plan.md`.
         const savedPath = await invoke<string>('export_recovery_file_to_path', {
           pathToken,
           passphrase,
