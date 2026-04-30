@@ -8,11 +8,11 @@
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use zeroize::Zeroizing;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::Sha256;
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
