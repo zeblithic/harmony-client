@@ -8,6 +8,7 @@
   } from '../recovery-policy';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
+  import Modal from './Modal.svelte';
 
   let svc = new OwnerService();
   let state = $state<OwnerStateView | null>(null);
@@ -472,26 +473,28 @@
   {/if}
 
   {#if modalOpen}
-    <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
-      <div class="modal">
-        <h3 id="modal-heading">Create your owner identity</h3>
-        <p>
-          This will create your owner identity. This device will be bound as the first device.
-          You'll receive a recovery file to back up — you can do this immediately or later.
-        </p>
-        {#if mintError}
-          <p class="error" role="alert">{mintError}</p>
-        {/if}
-        <div class="modal-actions">
-          <button class="secondary" onclick={() => { modalOpen = false; }} disabled={mintInFlight}>
-            Cancel
-          </button>
-          <button class="primary" onclick={handleConfirmMint} disabled={mintInFlight}>
-            {mintInFlight ? 'Creating…' : 'Create owner identity'}
-          </button>
-        </div>
+    <Modal
+      onCancel={() => { modalOpen = false; }}
+      canCancel={!mintInFlight}
+      ariaLabelledby="modal-heading"
+    >
+      <h3 id="modal-heading">Create your owner identity</h3>
+      <p>
+        This will create your owner identity. This device will be bound as the first device.
+        You'll receive a recovery file to back up — you can do this immediately or later.
+      </p>
+      {#if mintError}
+        <p class="error" role="alert">{mintError}</p>
+      {/if}
+      <div class="modal-actions">
+        <button class="secondary" onclick={() => { modalOpen = false; }} disabled={mintInFlight}>
+          Cancel
+        </button>
+        <button class="primary" onclick={handleConfirmMint} disabled={mintInFlight}>
+          {mintInFlight ? 'Creating…' : 'Create owner identity'}
+        </button>
       </div>
-    </div>
+    </Modal>
   {/if}
 </section>
 

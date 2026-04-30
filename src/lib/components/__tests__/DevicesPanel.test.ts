@@ -779,3 +779,67 @@ describe('DevicesPanel — backend save dialog (request_export_save_path)', () =
     await screen.findByText('/Users/test/Desktop/owner-recovery.bin');
   });
 });
+
+describe('DevicesPanel — mint modal a11y (ZEB-195)', () => {
+  it('moves focus into the modal when opened, restores it on close via Escape', async () => {
+    mockedInvoke.mockResolvedValueOnce(null);
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /bind this device/i });
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('Escape closes the mint modal', async () => {
+    mockedInvoke.mockResolvedValueOnce(null);
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /bind this device/i });
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('Escape is a no-op while mintInFlight', async () => {
+    mockedInvoke.mockResolvedValueOnce(null);
+    // mint_owner_identity returns a pending promise so mintInFlight stays true.
+    let resolveMint: (value: unknown) => void = () => {};
+    const pendingMint = new Promise((resolve) => { resolveMint = resolve; });
+    mockedInvoke.mockReturnValueOnce(pendingMint);
+
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /bind this device/i });
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    // Click "Create owner identity" inside the modal — this starts the mint
+    // flow and sets mintInFlight = true. Do NOT await: we want the in-flight
+    // state to persist across the Escape press.
+    const confirmBtn = screen.getByRole('button', { name: /^create owner identity/i });
+    fireEvent.click(confirmBtn);
+    // Press Escape — must be a no-op because canCancel={!mintInFlight} is false.
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeInTheDocument();
+    // Resolve the pending promise so the test cleans up gracefully.
+    resolveMint({
+      state: {
+        ownerId: 'a4f1c8239b7dd809abcdef0123456789',
+        ownerDisplayName: 'this device',
+        devices: [{
+          deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
+          displayName: 'this device',
+          isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000,
+          fingerprint: 'aa11·bb22',
+        }],
+        canBackUp: true,
+      },
+      recoveryToken: 'tok-1',
+    });
+  });
+});
