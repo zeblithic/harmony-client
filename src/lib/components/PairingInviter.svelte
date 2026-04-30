@@ -31,7 +31,11 @@
     try { await svc.confirmSas(); } catch (e) { error = extractError(e); }
   }
   async function handleCancel() {
-    try { await svc.cancel(); } catch (e) { /* ignore */ }
+    // Skip the backend cancel IPC in terminal states — there's nothing to
+    // cancel and the call would be a wasted invoke (CodeRabbit, PR #68 round 2).
+    if (state.kind !== 'complete' && state.kind !== 'failed') {
+      try { await svc.cancel(); } catch (e) { /* ignore */ }
+    }
     onClose?.();
   }
 </script>
