@@ -96,6 +96,92 @@ pub fn space_lookup_key(keys: &KeyTree, space_id_bytes: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Domain-separation prefix for per-entry nonce derivation. Versions the
+/// construction; bump if the nonce scheme itself changes.
+const NONCE_DOMAIN_ENTRY: &[u8] = b"owner-state-entry-v1";
+
+/// Derive the deterministic 12-byte nonce for an entry write.
+///
+/// `nonce = BLAKE3-keyed-MAC(nonce_key,
+///                            domain_prefix || space_lookup_key || cleartext)[..12]`
+///
+/// Mixing `space_lookup_key` into the input prevents cross-space nonce
+/// collisions when two different spaces happen to have identical cleartext
+/// (per ZEB-211 round-2 fix). Same (space, cleartext) → same nonce, which
+/// is what the CRDT requires for stable cipher-CIDs.
+fn entry_nonce(keys: &KeyTree, space_lookup_key: &[u8; 32], cleartext: &[u8]) -> [u8; 12] {
+    // BLAKE3's new_keyed expects &[u8; 32], which we have in keys.nonce.
+    let nonce_key: &[u8; 32] = keys.nonce.as_ref().try_into().expect("nonce is 32 bytes");
+    let mut hasher = blake3::Hasher::new_keyed(nonce_key);
+    hasher.update(NONCE_DOMAIN_ENTRY);
+    hasher.update(space_lookup_key);
+    hasher.update(cleartext);
+
+    let mut output = [0u8; 12];
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut output);
+    output
+}
+
+/// Encrypt a Space entry's cleartext for CAS storage.
+///
+/// Returns `storage_blob = nonce(12) || ChaCha20-Poly1305-ciphertext-with-tag`.
+/// The CID stored in harmony-content is `BLAKE3(storage_blob)`.
+///
+/// Deterministic: same `(keys, space_lookup_key, cleartext)` → same blob.
+pub fn encrypt_entry(
+    keys: &KeyTree,
+    space_lookup_key: &[u8; 32],
+    cleartext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let nonce_bytes = entry_nonce(keys, space_lookup_key, cleartext);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.entry_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+
+    // AAD binds the ciphertext to its tree position (defense-in-depth
+    // against relocation attacks; see ZEB-211 "Why AAD = space_lookup_key").
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: cleartext,
+                aad: space_lookup_key,
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Decrypt a storage blob produced by `encrypt_entry`.
+///
+/// Returns the cleartext on success, or `CryptoError::AeadDecrypt` if
+/// the AAD doesn't match (relocation attack) or the blob is corrupt.
+pub fn decrypt_entry(
+    keys: &KeyTree,
+    space_lookup_key: &[u8; 32],
+    blob: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    if blob.len() < 12 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.entry_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: space_lookup_key,
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +243,79 @@ mod tests {
         let lookup = space_lookup_key(&kt, b"some-space");
         let plain = blake3::hash(b"some-space");
         assert_ne!(&lookup[..], plain.as_bytes().as_slice());
+    }
+
+    #[test]
+    fn encrypt_entry_round_trip() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup = space_lookup_key(&kt, b"alice-dm");
+        let cleartext = b"hello, world".to_vec();
+
+        let blob = encrypt_entry(&kt, &lookup, &cleartext).expect("encrypt");
+        let recovered = decrypt_entry(&kt, &lookup, &blob).expect("decrypt");
+
+        assert_eq!(recovered, cleartext);
+        // Storage blob layout: nonce(12) || ciphertext_with_tag(N+16)
+        assert_eq!(blob.len(), 12 + cleartext.len() + 16);
+    }
+
+    #[test]
+    fn encrypt_entry_is_deterministic_for_same_inputs() {
+        // The CRDT relies on this: two bound devices encrypting the same
+        // (space, cleartext) pair must produce identical ciphertext + CID.
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup = space_lookup_key(&kt, b"alice-dm");
+        let cleartext = b"identical bytes".to_vec();
+
+        let blob1 = encrypt_entry(&kt, &lookup, &cleartext).expect("e1");
+        let blob2 = encrypt_entry(&kt, &lookup, &cleartext).expect("e2");
+        assert_eq!(blob1, blob2);
+    }
+
+    #[test]
+    fn encrypt_entry_cross_space_nonce_binding_prevents_collision() {
+        // The CRITICAL fix from PR #71 round 2: two different spaces with
+        // identical cleartext MUST produce different nonces. Otherwise
+        // ChaCha20-Poly1305 keystream is reused under the same key,
+        // catastrophically breaking confidentiality + integrity.
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup_a = space_lookup_key(&kt, b"space-A");
+        let lookup_b = space_lookup_key(&kt, b"space-B");
+        let cleartext = b"identical cleartext".to_vec();
+
+        let blob_a = encrypt_entry(&kt, &lookup_a, &cleartext).expect("a");
+        let blob_b = encrypt_entry(&kt, &lookup_b, &cleartext).expect("b");
+
+        // First 12 bytes are the nonce.
+        let nonce_a = &blob_a[..12];
+        let nonce_b = &blob_b[..12];
+        assert_ne!(
+            nonce_a, nonce_b,
+            "cross-space nonce collision: ZEB-211 fix regressed"
+        );
+    }
+
+    #[test]
+    fn decrypt_entry_rejects_aad_mismatch_relocation() {
+        // AAD-binding prevents relocating Space-A's ciphertext into
+        // Space-B's tree slot.
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup_a = space_lookup_key(&kt, b"space-A");
+        let lookup_b = space_lookup_key(&kt, b"space-B");
+        let cleartext = b"some content".to_vec();
+
+        let blob_a = encrypt_entry(&kt, &lookup_a, &cleartext).expect("encrypt-a");
+        // Try decrypting blob-A with space-B's lookup key — must fail.
+        let result = decrypt_entry(&kt, &lookup_b, &blob_a);
+        assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
+    }
+
+    #[test]
+    fn decrypt_entry_rejects_truncated_blob() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup = space_lookup_key(&kt, b"some-space");
+        // Less than 12+16=28 bytes can never be a valid blob.
+        let result = decrypt_entry(&kt, &lookup, &[0u8; 27]);
+        assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
     }
 }
