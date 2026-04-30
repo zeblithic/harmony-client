@@ -51,4 +51,13 @@ describe('PairingJoiner', () => {
     await fireEvent.click(cancelBtn);
     expect(invoke).toHaveBeenCalledWith('cancel_pairing');
   });
+
+  it('renders modal with correct a11y attributes', async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: 'idle' });
+    mockedInvoke.mockResolvedValueOnce(undefined);
+    render(PairingJoiner);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog).toHaveAttribute('aria-labelledby', 'join-heading');
+  });
 });

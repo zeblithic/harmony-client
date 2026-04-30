@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { PairingService, extractError, type PairingState } from '../pairing-service';
+  import Modal from './Modal.svelte';
 
   let { onClose } = $props<{ onClose?: () => void }>();
 
@@ -48,86 +49,84 @@
   }
 </script>
 
-<div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="join-heading">
-  <div class="modal">
-    <h3 id="join-heading">Join existing identity</h3>
+<Modal
+  onCancel={handleCancel}
+  canCancel={state.kind !== 'complete' && state.kind !== 'failed'}
+  ariaLabelledby="join-heading"
+>
+  <h3 id="join-heading">Join existing identity</h3>
 
-    {#if state.kind === 'idle'}
-      <label>
-        Give this device a name
-        <!-- maxlength=64: device names are broadcast in plaintext on every
-             DISCOVER. The 64KB MAX_PAIRING_WIRE_BYTES backend cap would
-             still reject a malicious payload, but a 60KB legitimate name
-             would silently bloat every emit until that wire-level rejection. -->
-        <input type="text" bind:value={displayName} maxlength={64} />
-      </label>
-      {#if error}<p class="error" role="alert">{error}</p>{/if}
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>Cancel</button>
-        <button class="primary" onclick={handleStart} disabled={starting}>
-          {starting ? 'Starting…' : 'Start pairing'}
-        </button>
-      </div>
-    {:else if state.kind === 'discovering'}
-      <p>Looking for nearby devices…</p>
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>Cancel</button>
-      </div>
-    {:else if state.kind === 'discovered'}
-      <p>Devices nearby:</p>
-      <ul class="peer-list">
-        {#each state.peers as peer (peer.sessionId)}
-          <li>
-            <button class="peer-row" onclick={() => handleSelectPeer(peer.sessionId)}>
-              <strong>{peer.displayName}</strong>
-              {#if peer.ownerIdIfInviter}
-                <span class="owner-id">owner {peer.ownerIdIfInviter.slice(0, 8)}…</span>
-              {/if}
-            </button>
-          </li>
-        {/each}
-      </ul>
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>Cancel</button>
-      </div>
-    {:else if state.kind === 'handshaking'}
-      <p>Confirm the codes match on both screens:</p>
-      <p class="sas-display">
-        {state.sasDigits.slice(0, 3)}&nbsp;{state.sasDigits.slice(3, 6)}
-      </p>
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>No, don't match</button>
-        <button class="primary" onclick={handleConfirm}>Yes, match</button>
-      </div>
-    {:else if state.kind === 'waitingPeerConfirm'}
-      <p>Waiting for the other device to confirm…</p>
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>Cancel</button>
-      </div>
-    {:else if state.kind === 'enrolling'}
-      <p>Installing your enrollment…</p>
-      <div class="modal-actions">
-        <button class="secondary" onclick={handleCancel}>Cancel</button>
-      </div>
-    {:else if state.kind === 'complete'}
-      <p>Done! This device is now part of the owner identity.</p>
-      <div class="modal-actions">
-        <button class="primary" onclick={onClose}>Close</button>
-      </div>
-    {:else if state.kind === 'failed'}
-      <p class="error" role="alert">Pairing failed: {state.reason}</p>
-      <div class="modal-actions">
-        <button class="primary" onclick={onClose}>Close</button>
-      </div>
-    {/if}
-  </div>
-</div>
+  {#if state.kind === 'idle'}
+    <label>
+      Give this device a name
+      <!-- maxlength=64: device names are broadcast in plaintext on every
+           DISCOVER. The 64KB MAX_PAIRING_WIRE_BYTES backend cap would
+           still reject a malicious payload, but a 60KB legitimate name
+           would silently bloat every emit until that wire-level rejection. -->
+      <input type="text" bind:value={displayName} maxlength={64} />
+    </label>
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+      <button class="primary" onclick={handleStart} disabled={starting}>
+        {starting ? 'Starting…' : 'Start pairing'}
+      </button>
+    </div>
+  {:else if state.kind === 'discovering'}
+    <p>Looking for nearby devices…</p>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+    </div>
+  {:else if state.kind === 'discovered'}
+    <p>Devices nearby:</p>
+    <ul class="peer-list">
+      {#each state.peers as peer (peer.sessionId)}
+        <li>
+          <button class="peer-row" onclick={() => handleSelectPeer(peer.sessionId)}>
+            <strong>{peer.displayName}</strong>
+            {#if peer.ownerIdIfInviter}
+              <span class="owner-id">owner {peer.ownerIdIfInviter.slice(0, 8)}…</span>
+            {/if}
+          </button>
+        </li>
+      {/each}
+    </ul>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+    </div>
+  {:else if state.kind === 'handshaking'}
+    <p>Confirm the codes match on both screens:</p>
+    <p class="sas-display">
+      {state.sasDigits.slice(0, 3)}&nbsp;{state.sasDigits.slice(3, 6)}
+    </p>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>No, don't match</button>
+      <button class="primary" onclick={handleConfirm}>Yes, match</button>
+    </div>
+  {:else if state.kind === 'waitingPeerConfirm'}
+    <p>Waiting for the other device to confirm…</p>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+    </div>
+  {:else if state.kind === 'enrolling'}
+    <p>Installing your enrollment…</p>
+    <div class="modal-actions">
+      <button class="secondary" onclick={handleCancel}>Cancel</button>
+    </div>
+  {:else if state.kind === 'complete'}
+    <p>Done! This device is now part of the owner identity.</p>
+    <div class="modal-actions">
+      <button class="primary" onclick={onClose}>Close</button>
+    </div>
+  {:else if state.kind === 'failed'}
+    <p class="error" role="alert">Pairing failed: {state.reason}</p>
+    <div class="modal-actions">
+      <button class="primary" onclick={onClose}>Close</button>
+    </div>
+  {/if}
+</Modal>
 
 <style>
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5);
-    display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal { background: var(--bg-secondary); padding: 24px; border-radius: 8px;
-    max-width: 480px; border: 1px solid var(--border); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   .primary, .secondary { padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border);
     cursor: pointer; font-size: 13px; }
