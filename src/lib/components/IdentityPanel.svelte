@@ -134,6 +134,13 @@
   }
 
   function resetToIdle() {
+    // Defensive guard against concurrent close-while-export-running:
+    // even with the Cancel button disabled in the fileEntry phase, a
+    // future caller (e.g., a different view's Cancel) might invoke
+    // resetToIdle while the export IPC is mid-flight. Closing the
+    // wizard would let the backend write complete unobserved by the
+    // user. (CodeRabbit, PR #66 review.)
+    if (backupInFlight) return;
     wizardState = { kind: 'idle' };
     selectedBackupType = null;
     selectedRestoreSource = null;
@@ -679,7 +686,7 @@
         />
       </label>
       <div class="actions">
-        <button onclick={resetToIdle}>Cancel</button>
+        <button disabled={backupInFlight} onclick={resetToIdle}>Cancel</button>
         <button
           disabled={backupInFlight || !wizardState.step.passphrase || wizardState.step.passphrase !== wizardState.step.passphraseConfirm}
           onclick={advanceFromFileEntry}

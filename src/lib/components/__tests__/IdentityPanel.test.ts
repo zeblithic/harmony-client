@@ -749,12 +749,17 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
   });
 
-  // Race regression: cancel during pending file write must not resurrect the wizard.
-  // Mirrors the pattern from Task 5's "cancel during pending export" test.
-  it('cancel during pending file write does not resurrect the wizard', async () => {
+  // The Cancel button is disabled while the file write is pending so the
+  // user cannot close the wizard while the backend is mid-write — closing
+  // would let the write complete unobserved with no saved-path
+  // confirmation (CodeRabbit, PR #66 review). Replaces the earlier
+  // "cancel does not resurrect the wizard" race-regression test: with
+  // Cancel disabled during the busy phase, that race is unreachable from
+  // the UI. The defensive `if (backupInFlight) return` guard at the top
+  // of `resetToIdle` is a backstop for any non-UI caller.
+  it('cancel button is disabled while file write is pending', async () => {
     const savePath = '/tmp/identity.recovery';
 
-    // Make the file write hang via a promise we control.
     let resolveWrite!: (path: string) => void;
     const writePromise = new Promise<string>((resolve) => { resolveWrite = resolve; });
 
@@ -770,25 +775,17 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     await fireEvent.input(screen.getByLabelText(/^passphrase$/i), { target: { value: 'pass' } });
     await fireEvent.input(screen.getByLabelText(/confirm passphrase/i), { target: { value: 'pass' } });
 
-    // Click Continue — save dialog resolves immediately, then file write starts (pending).
-    // The component is still in fileEntry state while the write is pending.
+    // Click Continue — save dialog resolves immediately; file write hangs.
     await fireEvent.click(screen.getByRole('button', { name: /continue/i }));
-
-    // Cancel while write is pending. The Cancel button is still visible since
-    // fileEntry is still rendered (no transition until write completes).
-    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
-
-    // Sanity-check: idle screen visible right after cancel.
-    await screen.findByText(/0xaaaaaaaa/);
-    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
-
-    // Now resolve the write — wizard should NOT transition to fileSaved.
-    resolveWrite(savePath);
+    // Drain microtasks so the post-dialog `backupInFlight = true` propagates
+    // to the DOM before we check the Cancel button's disabled state.
     await new Promise((r) => setTimeout(r, 0));
 
-    // Assert: still on idle, no success screen.
-    expect(screen.queryByText(/recovery file saved/i)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /backup/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeDisabled();
+
+    // Resolve the pending write — wizard transitions to the success state.
+    resolveWrite(savePath);
+    await screen.findByText(/recovery file saved/i);
   });
 });
 
