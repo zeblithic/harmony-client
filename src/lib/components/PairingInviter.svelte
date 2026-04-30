@@ -38,7 +38,6 @@
 
 <Modal
   onCancel={handleCancel}
-  canCancel={state.kind !== 'complete' && state.kind !== 'failed'}
   ariaLabelledby="invite-heading"
 >
   <h3 id="invite-heading">Add another device</h3>

@@ -51,7 +51,6 @@
 
 <Modal
   onCancel={handleCancel}
-  canCancel={state.kind !== 'complete' && state.kind !== 'failed'}
   ariaLabelledby="join-heading"
 >
   <h3 id="join-heading">Join existing identity</h3>

@@ -82,7 +82,7 @@ The action handles all four behaviors internally. The Modal component is the onl
 
 ### Focusable element selector
 
-```
+```css
 button:not(:disabled),
 [href],
 input:not(:disabled):not([type="hidden"]),
