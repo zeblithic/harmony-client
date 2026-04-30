@@ -62,7 +62,7 @@ Four layers, each with a distinct authority and transport choice.
 | My spaces, folders, read markers, DM outbox + inbox | Owner-state Prolly Tree | This owner's bound devices (ZEB-197) |
 | Community membership / power levels | Per-community CRDT | All members of that community |
 | Public channel "membership" | Transport-derived | Anyone subscribed to the Zenoh topic |
-| DM "membership" | Mutable up to 16 cap (current participants can add); each Space has authoritative member list | Embedded in `Space.members`; mirrored in OutboxEntry/InboxEntry recipients |
+| DM "membership" | Asymmetric in v1: **adds** are authoritative + grow-only via CRDT (any current member adds, ≤16 cap); **leaves are owner-local only** and not propagated. See "Group DM mutability" for full semantics. | `Space.members` is the canonical add list. OutboxEntry/InboxEntry `recipient_owners` mirror current members minus sender. Leaves never modify `Space.members` on other devices in v1. |
 | Library directory entries | Per-library | Subscribers to that library's directory topic |
 | Profile membership broadcast | Owner | Subscribers to that owner's profile topic |
 
@@ -273,20 +273,28 @@ Device A:                                  Device B (same owner):
 ### Flow C — Sending a DM (offline recipient — the hard case)
 
 1. User sends DM. MessageService → IPC `send_dm(space_id, content)`
-2. Rust stores message blob in CAS → gets CID
+2. Rust **encrypts** the message blob with the per-DM-Space content key (see "DM content confidentiality" below), stores ciphertext in CAS → gets CID over ciphertext
 3. Attempts Reticulum link to recipient's owner (tries known device endpoints)
 4. **Link fails / no endpoints reachable:**
    - Writes `OutboxEntry {id, space_id, recipient_owners, message_cid, created_at, delivered_to: []}` to owner-state CRDT
    - Owner-state sync replicates outbox to *sender's* other bound devices
 5. **Delivery loop** (any of sender's bound devices, whichever is online):
-   - Walks outbox every N seconds
+   - Schedules retries per OutboxEntry using **exponential backoff with jitter, bounded max interval** (consistent with the failure-mode row "Retry with exponential backoff" — see Failure modes table). Implementations: backoff base ~5s, multiplier 2×, max ~5min, plus ±20% jitter; tune as needed.
    - For each pending entry, attempts Reticulum link to each unack'd recipient
-   - On successful link: delivers `message_cid` (recipient fetches blob from CAS via `fetch_content`)
+   - On successful link: delivers `message_cid` (recipient fetches the **encrypted blob** from CAS via `fetch_content`; see "DM content confidentiality" below)
    - **Recipient device writes a new `InboxEntry` to its owner-state CRDT** — `{id, space_id, message_cid, from: sender_addr, received_at: HLC}`
    - Recipient acks via the same link → sender updates `delivered_to[]`
 6. When `delivered_to.length === recipient_owners.length`, GC the OutboxEntry
 
-**Multi-device convergence on the recipient side:** the recipient also has multiple bound devices. Delivery succeeds when **any** of the recipient's devices acks. The receiving device's owner-state CRDT now contains the new `InboxEntry`; Flow A replicates it to the recipient's other bound devices, which then see the new message without needing direct Reticulum delivery. Each of the recipient's other devices runs DAG-sync to fetch the `message_cid` blob from CAS as needed for rendering.
+**Multi-device convergence on the recipient side:** the recipient also has multiple bound devices. Delivery succeeds when **any** of the recipient's devices acks. The receiving device's owner-state CRDT now contains the new `InboxEntry`; Flow A replicates it to the recipient's other bound devices, which then see the new message without needing direct Reticulum delivery. Each of the recipient's other devices runs DAG-sync to fetch the `message_cid` blob from CAS and decrypts it locally with the per-DM-Space content key (which is in their owner-state CRDT, replicated via Flow A).
+
+### DM content confidentiality
+
+CAS is content-addressed but **not access-controlled** — anyone who learns a CID can fetch the blob. To prevent CID-leak attacks (e.g., timing analysis, accidental log exposure) from compromising DM contents, **all DM message blobs are encrypted before CAS storage**.
+
+The per-DM-Space content key is established at Space creation, distributed to invitees alongside the `id` via the Reticulum invite payload, and stored in each member's owner-state CRDT (where it inherits the encryption-at-rest provided by ZEB-211). Senders encrypt with the per-Space key + a fresh random nonce; recipients fetch ciphertext from CAS and decrypt with the same key.
+
+**The specific encryption scheme** (key-derivation, AEAD primitive, nonce policy, group-DM key rotation under membership growth) is the subject of a dedicated companion spec — parallel to ZEB-211 for owner-state. Sub-B (ZEB-216) is blocked on that spec landing; this section is the design contract.
 
 ### Flow D — Library-federated discovery
 
@@ -484,13 +492,14 @@ ZEB-206 splits into four PR-sized sub-tickets. Each ships something user-visible
 
 ## Followup tickets (out of ZEB-206 scope)
 
-To file separately at end of brainstorm:
+Filed as separate Linear tickets (post-brainstorm):
 
 1. **Reticulum global routing at billion-user scale** — transport-layer concern (related to ZEB-16). Possibly a hybrid where Zenoh handles route discovery and Reticulum handles the unicast link.
-2. **Owner-state Zenoh topic encryption spec** — symmetric-key-from-owner-key derivation; needs a real spec before Sub-A ships.
-3. **M-of-N community admin recovery** — governance failure case. Borrows from ZEB-173 identity-recovery patterns.
-4. **Extend ZEB-173 backup to include owner-state CRDT root** — makes hard-recovery actually recover the user's nav tree, not just identity.
-5. **Read-receipts as opt-in signed event type** — nice-to-have; very deliberate to not bake in privacy default.
+2. **Owner-state Zenoh topic encryption spec** (ZEB-211) — symmetric-key-from-owner-key derivation; blocks Sub-A.
+3. **DM content encryption spec** — companion to ZEB-211 covering encryption of DM message blobs before CAS storage (per-DM-Space content key, key distribution via Reticulum invite, group-DM key rotation under membership growth). **Blocks Sub-B.**
+4. **M-of-N community admin recovery** — governance failure case. Borrows from ZEB-173 identity-recovery patterns.
+5. **Extend ZEB-173 backup to include owner-state CRDT root** — makes hard-recovery actually recover the user's nav tree, not just identity.
+6. **Read-receipts as opt-in signed event type** — nice-to-have; very deliberate to not bake in privacy default.
 
 ## Verification gates
 
