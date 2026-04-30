@@ -235,6 +235,22 @@ describe('trap-focus action', () => {
     expect(modal.getAttribute('tabindex')).toBe('0');
   });
 
+  it('preserves a consumer-authored tabindex when no focusables are present', () => {
+    // Regression net for the empty-focusables branch — `setTabindexFallback`
+    // means "I'm in the empty-list path", not "I authored the tabindex". The
+    // action must check `originalTabindex` before mutating.
+    document.body.innerHTML = `
+      <button id="trigger">Open</button>
+      <div id="modal" tabindex="0"><p>No focusables here.</p></div>
+    `;
+    document.querySelector<HTMLButtonElement>('#trigger')!.focus();
+    const modal = document.querySelector<HTMLElement>('#modal')!;
+    const handle = trapFocus(modal, {});
+    expect(modal.getAttribute('tabindex')).toBe('0');
+    handle.destroy();
+    expect(modal.getAttribute('tabindex')).toBe('0');
+  });
+
   it('honors canCancel changes via update()', () => {
     document.body.innerHTML = `
       <div id="modal"><button id="b1">B1</button></div>

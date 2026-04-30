@@ -22,11 +22,12 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
   let current = params;
   const previouslyFocused =
     document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const originalTabindex = node.getAttribute('tabindex');
 
   const focusables = focusableIn(node);
   const setTabindexFallback = focusables.length === 0;
   if (setTabindexFallback) {
-    node.setAttribute('tabindex', '-1');
+    if (originalTabindex === null) node.setAttribute('tabindex', '-1');
     node.focus();
   } else {
     focusables[0].focus();
@@ -65,7 +66,9 @@ export function trapFocus(node: HTMLElement, params: TrapFocusParams) {
     },
     destroy() {
       node.removeEventListener('keydown', onKeydown);
-      if (setTabindexFallback) node.removeAttribute('tabindex');
+      if (setTabindexFallback && originalTabindex === null) {
+        node.removeAttribute('tabindex');
+      }
       try {
         previouslyFocused?.focus({ preventScroll: true });
       } catch {
