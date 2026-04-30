@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 use crate::identity;
 use crate::identity::KeychainStore;
 use crate::recovery_cli;
+use crate::recovery_policy::MAX_RECOVERY_COMMENT_BYTES;
 
 // ── Shared types ─────────────────────────────────────────────────────────
 
@@ -144,13 +145,6 @@ fn clear_preview_cache() {
 /// rejects accidental selection of a large file (image, video, archive).
 const MAX_RECOVERY_FILE_BYTES: u64 = 1 << 20;
 
-/// Maximum byte length of a user-supplied recovery-file comment.
-/// `harmony_owner::recovery` already enforces this cap inside
-/// `to_encrypted_file`; the GUI mirrors it (round 3 review) so the user sees
-/// a friendly, predictable error before any I/O instead of a generic message
-/// surfaced from the encryption layer. The value MUST match the inner cap
-/// so the GUI rejection fires first.
-const MAX_RECOVERY_COMMENT_BYTES: usize = 256;
 
 /// Read a recovery file with a size guard.
 ///
