@@ -2,7 +2,10 @@
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
   import { loadProfile, saveProfile } from '../profile-service';
-  import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
+  import {
+    MAX_RECOVERY_COMMENT_BYTES,
+    MIN_RECOVERY_PASSPHRASE_LEN,
+  } from '../recovery-policy';
   import PairingInviter from './PairingInviter.svelte';
   import PairingJoiner from './PairingJoiner.svelte';
 
@@ -184,8 +187,8 @@
     // the trimmed form fits.
     const trimmedComment = backupComment.trim();
     const commentBytes = new TextEncoder().encode(trimmedComment).length;
-    if (commentBytes > 256) {
-      backupError = `Comment must be at most 256 bytes (currently ${commentBytes}).`;
+    if (commentBytes > MAX_RECOVERY_COMMENT_BYTES) {
+      backupError = `Comment must be at most ${MAX_RECOVERY_COMMENT_BYTES} bytes (currently ${commentBytes}).`;
       return;
     }
     // Mark dialog-in-flight BEFORE the save dialog opens so a fast double-
