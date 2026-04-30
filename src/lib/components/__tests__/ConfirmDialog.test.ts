@@ -76,4 +76,19 @@ describe('ConfirmDialog', () => {
     const confirmBtn = screen.getByRole('button', { name: 'Delete' });
     expect(confirmBtn.classList.contains('destructive')).toBe(true);
   });
+
+  it('renders inside <Modal> with correct a11y attributes', () => {
+    const { getByRole } = render(ConfirmDialog, {
+      props: {
+        title: 'Confirm',
+        message: 'Are you sure?',
+        confirmLabel: 'Yes',
+        onConfirm: () => {},
+        onCancel: () => {},
+      },
+    });
+    const dialog = getByRole('dialog');
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    expect(dialog.getAttribute('aria-labelledby')).toMatch(/^dialog-title-/);
+  });
 });
