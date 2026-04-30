@@ -11,6 +11,7 @@ use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
+use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +235,35 @@ pub fn decrypt_root_publish(keys: &KeyTree, blob: &[u8]) -> Result<Vec<u8>, Cryp
             },
         )
         .map_err(|_| CryptoError::AeadDecrypt)
+}
+
+/// Per-publisher HLC tracker for state-root replay protection.
+///
+/// Per ZEB-211 round-5: "last accepted" is keyed by `at.device_id`,
+/// not global per-owner — different bound devices' clocks can interleave
+/// with arbitrary wall_ms ordering, so a global rule would falsely reject
+/// legitimate publishes.
+///
+/// Receivers call `try_accept` after AEAD-decrypting a state-root publish
+/// payload but BEFORE applying the new `root_cid`.
+#[derive(Debug, Default)]
+pub struct RootReplayTracker {
+    last_accepted: HashMap<String, Hlc>,
+}
+
+impl RootReplayTracker {
+    /// Returns `Ok(())` if `at` is strictly newer than the last accepted
+    /// HLC from the same publisher (`at.device_id`), and updates the
+    /// tracker's record. Returns `Err(CryptoError::ReplayRejected)` if not.
+    pub fn try_accept(&mut self, at: &Hlc) -> Result<(), CryptoError> {
+        if let Some(last) = self.last_accepted.get(&at.device_id) {
+            if !at.is_strictly_newer_than(last) {
+                return Err(CryptoError::ReplayRejected(at.device_id.clone()));
+            }
+        }
+        self.last_accepted.insert(at.device_id.clone(), at.clone());
+        Ok(())
+    }
 }
 
 /// Hybrid Logical Clock. Mirrors the type defined in the ZEB-206 spec.
@@ -492,5 +522,57 @@ mod tests {
             device_id: "aardvark".into(),
         };
         assert!(a.is_strictly_newer_than(&earlier_device));
+    }
+
+    fn hlc(wall_ms: u64, logical: u32, device_id: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical,
+            device_id: device_id.into(),
+        }
+    }
+
+    #[test]
+    fn replay_tracker_accepts_first_publish_from_each_publisher() {
+        let mut tracker = RootReplayTracker::default();
+        assert!(tracker.try_accept(&hlc(100, 0, "alice")).is_ok());
+        // Different publisher (different device_id) — separate counter,
+        // also accepted on first publish.
+        assert!(tracker.try_accept(&hlc(50, 0, "bob")).is_ok());
+    }
+
+    #[test]
+    fn replay_tracker_accepts_strictly_newer_from_same_publisher() {
+        let mut tracker = RootReplayTracker::default();
+        tracker.try_accept(&hlc(100, 0, "alice")).expect("first");
+        assert!(tracker.try_accept(&hlc(100, 1, "alice")).is_ok());
+        assert!(tracker.try_accept(&hlc(101, 0, "alice")).is_ok());
+    }
+
+    #[test]
+    fn replay_tracker_rejects_replayed_publish_from_same_publisher() {
+        let mut tracker = RootReplayTracker::default();
+        tracker.try_accept(&hlc(100, 0, "alice")).expect("first");
+        // Replay of the same HLC: rejected (not strictly newer).
+        let result = tracker.try_accept(&hlc(100, 0, "alice"));
+        assert!(matches!(result, Err(CryptoError::ReplayRejected(d)) if d == "alice"));
+        // Older HLC: also rejected.
+        let result = tracker.try_accept(&hlc(99, 999, "alice"));
+        assert!(matches!(result, Err(CryptoError::ReplayRejected(_))));
+    }
+
+    #[test]
+    fn replay_tracker_independent_per_publisher() {
+        // Alice and Bob's clocks may interleave arbitrarily. The tracker
+        // checks each publisher independently — a bob publish at wall_ms=50
+        // is fine even after an alice publish at wall_ms=200.
+        let mut tracker = RootReplayTracker::default();
+        tracker.try_accept(&hlc(200, 0, "alice")).expect("alice-1");
+        // Bob's first publish at lower wall_ms must succeed (per-publisher).
+        tracker.try_accept(&hlc(50, 0, "bob")).expect("bob-1");
+        // Bob's second publish at still-lower wall_ms is rejected (not
+        // strictly newer than bob's last-accepted at wall_ms=50).
+        let result = tracker.try_accept(&hlc(40, 0, "bob"));
+        assert!(matches!(result, Err(CryptoError::ReplayRejected(_))));
     }
 }
