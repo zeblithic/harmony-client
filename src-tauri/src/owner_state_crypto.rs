@@ -277,6 +277,25 @@ pub struct Hlc {
     pub device_id: String,
 }
 
+/// Canonical CBOR encoder. Produces deterministic output per RFC 8949 §4.2
+/// when the input value's structure is canonical (sorted-key maps,
+/// definite-length collections, no floats). The CRDT's deterministic
+/// encryption property depends on byte-identical output across bound
+/// devices — types crossing this boundary MUST use `BTreeMap` (which
+/// `serde` serializes in sorted order) instead of `HashMap`.
+pub fn canonical_cbor_encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CryptoError> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
+    Ok(buf)
+}
+
+/// Canonical CBOR decoder. Symmetric inverse of `canonical_cbor_encode`.
+pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, CryptoError> {
+    ciborium::from_reader(bytes).map_err(|e| CryptoError::CborDecode(format!("{e}")))
+}
+
 impl Hlc {
     /// Lexicographic ordering on `(wall_ms, logical, device_id)`.
     ///
@@ -574,5 +593,38 @@ mod tests {
         // strictly newer than bob's last-accepted at wall_ms=50).
         let result = tracker.try_accept(&hlc(40, 0, "bob"));
         assert!(matches!(result, Err(CryptoError::ReplayRejected(_))));
+    }
+
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn canonical_cbor_byte_identical_for_same_value() {
+        // The deterministic-encryption property of the CRDT relies on
+        // byte-identical CBOR output across implementations and runs.
+        let mut value: BTreeMap<String, u32> = BTreeMap::new();
+        value.insert("foo".into(), 1);
+        value.insert("bar".into(), 2);
+
+        let bytes1 = canonical_cbor_encode(&value).expect("encode 1");
+        let bytes2 = canonical_cbor_encode(&value).expect("encode 2");
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn canonical_cbor_round_trip() {
+        let value = Hlc {
+            wall_ms: 12345,
+            logical: 7,
+            device_id: "alice".into(),
+        };
+        let bytes = canonical_cbor_encode(&value).expect("encode");
+        let recovered: Hlc = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(value, recovered);
+    }
+
+    #[test]
+    fn canonical_cbor_decode_rejects_garbage() {
+        let result = canonical_cbor_decode::<Hlc>(b"not cbor at all");
+        assert!(matches!(result, Err(CryptoError::CborDecode(_))));
     }
 }
