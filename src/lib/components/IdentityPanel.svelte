@@ -173,6 +173,12 @@
 
   async function advanceFromFileEntry() {
     if (wizardState.kind !== 'backup' || wizardState.step.phase !== 'fileEntry') return;
+    // Function-level reentrancy guard: even with the Continue button gated
+    // on `backupInFlight`, two click handlers can be queued in the same
+    // event-loop turn before Svelte's reactivity propagates `disabled` to
+    // the DOM. Mirrors the existing guard in commitRestore.
+    // (CodeRabbit, PR #66 review.)
+    if (backupInFlight) return;
     const { passphrase, passphraseConfirm, comment } = wizardState.step;
     if (!passphrase || passphrase !== passphraseConfirm) return;
 

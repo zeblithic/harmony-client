@@ -142,6 +142,12 @@
   }
 
   async function commitBackup() {
+    // Function-level reentrancy guard: even with the Save backup button
+    // gated on the in-flight flags, two click handlers can be queued in
+    // the same event-loop turn before Svelte's reactivity propagates
+    // `disabled` to the DOM. Symmetric with IdentityPanel's
+    // advanceFromFileEntry guard. (CodeRabbit, PR #66 review.)
+    if (backupDialogInFlight || backupInFlight) return;
     // Clear any error from a prior commit attempt in this same modal session
     // BEFORE re-validating. Without this, a stale error string from the
     // previous click can render alongside (or instead of) the current
