@@ -236,6 +236,29 @@ pub fn decrypt_root_publish(keys: &KeyTree, blob: &[u8]) -> Result<Vec<u8>, Cryp
         .map_err(|_| CryptoError::AeadDecrypt)
 }
 
+/// Hybrid Logical Clock. Mirrors the type defined in the ZEB-206 spec.
+///
+/// Phase 2 of ZEB-215 will move this to a shared types module; Phase 1
+/// keeps it here so the crypto module is self-contained for testing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Hlc {
+    pub wall_ms: u64,
+    pub logical: u32,
+    pub device_id: String,
+}
+
+impl Hlc {
+    /// Lexicographic ordering on `(wall_ms, logical, device_id)`.
+    ///
+    /// Per ZEB-211 round-5: integers compared numerically; `device_id`
+    /// compared bytewise (the `String` Ord impl provides this for UTF-8).
+    /// Replay-protection check uses `self.is_strictly_newer_than(&last_accepted)`.
+    pub fn is_strictly_newer_than(&self, other: &Hlc) -> bool {
+        (self.wall_ms, self.logical, self.device_id.as_str())
+            > (other.wall_ms, other.logical, other.device_id.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +443,54 @@ mod tests {
         let entry_blob = encrypt_entry(&kt, &lookup, &payload).expect("encrypt-entry");
         let result = decrypt_root_publish(&kt, &entry_blob);
         assert!(matches!(result, Err(CryptoError::AeadDecrypt)));
+    }
+
+    #[test]
+    fn hlc_lexicographic_ordering_per_zeb_211() {
+        let a = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        let b = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        assert!(!a.is_strictly_newer_than(&b));
+        assert!(!b.is_strictly_newer_than(&a));
+
+        // wall_ms dominates.
+        let later_wall = Hlc {
+            wall_ms: 101,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        assert!(later_wall.is_strictly_newer_than(&a));
+        assert!(!a.is_strictly_newer_than(&later_wall));
+
+        // logical breaks wall_ms ties.
+        let later_logical = Hlc {
+            wall_ms: 100,
+            logical: 1,
+            device_id: "alice".into(),
+        };
+        assert!(later_logical.is_strictly_newer_than(&a));
+
+        // device_id breaks (wall_ms, logical) ties — bytewise UTF-8.
+        let later_device = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "bob".into(),
+        };
+        assert!(later_device.is_strictly_newer_than(&a));
+
+        // Within tie, smaller bytewise device_id is older.
+        let earlier_device = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "aardvark".into(),
+        };
+        assert!(a.is_strictly_newer_than(&earlier_device));
     }
 }
