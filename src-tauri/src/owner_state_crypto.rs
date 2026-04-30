@@ -79,6 +79,23 @@ impl KeyTree {
     }
 }
 
+/// Derive the per-space Prolly Tree lookup key.
+///
+/// The lookup key is `HMAC-SHA256(owner_state_lookup_key, space_id_bytes)`
+/// — a keyed MAC, NOT a plain hash, so observers without the lookup key
+/// cannot enumerate the tree by precomputing hashes of known space IDs.
+///
+/// Returns 32 bytes for use as a Prolly Tree key AND as AAD when
+/// encrypting that space's value (defense-in-depth against ciphertext
+/// relocation; see ZEB-211 spec).
+pub fn space_lookup_key(keys: &KeyTree, space_id_bytes: &[u8]) -> [u8; 32] {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(keys.lookup.as_ref())
+        .expect("HMAC accepts any key length");
+    mac.update(space_id_bytes);
+    mac.finalize().into_bytes().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +128,34 @@ mod tests {
         let kt1 = KeyTree::derive(&[0u8; 32]).expect("derive 1");
         let kt2 = KeyTree::derive(&[1u8; 32]).expect("derive 2");
         assert_ne!(kt1.entry_aead.as_ref(), kt2.entry_aead.as_ref());
+    }
+
+    #[test]
+    fn space_lookup_key_is_deterministic_and_distinguishes_spaces() {
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+
+        let key_a1 = space_lookup_key(&kt, b"space-id-A");
+        let key_a2 = space_lookup_key(&kt, b"space-id-A");
+        let key_b = space_lookup_key(&kt, b"space-id-B");
+
+        // Same input → same lookup key (deterministic; bound devices agree).
+        assert_eq!(key_a1, key_a2);
+
+        // Different space IDs → different lookup keys.
+        assert_ne!(key_a1, key_b);
+
+        // Output is exactly 32 bytes (SHA-256 size).
+        assert_eq!(key_a1.len(), 32);
+    }
+
+    #[test]
+    fn space_lookup_key_unrelated_to_plain_blake3_hash() {
+        // Sanity: lookup key must be HMAC, not a plain hash. A plain
+        // BLAKE3(space_id) would let observers enumerate by precomputing
+        // hashes of known space IDs.
+        let kt = KeyTree::derive(&TEST_SEED).expect("derive");
+        let lookup = space_lookup_key(&kt, b"some-space");
+        let plain = blake3::hash(b"some-space");
+        assert_ne!(&lookup[..], plain.as_bytes().as_slice());
     }
 }
