@@ -26,6 +26,8 @@ pub enum CryptoError {
     CborEncode(String),
     #[error("CBOR decode failed: {0}")]
     CborDecode(String),
+    #[error("OS RNG failed: {0}")]
+    Rng(String),
     #[error("Replay rejected: at HLC not strictly newer than last accepted from device {0}")]
     ReplayRejected(String),
 }
@@ -206,7 +208,9 @@ const AAD_ROOT_PUBLISH: &[u8] = b"state-root-pointer";
 /// but this function is bytes-in/bytes-out — Phase 2 owns the CBOR shape.
 pub fn encrypt_root_publish(keys: &KeyTree, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| CryptoError::Rng(e.to_string()))?;
 
     let cipher = ChaCha20Poly1305::new_from_slice(keys.root_aead.as_ref())
         .expect("ChaCha20-Poly1305 accepts a 32-byte key");
@@ -329,10 +333,26 @@ pub fn canonical_cbor_encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 /// Decoder paired with `canonical_cbor_encode`. Round-tripping is
 /// symmetric for any value that encoded successfully under the
 /// encoder's contract above.
+///
+/// Rejects inputs with trailing bytes after the first valid CBOR value.
+/// Without this check an attacker could append arbitrary bytes to a
+/// known-good blob and produce a different byte sequence that decodes
+/// to the same value, defeating any downstream code that fingerprints
+/// (BLAKE3-hashes, signs, dedup-checks) the encoded form.
 pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, CryptoError> {
-    ciborium::from_reader(bytes).map_err(|e| CryptoError::CborDecode(format!("{e}")))
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value =
+        ciborium::from_reader(&mut cursor).map_err(|e| CryptoError::CborDecode(format!("{e}")))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(CryptoError::CborDecode(format!(
+            "trailing bytes after canonical value: consumed {} of {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(value)
 }
 
 impl Hlc {
@@ -664,6 +684,25 @@ mod tests {
     #[test]
     fn canonical_cbor_decode_rejects_garbage() {
         let result = canonical_cbor_decode::<Hlc>(b"not cbor at all");
+        assert!(matches!(result, Err(CryptoError::CborDecode(_))));
+    }
+
+    #[test]
+    fn canonical_cbor_decode_rejects_trailing_bytes() {
+        // A canonical decoder must reject inputs with extra bytes after the
+        // first valid value — otherwise an attacker can append garbage to a
+        // known-good blob and produce a different byte sequence that decodes
+        // to the same value, breaking any downstream code that fingerprints
+        // (BLAKE3-hashes, signs, dedup-checks) the encoded form.
+        let value = Hlc {
+            wall_ms: 7,
+            logical: 0,
+            device_id: "alice".into(),
+        };
+        let mut bytes = canonical_cbor_encode(&value).expect("encode");
+        bytes.push(0x00);
+        bytes.push(0xFF);
+        let result = canonical_cbor_decode::<Hlc>(&bytes);
         assert!(matches!(result, Err(CryptoError::CborDecode(_))));
     }
 
