@@ -956,16 +956,24 @@ mod tests {
     }
 
     /// ZEB-202: pin the codepoint-vs-byte distinction the guard relies on.
-    /// A 12-codepoint multibyte passphrase has > 12 *bytes* — under a
-    /// naive `passphrase.len() < MIN` byte-count guard it would still
-    /// pass, but under `passphrase.chars().count() < MIN` (what the IPC
-    /// actually uses) it also passes. The danger is if someone "fixes"
-    /// the guard to use byte count: a user who picks a 12-character
-    /// English passphrase would still pass, but the multibyte case
-    /// would silently change semantics. This test fails the moment
-    /// someone refactors `.chars().count()` to `.len()` AND a fixture
-    /// with the codepoint-vs-byte gap is exercised against the new
-    /// predicate.
+    ///
+    /// A 12-codepoint multibyte fixture has > 12 *bytes*. The IPC's guard
+    /// uses `passphrase.chars().count()`, so this fixture clears the guard
+    /// — that's the property the IPC needs.
+    ///
+    /// **What this test catches:** drift in the fixture itself (e.g. the
+    /// CJK string is edited and silently loses or gains a codepoint), or
+    /// a change to `MIN_RECOVERY_PASSPHRASE_LEN` that would invalidate
+    /// the fixture's role as the boundary case.
+    ///
+    /// **What this test does NOT catch:** a refactor of the IPC's guard
+    /// from `.chars().count()` to `.len()`. The fixture's `.len()` is 36,
+    /// well above 12, so a `.len()` predicate would still admit it. A
+    /// `.len()`-vs-`.chars().count()` drift in the actual guard would
+    /// only break user-facing behavior on passphrases with 12 codepoints
+    /// AND fewer than 12 bytes, which is impossible (a single codepoint
+    /// is at least 1 byte). The real defense against that drift is the
+    /// guard's own implementation comment plus owner-side parity.
     #[test]
     fn min_passphrase_len_check_uses_codepoint_count_not_byte_count() {
         // 12 CJK codepoints, 36 bytes.
