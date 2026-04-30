@@ -406,57 +406,59 @@
   {/if}
 
   {#if backupOpen}
-    <div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="backup-modal-heading">
-      <div class="modal">
-        <h3 id="backup-modal-heading">Back up owner identity</h3>
-        {#if backupSavedPath}
-          <p>Recovery file written to <code>{backupSavedPath}</code>. Keep it somewhere safe.</p>
-          <button class="primary" onclick={closeBackup}>Done</button>
-        {:else}
-          <p>
-            Choose a strong passphrase. The encrypted file alone cannot be opened
-            without it.
-          </p>
-          <label>
-            Passphrase
-            <input type="password" bind:value={backupPassphrase} aria-label="Passphrase" />
-          </label>
-          <label>
-            Confirm passphrase
-            <input type="password" bind:value={backupPassphraseConfirm} aria-label="Confirm passphrase" />
-          </label>
-          <label>
-            Comment (optional)
-            <!--
-              No `maxlength` attribute — that counts UTF-16 code units, but
-              the harmony-owner backend cap is 256 bytes. commitBackup
-              validates byte length explicitly via TextEncoder before submit.
-            --><input type="text" bind:value={backupComment} aria-label="Comment" />
-          </label>
-          {#if backupError}
-            <p class="error" role="alert">{backupError}</p>
-          {/if}
-          <div class="modal-actions">
-            <button class="secondary" onclick={closeBackup} disabled={backupDialogInFlight || backupInFlight}>Cancel</button>
-            {#if recoveryToken === null && backupError}
-              <!--
-                Token-issuance failed (e.g., locked keychain). Inline retry
-                avoids forcing the user to close + reopen the modal.
-              -->
-              <button class="secondary" onclick={retryIssueToken} disabled={backupDialogInFlight || backupInFlight}>Retry</button>
-            {/if}
-            <!--
-              Disable Save backup when no token is available (e.g., issue_owner_recovery_token
-              failed during openBackup). Otherwise the user clicks Save and gets a confusing
-              "No recovery token available" inline error instead of the disabled-state hint.
-            -->
-            <button class="primary" onclick={commitBackup} disabled={backupDialogInFlight || backupInFlight || recoveryToken === null}>
-              {#if backupInFlight}Encrypting…{:else if backupDialogInFlight}Choose location…{:else}Save backup{/if}
-            </button>
-          </div>
+    <Modal
+      onCancel={closeBackup}
+      canCancel={!backupDialogInFlight && !backupInFlight}
+      ariaLabelledby="backup-modal-heading"
+    >
+      <h3 id="backup-modal-heading">Back up owner identity</h3>
+      {#if backupSavedPath}
+        <p>Recovery file written to <code>{backupSavedPath}</code>. Keep it somewhere safe.</p>
+        <button class="primary" onclick={closeBackup}>Done</button>
+      {:else}
+        <p>
+          Choose a strong passphrase. The encrypted file alone cannot be opened
+          without it.
+        </p>
+        <label>
+          Passphrase
+          <input type="password" bind:value={backupPassphrase} aria-label="Passphrase" />
+        </label>
+        <label>
+          Confirm passphrase
+          <input type="password" bind:value={backupPassphraseConfirm} aria-label="Confirm passphrase" />
+        </label>
+        <label>
+          Comment (optional)
+          <!--
+            No `maxlength` attribute — that counts UTF-16 code units, but
+            the harmony-owner backend cap is 256 bytes. commitBackup
+            validates byte length explicitly via TextEncoder before submit.
+          --><input type="text" bind:value={backupComment} aria-label="Comment" />
+        </label>
+        {#if backupError}
+          <p class="error" role="alert">{backupError}</p>
         {/if}
-      </div>
-    </div>
+        <div class="modal-actions">
+          <button class="secondary" onclick={closeBackup} disabled={backupDialogInFlight || backupInFlight}>Cancel</button>
+          {#if recoveryToken === null && backupError}
+            <!--
+              Token-issuance failed (e.g., locked keychain). Inline retry
+              avoids forcing the user to close + reopen the modal.
+            -->
+            <button class="secondary" onclick={retryIssueToken} disabled={backupDialogInFlight || backupInFlight}>Retry</button>
+          {/if}
+          <!--
+            Disable Save backup when no token is available (e.g., issue_owner_recovery_token
+            failed during openBackup). Otherwise the user clicks Save and gets a confusing
+            "No recovery token available" inline error instead of the disabled-state hint.
+          -->
+          <button class="primary" onclick={commitBackup} disabled={backupDialogInFlight || backupInFlight || recoveryToken === null}>
+            {#if backupInFlight}Encrypting…{:else if backupDialogInFlight}Choose location…{:else}Save backup{/if}
+          </button>
+        </div>
+      {/if}
+    </Modal>
   {/if}
 
   {#if joinerOpen}
@@ -536,22 +538,6 @@
   .primary:disabled, .secondary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-  }
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-  .modal {
-    background: var(--bg-secondary);
-    padding: 24px;
-    border-radius: 8px;
-    max-width: 480px;
-    border: 1px solid var(--border);
   }
   .modal-actions {
     display: flex;

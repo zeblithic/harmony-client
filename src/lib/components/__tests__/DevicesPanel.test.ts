@@ -843,3 +843,99 @@ describe('DevicesPanel — mint modal a11y (ZEB-195)', () => {
     });
   });
 });
+
+describe('DevicesPanel — backup modal a11y (ZEB-195)', () => {
+  it('moves focus into the modal when opened, restores it on close via Escape', async () => {
+    // Setup mirrors the existing "clicking Back up opens the backup modal and
+    // issues a token if needed" test: populated state with canBackUp=true,
+    // followed by issue_owner_recovery_token.
+    mockedInvoke
+      .mockResolvedValueOnce({
+        ownerId: 'x',
+        ownerDisplayName: 'me',
+        devices: [{
+          deviceId: 'd', displayName: 'this', isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+        }],
+        canBackUp: true,
+      })
+      .mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /back up owner identity/i });
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('Escape closes the backup modal', async () => {
+    mockedInvoke
+      .mockResolvedValueOnce({
+        ownerId: 'x',
+        ownerDisplayName: 'me',
+        devices: [{
+          deviceId: 'd', displayName: 'this', isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+        }],
+        canBackUp: true,
+      })
+      .mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('Escape is a no-op while backupDialogInFlight', async () => {
+    // Open backup modal, fill matching ≥12-codepoint passphrases, click Save
+    // backup. While the request_export_save_path promise is pending,
+    // backupDialogInFlight = true → canCancel = false → Escape must no-op.
+    mockedInvoke
+      .mockResolvedValueOnce({
+        ownerId: 'x',
+        ownerDisplayName: 'me',
+        devices: [{
+          deviceId: 'd', displayName: 'this', isThisDevice: true,
+          trustDecision: { kind: 'full', reason: null },
+          enrolledAt: 1_700_000_000, fingerprint: 'd·x',
+        }],
+        canBackUp: true,
+      })
+      .mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+
+    // request_export_save_path returns a pending promise so
+    // backupDialogInFlight stays true while we press Escape.
+    let resolvePath: (value: unknown) => void = () => {};
+    const pendingPath = new Promise((resolve) => { resolvePath = resolve; });
+    mockedInvoke.mockReturnValueOnce(pendingPath);
+
+    render(DevicesPanel);
+    const trigger = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    const saveBtn = screen.getByRole('button', { name: /save backup/i });
+    // Do NOT await — we want backupDialogInFlight = true while we press Escape.
+    fireEvent.click(saveBtn);
+    // Press Escape — must be a no-op because canCancel is false while the
+    // path-token request is in flight.
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeInTheDocument();
+    // Resolve the pending dialog promise (returns null = user cancelled) so
+    // the test cleans up gracefully.
+    resolvePath(null);
+  });
+});
