@@ -101,8 +101,8 @@ interface Space {
   members: OwnerAddr[];           // for DM/group-DM only — INCLUDES sender; communities use separate CRDT
   custom_name: string | null;     // owner's local rename, applies only on this owner's devices
   notification_pref: 'all' | 'mentions' | 'muted' | null;
-  created_at: HybridLogicalClock;
-  updated_at: HybridLogicalClock;
+  created_at: HLC;
+  updated_at: HLC;
 }
 
 type TransportBinding =
@@ -217,9 +217,13 @@ interface ProfileMembershipBroadcast {
 }
 ```
 
-### Hybrid Logical Clock
+### Hybrid Logical Clock (`HLC`)
+
+`HLC` is used as the timestamp type throughout this spec (`Space.created_at`, `OutboxEntry.created_at`, `ReadMarker.last_read_at`, etc.). It's an alias for `HybridLogicalClock`:
 
 ```typescript
+type HLC = HybridLogicalClock;
+
 interface HybridLogicalClock {
   wall_ms: number;       // unix milliseconds
   logical: number;       // monotone counter for same-wall-ms events
