@@ -96,22 +96,26 @@ Use the `hkdf` crate (already in Cargo.toml):
 ```rust
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 let hk = Hkdf::<Sha256>::new(
     Some(b"harmony-owner-state-v1-epoch-0"),
     master_seed.as_ref(),
 );
-let mut entry_aead_key = [0u8; 32];
-hk.expand(b"entry-aead-key", &mut entry_aead_key)?;
-let mut root_aead_key = [0u8; 32];
-hk.expand(b"root-aead-key", &mut root_aead_key)?;
-let mut lookup_key = [0u8; 32];
-hk.expand(b"tree-lookup", &mut lookup_key)?;
-let mut nonce_key = [0u8; 32];
-hk.expand(b"nonce-deriv", &mut nonce_key)?;
+
+// All four derived keys MUST be wrapped in Zeroizing so they're cleared
+// from memory on drop (zeroize crate is already a dep).
+let mut entry_aead_key = Zeroizing::new([0u8; 32]);
+hk.expand(b"entry-aead-key", entry_aead_key.as_mut())?;
+let mut root_aead_key = Zeroizing::new([0u8; 32]);
+hk.expand(b"root-aead-key", root_aead_key.as_mut())?;
+let mut lookup_key = Zeroizing::new([0u8; 32]);
+hk.expand(b"tree-lookup", lookup_key.as_mut())?;
+let mut nonce_key = Zeroizing::new([0u8; 32]);
+hk.expand(b"nonce-deriv", nonce_key.as_mut())?;
 ```
 
-All four keys MUST be wrapped in `Zeroizing<[u8; 32]>` (the `zeroize` crate is already a dep) so they don't linger in freed memory.
+The `Zeroizing` wrapper is mandatory — bare `[u8; 32]` would leave key material in freed memory, defeating the at-rest protection that the rest of this scheme relies on.
 
 ## Canonical CBOR encoding (required)
 
@@ -282,6 +286,8 @@ state_root_payload = {
 
 **Receiver parsing:** read the first 12 bytes as the nonce; the remainder is the AEAD ciphertext-with-tag. Decrypt with `owner_state_root_aead_key` and `aad = b"state-root-pointer"`. On AEAD failure, drop the publish (could be unauthenticated injection).
 
+**Replay/rollback protection — REQUIRED:** after successful AEAD decryption, the receiver MUST compare the decrypted `at` HLC to the last accepted `at` for this owner (per-publisher tracked in local state). If the new `at` is **not strictly newer** than the last accepted, drop the publish. Without this check, an active adversary could capture a valid past publish and replay it on the topic — the AEAD would verify, and the receiver would silently accept a rolled-back `root_cid`, regressing the owner-state to a stale snapshot until a fresh publish from another bound device arrives. The CRDT does eventually self-heal in that scenario, but the rollback window is long enough to cause user-visible misbehavior. The HLC monotonicity check closes this window and makes the `at` field load-bearing rather than informational.
+
 **AEAD parameters:**
 
 - Key: `owner_state_root_aead_key` (separate from `owner_state_entry_aead_key` — see "Key separation: why two AEAD keys" above)
@@ -345,6 +351,7 @@ Before ZEB-211 implementation lands (note: this spec is design-only; implementat
 - Negative test: ciphertext from Space-A cannot be decrypted as Space-B (AAD binding works)
 - Negative test: Space ID enumeration via tree-lookup-key brute force is computationally infeasible (assert HMAC, not plain hash, used for lookup keys)
 - Round-trip test for state-root publish: encrypt random `(root_cid, HLC)` payloads with random nonces and `aad=b"state-root-pointer"`, decrypt, verify cleartext match
+- **Replay-protection test:** simulate an active adversary replaying a captured valid root publish; assert the receiver's HLC monotonicity check rejects it (state remains at the latest-accepted snapshot, no rollback)
 - `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` clean
 - `cargo fmt --all -- --check` clean
 
