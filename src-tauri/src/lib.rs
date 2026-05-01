@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub mod content_index;
+pub mod content_store;
 pub mod event_loop;
 pub mod folders;
 mod follows;
@@ -20,6 +21,8 @@ pub mod owner_commands;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
+pub mod owner_state_persist;
+pub mod owner_state_sync;
 pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
