@@ -630,6 +630,14 @@ impl InboxEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadMarker {
+    #[serde(rename = "sp")]
+    pub space_id: SpaceId,
+    #[serde(rename = "lr")]
+    pub last_read_at: Hlc,
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
@@ -671,6 +679,27 @@ mod inbox_tests {
         ciborium::into_writer(&e, &mut bytes).unwrap();
         let recovered: InboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(e, recovered);
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn read_marker_round_trip() {
+        let m = ReadMarker {
+            space_id: SpaceId([5u8; 16]),
+            last_read_at: Hlc {
+                wall_ms: 999,
+                logical: 7,
+                device_id: "d".into(),
+            },
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&m, &mut bytes).unwrap();
+        let recovered: ReadMarker = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(m, recovered);
     }
 }
 
