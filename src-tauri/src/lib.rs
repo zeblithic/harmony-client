@@ -688,24 +688,14 @@ async fn start_node(
                     // ContentStore; cross-device convergence only works
                     // in the test-only shared-stub setup. Production
                     // multi-device will silently fail until Phase 3b
-                    // wires a real harmony-content CAS. Surface this to
-                    // the GUI on every successful boot so users
-                    // understand the limitation rather than seeing
-                    // "node started" with sync invisibly broken.
+                    // wires a real harmony-content CAS. The GUI gets
+                    // a `state-root-sync-degraded` event AFTER the
+                    // event loop reports startup success — emitting
+                    // here would race the runtime-thread spawn and
+                    // could leave the banner up for nodes that never
+                    // came up.
                     let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
                         std::sync::Arc::new(crate::content_store::InMemoryStub::default());
-                    {
-                        use tauri::Emitter;
-                        let _ = app.emit(
-                            "state-root-sync-degraded",
-                            serde_json::json!({
-                                "reason": "phase_3a_in_memory_stub",
-                                "message": "Phase 3a uses an in-process content stub; \
-                                            cross-device state sync will not work until \
-                                            Phase 3b lands a real CAS backend.",
-                            }),
-                        );
-                    }
 
                     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -937,6 +927,25 @@ async fn start_node(
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
         Ok(Ok(())) => 'arm: {
+            // Phase 3a: now that the event loop has signaled startup
+            // success, surface the InMemoryStub limitation to the GUI.
+            // Emitting earlier (during engine construction) could leave
+            // the degraded banner up for nodes that never came up.
+            // Gated on `engine_for_cleanup.is_some()` because nodes
+            // without a master_seed (pre-mint state) have no engine and
+            // shouldn't display a sync-degraded banner.
+            if engine_for_cleanup.is_some() {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "state-root-sync-degraded",
+                    serde_json::json!({
+                        "reason": "phase_3a_in_memory_stub",
+                        "message": "Phase 3a uses an in-process content stub; \
+                                    cross-device state sync will not work until \
+                                    Phase 3b lands a real CAS backend.",
+                    }),
+                );
+            }
             // ZEB-197: spawn the pairing state machine now that the
             // event loop is up. Construct ZenohPairingTransport with
             // a clone of publish_tx (publishes go through the running

@@ -169,11 +169,20 @@ impl SyncEngine {
     pub async fn shutdown(&self) -> Result<(), SyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let result = if self.shutdown_tx.send(resp_tx).await.is_ok() {
-            // The task receives, runs the final flush, then drops the
-            // oneshot sender. If oneshot resolves to Err the task
-            // panicked or was cancelled mid-flush.
-            resp_rx.await.unwrap_or(Ok(()))
+            // Mirror `flush_now`'s error propagation. Three outcomes:
+            //   Ok(Ok(()))    flush succeeded
+            //   Ok(Err(e))    flush failed (publish or persist)
+            //   Err(_)        oneshot cancelled — task panicked or
+            //                 dropped resp_tx mid-flush. We surface
+            //                 this as TransportClosed rather than
+            //                 silently swallowing as Ok(()), since
+            //                 that would mask exactly the failure
+            //                 mode this API is meant to surface.
+            resp_rx.await.map_err(|_| SyncError::TransportClosed)?
         } else {
+            // shutdown_tx.send failed — the receiver is gone, so
+            // the task already exited (e.g. a previous shutdown).
+            // No flush to wait on; treat as already-done.
             Ok(())
         };
         // Drop the JoinHandle without awaiting it (see doc above for why).
@@ -251,9 +260,21 @@ async fn internal_task(mut ctx: InternalCtx) {
             }
             _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
                 next_wakeup = None;
-                ctx.has_pending_dirty.store(false, Ordering::Relaxed);
-                if let Err(e) = publish_root_now(&ctx).await {
+                // Use `swap` rather than `store(false)` so we can
+                // restore the dirty bit if the publish itself fails.
+                // Otherwise a transient publish error (Zenoh blip,
+                // ContentStore failure) silently consumes the dirty
+                // signal and the next `shutdown()`/wakeup misses the
+                // pending-state guard.
+                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let pub_result = publish_root_now(&ctx).await;
+                if let Err(e) = &pub_result {
                     tracing::warn!(error = %e, "publish_root_now failed");
+                    if was_dirty {
+                        // Re-arm so the next debounce wakeup / shutdown
+                        // retries this publish instead of skipping it.
+                        ctx.has_pending_dirty.store(true, Ordering::Release);
+                    }
                 }
                 if let Err(e) = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await {
                     tracing::warn!(error = %e, "persist_both failed");
@@ -268,8 +289,15 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // happens to be idle, which is acceptable for tests
                 // and explicit "force publish" callers.
                 next_wakeup = None;
-                ctx.has_pending_dirty.store(false, Ordering::Relaxed);
+                // Same swap-and-restore pattern as the wakeup arm: if
+                // the publish fails, preserve the dirty latch so the
+                // engine retries on its next signal instead of losing
+                // pending work.
+                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
                 let pub_result = publish_root_now(&ctx).await;
+                if pub_result.is_err() && was_dirty {
+                    ctx.has_pending_dirty.store(true, Ordering::Release);
+                }
                 let persist_result = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
                 let result = pub_result.and(persist_result);
                 let _ = resp_tx.send(result);
