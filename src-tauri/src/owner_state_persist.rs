@@ -39,9 +39,90 @@ pub fn save_atomically(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
     Ok(())
 }
 
+use crate::owner_state_crdt::OwnerState;
+use ciborium::{from_reader, into_writer};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+
+const CRDT_FILE_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct CrdtFileV1 {
+    spaces: BTreeMap<crate::owner_state_types::SpaceId, crate::owner_state_types::Space>,
+    outbox:
+        BTreeMap<crate::owner_state_types::OutboxEntryId, crate::owner_state_types::OutboxEntry>,
+    inbox: BTreeMap<crate::owner_state_types::InboxKey, crate::owner_state_types::InboxEntry>,
+    markers: BTreeMap<crate::owner_state_types::SpaceId, crate::owner_state_types::ReadMarker>,
+    tombstones: BTreeSet<crate::owner_state_types::SpaceId>,
+}
+
+impl From<&OwnerState> for CrdtFileV1 {
+    fn from(s: &OwnerState) -> Self {
+        Self {
+            spaces: s.spaces.clone(),
+            outbox: s.outbox.clone(),
+            inbox: s.inbox.clone(),
+            markers: s.markers.clone(),
+            tombstones: s.tombstones.clone(),
+        }
+    }
+}
+
+impl From<CrdtFileV1> for OwnerState {
+    fn from(f: CrdtFileV1) -> Self {
+        OwnerState {
+            spaces: f.spaces,
+            outbox: f.outbox,
+            inbox: f.inbox,
+            markers: f.markers,
+            tombstones: f.tombstones,
+        }
+    }
+}
+
+pub fn save_crdt(path: &Path, state: &OwnerState) -> Result<(), PersistError> {
+    let file = CrdtFileV1::from(state);
+    let mut bytes = vec![CRDT_FILE_SCHEMA_V1];
+    into_writer(&file, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
+    save_atomically(path, &bytes)
+}
+
+pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OwnerState::default()),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.is_empty() {
+        return Err(PersistError::Corrupt);
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        CRDT_FILE_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: CrdtFileV1 =
+                from_reader(&mut cursor).map_err(|e| PersistError::CborDecode(e.to_string()))?;
+            // Reject trailing bytes — defensive against truncation
+            // edge cases that decode "successfully" but stop short.
+            if (cursor.position() as usize) != payload.len() {
+                return Err(PersistError::Corrupt);
+            }
+            Ok(file.into())
+        }
+        v => Err(PersistError::UnknownSchemaVersion(v)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{
+        ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
+        SpaceId, SpaceKind, TransportBinding,
+    };
 
     #[test]
     fn save_atomically_creates_file_with_bytes() {
@@ -79,5 +160,73 @@ mod tests {
         }
 
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "alice".into(),
+        }
+    }
+
+    fn sample_state() -> OwnerState {
+        let mut s = OwnerState::default();
+        let folder = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Root".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100),
+        };
+        s.spaces.insert(folder.id, folder);
+        s.outbox.insert(
+            OutboxEntryId([7; 16]),
+            OutboxEntry {
+                id: OutboxEntryId([7; 16]),
+                space_id: SpaceId([1; 16]),
+                recipient_owners: vec![OwnerAddr([2; 16])],
+                message_cid: ContentId([3; 32]),
+                created_at: hlc(100),
+                delivered_to: Default::default(),
+                delivery_status: DeliveryStatus::Pending,
+            },
+        );
+        s.markers.insert(
+            SpaceId([1; 16]),
+            ReadMarker {
+                space_id: SpaceId([1; 16]),
+                last_read_at: hlc(150),
+            },
+        );
+        let _ = (TransportBinding::Reticulum {
+            participants: vec![],
+        },); // ensure import isn't dead
+        s
+    }
+
+    #[test]
+    fn crdt_round_trip_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        let original = sample_state();
+        save_crdt(&path, &original).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn crdt_load_missing_file_returns_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_written.cbor");
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded, OwnerState::default());
     }
 }
