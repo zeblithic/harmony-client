@@ -12,8 +12,6 @@
 //! Phase 3 (Zenoh sync) and Phase 4 (IPC) consume these types; this
 //! module has no I/O of its own.
 
-#![allow(dead_code)] // Skeleton; tasks 2-9 fill in the public surface.
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Helper: serialize byte array as CBOR bstr, not as array.
@@ -584,6 +582,12 @@ impl Space {
                 // Distinct-member check: dedupe_key() collapses members
                 // via SortedMembers, so [alice, alice] would otherwise
                 // pass len==2 here yet hash to a 1-member dedupe key.
+                // Sorted-ascending check: independently-created DM
+                // Spaces with members in different orders would produce
+                // different canonical CBOR bytes (and thus different
+                // cipher_cids) until CRDT dedup converges. Forcing
+                // sorted-ascending makes the wire format deterministic
+                // by construction.
                 let unique: BTreeSet<&OwnerAddr> = self.members.iter().collect();
                 if self.members.len() != 2 || unique.len() != 2 {
                     return Err(InvariantError(format!(
@@ -591,6 +595,11 @@ impl Space {
                         self.members.len(),
                         unique.len()
                     )));
+                }
+                if !self.members.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(InvariantError(
+                        "dm members must be sorted ascending (canonical CBOR determinism)".into(),
+                    ));
                 }
                 match &self.transport {
                     Some(TransportBinding::Reticulum { .. }) => {}
@@ -605,6 +614,12 @@ impl Space {
                         self.members.len(),
                         unique.len()
                     )));
+                }
+                if !self.members.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(InvariantError(
+                        "group-dm members must be sorted ascending (canonical CBOR determinism)"
+                            .into(),
+                    ));
                 }
                 match &self.transport {
                     Some(TransportBinding::Reticulum { .. }) => {}
@@ -997,6 +1012,66 @@ mod space_tests {
         // Distinct members still pass.
         d.members = vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])];
         assert!(d.validate_invariants().is_ok());
+    }
+
+    /// Regression for PR #73 Greptile P2: independently-created DM
+    /// Spaces with members in different orders would produce different
+    /// canonical CBOR bytes. Reject unsorted at construction time so
+    /// wire format is deterministic by construction.
+    #[test]
+    fn dm_rejects_unsorted_members() {
+        let mut d = Space {
+            id: SpaceId([2u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            // Reverse order — bob > alice but listed bob-first.
+            members: vec![OwnerAddr([2u8; 16]), OwnerAddr([1u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(d.validate_invariants().is_err());
+        // Sorted ascending passes.
+        d.members = vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])];
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn group_dm_rejects_unsorted_members() {
+        let mut g = Space {
+            id: SpaceId([3u8; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Group".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![
+                OwnerAddr([3u8; 16]),
+                OwnerAddr([1u8; 16]),
+                OwnerAddr([2u8; 16]),
+            ],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(g.validate_invariants().is_err());
+        g.members = vec![
+            OwnerAddr([1u8; 16]),
+            OwnerAddr([2u8; 16]),
+            OwnerAddr([3u8; 16]),
+        ];
+        assert!(g.validate_invariants().is_ok());
     }
 
     #[test]

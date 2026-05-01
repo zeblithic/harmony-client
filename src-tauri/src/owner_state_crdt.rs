@@ -83,8 +83,19 @@ impl OwnerState {
         //    SpaceIds could end up sharing a dedupe_key without ever
         //    going through the cross-id collision branch (step 4) and
         //    the canonicalization rewrite would be skipped entirely.
+        //    We also reject `kind` mutation outright. The dedupe_key
+        //    check catches most kind changes (e.g., Folder→DM has a
+        //    different DedupeKey shape) but not Channel↔GroupDm (both
+        //    use DedupeKey::Id(self.id) and would slip past).
         if self.spaces.contains_key(&incoming.id) {
             let existing = self.spaces.get(&incoming.id).unwrap();
+            if existing.kind != incoming.kind {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "same-SpaceId update changes kind ({:?} → {:?}) for {:?} \
+                     (kind is immutable; logical identity changes need a fresh ULID)",
+                    existing.kind, incoming.kind, incoming.id
+                )));
+            }
             let existing_dk = existing.dedupe_key();
             let merged = lww_merge_space(existing, &incoming);
             if merged.dedupe_key() != existing_dk {
@@ -424,12 +435,16 @@ mod apply_space_tests {
     #[test]
     fn dm_dedupes_by_sorted_members_regardless_of_id() {
         let mut s = OwnerState::default();
-        // Device A creates DM with id=1, members=[a, b].
+        // Device A creates DM with id=1, members=[alice, bob].
         let outcome_a = s.apply_space(dm(1, vec![1, 2], 100));
         assert_eq!(outcome_a, ApplyOutcome::Inserted);
-        // Device B creates DM with id=2, members=[b, a] — same sorted set.
-        // Should dedupe; ULID tie-break picks lexicographically smaller (id=1).
-        let outcome_b = s.apply_space(dm(2, vec![2, 1], 100));
+        // Device B independently creates the same DM with id=2 — same
+        // sorted members (the validate_invariants sorted-ascending
+        // rule means both devices necessarily construct identical
+        // member orderings, so dedupe always converges via the
+        // SortedMembers key + ULID tie-break, never via member-order
+        // reconciliation).
+        let outcome_b = s.apply_space(dm(2, vec![1, 2], 100));
         match outcome_b {
             ApplyOutcome::Merged {
                 old_id: Some(loser),
@@ -534,6 +549,66 @@ mod apply_space_tests {
         assert_eq!(stored.members.len(), 2);
         assert_eq!(stored.members[0], OwnerAddr([1; 16]));
         assert_eq!(stored.members[1], OwnerAddr([2; 16]));
+    }
+
+    /// Regression for PR #73 Greptile P2: kind mutation on the same
+    /// SpaceId must be rejected. The dedupe_key check catches most
+    /// kind changes, but Channel↔GroupDm both use `DedupeKey::Id(id)`
+    /// and would slip through dedupe_key equality alone.
+    #[test]
+    fn same_id_kind_change_rejects() {
+        let mut s = OwnerState::default();
+        // Seed a Channel.
+        let channel = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Channel,
+            parent: None,
+            community_id: Some(SpaceId([8; 16])),
+            name: "general".into(),
+            transport: Some(TransportBinding::Zenoh {
+                topic: "harmony/community/general".into(),
+            }),
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100),
+        };
+        assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
+        // Same SpaceId, kind swapped to GroupDm — dedupe_key still
+        // Id([7;16]) on both sides, so the dedupe_key check would
+        // not catch this. Explicit kind check must reject it.
+        let group_dm = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Hijacked".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), OwnerAddr([3; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(200),
+            updated_at: hlc(200),
+        };
+        let outcome = s.apply_space(group_dm);
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "expected InvariantFail on kind change, got {:?}",
+            outcome
+        );
+        // Stored Space must remain a Channel.
+        assert_eq!(
+            s.spaces.get(&SpaceId([7; 16])).unwrap().kind,
+            SpaceKind::Channel
+        );
     }
 
     /// Same-SpaceId update that does NOT touch dedupe-key fields
@@ -1197,6 +1272,47 @@ mod crypto_integration_tests {
         let recovered_cleartext = decrypt_entry(&kt, &lookup, &blob).expect("decrypt");
         let recovered: OutboxEntry = canonical_cbor_decode(&recovered_cleartext).expect("decode");
         assert_eq!(recovered, entry);
+    }
+
+    /// Regression for PR #73 Greptile P2: DM Spaces carry non-empty
+    /// `members`. The sorted-ascending invariant ensures two devices
+    /// constructing the same DM produce byte-identical canonical CBOR
+    /// (and thus identical cipher_cids) without waiting on CRDT dedup
+    /// to converge them.
+    #[test]
+    fn dm_with_members_yields_identical_cipher_cid_across_devices() {
+        let dm = Space {
+            id: SpaceId([42; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            // Sorted ascending — required by validate_invariants.
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100),
+        };
+        // Sanity: invariant check must pass for a well-formed DM.
+        dm.validate_invariants().expect("DM invariants");
+
+        let cleartext = canonical_cbor_encode(&dm).expect("encode");
+        let master = [55u8; 32];
+        let kt_a = KeyTree::derive(&master).expect("derive a");
+        let kt_b = KeyTree::derive(&master).expect("derive b");
+        let lookup_a = space_lookup_key(&kt_a, b"dm-space-id");
+        let lookup_b = space_lookup_key(&kt_b, b"dm-space-id");
+        let blob_a = encrypt_entry(&kt_a, &lookup_a, &cleartext).expect("encrypt a");
+        let blob_b = encrypt_entry(&kt_b, &lookup_b, &cleartext).expect("encrypt b");
+        assert_eq!(blob_a, blob_b);
+        let cid_a = blake3::hash(&blob_a);
+        let cid_b = blake3::hash(&blob_b);
+        assert_eq!(cid_a.as_bytes(), cid_b.as_bytes());
     }
 
     #[test]
