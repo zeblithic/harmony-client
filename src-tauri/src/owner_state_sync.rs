@@ -196,8 +196,10 @@ async fn internal_task(mut ctx: InternalCtx) {
                 let result = publish_root_now(&ctx).await;
                 let _ = resp_tx.send(result);
             }
-            Some(_bytes) = ctx.subscriber_rx.recv() => {
-                // Tasks 13-15 fill in receive handling.
+            Some(bytes) = ctx.subscriber_rx.recv() => {
+                if let Err(e) = handle_incoming_publish(&mut ctx, bytes).await {
+                    tracing::warn!(error = %e, "incoming publish dropped");
+                }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 // Flush only if there is genuinely unpublished dirty state.
@@ -212,7 +214,8 @@ async fn internal_task(mut ctx: InternalCtx) {
 }
 
 use crate::owner_state_crypto::{
-    canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key,
+    canonical_cbor_decode, canonical_cbor_encode, decrypt_root_publish, encrypt_entry,
+    encrypt_root_publish, space_lookup_key,
 };
 use crate::owner_state_types::{ContentId, RootPublishPayload};
 
@@ -293,6 +296,32 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     };
     tracker.insert(ctx.device_id.clone(), now.clone());
     now
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result<(), SyncError> {
+    // 1. Decrypt the Zenoh wire payload.
+    let payload_bytes =
+        decrypt_root_publish(&ctx.kt, &wire).map_err(|e| SyncError::Crypto(e.to_string()))?;
+    let payload: RootPublishPayload =
+        canonical_cbor_decode(&payload_bytes).map_err(|e| SyncError::CborDecode(e.to_string()))?;
+
+    // 2. Replay protection.
+    {
+        let mut tracker = ctx.tracker.lock().await;
+        let accept = match tracker.get(&payload.at.device_id) {
+            None => true,
+            Some(existing) => payload.at.is_strictly_newer_than(existing),
+        };
+        if !accept {
+            return Ok(());
+        }
+        tracker.insert(payload.at.device_id.clone(), payload.at.clone());
+    }
+
+    // 3. Fetch + merge — Tasks 14-15 fill in.
+    let _root_cid = payload.root_cid;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -513,6 +542,149 @@ mod skeleton_tests {
         );
         engine.shutdown().await;
         // No assertions beyond "didn't hang or panic."
+    }
+}
+
+#[cfg(test)]
+mod subscriber_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_crypto::{
+        canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key,
+    };
+    use crate::owner_state_types::RootPublishPayload;
+    use std::time::Duration;
+
+    fn make_kt() -> Arc<KeyTree> {
+        Arc::new(KeyTree::derive(&[7u8; 32]).expect("kt"))
+    }
+
+    fn paths() -> (tempfile::TempDir, PersistPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PersistPaths {
+            crdt: dir.path().join("crdt.cbor"),
+            replay: dir.path().join("replay.cbor"),
+        };
+        (dir, paths)
+    }
+
+    /// Build a wire payload for testing — re-uses the publisher's
+    /// encryption path but with a controlled HLC.
+    fn make_wire(
+        kt: &Arc<KeyTree>,
+        store: &Arc<dyn ContentStore>,
+        state: &OwnerState,
+        device_id: &str,
+        wall_ms: u64,
+        logical: u32,
+    ) -> Vec<u8> {
+        let blob_cleartext = canonical_cbor_encode(state).unwrap();
+        let lookup = space_lookup_key(kt, b"owner-state-root-blob-v1");
+        let blob_ciphertext = encrypt_entry(kt, &lookup, &blob_cleartext).unwrap();
+        let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
+        store.put(root_cid, blob_ciphertext).unwrap();
+        let payload = RootPublishPayload {
+            root_cid,
+            at: Hlc {
+                wall_ms,
+                logical,
+                device_id: device_id.into(),
+            },
+        };
+        let payload_bytes = canonical_cbor_encode(&payload).unwrap();
+        encrypt_root_publish(kt, &payload_bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscriber_accepts_strictly_newer_hlc_and_updates_tracker() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000, // long debounce — keep self-publishes out of the way
+        );
+
+        let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0);
+        sub_tx.send(wire).await.unwrap();
+        // Give the subscriber branch a moment to process.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let t = tracker.lock().await;
+        let stored = t.get("peer-bob").expect("peer accepted");
+        assert_eq!(stored.wall_ms, 1000);
+        assert_eq!(stored.logical, 0);
+        drop(t);
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_rejects_strictly_older_hlc() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        // First publish: at=2000.
+        sub_tx
+            .send(make_wire(
+                &kt,
+                &store,
+                &OwnerState::default(),
+                "peer-bob",
+                2000,
+                0,
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Replay: at=1000 (older). Tracker must NOT regress.
+        sub_tx
+            .send(make_wire(
+                &kt,
+                &store,
+                &OwnerState::default(),
+                "peer-bob",
+                1000,
+                0,
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let t = tracker.lock().await;
+        let stored = t.get("peer-bob").expect("still present");
+        assert_eq!(stored.wall_ms, 2000, "tracker must not regress");
+        drop(t);
+
+        engine.shutdown().await;
     }
 }
 
