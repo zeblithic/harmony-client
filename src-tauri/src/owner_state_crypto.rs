@@ -14,6 +14,8 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
+pub use crate::owner_state_types::Hlc;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("HKDF expand failed: {0}")]
@@ -306,32 +308,6 @@ impl RootReplayTracker {
     }
 }
 
-/// Hybrid Logical Clock. Mirrors the type defined in the ZEB-206 spec.
-///
-/// Phase 2 of ZEB-215 will move this to a shared types module; Phase 1
-/// keeps it here so the crypto module is self-contained for testing.
-///
-/// **Wire format:** serialized as a CBOR map with single-char field
-/// names (`w`/`l`/`d`) so all three keys have the same encoded length
-/// (1-byte CBOR length prefix + 1 ASCII byte). This satisfies the
-/// `canonical_cbor_encode` "all keys same encoded length" precondition
-/// — without the renames, `wall_ms` (7) / `logical` (7) / `device_id`
-/// (9) would mix encoded-length 8/8/10, silently violating the
-/// invariant every other type relies on. The rename also keeps the
-/// wire form ~22 bytes smaller per Hlc, which matters because every
-/// state-root-publish payload carries one. Locked in by the
-/// `hlc_cbor_uses_single_char_field_names_per_canonical_precondition`
-/// regression test.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Hlc {
-    #[serde(rename = "w")]
-    pub wall_ms: u64,
-    #[serde(rename = "l")]
-    pub logical: u32,
-    #[serde(rename = "d")]
-    pub device_id: String,
-}
-
 /// Deterministic CBOR encoder for the owner-state crypto surface.
 ///
 /// **Contract (current scope — Phase 1):** produces byte-identical output
@@ -401,18 +377,6 @@ pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
         )));
     }
     Ok(value)
-}
-
-impl Hlc {
-    /// Lexicographic ordering on `(wall_ms, logical, device_id)`.
-    ///
-    /// Per ZEB-211 round-5: integers compared numerically; `device_id`
-    /// compared bytewise (the `String` Ord impl provides this for UTF-8).
-    /// Replay-protection check uses `self.is_strictly_newer_than(&last_accepted)`.
-    pub fn is_strictly_newer_than(&self, other: &Hlc) -> bool {
-        (self.wall_ms, self.logical, self.device_id.as_str())
-            > (other.wall_ms, other.logical, other.device_id.as_str())
-    }
 }
 
 #[cfg(test)]
