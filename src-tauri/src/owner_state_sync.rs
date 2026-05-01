@@ -1078,3 +1078,214 @@ mod publisher_tests {
         engine.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding};
+    use std::time::Duration;
+
+    fn make_kt(seed: u8) -> Arc<KeyTree> {
+        Arc::new(KeyTree::derive(&[seed; 32]).expect("kt"))
+    }
+
+    fn paths(name: &str, dir: &tempfile::TempDir) -> PersistPaths {
+        PersistPaths {
+            crdt: dir.path().join(format!("{}_crdt.cbor", name)),
+            replay: dir.path().join(format!("{}_replay.cbor", name)),
+        }
+    }
+
+    fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        let mut sorted = members.clone();
+        sorted.sort();
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: sorted.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: ts,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: ts,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        }
+    }
+
+    /// Two SyncEngines share one InMemoryStub. A's publish flows to B
+    /// via the cross-wired channels. Senders are stored to keep the
+    /// forwarding tasks alive; they're not used directly so the
+    /// `_`-prefix silences dead-code warnings.
+    struct TwoDevices {
+        a_engine: SyncEngine,
+        b_engine: SyncEngine,
+        a_state: Arc<Mutex<OwnerState>>,
+        b_state: Arc<Mutex<OwnerState>>,
+        _a_to_b_tx: mpsc::Sender<Vec<u8>>,
+        _b_to_a_tx: mpsc::Sender<Vec<u8>>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn spawn_two_devices(kt_seed: u8) -> TwoDevices {
+        let dir = tempfile::tempdir().unwrap();
+        let kt = make_kt(kt_seed);
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let a_state = Arc::new(Mutex::new(OwnerState::default()));
+        let b_state = Arc::new(Mutex::new(OwnerState::default()));
+        let a_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let b_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+
+        // A publishes → forwards into B's subscriber.
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (a_to_b_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        // Forwarding task: drain A's outbox into B's inbox.
+        let a_to_b_forwarder = a_to_b_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = a_pub_rx.recv().await {
+                let _ = a_to_b_forwarder.send(bytes).await;
+            }
+        });
+
+        // B publishes → forwards into A's subscriber.
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_to_a_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let b_to_a_forwarder = b_to_a_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = b_pub_rx.recv().await {
+                let _ = b_to_a_forwarder.send(bytes).await;
+            }
+        });
+
+        let a_engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "device-a".into(),
+            Arc::clone(&a_state),
+            a_tracker,
+            Arc::clone(&store),
+            a_pub_tx,
+            a_sub_rx,
+            paths("a", &dir),
+            50,
+        );
+        let b_engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "device-b".into(),
+            Arc::clone(&b_state),
+            b_tracker,
+            Arc::clone(&store),
+            b_pub_tx,
+            b_sub_rx,
+            paths("b", &dir),
+            50,
+        );
+
+        TwoDevices {
+            a_engine,
+            b_engine,
+            a_state,
+            b_state,
+            _a_to_b_tx: a_to_b_tx,
+            _b_to_a_tx: b_to_a_tx,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_way_convergence() {
+        let dev = spawn_two_devices(123);
+        // A applies a folder.
+        let f = dm(1, vec![1, 2], 100);
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_space_with_canonicalization(f.clone());
+        }
+        dev.a_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let b = dev.b_state.lock().await;
+        assert!(b.spaces.contains_key(&SpaceId([1; 16])));
+        drop(b);
+
+        dev.a_engine.shutdown().await;
+        dev.b_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bidirectional_convergence() {
+        let dev = spawn_two_devices(45);
+        let dm_ab = dm(1, vec![1, 2], 100);
+        let dm_cd = dm(2, vec![3, 4], 100);
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_space_with_canonicalization(dm_ab);
+        }
+        {
+            let mut b = dev.b_state.lock().await;
+            b.apply_space_with_canonicalization(dm_cd);
+        }
+        dev.a_engine.notify_dirty();
+        dev.b_engine.notify_dirty();
+        // Multiple debounce cycles to converge.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let a = dev.a_state.lock().await;
+        let b = dev.b_state.lock().await;
+        assert!(a.spaces.contains_key(&SpaceId([1; 16])));
+        assert!(a.spaces.contains_key(&SpaceId([2; 16])));
+        assert!(b.spaces.contains_key(&SpaceId([1; 16])));
+        assert!(b.spaces.contains_key(&SpaceId([2; 16])));
+        drop(a);
+        drop(b);
+
+        dev.a_engine.shutdown().await;
+        dev.b_engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cross_device_dedupe_through_sync() {
+        // A and B independently create the same DM with different
+        // ULIDs but the same sorted-members. After sync, both
+        // converge on the smaller ULID.
+        let dev = spawn_two_devices(7);
+        let a_dm = dm(5, vec![1, 2], 100); // larger ULID — loser
+        let b_dm = dm(1, vec![1, 2], 100); // smaller ULID — winner
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_space_with_canonicalization(a_dm);
+        }
+        {
+            let mut b = dev.b_state.lock().await;
+            b.apply_space_with_canonicalization(b_dm);
+        }
+        dev.a_engine.notify_dirty();
+        dev.b_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let a = dev.a_state.lock().await;
+        let b = dev.b_state.lock().await;
+        // Both must agree on the winner SpaceId(1) and have lost SpaceId(5).
+        assert!(a.spaces.contains_key(&SpaceId([1; 16])));
+        assert!(!a.spaces.contains_key(&SpaceId([5; 16])));
+        assert!(b.spaces.contains_key(&SpaceId([1; 16])));
+        assert!(!b.spaces.contains_key(&SpaceId([5; 16])));
+        drop(a);
+        drop(b);
+
+        dev.a_engine.shutdown().await;
+        dev.b_engine.shutdown().await;
+    }
+}
