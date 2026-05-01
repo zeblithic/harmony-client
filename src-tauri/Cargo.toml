@@ -62,6 +62,7 @@ hmac = "0.12"
 sha2 = "0.10"
 async-trait = "0.1"
 thiserror = "1"
+tempfile = "3"
 
 [dev-dependencies]
 serial_test = "3"
