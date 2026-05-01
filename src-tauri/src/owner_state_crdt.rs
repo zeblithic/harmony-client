@@ -801,3 +801,128 @@ mod canonicalization_tests {
         assert_eq!(entry.space_id, SpaceId([1; 16]));
     }
 }
+
+#[cfg(test)]
+mod crypto_integration_tests {
+    use super::*;
+    use crate::owner_state_crypto::{
+        canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, encrypt_entry,
+        space_lookup_key, KeyTree,
+    };
+    use crate::owner_state_types::{
+        ContentId, DeliveryStatus, Hlc, NotificationPref, OutboxEntry, OutboxEntryId, OwnerAddr,
+        SpaceKind, TransportBinding,
+    };
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "alice".into(),
+        }
+    }
+
+    fn sample_space() -> Space {
+        Space {
+            id: SpaceId([42; 16]),
+            kind: SpaceKind::Channel,
+            parent: Some(SpaceId([1; 16])),
+            community_id: Some(SpaceId([2; 16])),
+            name: "general".into(),
+            transport: Some(TransportBinding::Zenoh {
+                topic: "harmony/community/2/general".into(),
+            }),
+            members: vec![],
+            custom_name: Some("My #general".into()),
+            notification_pref: Some(NotificationPref::Mentions),
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100),
+        }
+    }
+
+    #[test]
+    fn space_round_trip_through_phase1_crypto() {
+        // 1. Canonical-CBOR encode the Space.
+        let space = sample_space();
+        let cleartext = canonical_cbor_encode(&space).expect("encode");
+
+        // 2. Derive lookup key + encrypt with Phase 1 crypto.
+        let kt = KeyTree::derive(&[0u8; 32]).expect("derive");
+        let lookup = space_lookup_key(&kt, b"some-space-id");
+        let blob = encrypt_entry(&kt, &lookup, &cleartext).expect("encrypt");
+
+        // 3. Compute cipher_cid (BLAKE3 of the storage blob — what
+        //    harmony-content would index by).
+        let _cipher_cid = blake3::hash(&blob);
+
+        // 4. Decrypt with the same lookup key → recover cleartext.
+        let recovered_cleartext = decrypt_entry(&kt, &lookup, &blob).expect("decrypt");
+        assert_eq!(recovered_cleartext, cleartext);
+
+        // 5. Canonical-CBOR decode → recover the Space.
+        let recovered: Space = canonical_cbor_decode(&recovered_cleartext).expect("decode");
+        assert_eq!(recovered, space);
+    }
+
+    #[test]
+    fn cross_encoder_determinism_gate() {
+        // ZEB-211 spec §Verification gates: encode the same Space 100
+        // times; assert byte-identical output. Catches non-determinism
+        // in serde_derive / ciborium output for the actual Phase 2
+        // type universe.
+        let space = sample_space();
+        let baseline = canonical_cbor_encode(&space).expect("baseline");
+        for _ in 0..100 {
+            let bytes = canonical_cbor_encode(&space).expect("repeat");
+            assert_eq!(bytes, baseline, "non-deterministic CBOR for Space");
+        }
+    }
+
+    #[test]
+    fn outbox_entry_round_trip_through_phase1_crypto() {
+        // Same as space_round_trip but for OutboxEntry — exercises
+        // BTreeSet<OwnerAddr> serialization through canonical CBOR.
+        let entry = OutboxEntry {
+            id: OutboxEntryId([7; 16]),
+            space_id: SpaceId([8; 16]),
+            recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            message_cid: ContentId([3; 32]),
+            created_at: hlc(100),
+            delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
+            delivery_status: DeliveryStatus::Partial,
+        };
+        let cleartext = canonical_cbor_encode(&entry).expect("encode");
+        let kt = KeyTree::derive(&[1u8; 32]).expect("derive");
+        let lookup = space_lookup_key(&kt, b"outbox-entry-test");
+        let blob = encrypt_entry(&kt, &lookup, &cleartext).expect("encrypt");
+        let recovered_cleartext = decrypt_entry(&kt, &lookup, &blob).expect("decrypt");
+        let recovered: OutboxEntry = canonical_cbor_decode(&recovered_cleartext).expect("decode");
+        assert_eq!(recovered, entry);
+    }
+
+    #[test]
+    fn two_bound_devices_produce_identical_cipher_cid_for_same_space() {
+        // The CRDT convergence property the whole ZEB-211 spec hangs on:
+        // two devices encrypting the same Space (same master seed) MUST
+        // produce identical cipher_cids, otherwise the CRDT treats them
+        // as conflicting writes.
+        let space = sample_space();
+        let cleartext = canonical_cbor_encode(&space).expect("encode");
+        let master = [99u8; 32];
+        let kt_a = KeyTree::derive(&master).expect("derive a");
+        let kt_b = KeyTree::derive(&master).expect("derive b");
+        let lookup_a = space_lookup_key(&kt_a, b"the-space-id");
+        let lookup_b = space_lookup_key(&kt_b, b"the-space-id");
+        assert_eq!(lookup_a, lookup_b);
+        let blob_a = encrypt_entry(&kt_a, &lookup_a, &cleartext).expect("encrypt a");
+        let blob_b = encrypt_entry(&kt_b, &lookup_b, &cleartext).expect("encrypt b");
+        assert_eq!(
+            blob_a, blob_b,
+            "deterministic encryption across bound devices"
+        );
+        let cid_a = blake3::hash(&blob_a);
+        let cid_b = blake3::hash(&blob_b);
+        assert_eq!(cid_a.as_bytes(), cid_b.as_bytes());
+    }
+}
