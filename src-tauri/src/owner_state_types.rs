@@ -57,20 +57,11 @@ where
             Ok(arr)
         }
 
-        fn visit_seq<A>(self, mut seq: A) -> Result<[u8; N], A::Error>
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<[u8; N], E>
         where
-            A: serde::de::SeqAccess<'de>,
+            E: serde::de::Error,
         {
-            let mut arr = [0u8; N];
-            for elem in &mut arr {
-                *elem = seq
-                    .next_element::<u8>()?
-                    .ok_or_else(|| serde::de::Error::custom("sequence too short"))?;
-            }
-            if seq.next_element::<u8>()?.is_some() {
-                return Err(serde::de::Error::custom("sequence too long"));
-            }
-            Ok(arr)
+            self.visit_bytes(&v)
         }
     }
 
@@ -106,95 +97,47 @@ impl Hlc {
 
 /// 16-byte ULID-shaped identifier for Spaces. Stored on the wire as
 /// `bstr(16)` (17 encoded bytes incl. CBOR length byte).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SpaceId(pub [u8; 16]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SpaceId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 /// 16-byte truncated owner address (matches harmony-identity's
 /// `ADDRESS_HASH_LENGTH = 16`). Stored as `bstr(16)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OwnerAddr(pub [u8; 16]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OwnerAddr(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 /// 32-byte BLAKE3 content identifier (matches harmony-content CID size).
 /// Stored as `bstr(32)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContentId(pub [u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ContentId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 32],
+);
 
 /// 16-byte ULID for OutboxEntry IDs. Wire-shape identical to SpaceId
 /// but the type distinction prevents accidental swaps at call sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OutboxEntryId(pub [u8; 16]);
-
-impl Serialize for SpaceId {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serialize_bytes_as_bstr(&self.0, s)
-    }
-}
-
-impl<'de> Deserialize<'de> for SpaceId {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_bytes_from_bstr(d).map(SpaceId)
-    }
-}
-
-impl Serialize for OwnerAddr {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serialize_bytes_as_bstr(&self.0, s)
-    }
-}
-
-impl<'de> Deserialize<'de> for OwnerAddr {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_bytes_from_bstr(d).map(OwnerAddr)
-    }
-}
-
-impl Serialize for ContentId {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serialize_bytes_as_bstr(&self.0, s)
-    }
-}
-
-impl<'de> Deserialize<'de> for ContentId {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_bytes_from_bstr(d).map(ContentId)
-    }
-}
-
-impl Serialize for OutboxEntryId {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serialize_bytes_as_bstr(&self.0, s)
-    }
-}
-
-impl<'de> Deserialize<'de> for OutboxEntryId {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_bytes_from_bstr(d).map(OutboxEntryId)
-    }
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OutboxEntryId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 #[cfg(test)]
 mod hlc_tests {
@@ -279,5 +222,40 @@ mod newtype_tests {
         b_bytes[15] = 1;
         let b = SpaceId(b_bytes);
         assert!(a < b);
+    }
+
+    #[test]
+    fn owner_addr_round_trip() {
+        let a = OwnerAddr([0xab; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&a, &mut bytes).unwrap();
+        let recovered: OwnerAddr = from_reader(&bytes[..]).unwrap();
+        assert_eq!(a, recovered);
+        // Wire shape is bstr(16): 17 bytes total, first byte 0x50.
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x50);
+    }
+
+    #[test]
+    fn outbox_entry_id_round_trip() {
+        let oid = OutboxEntryId([0xcd; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&oid, &mut bytes).unwrap();
+        let recovered: OutboxEntryId = from_reader(&bytes[..]).unwrap();
+        assert_eq!(oid, recovered);
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x50);
+    }
+
+    #[test]
+    fn content_id_round_trip() {
+        let c = ContentId([0xef; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&c, &mut bytes).unwrap();
+        let recovered: ContentId = from_reader(&bytes[..]).unwrap();
+        assert_eq!(c, recovered);
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(bytes[1], 0x20);
     }
 }
