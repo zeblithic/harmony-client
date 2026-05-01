@@ -532,6 +532,134 @@ impl Space {
     }
 }
 
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryStatus {
+    #[serde(rename = "p")]
+    Pending,
+    #[serde(rename = "r")]
+    Partial,
+    #[serde(rename = "c")]
+    Complete,
+    #[serde(rename = "x")]
+    Expired,
+}
+
+/// OutboxEntry — persistent sent-DM log entry.
+///
+/// Wire-format note: 7 fields, all 2-char renames, same-length-keys
+/// satisfied. `delivered_to` is `BTreeSet` so canonical CBOR encoding
+/// is deterministic (BTreeSet serializes in `K::Ord` order which is
+/// bytewise for `OwnerAddr` since it's a `bstr(16)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxEntry {
+    #[serde(rename = "id")]
+    pub id: OutboxEntryId,
+    #[serde(rename = "sp")]
+    pub space_id: SpaceId,
+    #[serde(rename = "rc")]
+    pub recipient_owners: Vec<OwnerAddr>,
+    #[serde(rename = "mc")]
+    pub message_cid: ContentId,
+    #[serde(rename = "ca")]
+    pub created_at: Hlc,
+    #[serde(rename = "dl")]
+    pub delivered_to: BTreeSet<OwnerAddr>,
+    #[serde(rename = "ds")]
+    pub delivery_status: DeliveryStatus,
+}
+
+impl OutboxEntry {
+    /// Compute the delivery_status that *should* hold given the current
+    /// `delivered_to` set + recipient list + the optional 30-day-expired
+    /// flag from the caller (Phase 3 owns the wall-clock; Phase 2 just
+    /// reflects the state).
+    ///
+    /// Rules (ZEB-206 spec):
+    /// - `Pending` → no acks yet (`delivered_to` empty)
+    /// - `Partial` → some recipients acked, others outstanding
+    /// - `Complete` → all `recipient_owners` are in `delivered_to`
+    /// - `Expired` → `is_expired` flag set AND at least one recipient
+    ///   not in `delivered_to`
+    pub fn compute_status(&self, is_expired: bool) -> DeliveryStatus {
+        let recipients_in_set: BTreeSet<&OwnerAddr> = self.recipient_owners.iter().collect();
+        let all_acked = recipients_in_set
+            .iter()
+            .all(|r| self.delivered_to.contains(*r));
+        if all_acked {
+            DeliveryStatus::Complete
+        } else if is_expired {
+            DeliveryStatus::Expired
+        } else if self.delivered_to.is_empty() {
+            DeliveryStatus::Pending
+        } else {
+            DeliveryStatus::Partial
+        }
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn entry(recipients: Vec<u8>, delivered: Vec<u8>) -> OutboxEntry {
+        OutboxEntry {
+            id: OutboxEntryId([1u8; 16]),
+            space_id: SpaceId([2u8; 16]),
+            recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            message_cid: ContentId([3u8; 32]),
+            created_at: hlc(100),
+            delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            delivery_status: DeliveryStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn status_pending_when_no_acks() {
+        let e = entry(vec![1, 2, 3], vec![]);
+        assert_eq!(e.compute_status(false), DeliveryStatus::Pending);
+    }
+
+    #[test]
+    fn status_partial_when_some_acked() {
+        let e = entry(vec![1, 2, 3], vec![1]);
+        assert_eq!(e.compute_status(false), DeliveryStatus::Partial);
+    }
+
+    #[test]
+    fn status_complete_when_all_acked() {
+        let e = entry(vec![1, 2, 3], vec![1, 2, 3]);
+        assert_eq!(e.compute_status(false), DeliveryStatus::Complete);
+    }
+
+    #[test]
+    fn status_expired_only_when_partial_and_flag_set() {
+        let e = entry(vec![1, 2, 3], vec![1]);
+        assert_eq!(e.compute_status(true), DeliveryStatus::Expired);
+        // Complete trumps expired.
+        let done = entry(vec![1, 2, 3], vec![1, 2, 3]);
+        assert_eq!(done.compute_status(true), DeliveryStatus::Complete);
+    }
+
+    #[test]
+    fn outbox_entry_round_trip() {
+        let e = entry(vec![1, 2, 3], vec![1]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&e, &mut bytes).unwrap();
+        let recovered: OutboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(e, recovered);
+    }
+}
+
 #[cfg(test)]
 mod space_tests {
     use super::*;
