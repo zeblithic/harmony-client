@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, ReadMarker, Space,
-    SpaceId,
+    DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, OwnerAddr,
+    ReadMarker, Space, SpaceId,
 };
 
 /// In-memory owner-state CRDT store. Phase 3 wraps this in persistence +
@@ -161,6 +161,22 @@ impl OwnerState {
     /// both sets and `delivery_status` recomputes from the union.
     /// OutboxEntries are NEVER GC'd in v1 — chat history.
     pub fn apply_outbox(&mut self, incoming: OutboxEntry) -> ApplyOutcome {
+        // Validate that every ack in delivered_to is for an actual
+        // recipient. A non-recipient ack inflates the set, has no
+        // semantic meaning, and would persist on the wire — reject
+        // rather than silently filter so the divergence is surfaced.
+        let recipient_set: BTreeSet<&OwnerAddr> = incoming.recipient_owners.iter().collect();
+        if !incoming
+            .delivered_to
+            .iter()
+            .all(|o| recipient_set.contains(o))
+        {
+            return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                "OutboxEntry {:?} has delivered_to entry not in recipient_owners",
+                incoming.id
+            )));
+        }
+
         match self.outbox.get(&incoming.id) {
             None => {
                 let mut entry = incoming;
@@ -177,6 +193,26 @@ impl OwnerState {
                 ApplyOutcome::Inserted
             }
             Some(existing) => {
+                // Envelope immutability: same OutboxEntryId means same
+                // logical message, so space_id/message_cid/recipient_owners/
+                // created_at MUST match. A divergence implies ULID
+                // collision, replay attack, or buggy peer — reject
+                // rather than silently overwriting (existing wins) so
+                // the operator sees the divergence. The incoming
+                // delivered_to set could legitimately differ; that's
+                // what we union below.
+                if existing.space_id != incoming.space_id
+                    || existing.message_cid != incoming.message_cid
+                    || existing.recipient_owners != incoming.recipient_owners
+                    || existing.created_at != incoming.created_at
+                {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "OutboxEntry {:?} envelope mismatch (space_id/message_cid/\
+                         recipient_owners/created_at must be immutable across \
+                         merges; same OutboxEntryId implies same logical message)",
+                        incoming.id
+                    )));
+                }
                 let mut merged = existing.clone();
                 merged
                     .delivered_to
@@ -787,6 +823,111 @@ mod apply_outbox_tests {
         s.apply_outbox(entry(1, vec![10], vec![]));
         s.apply_outbox(entry(2, vec![20], vec![]));
         assert_eq!(s.outbox.len(), 2);
+    }
+
+    /// Regression for PR #73 round 4 review: an OutboxEntry whose
+    /// `delivered_to` set contains an owner not in `recipient_owners`
+    /// is malformed — a non-recipient ack inflates state with
+    /// meaningless data. Reject at insert time.
+    #[test]
+    fn insert_rejects_delivered_to_with_non_recipient() {
+        let mut s = OwnerState::default();
+        // Recipients: [10, 20]; delivered_to includes 99 — not a recipient.
+        let outcome = s.apply_outbox(entry(1, vec![10, 20], vec![10, 99]));
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "expected InvariantFail, got {:?}",
+            outcome
+        );
+        assert!(s.outbox.is_empty());
+    }
+
+    /// Same rule applies on the merge path — incoming.delivered_to
+    /// must also be a subset of recipient_owners.
+    #[test]
+    fn merge_rejects_delivered_to_with_non_recipient() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        // Incoming has the same envelope but a stray 99 in delivered_to.
+        let outcome = s.apply_outbox(entry(1, vec![10, 20], vec![99]));
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "expected InvariantFail, got {:?}",
+            outcome
+        );
+        // Existing entry must be unchanged (no stray ack added).
+        let stored = s.outbox.get(&OutboxEntryId([1; 16])).unwrap();
+        assert_eq!(stored.delivered_to.len(), 1);
+        assert!(stored.delivered_to.contains(&OwnerAddr([10; 16])));
+    }
+
+    /// Envelope immutability: same OutboxEntryId must mean same
+    /// logical message. A merge with diverging space_id implies
+    /// ULID collision, replay attack, or a buggy peer — reject.
+    #[test]
+    fn merge_rejects_space_id_divergence() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        let mut diverged = entry(1, vec![10, 20], vec![20]);
+        diverged.space_id = SpaceId([99; 16]); // different space
+        let outcome = s.apply_outbox(diverged);
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "expected InvariantFail, got {:?}",
+            outcome
+        );
+        // Existing entry must remain on its original space_id.
+        assert_eq!(
+            s.outbox.get(&OutboxEntryId([1; 16])).unwrap().space_id,
+            SpaceId([1; 16])
+        );
+    }
+
+    #[test]
+    fn merge_rejects_message_cid_divergence() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        let mut diverged = entry(1, vec![10, 20], vec![20]);
+        diverged.message_cid = ContentId([99; 32]);
+        let outcome = s.apply_outbox(diverged);
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+        ));
+    }
+
+    #[test]
+    fn merge_rejects_recipient_owners_divergence() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        // Same id but a different recipient set — implies ULID collision.
+        let outcome = s.apply_outbox(entry(1, vec![10, 30], vec![10]));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+        ));
+    }
+
+    #[test]
+    fn merge_rejects_created_at_divergence() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        let mut diverged = entry(1, vec![10, 20], vec![20]);
+        diverged.created_at = hlc(999);
+        let outcome = s.apply_outbox(diverged);
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+        ));
     }
 }
 
