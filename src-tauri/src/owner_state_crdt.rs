@@ -52,7 +52,14 @@ pub enum RejectionReason {
 impl OwnerState {
     /// Apply an incoming Space to the CRDT, handling per-kind dedupe,
     /// LWW field merge, ULID tie-break, and tombstone rejection.
-    pub fn apply_space(&mut self, incoming: Space) -> ApplyOutcome {
+    ///
+    /// Crate-private: a cross-SpaceId dedupe through this method
+    /// removes the loser Space but does NOT rewrite outbox / inbox /
+    /// markers. External callers (Phase 3 sync, Tauri IPC) must use
+    /// [`Self::apply_space_with_canonicalization`] which leaves
+    /// OwnerState internally consistent. Internal tests can still
+    /// reach this directly when they don't care about dependent records.
+    pub(crate) fn apply_space(&mut self, incoming: Space) -> ApplyOutcome {
         // 1. Invariant check — reject malformed Spaces before touching state.
         if let Err(e) = incoming.validate_invariants() {
             return ApplyOutcome::Rejected(RejectionReason::InvariantFail(e.0));
@@ -96,9 +103,16 @@ impl OwnerState {
                     existing.kind, incoming.kind, incoming.id
                 )));
             }
+            // Reject any structural divergence on dedupe-key fields
+            // before LWW. We check incoming.dedupe_key() directly
+            // rather than the merged result: if we waited until after
+            // lww_merge_space, an incoming with different DM members
+            // but older HLC would silently lose those bad members to
+            // existing's via LWW and the rejection would never fire.
+            // Rejecting on incoming's own dedupe_key catches both
+            // cases (LWW winner OR loser).
             let existing_dk = existing.dedupe_key();
-            let merged = lww_merge_space(existing, &incoming);
-            if merged.dedupe_key() != existing_dk {
+            if incoming.dedupe_key() != existing_dk {
                 return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                     "same-SpaceId update would change dedupe_key for {:?} \
                      (DM members or PublicChannel topic are immutable on \
@@ -106,6 +120,7 @@ impl OwnerState {
                     incoming.id
                 )));
             }
+            let merged = lww_merge_space(existing, &incoming);
             self.spaces.insert(incoming.id, merged);
             return ApplyOutcome::Merged { old_id: None };
         }
@@ -194,20 +209,30 @@ impl OwnerState {
             }
             Some(existing) => {
                 // Envelope immutability: same OutboxEntryId means same
-                // logical message, so space_id/message_cid/recipient_owners/
+                // logical message, so message_cid/recipient_owners/
                 // created_at MUST match. A divergence implies ULID
                 // collision, replay attack, or buggy peer — reject
                 // rather than silently overwriting (existing wins) so
-                // the operator sees the divergence. The incoming
+                // the operator sees the divergence.
+                //
+                // space_id is intentionally NOT in this check.
+                // canonicalize_dependent_space_ids rewrites stored
+                // outbox space_ids when a Space dedupe collapses two
+                // SpaceIds into one. A peer that hasn't yet learned
+                // about that dedupe may still send acks referencing
+                // the original (loser) space_id; we keep existing's
+                // space_id (already canonicalized) and merge the
+                // delivered_to set. message_cid (a content hash) and
+                // recipients/created_at (immutable per logical
+                // message) remain the strong identity signal. The
                 // delivered_to set could legitimately differ; that's
                 // what we union below.
-                if existing.space_id != incoming.space_id
-                    || existing.message_cid != incoming.message_cid
+                if existing.message_cid != incoming.message_cid
                     || existing.recipient_owners != incoming.recipient_owners
                     || existing.created_at != incoming.created_at
                 {
                     return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
-                        "OutboxEntry {:?} envelope mismatch (space_id/message_cid/\
+                        "OutboxEntry {:?} envelope mismatch (message_cid/\
                          recipient_owners/created_at must be immutable across \
                          merges; same OutboxEntryId implies same logical message)",
                         incoming.id
@@ -868,28 +893,28 @@ mod apply_outbox_tests {
     }
 
     /// Envelope immutability: same OutboxEntryId must mean same
-    /// logical message. A merge with diverging space_id implies
-    /// ULID collision, replay attack, or a buggy peer — reject.
+    /// logical message for the immutable identity fields. space_id
+    /// is intentionally excluded because canonicalize_dependent_
+    /// space_ids can rewrite it (Space dedupe collapses two SpaceIds
+    /// into one), and a peer that hasn't yet learned about the
+    /// dedupe may still send acks referencing the loser space_id —
+    /// we accept the merge and preserve existing's (canonicalized)
+    /// space_id while unioning the ack set.
     #[test]
-    fn merge_rejects_space_id_divergence() {
+    fn merge_accepts_space_id_divergence_and_preserves_existing() {
         let mut s = OwnerState::default();
         s.apply_outbox(entry(1, vec![10, 20], vec![10]));
         let mut diverged = entry(1, vec![10, 20], vec![20]);
-        diverged.space_id = SpaceId([99; 16]); // different space
+        diverged.space_id = SpaceId([99; 16]); // peer still on old (loser) space
         let outcome = s.apply_outbox(diverged);
-        assert!(
-            matches!(
-                outcome,
-                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
-            ),
-            "expected InvariantFail, got {:?}",
-            outcome
-        );
-        // Existing entry must remain on its original space_id.
-        assert_eq!(
-            s.outbox.get(&OutboxEntryId([1; 16])).unwrap().space_id,
-            SpaceId([1; 16])
-        );
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        let merged = s.outbox.get(&OutboxEntryId([1; 16])).unwrap();
+        // Existing's (canonicalized) space_id wins.
+        assert_eq!(merged.space_id, SpaceId([1; 16]));
+        // Ack from the diverged peer is still folded in.
+        assert_eq!(merged.delivered_to.len(), 2);
+        assert!(merged.delivered_to.contains(&OwnerAddr([10; 16])));
+        assert!(merged.delivered_to.contains(&OwnerAddr([20; 16])));
     }
 
     #[test]
@@ -1194,6 +1219,61 @@ mod canonicalization_tests {
         s.apply_space_with_canonicalization(dm(1, vec![1, 2], 200));
         let entry = s.outbox.get(&OutboxEntryId([99; 16])).unwrap();
         assert_eq!(entry.space_id, SpaceId([1; 16]));
+    }
+
+    /// Regression for PR #73 round 5 (Cursor): after a Space dedupe
+    /// rewrites an outbox entry's space_id from loser→winner, a peer
+    /// that hasn't yet learned about the dedupe still sends acks
+    /// referencing the OLD (loser) space_id. The apply_outbox
+    /// envelope check used to reject those, silently dropping
+    /// delivery acknowledgments and stranding delivery_status. The
+    /// fix: drop space_id from the envelope check; preserve
+    /// existing's (canonicalized) space_id and union the ack set.
+    #[test]
+    fn outbox_ack_with_loser_space_id_after_dedupe_still_merges() {
+        let mut s = OwnerState::default();
+        // Device A creates DM id=5 (will be loser — larger ULID).
+        s.apply_space_with_canonicalization(dm(5, vec![1, 2], 100));
+        // Device A sends an OutboxEntry referencing id=5.
+        s.apply_outbox(OutboxEntry {
+            id: OutboxEntryId([42; 16]),
+            space_id: SpaceId([5; 16]),
+            recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            message_cid: ContentId([7; 32]),
+            created_at: hlc(100),
+            delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
+            delivery_status: DeliveryStatus::Partial,
+        });
+        // Device B's DM id=1 arrives — Space dedupe collapses 5→1
+        // and canonicalize_dependent_space_ids rewrites the outbox
+        // entry to space_id=1.
+        s.apply_space_with_canonicalization(dm(1, vec![1, 2], 100));
+        assert_eq!(
+            s.outbox.get(&OutboxEntryId([42; 16])).unwrap().space_id,
+            SpaceId([1; 16]),
+            "outbox entry should now reference winner space_id"
+        );
+
+        // Device C (has not yet learned about the dedupe) sends an
+        // ack still referencing the original loser space_id=5. With
+        // the round-4 envelope check this would have been rejected
+        // for space_id mismatch — now it merges.
+        let outcome = s.apply_outbox(OutboxEntry {
+            id: OutboxEntryId([42; 16]),
+            space_id: SpaceId([5; 16]), // peer is still on the old loser id
+            recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            message_cid: ContentId([7; 32]),
+            created_at: hlc(100),
+            delivered_to: [OwnerAddr([2; 16])].into_iter().collect(),
+            delivery_status: DeliveryStatus::Partial,
+        });
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        let merged = s.outbox.get(&OutboxEntryId([42; 16])).unwrap();
+        // Stored space_id stays canonicalized (winner).
+        assert_eq!(merged.space_id, SpaceId([1; 16]));
+        // Both acks landed; delivery is Complete.
+        assert_eq!(merged.delivered_to.len(), 2);
+        assert_eq!(merged.delivery_status, DeliveryStatus::Complete);
     }
 
     /// Regression for PR #73 review: when both loser and winner have an
