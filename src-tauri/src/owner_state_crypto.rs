@@ -14,6 +14,70 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
+pub use crate::owner_state_types::Hlc;
+
+/// Sealed marker trait certifying that a type's `serde::Serialize` impl
+/// produces deterministic CBOR output meeting the
+/// `canonical_cbor_encode` contract. The trait is sealed (cannot be
+/// impl'd outside this crate) so all impls live in `owner_state_types`
+/// and a reviewer can audit them in one place.
+///
+/// Closes ZEB-220 (the sealed marker trait portion). The strict
+/// RFC 8949 §4.2.1 cross-implementation encoder remains a separate
+/// followup since ciborium 0.2 has no canonical writer.
+pub trait CanonicalPayload: sealed::CanonicalPayloadSealed + serde::Serialize {}
+
+pub(crate) mod sealed {
+    /// Sealing trait — only this crate can impl it. `pub(crate)` so
+    /// the macro in `owner_state_types` can reach it; outside-crate
+    /// users still cannot impl `CanonicalPayload` (they'd need to
+    /// impl this trait too, and it's only crate-visible).
+    pub trait CanonicalPayloadSealed {}
+}
+
+// Base-type impls used by Phase 2 owner_state_types. New impls go in
+// `owner_state_types`, NOT here — keep base-type impls together.
+// Note: we deliberately don't implement CanonicalPayload for `[u8; N]`.
+// The standard serde Serialize impl for `[u8; N]` emits a CBOR array
+// (major type 4), not a bstr — but our wire format requires bstr for
+// fixed-length identifiers. The Phase 2 newtypes (SpaceId, OwnerAddr,
+// ContentId, OutboxEntryId) wrap `[u8; N]` AND override its Serialize
+// impl with custom helpers that emit bstr. Their CanonicalPayload
+// impls live in `impl_canonical!` in owner_state_types.rs, not via
+// any blanket `[u8; N]` impl here.
+
+impl sealed::CanonicalPayloadSealed for u8 {}
+impl CanonicalPayload for u8 {}
+impl sealed::CanonicalPayloadSealed for u16 {}
+impl CanonicalPayload for u16 {}
+impl sealed::CanonicalPayloadSealed for u32 {}
+impl CanonicalPayload for u32 {}
+impl sealed::CanonicalPayloadSealed for u64 {}
+impl CanonicalPayload for u64 {}
+impl sealed::CanonicalPayloadSealed for String {}
+impl CanonicalPayload for String {}
+
+impl<T: CanonicalPayload> sealed::CanonicalPayloadSealed for Option<T> {}
+impl<T: CanonicalPayload> CanonicalPayload for Option<T> {}
+
+impl<T: CanonicalPayload> sealed::CanonicalPayloadSealed for Vec<T> {}
+impl<T: CanonicalPayload> CanonicalPayload for Vec<T> {}
+
+impl<T: CanonicalPayload> sealed::CanonicalPayloadSealed for std::collections::BTreeSet<T> {}
+impl<T: CanonicalPayload> CanonicalPayload for std::collections::BTreeSet<T> {}
+
+impl<K: CanonicalPayload, V: CanonicalPayload> sealed::CanonicalPayloadSealed
+    for std::collections::BTreeMap<K, V>
+{
+}
+impl<K: CanonicalPayload, V: CanonicalPayload> CanonicalPayload
+    for std::collections::BTreeMap<K, V>
+{
+}
+
+impl<A: CanonicalPayload, B: CanonicalPayload> sealed::CanonicalPayloadSealed for (A, B) {}
+impl<A: CanonicalPayload, B: CanonicalPayload> CanonicalPayload for (A, B) {}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("HKDF expand failed: {0}")]
@@ -306,32 +370,6 @@ impl RootReplayTracker {
     }
 }
 
-/// Hybrid Logical Clock. Mirrors the type defined in the ZEB-206 spec.
-///
-/// Phase 2 of ZEB-215 will move this to a shared types module; Phase 1
-/// keeps it here so the crypto module is self-contained for testing.
-///
-/// **Wire format:** serialized as a CBOR map with single-char field
-/// names (`w`/`l`/`d`) so all three keys have the same encoded length
-/// (1-byte CBOR length prefix + 1 ASCII byte). This satisfies the
-/// `canonical_cbor_encode` "all keys same encoded length" precondition
-/// — without the renames, `wall_ms` (7) / `logical` (7) / `device_id`
-/// (9) would mix encoded-length 8/8/10, silently violating the
-/// invariant every other type relies on. The rename also keeps the
-/// wire form ~22 bytes smaller per Hlc, which matters because every
-/// state-root-publish payload carries one. Locked in by the
-/// `hlc_cbor_uses_single_char_field_names_per_canonical_precondition`
-/// regression test.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Hlc {
-    #[serde(rename = "w")]
-    pub wall_ms: u64,
-    #[serde(rename = "l")]
-    pub logical: u32,
-    #[serde(rename = "d")]
-    pub device_id: String,
-}
-
 /// Deterministic CBOR encoder for the owner-state crypto surface.
 ///
 /// **Contract (current scope — Phase 1):** produces byte-identical output
@@ -372,7 +410,7 @@ pub struct Hlc {
 /// Both belong to the followup that locks down canonical CBOR once
 /// Phase 2 fixes the type universe (the actual `Space`, `OutboxEntry`
 /// CBOR shapes). See ZEB-220 (filed as part of PR #72 review).
-pub fn canonical_cbor_encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CryptoError> {
+pub fn canonical_cbor_encode<T: CanonicalPayload>(value: &T) -> Result<Vec<u8>, CryptoError> {
     let mut buf = Vec::new();
     ciborium::into_writer(value, &mut buf).map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
     Ok(buf)
@@ -387,7 +425,7 @@ pub fn canonical_cbor_encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 /// known-good blob and produce a different byte sequence that decodes
 /// to the same value, defeating any downstream code that fingerprints
 /// (BLAKE3-hashes, signs, dedup-checks) the encoded form.
-pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
+pub fn canonical_cbor_decode<T: CanonicalPayload + serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, CryptoError> {
     let mut cursor = std::io::Cursor::new(bytes);
@@ -401,18 +439,6 @@ pub fn canonical_cbor_decode<T: serde::de::DeserializeOwned>(
         )));
     }
     Ok(value)
-}
-
-impl Hlc {
-    /// Lexicographic ordering on `(wall_ms, logical, device_id)`.
-    ///
-    /// Per ZEB-211 round-5: integers compared numerically; `device_id`
-    /// compared bytewise (the `String` Ord impl provides this for UTF-8).
-    /// Replay-protection check uses `self.is_strictly_newer_than(&last_accepted)`.
-    pub fn is_strictly_newer_than(&self, other: &Hlc) -> bool {
-        (self.wall_ms, self.logical, self.device_id.as_str())
-            > (other.wall_ms, other.logical, other.device_id.as_str())
-    }
 }
 
 #[cfg(test)]
@@ -702,16 +728,17 @@ mod tests {
         assert!(matches!(result, Err(CryptoError::ReplayRejected(_))));
     }
 
-    use std::collections::BTreeMap;
-
     #[test]
     fn canonical_cbor_byte_identical_for_same_value() {
         // The deterministic-encryption property of the CRDT relies on
         // byte-identical CBOR output across implementations and runs.
-        let mut value: BTreeMap<String, u32> = BTreeMap::new();
-        value.insert("foo".into(), 1);
-        value.insert("bar".into(), 2);
-
+        // Use a Phase 2 type (Hlc) so the test reflects the actual
+        // type universe under the sealed-trait constraint.
+        let value = Hlc {
+            wall_ms: 100,
+            logical: 5,
+            device_id: "alice".into(),
+        };
         let bytes1 = canonical_cbor_encode(&value).expect("encode 1");
         let bytes2 = canonical_cbor_encode(&value).expect("encode 2");
         assert_eq!(bytes1, bytes2);
@@ -788,6 +815,31 @@ mod tests {
         bytes.push(0xFF);
         let result = canonical_cbor_decode::<Hlc>(&bytes);
         assert!(matches!(result, Err(CryptoError::CborDecode(_))));
+    }
+
+    /// Compile-time test: every Phase 2 wire type must implement
+    /// `CanonicalPayload`. If a type is added to `owner_state_types`
+    /// and its impl is forgotten, this test fails at compile time
+    /// with "the trait bound `T: CanonicalPayload` is not satisfied".
+    #[test]
+    fn phase2_types_implement_canonical_payload() {
+        use crate::owner_state_types::*;
+        fn assert_canonical<T: CanonicalPayload>() {}
+        assert_canonical::<Hlc>();
+        assert_canonical::<SpaceId>();
+        assert_canonical::<OwnerAddr>();
+        assert_canonical::<ContentId>();
+        assert_canonical::<OutboxEntryId>();
+        assert_canonical::<SpaceKind>();
+        assert_canonical::<NotificationPref>();
+        assert_canonical::<ReticulumDest>();
+        assert_canonical::<TransportBinding>();
+        assert_canonical::<Space>();
+        assert_canonical::<DeliveryStatus>();
+        assert_canonical::<OutboxEntry>();
+        assert_canonical::<InboxKey>();
+        assert_canonical::<InboxEntry>();
+        assert_canonical::<ReadMarker>();
     }
 
     #[test]
