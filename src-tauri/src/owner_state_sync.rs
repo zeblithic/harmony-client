@@ -214,8 +214,8 @@ async fn internal_task(mut ctx: InternalCtx) {
 }
 
 use crate::owner_state_crypto::{
-    canonical_cbor_decode, canonical_cbor_encode, decrypt_root_publish, encrypt_entry,
-    encrypt_root_publish, space_lookup_key,
+    canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, decrypt_root_publish,
+    encrypt_entry, encrypt_root_publish, space_lookup_key,
 };
 use crate::owner_state_types::{ContentId, RootPublishPayload};
 
@@ -319,8 +319,47 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result
         tracker.insert(payload.at.device_id.clone(), payload.at.clone());
     }
 
-    // 3. Fetch + merge — Tasks 14-15 fill in.
-    let _root_cid = payload.root_cid;
+    // 3. Fetch the encrypted root blob from CAS.
+    let blob_ciphertext = ctx.content_store.get(&payload.root_cid)?.ok_or_else(|| {
+        // Phase 3b will replace InMemoryStub with real CAS; for
+        // 3a, a missing blob means the subscriber and publisher
+        // aren't sharing the same stub (e.g. cross-process). Log
+        // and skip — never panic.
+        SyncError::Crypto("ContentStore returned None for root_cid".into())
+    })?;
+
+    // 4. Decrypt with the same lookup key the publisher used.
+    let lookup = space_lookup_key(&ctx.kt, OWNER_STATE_ROOT_BLOB_TAG);
+    let blob_cleartext = decrypt_entry(&ctx.kt, &lookup, &blob_ciphertext)
+        .map_err(|e| SyncError::Crypto(e.to_string()))?;
+
+    // 5. Decode into a remote OwnerState snapshot.
+    let remote: OwnerState =
+        canonical_cbor_decode(&blob_cleartext).map_err(|e| SyncError::CborDecode(e.to_string()))?;
+
+    // 6. Merge each entry through Phase 2's CRDT methods. Order
+    //    matters slightly — Spaces must merge first because outbox/
+    //    inbox/markers reference SpaceIds that the canonicalization
+    //    rewrite needs to see resolved.
+    {
+        let mut local = ctx.state.lock().await;
+        for (_, space) in remote.spaces {
+            local.apply_space_with_canonicalization(space);
+        }
+        for (_, entry) in remote.outbox {
+            local.apply_outbox(entry);
+        }
+        for (_, entry) in remote.inbox {
+            local.apply_inbox(entry);
+        }
+        for (_, marker) in remote.markers {
+            local.apply_marker(marker);
+        }
+        for tomb in remote.tombstones {
+            local.tombstones.insert(tomb);
+        }
+    }
+
     Ok(())
 }
 
@@ -683,6 +722,137 @@ mod subscriber_tests {
         let stored = t.get("peer-bob").expect("still present");
         assert_eq!(stored.wall_ms, 2000, "tracker must not regress");
         drop(t);
+
+        engine.shutdown().await;
+    }
+
+    use crate::owner_state_types::{
+        ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
+        SpaceId, SpaceKind,
+    };
+
+    fn folder(id: u8, ts: u64) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "F".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: ts,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: ts,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn subscriber_fetches_and_merges_remote_state() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let local_state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&local_state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        // Build a remote OwnerState containing a folder id=42.
+        let mut remote = OwnerState::default();
+        remote.spaces.insert(SpaceId([42; 16]), folder(42, 100));
+
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        sub_tx.send(wire).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let local = local_state.lock().await;
+        assert!(
+            local.spaces.contains_key(&SpaceId([42; 16])),
+            "remote folder must merge into local"
+        );
+        drop(local);
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_merges_outbox_inbox_marker_entries() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let local_state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&local_state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        let mut remote = OwnerState::default();
+        remote.spaces.insert(SpaceId([1; 16]), folder(1, 100));
+        remote.outbox.insert(
+            OutboxEntryId([7; 16]),
+            OutboxEntry {
+                id: OutboxEntryId([7; 16]),
+                space_id: SpaceId([1; 16]),
+                recipient_owners: vec![OwnerAddr([2; 16])],
+                message_cid: ContentId([3; 32]),
+                created_at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+                delivered_to: Default::default(),
+                delivery_status: DeliveryStatus::Pending,
+            },
+        );
+        remote.markers.insert(
+            SpaceId([1; 16]),
+            ReadMarker {
+                space_id: SpaceId([1; 16]),
+                last_read_at: Hlc {
+                    wall_ms: 200,
+                    logical: 0,
+                    device_id: "peer".into(),
+                },
+            },
+        );
+
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        sub_tx.send(wire).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let local = local_state.lock().await;
+        assert!(local.spaces.contains_key(&SpaceId([1; 16])));
+        assert!(local.outbox.contains_key(&OutboxEntryId([7; 16])));
+        assert!(local.markers.contains_key(&SpaceId([1; 16])));
+        drop(local);
 
         engine.shutdown().await;
     }
