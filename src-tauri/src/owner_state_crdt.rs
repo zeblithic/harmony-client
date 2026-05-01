@@ -182,6 +182,82 @@ impl OwnerState {
         }
     }
 
+    /// `apply_space` followed by atomic rewrite of all dependent records
+    /// (OutboxEntry/InboxEntry/ReadMarker `space_id`) when the merge
+    /// collapses two SpaceIds into one. This is the public entry point
+    /// for incoming Spaces — Phase 3 (sync) calls this; Phase 2 internal
+    /// tests can call `apply_space` directly when they don't have
+    /// dependent records to worry about.
+    ///
+    /// Implementation note: we capture the would-be winner id BEFORE
+    /// `apply_space` mutates state (which removes the loser entry).
+    /// Without this snapshot, we couldn't recover the winner from the
+    /// post-merge map alone.
+    pub fn apply_space_with_canonicalization(&mut self, incoming: Space) -> ApplyOutcome {
+        let dk = incoming.dedupe_key();
+        let predicted_winner = if matches!(dk, DedupeKey::None) {
+            None
+        } else {
+            self.spaces
+                .iter()
+                .find(|(_, s)| s.dedupe_key() == dk)
+                .map(|(id, _)| std::cmp::min(*id, incoming.id))
+        };
+        let outcome = self.apply_space(incoming);
+        if let ApplyOutcome::Merged {
+            old_id: Some(loser),
+        } = &outcome
+        {
+            if let Some(winner) = predicted_winner {
+                self.canonicalize_dependent_space_ids(*loser, winner);
+            }
+        }
+        outcome
+    }
+
+    /// Atomic rewrite of every dependent record's `space_id` from `loser`
+    /// to `winner`. Touches outbox (mutate space_id field in place),
+    /// inbox (rebuild composite map key), markers (rebuild map key).
+    fn canonicalize_dependent_space_ids(&mut self, loser: SpaceId, winner: SpaceId) {
+        // OutboxEntry — mutate in place; the map key (OutboxEntryId) is
+        // independent of space_id.
+        for entry in self.outbox.values_mut() {
+            if entry.space_id == loser {
+                entry.space_id = winner;
+            }
+        }
+
+        // InboxEntry — composite key (space_id, message_cid) is the BTreeMap
+        // key, so rewriting space_id requires rebuilding the entry under
+        // the new key.
+        let mut updates: Vec<(InboxKey, InboxEntry)> = Vec::new();
+        let mut keys_to_remove: Vec<InboxKey> = Vec::new();
+        for (k, v) in &self.inbox {
+            if k.space_id == loser {
+                let new_key = InboxKey {
+                    space_id: winner,
+                    message_cid: k.message_cid,
+                };
+                let mut new_entry = v.clone();
+                new_entry.space_id = winner;
+                updates.push((new_key, new_entry));
+                keys_to_remove.push(*k);
+            }
+        }
+        for k in keys_to_remove {
+            self.inbox.remove(&k);
+        }
+        for (k, v) in updates {
+            self.inbox.insert(k, v);
+        }
+
+        // ReadMarker — keyed by space_id; rewrite map key.
+        if let Some(mut marker) = self.markers.remove(&loser) {
+            marker.space_id = winner;
+            self.markers.insert(winner, marker);
+        }
+    }
+
     /// Apply an incoming ReadMarker. `last_read_at` advances monotonically —
     /// older HLCs are rejected so reading state never regresses.
     pub fn apply_marker(&mut self, incoming: ReadMarker) -> ApplyOutcome {
@@ -611,5 +687,117 @@ mod apply_marker_tests {
         s.apply_marker(marker(1, 100));
         s.apply_marker(marker(2, 50));
         assert_eq!(s.markers.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod canonicalization_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        ContentId, DeliveryStatus, Hlc, InboxEntry, OutboxEntry, OutboxEntryId, OwnerAddr,
+        ReadMarker, SpaceKind, TransportBinding,
+    };
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: members.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(ts),
+            updated_at: hlc(ts),
+        }
+    }
+
+    #[test]
+    fn dedupe_rewrites_outbox_inbox_marker_space_ids() {
+        let mut s = OwnerState::default();
+        // Device A creates DM with id=5 (will be the loser — larger ULID).
+        s.apply_space_with_canonicalization(dm(5, vec![1, 2], 100));
+        // Insert an OutboxEntry, InboxEntry, ReadMarker pointing at id=5.
+        s.apply_outbox(OutboxEntry {
+            id: OutboxEntryId([100; 16]),
+            space_id: SpaceId([5; 16]),
+            recipient_owners: vec![OwnerAddr([2; 16])],
+            message_cid: ContentId([1; 32]),
+            created_at: hlc(100),
+            delivered_to: Default::default(),
+            delivery_status: DeliveryStatus::Pending,
+        });
+        s.apply_inbox(InboxEntry {
+            space_id: SpaceId([5; 16]),
+            message_cid: ContentId([2; 32]),
+            from: OwnerAddr([2; 16]),
+            received_at: hlc(100),
+        });
+        s.apply_marker(ReadMarker {
+            space_id: SpaceId([5; 16]),
+            last_read_at: hlc(100),
+        });
+        // Now device B's write with id=1 (smaller ULID — winner).
+        let outcome = s.apply_space_with_canonicalization(dm(1, vec![1, 2], 100));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Merged {
+                old_id: Some(SpaceId([5; 16]))
+            }
+        );
+
+        // All three dependent records should now reference id=1, not id=5.
+        let outbox_entry = s.outbox.get(&OutboxEntryId([100; 16])).unwrap();
+        assert_eq!(outbox_entry.space_id, SpaceId([1; 16]));
+
+        // InboxEntry's composite key includes space_id, so the BTreeMap key
+        // itself rewrites — old key is gone, new key present.
+        let new_inbox_key = InboxKey {
+            space_id: SpaceId([1; 16]),
+            message_cid: ContentId([2; 32]),
+        };
+        let old_inbox_key = InboxKey {
+            space_id: SpaceId([5; 16]),
+            message_cid: ContentId([2; 32]),
+        };
+        assert!(s.inbox.contains_key(&new_inbox_key));
+        assert!(!s.inbox.contains_key(&old_inbox_key));
+
+        // ReadMarker keyed by space_id — same rewrite.
+        assert!(s.markers.contains_key(&SpaceId([1; 16])));
+        assert!(!s.markers.contains_key(&SpaceId([5; 16])));
+    }
+
+    #[test]
+    fn no_dedupe_no_rewrite() {
+        let mut s = OwnerState::default();
+        s.apply_space_with_canonicalization(dm(1, vec![1, 2], 100));
+        // Fresh outbox/inbox/marker untouched by a non-dedupe-merge apply.
+        s.apply_outbox(OutboxEntry {
+            id: OutboxEntryId([99; 16]),
+            space_id: SpaceId([1; 16]),
+            recipient_owners: vec![OwnerAddr([2; 16])],
+            message_cid: ContentId([1; 32]),
+            created_at: hlc(100),
+            delivered_to: Default::default(),
+            delivery_status: DeliveryStatus::Pending,
+        });
+        // Same dm, same id — pure LWW, no canonicalization triggered.
+        s.apply_space_with_canonicalization(dm(1, vec![1, 2], 200));
+        let entry = s.outbox.get(&OutboxEntryId([99; 16])).unwrap();
+        assert_eq!(entry.space_id, SpaceId([1; 16]));
     }
 }
