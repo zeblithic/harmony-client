@@ -156,6 +156,31 @@ impl OwnerState {
         }
     }
 
+    /// Apply an incoming InboxEntry to the CRDT. Upsert by composite key
+    /// `(space_id, message_cid)` per ZEB-206 §Idempotency. On collision,
+    /// keep the earliest `received_at` (matches the spec: "first device's
+    /// receive time").
+    pub fn apply_inbox(&mut self, incoming: InboxEntry) -> ApplyOutcome {
+        let key = incoming.key();
+        match self.inbox.get(&key) {
+            None => {
+                self.inbox.insert(key, incoming);
+                ApplyOutcome::Inserted
+            }
+            Some(existing) => {
+                let earlier = if existing
+                    .received_at
+                    .is_strictly_newer_than(&incoming.received_at)
+                {
+                    incoming
+                } else {
+                    existing.clone()
+                };
+                self.inbox.insert(key, earlier);
+                ApplyOutcome::Merged { old_id: None }
+            }
+        }
+    }
 }
 
 /// Merge two Space values using last-writer-wins per-field on
@@ -431,3 +456,66 @@ mod apply_outbox_tests {
     }
 }
 
+#[cfg(test)]
+mod apply_inbox_tests {
+    use super::*;
+    use crate::owner_state_types::{ContentId, Hlc, InboxEntry, InboxKey, OwnerAddr};
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn entry(space: u8, msg: u8, from: u8, ts: u64) -> InboxEntry {
+        InboxEntry {
+            space_id: SpaceId([space; 16]),
+            message_cid: ContentId([msg; 32]),
+            from: OwnerAddr([from; 16]),
+            received_at: hlc(ts),
+        }
+    }
+
+    #[test]
+    fn first_write_inserts() {
+        let mut s = OwnerState::default();
+        let outcome = s.apply_inbox(entry(1, 2, 3, 100));
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+        assert_eq!(s.inbox.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_upserts_to_earliest_received_at() {
+        let mut s = OwnerState::default();
+        s.apply_inbox(entry(1, 2, 3, 200)); // device A
+        let outcome = s.apply_inbox(entry(1, 2, 3, 100)); // device B (earlier)
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        // Earliest wins.
+        let key = InboxKey {
+            space_id: SpaceId([1; 16]),
+            message_cid: ContentId([2; 32]),
+        };
+        assert_eq!(s.inbox.get(&key).unwrap().received_at.wall_ms, 100);
+    }
+
+    #[test]
+    fn different_messages_in_same_space_dont_collide() {
+        let mut s = OwnerState::default();
+        s.apply_inbox(entry(1, 2, 3, 100));
+        s.apply_inbox(entry(1, 99, 3, 100));
+        assert_eq!(s.inbox.len(), 2);
+    }
+
+    #[test]
+    fn same_message_in_different_spaces_dont_collide() {
+        // Pathological edge case: same message_cid would only happen if the
+        // same encrypted blob was sent in two spaces — but we treat them as
+        // distinct InboxEntries because the composite key differs.
+        let mut s = OwnerState::default();
+        s.apply_inbox(entry(1, 2, 3, 100));
+        s.apply_inbox(entry(99, 2, 3, 100));
+        assert_eq!(s.inbox.len(), 2);
+    }
+}
