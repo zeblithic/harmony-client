@@ -294,6 +294,14 @@ impl_canonical!(
     RootPublishPayload,
 );
 
+// OwnerState lives in owner_state_crdt to keep CRDT semantics together;
+// its CanonicalPayload impl is registered here alongside all Phase 2 wire types.
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed
+    for crate::owner_state_crdt::OwnerState
+{
+}
+impl crate::owner_state_crypto::CanonicalPayload for crate::owner_state_crdt::OwnerState {}
+
 #[cfg(test)]
 mod hlc_tests {
     use super::*;

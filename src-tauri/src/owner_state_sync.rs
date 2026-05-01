@@ -144,7 +144,6 @@ impl SyncEngine {
     }
 }
 
-#[allow(dead_code)]
 struct InternalCtx {
     kt: Arc<KeyTree>,
     device_id: String,
@@ -153,6 +152,8 @@ struct InternalCtx {
     content_store: Arc<dyn ContentStore>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
+    /// Persistence paths — used by Tasks 13+ for CRDT + replay-tracker flush.
+    #[allow(dead_code)]
     paths: PersistPaths,
     debounce: std::time::Duration,
     notify_dirty: Arc<Notify>,
@@ -210,18 +211,88 @@ async fn internal_task(mut ctx: InternalCtx) {
     }
 }
 
-/// Publish a state-root snapshot. Tasks 12 fills in real encryption +
-/// CAS put + Zenoh send; for now this writes a placeholder byte
-/// sequence to publisher_tx so the debounce tests have something
-/// observable.
+use crate::owner_state_crypto::{
+    canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key,
+};
+use crate::owner_state_types::{ContentId, RootPublishPayload};
+
+/// Lookup-key tag for the single-blob OwnerState in 3a's
+/// simplified CAS layout. See spec §"Root blob shape — Phase 3a
+/// simplification". Phase 3b/c restructures into per-entry blobs.
+const OWNER_STATE_ROOT_BLOB_TAG: &[u8] = b"owner-state-root-blob-v1";
+
 async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
-    // Placeholder for Task 9. Task 12 replaces this with the real
-    // encrypt → put → publish pipeline.
+    // Snapshot CRDT state under brief lock.
+    let snapshot = {
+        let state = ctx.state.lock().await;
+        state.clone()
+    };
+
+    // 1. Canonical-CBOR encode the OwnerState as the cleartext "root blob."
+    let blob_cleartext =
+        canonical_cbor_encode(&snapshot).map_err(|e| SyncError::CborEncode(e.to_string()))?;
+
+    // 2. Encrypt with deterministic per-entry AEAD using the fixed
+    //    owner-state-root lookup key, so cipher_cid is reproducible
+    //    across two devices encrypting the same state.
+    let lookup = space_lookup_key(&ctx.kt, OWNER_STATE_ROOT_BLOB_TAG);
+    let blob_ciphertext = encrypt_entry(&ctx.kt, &lookup, &blob_cleartext)
+        .map_err(|e| SyncError::Crypto(e.to_string()))?;
+
+    // 3. cipher_cid = BLAKE3 of the encrypted blob.
+    let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
+
+    // 4. Put into ContentStore (in 3a: InMemoryStub; 3b: real CAS).
+    ctx.content_store.put(root_cid, blob_ciphertext)?;
+
+    // 5. Build state-root payload.
+    let now = next_hlc(ctx).await;
+    let payload = RootPublishPayload { root_cid, at: now };
+    let payload_bytes =
+        canonical_cbor_encode(&payload).map_err(|e| SyncError::CborEncode(e.to_string()))?;
+
+    // 6. Encrypt with random-nonce root AEAD (Phase 1).
+    let wire = encrypt_root_publish(&ctx.kt, &payload_bytes)
+        .map_err(|e| SyncError::Crypto(e.to_string()))?;
+
+    // 7. Send onto outbound channel — Zenoh adapter forwards.
     ctx.publisher_tx
-        .send(b"placeholder".to_vec())
+        .send(wire)
         .await
         .map_err(|_| SyncError::TransportClosed)?;
+
     Ok(())
+}
+
+/// Build a strictly-newer HLC than the last one we published. The
+/// internal task is single-threaded so we don't need atomic ops;
+/// caller holds an `&mut self` to the task's local state in a real
+/// design, but for now we re-derive from system time + a per-task
+/// monotonic counter cached in `ctx.tracker` keyed by our own
+/// device_id.
+async fn next_hlc(ctx: &InternalCtx) -> Hlc {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut tracker = ctx.tracker.lock().await;
+    let logical = match tracker.get(&ctx.device_id) {
+        Some(prev) if prev.wall_ms == wall_ms => prev.logical + 1,
+        Some(prev) if prev.wall_ms > wall_ms => prev.logical + 1, // wall non-monotonic
+        _ => 0,
+    };
+    let prev_wall = tracker.get(&ctx.device_id).map(|p| p.wall_ms).unwrap_or(0);
+    let effective_wall = std::cmp::max(wall_ms, prev_wall);
+
+    let now = Hlc {
+        wall_ms: effective_wall,
+        logical,
+        device_id: ctx.device_id.clone(),
+    };
+    tracker.insert(ctx.device_id.clone(), now.clone());
+    now
 }
 
 #[cfg(test)]
@@ -442,5 +513,65 @@ mod skeleton_tests {
         );
         engine.shutdown().await;
         // No assertions beyond "didn't hang or panic."
+    }
+}
+
+#[cfg(test)]
+mod publisher_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_crypto::decrypt_root_publish;
+    use crate::owner_state_types::RootPublishPayload;
+    use ciborium::from_reader;
+
+    fn make_kt() -> Arc<KeyTree> {
+        Arc::new(KeyTree::derive(&[42u8; 32]).expect("kt"))
+    }
+
+    fn paths() -> (tempfile::TempDir, PersistPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PersistPaths {
+            crdt: dir.path().join("crdt.cbor"),
+            replay: dir.path().join("replay.cbor"),
+        };
+        (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn publish_emits_decryptable_payload_with_blob_in_store() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default());
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "alice-device".into(),
+            Arc::clone(&state),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&store) as Arc<dyn ContentStore>,
+            pub_tx,
+            sub_rx,
+            paths,
+            50,
+        );
+
+        engine.notify_dirty();
+        let wire = tokio::time::timeout(std::time::Duration::from_millis(500), pub_rx.recv())
+            .await
+            .expect("publish within timeout")
+            .expect("channel open");
+
+        // Decrypt the wire payload with Phase-1 helper.
+        let payload_bytes = decrypt_root_publish(&kt, &wire).expect("decrypt");
+        let payload: RootPublishPayload = from_reader(&payload_bytes[..]).expect("CBOR decode");
+        assert_eq!(payload.at.device_id, "alice-device");
+
+        // The root_cid must reference a blob present in the stub.
+        let blob = store.get(&payload.root_cid).unwrap().expect("blob present");
+        assert!(!blob.is_empty());
+
+        engine.shutdown().await;
     }
 }

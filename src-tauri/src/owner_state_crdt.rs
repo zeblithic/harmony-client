@@ -9,10 +9,11 @@ use crate::owner_state_types::{
     DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, OwnerAddr,
     ReadMarker, Space, SpaceId,
 };
+use serde::Serialize;
 
 /// In-memory owner-state CRDT store. Phase 3 wraps this in persistence +
 /// transport; Phase 2 owns purely the typed merge semantics.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnerState {
     pub spaces: BTreeMap<SpaceId, Space>,
     pub outbox: BTreeMap<OutboxEntryId, OutboxEntry>,
