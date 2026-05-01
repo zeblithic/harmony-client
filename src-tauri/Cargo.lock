@@ -1919,8 +1919,8 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "harmony-compute",
- "harmony-content",
- "harmony-identity",
+ "harmony-content 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "harmony-mailbox",
  "harmony-owner",
  "harmony-runtime",
@@ -1958,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "harmony-athenaeum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "sha2",
 ]
@@ -1966,9 +1966,9 @@ dependencies = [
 [[package]]
 name = "harmony-compute"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-crypto",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "thiserror 2.0.18",
  "wasmi",
  "wasmparser 0.228.0",
@@ -1977,9 +1977,9 @@ dependencies = [
 [[package]]
 name = "harmony-contacts"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-identity",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hashbrown 0.15.5",
  "postcard",
  "serde",
@@ -1988,10 +1988,25 @@ dependencies = [
 [[package]]
 name = "harmony-content"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-crypto",
- "harmony-zenoh",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-zenoh 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "hashbrown 0.15.5",
+ "hex",
+ "libm",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "harmony-content"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
+dependencies = [
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
+ "harmony-zenoh 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
  "hashbrown 0.15.5",
  "hex",
  "libm",
@@ -2003,10 +2018,10 @@ dependencies = [
 [[package]]
 name = "harmony-credential"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "postcard",
  "serde",
 ]
@@ -2014,7 +2029,31 @@ dependencies = [
 [[package]]
 name = "harmony-crypto"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
+dependencies = [
+ "aes",
+ "blake3",
+ "cbc",
+ "chacha20poly1305",
+ "hkdf",
+ "hmac",
+ "hybrid-array 0.2.3",
+ "keccak 0.2.0-rc.2",
+ "ml-dsa",
+ "ml-kem",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "harmony-crypto"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "aes",
  "blake3",
@@ -2038,10 +2077,10 @@ dependencies = [
 [[package]]
 name = "harmony-discovery"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hashbrown 0.15.5",
  "postcard",
  "serde",
@@ -2050,14 +2089,33 @@ dependencies = [
 [[package]]
 name = "harmony-identity"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "argon2",
  "base64 0.22.1",
  "bs58",
  "ed25519-dalek",
- "harmony-crypto",
- "harmony-platform",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-platform 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "harmony-identity"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
+dependencies = [
+ "argon2",
+ "base64 0.22.1",
+ "bs58",
+ "ed25519-dalek",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
+ "harmony-platform 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
@@ -2069,10 +2127,10 @@ dependencies = [
 [[package]]
 name = "harmony-mailbox"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "blake3",
- "harmony-identity",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "rand 0.8.5",
  "thiserror 2.0.18",
 ]
@@ -2080,11 +2138,11 @@ dependencies = [
 [[package]]
 name = "harmony-memo"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-content",
+ "harmony-content 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "harmony-credential",
- "harmony-identity",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hashbrown 0.15.5",
  "postcard",
  "rand_core 0.6.4",
@@ -2094,15 +2152,15 @@ dependencies = [
 [[package]]
 name = "harmony-owner"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "argon2",
  "bip39",
  "chacha20poly1305",
  "ciborium",
  "ed25519-dalek",
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hkdf",
  "rand_core 0.6.4",
  "secrecy 0.10.3",
@@ -2118,18 +2176,28 @@ dependencies = [
 [[package]]
 name = "harmony-peers"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "harmony-contacts",
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hashbrown 0.15.5",
 ]
 
 [[package]]
 name = "harmony-platform"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
+dependencies = [
+ "hashbrown 0.15.5",
+ "rand_core 0.6.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "harmony-platform"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
@@ -2139,11 +2207,11 @@ dependencies = [
 [[package]]
 name = "harmony-reticulum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "ed25519-dalek",
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
  "rmp",
@@ -2155,22 +2223,22 @@ dependencies = [
 [[package]]
 name = "harmony-runtime"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "harmony-athenaeum",
  "harmony-compute",
  "harmony-contacts",
- "harmony-content",
+ "harmony-content 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "harmony-credential",
- "harmony-crypto",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "harmony-discovery",
- "harmony-identity",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "harmony-memo",
  "harmony-peers",
  "harmony-reticulum",
  "harmony-speculative",
  "harmony-workflow",
- "harmony-zenoh",
+ "harmony-zenoh 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "hex",
  "postcard",
  "rand_core 0.6.4",
@@ -2181,12 +2249,12 @@ dependencies = [
 [[package]]
 name = "harmony-speculative"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 
 [[package]]
 name = "harmony-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2195,20 +2263,34 @@ dependencies = [
 [[package]]
 name = "harmony-workflow"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
  "harmony-compute",
- "harmony-crypto",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "harmony-zenoh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?branch=main#1ea6883bc55e132f271133e72838e7d1c3d28e3b"
+source = "git+https://github.com/zeblithic/harmony.git?branch=main#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
 dependencies = [
- "harmony-crypto",
- "harmony-identity",
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?branch=main)",
+ "hashbrown 0.15.5",
+ "rand_core 0.6.4",
+ "thiserror 2.0.18",
+ "zenoh-keyexpr",
+ "zeroize",
+]
+
+[[package]]
+name = "harmony-zenoh"
+version = "0.1.0"
+source = "git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8#ddf2ce07109eb30526a10bd37af3b0ddc901faa8"
+dependencies = [
+ "harmony-crypto 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
+ "harmony-identity 0.1.0 (git+https://github.com/zeblithic/harmony.git?rev=ddf2ce07109eb30526a10bd37af3b0ddc901faa8)",
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
  "thiserror 2.0.18",
