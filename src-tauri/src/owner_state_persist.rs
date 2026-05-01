@@ -115,6 +115,45 @@ pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {
     }
 }
 
+use crate::owner_state_types::Hlc;
+
+const REPLAY_FILE_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ReplayFileV1(BTreeMap<String, Hlc>);
+
+pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), PersistError> {
+    let file = ReplayFileV1(tracker.clone());
+    let mut bytes = vec![REPLAY_FILE_SCHEMA_V1];
+    into_writer(&file, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
+    save_atomically(path, &bytes)
+}
+
+pub fn load_replay(path: &Path) -> Result<BTreeMap<String, Hlc>, PersistError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if bytes.is_empty() {
+        return Err(PersistError::Corrupt);
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        REPLAY_FILE_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: ReplayFileV1 =
+                from_reader(&mut cursor).map_err(|e| PersistError::CborDecode(e.to_string()))?;
+            if (cursor.position() as usize) != payload.len() {
+                return Err(PersistError::Corrupt);
+            }
+            Ok(file.0)
+        }
+        v => Err(PersistError::UnknownSchemaVersion(v)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +267,25 @@ mod tests {
         let path = dir.path().join("never_written.cbor");
         let loaded = load_crdt(&path).unwrap();
         assert_eq!(loaded, OwnerState::default());
+    }
+
+    #[test]
+    fn replay_round_trip_preserves_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state_root_replay.cbor");
+        let mut original: BTreeMap<String, Hlc> = BTreeMap::new();
+        original.insert("alice-laptop".into(), hlc(100));
+        original.insert("bob-phone".into(), hlc(200));
+        save_replay(&path, &original).unwrap();
+        let loaded = load_replay(&path).unwrap();
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn replay_load_missing_file_returns_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_written.cbor");
+        let loaded = load_replay(&path).unwrap();
+        assert!(loaded.is_empty());
     }
 }
