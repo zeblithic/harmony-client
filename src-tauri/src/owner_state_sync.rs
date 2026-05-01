@@ -153,7 +153,6 @@ struct InternalCtx {
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
     /// Persistence paths — used by Tasks 13+ for CRDT + replay-tracker flush.
-    #[allow(dead_code)]
     paths: PersistPaths,
     debounce: std::time::Duration,
     notify_dirty: Arc<Notify>,
@@ -189,16 +188,24 @@ async fn internal_task(mut ctx: InternalCtx) {
                 if let Err(e) = publish_root_now(&ctx).await {
                     tracing::warn!(error = %e, "publish_root_now failed");
                 }
+                if let Err(e) = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await {
+                    tracing::warn!(error = %e, "persist_both failed");
+                }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
                 next_wakeup = None;
                 ctx.has_pending_dirty.store(false, Ordering::Relaxed);
-                let result = publish_root_now(&ctx).await;
+                let pub_result = publish_root_now(&ctx).await;
+                let persist_result = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
+                let result = pub_result.and(persist_result);
                 let _ = resp_tx.send(result);
             }
             Some(bytes) = ctx.subscriber_rx.recv() => {
                 if let Err(e) = handle_incoming_publish(&mut ctx, bytes).await {
                     tracing::warn!(error = %e, "incoming publish dropped");
+                }
+                if let Err(e) = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await {
+                    tracing::warn!(error = %e, "persist_both failed");
                 }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
@@ -206,6 +213,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                 if ctx.has_pending_dirty.load(Ordering::Relaxed) {
                     let _ = publish_root_now(&ctx).await;
                 }
+                let _ = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
                 let _ = resp_tx.send(());
                 return;
             }
@@ -223,6 +231,18 @@ use crate::owner_state_types::{ContentId, RootPublishPayload};
 /// simplified CAS layout. See spec §"Root blob shape — Phase 3a
 /// simplification". Phase 3b/c restructures into per-entry blobs.
 const OWNER_STATE_ROOT_BLOB_TAG: &[u8] = b"owner-state-root-blob-v1";
+
+async fn persist_both(
+    state: &Arc<Mutex<OwnerState>>,
+    tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
+    paths: &PersistPaths,
+) -> Result<(), SyncError> {
+    let state_snap = state.lock().await.clone();
+    let tracker_snap = tracker.lock().await.clone();
+    crate::owner_state_persist::save_crdt(&paths.crdt, &state_snap)?;
+    crate::owner_state_persist::save_replay(&paths.replay, &tracker_snap)?;
+    Ok(())
+}
 
 async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
     // Snapshot CRDT state under brief lock.
@@ -908,6 +928,94 @@ mod subscriber_tests {
         drop(t);
 
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_tracker_survives_engine_restart() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PersistPaths {
+            crdt: dir.path().join("crdt.cbor"),
+            replay: dir.path().join("replay.cbor"),
+        };
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+
+        // Round 1: bring up engine, accept a publish, shut down.
+        {
+            let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+            let state = Arc::new(Mutex::new(OwnerState::default()));
+            let engine = SyncEngine::new(
+                Arc::clone(&kt),
+                "self-device".into(),
+                Arc::clone(&state),
+                Arc::clone(&tracker),
+                Arc::clone(&store),
+                pub_tx.clone(),
+                sub_rx,
+                paths.clone(),
+                5000,
+            );
+            sub_tx
+                .send(make_wire(
+                    &kt,
+                    &store,
+                    &OwnerState::default(),
+                    "peer-bob",
+                    5000,
+                    0,
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            engine.shutdown().await;
+        }
+
+        // Round 2: boot a fresh engine, load tracker from disk,
+        // verify peer-bob's HLC is 5000. Then send an OLDER publish
+        // and confirm rejection.
+        let tracker_loaded = crate::owner_state_persist::load_replay(&paths.replay).unwrap();
+        assert_eq!(tracker_loaded.get("peer-bob").unwrap().wall_ms, 5000);
+
+        let (_pub_tx2, _pub_rx2) = mpsc::channel(16);
+        let (sub_tx2, sub_rx2) = mpsc::channel(16);
+        let tracker2 = Arc::new(Mutex::new(tracker_loaded));
+        let state2 = Arc::new(Mutex::new(OwnerState::default()));
+        let engine2 = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&state2),
+            Arc::clone(&tracker2),
+            Arc::clone(&store),
+            _pub_tx2,
+            sub_rx2,
+            paths.clone(),
+            5000,
+        );
+        // Send an older publish: at=2000 < 5000.
+        sub_tx2
+            .send(make_wire(
+                &kt,
+                &store,
+                &OwnerState::default(),
+                "peer-bob",
+                2000,
+                0,
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let t = tracker2.lock().await;
+        assert_eq!(
+            t.get("peer-bob").unwrap().wall_ms,
+            5000,
+            "replay tracker must reject the older HLC across restart"
+        );
+        drop(t);
+
+        engine2.shutdown().await;
     }
 }
 
