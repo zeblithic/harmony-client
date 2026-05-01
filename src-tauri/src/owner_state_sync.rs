@@ -1288,4 +1288,92 @@ mod integration_tests {
         dev.a_engine.shutdown().await;
         dev.b_engine.shutdown().await;
     }
+
+    use crate::owner_state_types::{ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId};
+
+    /// Phase 2 round-5 scenario, exercised end-to-end through real
+    /// sync: A and B's DMs collapse via dedupe, then a lagging
+    /// device C sends an outbox ack still referencing the OLD
+    /// (loser) space_id. After canonicalization rewrites A's outbox
+    /// to the winner space_id, C's lagging ack must still merge.
+    #[tokio::test]
+    async fn lagging_peer_ack_after_dedupe_still_merges() {
+        let dev = spawn_two_devices(99);
+
+        // A creates DM id=5 (will lose dedupe to B's id=1).
+        let a_dm = dm(5, vec![1, 2], 100);
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_space_with_canonicalization(a_dm);
+            // Plus an OutboxEntry on that DM.
+            a.apply_outbox(OutboxEntry {
+                id: OutboxEntryId([42; 16]),
+                space_id: SpaceId([5; 16]),
+                recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+                message_cid: ContentId([7; 32]),
+                created_at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "device-a".into(),
+                },
+                delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
+                delivery_status: DeliveryStatus::Partial,
+            });
+        }
+        // B creates DM id=1 (winner).
+        let b_dm = dm(1, vec![1, 2], 100);
+        {
+            let mut b = dev.b_state.lock().await;
+            b.apply_space_with_canonicalization(b_dm);
+        }
+
+        dev.a_engine.notify_dirty();
+        dev.b_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // After sync: A's outbox should have been canonicalized to id=1.
+        {
+            let a = dev.a_state.lock().await;
+            let entry = a.outbox.get(&OutboxEntryId([42; 16])).unwrap();
+            assert_eq!(
+                entry.space_id,
+                SpaceId([1; 16]),
+                "A's outbox must have canonicalized space_id"
+            );
+        }
+
+        // Now A re-mutates its outbox with the SAME OutboxEntry but
+        // still referencing the OLD space_id=5 (simulating a lagging
+        // peer). Phase 2 round-5 made apply_outbox accept this.
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_outbox(OutboxEntry {
+                id: OutboxEntryId([42; 16]),
+                space_id: SpaceId([5; 16]), // lagging — old loser id
+                recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+                message_cid: ContentId([7; 32]),
+                created_at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "device-a".into(),
+                },
+                delivered_to: [OwnerAddr([2; 16])].into_iter().collect(),
+                delivery_status: DeliveryStatus::Partial,
+            });
+        }
+        dev.a_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // After sync: A's entry still on canonicalized space_id=1,
+        // and BOTH acks ({1, 2}) are present → Complete.
+        let a = dev.a_state.lock().await;
+        let entry = a.outbox.get(&OutboxEntryId([42; 16])).unwrap();
+        assert_eq!(entry.space_id, SpaceId([1; 16]));
+        assert_eq!(entry.delivered_to.len(), 2);
+        assert_eq!(entry.delivery_status, DeliveryStatus::Complete);
+        drop(a);
+
+        dev.a_engine.shutdown().await;
+        dev.b_engine.shutdown().await;
+    }
 }
