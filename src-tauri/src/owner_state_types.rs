@@ -164,11 +164,12 @@ pub enum SpaceKind {
 pub struct ReticulumDest(pub Vec<u8>);
 
 /// Transport binding. Internally tagged so the wire format is one CBOR
-/// map per binding (not nested). Discriminant key `t`, variant codes
-/// `z` / `r` (canonical CBOR same-length); inner field names also two
-/// chars to match within the inner map.
+/// map per binding (not nested). Discriminant key `tg` (2 chars to match
+/// the inner field key length per `canonical_cbor_encode`'s same-length-
+/// keys precondition); variant codes `z` / `r` (1 char — values, not keys,
+/// so not subject to that rule); inner field names `tp` / `pa`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "t")]
+#[serde(tag = "tg")]
 pub enum TransportBinding {
     #[serde(rename = "z")]
     Zenoh {

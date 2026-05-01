@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, ReadMarker, Space, SpaceId,
+    DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, ReadMarker, Space,
+    SpaceId,
 };
 
 /// In-memory owner-state CRDT store. Phase 3 wraps this in persistence +
@@ -133,10 +134,15 @@ impl OwnerState {
         match self.outbox.get(&incoming.id) {
             None => {
                 let mut entry = incoming;
-                // Re-derive status from delivered_to. is_expired is false here —
-                // Phase 3 owns the wall-clock 30-day timer and will set
-                // delivery_status=Expired explicitly when it fires.
-                entry.delivery_status = entry.compute_status(false);
+                // Re-derive status from delivered_to via ack-driven
+                // transitions, but preserve Expired if the incoming
+                // entry is already marked Expired (Phase 3 stamps the
+                // 30-day wall-clock expiry and that decision must
+                // survive replication — re-deriving from acks alone
+                // would never produce Expired and would silently
+                // downgrade it to Pending/Partial/Complete).
+                let is_expired = matches!(entry.delivery_status, DeliveryStatus::Expired);
+                entry.delivery_status = entry.compute_status(is_expired);
                 self.outbox.insert(entry.id, entry);
                 ApplyOutcome::Inserted
             }
@@ -145,11 +151,12 @@ impl OwnerState {
                 merged
                     .delivered_to
                     .extend(incoming.delivered_to.iter().copied());
-                // Re-derive status from merged delivered_to. is_expired is
-                // false here — Phase 3 owns the wall-clock 30-day timer
-                // and will set delivery_status=Expired explicitly when
-                // it fires; we only handle the ack-driven transitions.
-                merged.delivery_status = merged.compute_status(false);
+                // Expired is sticky across both sides of a merge —
+                // either replica observing expiry seals the entry, so
+                // a stale ack arriving later cannot un-expire it.
+                let is_expired = matches!(existing.delivery_status, DeliveryStatus::Expired)
+                    || matches!(incoming.delivery_status, DeliveryStatus::Expired);
+                merged.delivery_status = merged.compute_status(is_expired);
                 self.outbox.insert(incoming.id, merged);
                 ApplyOutcome::Merged { old_id: None }
             }
@@ -229,32 +236,37 @@ impl OwnerState {
 
         // InboxEntry — composite key (space_id, message_cid) is the BTreeMap
         // key, so rewriting space_id requires rebuilding the entry under
-        // the new key.
-        let mut updates: Vec<(InboxKey, InboxEntry)> = Vec::new();
+        // the new key. If the rewrite collides with an existing
+        // (winner, message_cid) entry, delegate to `apply_inbox` so the
+        // earliest-received_at merge rule applies (rather than blindly
+        // overwriting).
+        let mut rewritten: Vec<InboxEntry> = Vec::new();
         let mut keys_to_remove: Vec<InboxKey> = Vec::new();
         for (k, v) in &self.inbox {
             if k.space_id == loser {
-                let new_key = InboxKey {
-                    space_id: winner,
-                    message_cid: k.message_cid,
-                };
                 let mut new_entry = v.clone();
                 new_entry.space_id = winner;
-                updates.push((new_key, new_entry));
+                rewritten.push(new_entry);
                 keys_to_remove.push(*k);
             }
         }
         for k in keys_to_remove {
             self.inbox.remove(&k);
         }
-        for (k, v) in updates {
-            self.inbox.insert(k, v);
+        for entry in rewritten {
+            // apply_inbox handles the (winner, message_cid) collision case
+            // by keeping the earliest received_at; outcome is discarded
+            // because canonicalization is a state rewrite, not a new apply.
+            let _ = self.apply_inbox(entry);
         }
 
-        // ReadMarker — keyed by space_id; rewrite map key.
+        // ReadMarker — keyed by space_id; rewrite map key. If the winner
+        // already has a marker, delegate to `apply_marker` so the
+        // monotone-advance rule applies (older HLC rejected, never
+        // regresses read progress).
         if let Some(mut marker) = self.markers.remove(&loser) {
             marker.space_id = winner;
-            self.markers.insert(winner, marker);
+            let _ = self.apply_marker(marker);
         }
     }
 
@@ -548,6 +560,85 @@ mod apply_outbox_tests {
         );
     }
 
+    /// Regression for PR #73 review: an Expired entry replicating in
+    /// from another device must NOT be downgraded back to Pending/
+    /// Partial/Complete just because we re-derive status from acks
+    /// alone. Phase 3 stamps Expired via the wall-clock 30-day timer
+    /// and that decision must survive replication.
+    #[test]
+    fn insert_preserves_expired_status() {
+        let mut s = OwnerState::default();
+        let mut e = entry(1, vec![10, 20, 30], vec![10]);
+        e.delivery_status = DeliveryStatus::Expired;
+        s.apply_outbox(e);
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Expired
+        );
+    }
+
+    /// Expired propagates across merges: if either side observed expiry
+    /// and the merged delivered_to still doesn't cover all recipients,
+    /// the entry stays Expired (would otherwise downgrade to Partial
+    /// because compute_status(false) can't see the wall-clock decision).
+    /// Note: if a merge happens to fill in ALL acks, compute_status
+    /// short-circuits to Complete regardless of is_expired — that's
+    /// intentional spec behavior (delivery did complete, just late).
+    #[test]
+    fn merge_preserves_expired_when_existing_expired_and_not_all_acked() {
+        let mut s = OwnerState::default();
+        // 3 recipients, only 1 acked — Expired and incomplete.
+        let mut existing = entry(1, vec![10, 20, 30], vec![10]);
+        existing.delivery_status = DeliveryStatus::Expired;
+        s.apply_outbox(existing);
+        // Late ack arrives for one more recipient (still not all 3).
+        s.apply_outbox(entry(1, vec![10, 20, 30], vec![20]));
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Expired
+        );
+    }
+
+    #[test]
+    fn merge_preserves_expired_when_incoming_expired_and_not_all_acked() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20, 30], vec![10]));
+        let mut incoming = entry(1, vec![10, 20, 30], vec![20]);
+        incoming.delivery_status = DeliveryStatus::Expired;
+        s.apply_outbox(incoming);
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Expired
+        );
+    }
+
+    /// Spec-defined: a merge that fills every recipient ack DOES upgrade
+    /// to Complete even if one side was Expired. Late delivery > expiry.
+    #[test]
+    fn merge_full_acks_overrides_expired() {
+        let mut s = OwnerState::default();
+        let mut existing = entry(1, vec![10, 20], vec![10]);
+        existing.delivery_status = DeliveryStatus::Expired;
+        s.apply_outbox(existing);
+        s.apply_outbox(entry(1, vec![10, 20], vec![20]));
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Complete
+        );
+    }
+
     #[test]
     fn distinct_outbox_ids_dont_collide() {
         let mut s = OwnerState::default();
@@ -799,6 +890,125 @@ mod canonicalization_tests {
         s.apply_space_with_canonicalization(dm(1, vec![1, 2], 200));
         let entry = s.outbox.get(&OutboxEntryId([99; 16])).unwrap();
         assert_eq!(entry.space_id, SpaceId([1; 16]));
+    }
+
+    /// Regression for PR #73 review: when both loser and winner have an
+    /// inbox entry for the same message_cid, the rewrite must NOT
+    /// overwrite the winner's entry. Earliest received_at must win
+    /// (matching apply_inbox's collision rule).
+    #[test]
+    fn dedupe_inbox_collision_keeps_earliest_received_at() {
+        let mut s = OwnerState::default();
+        // Both devices create the same DM independently and each
+        // receives the same message; the loser's entry has received_at
+        // = 200 (later), the winner's = 100 (earlier).
+        s.apply_space_with_canonicalization(dm(5, vec![1, 2], 100));
+        s.apply_space_with_canonicalization(dm(1, vec![1, 2], 100));
+        // Re-create the loser space so its inbox slot exists; tombstone-
+        // path doesn't matter here, we're testing the rewrite directly.
+        // To set up a true collision we manually populate both keys,
+        // then call canonicalization through a no-op apply that triggers
+        // the merge path. Instead, directly seed both inbox keys and
+        // exercise canonicalize_dependent_space_ids.
+        s.inbox.insert(
+            InboxKey {
+                space_id: SpaceId([5; 16]),
+                message_cid: ContentId([7; 32]),
+            },
+            InboxEntry {
+                space_id: SpaceId([5; 16]),
+                message_cid: ContentId([7; 32]),
+                from: OwnerAddr([2; 16]),
+                received_at: hlc(200), // later
+            },
+        );
+        s.inbox.insert(
+            InboxKey {
+                space_id: SpaceId([1; 16]),
+                message_cid: ContentId([7; 32]),
+            },
+            InboxEntry {
+                space_id: SpaceId([1; 16]),
+                message_cid: ContentId([7; 32]),
+                from: OwnerAddr([2; 16]),
+                received_at: hlc(100), // earlier — should win
+            },
+        );
+
+        s.canonicalize_dependent_space_ids(SpaceId([5; 16]), SpaceId([1; 16]));
+
+        // Old loser key gone; only the winner key remains.
+        assert!(!s.inbox.contains_key(&InboxKey {
+            space_id: SpaceId([5; 16]),
+            message_cid: ContentId([7; 32]),
+        }));
+        let winner_entry = s
+            .inbox
+            .get(&InboxKey {
+                space_id: SpaceId([1; 16]),
+                message_cid: ContentId([7; 32]),
+            })
+            .unwrap();
+        // Earlier (winner-side) received_at wins, NOT loser's later 200.
+        assert_eq!(winner_entry.received_at.wall_ms, 100);
+    }
+
+    /// Regression for PR #73 review: when both loser and winner have a
+    /// ReadMarker, the rewrite must NOT regress the winner's read
+    /// progress. The newer last_read_at must win (matching
+    /// apply_marker's monotone-advance rule).
+    #[test]
+    fn dedupe_marker_collision_keeps_newer_last_read_at() {
+        let mut s = OwnerState::default();
+        // Set up: winner already has a newer marker (300); loser has
+        // an older one (100). Rewrite must NOT regress to 100.
+        s.markers.insert(
+            SpaceId([5; 16]),
+            ReadMarker {
+                space_id: SpaceId([5; 16]),
+                last_read_at: hlc(100),
+            },
+        );
+        s.markers.insert(
+            SpaceId([1; 16]),
+            ReadMarker {
+                space_id: SpaceId([1; 16]),
+                last_read_at: hlc(300), // newer — must win
+            },
+        );
+
+        s.canonicalize_dependent_space_ids(SpaceId([5; 16]), SpaceId([1; 16]));
+
+        assert!(!s.markers.contains_key(&SpaceId([5; 16])));
+        let winner_marker = s.markers.get(&SpaceId([1; 16])).unwrap();
+        assert_eq!(winner_marker.last_read_at.wall_ms, 300);
+    }
+
+    /// Inverse case: when the loser's marker is newer, it should
+    /// advance the winner's marker (still monotone, just promoted).
+    #[test]
+    fn dedupe_marker_collision_loser_newer_advances_winner() {
+        let mut s = OwnerState::default();
+        s.markers.insert(
+            SpaceId([5; 16]),
+            ReadMarker {
+                space_id: SpaceId([5; 16]),
+                last_read_at: hlc(500), // newer
+            },
+        );
+        s.markers.insert(
+            SpaceId([1; 16]),
+            ReadMarker {
+                space_id: SpaceId([1; 16]),
+                last_read_at: hlc(100),
+            },
+        );
+
+        s.canonicalize_dependent_space_ids(SpaceId([5; 16]), SpaceId([1; 16]));
+
+        let winner_marker = s.markers.get(&SpaceId([1; 16])).unwrap();
+        assert_eq!(winner_marker.last_read_at.wall_ms, 500);
+        assert_eq!(winner_marker.space_id, SpaceId([1; 16]));
     }
 }
 
