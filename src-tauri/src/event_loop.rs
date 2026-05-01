@@ -286,6 +286,8 @@ pub async fn run<R: Runtime>(
                     Ok(sub) => {
                         let inbound_tx = handles.inbound_tx;
                         let closing_sub = Arc::clone(&closing);
+                        let app_late = app.clone();
+                        let topic_late = topic.clone();
                         tokio::spawn(async move {
                             // Two ways the loop ends:
                             //   1. `inbound_tx.send` fails — the engine
@@ -297,8 +299,12 @@ pub async fn run<R: Runtime>(
                             //      every routine stop_node.
                             //   2. `sub.recv_async` returns Err — the
                             //      Zenoh session/subscriber died on us.
-                            //      Warn unless event-loop shutdown is
-                            //      already in progress (closing flag).
+                            //      Warn AND emit the same degraded
+                            //      event used at install-time so the
+                            //      frontend can surface the failure
+                            //      consistently regardless of WHEN it
+                            //      happens. Skip both if the event
+                            //      loop is already shutting down.
                             loop {
                                 match sub.recv_async().await {
                                     Ok(sample) => {
@@ -311,6 +317,13 @@ pub async fn run<R: Runtime>(
                                         if !closing_sub.load(Ordering::SeqCst) {
                                             tracing::warn!(
                                                 "state-root subscriber closed unexpectedly"
+                                            );
+                                            let _ = app_late.emit(
+                                                "state-root-sync-degraded",
+                                                serde_json::json!({
+                                                    "reason": "subscriber_closed",
+                                                    "topic": &topic_late,
+                                                }),
                                             );
                                         }
                                         break;

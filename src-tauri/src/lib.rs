@@ -440,14 +440,33 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     if let Some(engine) = sync_engine {
         std::thread::scope(|s| {
             s.spawn(|| {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
-                    if let Err(e) = rt.block_on(engine.shutdown()) {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "SyncEngine final flush failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Without the ephemeral runtime we can't
+                        // drive `engine.shutdown()` from this sync
+                        // context, so the final publish + persist
+                        // are skipped. Surfacing the failure loudly
+                        // is the best we can do — silently dropping
+                        // the last delta would corrupt next-boot
+                        // state. Runtime build is essentially
+                        // infallible in practice (only fails on OOM
+                        // / thread-creation failure), so this path
+                        // is mostly defensive.
                         tracing::error!(
                             error = %e,
-                            "SyncEngine final flush failed during stop_inner"
+                            "could not build ephemeral tokio runtime for SyncEngine \
+                             shutdown — final publish/persist skipped"
                         );
                     }
                 }
@@ -665,8 +684,28 @@ async fn start_node(
 
                     let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
                     let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
+                    // Phase 3a uses a per-process InMemoryStub for the
+                    // ContentStore; cross-device convergence only works
+                    // in the test-only shared-stub setup. Production
+                    // multi-device will silently fail until Phase 3b
+                    // wires a real harmony-content CAS. Surface this to
+                    // the GUI on every successful boot so users
+                    // understand the limitation rather than seeing
+                    // "node started" with sync invisibly broken.
                     let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
                         std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+                    {
+                        use tauri::Emitter;
+                        let _ = app.emit(
+                            "state-root-sync-degraded",
+                            serde_json::json!({
+                                "reason": "phase_3a_in_memory_stub",
+                                "message": "Phase 3a uses an in-process content stub; \
+                                            cross-device state sync will not work until \
+                                            Phase 3b lands a real CAS backend.",
+                            }),
+                        );
+                    }
 
                     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -780,7 +819,7 @@ async fn start_node(
         let mail_mgr_clone = mail_mgr.clone();
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let sync_handles_for_loop = sync_handles_opt;
-        let thread = thread::Builder::new()
+        let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
             // Zenoh session setup; match the 8 MiB used throughout identity.rs.
@@ -833,27 +872,66 @@ async fn start_node(
                     )
                     .await;
                 });
-            })
-            .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
+            });
 
-        guard.thread = Some(thread);
-        guard.shutdown_tx = Some(shutdown_tx);
-        guard.publish_tx = Some(publish_tx);
-        guard.fetch_tx = Some(fetch_tx);
-        guard.ingest_tx = Some(ingest_tx);
-        guard.content_verb_tx = Some(content_verb_tx);
-        guard.content_index = content_index;
-        guard.follow_tx = Some(follow_tx);
-        guard.voice_tx = Some(voice_tx);
-        guard.voice_channel_tx = Some(voice_channel_tx);
-        guard.follow_mgr = Some(follow_mgr);
-        guard.followed_set = Some(followed_set);
-        guard.mail_mgr = Some(mail_mgr);
-        guard.mail_sync = Some(mail_sync);
-        guard.node_addr = node_addr_for_state;
-        guard.sync_engine = sync_engine_arc;
-        guard.generation
+        // If the runtime-thread spawn fails (rare — typically only on
+        // OOM / kernel-thread limits), the SyncEngine constructed
+        // above has ALREADY spawned its background tokio task. We
+        // can't drop the Arc<SyncEngine> here without first calling
+        // `shutdown()` — that would orphan the task and silently lose
+        // the final-flush path. The await must happen OUTSIDE this
+        // lock-held block (the std `MutexGuard` is `!Send` across an
+        // await point), so we capture the failure into a sentinel
+        // and clean up below.
+        let thread_install_failure: Option<String>;
+        match thread_result {
+            Ok(thread) => {
+                guard.thread = Some(thread);
+                guard.shutdown_tx = Some(shutdown_tx);
+                guard.publish_tx = Some(publish_tx);
+                guard.fetch_tx = Some(fetch_tx);
+                guard.ingest_tx = Some(ingest_tx);
+                guard.content_verb_tx = Some(content_verb_tx);
+                guard.content_index = content_index;
+                guard.follow_tx = Some(follow_tx);
+                guard.voice_tx = Some(voice_tx);
+                guard.voice_channel_tx = Some(voice_channel_tx);
+                guard.follow_mgr = Some(follow_mgr);
+                guard.followed_set = Some(followed_set);
+                guard.mail_mgr = Some(mail_mgr);
+                guard.mail_sync = Some(mail_sync);
+                guard.node_addr = node_addr_for_state;
+                guard.sync_engine = sync_engine_arc.clone();
+                thread_install_failure = None;
+            }
+            Err(e) => {
+                thread_install_failure = Some(format!("failed to spawn runtime thread: {e}"));
+            }
+        }
+        // The third tuple element carries the SyncEngine Arc back out
+        // of the block so the failure-cleanup path below can await
+        // `shutdown()` on it without holding the std `MutexGuard`
+        // across an await (the guard is `!Send`). On success this
+        // Arc is discarded; NodeState already owns its own clone.
+        (
+            guard.generation,
+            thread_install_failure,
+            sync_engine_arc.clone(),
+        )
     };
+    let (our_gen, thread_spawn_failure, engine_for_cleanup) = our_gen;
+
+    if let Some(msg) = thread_spawn_failure {
+        if let Some(engine) = engine_for_cleanup {
+            if let Err(e) = engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "SyncEngine cleanup after runtime-thread spawn failure"
+                );
+            }
+        }
+        return Err(msg);
+    }
 
     // Wait for the event loop to report startup success or failure.
     // stop_node can cancel this by signaling shutdown_tx (now registered).

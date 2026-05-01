@@ -125,6 +125,15 @@ impl SyncEngine {
     /// Force an immediate publish, bypassing the debounce window.
     /// Returns when the publish has been written to the outbound
     /// channel and any persistence flush has completed.
+    ///
+    /// Unconditionally publishes even when the engine has no pending
+    /// dirty state — this differs from the implicit shutdown flush,
+    /// which is gated on `has_pending_dirty`. The "force publish"
+    /// semantics are intentional for callers that need a fence-style
+    /// sync point (tests, explicit "sync now" UI). On an idle engine
+    /// the publish carries an advanced HLC but identical content, so
+    /// peers see one extra encrypt/decrypt round-trip — acceptable for
+    /// the cases that opt in to this method.
     pub async fn flush_now(&self) -> Result<(), SyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.flush_now_tx
@@ -145,6 +154,18 @@ impl SyncEngine {
     ///
     /// If the engine task was already gone (channel closed before our
     /// send landed), returns `Ok(())` — there was nothing to flush.
+    ///
+    /// Note: we DO NOT `handle.await` the JoinHandle. The internal
+    /// task is spawned via `tokio::spawn` on whatever runtime called
+    /// `SyncEngine::new` (Tauri's main runtime in production); but
+    /// `stop_inner` invokes `shutdown()` from a fresh current-thread
+    /// runtime via `std::thread::scope`. Awaiting a JoinHandle from
+    /// a different runtime than the one it was spawned on is not part
+    /// of tokio's documented contract and risks deadlocking under
+    /// future tokio releases. The `resp_rx.await` already gives the
+    /// flush-complete guarantee — the task sends on `resp_tx` as the
+    /// LAST step before `return`, so dropping the JoinHandle just
+    /// lets the task's final stack-pop happen on its own runtime.
     pub async fn shutdown(&self) -> Result<(), SyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let result = if self.shutdown_tx.send(resp_tx).await.is_ok() {
@@ -155,9 +176,8 @@ impl SyncEngine {
         } else {
             Ok(())
         };
-        if let Some(handle) = self.task.lock().await.take() {
-            let _ = handle.await;
-        }
+        // Drop the JoinHandle without awaiting it (see doc above for why).
+        let _ = self.task.lock().await.take();
         result
     }
 }
@@ -240,6 +260,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                 }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
+                // `flush_now` ALWAYS publishes, even on an idle engine
+                // (no `has_pending_dirty` guard, unlike the shutdown
+                // arm). This is intentional — see the public-facing
+                // doc on `SyncEngine::flush_now`. The cost is one
+                // extra Zenoh put + AES-GCM round-trip if the engine
+                // happens to be idle, which is acceptable for tests
+                // and explicit "force publish" callers.
                 next_wakeup = None;
                 ctx.has_pending_dirty.store(false, Ordering::Relaxed);
                 let pub_result = publish_root_now(&ctx).await;
@@ -389,12 +416,28 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    let logical = match tracker.get(&ctx.device_id) {
-        Some(prev) if prev.wall_ms == wall_ms => prev.logical + 1,
-        Some(prev) if prev.wall_ms > wall_ms => prev.logical + 1, // wall non-monotonic
-        _ => 0,
+    // Read once — both the logical-counter computation and the
+    // effective-wall pin need the same `prev`. Re-fetching from the
+    // map is cheap but invites future divergence; folding into one
+    // lookup keeps the read consistent.
+    //
+    // `saturating_add` on the logical counter: under sustained
+    // backward NTP correction or repeated clock-monotonicity faults
+    // we'd repeatedly bump `logical` without advancing `wall_ms`. An
+    // unchecked u32 add would eventually wrap and produce an HLC
+    // smaller than the previous one, breaking the strict-newer
+    // monotonicity that replay protection depends on. Saturation
+    // pins the value at u32::MAX instead — pathological but
+    // bounded; further publishes from the same device on the same
+    // wall_ms tick would be rejected by the receiver until the
+    // wall clock advances, which is preferable to silent replay.
+    let prev = tracker.get(&ctx.device_id).cloned();
+    let (logical, prev_wall) = match prev.as_ref() {
+        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) => (0, p.wall_ms),
+        None => (0, 0),
     };
-    let prev_wall = tracker.get(&ctx.device_id).map(|p| p.wall_ms).unwrap_or(0);
     let effective_wall = std::cmp::max(wall_ms, prev_wall);
 
     let now = Hlc {
