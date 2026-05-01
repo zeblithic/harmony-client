@@ -139,6 +139,61 @@ pub struct OutboxEntryId(
     pub [u8; 16],
 );
 
+/// Six SpaceKind variants. Wire format: single-char string per variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpaceKind {
+    #[serde(rename = "f")]
+    Folder,
+    #[serde(rename = "c")]
+    Community,
+    #[serde(rename = "h")]
+    Channel,
+    #[serde(rename = "p")]
+    PublicChannel,
+    #[serde(rename = "d")]
+    Dm,
+    #[serde(rename = "g")]
+    GroupDm,
+}
+
+/// Reticulum destination identifier — opaque bytes for Phase 2 (ZEB-16
+/// plane B has not finalized the wire shape). Wrapped as a newtype so
+/// future protocol changes don't ripple through every caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReticulumDest(pub Vec<u8>);
+
+/// Transport binding. Internally tagged so the wire format is one CBOR
+/// map per binding (not nested). Discriminant key `t`, variant codes
+/// `z` / `r` (canonical CBOR same-length); inner field names also two
+/// chars to match within the inner map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "t")]
+pub enum TransportBinding {
+    #[serde(rename = "z")]
+    Zenoh {
+        #[serde(rename = "tp")] // "topic"
+        topic: String,
+    },
+    #[serde(rename = "r")]
+    Reticulum {
+        #[serde(rename = "pa")] // "participants"
+        participants: Vec<ReticulumDest>,
+    },
+}
+
+/// Per-Space notification preference (owner-local; not propagated to
+/// other members).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationPref {
+    #[serde(rename = "a")]
+    All,
+    #[serde(rename = "m")]
+    Mentions,
+    #[serde(rename = "u")]
+    Muted,
+}
+
 #[cfg(test)]
 mod hlc_tests {
     use super::*;
@@ -257,5 +312,73 @@ mod newtype_tests {
         assert_eq!(bytes.len(), 34);
         assert_eq!(bytes[0], 0x58);
         assert_eq!(bytes[1], 0x20);
+    }
+}
+
+#[cfg(test)]
+mod enum_tests {
+    use super::*;
+    use ciborium::{from_reader, into_writer};
+
+    #[test]
+    fn space_kind_cbor_is_single_char() {
+        // text(1) "f" → 0x61 0x66
+        let k = SpaceKind::Folder;
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        assert_eq!(bytes, vec![0x61, b'f']);
+    }
+
+    #[test]
+    fn space_kind_round_trip_all_variants() {
+        for k in [
+            SpaceKind::Folder,
+            SpaceKind::Community,
+            SpaceKind::Channel,
+            SpaceKind::PublicChannel,
+            SpaceKind::Dm,
+            SpaceKind::GroupDm,
+        ] {
+            let mut bytes = Vec::new();
+            into_writer(&k, &mut bytes).unwrap();
+            let recovered: SpaceKind = from_reader(&bytes[..]).unwrap();
+            assert_eq!(k, recovered);
+        }
+    }
+
+    #[test]
+    fn transport_binding_zenoh_round_trip() {
+        let b = TransportBinding::Zenoh {
+            topic: "harmony/owner/state".into(),
+        };
+        let mut bytes = Vec::new();
+        into_writer(&b, &mut bytes).unwrap();
+        let recovered: TransportBinding = from_reader(&bytes[..]).unwrap();
+        assert_eq!(b, recovered);
+    }
+
+    #[test]
+    fn transport_binding_reticulum_round_trip() {
+        let b = TransportBinding::Reticulum {
+            participants: vec![ReticulumDest(vec![1, 2, 3])],
+        };
+        let mut bytes = Vec::new();
+        into_writer(&b, &mut bytes).unwrap();
+        let recovered: TransportBinding = from_reader(&bytes[..]).unwrap();
+        assert_eq!(b, recovered);
+    }
+
+    #[test]
+    fn notification_pref_round_trip() {
+        for p in [
+            NotificationPref::All,
+            NotificationPref::Mentions,
+            NotificationPref::Muted,
+        ] {
+            let mut bytes = Vec::new();
+            into_writer(&p, &mut bytes).unwrap();
+            let recovered: NotificationPref = from_reader(&bytes[..]).unwrap();
+            assert_eq!(p, recovered);
+        }
     }
 }
