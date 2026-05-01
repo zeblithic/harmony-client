@@ -181,6 +181,31 @@ impl OwnerState {
             }
         }
     }
+
+    /// Apply an incoming ReadMarker. `last_read_at` advances monotonically —
+    /// older HLCs are rejected so reading state never regresses.
+    pub fn apply_marker(&mut self, incoming: ReadMarker) -> ApplyOutcome {
+        match self.markers.get(&incoming.space_id) {
+            None => {
+                self.markers.insert(incoming.space_id, incoming);
+                ApplyOutcome::Inserted
+            }
+            Some(existing) => {
+                if incoming
+                    .last_read_at
+                    .is_strictly_newer_than(&existing.last_read_at)
+                {
+                    self.markers.insert(incoming.space_id, incoming);
+                    ApplyOutcome::Merged { old_id: None }
+                } else {
+                    ApplyOutcome::Rejected(RejectionReason::StaleHlc {
+                        kind: "ReadMarker",
+                        device_id: incoming.last_read_at.device_id.clone(),
+                    })
+                }
+            }
+        }
+    }
 }
 
 /// Merge two Space values using last-writer-wins per-field on
@@ -517,5 +542,74 @@ mod apply_inbox_tests {
         s.apply_inbox(entry(1, 2, 3, 100));
         s.apply_inbox(entry(99, 2, 3, 100));
         assert_eq!(s.inbox.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod apply_marker_tests {
+    use super::*;
+    use crate::owner_state_types::{Hlc, ReadMarker};
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn marker(space: u8, ts: u64) -> ReadMarker {
+        ReadMarker {
+            space_id: SpaceId([space; 16]),
+            last_read_at: hlc(ts),
+        }
+    }
+
+    #[test]
+    fn first_write_inserts() {
+        let mut s = OwnerState::default();
+        assert_eq!(s.apply_marker(marker(1, 100)), ApplyOutcome::Inserted);
+    }
+
+    #[test]
+    fn newer_marker_advances() {
+        let mut s = OwnerState::default();
+        s.apply_marker(marker(1, 100));
+        s.apply_marker(marker(1, 200));
+        assert_eq!(
+            s.markers
+                .get(&SpaceId([1; 16]))
+                .unwrap()
+                .last_read_at
+                .wall_ms,
+            200
+        );
+    }
+
+    #[test]
+    fn older_marker_does_not_regress() {
+        let mut s = OwnerState::default();
+        s.apply_marker(marker(1, 200));
+        let outcome = s.apply_marker(marker(1, 100));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::StaleHlc { .. })
+        ));
+        assert_eq!(
+            s.markers
+                .get(&SpaceId([1; 16]))
+                .unwrap()
+                .last_read_at
+                .wall_ms,
+            200
+        );
+    }
+
+    #[test]
+    fn distinct_spaces_dont_interfere() {
+        let mut s = OwnerState::default();
+        s.apply_marker(marker(1, 100));
+        s.apply_marker(marker(2, 50));
+        assert_eq!(s.markers.len(), 2);
     }
 }
