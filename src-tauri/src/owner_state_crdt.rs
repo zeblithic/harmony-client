@@ -9,19 +9,29 @@ use crate::owner_state_types::{
     DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, OwnerAddr,
     ReadMarker, Space, SpaceId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// In-memory owner-state CRDT store. Phase 3 wraps this in persistence +
 /// transport; Phase 2 owns purely the typed merge semantics.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+///
+/// Wire format: canonical CBOR map with single-letter-length keys to
+/// satisfy `canonical_cbor_encode`'s same-length-keys precondition
+/// (see Phase 1 spec). Phase 3a registers this type as
+/// `CanonicalPayload`; the renames here keep that registration honest.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerState {
+    #[serde(rename = "sp")]
     pub spaces: BTreeMap<SpaceId, Space>,
+    #[serde(rename = "ob")]
     pub outbox: BTreeMap<OutboxEntryId, OutboxEntry>,
+    #[serde(rename = "ib")]
     pub inbox: BTreeMap<InboxKey, InboxEntry>,
+    #[serde(rename = "mk")]
     pub markers: BTreeMap<SpaceId, ReadMarker>,
     /// Permanent tombstones — explicit `remove_space` writes a SpaceId here;
     /// re-add via the normal apply path is rejected. Distinct from
     /// `Space.left_at` which is reversible.
+    #[serde(rename = "tm")]
     pub tombstones: BTreeSet<SpaceId>,
 }
 
