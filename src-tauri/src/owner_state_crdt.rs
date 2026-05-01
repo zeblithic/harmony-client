@@ -124,6 +124,38 @@ impl OwnerState {
         self.spaces.remove(&space_id);
         self.tombstones.insert(space_id);
     }
+
+    /// Apply an incoming OutboxEntry to the CRDT. Upsert by
+    /// `OutboxEntryId`. On merge: `delivered_to` becomes the union of
+    /// both sets and `delivery_status` recomputes from the union.
+    /// OutboxEntries are NEVER GC'd in v1 — chat history.
+    pub fn apply_outbox(&mut self, incoming: OutboxEntry) -> ApplyOutcome {
+        match self.outbox.get(&incoming.id) {
+            None => {
+                let mut entry = incoming;
+                // Re-derive status from delivered_to. is_expired is false here —
+                // Phase 3 owns the wall-clock 30-day timer and will set
+                // delivery_status=Expired explicitly when it fires.
+                entry.delivery_status = entry.compute_status(false);
+                self.outbox.insert(entry.id, entry);
+                ApplyOutcome::Inserted
+            }
+            Some(existing) => {
+                let mut merged = existing.clone();
+                merged
+                    .delivered_to
+                    .extend(incoming.delivered_to.iter().copied());
+                // Re-derive status from merged delivered_to. is_expired is
+                // false here — Phase 3 owns the wall-clock 30-day timer
+                // and will set delivery_status=Expired explicitly when
+                // it fires; we only handle the ack-driven transitions.
+                merged.delivery_status = merged.compute_status(false);
+                self.outbox.insert(incoming.id, merged);
+                ApplyOutcome::Merged { old_id: None }
+            }
+        }
+    }
+
 }
 
 /// Merge two Space values using last-writer-wins per-field on
@@ -315,3 +347,87 @@ mod apply_space_tests {
         assert!(s.spaces.get(&SpaceId([1; 16])).unwrap().left_at.is_none());
     }
 }
+
+#[cfg(test)]
+mod apply_outbox_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr,
+    };
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn entry(id: u8, recipients: Vec<u8>, delivered: Vec<u8>) -> OutboxEntry {
+        OutboxEntry {
+            id: OutboxEntryId([id; 16]),
+            space_id: SpaceId([1; 16]),
+            recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            message_cid: ContentId([2; 32]),
+            created_at: hlc(100),
+            delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
+            delivery_status: DeliveryStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn first_write_inserts() {
+        let mut s = OwnerState::default();
+        let outcome = s.apply_outbox(entry(1, vec![10, 20], vec![]));
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+        assert_eq!(s.outbox.len(), 1);
+    }
+
+    #[test]
+    fn merge_unions_delivered_to() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20, 30], vec![10]));
+        let outcome = s.apply_outbox(entry(1, vec![10, 20, 30], vec![20]));
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        let merged = s.outbox.get(&OutboxEntryId([1; 16])).unwrap();
+        assert_eq!(merged.delivered_to.len(), 2);
+        assert!(merged.delivered_to.contains(&OwnerAddr([10; 16])));
+        assert!(merged.delivered_to.contains(&OwnerAddr([20; 16])));
+    }
+
+    #[test]
+    fn delivery_status_recomputes_to_complete_on_full_ack() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20], vec![10]));
+        s.apply_outbox(entry(1, vec![10, 20], vec![20]));
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Complete
+        );
+    }
+
+    #[test]
+    fn delivery_status_recomputes_to_partial_when_some_acked() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10, 20, 30], vec![10]));
+        assert_eq!(
+            s.outbox
+                .get(&OutboxEntryId([1; 16]))
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Partial
+        );
+    }
+
+    #[test]
+    fn distinct_outbox_ids_dont_collide() {
+        let mut s = OwnerState::default();
+        s.apply_outbox(entry(1, vec![10], vec![]));
+        s.apply_outbox(entry(2, vec![20], vec![]));
+        assert_eq!(s.outbox.len(), 2);
+    }
+}
+
