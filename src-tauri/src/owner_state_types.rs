@@ -382,3 +382,358 @@ mod enum_tests {
         }
     }
 }
+
+/// The unified Space CRDT entry — see ZEB-206 spec §"Space — unified
+/// entry in owner-state CRDT".
+///
+/// Wire-format note: every field is renamed to a 2-char code so all 12
+/// keys at this nesting level have identical encoded length (CBOR
+/// text(2) = 3 bytes per key). Mixing 1-char and 2-char renames here
+/// would re-introduce the same-length-keys violation Hlc had before
+/// PR #72 round 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Space {
+    #[serde(rename = "id")]
+    pub id: SpaceId,
+    #[serde(rename = "kn")]
+    pub kind: SpaceKind,
+    #[serde(rename = "pa")]
+    pub parent: Option<SpaceId>,
+    #[serde(rename = "ci")]
+    pub community_id: Option<SpaceId>,
+    #[serde(rename = "nm")]
+    pub name: String,
+    #[serde(rename = "tr")]
+    pub transport: Option<TransportBinding>,
+    #[serde(rename = "me")]
+    pub members: Vec<OwnerAddr>,
+    #[serde(rename = "cn")]
+    pub custom_name: Option<String>,
+    #[serde(rename = "np")]
+    pub notification_pref: Option<NotificationPref>,
+    #[serde(rename = "la")]
+    pub left_at: Option<Hlc>,
+    #[serde(rename = "ca")]
+    pub created_at: Hlc,
+    #[serde(rename = "ua")]
+    pub updated_at: Hlc,
+}
+
+/// Per-kind dedupe key — what the CRDT uses to identify "same Space"
+/// across two devices' independent writes. See ZEB-206 spec
+/// §"Dedupe key per Space kind".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DedupeKey {
+    /// Folders never dedupe — same name on different devices = different folders.
+    None,
+    /// Community / channel / group-dm: by Space.id.
+    Id(SpaceId),
+    /// public-channel: by Zenoh topic string.
+    Topic(String),
+    /// dm: by sorted members (immutable 2-member set).
+    SortedMembers(Vec<OwnerAddr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvariantError(pub String);
+
+impl Space {
+    /// Validate the kind-specific shape invariants. Run on every write
+    /// (locally produced) and after merge (incoming). See ZEB-206 spec
+    /// §"Invariants".
+    pub fn validate_invariants(&self) -> Result<(), InvariantError> {
+        match self.kind {
+            SpaceKind::Folder => {
+                if self.transport.is_some() {
+                    return Err(InvariantError("folder must have transport=None".into()));
+                }
+                if !self.members.is_empty() {
+                    return Err(InvariantError("folder must have members=[]".into()));
+                }
+            }
+            SpaceKind::Channel => {
+                if self.community_id.is_none() {
+                    return Err(InvariantError("channel must have community_id".into()));
+                }
+                match &self.transport {
+                    Some(TransportBinding::Zenoh { .. }) => {}
+                    _ => return Err(InvariantError("channel must have zenoh transport".into())),
+                }
+            }
+            SpaceKind::PublicChannel => {
+                if self.community_id.is_some() {
+                    return Err(InvariantError(
+                        "public-channel must have community_id=None".into(),
+                    ));
+                }
+                match &self.transport {
+                    Some(TransportBinding::Zenoh { .. }) => {}
+                    _ => {
+                        return Err(InvariantError(
+                            "public-channel must have zenoh transport".into(),
+                        ))
+                    }
+                }
+            }
+            SpaceKind::Dm => {
+                if self.members.len() != 2 {
+                    return Err(InvariantError(format!(
+                        "dm must have exactly 2 members, got {}",
+                        self.members.len()
+                    )));
+                }
+                match &self.transport {
+                    Some(TransportBinding::Reticulum { .. }) => {}
+                    _ => return Err(InvariantError("dm must have reticulum transport".into())),
+                }
+            }
+            SpaceKind::GroupDm => {
+                if !(3..=16).contains(&self.members.len()) {
+                    return Err(InvariantError(format!(
+                        "group-dm must have 3..=16 members, got {}",
+                        self.members.len()
+                    )));
+                }
+                match &self.transport {
+                    Some(TransportBinding::Reticulum { .. }) => {}
+                    _ => {
+                        return Err(InvariantError(
+                            "group-dm must have reticulum transport".into(),
+                        ))
+                    }
+                }
+            }
+            SpaceKind::Community => {
+                // community must have a corresponding CommunityMembership CRDT
+                // — that lives in Sub-C scope, not validated here.
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract the dedupe key for this Space — see ZEB-206 spec
+    /// §"Dedupe key per Space kind".
+    pub fn dedupe_key(&self) -> DedupeKey {
+        match self.kind {
+            SpaceKind::Folder => DedupeKey::None,
+            SpaceKind::Community | SpaceKind::Channel | SpaceKind::GroupDm => {
+                DedupeKey::Id(self.id)
+            }
+            SpaceKind::PublicChannel => match &self.transport {
+                Some(TransportBinding::Zenoh { topic }) => DedupeKey::Topic(topic.clone()),
+                _ => DedupeKey::Id(self.id), // invariant violation; should be caught by validate_invariants
+            },
+            SpaceKind::Dm => {
+                let mut sorted = self.members.clone();
+                sorted.sort();
+                DedupeKey::SortedMembers(sorted)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn folder() -> Space {
+        Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        }
+    }
+
+    #[test]
+    fn folder_invariants_pass() {
+        assert_eq!(folder().validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn folder_with_transport_rejects() {
+        let mut f = folder();
+        f.transport = Some(TransportBinding::Zenoh { topic: "x".into() });
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn folder_with_members_rejects() {
+        let mut f = folder();
+        f.members = vec![OwnerAddr([0u8; 16])];
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn dm_must_have_exactly_two_members() {
+        let mk_dm = |n_members: usize| Space {
+            id: SpaceId([2u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: (0..n_members).map(|i| OwnerAddr([i as u8; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(mk_dm(0).validate_invariants().is_err());
+        assert!(mk_dm(1).validate_invariants().is_err());
+        assert!(mk_dm(2).validate_invariants().is_ok());
+        assert!(mk_dm(3).validate_invariants().is_err());
+    }
+
+    #[test]
+    fn group_dm_caps_at_16() {
+        let mk = |n: usize| Space {
+            id: SpaceId([3u8; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Group".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: (0..n).map(|i| OwnerAddr([i as u8; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(mk(2).validate_invariants().is_err());
+        assert!(mk(3).validate_invariants().is_ok());
+        assert!(mk(16).validate_invariants().is_ok());
+        assert!(mk(17).validate_invariants().is_err());
+    }
+
+    #[test]
+    fn channel_must_have_community_id_and_zenoh_transport() {
+        let mk_channel =
+            |community_id: Option<SpaceId>, transport: Option<TransportBinding>| Space {
+                id: SpaceId([4u8; 16]),
+                kind: SpaceKind::Channel,
+                parent: None,
+                community_id,
+                name: "general".into(),
+                transport,
+                members: vec![],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: hlc(1),
+                updated_at: hlc(1),
+            };
+        // Missing community_id → reject.
+        assert!(
+            mk_channel(None, Some(TransportBinding::Zenoh { topic: "t".into() }))
+                .validate_invariants()
+                .is_err()
+        );
+        // Wrong transport → reject.
+        assert!(mk_channel(
+            Some(SpaceId([5u8; 16])),
+            Some(TransportBinding::Reticulum {
+                participants: vec![]
+            })
+        )
+        .validate_invariants()
+        .is_err());
+        // Both correct → pass.
+        assert!(mk_channel(
+            Some(SpaceId([5u8; 16])),
+            Some(TransportBinding::Zenoh { topic: "t".into() })
+        )
+        .validate_invariants()
+        .is_ok());
+    }
+
+    #[test]
+    fn dedupe_key_folder_is_none() {
+        assert_eq!(folder().dedupe_key(), DedupeKey::None);
+    }
+
+    #[test]
+    fn dedupe_key_dm_sorts_members() {
+        let mk_dm = |m: Vec<OwnerAddr>| Space {
+            id: SpaceId([6u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: m,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        let a = OwnerAddr([1u8; 16]);
+        let b = OwnerAddr([2u8; 16]);
+        // Both orderings produce the same dedupe key.
+        assert_eq!(
+            mk_dm(vec![a, b]).dedupe_key(),
+            mk_dm(vec![b, a]).dedupe_key()
+        );
+    }
+
+    #[test]
+    fn dedupe_key_public_channel_is_topic() {
+        let pc = Space {
+            id: SpaceId([7u8; 16]),
+            kind: SpaceKind::PublicChannel,
+            parent: None,
+            community_id: None,
+            name: "rust".into(),
+            transport: Some(TransportBinding::Zenoh {
+                topic: "harmony/public/rust".into(),
+            }),
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert_eq!(
+            pc.dedupe_key(),
+            DedupeKey::Topic("harmony/public/rust".into())
+        );
+    }
+
+    #[test]
+    fn space_round_trip_preserves_all_fields() {
+        let mut s = folder();
+        s.parent = Some(SpaceId([99u8; 16]));
+        s.custom_name = Some("My Work".into());
+        s.notification_pref = Some(NotificationPref::Mentions);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&s, &mut bytes).unwrap();
+        let recovered: Space = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(s, recovered);
+    }
+}
