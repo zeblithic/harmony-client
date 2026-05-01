@@ -288,4 +288,58 @@ mod tests {
         let loaded = load_replay(&path).unwrap();
         assert!(loaded.is_empty());
     }
+
+    #[test]
+    fn crdt_load_unknown_schema_version_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.cbor");
+        // 0xFF is reserved-future; v1 is 0x01.
+        std::fs::write(&path, [0xFF_u8, 0x00, 0x01]).unwrap();
+        let err = load_crdt(&path).expect_err("should error");
+        assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFF)));
+    }
+
+    #[test]
+    fn crdt_load_truncated_cbor_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.cbor");
+        // Schema v1 + arbitrary CBOR-like junk that won't decode.
+        std::fs::write(&path, [CRDT_FILE_SCHEMA_V1, 0xA1, 0x66]).unwrap();
+        let err = load_crdt(&path).expect_err("should error");
+        assert!(matches!(
+            err,
+            PersistError::CborDecode(_) | PersistError::Corrupt
+        ));
+    }
+
+    #[test]
+    fn crdt_load_empty_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.cbor");
+        std::fs::write(&path, []).unwrap();
+        let err = load_crdt(&path).expect_err("should error");
+        assert!(matches!(err, PersistError::Corrupt));
+    }
+
+    #[test]
+    fn replay_load_unknown_schema_version_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future_replay.cbor");
+        std::fs::write(&path, [0xFE_u8]).unwrap();
+        let err = load_replay(&path).expect_err("should error");
+        assert!(matches!(err, PersistError::UnknownSchemaVersion(0xFE)));
+    }
+
+    #[test]
+    fn crdt_load_trailing_bytes_after_valid_cbor_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_tail.cbor");
+        // Save a valid file, then append a junk byte.
+        save_crdt(&path, &OwnerState::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, bytes).unwrap();
+        let err = load_crdt(&path).expect_err("should error");
+        assert!(matches!(err, PersistError::Corrupt));
+    }
 }
