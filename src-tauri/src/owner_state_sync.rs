@@ -305,6 +305,64 @@ mod debounce_tests {
         assert_eq!(count, 1, "expected exactly one publish, got {}", count);
         engine.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn flush_now_fires_immediately() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000, // very long debounce — flush_now must beat it
+        );
+
+        engine.flush_now().await.unwrap();
+        // Must fire within ~50ms — well below the 5000ms debounce.
+        let bytes = tokio::time::timeout(Duration::from_millis(200), pub_rx.recv())
+            .await
+            .expect("publish within timeout")
+            .expect("not closed");
+        assert!(!bytes.is_empty());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn flush_now_cancels_pending_wakeup() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            200,
+        );
+
+        engine.notify_dirty();
+        // Don't wait for the debounce — call flush_now immediately.
+        engine.flush_now().await.unwrap();
+        // Drain — should see exactly one publish (flush_now's), not two.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut count = 0;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), pub_rx.recv()).await
+        {
+            count += 1;
+        }
+        assert_eq!(count, 1, "flush_now should cancel pending wakeup");
+        engine.shutdown().await;
+    }
 }
 
 #[cfg(test)]
