@@ -37,10 +37,14 @@ pub(crate) mod sealed {
 
 // Base-type impls used by Phase 2 owner_state_types. New impls go in
 // `owner_state_types`, NOT here — keep base-type impls together.
-// Note: [u8; N] is NOT listed here because the standard serde::Serialize
-// impl for arrays is not available for all lengths without serde_bytes;
-// the Phase 2 newtypes (SpaceId, OwnerAddr, etc.) use custom serialize
-// impls and are covered by their explicit impl_canonical! entries.
+// Note: we deliberately don't implement CanonicalPayload for `[u8; N]`.
+// The standard serde Serialize impl for `[u8; N]` emits a CBOR array
+// (major type 4), not a bstr — but our wire format requires bstr for
+// fixed-length identifiers. The Phase 2 newtypes (SpaceId, OwnerAddr,
+// ContentId, OutboxEntryId) wrap `[u8; N]` AND override its Serialize
+// impl with custom helpers that emit bstr. Their CanonicalPayload
+// impls live in `impl_canonical!` in owner_state_types.rs, not via
+// any blanket `[u8; N]` impl here.
 
 impl sealed::CanonicalPayloadSealed for u8 {}
 impl CanonicalPayload for u8 {}
@@ -828,6 +832,7 @@ mod tests {
         assert_canonical::<OutboxEntryId>();
         assert_canonical::<SpaceKind>();
         assert_canonical::<NotificationPref>();
+        assert_canonical::<ReticulumDest>();
         assert_canonical::<TransportBinding>();
         assert_canonical::<Space>();
         assert_canonical::<DeliveryStatus>();
