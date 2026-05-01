@@ -12,6 +12,7 @@ use crate::owner_state_crypto::KeyTree;
 use crate::owner_state_types::Hlc;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -52,6 +53,11 @@ pub struct PersistPaths {
 /// cleanly with one final flush.
 pub struct SyncEngine {
     notify_dirty: Arc<Notify>,
+    /// Set to `true` by `notify_dirty()`; cleared by the task after
+    /// each publish. Prevents the shutdown path from emitting a
+    /// spurious publish when the `Notify` permit was left over from
+    /// before the most-recent actual publish.
+    has_pending_dirty: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -76,6 +82,7 @@ impl SyncEngine {
         debounce_ms: u64,
     ) -> Self {
         let notify_dirty = Arc::new(Notify::new());
+        let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
@@ -90,12 +97,14 @@ impl SyncEngine {
             paths,
             debounce: std::time::Duration::from_millis(debounce_ms),
             notify_dirty: Arc::clone(&notify_dirty),
+            has_pending_dirty: Arc::clone(&has_pending_dirty),
             flush_now_rx,
             shutdown_rx,
         }));
 
         SyncEngine {
             notify_dirty,
+            has_pending_dirty,
             flush_now_tx,
             shutdown_tx,
             task: Mutex::new(Some(task)),
@@ -105,6 +114,7 @@ impl SyncEngine {
     /// Hint that local CRDT state has mutated and a debounced
     /// publish should fire after `debounce_ms`. Non-blocking.
     pub fn notify_dirty(&self) {
+        self.has_pending_dirty.store(true, Ordering::Relaxed);
         self.notify_dirty.notify_one();
     }
 
@@ -146,12 +156,155 @@ struct InternalCtx {
     paths: PersistPaths,
     debounce: std::time::Duration,
     notify_dirty: Arc<Notify>,
+    has_pending_dirty: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
 }
 
-async fn internal_task(_ctx: InternalCtx) {
-    // Tasks 9-15 fill in the loop body.
+async fn internal_task(mut ctx: InternalCtx) {
+    use std::time::Instant;
+
+    let mut next_wakeup: Option<Instant> = None;
+
+    loop {
+        // Compute the sleep duration for the wakeup branch.
+        let sleep_dur = next_wakeup
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+
+        tokio::select! {
+            _ = ctx.notify_dirty.notified() => {
+                // Extend (or arm) the debounce window on every dirty
+                // signal. This is a sliding debounce: multiple rapid
+                // calls reset the timer, collapsing to one publish
+                // 100ms after the last call in the burst.
+                if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                    next_wakeup = Some(Instant::now() + ctx.debounce);
+                }
+            }
+            _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
+                next_wakeup = None;
+                ctx.has_pending_dirty.store(false, Ordering::Relaxed);
+                if let Err(e) = publish_root_now(&ctx).await {
+                    tracing::warn!(error = %e, "publish_root_now failed");
+                }
+            }
+            Some(resp_tx) = ctx.flush_now_rx.recv() => {
+                next_wakeup = None;
+                ctx.has_pending_dirty.store(false, Ordering::Relaxed);
+                let result = publish_root_now(&ctx).await;
+                let _ = resp_tx.send(result);
+            }
+            Some(_bytes) = ctx.subscriber_rx.recv() => {
+                // Tasks 13-15 fill in receive handling.
+            }
+            Some(resp_tx) = ctx.shutdown_rx.recv() => {
+                // Flush only if there is genuinely unpublished dirty state.
+                if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                    let _ = publish_root_now(&ctx).await;
+                }
+                let _ = resp_tx.send(());
+                return;
+            }
+        }
+    }
+}
+
+/// Publish a state-root snapshot. Tasks 12 fills in real encryption +
+/// CAS put + Zenoh send; for now this writes a placeholder byte
+/// sequence to publisher_tx so the debounce tests have something
+/// observable.
+async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
+    // Placeholder for Task 9. Task 12 replaces this with the real
+    // encrypt → put → publish pipeline.
+    ctx.publisher_tx
+        .send(b"placeholder".to_vec())
+        .await
+        .map_err(|_| SyncError::TransportClosed)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+    use crate::content_store::InMemoryStub;
+    use std::time::Duration;
+
+    fn make_kt() -> Arc<KeyTree> {
+        Arc::new(KeyTree::derive(&[0u8; 32]).expect("kt"))
+    }
+
+    fn paths() -> (tempfile::TempDir, PersistPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PersistPaths {
+            crdt: dir.path().join("crdt.cbor"),
+            replay: dir.path().join("replay.cbor"),
+        };
+        (dir, paths)
+    }
+
+    /// One notify_dirty fires exactly one publish after the debounce.
+    #[tokio::test]
+    async fn single_notify_dirty_fires_one_publish() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            50, // shorter debounce for tests
+        );
+
+        engine.notify_dirty();
+        // Should fire within ~50ms; allow 500ms slack.
+        let bytes = tokio::time::timeout(Duration::from_millis(500), pub_rx.recv())
+            .await
+            .expect("publish within timeout")
+            .expect("not closed");
+        assert!(!bytes.is_empty(), "publish bytes should be non-empty");
+        engine.shutdown().await;
+    }
+
+    /// 50 rapid notify_dirty calls within one debounce window
+    /// collapse to exactly one publish.
+    #[tokio::test]
+    async fn rapid_notify_dirty_collapses_to_one_publish() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(64);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            100, // 100ms debounce
+        );
+
+        for _ in 0..50 {
+            engine.notify_dirty();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Wait long enough for the debounce to fire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Drain channel and count publishes.
+        let mut count = 0;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), pub_rx.recv()).await
+        {
+            count += 1;
+        }
+        assert_eq!(count, 1, "expected exactly one publish, got {}", count);
+        engine.shutdown().await;
+    }
 }
 
 #[cfg(test)]
