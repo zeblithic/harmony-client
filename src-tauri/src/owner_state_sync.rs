@@ -363,6 +363,52 @@ mod debounce_tests {
         assert_eq!(count, 1, "flush_now should cancel pending wakeup");
         engine.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_publish() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000, // long debounce — shutdown must short-circuit it
+        );
+
+        engine.notify_dirty();
+        engine.shutdown().await;
+        // After shutdown, the pending publish must already have fired.
+        let bytes = pub_rx.try_recv().expect("pending publish flushed");
+        assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_pending_writes_does_not_publish() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(16);
+        let (_sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let engine = SyncEngine::new(
+            make_kt(),
+            "test-device".into(),
+            Arc::new(Mutex::new(OwnerState::default())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(InMemoryStub::default()),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        engine.shutdown().await;
+        // No notify_dirty was called, so nothing to flush.
+        assert!(pub_rx.try_recv().is_err());
+    }
 }
 
 #[cfg(test)]
