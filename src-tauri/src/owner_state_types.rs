@@ -194,6 +194,40 @@ pub enum NotificationPref {
     Muted,
 }
 
+// ZEB-220 sealed trait impls — every wire type in this module must
+// implement `CanonicalPayload` so it can pass through
+// `canonical_cbor_encode` / `canonical_cbor_decode`. Adding a new
+// type to this module is incomplete until its impl is added here.
+
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
+
+macro_rules! impl_canonical {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl CanonicalPayloadSealed for $t {}
+            impl CanonicalPayload for $t {}
+        )*
+    };
+}
+
+impl_canonical!(
+    Hlc,
+    SpaceId,
+    OwnerAddr,
+    ContentId,
+    OutboxEntryId,
+    SpaceKind,
+    NotificationPref,
+    ReticulumDest,
+    TransportBinding,
+    Space,
+    DeliveryStatus,
+    OutboxEntry,
+    InboxKey,
+    InboxEntry,
+    ReadMarker,
+);
+
 #[cfg(test)]
 mod hlc_tests {
     use super::*;
