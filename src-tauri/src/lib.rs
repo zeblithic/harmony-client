@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub mod content_index;
+pub mod content_store;
 pub mod event_loop;
 pub mod folders;
 mod follows;
@@ -20,6 +21,8 @@ pub mod owner_commands;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
+pub mod owner_state_persist;
+pub mod owner_state_sync;
 pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
@@ -176,6 +179,10 @@ pub struct NodeState {
     /// running; the inner task drives the abstract pairing state machine
     /// against a `ZenohPairingTransport` bound to the running event loop.
     pairing_handle: Option<crate::pairing::state_machine::PairingHandle>,
+    /// Phase 3a SyncEngine — `Some` while the node is running and an
+    /// owner identity (master_seed) is available. Shutdown is called
+    /// explicitly in `stop_inner` before the event-loop thread is joined.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 }
 
 impl NodeState {
@@ -210,6 +217,7 @@ impl Default for NodeState {
             generation: 0,
             node_addr: String::new(),
             pairing_handle: None,
+            sync_engine: None,
         }
     }
 }
@@ -370,6 +378,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _followed_set,
         _mail_sync,
         pairing_handle,
+        sync_engine,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -399,6 +408,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             // "channel closed" errors until next start.
             guard.mail_sync.take(),
             guard.pairing_handle.take(),
+            guard.sync_engine.take(),
         )
     };
 
@@ -416,6 +426,53 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
+    // Phase 3a: explicitly shut down the SyncEngine before joining the
+    // event-loop thread. This flushes any pending debounced publish and
+    // runs the final persist pass. Must run before stop_handles so the
+    // engine's internal tokio task is still alive when we await it.
+    //
+    // `stop_inner` is sync, but it's reachable from async contexts (e.g.,
+    // start_node's restart path). Calling `Runtime::block_on` on a thread
+    // that already participates in a Tokio runtime panics with "Cannot
+    // start a runtime from within a runtime." Host the shutdown on a
+    // fresh OS thread via `thread::scope` so the new runtime sees no
+    // outer runtime context.
+    if let Some(engine) = sync_engine {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "SyncEngine final flush failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Without the ephemeral runtime we can't
+                        // drive `engine.shutdown()` from this sync
+                        // context, so the final publish + persist
+                        // are skipped. Surfacing the failure loudly
+                        // is the best we can do — silently dropping
+                        // the last delta would corrupt next-boot
+                        // state. Runtime build is essentially
+                        // infallible in practice (only fails on OOM
+                        // / thread-creation failure), so this path
+                        // is mostly defensive.
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for SyncEngine \
+                             shutdown — final publish/persist skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -483,39 +540,79 @@ async fn start_node(
     // Placeholder — set below once we have our_addr_bytes.
     let mail_mgr: std::sync::Arc<std::sync::Mutex<mail::MailManager>>;
 
-    let our_gen = {
+    // Stop existing node — extract handles under the lock in a tight
+    // inner scope so the std `MutexGuard` (which is `!Send`) is fully
+    // out of scope before the SyncEngine's `.await`. Without this
+    // scoping, rustc's async generator analysis sees the guard's
+    // storage slot as live across the await point and rejects the
+    // function as not `Send`.
+    let (
+        old_shutdown,
+        old_thread,
+        old_publish,
+        old_fetch,
+        old_ingest,
+        old_content_verb,
+        old_follow,
+        old_voice,
+        old_voice_channel,
+        old_pairing_handle,
+        old_sync_engine,
+    ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-
-        // Stop existing node — extract handles under lock, join outside.
-        let old_shutdown = guard.shutdown_tx.take();
-        let old_thread = guard.thread.take();
-        let old_publish = guard.publish_tx.take();
-        let old_fetch = guard.fetch_tx.take();
-        let old_ingest = guard.ingest_tx.take();
-        let old_content_verb = guard.content_verb_tx.take();
-        let old_follow = guard.follow_tx.take();
-        let old_voice = guard.voice_tx.take();
-        let old_voice_channel = guard.voice_channel_tx.take();
+        let tup = (
+            guard.shutdown_tx.take(),
+            guard.thread.take(),
+            guard.publish_tx.take(),
+            guard.fetch_tx.take(),
+            guard.ingest_tx.take(),
+            guard.content_verb_tx.take(),
+            guard.follow_tx.take(),
+            guard.voice_tx.take(),
+            guard.voice_channel_tx.take(),
+            guard.pairing_handle.take(),
+            guard.sync_engine.take(),
+        );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
-        let old_pairing_handle = guard.pairing_handle.take();
-        drop(guard);
-        // Drop pairing_handle BEFORE publish_tx so the SM task's transport
-        // sees its receiver close after the publish channel is gone — same
-        // ordering as stop_inner.
-        drop(old_pairing_handle);
-        drop(old_publish);
-        drop(old_fetch);
-        drop(old_ingest);
-        drop(old_content_verb);
-        drop(old_follow);
-        drop(old_voice);
-        drop(old_voice_channel);
-        stop_handles(old_shutdown, old_thread);
+        tup
+    };
 
-        // ── Identity (serialized by the lock — no concurrent generation race)
+    // Drop pairing_handle BEFORE publish_tx so the SM task's transport
+    // sees its receiver close after the publish channel is gone — same
+    // ordering as stop_inner.
+    drop(old_pairing_handle);
+    drop(old_publish);
+    drop(old_fetch);
+    drop(old_ingest);
+    drop(old_content_verb);
+    drop(old_follow);
+    drop(old_voice);
+    drop(old_voice_channel);
+    // Phase 3a: explicitly await the previous SyncEngine's shutdown
+    // before installing the replacement, so any pending debounced
+    // publish flushes and the final persist pass completes. Dropping
+    // alone is best-effort — the internal task could be mid-await
+    // and never observe the channel close in time. We're in async
+    // start_node, so no thread::scope juggling needed.
+    if let Some(engine) = old_sync_engine {
+        if let Err(e) = engine.shutdown().await {
+            tracing::error!(
+                error = %e,
+                "previous SyncEngine final flush failed during start_node restart"
+            );
+        }
+    }
+    stop_handles(old_shutdown, old_thread);
+
+    let our_gen = {
+        // ── Identity loading — no lock held here; the inner block at
+        //    line ~735 re-acquires the std::Mutex to atomically register
+        //    the new node handles. (Stopping the old node already ran
+        //    above outside this block, so the registration race window
+        //    is bounded by that re-acquisition only.)
         let id_path = identity::resolve_path(None)?;
         let id = identity::load_or_generate(&id_path)?;
         let identity::NodeIdentity { pq, ed25519 } = id;
@@ -549,6 +646,94 @@ async fn start_node(
             std::sync::Arc::clone(&mail_mgr),
             app.clone(),
         ));
+
+        // ── Phase 3a: SyncEngine construction ──────────────────────────
+        // Load the owner identity (master_seed + device_signing_key) to
+        // construct the SyncEngine. This is independent of the Reticulum
+        // network identity loaded above. If no owner identity exists yet
+        // (pre-mint), sync_handles / sync_engine are None and the rest of
+        // start_node proceeds normally.
+        let identity_dir = crate::owner_commands::resolve_identity_dir()?;
+        let owner_loaded = crate::owner_state::load_owner_state(
+            &identity_dir,
+            crate::identity::KeychainStore::new().ok(),
+        )?;
+
+        let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
+        let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
+            if let Some(ref loaded) = owner_loaded {
+                if let Some(seed) = loaded.master_seed.as_ref() {
+                    let kt = std::sync::Arc::new(
+                        crate::owner_state_crypto::KeyTree::derive(seed)
+                            .map_err(|e| format!("KeyTree::derive: {e}"))?,
+                    );
+                    let device_id = loaded
+                        .device_signing_key
+                        .verifying_key()
+                        .to_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+
+                    let crdt_path = identity_dir.join("owner_state_crdt.cbor");
+                    let replay_path = identity_dir.join("state_root_replay.cbor");
+                    let initial_crdt = crate::owner_state_persist::load_crdt(&crdt_path)
+                        .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
+                    let initial_replay = crate::owner_state_persist::load_replay(&replay_path)
+                        .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
+
+                    let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
+                    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
+                    // Phase 3a uses a per-process InMemoryStub for the
+                    // ContentStore; cross-device convergence only works
+                    // in the test-only shared-stub setup. Production
+                    // multi-device will silently fail until Phase 3b
+                    // wires a real harmony-content CAS. The GUI gets
+                    // a `state-root-sync-degraded` event AFTER the
+                    // event loop reports startup success — emitting
+                    // here would race the runtime-thread spawn and
+                    // could leave the banner up for nodes that never
+                    // came up.
+                    let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
+                        std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+
+                    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+                    let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
+                        std::sync::Arc::clone(&kt),
+                        device_id,
+                        std::sync::Arc::clone(&crdt_state),
+                        std::sync::Arc::clone(&tracker),
+                        content_store,
+                        out_tx,
+                        in_rx,
+                        crate::owner_state_sync::PersistPaths {
+                            crdt: crdt_path,
+                            replay: replay_path,
+                        },
+                        crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
+                    ));
+
+                    // Topic key is the OWNER identity (16-byte address from
+                    // `harmony_owner::state::OwnerState.owner_id`), not the
+                    // per-device Reticulum transport address — every device
+                    // bound to this owner must converge on the same Zenoh
+                    // topic `harmony/owner/{addr_hex}/state-root-v1`.
+                    let owner_addr_hex = hex::encode(loaded.state.owner_id);
+                    sync_handles_opt = Some(crate::event_loop::SyncEngineHandles {
+                        addr_hex: owner_addr_hex,
+                        outbound_rx: out_rx,
+                        inbound_tx: in_tx,
+                    });
+
+                    Some(engine)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         let node_addr_for_state = node_addr.clone();
         let config = NodeConfig {
@@ -623,7 +808,8 @@ async fn start_node(
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
-        let thread = thread::Builder::new()
+        let sync_handles_for_loop = sync_handles_opt;
+        let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
             // Zenoh session setup; match the 8 MiB used throughout identity.rs.
@@ -672,34 +858,94 @@ async fn start_node(
                         fetch_completion_tx,
                         fetch_completion_rx,
                         Some(pairing_in_tx),
+                        sync_handles_for_loop,
                     )
                     .await;
                 });
-            })
-            .map_err(|e| format!("failed to spawn runtime thread: {e}"))?;
+            });
 
-        guard.thread = Some(thread);
-        guard.shutdown_tx = Some(shutdown_tx);
-        guard.publish_tx = Some(publish_tx);
-        guard.fetch_tx = Some(fetch_tx);
-        guard.ingest_tx = Some(ingest_tx);
-        guard.content_verb_tx = Some(content_verb_tx);
-        guard.content_index = content_index;
-        guard.follow_tx = Some(follow_tx);
-        guard.voice_tx = Some(voice_tx);
-        guard.voice_channel_tx = Some(voice_channel_tx);
-        guard.follow_mgr = Some(follow_mgr);
-        guard.followed_set = Some(followed_set);
-        guard.mail_mgr = Some(mail_mgr);
-        guard.mail_sync = Some(mail_sync);
-        guard.node_addr = node_addr_for_state;
-        guard.generation
+        // If the runtime-thread spawn fails (rare — typically only on
+        // OOM / kernel-thread limits), the SyncEngine constructed
+        // above has ALREADY spawned its background tokio task. We
+        // can't drop the Arc<SyncEngine> here without first calling
+        // `shutdown()` — that would orphan the task and silently lose
+        // the final-flush path. The await must happen OUTSIDE this
+        // lock-held block (the std `MutexGuard` is `!Send` across an
+        // await point), so we capture the failure into a sentinel
+        // and clean up below.
+        let thread_install_failure: Option<String>;
+        match thread_result {
+            Ok(thread) => {
+                guard.thread = Some(thread);
+                guard.shutdown_tx = Some(shutdown_tx);
+                guard.publish_tx = Some(publish_tx);
+                guard.fetch_tx = Some(fetch_tx);
+                guard.ingest_tx = Some(ingest_tx);
+                guard.content_verb_tx = Some(content_verb_tx);
+                guard.content_index = content_index;
+                guard.follow_tx = Some(follow_tx);
+                guard.voice_tx = Some(voice_tx);
+                guard.voice_channel_tx = Some(voice_channel_tx);
+                guard.follow_mgr = Some(follow_mgr);
+                guard.followed_set = Some(followed_set);
+                guard.mail_mgr = Some(mail_mgr);
+                guard.mail_sync = Some(mail_sync);
+                guard.node_addr = node_addr_for_state;
+                guard.sync_engine = sync_engine_arc.clone();
+                thread_install_failure = None;
+            }
+            Err(e) => {
+                thread_install_failure = Some(format!("failed to spawn runtime thread: {e}"));
+            }
+        }
+        // The third tuple element carries the SyncEngine Arc back out
+        // of the block so the failure-cleanup path below can await
+        // `shutdown()` on it without holding the std `MutexGuard`
+        // across an await (the guard is `!Send`). On success this
+        // Arc is discarded; NodeState already owns its own clone.
+        (
+            guard.generation,
+            thread_install_failure,
+            sync_engine_arc.clone(),
+        )
     };
+    let (our_gen, thread_spawn_failure, engine_for_cleanup) = our_gen;
+
+    if let Some(msg) = thread_spawn_failure {
+        if let Some(engine) = engine_for_cleanup {
+            if let Err(e) = engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "SyncEngine cleanup after runtime-thread spawn failure"
+                );
+            }
+        }
+        return Err(msg);
+    }
 
     // Wait for the event loop to report startup success or failure.
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
         Ok(Ok(())) => 'arm: {
+            // Phase 3a: now that the event loop has signaled startup
+            // success, surface the InMemoryStub limitation to the GUI.
+            // Emitting earlier (during engine construction) could leave
+            // the degraded banner up for nodes that never came up.
+            // Gated on `engine_for_cleanup.is_some()` because nodes
+            // without a master_seed (pre-mint state) have no engine and
+            // shouldn't display a sync-degraded banner.
+            if engine_for_cleanup.is_some() {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "state-root-sync-degraded",
+                    serde_json::json!({
+                        "reason": "phase_3a_in_memory_stub",
+                        "message": "Phase 3a uses an in-process content stub; \
+                                    cross-device state sync will not work until \
+                                    Phase 3b lands a real CAS backend.",
+                    }),
+                );
+            }
             // ZEB-197: spawn the pairing state machine now that the
             // event loop is up. Construct ZenohPairingTransport with
             // a clone of publish_tx (publishes go through the running

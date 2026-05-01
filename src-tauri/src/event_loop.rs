@@ -22,6 +22,22 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// so that all nodes on the LAN broadcast/listen on the same port.
 const RETICULUM_UDP_PORT: u16 = 4242;
 
+/// Handles passed from `start_node` (lib.rs) into the event loop so the
+/// Zenoh adapter can wire the SyncEngine's mpsc channels to Zenoh pub/sub.
+///
+/// Constructed in `start_node` after the SyncEngine is built; consumed
+/// (via `take()`) inside `event_loop::run` once the Zenoh session is open.
+pub struct SyncEngineHandles {
+    /// Hex-encoded OWNER identity address (16 bytes) — used to form the
+    /// state-root topic key `harmony/owner/{addr_hex}/state-root-v1`.
+    /// Every device bound to one owner shares the same topic.
+    pub addr_hex: String,
+    /// Bytes produced by the SyncEngine for outbound Zenoh puts.
+    pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Bytes received from Zenoh, forwarded into the SyncEngine.
+    pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -137,6 +153,7 @@ pub async fn run<R: Runtime>(
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
     mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
     pairing_in_tx: Option<mpsc::Sender<crate::pairing::types::PairingWireMessage>>,
+    mut sync_handles: Option<SyncEngineHandles>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -221,6 +238,125 @@ pub async fn run<R: Runtime>(
 
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
+
+    // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
+    // The SyncEngine itself is constructed in start_node (lib.rs).
+    // Here in event_loop we own the Zenoh adapter — declaring publisher
+    // and subscriber on the state-root topic and forwarding bytes
+    // between the SyncEngine's channels and Zenoh.
+    if let Some(handles) = sync_handles.take() {
+        let topic = format!("harmony/owner/{}/state-root-v1", handles.addr_hex);
+        // Helper closure to surface adapter failures to the GUI as a
+        // `state-root-sync-degraded` event so the user can see Phase 3a
+        // sync isn't working — relying on log-only signals leaves the
+        // failure invisible to anyone not tailing harmony's logs.
+        // Engine itself remains alive: outbound publishes fail (engine
+        // logs SyncError::TransportClosed) and inbound is gated off by
+        // the engine's `inbound_closed` latch, so we operate in a
+        // graceful publish-only / fully-degraded mode rather than
+        // crashing the node.
+        let emit_degraded = |reason: &str| {
+            let _ = app.emit(
+                "state-root-sync-degraded",
+                serde_json::json!({
+                    "reason": reason,
+                    "topic": &topic,
+                }),
+            );
+        };
+        match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(key_expr) => {
+                // Outbound: drain SyncEngine publisher_tx → Zenoh put.
+                let session_pub = session.clone();
+                let key_pub = key_expr.clone();
+                let mut outbound_rx = handles.outbound_rx;
+                let closing_pub = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    while let Some(bytes) = outbound_rx.recv().await {
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(error = %e, "state-root publish failed");
+                            }
+                        }
+                    }
+                });
+
+                // Inbound: Zenoh subscriber → SyncEngine subscriber_rx.
+                match session.declare_subscriber(&key_expr).await {
+                    Ok(sub) => {
+                        let inbound_tx = handles.inbound_tx;
+                        let closing_sub = Arc::clone(&closing);
+                        let app_late = app.clone();
+                        let topic_late = topic.clone();
+                        tokio::spawn(async move {
+                            // Two ways the loop ends:
+                            //   1. `inbound_tx.send` fails — the engine
+                            //      dropped its subscriber_rx, i.e. the
+                            //      engine cleanly shut down. The engine
+                            //      logs its own shutdown trace; we stay
+                            //      silent here to avoid a spurious
+                            //      "subscriber closed unexpectedly" on
+                            //      every routine stop_node.
+                            //   2. `sub.recv_async` returns Err — the
+                            //      Zenoh session/subscriber died on us.
+                            //      Warn AND emit the same degraded
+                            //      event used at install-time so the
+                            //      frontend can surface the failure
+                            //      consistently regardless of WHEN it
+                            //      happens. Skip both if the event
+                            //      loop is already shutting down.
+                            loop {
+                                match sub.recv_async().await {
+                                    Ok(sample) => {
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if inbound_tx.send(bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if !closing_sub.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                "state-root subscriber closed unexpectedly"
+                                            );
+                                            let _ = app_late.emit(
+                                                "state-root-sync-degraded",
+                                                serde_json::json!({
+                                                    "reason": "subscriber_closed",
+                                                    "topic": &topic_late,
+                                                }),
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to declare state-root subscriber"
+                        );
+                        emit_degraded("declare_subscriber_failed");
+                        // Drop handles.inbound_tx by NOT spawning an
+                        // inbound forwarder; engine's subscriber_rx
+                        // hits None and latches `inbound_closed` so it
+                        // continues in publish-only mode.
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "state-root key_expr invalid; SyncEngine Zenoh adapter skipped"
+                );
+                emit_degraded("key_expr_invalid");
+                // handles.outbound_rx and handles.inbound_tx drop at end
+                // of this arm; engine sees both channels close.
+            }
+        }
+    }
 
     // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {

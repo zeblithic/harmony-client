@@ -135,6 +135,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     fetch_completion_tx,
                     fetch_completion_rx,
                     None, // pairing_in_tx — pairing not exercised in this test
+                    None, // sync_handles — SyncEngine not exercised in this test
                 )
                 .await;
             });
@@ -372,7 +373,8 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None,
+                    None, // pairing_in_tx
+                    None, // sync_handles — SyncEngine not exercised in this test
                 )
                 .await;
             });
@@ -688,7 +690,8 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None,
+                    None, // pairing_in_tx
+                    None, // sync_handles — SyncEngine not exercised in this test
                 )
                 .await;
             });

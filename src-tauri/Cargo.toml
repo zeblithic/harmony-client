@@ -62,9 +62,12 @@ hmac = "0.12"
 sha2 = "0.10"
 async-trait = "0.1"
 thiserror = "1"
+tempfile = "3"
 
 [dev-dependencies]
 serial_test = "3"
-tempfile = "3"
+# tempfile is declared in [dependencies] (used by save_atomically); cargo
+# already makes it available to tests, so a [dev-dependencies] entry would
+# be redundant and would misleadingly suggest test-only usage.
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

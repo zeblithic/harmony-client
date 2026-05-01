@@ -139,6 +139,20 @@ impl Hlc {
     }
 }
 
+/// State-root publish payload (encrypted plaintext on the
+/// `harmony/owner/{addr_hex}/state-root-v1` Zenoh topic).
+///
+/// Wire format: canonical CBOR map with two single-letter-length
+/// keys to satisfy `canonical_cbor_encode`'s same-length-keys
+/// precondition. See spec §"State-root payload format".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootPublishPayload {
+    #[serde(rename = "rc")]
+    pub root_cid: ContentId,
+    #[serde(rename = "at")]
+    pub at: Hlc,
+}
+
 /// 16-byte ULID-shaped identifier for Spaces. Stored on the wire as
 /// `bstr(16)` (17 encoded bytes incl. CBOR length byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -277,7 +291,16 @@ impl_canonical!(
     InboxKey,
     InboxEntry,
     ReadMarker,
+    RootPublishPayload,
 );
+
+// OwnerState lives in owner_state_crdt to keep CRDT semantics together;
+// its CanonicalPayload impl is registered here alongside all Phase 2 wire types.
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed
+    for crate::owner_state_crdt::OwnerState
+{
+}
+impl crate::owner_state_crypto::CanonicalPayload for crate::owner_state_crdt::OwnerState {}
 
 #[cfg(test)]
 mod hlc_tests {
@@ -827,6 +850,22 @@ mod marker_tests {
         ciborium::into_writer(&m, &mut bytes).unwrap();
         let recovered: ReadMarker = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(m, recovered);
+    }
+
+    #[test]
+    fn root_publish_payload_round_trip() {
+        let p = RootPublishPayload {
+            root_cid: ContentId([0xAA; 32]),
+            at: Hlc {
+                wall_ms: 12345,
+                logical: 7,
+                device_id: "alice".into(),
+            },
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&p, &mut bytes).unwrap();
+        let recovered: RootPublishPayload = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(p, recovered);
     }
 }
 
