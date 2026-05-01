@@ -1376,4 +1376,71 @@ mod integration_tests {
         dev.a_engine.shutdown().await;
         dev.b_engine.shutdown().await;
     }
+
+    /// 50 randomized sequences of (mutate-on-A, mutate-on-B,
+    /// publish-A, publish-B) operations. After draining, A and B
+    /// must hold equal `OwnerState`s. Catches non-determinism in
+    /// the merge path that scripted tests miss.
+    #[tokio::test]
+    async fn random_sequence_convergence_50x() {
+        // Seedable PRNG — chosen so a regression reproduces.
+        let mut rng_state: u64 = 0xdead_beef_cafe_babe;
+        fn next(rng: &mut u64) -> u64 {
+            // xorshift64
+            let mut x = *rng;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *rng = x;
+            x
+        }
+
+        for trial in 0..50 {
+            let dev = spawn_two_devices((trial % 256) as u8);
+            // Generate 8-12 random folder mutations split between A and B.
+            let n_ops = 8 + (next(&mut rng_state) % 5) as u8;
+            for op in 0..n_ops {
+                let folder_id = 100 + op;
+                let timestamp = 1000 + (next(&mut rng_state) % 10000);
+                let to_a = next(&mut rng_state) & 1 == 0;
+                let f = dm(
+                    folder_id,
+                    vec![1, 2 + (op % 3)], // distinct sorted-members per op
+                    timestamp,
+                );
+                if to_a {
+                    let mut a = dev.a_state.lock().await;
+                    a.apply_space_with_canonicalization(f);
+                } else {
+                    let mut b = dev.b_state.lock().await;
+                    b.apply_space_with_canonicalization(f);
+                }
+            }
+            dev.a_engine.notify_dirty();
+            dev.b_engine.notify_dirty();
+            // Multiple debounce + sync cycles to let convergence settle.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            // Force final flushes both directions and let them propagate.
+            dev.a_engine.flush_now().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            dev.b_engine.flush_now().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            dev.a_engine.flush_now().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let a = dev.a_state.lock().await;
+            let b = dev.b_state.lock().await;
+            assert_eq!(
+                a.spaces, b.spaces,
+                "trial {}: A and B spaces diverge\nA: {:?}\nB: {:?}",
+                trial, a.spaces, b.spaces
+            );
+            drop(a);
+            drop(b);
+
+            dev.a_engine.shutdown().await;
+            dev.b_engine.shutdown().await;
+        }
+    }
 }
