@@ -166,6 +166,23 @@ async fn internal_task(mut ctx: InternalCtx) {
 
     let mut next_wakeup: Option<Instant> = None;
 
+    // Pin the `Notified` future OUTSIDE the loop so its state persists
+    // across iterations. `tokio::select!` polls every branch in each
+    // iteration; when both `notified()` and another branch are Ready
+    // simultaneously, select picks one and drops the &mut reference to
+    // the others. If `notified()` was constructed inside the loop, that
+    // drop discards the consumed permit and the wakeup is silently
+    // lost. Pinning outside means the underlying `Notified` survives
+    // the dropped &mut, retains its `Done(consumed)` state, and the
+    // next iteration's poll returns `Ready` immediately — the permit's
+    // effect is preserved regardless of which branch select picked.
+    //
+    // After we successfully observe the notification, we replace the
+    // pinned future with a fresh `Notified` to start waiting again.
+    let notify = Arc::clone(&ctx.notify_dirty);
+    let notified = notify.notified();
+    tokio::pin!(notified);
+
     loop {
         // Compute the sleep duration for the wakeup branch.
         let sleep_dur = next_wakeup
@@ -173,14 +190,18 @@ async fn internal_task(mut ctx: InternalCtx) {
             .unwrap_or(std::time::Duration::from_secs(3600));
 
         tokio::select! {
-            _ = ctx.notify_dirty.notified() => {
+            _ = notified.as_mut() => {
                 // Extend (or arm) the debounce window on every dirty
                 // signal. This is a sliding debounce: multiple rapid
                 // calls reset the timer, collapsing to one publish
-                // 100ms after the last call in the burst.
+                // `debounce` after the last call in the burst.
                 if ctx.has_pending_dirty.load(Ordering::Relaxed) {
                     next_wakeup = Some(Instant::now() + ctx.debounce);
                 }
+                // Replace the pinned future with a fresh one so we wait
+                // for the next notification. Without this, subsequent
+                // polls of the Done future return Ready in a tight loop.
+                notified.set(notify.notified());
             }
             _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
                 next_wakeup = None;
@@ -201,11 +222,24 @@ async fn internal_task(mut ctx: InternalCtx) {
                 let _ = resp_tx.send(result);
             }
             Some(bytes) = ctx.subscriber_rx.recv() => {
-                if let Err(e) = handle_incoming_publish(&mut ctx, bytes).await {
+                // `handle_incoming_publish` returns:
+                //   Ok(true)  → tracker advanced + merge ran → persist
+                //   Ok(false) → replay-rejected duplicate → skip fsync
+                //   Err(_)    → may have advanced the tracker BEFORE
+                //               failing (e.g. missing blob, decrypt
+                //               failure), so persist defensively to
+                //               avoid losing replay state on restart
+                let outcome = handle_incoming_publish(&mut ctx, bytes).await;
+                let needs_persist = !matches!(outcome, Ok(false));
+                if let Err(e) = &outcome {
                     tracing::warn!(error = %e, "incoming publish dropped");
                 }
-                if let Err(e) = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await {
-                    tracing::warn!(error = %e, "persist_both failed");
+                if needs_persist {
+                    if let Err(e) =
+                        persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await
+                    {
+                        tracing::warn!(error = %e, "persist_both failed");
+                    }
                 }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
@@ -237,10 +271,26 @@ async fn persist_both(
     tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
     paths: &PersistPaths,
 ) -> Result<(), SyncError> {
+    // Snapshot under the async locks, then hop to a blocking thread for
+    // the actual file I/O. `save_crdt` / `save_replay` call `write_all`
+    // + `sync_all` (fsync) + `persist` (atomic rename) + (on Unix) a
+    // directory fsync — all blocking syscalls. Running them directly
+    // on the tokio runtime stalls the worker for the full fsync cost
+    // and starves debounce timers / inbound publishes.
     let state_snap = state.lock().await.clone();
     let tracker_snap = tracker.lock().await.clone();
-    crate::owner_state_persist::save_crdt(&paths.crdt, &state_snap)?;
-    crate::owner_state_persist::save_replay(&paths.replay, &tracker_snap)?;
+    let paths = paths.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), SyncError> {
+        crate::owner_state_persist::save_crdt(&paths.crdt, &state_snap)?;
+        crate::owner_state_persist::save_replay(&paths.replay, &tracker_snap)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        SyncError::Persist(crate::owner_state_persist::PersistError::Io(
+            std::io::Error::other(format!("spawn_blocking join: {e}")),
+        ))
+    })??;
     Ok(())
 }
 
@@ -318,8 +368,13 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     now
 }
 
+/// Process an incoming publish. Returns `Ok(true)` if local state or
+/// the replay tracker was actually mutated (caller should persist),
+/// `Ok(false)` if the publish was replay-rejected as a duplicate (no
+/// state change, no need to fsync). `Err` for transport / crypto /
+/// decode failures — caller logs and continues.
 #[allow(clippy::needless_pass_by_ref_mut)]
-async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result<(), SyncError> {
+async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result<bool, SyncError> {
     // 1. Decrypt the Zenoh wire payload.
     let payload_bytes =
         decrypt_root_publish(&ctx.kt, &wire).map_err(|e| SyncError::Crypto(e.to_string()))?;
@@ -334,7 +389,7 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result
             Some(existing) => payload.at.is_strictly_newer_than(existing),
         };
         if !accept {
-            return Ok(());
+            return Ok(false);
         }
         tracker.insert(payload.at.device_id.clone(), payload.at.clone());
     }
@@ -380,7 +435,8 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result
         }
     }
 
-    Ok(())
+    // Tracker advanced and merge ran — caller should persist.
+    Ok(true)
 }
 
 #[cfg(test)]

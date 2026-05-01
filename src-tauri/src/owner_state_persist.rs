@@ -5,6 +5,7 @@
 //! §"Persistence layer". Two files written via atomic-rename + fsync,
 //! each prefixed with a 1-byte schema version.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -26,8 +27,16 @@ pub enum PersistError {
 }
 
 /// Atomically replace `path` with `bytes`. Writes to a sibling
-/// tempfile, fsyncs, renames into place, then fsyncs the directory
-/// entry so the rename itself is durable.
+/// tempfile, fsyncs, renames into place, then (on Unix) fsyncs the
+/// directory entry so the rename itself is durable.
+///
+/// The directory fsync is Unix-only: `File::open(dir)` fails on
+/// Windows with `ERROR_ACCESS_DENIED` because Win32 does not expose a
+/// regular file handle for directories. Windows' `MoveFileEx`/
+/// `ReplaceFile` (used by `tempfile::NamedTempFile::persist`) is
+/// already atomic for in-volume renames on NTFS, and NTFS journals
+/// the directory update along with the file rename, so dropping the
+/// dir fsync on Windows preserves the same crash semantics.
 pub fn save_atomically(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
     let dir = path.parent().expect("save_atomically: path has no parent");
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -35,6 +44,7 @@ pub fn save_atomically(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
     tmp.as_file().sync_all()?;
     tmp.persist(path)
         .map_err(|e| PersistError::Io(std::io::Error::other(e)))?;
+    #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     Ok(())
 }

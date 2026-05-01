@@ -28,7 +28,9 @@ const RETICULUM_UDP_PORT: u16 = 4242;
 /// Constructed in `start_node` after the SyncEngine is built; consumed
 /// (via `take()`) inside `event_loop::run` once the Zenoh session is open.
 pub struct SyncEngineHandles {
-    /// Hex-encoded node address — used to form the state-root topic key.
+    /// Hex-encoded OWNER identity address (16 bytes) — used to form the
+    /// state-root topic key `harmony/owner/{addr_hex}/state-root-v1`.
+    /// Every device bound to one owner shares the same topic.
     pub addr_hex: String,
     /// Bytes produced by the SyncEngine for outbound Zenoh puts.
     pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,

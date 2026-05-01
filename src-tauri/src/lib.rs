@@ -430,13 +430,24 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
     // engine's internal tokio task is still alive when we await it.
+    //
+    // `stop_inner` is sync, but it's reachable from async contexts (e.g.,
+    // start_node's restart path). Calling `Runtime::block_on` on a thread
+    // that already participates in a Tokio runtime panics with "Cannot
+    // start a runtime from within a runtime." Host the shutdown on a
+    // fresh OS thread via `thread::scope` so the new runtime sees no
+    // outer runtime context.
     if let Some(engine) = sync_engine {
-        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            rt.block_on(engine.shutdown());
-        }
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(engine.shutdown());
+                }
+            });
+        });
     }
     stop_handles(shutdown_tx, thread);
     had_node
@@ -505,40 +516,74 @@ async fn start_node(
     // Placeholder — set below once we have our_addr_bytes.
     let mail_mgr: std::sync::Arc<std::sync::Mutex<mail::MailManager>>;
 
-    let our_gen = {
+    // Stop existing node — extract handles under the lock in a tight
+    // inner scope so the std `MutexGuard` (which is `!Send`) is fully
+    // out of scope before the SyncEngine's `.await`. Without this
+    // scoping, rustc's async generator analysis sees the guard's
+    // storage slot as live across the await point and rejects the
+    // function as not `Send`.
+    let (
+        old_shutdown,
+        old_thread,
+        old_publish,
+        old_fetch,
+        old_ingest,
+        old_content_verb,
+        old_follow,
+        old_voice,
+        old_voice_channel,
+        old_pairing_handle,
+        old_sync_engine,
+    ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-
-        // Stop existing node — extract handles under lock, join outside.
-        let old_shutdown = guard.shutdown_tx.take();
-        let old_thread = guard.thread.take();
-        let old_publish = guard.publish_tx.take();
-        let old_fetch = guard.fetch_tx.take();
-        let old_ingest = guard.ingest_tx.take();
-        let old_content_verb = guard.content_verb_tx.take();
-        let old_follow = guard.follow_tx.take();
-        let old_voice = guard.voice_tx.take();
-        let old_voice_channel = guard.voice_channel_tx.take();
+        let tup = (
+            guard.shutdown_tx.take(),
+            guard.thread.take(),
+            guard.publish_tx.take(),
+            guard.fetch_tx.take(),
+            guard.ingest_tx.take(),
+            guard.content_verb_tx.take(),
+            guard.follow_tx.take(),
+            guard.voice_tx.take(),
+            guard.voice_channel_tx.take(),
+            guard.pairing_handle.take(),
+            guard.sync_engine.take(),
+        );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
-        let old_pairing_handle = guard.pairing_handle.take();
-        let _old_sync_engine = guard.sync_engine.take();
-        drop(guard);
-        // Drop pairing_handle BEFORE publish_tx so the SM task's transport
-        // sees its receiver close after the publish channel is gone — same
-        // ordering as stop_inner.
-        drop(old_pairing_handle);
-        drop(old_publish);
-        drop(old_fetch);
-        drop(old_ingest);
-        drop(old_content_verb);
-        drop(old_follow);
-        drop(old_voice);
-        drop(old_voice_channel);
-        stop_handles(old_shutdown, old_thread);
+        tup
+    };
 
-        // ── Identity (serialized by the lock — no concurrent generation race)
+    // Drop pairing_handle BEFORE publish_tx so the SM task's transport
+    // sees its receiver close after the publish channel is gone — same
+    // ordering as stop_inner.
+    drop(old_pairing_handle);
+    drop(old_publish);
+    drop(old_fetch);
+    drop(old_ingest);
+    drop(old_content_verb);
+    drop(old_follow);
+    drop(old_voice);
+    drop(old_voice_channel);
+    // Phase 3a: explicitly await the previous SyncEngine's shutdown
+    // before installing the replacement, so any pending debounced
+    // publish flushes and the final persist pass completes. Dropping
+    // alone is best-effort — the internal task could be mid-await
+    // and never observe the channel close in time. We're in async
+    // start_node, so no thread::scope juggling needed.
+    if let Some(engine) = old_sync_engine {
+        engine.shutdown().await;
+    }
+    stop_handles(old_shutdown, old_thread);
+
+    let our_gen = {
+        // ── Identity loading — no lock held here; the inner block at
+        //    line ~735 re-acquires the std::Mutex to atomically register
+        //    the new node handles. (Stopping the old node already ran
+        //    above outside this block, so the registration race window
+        //    is bounded by that re-acquisition only.)
         let id_path = identity::resolve_path(None)?;
         let id = identity::load_or_generate(&id_path)?;
         let identity::NodeIdentity { pq, ed25519 } = id;
@@ -631,8 +676,14 @@ async fn start_node(
                         crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
                     ));
 
+                    // Topic key is the OWNER identity (16-byte address from
+                    // `harmony_owner::state::OwnerState.owner_id`), not the
+                    // per-device Reticulum transport address — every device
+                    // bound to this owner must converge on the same Zenoh
+                    // topic `harmony/owner/{addr_hex}/state-root-v1`.
+                    let owner_addr_hex = hex::encode(loaded.state.owner_id);
                     sync_handles_opt = Some(crate::event_loop::SyncEngineHandles {
-                        addr_hex: node_addr.clone(),
+                        addr_hex: owner_addr_hex,
                         outbound_rx: out_rx,
                         inbound_tx: in_tx,
                     });
