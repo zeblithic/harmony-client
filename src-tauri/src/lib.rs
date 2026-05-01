@@ -179,6 +179,10 @@ pub struct NodeState {
     /// running; the inner task drives the abstract pairing state machine
     /// against a `ZenohPairingTransport` bound to the running event loop.
     pairing_handle: Option<crate::pairing::state_machine::PairingHandle>,
+    /// Phase 3a SyncEngine — `Some` while the node is running and an
+    /// owner identity (master_seed) is available. Shutdown is called
+    /// explicitly in `stop_inner` before the event-loop thread is joined.
+    sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
 }
 
 impl NodeState {
@@ -213,6 +217,7 @@ impl Default for NodeState {
             generation: 0,
             node_addr: String::new(),
             pairing_handle: None,
+            sync_engine: None,
         }
     }
 }
@@ -373,6 +378,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _followed_set,
         _mail_sync,
         pairing_handle,
+        sync_engine,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -402,6 +408,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             // "channel closed" errors until next start.
             guard.mail_sync.take(),
             guard.pairing_handle.take(),
+            guard.sync_engine.take(),
         )
     };
 
@@ -419,6 +426,18 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
+    // Phase 3a: explicitly shut down the SyncEngine before joining the
+    // event-loop thread. This flushes any pending debounced publish and
+    // runs the final persist pass. Must run before stop_handles so the
+    // engine's internal tokio task is still alive when we await it.
+    if let Some(engine) = sync_engine {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(engine.shutdown());
+        }
+    }
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -504,6 +523,7 @@ async fn start_node(
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
         let old_pairing_handle = guard.pairing_handle.take();
+        let _old_sync_engine = guard.sync_engine.take();
         drop(guard);
         // Drop pairing_handle BEFORE publish_tx so the SM task's transport
         // sees its receiver close after the publish channel is gone — same
@@ -552,6 +572,78 @@ async fn start_node(
             std::sync::Arc::clone(&mail_mgr),
             app.clone(),
         ));
+
+        // ── Phase 3a: SyncEngine construction ──────────────────────────
+        // Load the owner identity (master_seed + device_signing_key) to
+        // construct the SyncEngine. This is independent of the Reticulum
+        // network identity loaded above. If no owner identity exists yet
+        // (pre-mint), sync_handles / sync_engine are None and the rest of
+        // start_node proceeds normally.
+        let identity_dir = crate::owner_commands::resolve_identity_dir()?;
+        let owner_loaded = crate::owner_state::load_owner_state(
+            &identity_dir,
+            crate::identity::KeychainStore::new().ok(),
+        )?;
+
+        let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
+        let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
+            if let Some(ref loaded) = owner_loaded {
+                if let Some(seed) = loaded.master_seed.as_ref() {
+                    let kt = std::sync::Arc::new(
+                        crate::owner_state_crypto::KeyTree::derive(seed)
+                            .map_err(|e| format!("KeyTree::derive: {e}"))?,
+                    );
+                    let device_id = loaded
+                        .device_signing_key
+                        .verifying_key()
+                        .to_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+
+                    let crdt_path = identity_dir.join("owner_state_crdt.cbor");
+                    let replay_path = identity_dir.join("state_root_replay.cbor");
+                    let initial_crdt = crate::owner_state_persist::load_crdt(&crdt_path)
+                        .map_err(|e| format!("load owner_state_crdt.cbor: {e}"))?;
+                    let initial_replay = crate::owner_state_persist::load_replay(&replay_path)
+                        .map_err(|e| format!("load state_root_replay.cbor: {e}"))?;
+
+                    let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
+                    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
+                    let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
+                        std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+
+                    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+                    let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
+                        std::sync::Arc::clone(&kt),
+                        device_id,
+                        std::sync::Arc::clone(&crdt_state),
+                        std::sync::Arc::clone(&tracker),
+                        content_store,
+                        out_tx,
+                        in_rx,
+                        crate::owner_state_sync::PersistPaths {
+                            crdt: crdt_path,
+                            replay: replay_path,
+                        },
+                        crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
+                    ));
+
+                    sync_handles_opt = Some(crate::event_loop::SyncEngineHandles {
+                        addr_hex: node_addr.clone(),
+                        outbound_rx: out_rx,
+                        inbound_tx: in_tx,
+                    });
+
+                    Some(engine)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         let node_addr_for_state = node_addr.clone();
         let config = NodeConfig {
@@ -626,6 +718,7 @@ async fn start_node(
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
+        let sync_handles_for_loop = sync_handles_opt;
         let thread = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -675,6 +768,7 @@ async fn start_node(
                         fetch_completion_tx,
                         fetch_completion_rx,
                         Some(pairing_in_tx),
+                        sync_handles_for_loop,
                     )
                     .await;
                 });
@@ -696,6 +790,7 @@ async fn start_node(
         guard.mail_mgr = Some(mail_mgr);
         guard.mail_sync = Some(mail_sync);
         guard.node_addr = node_addr_for_state;
+        guard.sync_engine = sync_engine_arc;
         guard.generation
     };
 

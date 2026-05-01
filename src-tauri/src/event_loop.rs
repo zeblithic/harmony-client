@@ -22,6 +22,20 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// so that all nodes on the LAN broadcast/listen on the same port.
 const RETICULUM_UDP_PORT: u16 = 4242;
 
+/// Handles passed from `start_node` (lib.rs) into the event loop so the
+/// Zenoh adapter can wire the SyncEngine's mpsc channels to Zenoh pub/sub.
+///
+/// Constructed in `start_node` after the SyncEngine is built; consumed
+/// (via `take()`) inside `event_loop::run` once the Zenoh session is open.
+pub struct SyncEngineHandles {
+    /// Hex-encoded node address — used to form the state-root topic key.
+    pub addr_hex: String,
+    /// Bytes produced by the SyncEngine for outbound Zenoh puts.
+    pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Bytes received from Zenoh, forwarded into the SyncEngine.
+    pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -137,6 +151,7 @@ pub async fn run<R: Runtime>(
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
     mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
     pairing_in_tx: Option<mpsc::Sender<crate::pairing::types::PairingWireMessage>>,
+    mut sync_handles: Option<SyncEngineHandles>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -221,6 +236,65 @@ pub async fn run<R: Runtime>(
 
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
+
+    // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
+    // The SyncEngine itself is constructed in start_node (lib.rs).
+    // Here in event_loop we own the Zenoh adapter — declaring publisher
+    // and subscriber on the state-root topic and forwarding bytes
+    // between the SyncEngine's channels and Zenoh.
+    if let Some(handles) = sync_handles.take() {
+        let topic = format!("harmony/owner/{}/state-root-v1", handles.addr_hex);
+        match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(key_expr) => {
+                // Outbound: drain SyncEngine publisher_tx → Zenoh put.
+                let session_pub = session.clone();
+                let key_pub = key_expr.clone();
+                let mut outbound_rx = handles.outbound_rx;
+                let closing_pub = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    while let Some(bytes) = outbound_rx.recv().await {
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(error = %e, "state-root publish failed");
+                            }
+                        }
+                    }
+                });
+
+                // Inbound: Zenoh subscriber → SyncEngine subscriber_rx.
+                match session.declare_subscriber(&key_expr).await {
+                    Ok(sub) => {
+                        let inbound_tx = handles.inbound_tx;
+                        let closing_sub = Arc::clone(&closing);
+                        tokio::spawn(async move {
+                            while let Ok(sample) = sub.recv_async().await {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if inbound_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if !closing_sub.load(Ordering::SeqCst) {
+                                tracing::warn!("state-root subscriber closed unexpectedly");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to declare state-root subscriber"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "state-root key_expr invalid; SyncEngine Zenoh adapter skipped"
+                );
+            }
+        }
+    }
 
     // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {

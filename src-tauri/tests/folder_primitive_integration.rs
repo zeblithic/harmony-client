@@ -243,7 +243,8 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None,
+                    None, // pairing_in_tx — pairing not exercised in this test
+                    None, // sync_handles — SyncEngine not exercised in this test
                 )
                 .await;
             });
