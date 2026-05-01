@@ -856,6 +856,59 @@ mod subscriber_tests {
 
         engine.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn subscriber_logs_and_skips_when_blob_missing() {
+        // Build a wire payload but DON'T put the blob in the store —
+        // simulate cross-process / cross-device case where the
+        // publisher and subscriber don't share their stubs.
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store_publisher = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let store_subscriber = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let local_state = Arc::new(Mutex::new(OwnerState::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let engine = SyncEngine::new(
+            Arc::clone(&kt),
+            "self-device".into(),
+            Arc::clone(&local_state),
+            Arc::clone(&tracker),
+            Arc::clone(&store_subscriber), // subscriber's stub is empty
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+        );
+
+        let mut remote = OwnerState::default();
+        remote.spaces.insert(SpaceId([42; 16]), folder(42, 100));
+
+        // Publisher puts the blob in its OWN stub; subscriber's
+        // stub never receives it.
+        let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0);
+        sub_tx.send(wire).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Subscriber must NOT have merged — local stays empty.
+        let local = local_state.lock().await;
+        assert!(
+            local.spaces.is_empty(),
+            "subscriber should have skipped the merge for missing blob"
+        );
+        drop(local);
+
+        // BUT replay tracker should still have advanced — we accepted
+        // the publish, just couldn't fetch the data. That's OK because
+        // the next publish from the same peer will carry a newer HLC
+        // and a new (hopefully present) root_cid.
+        let t = tracker.lock().await;
+        assert!(t.contains_key("peer-bob"), "tracker must still record");
+        drop(t);
+
+        engine.shutdown().await;
+    }
 }
 
 #[cfg(test)]
