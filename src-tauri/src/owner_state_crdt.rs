@@ -73,9 +73,28 @@ impl OwnerState {
             return ApplyOutcome::Rejected(RejectionReason::Tombstoned(incoming.id));
         }
 
-        // 3. Check for same-SpaceId update first (always valid, even for folders).
+        // 3. Check for same-SpaceId update first (always valid for
+        //    folders/communities/channels/group-dms — their dedupe_key
+        //    is derived from `id` or is `None`, so it can't change).
+        //    For DMs (dedupe_key = sorted members) and PublicChannels
+        //    (dedupe_key = Zenoh topic), the dedupe-key fields ARE
+        //    mutable on the same SpaceId, so we must reject any merge
+        //    that would change the dedupe_key — otherwise two live
+        //    SpaceIds could end up sharing a dedupe_key without ever
+        //    going through the cross-id collision branch (step 4) and
+        //    the canonicalization rewrite would be skipped entirely.
         if self.spaces.contains_key(&incoming.id) {
-            let merged = lww_merge_space(self.spaces.get(&incoming.id).unwrap(), &incoming);
+            let existing = self.spaces.get(&incoming.id).unwrap();
+            let existing_dk = existing.dedupe_key();
+            let merged = lww_merge_space(existing, &incoming);
+            if merged.dedupe_key() != existing_dk {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "same-SpaceId update would change dedupe_key for {:?} \
+                     (DM members or PublicChannel topic are immutable on \
+                     the same SpaceId; logical identity changes need a fresh ULID)",
+                    incoming.id
+                )));
+            }
             self.spaces.insert(incoming.id, merged);
             return ApplyOutcome::Merged { old_id: None };
         }
@@ -271,7 +290,10 @@ impl OwnerState {
     }
 
     /// Apply an incoming ReadMarker. `last_read_at` advances monotonically —
-    /// older HLCs are rejected so reading state never regresses.
+    /// strictly-older HLCs are rejected so reading state never regresses.
+    /// An identical HLC is treated as an idempotent replay (succeed
+    /// without mutation) — sync flows replay the same marker freely
+    /// and `Rejected` should be reserved for genuine conflicts.
     pub fn apply_marker(&mut self, incoming: ReadMarker) -> ApplyOutcome {
         match self.markers.get(&incoming.space_id) {
             None => {
@@ -285,11 +307,17 @@ impl OwnerState {
                 {
                     self.markers.insert(incoming.space_id, incoming);
                     ApplyOutcome::Merged { old_id: None }
-                } else {
+                } else if existing
+                    .last_read_at
+                    .is_strictly_newer_than(&incoming.last_read_at)
+                {
                     ApplyOutcome::Rejected(RejectionReason::StaleHlc {
                         kind: "ReadMarker",
                         device_id: incoming.last_read_at.device_id.clone(),
                     })
+                } else {
+                    // Equal HLCs — same logical write, idempotent replay.
+                    ApplyOutcome::Merged { old_id: None }
                 }
             }
         }
@@ -483,6 +511,45 @@ mod apply_space_tests {
         d1.updated_at = hlc(300);
         s.apply_space(d1);
         assert!(s.spaces.get(&SpaceId([1; 16])).unwrap().left_at.is_none());
+    }
+
+    /// Regression for PR #73 round 2 review: a same-SpaceId DM update
+    /// that swaps members would change `dedupe_key()` and could create
+    /// two live SpaceIds sharing a sorted-members key without ever
+    /// going through the cross-id collision branch. Reject up front.
+    #[test]
+    fn same_id_dm_member_swap_rejects() {
+        let mut s = OwnerState::default();
+        s.apply_space(dm(1, vec![1, 2], 100));
+        let outcome = s.apply_space(dm(1, vec![3, 4], 200));
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
+            ),
+            "expected InvariantFail, got {:?}",
+            outcome
+        );
+        let stored = s.spaces.get(&SpaceId([1; 16])).unwrap();
+        assert_eq!(stored.members.len(), 2);
+        assert_eq!(stored.members[0], OwnerAddr([1; 16]));
+        assert_eq!(stored.members[1], OwnerAddr([2; 16]));
+    }
+
+    /// Same-SpaceId update that does NOT touch dedupe-key fields
+    /// (e.g., custom_name on a DM) must still pass.
+    #[test]
+    fn same_id_dm_non_dedupe_field_update_succeeds() {
+        let mut s = OwnerState::default();
+        s.apply_space(dm(1, vec![1, 2], 100));
+        let mut updated = dm(1, vec![1, 2], 200);
+        updated.custom_name = Some("renamed".into());
+        let outcome = s.apply_space(updated);
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        assert_eq!(
+            s.spaces.get(&SpaceId([1; 16])).unwrap().custom_name,
+            Some("renamed".into())
+        );
     }
 }
 
@@ -778,6 +845,27 @@ mod apply_marker_tests {
         s.apply_marker(marker(1, 100));
         s.apply_marker(marker(2, 50));
         assert_eq!(s.markers.len(), 2);
+    }
+
+    /// Regression for PR #73 round 2 review: an exact-duplicate marker
+    /// (same HLC) replays as a successful idempotent op, not as a
+    /// stale-write rejection. Sync flows replay the same marker freely;
+    /// `Rejected` is reserved for genuine conflict (strictly older).
+    #[test]
+    fn equal_hlc_marker_is_idempotent_replay() {
+        let mut s = OwnerState::default();
+        s.apply_marker(marker(1, 100));
+        let outcome = s.apply_marker(marker(1, 100));
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        // Stored marker must be unchanged (same HLC, no mutation).
+        assert_eq!(
+            s.markers
+                .get(&SpaceId([1; 16]))
+                .unwrap()
+                .last_read_at
+                .wall_ms,
+            100
+        );
     }
 }
 

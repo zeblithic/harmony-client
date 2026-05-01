@@ -24,6 +24,52 @@ where
     s.serialize_bytes(b)
 }
 
+/// Helper: serialize a `Vec<u8>` as CBOR bstr (major type 2). Used by
+/// variable-length opaque-bytes wrapper types like `ReticulumDest` so
+/// they don't accidentally encode as a CBOR array of u8 (major type 4).
+fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_bytes(b)
+}
+
+/// Helper: deserialize a CBOR bstr into a `Vec<u8>`. Pair with
+/// `serialize_vec_as_bstr`.
+fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Visitor;
+    use std::fmt;
+
+    struct VecBytesVisitor;
+
+    impl<'de> Visitor<'de> for VecBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "a CBOR byte string (major type 2)")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Vec<u8>, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Vec<u8>, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v)
+        }
+    }
+
+    d.deserialize_bytes(VecBytesVisitor)
+}
+
 /// Helper: deserialize CBOR bstr into byte array.
 fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
 where
@@ -161,7 +207,13 @@ pub enum SpaceKind {
 /// future protocol changes don't ripple through every caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ReticulumDest(pub Vec<u8>);
+pub struct ReticulumDest(
+    #[serde(
+        serialize_with = "serialize_vec_as_bstr",
+        deserialize_with = "deserialize_vec_from_bstr"
+    )]
+    pub Vec<u8>,
+);
 
 /// Transport binding. Internally tagged so the wire format is one CBOR
 /// map per binding (not nested). Discriminant key `tg` (2 chars to match
@@ -403,6 +455,24 @@ mod enum_tests {
         assert_eq!(b, recovered);
     }
 
+    /// Regression for PR #73 round 2 review: ReticulumDest must encode
+    /// as CBOR bstr (major type 2), not as a CBOR array of u8 (major
+    /// type 4). Pin the wire bytes so any future serde-attribute change
+    /// that breaks bstr emission fails loudly.
+    #[test]
+    fn reticulum_dest_emits_cbor_bstr() {
+        let d = ReticulumDest(vec![0xde, 0xad, 0xbe, 0xef]);
+        let mut bytes = Vec::new();
+        into_writer(&d, &mut bytes).unwrap();
+        // CBOR bstr len=4: 0x44 (major type 2, length 4) + the 4 bytes.
+        // CBOR array len=4 would be 0x84 + four u8-encoded values
+        // (each itself another byte or two), so this byte pattern would
+        // never match an array encoding.
+        assert_eq!(bytes, vec![0x44, 0xde, 0xad, 0xbe, 0xef]);
+        let recovered: ReticulumDest = from_reader(&bytes[..]).unwrap();
+        assert_eq!(d, recovered);
+    }
+
     #[test]
     fn notification_pref_round_trip() {
         for p in [
@@ -511,10 +581,15 @@ impl Space {
                 }
             }
             SpaceKind::Dm => {
-                if self.members.len() != 2 {
+                // Distinct-member check: dedupe_key() collapses members
+                // via SortedMembers, so [alice, alice] would otherwise
+                // pass len==2 here yet hash to a 1-member dedupe key.
+                let unique: BTreeSet<&OwnerAddr> = self.members.iter().collect();
+                if self.members.len() != 2 || unique.len() != 2 {
                     return Err(InvariantError(format!(
-                        "dm must have exactly 2 members, got {}",
-                        self.members.len()
+                        "dm must have exactly 2 distinct members, got {} ({} unique)",
+                        self.members.len(),
+                        unique.len()
                     )));
                 }
                 match &self.transport {
@@ -523,10 +598,12 @@ impl Space {
                 }
             }
             SpaceKind::GroupDm => {
-                if !(3..=16).contains(&self.members.len()) {
+                let unique: BTreeSet<&OwnerAddr> = self.members.iter().collect();
+                if !(3..=16).contains(&self.members.len()) || unique.len() != self.members.len() {
                     return Err(InvariantError(format!(
-                        "group-dm must have 3..=16 members, got {}",
-                        self.members.len()
+                        "group-dm must have 3..=16 distinct members, got {} ({} unique)",
+                        self.members.len(),
+                        unique.len()
                     )));
                 }
                 match &self.transport {
@@ -893,6 +970,61 @@ mod space_tests {
         assert!(mk(3).validate_invariants().is_ok());
         assert!(mk(16).validate_invariants().is_ok());
         assert!(mk(17).validate_invariants().is_err());
+    }
+
+    /// Regression for PR #73 round 2 review: a DM with two identical
+    /// members ([alice, alice]) passes the len==2 check today but
+    /// dedupe_key collapses it to one member. Reject up front.
+    #[test]
+    fn dm_rejects_duplicate_members() {
+        let mut d = Space {
+            id: SpaceId([2u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([1u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(d.validate_invariants().is_err());
+        // Distinct members still pass.
+        d.members = vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])];
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn group_dm_rejects_duplicate_members() {
+        let g = Space {
+            id: SpaceId([3u8; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Group".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            // 4 entries but only 3 distinct — len passes 3..=16 but
+            // dedupe_key would collapse to 3 sorted members.
+            members: vec![
+                OwnerAddr([1u8; 16]),
+                OwnerAddr([2u8; 16]),
+                OwnerAddr([3u8; 16]),
+                OwnerAddr([1u8; 16]),
+            ],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+        };
+        assert!(g.validate_invariants().is_err());
     }
 
     #[test]
