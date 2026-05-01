@@ -58,6 +58,16 @@ impl OwnerState {
         }
 
         // 2. Tombstone check — if this Space's id is tombstoned, reject.
+        //
+        // Note: tombstones are stored by SpaceId. The ZEB-206 spec
+        // §"Tombstones vs leaves" says re-creating a Space with the same
+        // *dedupe key* should be blocked, which would also block re-adds
+        // via a fresh SpaceId for non-folder kinds (e.g., a tombstoned DM
+        // re-created via a different ULID with the same sorted-members).
+        // That's a Phase-3 concern: it requires durable tombstone storage
+        // keyed by dedupe key, which is the natural shape once the store
+        // is persisted alongside the rest of owner-state. Phase 2 is
+        // in-memory only, so the gap is bounded.
         if self.tombstones.contains(&incoming.id) {
             return ApplyOutcome::Rejected(RejectionReason::Tombstoned(incoming.id));
         }
@@ -120,6 +130,13 @@ impl OwnerState {
 /// `updated_at` HLC. `created_at` always takes the earlier HLC.
 /// Caller is responsible for setting the merged Space's `id` correctly
 /// (the dedupe-key-based caller already chose the winning ULID).
+///
+/// Equal-timestamp tie-break: when `a.updated_at == b.updated_at`,
+/// `is_strictly_newer_than` returns false and we keep `a` (the existing
+/// record). This is a "keep local" bias which is stable and safe — the
+/// HLC's logical+device_id components mean exact-equality is rare in
+/// practice (two devices would need identical wall_ms AND identical
+/// logical AND identical device_id, which collapses to "the same write").
 fn lww_merge_space(a: &Space, b: &Space) -> Space {
     let newer = if b.updated_at.is_strictly_newer_than(&a.updated_at) {
         b
