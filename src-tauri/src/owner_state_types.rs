@@ -599,6 +599,81 @@ impl OutboxEntry {
     }
 }
 
+/// InboxEntry composite lookup key. `(space_id, message_cid)` is the
+/// upsert key for inbox writes — see ZEB-206 spec §"Idempotency".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct InboxKey {
+    #[serde(rename = "sp")]
+    pub space_id: SpaceId,
+    #[serde(rename = "mc")]
+    pub message_cid: ContentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEntry {
+    #[serde(rename = "sp")]
+    pub space_id: SpaceId,
+    #[serde(rename = "mc")]
+    pub message_cid: ContentId,
+    #[serde(rename = "fr")]
+    pub from: OwnerAddr,
+    #[serde(rename = "ra")]
+    pub received_at: Hlc,
+}
+
+impl InboxEntry {
+    pub fn key(&self) -> InboxKey {
+        InboxKey {
+            space_id: self.space_id,
+            message_cid: self.message_cid,
+        }
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    #[test]
+    fn key_extracts_composite() {
+        let e = InboxEntry {
+            space_id: SpaceId([1u8; 16]),
+            message_cid: ContentId([2u8; 32]),
+            from: OwnerAddr([3u8; 16]),
+            received_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        assert_eq!(
+            e.key(),
+            InboxKey {
+                space_id: SpaceId([1u8; 16]),
+                message_cid: ContentId([2u8; 32])
+            }
+        );
+    }
+
+    #[test]
+    fn inbox_entry_round_trip() {
+        let e = InboxEntry {
+            space_id: SpaceId([7u8; 16]),
+            message_cid: ContentId([8u8; 32]),
+            from: OwnerAddr([9u8; 16]),
+            received_at: Hlc {
+                wall_ms: 50,
+                logical: 1,
+                device_id: "alice".into(),
+            },
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&e, &mut bytes).unwrap();
+        let recovered: InboxEntry = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(e, recovered);
+    }
+}
+
 #[cfg(test)]
 mod outbox_tests {
     use super::*;
