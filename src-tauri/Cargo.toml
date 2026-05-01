@@ -32,13 +32,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
 # their types (PrivateIdentity, PqPrivateIdentity, MemoryBookStore, etc.).
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
 harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", branch = "main" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", branch = "main", features = ["recovery"] }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8", features = ["recovery"] }
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
