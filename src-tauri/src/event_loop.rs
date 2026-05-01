@@ -246,6 +246,24 @@ pub async fn run<R: Runtime>(
     // between the SyncEngine's channels and Zenoh.
     if let Some(handles) = sync_handles.take() {
         let topic = format!("harmony/owner/{}/state-root-v1", handles.addr_hex);
+        // Helper closure to surface adapter failures to the GUI as a
+        // `state-root-sync-degraded` event so the user can see Phase 3a
+        // sync isn't working — relying on log-only signals leaves the
+        // failure invisible to anyone not tailing harmony's logs.
+        // Engine itself remains alive: outbound publishes fail (engine
+        // logs SyncError::TransportClosed) and inbound is gated off by
+        // the engine's `inbound_closed` latch, so we operate in a
+        // graceful publish-only / fully-degraded mode rather than
+        // crashing the node.
+        let emit_degraded = |reason: &str| {
+            let _ = app.emit(
+                "state-root-sync-degraded",
+                serde_json::json!({
+                    "reason": reason,
+                    "topic": &topic,
+                }),
+            );
+        };
         match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
             Ok(key_expr) => {
                 // Outbound: drain SyncEngine publisher_tx → Zenoh put.
@@ -269,14 +287,35 @@ pub async fn run<R: Runtime>(
                         let inbound_tx = handles.inbound_tx;
                         let closing_sub = Arc::clone(&closing);
                         tokio::spawn(async move {
-                            while let Ok(sample) = sub.recv_async().await {
-                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                if inbound_tx.send(bytes).await.is_err() {
-                                    break;
+                            // Two ways the loop ends:
+                            //   1. `inbound_tx.send` fails — the engine
+                            //      dropped its subscriber_rx, i.e. the
+                            //      engine cleanly shut down. The engine
+                            //      logs its own shutdown trace; we stay
+                            //      silent here to avoid a spurious
+                            //      "subscriber closed unexpectedly" on
+                            //      every routine stop_node.
+                            //   2. `sub.recv_async` returns Err — the
+                            //      Zenoh session/subscriber died on us.
+                            //      Warn unless event-loop shutdown is
+                            //      already in progress (closing flag).
+                            loop {
+                                match sub.recv_async().await {
+                                    Ok(sample) => {
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if inbound_tx.send(bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if !closing_sub.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                "state-root subscriber closed unexpectedly"
+                                            );
+                                        }
+                                        break;
+                                    }
                                 }
-                            }
-                            if !closing_sub.load(Ordering::SeqCst) {
-                                tracing::warn!("state-root subscriber closed unexpectedly");
                             }
                         });
                     }
@@ -285,6 +324,11 @@ pub async fn run<R: Runtime>(
                             error = %e,
                             "failed to declare state-root subscriber"
                         );
+                        emit_degraded("declare_subscriber_failed");
+                        // Drop handles.inbound_tx by NOT spawning an
+                        // inbound forwarder; engine's subscriber_rx
+                        // hits None and latches `inbound_closed` so it
+                        // continues in publish-only mode.
                     }
                 }
             }
@@ -294,6 +338,9 @@ pub async fn run<R: Runtime>(
                     %topic,
                     "state-root key_expr invalid; SyncEngine Zenoh adapter skipped"
                 );
+                emit_degraded("key_expr_invalid");
+                // handles.outbound_rx and handles.inbound_tx drop at end
+                // of this arm; engine sees both channels close.
             }
         }
     }

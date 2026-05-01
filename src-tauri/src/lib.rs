@@ -444,7 +444,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
                     .enable_all()
                     .build()
                 {
-                    rt.block_on(engine.shutdown());
+                    if let Err(e) = rt.block_on(engine.shutdown()) {
+                        tracing::error!(
+                            error = %e,
+                            "SyncEngine final flush failed during stop_inner"
+                        );
+                    }
                 }
             });
         });
@@ -574,7 +579,12 @@ async fn start_node(
     // and never observe the channel close in time. We're in async
     // start_node, so no thread::scope juggling needed.
     if let Some(engine) = old_sync_engine {
-        engine.shutdown().await;
+        if let Err(e) = engine.shutdown().await {
+            tracing::error!(
+                error = %e,
+                "previous SyncEngine final flush failed during start_node restart"
+            );
+        }
     }
     stop_handles(old_shutdown, old_thread);
 

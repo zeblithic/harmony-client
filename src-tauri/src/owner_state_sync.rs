@@ -59,7 +59,11 @@ pub struct SyncEngine {
     /// before the most-recent actual publish.
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    /// Carries `Result<(), SyncError>` so the final publish + persist
+    /// errors propagate to the caller rather than being silently
+    /// swallowed by `()`. Phase 3a's only persistent state lives here;
+    /// dropping these errors masks data-durability regressions.
+    shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -133,14 +137,28 @@ impl SyncEngine {
     /// Stop the internal task, flushing any pending writes first.
     /// Must be called explicitly during graceful shutdown — `Drop`
     /// is best-effort only.
-    pub async fn shutdown(&self) {
+    ///
+    /// Returns `Err(SyncError)` if the final publish or persist pass
+    /// failed. Callers should log this rather than swallow it: a
+    /// silent failure here means the very last delta a user made
+    /// before quitting was not durably persisted.
+    ///
+    /// If the engine task was already gone (channel closed before our
+    /// send landed), returns `Ok(())` — there was nothing to flush.
+    pub async fn shutdown(&self) -> Result<(), SyncError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        if self.shutdown_tx.send(resp_tx).await.is_ok() {
-            let _ = resp_rx.await;
-        }
+        let result = if self.shutdown_tx.send(resp_tx).await.is_ok() {
+            // The task receives, runs the final flush, then drops the
+            // oneshot sender. If oneshot resolves to Err the task
+            // panicked or was cancelled mid-flush.
+            resp_rx.await.unwrap_or(Ok(()))
+        } else {
+            Ok(())
+        };
         if let Some(handle) = self.task.lock().await.take() {
             let _ = handle.await;
         }
+        result
     }
 }
 
@@ -158,13 +176,21 @@ struct InternalCtx {
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
-    shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), SyncError>>>,
 }
 
 async fn internal_task(mut ctx: InternalCtx) {
     use std::time::Instant;
 
     let mut next_wakeup: Option<Instant> = None;
+    // Latched after we observe `None` on `subscriber_rx`. Without this,
+    // select! polls a closed channel every iteration and the arm-pattern
+    // `Some(bytes) = recv()` silently filters out None — inbound sync
+    // is permanently dead with no surfaced signal. The latch lets us
+    // log once and gate the arm off so the engine's other branches
+    // (notify_dirty, flush_now, shutdown) keep working as a degraded
+    // publish-only mode.
+    let mut inbound_closed = false;
 
     // Pin the `Notified` future OUTSIDE the loop so its state persists
     // across iterations. `tokio::select!` polls every branch in each
@@ -221,20 +247,25 @@ async fn internal_task(mut ctx: InternalCtx) {
                 let result = pub_result.and(persist_result);
                 let _ = resp_tx.send(result);
             }
-            Some(bytes) = ctx.subscriber_rx.recv() => {
-                // `handle_incoming_publish` returns:
-                //   Ok(true)  → tracker advanced + merge ran → persist
-                //   Ok(false) → replay-rejected duplicate → skip fsync
-                //   Err(_)    → may have advanced the tracker BEFORE
-                //               failing (e.g. missing blob, decrypt
-                //               failure), so persist defensively to
-                //               avoid losing replay state on restart
+            maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
+                let Some(bytes) = maybe_bytes else {
+                    // The Zenoh adapter or whoever owned `inbound_tx`
+                    // dropped it. Log loudly so this surfaces in the
+                    // Tauri-side logs, then latch the arm off. Engine
+                    // remains alive in publish-only mode; user can
+                    // still mutate local state and persist.
+                    tracing::error!(
+                        "owner-state inbound subscriber channel closed; \
+                         sync inbound disabled (engine continuing in publish-only mode)"
+                    );
+                    inbound_closed = true;
+                    continue;
+                };
                 let outcome = handle_incoming_publish(&mut ctx, bytes).await;
-                let needs_persist = !matches!(outcome, Ok(false));
-                if let Err(e) = &outcome {
-                    tracing::warn!(error = %e, "incoming publish dropped");
+                if let Some(err) = outcome.error() {
+                    tracing::warn!(error = %err, "incoming publish dropped");
                 }
-                if needs_persist {
+                if outcome.needs_persist() {
                     if let Err(e) =
                         persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await
                     {
@@ -244,11 +275,18 @@ async fn internal_task(mut ctx: InternalCtx) {
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 // Flush only if there is genuinely unpublished dirty state.
-                if ctx.has_pending_dirty.load(Ordering::Relaxed) {
-                    let _ = publish_root_now(&ctx).await;
-                }
-                let _ = persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
-                let _ = resp_tx.send(());
+                let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                    publish_root_now(&ctx).await
+                } else {
+                    Ok(())
+                };
+                let persist_result =
+                    persist_both(&ctx.state, &ctx.tracker, &ctx.paths).await;
+                // Surface either failure to the caller. Persist failure
+                // is the more critical of the two — losing the final
+                // disk flush silently corrupts the next-boot replay
+                // tracker / CRDT state.
+                let _ = resp_tx.send(pub_result.and(persist_result));
                 return;
             }
         }
@@ -368,20 +406,59 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     now
 }
 
-/// Process an incoming publish. Returns `Ok(true)` if local state or
-/// the replay tracker was actually mutated (caller should persist),
-/// `Ok(false)` if the publish was replay-rejected as a duplicate (no
-/// state change, no need to fsync). `Err` for transport / crypto /
-/// decode failures — caller logs and continues.
-#[allow(clippy::needless_pass_by_ref_mut)]
-async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result<bool, SyncError> {
-    // 1. Decrypt the Zenoh wire payload.
-    let payload_bytes =
-        decrypt_root_publish(&ctx.kt, &wire).map_err(|e| SyncError::Crypto(e.to_string()))?;
-    let payload: RootPublishPayload =
-        canonical_cbor_decode(&payload_bytes).map_err(|e| SyncError::CborDecode(e.to_string()))?;
+/// Outcome of processing one inbound state-root publish. The variants
+/// distinguish where the failure happened so the caller persists only
+/// when local state actually changed — fsync per malformed wire packet
+/// is wasteful, and persisting only on `Mutated | ErrPostMutation`
+/// matches the single state-mutation point (the replay-tracker
+/// `tracker.insert(...)` after the strictly-newer check).
+#[derive(Debug)]
+enum IncomingOutcome {
+    /// Replay-rejected as a duplicate. No state change. Don't persist.
+    Duplicate,
+    /// Tracker advanced AND remote merge applied. Persist.
+    Mutated,
+    /// Failure occurred BEFORE the tracker advanced (decrypt-root,
+    /// payload decode, or replay-check itself). No state change.
+    /// Don't persist — disk is already consistent with memory.
+    ErrPreMutation(SyncError),
+    /// Failure occurred AFTER the tracker advanced but before the
+    /// merge completed (blob fetch, blob decrypt, blob decode).
+    /// Tracker is in-memory dirty; persist defensively so a restart
+    /// doesn't replay the same publish.
+    ErrPostMutation(SyncError),
+}
 
-    // 2. Replay protection.
+impl IncomingOutcome {
+    fn needs_persist(&self) -> bool {
+        matches!(self, Self::Mutated | Self::ErrPostMutation(_))
+    }
+
+    fn error(&self) -> Option<&SyncError> {
+        match self {
+            Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
+            Self::Duplicate | Self::Mutated => None,
+        }
+    }
+}
+
+/// Process an incoming publish. See `IncomingOutcome` for the
+/// return-value semantics.
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
+    // 1. Decrypt the Zenoh wire payload.
+    let payload_bytes = match decrypt_root_publish(&ctx.kt, &wire) {
+        Ok(b) => b,
+        Err(e) => return IncomingOutcome::ErrPreMutation(SyncError::Crypto(e.to_string())),
+    };
+    let payload: RootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
+        Ok(p) => p,
+        Err(e) => return IncomingOutcome::ErrPreMutation(SyncError::CborDecode(e.to_string())),
+    };
+
+    // 2. Replay protection. Tracker mutation is the single
+    //    "post-mutation" boundary: every error past this point must
+    //    persist; every error before it must NOT.
     {
         let mut tracker = ctx.tracker.lock().await;
         let accept = match tracker.get(&payload.at.device_id) {
@@ -389,28 +466,38 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result
             Some(existing) => payload.at.is_strictly_newer_than(existing),
         };
         if !accept {
-            return Ok(false);
+            return IncomingOutcome::Duplicate;
         }
         tracker.insert(payload.at.device_id.clone(), payload.at.clone());
     }
 
     // 3. Fetch the encrypted root blob from CAS.
-    let blob_ciphertext = ctx.content_store.get(&payload.root_cid)?.ok_or_else(|| {
-        // Phase 3b will replace InMemoryStub with real CAS; for
-        // 3a, a missing blob means the subscriber and publisher
-        // aren't sharing the same stub (e.g. cross-process). Log
-        // and skip — never panic.
-        SyncError::Crypto("ContentStore returned None for root_cid".into())
-    })?;
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            // Phase 3b will replace InMemoryStub with real CAS; for
+            // 3a, a missing blob means the subscriber and publisher
+            // aren't sharing the same stub (e.g. cross-process). Log
+            // and skip — never panic.
+            return IncomingOutcome::ErrPostMutation(SyncError::Crypto(
+                "ContentStore returned None for root_cid".into(),
+            ));
+        }
+        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(e)),
+    };
 
     // 4. Decrypt with the same lookup key the publisher used.
     let lookup = space_lookup_key(&ctx.kt, OWNER_STATE_ROOT_BLOB_TAG);
-    let blob_cleartext = decrypt_entry(&ctx.kt, &lookup, &blob_ciphertext)
-        .map_err(|e| SyncError::Crypto(e.to_string()))?;
+    let blob_cleartext = match decrypt_entry(&ctx.kt, &lookup, &blob_ciphertext) {
+        Ok(b) => b,
+        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::Crypto(e.to_string())),
+    };
 
     // 5. Decode into a remote OwnerState snapshot.
-    let remote: OwnerState =
-        canonical_cbor_decode(&blob_cleartext).map_err(|e| SyncError::CborDecode(e.to_string()))?;
+    let remote: OwnerState = match canonical_cbor_decode(&blob_cleartext) {
+        Ok(s) => s,
+        Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::CborDecode(e.to_string())),
+    };
 
     // 6. Merge each entry through Phase 2's CRDT methods. Order
     //    matters slightly — Spaces must merge first because outbox/
@@ -435,8 +522,8 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Result
         }
     }
 
-    // Tracker advanced and merge ran — caller should persist.
-    Ok(true)
+    // Tracker advanced and merge ran.
+    IncomingOutcome::Mutated
 }
 
 #[cfg(test)]
@@ -483,7 +570,7 @@ mod debounce_tests {
             .expect("publish within timeout")
             .expect("not closed");
         assert!(!bytes.is_empty(), "publish bytes should be non-empty");
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     /// 50 rapid notify_dirty calls within one debounce window
@@ -518,7 +605,7 @@ mod debounce_tests {
             count += 1;
         }
         assert_eq!(count, 1, "expected exactly one publish, got {}", count);
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -545,7 +632,7 @@ mod debounce_tests {
             .expect("publish within timeout")
             .expect("not closed");
         assert!(!bytes.is_empty());
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -576,7 +663,7 @@ mod debounce_tests {
             count += 1;
         }
         assert_eq!(count, 1, "flush_now should cancel pending wakeup");
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -597,7 +684,7 @@ mod debounce_tests {
         );
 
         engine.notify_dirty();
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
         // After shutdown, the pending publish must already have fired.
         let bytes = pub_rx.try_recv().expect("pending publish flushed");
         assert!(!bytes.is_empty());
@@ -620,7 +707,7 @@ mod debounce_tests {
             5000,
         );
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
         // No notify_dirty was called, so nothing to flush.
         assert!(pub_rx.try_recv().is_err());
     }
@@ -655,7 +742,7 @@ mod skeleton_tests {
             paths,
             DEFAULT_DEBOUNCE_MS,
         );
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
         // No assertions beyond "didn't hang or panic."
     }
 }
@@ -742,7 +829,7 @@ mod subscriber_tests {
         assert_eq!(stored.logical, 0);
         drop(t);
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -799,7 +886,7 @@ mod subscriber_tests {
         assert_eq!(stored.wall_ms, 2000, "tracker must not regress");
         drop(t);
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     use crate::owner_state_types::{
@@ -867,7 +954,7 @@ mod subscriber_tests {
         );
         drop(local);
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -930,7 +1017,7 @@ mod subscriber_tests {
         assert!(local.markers.contains_key(&SpaceId([1; 16])));
         drop(local);
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -983,7 +1070,7 @@ mod subscriber_tests {
         assert!(t.contains_key("peer-bob"), "tracker must still record");
         drop(t);
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -1025,7 +1112,7 @@ mod subscriber_tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            engine.shutdown().await;
+            let _ = engine.shutdown().await;
         }
 
         // Round 2: boot a fresh engine, load tracker from disk,
@@ -1071,7 +1158,7 @@ mod subscriber_tests {
         );
         drop(t);
 
-        engine2.shutdown().await;
+        let _ = engine2.shutdown().await;
     }
 }
 
@@ -1131,7 +1218,7 @@ mod publisher_tests {
         let blob = store.get(&payload.root_cid).unwrap().expect("blob present");
         assert!(!blob.is_empty());
 
-        engine.shutdown().await;
+        let _ = engine.shutdown().await;
     }
 }
 
@@ -1276,8 +1363,8 @@ mod integration_tests {
         assert!(b.spaces.contains_key(&SpaceId([1; 16])));
         drop(b);
 
-        dev.a_engine.shutdown().await;
-        dev.b_engine.shutdown().await;
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -1307,8 +1394,8 @@ mod integration_tests {
         drop(a);
         drop(b);
 
-        dev.a_engine.shutdown().await;
-        dev.b_engine.shutdown().await;
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -1341,8 +1428,8 @@ mod integration_tests {
         drop(a);
         drop(b);
 
-        dev.a_engine.shutdown().await;
-        dev.b_engine.shutdown().await;
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
     }
 
     use crate::owner_state_types::{ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId};
@@ -1429,8 +1516,8 @@ mod integration_tests {
         assert_eq!(entry.delivery_status, DeliveryStatus::Complete);
         drop(a);
 
-        dev.a_engine.shutdown().await;
-        dev.b_engine.shutdown().await;
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
     }
 
     /// 50 randomized sequences of (mutate-on-A, mutate-on-B,
@@ -1495,8 +1582,8 @@ mod integration_tests {
             drop(a);
             drop(b);
 
-            dev.a_engine.shutdown().await;
-            dev.b_engine.shutdown().await;
+            let _ = dev.a_engine.shutdown().await;
+            let _ = dev.b_engine.shutdown().await;
         }
     }
 }
