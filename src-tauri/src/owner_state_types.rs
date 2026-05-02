@@ -755,8 +755,14 @@ impl OutboxEntry {
 /// `PartialOrd`/`Ord` are implemented manually because
 /// `harmony_content::cid::ContentId` does not derive those traits.
 /// Ordering is bytewise: first by `space_id.0`, then by
-/// `message_cid.to_bytes()` — identical to the derived order the local
-/// newtype produced before Phase 3b.
+/// `message_cid.to_bytes()` on the 32-byte wire representation.
+///
+/// Note: this is NOT the same order as Phase 3a's ContentId([u8; 32]),
+/// which compared 32 raw BLAKE3 bytes. The byte layout changed (BLAKE3
+/// → SHA-256-MSB-truncated, plus the structured header), so the order
+/// of the same logical InboxKey changed too. Acceptable because Phase
+/// 3a's stub-only sync left no persisted inbox entries — see Phase 3b
+/// spec §"Wire format" for the v1-stub-only rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InboxKey {
     #[serde(rename = "sp")]
