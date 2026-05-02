@@ -14,7 +14,7 @@ In scope:
 
 1. **Async `ContentStore` trait.** `put` and `get` become `async fn` so the real adapter can await network fetches.
 2. **`RuntimeContentStore` adapter.** Implements `ContentStore` by sending operations on a new mpsc channel into the harmony-runtime event loop and awaiting oneshot replies.
-3. **`CasOp` channel handler in `event_loop.rs`.** Single new select arm processes both `PutLocal` (admit our own ciphertext to local cache) and `GetOrFetch` (cache-or-network-with-timeout, plus admit-on-success).
+3. **`CasOp` channel handler in `event_loop.rs`.** Single new select arm processes both `PutLocal` (admit our own ciphertext to local cache) and `GetOrFetch` (cache-or-network-with-timeout, plus fire-and-forget admit-on-success).
 4. **Wire-format reinterpretation of `RootPublishPayload.root_cid`.** Same 32-byte bstr, new meaning: harmony-content's structured `ContentId` (4-byte header + 28-byte SHA-256-MSB-truncated hash). Phase 3a's BLAKE3 interpretation never escaped a single process; treating v1 as never-deployed is honest.
 5. **Companion PR in harmony-content.** `Serialize for ContentId` emits CBOR `bstr(32)` instead of an array-of-u8. Required for harmony-client's bstr-based wire format; bytewise-identical in postcard, the workspace's primary codec.
 6. **Retire `state-root-sync-degraded` event.** Phase 3a's permanent "we know sync doesn't work" banner deletes. If a future phase needs a degraded indicator, it'll be a different signal with its own reason payload.
@@ -199,20 +199,21 @@ Some(op) = cas_op_rx.recv() => {
                 let fetch = fetch_via_zenoh(&session, &key);
                 match tokio::time::timeout(timeout, fetch).await {
                     Ok(Ok(bytes)) => {
-                        // 3. Admit to cache via a second CasOp::PutLocal hop,
-                        //    so the next subscriber hit serves from cache.
-                        //    See "Re-entry" subsection below.
-                        let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
-                        let _ = cas_op_tx_for_admit.send(CasOp::PutLocal {
+                        // 3. Best-effort admit via try_send. We have the
+                        //    bytes for the caller regardless of whether
+                        //    caching succeeds — admit is fire-and-forget
+                        //    so network-fetch latency isn't blocked on
+                        //    local cache contention or event-loop progress.
+                        //    If the cas_op channel is full or closed,
+                        //    caching is skipped; subsequent GetOrFetch on
+                        //    this CID will re-fetch over the network.
+                        let (admit_tx, _admit_rx) = tokio::sync::oneshot::channel();
+                        let _ = cas_op_tx_for_admit.try_send(CasOp::PutLocal {
                             cid,
                             blob: bytes.clone(),
                             reply: admit_tx,
-                        }).await;
-                        match admit_rx.await {
-                            Ok(Ok(())) => { let _ = reply.send(Ok(Some(bytes))); }
-                            // Admit rejected (e.g., hash verify failed) — treat as miss.
-                            Ok(Err(_)) | Err(_) => { let _ = reply.send(Ok(None)); }
-                        }
+                        });
+                        let _ = reply.send(Ok(Some(bytes)));
                     }
                     Ok(Err(e)) => { let _ = reply.send(Err(ContentStoreError::Io(format!("fetch: {e}")))); }
                     Err(_)     => { let _ = reply.send(Ok(None)); }  // timeout → None
@@ -225,12 +226,11 @@ Some(op) = cas_op_rx.recv() => {
 
 ### Re-entry: spawned fetch task admitting into the runtime
 
-The fetch task runs outside the event loop's select (it's spawned to avoid blocking the select arm during the network GET). Once bytes are in hand it needs to admit them through the runtime's `push_event` + `tick`, which is `&mut self`-bound to the event loop thread. Two options:
+The fetch task runs outside the event loop's select (it's spawned to avoid blocking the select arm during the network GET). Once bytes are in hand it admits them via a fire-and-forget second-mpsc-hop: the spawned task uses `cas_op_tx_for_admit.try_send(CasOp::PutLocal { ... })` to enqueue the admit, then immediately replies `Ok(Some(bytes))` to the original `GetOrFetch` caller WITHOUT waiting for the admit oneshot reply. The admit eventually runs through the select arm if there's room in the channel; if the channel is full or closed, the admit is dropped silently and the caller still receives the bytes.
 
-1. **Second mpsc hop.** The spawned task sends `CasOp::PutLocal { cid, blob: fetched_bytes, reply: inner_reply }` back through `cas_op_tx`. The select arm processes it. `inner_reply` carries the admit result; the original `reply` then sends `Ok(Some(bytes))` after the admit succeeds (or `Ok(None)` if the admit rejected — corrupt bytes case).
-2. **Bounded queue.** A `Vec<(ContentId, Vec<u8>)>` mutable from the select arm and pushed-to by the spawned task via a separate channel; drained on each select pass.
-
-Option 1 reuses the existing `CasOp` enum and is simpler to reason about. Cost: two mpsc round-trips per fetch, ~tens of microseconds — invisible against the network GET it follows. Option 1 is what we ship.
+This design preserves two important properties:
+- **Bounded latency.** `RuntimeContentStore::get` cannot block longer than the configured `fetch_timeout` plus a constant for `try_send` (microseconds). Earlier designs awaited the admit reply, which under cas_op channel backpressure could extend `get` latency unboundedly.
+- **Always preserve valid bytes.** When a fetch succeeds, the bytes are always returned to the caller — caching is opportunistic. Earlier designs returned `Ok(None)` on admit failure, which would discard valid bytes in hand and force the subscriber to drop the publish for purely-local-cache reasons.
 
 The full `GetOrFetch` happy path is:
 ```
@@ -241,16 +241,13 @@ SyncEngine.get(cid)
     → spawn fetch task
   → spawn task: fetch_via_zenoh(session, key) within tokio::time::timeout(500ms)
     → bytes returned
-    → cas_op_tx::send(PutLocal{cid, bytes, reply_inner})
-  → event loop select arm
-    → runtime.push_event + tick
-    → reply_inner ← Ok(())
-  → spawn task receives reply_inner
-    → reply_outer ← Ok(Some(bytes))
+    → cas_op_tx::try_send(PutLocal{cid, bytes, _admit_rx_dropped})  ← fire-and-forget
+    → reply_outer ← Ok(Some(bytes))                                  ← immediate
 SyncEngine.get returns Ok(Some(bytes))
+(Admit eventually drains through the select arm, or is dropped if channel full/closed.)
 ```
 
-The inner-reply error path (admit rejected because `cid.verify_hash` failed on the fetched bytes) returns `Ok(None)` to `reply_outer` — treat-as-miss, falling through to "no blob in network within deadline" semantics. This collapses the corruption case onto the same recovery path as a network timeout.
+The corrupted-bytes case (peer served bytes that fail StorageTier's hash check) manifests as: the admit eventually runs and is silently dropped by StorageTier, the cache stays empty for this CID, and the next `GetOrFetch` on the same CID re-fetches over Zenoh. The caller of THIS `GetOrFetch` still receives the (corrupt) bytes — but they would fail downstream decryption (`decrypt_entry`) which surfaces as `SyncError::Crypto` and the publish is dropped. CRDT eventual consistency carries the recovery via the next state-root from any peer.
 
 ### Lifecycle
 
@@ -328,9 +325,9 @@ Three new failure modes fold into existing `ContentStoreError` / `SyncError` var
 
 1. **Cache admit rejected (StorageTier policy).** `runtime.tick()` after a `PublishContent` event can yield a `RuntimeAction` indicating the content was rejected (e.g., budget exhausted). The `PutLocal` arm inspects actions for rejection and surfaces as `ContentStoreError::Io("admit rejected: ...")`. With Phase 3a's StorageBudget (`cache_capacity: 512`, `max_pinned_bytes: 50_000_000`), single-digit-KB owner-state blobs will not realistically hit this — but failing loudly beats silent corruption. Bubbles through `SyncError::ContentStore` into the existing degraded-path logging.
 2. **Network fetch timeout (GetOrFetch).** Returned as `Ok(None)` — semantically "blob not present in network within deadline." SyncEngine logs at `WARN` with the CID hex and HLC, drops the publish. CRDT eventual consistency carries the recovery via the next state-root from any peer.
-3. **Hash verify failure on receipt.** `runtime.push_event(SubscriptionMessage{...}) + tick()` validates `cid.verify_hash(data)` inside StorageTier before admitting. Mismatch → admit rejected, `Ok(None)` returned (same path as timeout). The peer-served-corrupted-bytes case; protected by harmony-content's own hash chain, no integrity exposure.
+3. **Hash verify failure on receipt.** `runtime.push_event(SubscriptionMessage{...}) + tick()` validates `cid.verify_hash(data)` inside StorageTier before admitting. With the fire-and-forget admit design, a hash-verify failure causes StorageTier to silently drop the admit; the cache stays empty for this CID. The caller of `GetOrFetch` already received the (corrupt) bytes, but they fail downstream decryption (`decrypt_entry`) which surfaces as `SyncError::Crypto` and the publish is dropped. CRDT eventual consistency carries the recovery. Admit observability (previously `Ok(None)` returned to caller on reject) is intentionally removed — bounded latency is the higher priority.
 
-Existing `SyncError::ContentStore` (for CAS misses, timeouts, and corrupted-admit drops) and `SyncError::Crypto`/`SyncError::CborDecode` (for decrypt and decode failures) cover all three failure modes. No new variants.
+Existing `SyncError::ContentStore` (for CAS misses and timeouts) and `SyncError::Crypto`/`SyncError::CborDecode` (for decrypt and decode failures) cover all three failure modes. No new variants.
 
 ## Testing strategy
 

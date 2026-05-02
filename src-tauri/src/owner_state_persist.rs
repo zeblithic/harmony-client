@@ -55,20 +55,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
-/// Phase 3a's stub-only sync never persisted ContentId-containing inbox
-/// entries (the inbox was always empty in practice — nothing was actually
-/// received via the stub). Phase 3b changes the meaning of ContentId's 32
-/// bytes (raw BLAKE3 → harmony-content structured CID with SHA-256-MSB-
-/// truncated hash), but the CBOR wire shape is still bstr(32), so V1 files
-/// continue to round-trip structurally. A formal V1→V2 schema bump with
-/// discard-on-load is unneeded for current realities; if Phase 3a-era
-/// persisted inbox entries with BLAKE3 ContentIds ever surface in practice,
-/// bump to V2 with explicit migration semantics. See Phase 3b spec §"Wire
-/// format" + §"Persistence layer".
+/// Phase 3a's CRDT file format. Persisted ContentId fields (in `inbox`
+/// keys via `InboxKey.message_cid` AND `outbox` values via
+/// `OutboxEntry.message_cid`) used the local `ContentId([u8; 32])`
+/// newtype, where the 32 bytes were a raw BLAKE3 hash of message content.
+/// Phase 3b reinterprets those bytes as harmony-content's structured
+/// CID (header[4] + SHA-256-MSB-truncated hash[28]), so any V1 file
+/// persisted by Phase 3a contains ContentId values whose bytes don't
+/// have valid harmony-content structure. Loading a V1 file in Phase 3b
+/// is therefore a discard-on-load operation: log WARN, return
+/// `OwnerState::default()`. CRDT eventual consistency carries the
+/// recovery — the next state-root publish from any peer rebuilds local
+/// state.
 const CRDT_FILE_SCHEMA_V1: u8 = 1;
 
+/// Phase 3b CRDT file format. Identical struct shape to V1 but
+/// ContentId fields now carry harmony-content's structured CID. The
+/// version byte changed because the SEMANTICS of the bytes-on-disk
+/// changed even though the CBOR shape did not.
+const CRDT_FILE_SCHEMA_V2: u8 = 2;
+
 #[derive(Serialize, Deserialize)]
-struct CrdtFileV1 {
+struct CrdtFileV2 {
     spaces: BTreeMap<crate::owner_state_types::SpaceId, crate::owner_state_types::Space>,
     outbox:
         BTreeMap<crate::owner_state_types::OutboxEntryId, crate::owner_state_types::OutboxEntry>,
@@ -77,7 +85,7 @@ struct CrdtFileV1 {
     tombstones: BTreeSet<crate::owner_state_types::SpaceId>,
 }
 
-impl From<&OwnerState> for CrdtFileV1 {
+impl From<&OwnerState> for CrdtFileV2 {
     fn from(s: &OwnerState) -> Self {
         Self {
             spaces: s.spaces.clone(),
@@ -89,8 +97,8 @@ impl From<&OwnerState> for CrdtFileV1 {
     }
 }
 
-impl From<CrdtFileV1> for OwnerState {
-    fn from(f: CrdtFileV1) -> Self {
+impl From<CrdtFileV2> for OwnerState {
+    fn from(f: CrdtFileV2) -> Self {
         OwnerState {
             spaces: f.spaces,
             outbox: f.outbox,
@@ -102,8 +110,8 @@ impl From<CrdtFileV1> for OwnerState {
 }
 
 pub fn save_crdt(path: &Path, state: &OwnerState) -> Result<(), PersistError> {
-    let file = CrdtFileV1::from(state);
-    let mut bytes = vec![CRDT_FILE_SCHEMA_V1];
+    let file = CrdtFileV2::from(state);
+    let mut bytes = vec![CRDT_FILE_SCHEMA_V2];
     into_writer(&file, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
     save_atomically(path, &bytes)
 }
@@ -120,9 +128,9 @@ pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {
     let version = bytes[0];
     let payload = &bytes[1..];
     match version {
-        CRDT_FILE_SCHEMA_V1 => {
+        CRDT_FILE_SCHEMA_V2 => {
             let mut cursor = Cursor::new(payload);
-            let file: CrdtFileV1 =
+            let file: CrdtFileV2 =
                 from_reader(&mut cursor).map_err(|e| PersistError::CborDecode(e.to_string()))?;
             // Reject trailing bytes — defensive against truncation
             // edge cases that decode "successfully" but stop short.
@@ -130,6 +138,23 @@ pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {
                 return Err(PersistError::Corrupt);
             }
             Ok(file.into())
+        }
+        CRDT_FILE_SCHEMA_V1 => {
+            // Phase 3a → 3b discard-on-load. Phase 3a persisted ContentId
+            // values as raw BLAKE3 bytes inside both `inbox` keys and
+            // `outbox` values; Phase 3b's harmony-content CID has
+            // structured (header + SHA-256-MSB) bytes. Trying to load
+            // V1 data into Phase 3b's types would produce ContentIds
+            // whose bytes don't have valid harmony-content structure.
+            // Discard rather than reinterpret. CRDT eventual consistency
+            // recovers via the next state-root from any peer.
+            tracing::warn!(
+                path = %path.display(),
+                "discarding Phase 3a CRDT file (schema v1) — incompatible \
+                 ContentId semantics with Phase 3b. Local CRDT state reset; \
+                 cross-device sync will rebuild on next state-root publish."
+            );
+            Ok(OwnerState::default())
         }
         v => Err(PersistError::UnknownSchemaVersion(v)),
     }
@@ -323,13 +348,46 @@ mod tests {
     fn crdt_load_truncated_cbor_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncated.cbor");
-        // Schema v1 + arbitrary CBOR-like junk that won't decode.
-        std::fs::write(&path, [CRDT_FILE_SCHEMA_V1, 0xA1, 0x66]).unwrap();
+        // Schema v2 + arbitrary CBOR-like junk that won't decode.
+        // (V1 is now the discard path, so we use V2 to exercise the
+        // CBOR-decode error path.)
+        std::fs::write(&path, [CRDT_FILE_SCHEMA_V2, 0xA1, 0x66]).unwrap();
         let err = load_crdt(&path).expect_err("should error");
         assert!(matches!(
             err,
             PersistError::CborDecode(_) | PersistError::Corrupt
         ));
+    }
+
+    #[test]
+    fn crdt_load_v1_discards_returns_empty_state() {
+        // Phase 3a → 3b migration: V1 files are discarded on load.
+        // The file body is irrelevant — even valid Phase-3a CBOR
+        // never gets decoded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phase3a.cbor");
+        std::fs::write(&path, [CRDT_FILE_SCHEMA_V1, 0x42, 0x43, 0x44]).unwrap();
+        let loaded = load_crdt(&path).expect("V1 load returns Ok with default state, not error");
+        assert!(
+            loaded.spaces.is_empty(),
+            "V1 load should produce empty spaces"
+        );
+        assert!(
+            loaded.outbox.is_empty(),
+            "V1 load should produce empty outbox"
+        );
+        assert!(
+            loaded.inbox.is_empty(),
+            "V1 load should produce empty inbox"
+        );
+        assert!(
+            loaded.markers.is_empty(),
+            "V1 load should produce empty markers"
+        );
+        assert!(
+            loaded.tombstones.is_empty(),
+            "V1 load should produce empty tombstones"
+        );
     }
 
     #[test]
