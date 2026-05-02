@@ -833,7 +833,7 @@ pub async fn run<R: Runtime>(
                 use crate::content_store::CasOp;
                 match op {
                     CasOp::PutLocal { cid, blob, reply } => {
-                        let cid_hex = hex::encode(cid.0);
+                        let cid_hex = hex::encode(cid.to_bytes());
                         let key_expr = format!("harmony/content/publish/{cid_hex}");
                         runtime.push_event(RuntimeEvent::SubscriptionMessage {
                             key_expr,
@@ -857,15 +857,14 @@ pub async fn run<R: Runtime>(
                     }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
-                        let hc_id = harmony_content::cid::ContentId::from_bytes(cid.0);
-                        if let Some(bytes) = runtime.storage_tier().cache().get(&hc_id).map(|b| b.to_vec()) {
+                        if let Some(bytes) = runtime.storage_tier().cache().get(&cid).map(|b| b.to_vec()) {
                             let _ = reply.send(Ok(Some(bytes)));
                         } else {
                             // 2. Cache miss — spawn the Zenoh GET wrapped in
                             //    tokio::time::timeout. Spawning avoids holding
                             //    the select arm during the network I/O.
-                            let cid_hex = hex::encode(cid.0);
-                            // Always Some: cid.0 is [u8; 32], so cid_hex is
+                            let cid_hex = hex::encode(cid.to_bytes());
+                            // Always Some: cid.to_bytes() is [u8; 32], so cid_hex is
                             // exactly 64 chars. The unwrap_or("") fallback is
                             // defensive but unreachable in practice; the empty
                             // string would produce a malformed double-slash

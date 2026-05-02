@@ -150,7 +150,7 @@ mod tests {
     use super::*;
 
     fn cid(byte: u8) -> ContentId {
-        ContentId([byte; 32])
+        ContentId::from_bytes([byte; 32])
     }
 
     #[tokio::test]
@@ -197,7 +197,7 @@ mod tests {
         // Stub receiver: handle exactly one PutLocal then exit.
         let stub = tokio::spawn(async move {
             if let Some(CasOp::PutLocal { cid, blob, reply }) = cas_op_rx.recv().await {
-                assert_eq!(cid, ContentId([0x42; 32]));
+                assert_eq!(cid, ContentId::from_bytes([0x42; 32]));
                 assert_eq!(blob, vec![1, 2, 3]);
                 let _ = reply.send(Ok(()));
             } else {
@@ -206,7 +206,7 @@ mod tests {
         });
 
         store
-            .put(ContentId([0x42; 32]), vec![1, 2, 3])
+            .put(ContentId::from_bytes([0x42; 32]), vec![1, 2, 3])
             .await
             .unwrap();
         stub.await.unwrap();
@@ -224,7 +224,7 @@ mod tests {
                 reply,
             }) = cas_op_rx.recv().await
             {
-                assert_eq!(cid, ContentId([0x99; 32]));
+                assert_eq!(cid, ContentId::from_bytes([0x99; 32]));
                 assert_eq!(timeout, std::time::Duration::from_millis(500));
                 let _ = reply.send(Ok(Some(vec![7, 8, 9])));
             } else {
@@ -232,7 +232,7 @@ mod tests {
             }
         });
 
-        let blob = store.get(&ContentId([0x99; 32])).await.unwrap();
+        let blob = store.get(&ContentId::from_bytes([0x99; 32])).await.unwrap();
         assert_eq!(blob, Some(vec![7, 8, 9]));
         stub.await.unwrap();
     }
@@ -248,7 +248,10 @@ mod tests {
             }
         });
 
-        let err = store.put(ContentId([1; 32]), vec![1]).await.unwrap_err();
+        let err = store
+            .put(ContentId::from_bytes([1; 32]), vec![1])
+            .await
+            .unwrap_err();
         match err {
             ContentStoreError::Io(msg) => assert!(msg.contains("admit rejected")),
         }
@@ -262,7 +265,10 @@ mod tests {
         drop(cas_op_rx);
 
         let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
-        let err = store.put(ContentId([0; 32]), vec![]).await.unwrap_err();
+        let err = store
+            .put(ContentId::from_bytes([0; 32]), vec![])
+            .await
+            .unwrap_err();
         match err {
             ContentStoreError::Io(msg) => {
                 assert!(msg.contains("(send)"), "got msg: {msg}");
@@ -284,7 +290,7 @@ mod tests {
             }
         });
 
-        let blob = store.get(&ContentId([0xAA; 32])).await.unwrap();
+        let blob = store.get(&ContentId::from_bytes([0xAA; 32])).await.unwrap();
         assert_eq!(blob, None);
         stub.await.unwrap();
     }
@@ -307,7 +313,10 @@ mod tests {
             }
         });
 
-        let err = store.put(ContentId([0; 32]), vec![]).await.unwrap_err();
+        let err = store
+            .put(ContentId::from_bytes([0; 32]), vec![])
+            .await
+            .unwrap_err();
         match err {
             ContentStoreError::Io(msg) => {
                 assert!(msg.contains("(reply)"), "got msg: {msg}");

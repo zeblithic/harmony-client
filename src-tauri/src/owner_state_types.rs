@@ -175,16 +175,16 @@ pub struct OwnerAddr(
     pub [u8; 16],
 );
 
-/// 32-byte BLAKE3 content identifier (matches harmony-content CID size).
-/// Stored as `bstr(32)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ContentId(
-    #[serde(
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub [u8; 32],
-);
+/// 32-byte structured content identifier (4-byte header + 28-byte hash).
+/// Re-exported from harmony-content. Stored as `bstr(32)` on the wire
+/// (after the harmony-content companion PR fixed `Serialize for ContentId`
+/// to emit bstr instead of array-of-u8).
+///
+/// Phase 3b switches from a local `ContentId([u8; 32])` newtype (raw
+/// BLAKE3 hash) to harmony-content's structured CID (header[4] +
+/// SHA-256-MSB-truncated hash[28]). Wire shape unchanged: 32-byte bstr.
+/// Meaning of those 32 bytes changes — see Phase 3b spec §"Wire format".
+pub use harmony_content::cid::ContentId;
 
 /// 16-byte ULID for OutboxEntry IDs. Wire-shape identical to SpaceId
 /// but the type distinction prevents accidental swaps at call sites.
@@ -361,7 +361,7 @@ mod newtype_tests {
     fn content_id_cbor_is_bstr_32() {
         // 0x58 = bstr major type with 1-byte length following.
         // Encodes as: 0x58 (1 byte) + 0x20 (1 byte length=32) + 32 bytes = 34 bytes total.
-        let c = ContentId([0u8; 32]);
+        let c = ContentId::from_bytes([0u8; 32]);
         let mut bytes = Vec::new();
         into_writer(&c, &mut bytes).unwrap();
         assert_eq!(bytes.len(), 34);
@@ -412,7 +412,7 @@ mod newtype_tests {
 
     #[test]
     fn content_id_round_trip() {
-        let c = ContentId([0xef; 32]);
+        let c = ContentId::from_bytes([0xef; 32]);
         let mut bytes = Vec::new();
         into_writer(&c, &mut bytes).unwrap();
         let recovered: ContentId = from_reader(&bytes[..]).unwrap();
@@ -751,12 +751,34 @@ impl OutboxEntry {
 
 /// InboxEntry composite lookup key. `(space_id, message_cid)` is the
 /// upsert key for inbox writes — see ZEB-206 spec §"Idempotency".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// `PartialOrd`/`Ord` are implemented manually because
+/// `harmony_content::cid::ContentId` does not derive those traits.
+/// Ordering is bytewise: first by `space_id.0`, then by
+/// `message_cid.to_bytes()` — identical to the derived order the local
+/// newtype produced before Phase 3b.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InboxKey {
     #[serde(rename = "sp")]
     pub space_id: SpaceId,
     #[serde(rename = "mc")]
     pub message_cid: ContentId,
+}
+
+impl PartialOrd for InboxKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InboxKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.space_id.cmp(&other.space_id).then_with(|| {
+            self.message_cid
+                .to_bytes()
+                .cmp(&other.message_cid.to_bytes())
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,7 +818,7 @@ mod inbox_tests {
     fn key_extracts_composite() {
         let e = InboxEntry {
             space_id: SpaceId([1u8; 16]),
-            message_cid: ContentId([2u8; 32]),
+            message_cid: ContentId::from_bytes([2u8; 32]),
             from: OwnerAddr([3u8; 16]),
             received_at: Hlc {
                 wall_ms: 100,
@@ -808,7 +830,7 @@ mod inbox_tests {
             e.key(),
             InboxKey {
                 space_id: SpaceId([1u8; 16]),
-                message_cid: ContentId([2u8; 32])
+                message_cid: ContentId::from_bytes([2u8; 32])
             }
         );
     }
@@ -817,7 +839,7 @@ mod inbox_tests {
     fn inbox_entry_round_trip() {
         let e = InboxEntry {
             space_id: SpaceId([7u8; 16]),
-            message_cid: ContentId([8u8; 32]),
+            message_cid: ContentId::from_bytes([8u8; 32]),
             from: OwnerAddr([9u8; 16]),
             received_at: Hlc {
                 wall_ms: 50,
@@ -855,7 +877,7 @@ mod marker_tests {
     #[test]
     fn root_publish_payload_round_trip() {
         let p = RootPublishPayload {
-            root_cid: ContentId([0xAA; 32]),
+            root_cid: ContentId::from_bytes([0xAA; 32]),
             at: Hlc {
                 wall_ms: 12345,
                 logical: 7,
@@ -886,7 +908,7 @@ mod outbox_tests {
             id: OutboxEntryId([1u8; 16]),
             space_id: SpaceId([2u8; 16]),
             recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
-            message_cid: ContentId([3u8; 32]),
+            message_cid: ContentId::from_bytes([3u8; 32]),
             created_at: hlc(100),
             delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             delivery_status: DeliveryStatus::Pending,

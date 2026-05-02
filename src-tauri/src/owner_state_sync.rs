@@ -352,7 +352,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, decrypt_root_publish,
     encrypt_entry, encrypt_root_publish, space_lookup_key,
 };
-use crate::owner_state_types::{ContentId, RootPublishPayload};
+use crate::owner_state_types::RootPublishPayload;
 
 /// Lookup-key tag for the single-blob OwnerState in 3a's
 /// simplified CAS layout. See spec §"Root blob shape — Phase 3a
@@ -405,10 +405,21 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
     let blob_ciphertext = encrypt_entry(&ctx.kt, &lookup, &blob_cleartext)
         .map_err(|e| SyncError::Crypto(e.to_string()))?;
 
-    // 3. cipher_cid = BLAKE3 of the encrypted blob.
-    let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
+    // 3. Phase 3b: cipher_cid = harmony-content's structured ContentId
+    //    derived from the ciphertext. Encrypted+durable flag set so
+    //    StorageTier classifies as EncryptedDurable (eviction priority
+    //    matches PublicDurable; never auto-burns). The 28-byte hash is
+    //    SHA-256 truncated to its 224 most-significant bits.
+    let root_cid = harmony_content::cid::ContentId::for_book(
+        &blob_ciphertext,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| SyncError::Crypto(format!("ContentId::for_book: {e}")))?;
 
-    // 4. Put into ContentStore (in 3a: InMemoryStub; 3b: real CAS).
+    // 4. Put into ContentStore (Phase 3b: routes through CasOp::PutLocal).
     ctx.content_store.put(root_cid, blob_ciphertext).await?;
 
     // 5. Build state-root payload.
@@ -855,7 +866,14 @@ mod subscriber_tests {
         let blob_cleartext = canonical_cbor_encode(state).unwrap();
         let lookup = space_lookup_key(kt, b"owner-state-root-blob-v1");
         let blob_ciphertext = encrypt_entry(kt, &lookup, &blob_cleartext).unwrap();
-        let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
+        let root_cid = harmony_content::cid::ContentId::for_book(
+            &blob_ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         store.put(root_cid, blob_ciphertext).await.unwrap();
         let payload = RootPublishPayload {
             root_cid,
@@ -1043,7 +1061,7 @@ mod subscriber_tests {
                 id: OutboxEntryId([7; 16]),
                 space_id: SpaceId([1; 16]),
                 recipient_owners: vec![OwnerAddr([2; 16])],
-                message_cid: ContentId([3; 32]),
+                message_cid: ContentId::from_bytes([3; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1501,7 +1519,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]),
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1542,7 +1560,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]), // lagging — old loser id
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,

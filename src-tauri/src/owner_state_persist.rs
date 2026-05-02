@@ -242,7 +242,7 @@ mod tests {
                 id: OutboxEntryId([7; 16]),
                 space_id: SpaceId([1; 16]),
                 recipient_owners: vec![OwnerAddr([2; 16])],
-                message_cid: ContentId([3; 32]),
+                message_cid: ContentId::from_bytes([3; 32]),
                 created_at: hlc(100),
                 delivered_to: Default::default(),
                 delivery_status: DeliveryStatus::Pending,
