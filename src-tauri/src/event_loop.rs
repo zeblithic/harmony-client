@@ -142,10 +142,8 @@ pub async fn run<R: Runtime>(
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
     mut content_verb_rx: mpsc::Receiver<ContentVerbRequest>,
-    #[allow(unused_variables)] cas_op_tx: mpsc::Sender<crate::content_store::CasOp>,
-    #[allow(unused_mut, unused_variables)] mut cas_op_rx: mpsc::Receiver<
-        crate::content_store::CasOp,
-    >,
+    cas_op_tx: mpsc::Sender<crate::content_store::CasOp>,
+    mut cas_op_rx: mpsc::Receiver<crate::content_store::CasOp>,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
@@ -821,6 +819,99 @@ pub async fn run<R: Runtime>(
                         ).await;
                     }
                     let _ = req.reply.send(Ok(()));
+                }
+            }
+
+            // ── Phase 3b: CAS operations from SyncEngine ────────────
+            // PutLocal admits ciphertext to the local cache via the
+            // existing StorageTier ingest path (parity with ingest_rx).
+            // GetOrFetch checks cache; on miss spawns a Zenoh GET wrapped
+            // in tokio::time::timeout and uses a second-mpsc-hop back
+            // through cas_op_tx to admit fetched bytes before replying.
+            // See spec §"Event loop handler" and §"Re-entry".
+            Some(op) = cas_op_rx.recv() => {
+                use crate::content_store::CasOp;
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        let cid_hex = hex::encode(cid.0);
+                        let key_expr = format!("harmony/content/publish/{cid_hex}");
+                        runtime.push_event(RuntimeEvent::SubscriptionMessage {
+                            key_expr,
+                            payload: blob,
+                        });
+                        for action in runtime.tick() {
+                            dispatch_action(
+                                action, &session, &zenoh_tx, &udp,
+                                &broadcast_addr, &app, &closing, &own_zid,
+                            ).await;
+                        }
+                        // We do NOT inspect tick() actions for a "rejected"
+                        // signal — StorageTier silently drops corrupted
+                        // bytes (parity with ingest_rx pattern). A subsequent
+                        // GetOrFetch on a corrupted CID hits a real cache
+                        // miss and re-fetches over Zenoh, where harmony-
+                        // content's transport-side hash check provides
+                        // integrity. See plan §"Pre-flight: admit-rejection
+                        // signal".
+                        let _ = reply.send(Ok(()));
+                    }
+                    CasOp::GetOrFetch { cid, timeout, reply } => {
+                        // 1. Cache check first (fast path).
+                        let hc_id = harmony_content::cid::ContentId::from_bytes(cid.0);
+                        if let Some(bytes) = runtime.storage_tier().cache().get(&hc_id).map(|b| b.to_vec()) {
+                            let _ = reply.send(Ok(Some(bytes)));
+                        } else {
+                            // 2. Cache miss — spawn the Zenoh GET wrapped in
+                            //    tokio::time::timeout. Spawning avoids holding
+                            //    the select arm during the network I/O.
+                            let cid_hex = hex::encode(cid.0);
+                            let prefix = cid_hex.get(1..2).unwrap_or("").to_string();
+                            let key = format!("harmony/content/{prefix}/{cid_hex}");
+                            let session_clone = session.clone();
+                            let cas_op_tx_for_admit = cas_op_tx.clone();
+                            tokio::spawn(async move {
+                                let fetch = fetch_via_zenoh(&session_clone, &key);
+                                match tokio::time::timeout(timeout, fetch).await {
+                                    Ok(Ok(bytes)) => {
+                                        // 3. Admit via second-mpsc-hop. The
+                                        //    select arm processes this PutLocal,
+                                        //    then we reply Ok(Some(bytes)).
+                                        let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
+                                        if cas_op_tx_for_admit.send(crate::content_store::CasOp::PutLocal {
+                                            cid,
+                                            blob: bytes.clone(),
+                                            reply: admit_tx,
+                                        }).await.is_err() {
+                                            // Event loop shutting down; reply
+                                            // Ok(Some) since we have the bytes
+                                            // — the caller still gets to merge.
+                                            let _ = reply.send(Ok(Some(bytes)));
+                                            return;
+                                        }
+                                        match admit_rx.await {
+                                            Ok(Ok(())) => {
+                                                let _ = reply.send(Ok(Some(bytes)));
+                                            }
+                                            // Admit channel reply error or admit
+                                            // returned Err — treat as miss.
+                                            Ok(Err(_)) | Err(_) => {
+                                                let _ = reply.send(Ok(None));
+                                            }
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        let _ = reply.send(Err(crate::content_store::ContentStoreError::Io(
+                                            format!("fetch '{key}': {e}"),
+                                        )));
+                                    }
+                                    // Timeout → Ok(None) (CRDT carries recovery).
+                                    Err(_) => {
+                                        let _ = reply.send(Ok(None));
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
             }
 
