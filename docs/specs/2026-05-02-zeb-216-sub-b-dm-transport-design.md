@@ -37,7 +37,10 @@ Same as ZEB-219 plus transport-layer concerns:
 - **Reticulum link observer**: link-layer ECDH between device identities encrypts wire payloads; observer sees identity_hash → identity_hash + length, not contents
 - **Sender impersonation across owners**: receive-time `verify_sender_binding` check blocks impersonation by comparing `MessagePayload.sender` against the link-origin OwnerAddr resolved from `from_identity_hash`
 - **Sender impersonation across own devices**: per-owner CRDT replication boundary makes this structurally impossible — only the owner's own bound devices can write to their owner-state
+- **OwnerDeviceCache poisoning via spoofed payload owner**: blocked by the link-origin binding rule — every cache mutation uses the owner resolved from `from_identity_hash`, never the payload-controlled owner field. Mismatched packets are dropped with telemetry.
+- **Forged DmAck inflating `delivered_to`**: blocked by (a) link-origin binding (ack owner = link origin owner) AND (b) recipient-membership check (resolved owner must be in `OutboxEntry.recipient_owners`).
 - **Stale device list**: piggyback refresh on every DM envelope keeps recipient's `OwnerDeviceCache` fresh; cache LWW on `learned_at` HLC
+- **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot run link-origin binding. Trust comes from the out-of-band channel by which the inviter's `(owner_addr, device_identity_hash)` was shared (invite link, QR, library directory listing). UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated. Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
 
 Out of scope:
 - Master-seed compromise of any participant (ZEB-173 fresh-identity flow)
@@ -110,27 +113,82 @@ Five-PR rollout. Each PR ships independently green; Phase 3a is a cross-repo com
 
 ## Data model
 
+### Wire-format newtypes (Phase 1)
+
+Per existing repo convention (see `owner_state_types.rs:17-23` and the bstr-helpers around `SpaceId` / `OwnerAddr` / `OutboxEntryId`), all fixed-size byte identifiers that go on the wire MUST be wrapped in newtypes carrying `serialize_bytes_as_bstr` / `deserialize_bytes_from_bstr` serde attributes. A bare `[u8; N]` would serialize as a CBOR array-of-u8 (major type 4) — roughly 2× the size of bstr (major type 2) for random bytes — which defeats the MTU-conscious wire-format goals of this spec.
+
+Two new wire newtypes for Phase 1:
+
+```rust
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// 32-byte symmetric content key for DM/group-DM ChaCha20-Poly1305 encryption.
+/// Wire format: bstr(32). In-memory: zeroized on drop.
+///
+/// Custom Drop ensures key bytes are wiped from memory before the allocation
+/// is freed (the same property `Zeroizing<[u8; 32]>` provides), and the bstr
+/// serde helpers force compact wire encoding.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ZeroizeOnDrop)]
+pub struct DmContentKey(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr",
+    )]
+    [u8; 32],
+);
+
+impl DmContentKey {
+    pub fn new(key: [u8; 32]) -> Self { Self(key) }
+    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+    pub fn random() -> Self {
+        let mut k = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut k);
+        Self(k)
+    }
+}
+
+// Manual Debug to avoid leaking key material to logs.
+impl std::fmt::Debug for DmContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DmContentKey(<32 bytes redacted>)")
+    }
+}
+
+/// 16-byte Reticulum device-identity hash (matches Reticulum
+/// `IDENTITY_TRUNCATED_HASH_LENGTH = 16`). Wire format: bstr(16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeviceIdentityHash(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr",
+    )]
+    pub [u8; 16],
+);
+```
+
+Both types must round-trip through CBOR as bstr (regression tests required, mirroring the existing `space_id_serializes_as_bstr` patterns in `owner_state_types.rs`).
+
 ### Space struct additions (Phase 1)
 
 ```rust
-use zeroize::Zeroizing;
-
 pub struct Space {
     // ... existing fields ...
 
     /// Per-DM-Space symmetric content key (ChaCha20-Poly1305).
     /// MUST be Some for kind ∈ {dm, group-dm}; MUST be None otherwise.
-    /// Wrapped in Zeroizing so memory is wiped on drop.
+    /// Wire format: bstr(32) inside the Space CBOR map under key "ck".
+    /// In-memory: zeroized on drop via DmContentKey's ZeroizeOnDrop impl.
     #[serde(rename = "ck", skip_serializing_if = "Option::is_none", default)]
-    pub content_key: Option<Zeroizing<[u8; 32]>>,
+    pub content_key: Option<DmContentKey>,
 
     /// Historical content keys retained from past dedupe-collision merges.
     /// Used as fallback decryption for messages encrypted under a now-
     /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16.
     /// MUST NOT contain the current `content_key`.
     /// MUST be empty for non-DM kinds.
+    /// Wire format: array of bstr(32) under key "pk".
     #[serde(rename = "pk", skip_serializing_if = "Vec::is_empty", default)]
-    pub prior_content_keys: Vec<Zeroizing<[u8; 32]>>,
+    pub prior_content_keys: Vec<DmContentKey>,
 }
 
 pub const MAX_PRIOR_CONTENT_KEYS: usize = 16;
@@ -151,9 +209,9 @@ pub struct OwnerDeviceEntry {
     pub devices: Vec<DeviceIdentityHash>,  // sorted lex
     pub learned_at: Hlc,                   // LWW key
 }
-
-pub type DeviceIdentityHash = [u8; 16];
 ```
+
+`DeviceIdentityHash` is the bstr(16) newtype defined above.
 
 Apply rule (LWW on `learned_at`):
 
@@ -208,7 +266,7 @@ pub struct DmInvite {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "kn")] pub kind: SpaceKind,            // dm or group-dm
     #[serde(rename = "me")] pub members: Vec<OwnerAddr>,    // includes inviter
-    #[serde(rename = "ck")] pub content_key: Zeroizing<[u8; 32]>,
+    #[serde(rename = "ck")] pub content_key: DmContentKey,  // bstr(32) on wire, zeroized in memory
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
     #[serde(rename = "ca")] pub created_at: Hlc,
 }
@@ -216,6 +274,10 @@ pub struct DmInvite {
 pub struct DmCidNotify {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
+    /// Diagnostic only — receiver MUST verify this matches the owner
+    /// resolved from the inbound `from_identity_hash` via OwnerDeviceCache,
+    /// and drop the packet on mismatch. Authoritative sender identity
+    /// comes from the link origin, not this field.
     #[serde(rename = "so")] pub sender_owner_addr: OwnerAddr,
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
 }
@@ -223,10 +285,48 @@ pub struct DmCidNotify {
 pub struct DmAck {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
+    /// Diagnostic only — receiver MUST verify this matches the owner
+    /// resolved from the inbound `from_identity_hash`, AND that the
+    /// resolved owner is listed in the OutboxEntry's `recipient_owners`.
+    /// Drop the packet on either mismatch.
     #[serde(rename = "ao")] pub ack_from_owner_addr: OwnerAddr,
     #[serde(rename = "ad")] pub ack_from_devices: Vec<DeviceIdentityHash>,
 }
 ```
+
+### Link-origin binding rule (load-bearing, applies to DmCidNotify and DmAck)
+
+Both DmCidNotify and DmAck carry payload-controlled owner fields (`sender_owner_addr` / `ack_from_owner_addr`). Without binding to the Reticulum link origin, an attacker on identity_hash *X* could forge a DmCidNotify claiming `sender_owner_addr = Alice` and overwrite Alice's `OwnerDeviceCache` entry with the attacker's devices, or forge a DmAck marking the attacker as a "delivered" recipient on someone else's OutboxEntry.
+
+The receive-side rule (Phase 3b):
+
+```rust
+fn resolve_link_origin_owner(
+    cache: &OwnerDeviceCache,
+    from_identity_hash: DeviceIdentityHash,
+) -> Option<OwnerAddr> {
+    cache.devices.iter()
+        .find(|(_, entry)| entry.devices.binary_search(&from_identity_hash).is_ok())
+        .map(|(addr, _)| *addr)
+}
+
+// For DmCidNotify and DmAck:
+let resolved_owner = match resolve_link_origin_owner(cache, from_identity_hash) {
+    Some(o) => o,
+    None => return Err(DmReceiveError::UnknownLinkOrigin),  // drop + telemetry
+};
+if payload_owner_field != resolved_owner {
+    return Err(DmReceiveError::OwnerFieldMismatch);  // drop + telemetry
+}
+// Additional check for DmAck:
+if matches!(packet, DmPacket::Ack(_)) && !outbox_entry.recipient_owners.contains(&resolved_owner) {
+    return Err(DmReceiveError::AckFromNonRecipient);  // drop + telemetry
+}
+// All authoritative state mutations (apply_owner_device_update, apply_outbox)
+// use `resolved_owner`, never the payload field.
+```
+
+DmInvite is the bootstrap exception: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `resolve_link_origin_owner` returns None. The Invite teaches the cache the `(invite.members[0], invite.sender_devices)` mapping. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's devices are validated through link-origin binding.
 
 Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Decode pseudocode:
 
@@ -246,13 +346,13 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
 
 ```rust
 pub fn encrypt_dm_message(
-    content_key: &Zeroizing<[u8; 32]>,
+    content_key: &DmContentKey,
     aad: &[u8],
     payload: &MessagePayload,
 ) -> Result<Vec<u8>, DmEncryptError> {
     let plaintext = canonical_cbor_encode(payload)?;
     let nonce: [u8; 12] = OsRng.gen();
-    let cipher = ChaCha20Poly1305::new(content_key.as_ref().into());
+    let cipher = ChaCha20Poly1305::new(content_key.as_bytes().into());
     let mut ciphertext_with_tag = cipher.encrypt(&nonce.into(), Payload { msg: &plaintext, aad })
         .map_err(|_| DmEncryptError::AeadFailure)?;
     let mut blob = Vec::with_capacity(1 + 12 + ciphertext_with_tag.len());
@@ -263,8 +363,8 @@ pub fn encrypt_dm_message(
 }
 
 pub fn decrypt_dm_message(
-    content_key: &Zeroizing<[u8; 32]>,
-    prior_content_keys: &[Zeroizing<[u8; 32]>],
+    content_key: &DmContentKey,
+    prior_content_keys: &[DmContentKey],
     aad: &[u8],
     storage_blob: &[u8],
 ) -> Result<MessagePayload, DmDecryptError> {
@@ -281,7 +381,7 @@ pub fn decrypt_dm_message(
 
     // Try current key first, then prior_content_keys in stored order.
     for key in std::iter::once(content_key).chain(prior_content_keys.iter()) {
-        let cipher = ChaCha20Poly1305::new(key.as_ref().into());
+        let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
         if let Ok(plaintext) = cipher.decrypt(
             &nonce.into(),
             Payload { msg: ciphertext_slice, aad },
@@ -337,7 +437,7 @@ impl Space {
         }
 
         if let Some(ck) = &self.content_key {
-            if self.prior_content_keys.iter().any(|p| p.as_ref() == ck.as_ref()) {
+            if self.prior_content_keys.iter().any(|p| p.as_bytes() == ck.as_bytes()) {
                 return Err(InvariantError::ContentKeyInPriorList);
             }
         }
@@ -360,18 +460,18 @@ This rule is path-independent (multi-merge convergent). The 5-Space convergence 
 
 ```rust
 fn merge_prior_content_keys(
-    winner_current: &Zeroizing<[u8; 32]>,
-    winner_prior: &[Zeroizing<[u8; 32]>],
-    loser_current: &Zeroizing<[u8; 32]>,
-    loser_prior: &[Zeroizing<[u8; 32]>],
-) -> Vec<Zeroizing<[u8; 32]>> {
-    let mut all: Vec<Zeroizing<[u8; 32]>> = winner_prior.iter().cloned()
+    winner_current: &DmContentKey,
+    winner_prior: &[DmContentKey],
+    loser_current: &DmContentKey,
+    loser_prior: &[DmContentKey],
+) -> Vec<DmContentKey> {
+    let mut all: Vec<DmContentKey> = winner_prior.iter().cloned()
         .chain(std::iter::once(loser_current.clone()))
         .chain(loser_prior.iter().cloned())
-        .filter(|k| k.as_ref() != winner_current.as_ref())
+        .filter(|k| k.as_bytes() != winner_current.as_bytes())
         .collect();
-    all.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    all.dedup_by(|a, b| a.as_ref() == b.as_ref());
+    all.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    all.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
     all.truncate(MAX_PRIOR_CONTENT_KEYS);
     all
 }
@@ -549,8 +649,18 @@ Alice A1 (sender)                         Bob B1 (recipient)
                                           6. (B1) UnicastReceived(from=A1,
                                              payload=[0x02]||cbor(...))
                                           7. parse → DmCidNotify
-                                          8. apply_owner_device_update(Alice,
-                                             notify.sender_devices, HLC now)
+                                          7a. resolve_link_origin_owner(
+                                              cache, from_identity_hash=A1)
+                                              → Some(Alice). If None: drop
+                                              packet (unknown identity).
+                                          7b. verify notify.sender_owner_addr
+                                              == Alice. If mismatch: drop
+                                              + telemetry (cache-poisoning
+                                              attempt).
+                                          8. apply_owner_device_update(
+                                              Alice (resolved, NOT payload
+                                              field), notify.sender_devices,
+                                              HLC now)
                                           9. CasOp::GetOrFetch(message_cid):
                                              - local CAS miss
                                              - DAG-sync fetch from Alice's CAS
@@ -578,8 +688,19 @@ Alice A1 (sender)                         Bob B1 (recipient)
 15. UnicastReceived(from=B1,
     payload=[0x03]||cbor(DmAck))
 16. dm_outbox::handle_ack:
-    - apply_owner_device_update(Bob,
-      ack.ack_from_devices, HLC now)
+    - resolve_link_origin_owner(cache,
+      from_identity_hash=B1) → Some(Bob).
+      If None: drop (unknown identity).
+    - verify ack.ack_from_owner_addr ==
+      Bob. If mismatch: drop + telemetry
+      (impersonated ack).
+    - lookup OutboxEntry by (space_id,
+      message_cid). Verify Bob ∈ entry
+      .recipient_owners. If not: drop +
+      telemetry (ack from non-recipient).
+    - apply_owner_device_update(Bob
+      (resolved), ack.ack_from_devices,
+      HLC now)
     - apply_outbox: outbox[id].delivered_to
       .insert(Bob); recompute status →
       'complete' (only one recipient)
@@ -670,6 +791,10 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `dm_crypto::sender_binding_mismatch_rejects` — payload.sender ≠ link_origin → SenderImpersonation
 - `dm_envelope::dm_packet_discriminant_round_trip` — encode each variant, decode, equal
 - `dm_envelope::dm_packet_unknown_discriminant_rejects` — `[0xFF, ...]` → Err(UnknownDiscriminant)
+- `owner_state_types::dm_content_key_serializes_as_bstr_32` — single key encodes as `0x58 0x20 || <32 bytes>` (34 bytes total), NOT as CBOR array-of-u8 (~63 bytes for random data)
+- `owner_state_types::device_identity_hash_serializes_as_bstr_16` — single hash encodes as `0x50 || <16 bytes>` (17 bytes total), NOT as CBOR array-of-u8
+- `owner_state_types::dm_content_key_zeroized_on_drop` — drop a key in a controlled allocation, verify backing memory is zero (use `ZeroizeOnDrop` derive's guarantees)
+- `owner_state_types::dm_content_key_debug_redacts` — `format!("{:?}", key)` does not include any of the 32 byte values
 - `owner_state_types::space_with_content_key_round_trip_cbor` — DM Space round-trips through CBOR persistence
 - `owner_state_types::folder_space_no_content_key_round_trip_cbor` — Folder Space serializes without `ck`/`pk` keys
 - `owner_state_crdt::validate_invariants_dm_requires_content_key` — DM without content_key → InvariantError
@@ -706,9 +831,13 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - All Phase 2 stub-transport tests re-run with real harmony-runtime transport (mocked at the RuntimeAction-channel boundary, not over the wire)
 - `dm_outbox::handle_unicast_invite_creates_space` — inject UnicastReceived(disc=0x01, ...) → new Space + OwnerDeviceCache update
 - `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, ...) + mock CasOp::GetOrFetch → InboxEntry written, dm-received emitted, DmAck queued
-- `dm_outbox::handle_unicast_cidnotify_sender_binding_mismatch_drops` — payload.sender ≠ link_origin → no InboxEntry, no ack, telemetry logged
+- `dm_outbox::handle_unicast_cidnotify_sender_binding_mismatch_drops` — `MessagePayload.sender` ≠ link_origin → no InboxEntry, no ack, telemetry logged
+- `dm_outbox::handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update` — `notify.sender_owner_addr` ≠ resolved owner from `from_identity_hash` → no `apply_owner_device_update`, no InboxEntry, no ack, telemetry logged (cache-poisoning regression)
+- `dm_outbox::handle_unicast_cidnotify_unknown_link_origin_drops` — `from_identity_hash` not in any OwnerDeviceCache entry → drop with `UnknownLinkOrigin` telemetry
 - `dm_outbox::handle_unicast_cidnotify_decrypt_failure_uses_prior_keys` — primary content_key fails, prior_content_keys[0] succeeds → InboxEntry written
 - `dm_outbox::handle_unicast_ack_updates_outbox_delivered_to` — inject (disc=0x03, ...) → OutboxEntry update, dm-delivered emitted
+- `dm_outbox::handle_unicast_ack_owner_field_mismatch_drops` — `ack.ack_from_owner_addr` ≠ resolved owner → no delivered_to mutation, telemetry logged
+- `dm_outbox::handle_unicast_ack_from_non_recipient_drops` — resolved owner not in `OutboxEntry.recipient_owners` → no delivered_to mutation, telemetry logged (forged-ack regression)
 - `dm_outbox::expiration_30day_real_transport_path`
 
 ### Phase 4 — NavService + IPC events + UI
