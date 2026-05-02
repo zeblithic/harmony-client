@@ -40,7 +40,7 @@ Define a concrete encryption scheme for DM and group-DM message payloads stored 
 
 ## Design constraints (architectural — read before implementation or v2 design)
 
-- **Fixed 32-byte key shape.** `Space.content_key: Option<[u8; 32]>` and `Space.prior_content_keys: Vec<[u8; 32]>` hardcode 256-bit symmetric keys. v1 (ChaCha20-Poly1305) and a hypothetical v2 (XChaCha20-Poly1305) both use 256-bit keys, so the version-byte prefix carries the v1↔v2 migration cleanly without changing the `Space` schema. **A future v3 primitive that requires a different key length (e.g., a 384-bit AEAD) would require a Space-schema migration**, not just a version-byte bump — both `content_key` and `prior_content_keys` would need restructuring (e.g., to `Option<Vec<u8>>` with length-prefixed entries, plus a per-key version tag in `prior_content_keys` to disambiguate which primitive expects which key length). Design the v3 transition as a Space-schema migration, not a wire-format-only bump.
+- **Fixed 32-byte key shape.** `Space.content_key: Option<Zeroizing<[u8; 32]>>` and `Space.prior_content_keys: Vec<Zeroizing<[u8; 32]>>` hardcode 256-bit symmetric keys (the `Zeroizing` wrapper is the in-memory zeroization invariant — see "Implementation note" below; the wire format is identical to a bare `[u8; 32]`). v1 (ChaCha20-Poly1305) and a hypothetical v2 (XChaCha20-Poly1305) both use 256-bit keys, so the version-byte prefix carries the v1↔v2 migration cleanly without changing the `Space` schema. **A future v3 primitive that requires a different key length (e.g., a 384-bit AEAD) would require a Space-schema migration**, not just a version-byte bump — both `content_key` and `prior_content_keys` would need restructuring (e.g., to `Option<Zeroizing<Vec<u8>>>` with length-prefixed entries, plus a per-key version tag in `prior_content_keys` to disambiguate which primitive expects which key length). Design the v3 transition as a Space-schema migration, not a wire-format-only bump.
 - **Symmetric AEAD only.** The scheme assumes every member can both encrypt and decrypt with the same `content_key`. Asymmetric primitives (e.g., per-recipient public-key encryption) would shift the data model away from a per-Space shared key. Out of scope for v1; tied to a hypothetical "DM with read-only members" feature that doesn't exist yet.
 - **Reticulum-link as the authenticator.** The receive-time sender-binding check (see "Sender-binding check" below) relies on Reticulum's authenticated `Link` primitive to provide the ground-truth origin owner. A future non-Reticulum delivery transport would either need to provide an equivalent authenticated origin OR require per-message Ed25519 signing (Future Work).
 
@@ -60,7 +60,8 @@ Encryption sits at the harmony-client application layer between the message-comp
 │   └─ MessagePayload — bound envelope (canonical CBOR)       │
 ├─────────────────────────────────────────────────────────────┤
 │ harmony-client::owner_state_types::Space                    │
-│   adds field: content_key: Option<[u8; 32]>                 │
+│   adds: content_key: Option<Zeroizing<[u8; 32]>>            │
+│         prior_content_keys: Vec<Zeroizing<[u8; 32]>>        │
 │   (None for folder/community; Some for dm/group-dm.         │
 │   Inherits ZEB-211 at-rest encryption automatically.)       │
 ├─────────────────────────────────────────────────────────────┤
@@ -99,16 +100,20 @@ The key MUST come from a CSPRNG. `rand::rngs::OsRng` is the canonical choice in 
 Per-DM-Space `content_key` is distributed to each prospective member via Reticulum unicast as part of the Space invite. The invite payload carries everything the recipient needs to write a matching `Space` entry into their own owner-state CRDT:
 
 ```rust
+use zeroize::Zeroizing;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmInvite {
     #[serde(rename = "si")] pub space_id: SpaceId,
-    #[serde(rename = "kn")] pub kind: SpaceKind,         // 'dm' or 'group-dm'
-    #[serde(rename = "me")] pub members: Vec<OwnerAddr>, // canonical member set including inviter
-    #[serde(rename = "ck")] pub content_key: [u8; 32],
-    #[serde(rename = "ca")] pub created_at: Hlc,         // for the new Space entry's HLC
+    #[serde(rename = "kn")] pub kind: SpaceKind,                 // 'dm' or 'group-dm'
+    #[serde(rename = "me")] pub members: Vec<OwnerAddr>,         // canonical member set including inviter
+    #[serde(rename = "ck")] pub content_key: Zeroizing<[u8; 32]>, // zeros on drop, same as Space.content_key
+    #[serde(rename = "ca")] pub created_at: Hlc,                 // for the new Space entry's HLC
 }
 impl_canonical!(DmInvite);
 ```
+
+`content_key` here is wrapped in `Zeroizing` for the same reason as `Space.content_key`: an in-flight invite is key material in memory and must not leak via freed allocations. Wire format is unchanged (`Zeroizing<T>` delegates serde to `T`).
 
 Short `serde(rename)` keys mirror the existing `Space` / `OutboxEntry` patterns; canonical CBOR rules from ZEB-220 apply via `impl_canonical!`.
 
@@ -149,14 +154,19 @@ message_cid       = ContentId::for_book(
 
 Decrypt is the inverse with **multi-key fallback in deterministic order** (see "DM dedupe + content_key collisions" below):
 
-1. Read the 1-byte `version` prefix from `storage_blob[0]`. v1 uses `0x01`. If the byte is anything other than a recognized version, drop the blob.
-2. Take `storage_blob[1..13]` as the nonce; `storage_blob[13..]` is the `ciphertext_with_tag` (length `N + 16` for plaintext length `N`).
-3. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below).
-4. Try `ChaCha20Poly1305::decrypt(space.content_key, nonce, aad, ciphertext_with_tag)` first — the active key. On AEAD success, return plaintext.
-5. On AEAD failure, iterate `space.prior_content_keys` **in stored order** (which is lexicographically sorted and deduplicated — see invariants below), retrying decrypt with each candidate. Return plaintext on first success.
+1. Read the 1-byte `version` prefix from `storage_blob[0]`. If it's not a version this build recognizes, drop the blob.
+2. **Select the per-version wire-format layout and the matching primitive** (this is what makes mixed-version dedupe collisions safe — see "DM dedupe + content_key collisions" and "Migration path"):
+   - `version == 0x01` (v1, ChaCha20-Poly1305): `nonce_len = 12`. Slice `nonce = storage_blob[1..13]` and `ciphertext_with_tag = storage_blob[13..]`. Use `ChaCha20Poly1305::decrypt`.
+   - `version == 0x02` (v2, XChaCha20-Poly1305) — *reserved for future use; not implemented in v1 builds:* `nonce_len = 24`. Slice `nonce = storage_blob[1..25]` and `ciphertext_with_tag = storage_blob[25..]`. Use `XChaCha20Poly1305::decrypt`.
+   - In all versions, `poly1305_tag_len = 16` and the plaintext length is implicit: `N = storage_blob.len() - 1 - nonce_len - 16`.
+3. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below). AAD is independent of version.
+4. Try `decrypt(key=space.content_key, nonce, aad, ciphertext_with_tag)` first — the active key, with the version-selected primitive. On AEAD success, return plaintext.
+5. On AEAD failure, iterate `space.prior_content_keys` **in stored order** (which is lexicographically sorted and deduplicated — see invariants below), retrying decrypt with each candidate using the same version-selected primitive. Return plaintext on first success.
 6. If all keys fail, drop the blob (could be relocation attack, corrupted ciphertext, or genuinely wrong-key payload from a non-member).
 
 Stored order matters for test determinism — the "DM dedupe collision preserves decryptability" verification gate depends on a fixed iteration sequence to avoid flake.
+
+Note: the same 32-byte `content_key` is usable by both v1 and v2 primitives (both happen to use 256-bit keys), which is why the per-Space key set is scheme-agnostic. A future v3 with a different key length would need a Space-schema migration — see "Design constraints" above.
 
 ### Why random nonce, not deterministic
 
@@ -192,7 +202,13 @@ fn encrypt_dm_payload(
     payload: &MessagePayload,
 ) -> Result<(Vec<u8>, ContentId), DmEncryptError> {
     // Active key is required by the Space invariant for kind=dm/group-dm.
-    let content_key = space.content_key.as_ref().ok_or(DmEncryptError::MissingKey)?;
+    // `Option<Zeroizing<[u8; 32]>>::as_deref()` returns `Option<&[u8; 32]>`
+    // via Zeroizing's Deref<Target = T>; the inner key bytes never leave
+    // the Zeroizing wrapper, so they zero on drop.
+    let content_key: &[u8; 32] = space
+        .content_key
+        .as_deref()
+        .ok_or(DmEncryptError::MissingKey)?;
 
     let plaintext_cbor = canonical_cbor_encode(payload)?;
     let aad = canonical_cbor_encode(&space.dedupe_key())?;  // dedupe-stable binding
@@ -201,7 +217,7 @@ fn encrypt_dm_payload(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_slice())
+    let cipher = ChaCha20Poly1305::new_from_slice(content_key)
         .map_err(DmEncryptError::Key)?;
 
     let ciphertext_with_tag = cipher
@@ -233,7 +249,9 @@ const DM_ENCRYPTION_VERSION_V1: u8 = 0x01;
 
 `ContentId::for_book` is fallible (matches the existing call sites in `owner_state_sync.rs:415-422`, `folders.rs:78-82`); `DmEncryptError::Cid` wraps the upstream error. The function takes `&Space` rather than `(&[u8; 32], &SpaceId)` so the dedupe-key AAD is computed from the same source-of-truth that the encryption key comes from — this prevents a class of caller-side bugs where the wrong `SpaceId` is paired with a different Space's `content_key`.
 
-The nonce buffer is on the stack (small, no zeroize concern). `Space.content_key` and `Space.prior_content_keys` are bytes inside an AEAD-sealed CRDT block on disk; in-memory long-lived references MUST be wrapped in `Zeroizing` so they are deterministically cleared from memory on drop (matching ZEB-211's MUST-level handling of derived keys). This is a security invariant — bare `[u8; 32]` would leave key material in freed allocations and defeat the at-rest protection that the rest of this scheme rests on. Constructors that materialize `content_key`/`prior_content_keys` for in-memory use (e.g., decrypted from the CRDT, lifted out of `DmInvite`) MUST return `Zeroizing<[u8; 32]>` (or an equivalent zeroizing wrapper) rather than plain byte slices, so callers cannot accidentally hold un-zeroized copies.
+The nonce buffer is on the stack (small, no zeroize concern). `Space.content_key`, `Space.prior_content_keys`, and `DmInvite.content_key` MUST hold key material via `Zeroizing<[u8; 32]>` — the field types in this spec encode that requirement directly (see the struct definitions above). This is a security invariant: bare `[u8; 32]` would leave key material in freed allocations and defeat the at-rest protection that the rest of this scheme rests on. Wire format is unchanged because `Zeroizing<T>` delegates serde Serialize/Deserialize to `T` transparently.
+
+Local-variable bindings that materialize key material (e.g., a derived key during a merge step, or a working copy lifted out of `DmInvite` before assignment to `Space`) MUST be wrapped in `Zeroizing` for the same reason. Use `as_deref()` (which returns `Option<&[u8; 32]>` via `Zeroizing`'s `Deref<Target = [u8; 32]>` impl) when you need a `&[u8; 32]` for an AEAD call — see the `encrypt_dm_payload` snippet above. This keeps the underlying bytes inside the wrapper for the entirety of their lifetime; nothing escapes into an unzeroed long-lived binding.
 
 ## Plaintext envelope: `MessagePayload`
 
@@ -332,22 +350,30 @@ Receivers MUST reject ciphertexts whose version byte they do not recognize. v1 r
 Added to the existing `Space` struct in `owner_state_types.rs`:
 
 ```rust
+use zeroize::Zeroizing;
+
 pub struct Space {
     // ... existing fields (id, kind, parent, community_id, name, transport, members, ...) ...
 
     /// Active key — used for ALL new encryption. `Some` for kind=dm/group-dm,
     /// `None` for everything else. Enforced by `Space::validate_invariants`
     /// (see "Required invariants" below).
+    ///
+    /// Wrapped in `Zeroizing` so the bytes are deterministically cleared on
+    /// drop — this is a security MUST, not a SHOULD. Wire format is identical
+    /// to a bare `[u8; 32]` because `Zeroizing<T>` delegates serde
+    /// Serialize/Deserialize to `T` transparently.
     #[serde(rename = "ck", skip_serializing_if = "Option::is_none")]
-    pub content_key: Option<[u8; 32]>,
+    pub content_key: Option<Zeroizing<[u8; 32]>>,
 
     /// Historical keys retained for DECRYPTION only — never used for new
     /// encryption. Populated by the dedupe-merge rule (see "DM dedupe +
     /// content_key collisions" below). Empty for non-DM Spaces and for DM
     /// Spaces that have not undergone any dedupe collision. Stored sorted
-    /// lexicographically (canonical CBOR contract).
+    /// lexicographically (canonical CBOR contract). Each entry is wrapped in
+    /// `Zeroizing` for the same reason as `content_key`.
     #[serde(rename = "pk", skip_serializing_if = "Vec::is_empty", default)]
-    pub prior_content_keys: Vec<[u8; 32]>,
+    pub prior_content_keys: Vec<Zeroizing<[u8; 32]>>,
 }
 ```
 
