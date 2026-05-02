@@ -1847,4 +1847,60 @@ mod cas_op_protocol_tests {
         // Engine is alive — shutdown returns cleanly.
         let _ = engine.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn subscriber_treats_corrupted_admit_as_miss() {
+        // Simulates: peer published valid wire, network served corrupted
+        // bytes, our event-loop's PutLocal silently drops them (StorageTier
+        // hash-verify rejects on the production path), subsequent cache
+        // lookups return Ok(None). Subscriber should treat the corruption
+        // case identically to a fetch timeout — both yield Ok(None) at
+        // the trait boundary, both fall through to "drop publish, rely on
+        // next state-root" recovery.
+        use crate::content_store::CasOp;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+
+        // Stub that ALWAYS returns Ok(None) for GetOrFetch, but accepts
+        // PutLocal inserts (simulating the publisher-side admit working,
+        // but a peer's corrupted reply being silently dropped on receive).
+        let store = Arc::new(AsyncMutex::new(HashMap::new()));
+        let store_for_stub = Arc::clone(&store);
+        let _stub = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store_for_stub.lock().await.insert(cid, blob);
+                        let _ = reply.send(Ok(()));
+                    }
+                    CasOp::GetOrFetch { reply, .. } => {
+                        // Always None — simulates StorageTier silently
+                        // dropping corrupted bytes from a peer's reply.
+                        let _ = reply.send(Ok(None));
+                    }
+                }
+            }
+        });
+
+        let store_client = crate::content_store::RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_millis(500),
+        );
+
+        // GetOrFetch on any CID returns Ok(None) — corrupted-admit collapses
+        // onto the same recovery path as a timeout.
+        let cid = harmony_content::cid::ContentId::for_book(
+            b"anything",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .unwrap();
+        let observed = store_client.get(&cid).await.unwrap();
+        assert_eq!(
+            observed, None,
+            "corrupted-admit must surface as Ok(None) at the get() boundary"
+        );
+    }
 }
