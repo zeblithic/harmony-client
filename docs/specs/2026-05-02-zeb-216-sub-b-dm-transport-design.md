@@ -287,7 +287,17 @@ Reticulum unicast carries one of three packet types. Wire layout: `[u8 discrimin
 pub struct DmInvite {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "kn")] pub kind: SpaceKind,            // dm or group-dm
-    #[serde(rename = "me")] pub members: Vec<OwnerAddr>,    // includes inviter
+    /// Members of the Space — sorted ascending lex (matches Space::members
+    /// invariant for canonical CBOR determinism). Includes the inviter.
+    /// CANNOT be used to identify the inviter — `members[0]` is the
+    /// lex-smallest OwnerAddr, not the sender.
+    #[serde(rename = "me")] pub members: Vec<OwnerAddr>,
+    /// Inviter's OwnerAddr — the sender of this DmInvite. Bootstrap-trusted
+    /// at first contact (cache has no entry yet, so link-origin binding
+    /// can't run). Receiver MUST verify `inviter ∈ members` and
+    /// `sender_devices.contains(from_identity_hash)` as sanity gates,
+    /// then prompt the user before applying any state mutations.
+    #[serde(rename = "iv")] pub inviter: OwnerAddr,
     #[serde(rename = "ck")] pub content_key: DmContentKey,  // bstr(32) on wire, zeroized in memory
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
     #[serde(rename = "ca")] pub created_at: Hlc,
@@ -358,7 +368,39 @@ if matches!(packet, DmPacket::Ack(_)) && !outbox_entry.recipient_owners.contains
 // use `resolved_owner`, never the payload field.
 ```
 
-DmInvite is the bootstrap exception: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `resolve_link_origin_owner` returns None. The Invite teaches the cache the `(invite.members[0], invite.sender_devices)` mapping. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's devices are validated through link-origin binding.
+DmInvite is the bootstrap exception: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `resolve_link_origin_owner` returns `Err(UnknownLinkOrigin)`. The Invite teaches the cache the `(invite.inviter, invite.sender_devices)` mapping after the user accepts. Sanity gates that MUST run before the user prompt:
+
+```rust
+// 1. inviter must be one of the Space members (otherwise the invite is
+//    structurally inconsistent — a non-member can't invite themselves).
+if !invite.members.contains(&invite.inviter) {
+    return Err(DmReceiveError::InviterNotInMembers);  // drop + telemetry
+}
+// 2. sender_devices must include the device that actually sent the packet
+//    (the inviter is claiming "these are my devices" — that list MUST
+//    include the device transmitting the claim).
+if invite.sender_devices.binary_search(&from_identity_hash).is_err() {
+    return Err(DmReceiveError::SenderDeviceNotInSenderDevices);  // drop + telemetry
+}
+// 3. Receiver's own OwnerAddr must be in members (otherwise this invite
+//    isn't for us — likely a misroute or a probe).
+if !invite.members.contains(&self_owner_addr) {
+    return Err(DmReceiveError::ReceiverNotInMembers);  // drop + telemetry
+}
+// 4. UI prompt: "Invite from {invite.inviter} to {invite.kind}, accept?"
+//    On accept:
+//      apply_owner_device_update(
+//          invite.inviter,                  // NOT members[0]
+//          invite.sender_devices.clone(),
+//          invite.created_at,
+//      );
+//      apply_space(Space {
+//          content_key: Some(invite.content_key.clone()),
+//          ... fields from invite ...
+//      });
+```
+
+Note that `invite.members` is sorted ascending (matching `Space::members` invariants for canonical CBOR determinism), so `invite.members[0]` is the lex-smallest OwnerAddr — **NOT** the inviter. Always use `invite.inviter` for owner-binding decisions. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's devices are validated through link-origin binding.
 
 Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Decode pseudocode:
 
@@ -612,9 +654,15 @@ Alice device A1 (initiator)              Bob device B1 (recipient)
      prior_content_keys: vec![],
      transport: Reticulum, ...}
 5. apply_space() locally → owner-state CRDT.
-6. Build DmInvite {space_id, kind, members,
-     content_key: ck, sender_devices,
-     created_at: HLC now}
+6. Build DmInvite {space_id, kind, members
+     (sorted ascending lex), inviter:
+     Alice_addr (explicit field — NOT
+     members[0], which is the lex-smallest
+     OwnerAddr and may not be the inviter),
+     content_key: ck, sender_devices
+     (Alice's bound devices, MUST include
+     the device about to send), created_at:
+     HLC now}
 7. For each Bob device hash known
    (via OwnerDeviceCache or Reticulum
    path discovery on first contact):
@@ -625,19 +673,40 @@ Alice device A1 (initiator)              Bob device B1 (recipient)
                                           9. parse disc 0x01 → DmInvite
                                           10. validate kind ∈ {dm, group-dm};
                                               members.len() matches kind
-                                          11. apply_space(Space {
+                                          10a. sanity gates (drop on any fail):
+                                              - invite.inviter ∈ invite.members
+                                                (InviterNotInMembers)
+                                              - from_identity_hash ∈
+                                                invite.sender_devices
+                                                (SenderDeviceNotInSenderDevices)
+                                              - self_owner_addr ∈
+                                                invite.members
+                                                (ReceiverNotInMembers)
+                                          10b. UI prompt: "Invite from
+                                              {invite.inviter} to start a
+                                              {kind}, accept?" On decline:
+                                              silent drop, no state mutation,
+                                              no inviter notification.
+                                          11. on accept: apply_space(Space {
                                                 id: invite.space_id, kind,
                                                 members,
-                                                content_key: Some(invite.ck),
+                                                content_key: Some(
+                                                  invite.content_key.clone()),
                                                 ...}) → CRDT dedupe handles
                                                 "Alice and I both created"
                                           12. apply_owner_device_update(
-                                                Alice, invite.sender_devices,
+                                                invite.inviter (NOT
+                                                members[0]),
+                                                invite.sender_devices,
                                                 invite.created_at)
                                           13. emit IPC nav-updated
                                           14. Owner-state Flow A replicates
                                               new Space + content_key to Bob's
-                                              other devices (B2, B3, ...).
+                                              other devices (B2, B3, ...). Each
+                                              of those devices learns the
+                                              (inviter → devices) mapping via
+                                              the same Flow A propagation of
+                                              the OwnerDeviceCache update.
 ```
 
 **Edge: dedupe collision.** If A1's invite races A2's independent creation, CRDT dedupe via `dedupe_key = sorted_members` merges them. Loser's content_key rolls into winner's `prior_content_keys` per the cap rule.
@@ -902,7 +971,11 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 ### Phase 3b — real Reticulum delivery + 30-day expiration
 
 - All Phase 2 stub-transport tests re-run with real harmony-runtime transport (mocked at the RuntimeAction-channel boundary, not over the wire)
-- `dm_outbox::handle_unicast_invite_creates_space` — inject UnicastReceived(disc=0x01, ...) → new Space + OwnerDeviceCache update
+- `dm_outbox::handle_unicast_invite_creates_space` — inject UnicastReceived(disc=0x01, ...) → new Space + OwnerDeviceCache update keyed by `invite.inviter` (NOT members[0])
+- `dm_outbox::handle_unicast_invite_binds_inviter_field_not_members_zero` — group-DM where `invite.inviter` is lex-LARGEST member → cache entry created under `invite.inviter`, not `invite.members[0]`. Subsequent DmCidNotify from inviter's identity_hash resolves correctly via link-origin binding (regression for the members[0]-vs-inviter bug)
+- `dm_outbox::handle_unicast_invite_inviter_not_in_members_drops` — invite.inviter ∉ invite.members → InviterNotInMembers, drop, no state mutation
+- `dm_outbox::handle_unicast_invite_sender_device_not_in_sender_devices_drops` — from_identity_hash ∉ invite.sender_devices → SenderDeviceNotInSenderDevices, drop
+- `dm_outbox::handle_unicast_invite_receiver_not_in_members_drops` — self_owner_addr ∉ invite.members → ReceiverNotInMembers, drop (likely misroute or probe)
 - `dm_outbox::handle_unicast_invite_decline_writes_no_state` — UI declines → no Space written, no cache update, no IPC emitted, no notification to inviter
 - `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, ...) + mock CasOp::GetOrFetch → InboxEntry written, dm-received emitted, DmAck fan-out queued to all sender_devices
 - `dm_outbox::handle_unicast_cidnotify_duplicate_no_dm_received_emit` — second receive of same notify → apply_inbox returns NoOp → no second dm-received IPC event (atomic-emit regression)
