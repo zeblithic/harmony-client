@@ -409,7 +409,7 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
     let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
 
     // 4. Put into ContentStore (in 3a: InMemoryStub; 3b: real CAS).
-    ctx.content_store.put(root_cid, blob_ciphertext)?;
+    ctx.content_store.put(root_cid, blob_ciphertext).await?;
 
     // 5. Build state-root payload.
     let now = next_hlc(ctx).await;
@@ -543,7 +543,7 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     }
 
     // 3. Fetch the encrypted root blob from CAS.
-    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid) {
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
             // Phase 3b will replace InMemoryStub with real CAS; for
@@ -843,7 +843,7 @@ mod subscriber_tests {
 
     /// Build a wire payload for testing — re-uses the publisher's
     /// encryption path but with a controlled HLC.
-    fn make_wire(
+    async fn make_wire(
         kt: &Arc<KeyTree>,
         store: &Arc<dyn ContentStore>,
         state: &OwnerState,
@@ -855,7 +855,7 @@ mod subscriber_tests {
         let lookup = space_lookup_key(kt, b"owner-state-root-blob-v1");
         let blob_ciphertext = encrypt_entry(kt, &lookup, &blob_cleartext).unwrap();
         let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
-        store.put(root_cid, blob_ciphertext).unwrap();
+        store.put(root_cid, blob_ciphertext).await.unwrap();
         let payload = RootPublishPayload {
             root_cid,
             at: Hlc {
@@ -889,7 +889,7 @@ mod subscriber_tests {
             5000, // long debounce — keep self-publishes out of the way
         );
 
-        let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         // Give the subscriber branch a moment to process.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -926,28 +926,14 @@ mod subscriber_tests {
 
         // First publish: at=2000.
         sub_tx
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                2000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Replay: at=1000 (older). Tracker must NOT regress.
         sub_tx
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                1000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1014,7 +1000,7 @@ mod subscriber_tests {
         let mut remote = OwnerState::default();
         remote.spaces.insert(SpaceId([42; 16]), folder(42, 100));
 
-        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1078,7 +1064,7 @@ mod subscriber_tests {
             },
         );
 
-        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1121,7 +1107,7 @@ mod subscriber_tests {
 
         // Publisher puts the blob in its OWN stub; subscriber's
         // stub never receives it.
-        let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1172,14 +1158,7 @@ mod subscriber_tests {
                 5000,
             );
             sub_tx
-                .send(make_wire(
-                    &kt,
-                    &store,
-                    &OwnerState::default(),
-                    "peer-bob",
-                    5000,
-                    0,
-                ))
+                .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 5000, 0).await)
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1209,14 +1188,7 @@ mod subscriber_tests {
         );
         // Send an older publish: at=2000 < 5000.
         sub_tx2
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                2000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1286,7 +1258,11 @@ mod publisher_tests {
         assert_eq!(payload.at.device_id, "alice-device");
 
         // The root_cid must reference a blob present in the stub.
-        let blob = store.get(&payload.root_cid).unwrap().expect("blob present");
+        let blob = store
+            .get(&payload.root_cid)
+            .await
+            .unwrap()
+            .expect("blob present");
         assert!(!blob.is_empty());
 
         let _ = engine.shutdown().await;
