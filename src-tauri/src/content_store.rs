@@ -60,6 +60,7 @@ impl ContentStore for InMemoryStub {
 /// awaits a oneshot reply. See spec §"Event loop handler" and
 /// §"Re-entry" for the full protocol including the second-mpsc-hop
 /// admit pattern used by `GetOrFetch` after a successful network GET.
+#[derive(Debug)]
 pub enum CasOp {
     /// Admit `blob` to the local StorageTier cache under `cid`.
     /// Reply `Ok(())` once `runtime.tick()` has drained the
@@ -264,7 +265,7 @@ mod tests {
         let err = store.put(ContentId([0; 32]), vec![]).await.unwrap_err();
         match err {
             ContentStoreError::Io(msg) => {
-                assert!(msg.contains("event loop unavailable"), "got msg: {msg}");
+                assert!(msg.contains("(send)"), "got msg: {msg}");
             }
         }
     }
@@ -285,6 +286,33 @@ mod tests {
 
         let blob = store.get(&ContentId([0xAA; 32])).await.unwrap();
         assert_eq!(blob, None);
+        stub.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_content_store_reply_dropped_returns_io_error() {
+        // Stub receives the message but drops the reply sender without
+        // replying. RuntimeContentStore.put should then surface the
+        // distinct (reply) error message — the spec calls out the
+        // distinction between (send) and (reply) lifecycle failures
+        // because they implicate different root causes (receiver gone
+        // before delivery vs receiver panicked after delivery).
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+
+        let stub = tokio::spawn(async move {
+            // Receive the message but drop the reply sender without replying.
+            if let Some(CasOp::PutLocal { reply, .. }) = cas_op_rx.recv().await {
+                drop(reply);
+            }
+        });
+
+        let err = store.put(ContentId([0; 32]), vec![]).await.unwrap_err();
+        match err {
+            ContentStoreError::Io(msg) => {
+                assert!(msg.contains("(reply)"), "got msg: {msg}");
+            }
+        }
         stub.await.unwrap();
     }
 }
