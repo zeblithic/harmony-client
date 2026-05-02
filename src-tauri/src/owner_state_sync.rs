@@ -1653,3 +1653,82 @@ mod integration_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cas_op_protocol_tests {
+    //! Phase 3b end-to-end test: exercise the CasOp protocol via a
+    //! HashMap-backed stub event loop instead of real Zenoh + StorageTier.
+    //! Verifies the publisher PutLocal path, subscriber GetOrFetch cache
+    //! hit, and subscriber GetOrFetch cache miss.
+
+    use crate::content_store::{CasOp, ContentStore, RuntimeContentStore};
+    use harmony_content::cid::ContentId;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// HashMap-backed simulator of the harmony-runtime event loop's
+    /// CasOp arm. Two devices share one `Arc<Mutex<HashMap<...>>>` to
+    /// represent the network's collective view; PutLocal inserts,
+    /// GetOrFetch reads (no real network).
+    fn spawn_stub_event_loop(
+        mut cas_op_rx: tokio::sync::mpsc::Receiver<CasOp>,
+        store: Arc<Mutex<HashMap<ContentId, Vec<u8>>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store.lock().await.insert(cid, blob);
+                        let _ = reply.send(Ok(()));
+                    }
+                    CasOp::GetOrFetch { cid, reply, .. } => {
+                        let bytes = store.lock().await.get(&cid).cloned();
+                        let _ = reply.send(Ok(bytes));
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn publisher_put_visible_to_subscriber() {
+        let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = Arc::new(Mutex::new(HashMap::new()));
+        let _stub = spawn_stub_event_loop(cas_op_rx, Arc::clone(&store));
+
+        let pub_store =
+            RuntimeContentStore::new(cas_op_tx.clone(), std::time::Duration::from_millis(500));
+        let sub_store =
+            RuntimeContentStore::new(cas_op_tx.clone(), std::time::Duration::from_millis(500));
+
+        // Publisher computes a structured CID for some ciphertext and puts.
+        let ciphertext = vec![1, 2, 3, 4, 5];
+        let cid = ContentId::for_book(
+            &ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pub_store.put(cid, ciphertext.clone()).await.unwrap();
+
+        // Subscriber fetches the same CID — must observe the bytes.
+        let observed = sub_store.get(&cid).await.unwrap();
+        assert_eq!(observed, Some(ciphertext));
+    }
+
+    #[tokio::test]
+    async fn subscriber_get_returns_none_for_unknown_cid() {
+        let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = Arc::new(Mutex::new(HashMap::new()));
+        let _stub = spawn_stub_event_loop(cas_op_rx, Arc::clone(&store));
+
+        let sub = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+        let unknown =
+            ContentId::for_book(b"nothing", harmony_content::cid::ContentFlags::default()).unwrap();
+        let observed = sub.get(&unknown).await.unwrap();
+        assert_eq!(observed, None);
+    }
+}
