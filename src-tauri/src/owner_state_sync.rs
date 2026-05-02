@@ -1731,4 +1731,120 @@ mod cas_op_protocol_tests {
         let observed = sub.get(&unknown).await.unwrap();
         assert_eq!(observed, None);
     }
+
+    #[tokio::test]
+    async fn subscriber_observes_timeout_as_none_and_drops_publish() {
+        // Stub that returns Ok(None) for the FIRST GetOrFetch — simulating
+        // a network timeout at the event-loop layer. PutLocal still works.
+        // Drives a SyncEngine subscriber through a synthetic state-root
+        // delivery for a CID the stub doesn't have, asserts the engine
+        // continues running and local state stays empty.
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_crypto::{
+            canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key, KeyTree,
+        };
+        use crate::owner_state_types::{Hlc, RootPublishPayload};
+        use std::collections::BTreeMap;
+        use tokio::sync::mpsc;
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(8);
+
+        // Custom stub: GetOrFetch returns Ok(None) on the first call,
+        // delegates to a shared HashMap on subsequent calls. PutLocal
+        // inserts to the HashMap (so any subsequent calls would see them).
+        let store_for_stub = Arc::new(Mutex::new(HashMap::<ContentId, Vec<u8>>::new()));
+        let store_ref = Arc::clone(&store_for_stub);
+        let _stub = tokio::spawn(async move {
+            let mut first_get = true;
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store_ref.lock().await.insert(cid, blob);
+                        let _ = reply.send(Ok(()));
+                    }
+                    CasOp::GetOrFetch { cid, reply, .. } => {
+                        if first_get {
+                            first_get = false;
+                            let _ = reply.send(Ok(None)); // simulated timeout
+                        } else {
+                            let bytes = store_ref.lock().await.get(&cid).cloned();
+                            let _ = reply.send(Ok(bytes));
+                        }
+                    }
+                }
+            }
+        });
+
+        // Set up a SyncEngine subscriber wired through RuntimeContentStore.
+        let kt = Arc::new(KeyTree::derive(&[42u8; 32]).unwrap());
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let content_store = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_millis(500),
+        )) as Arc<dyn ContentStore>;
+        let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::owner_state_sync::SyncEngine::new(
+            Arc::clone(&kt),
+            "device-sub".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&content_store),
+            pub_tx,
+            sub_rx,
+            crate::owner_state_sync::PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            50,
+        );
+
+        // Forge a state-root publish for a CID the stub doesn't have. The
+        // first GetOrFetch returns Ok(None), so the subscriber should drop
+        // this delivery without mutating local state.
+        let lookup = space_lookup_key(&kt, super::OWNER_STATE_ROOT_BLOB_TAG);
+        let snapshot = OwnerState::default();
+        let cleartext = canonical_cbor_encode(&snapshot).unwrap();
+        let ciphertext = encrypt_entry(&kt, &lookup, &cleartext).unwrap();
+        let cid_unknown = ContentId::for_book(
+            &ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payload = RootPublishPayload {
+            root_cid: cid_unknown,
+            at: Hlc {
+                wall_ms: 1_000_000,
+                logical: 0,
+                device_id: "device-pub".into(),
+            },
+        };
+        let payload_bytes = canonical_cbor_encode(&payload).unwrap();
+        let wire = encrypt_root_publish(&kt, &payload_bytes).unwrap();
+
+        // Deliver the wire payload — subscriber processes it, hits Ok(None),
+        // logs WARN, drops the publish. We assert the engine continues
+        // running and local state stays empty.
+        sub_tx.send(wire).await.unwrap();
+
+        // Allow the subscriber task to process. The 50ms debounce + a
+        // brief safety margin covers the async hop.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let s = state.lock().await;
+            assert!(
+                s.spaces.is_empty(),
+                "state should remain empty after dropped publish"
+            );
+        }
+
+        // Engine is alive — shutdown returns cleanly.
+        let _ = engine.shutdown().await;
+    }
 }
