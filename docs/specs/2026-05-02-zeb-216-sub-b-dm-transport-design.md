@@ -42,6 +42,16 @@ Same as ZEB-219 plus transport-layer concerns:
 - **Stale device list**: piggyback refresh on every DM envelope keeps recipient's `OwnerDeviceCache` fresh; cache LWW on `learned_at` HLC
 - **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot run link-origin binding. Trust comes from the out-of-band channel by which the inviter's `(owner_addr, device_identity_hash)` was shared (invite link, QR, library directory listing). UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated. Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
 
+### DmInvite rejection / decline semantics (v1)
+
+When the user declines a `DmInvite`:
+- **No persistent state is written.** Owner-state CRDT is untouched (no Space, no `OwnerDeviceCache` update), so no replication side-effects on the recipient's other bound devices.
+- **No notification to the inviter.** This is privacy-preserving — the recipient does not reveal whether their device was online, whether they saw the invite, or whether they declined vs ignored. The inviter's `OutboxEntry` (if they sent a follow-up DmCidNotify) will simply expire at 30 days like any unack'd DM.
+- **Repeat invites from the same OwnerAddr are re-prompted.** v1 has no per-OwnerAddr "ignored inviters" persistent set. If the user wants to durably block an OwnerAddr, that's a separate "block this peer" feature deferred to a follow-up ticket.
+- **Implementation note.** The decline path is just "drop the DmInvite packet and emit no IPC event"; no special handling beyond not running the accept path.
+
+If the receiver has already accepted a previous DmInvite from the same OwnerAddr (Space exists), a new DmInvite for the same `dedupe_key` is treated as a normal CRDT merge into the existing Space (per the dedupe-merge cap rule for `prior_content_keys`).
+
 Out of scope:
 - Master-seed compromise of any participant (ZEB-173 fresh-identity flow)
 - Forward secrecy on past messages (ZEB-219 v1 trade-off)
@@ -213,9 +223,16 @@ pub struct OwnerDeviceEntry {
 
 `DeviceIdentityHash` is the bstr(16) newtype defined above.
 
-Apply rule (LWW on `learned_at`):
+Apply rule (LWW on `learned_at`, with mandatory dedupe + cap to prevent cache-growth DoS):
 
 ```rust
+/// Maximum number of device identities retained per OwnerAddr. Bounds the
+/// memory cost of OwnerDeviceCache and the Reticulum-MTU cost of any
+/// piggybacked sender_devices lists. Chosen to comfortably exceed
+/// "one user with many bound devices" (~12-20 today) while staying
+/// well under levels that would meaningfully bloat envelopes.
+pub const MAX_DEVICES_PER_OWNER: usize = 32;
+
 pub fn apply_owner_device_update(
     cache: &mut OwnerDeviceCache,
     addr: OwnerAddr,
@@ -225,16 +242,21 @@ pub fn apply_owner_device_update(
     match cache.devices.get(&addr) {
         Some(existing) if existing.learned_at >= learned_at => ApplyOutcome::NoOp,
         _ => {
-            let mut sorted = devices;
-            sorted.sort();
-            cache.devices.insert(addr, OwnerDeviceEntry { devices: sorted, learned_at });
+            let mut sanitized = devices;
+            sanitized.sort();                            // ascending lex
+            sanitized.dedup();                           // drop repeated hashes
+            sanitized.truncate(MAX_DEVICES_PER_OWNER);   // bound size
+            cache.devices.insert(
+                addr,
+                OwnerDeviceEntry { devices: sanitized, learned_at },
+            );
             ApplyOutcome::Applied
         }
     }
 }
 ```
 
-Storage cost bound: 16 bytes (OwnerAddr) + 16 × K_devices + ~24 bytes (HLC) per peer. At 1000 DM peers × 12 devices each ≈ 210KB. Trivial.
+Storage cost bound: 16 bytes (OwnerAddr) + 16 × min(K, 32) + ~24 bytes (HLC) per peer. At 1000 DM peers × 32 devices each ≈ 560KB. Still trivial.
 
 ### Plaintext envelope (Phase 1, recap from ZEB-219)
 
@@ -301,20 +323,30 @@ Both DmCidNotify and DmAck carry payload-controlled owner fields (`sender_owner_
 The receive-side rule (Phase 3b):
 
 ```rust
+/// Resolve link-origin device → owner. MUST match exactly one OwnerAddr.
+///
+/// Returns Err on zero matches (UnknownLinkOrigin) or multiple matches
+/// (AmbiguousLinkOrigin). Multi-match is reachable via corrupted state
+/// or a malicious cache-poisoning DmInvite that claimed an existing
+/// device hash for a different owner; either way the resolution is not
+/// trustworthy — drop + telemetry.
 fn resolve_link_origin_owner(
     cache: &OwnerDeviceCache,
     from_identity_hash: DeviceIdentityHash,
-) -> Option<OwnerAddr> {
-    cache.devices.iter()
-        .find(|(_, entry)| entry.devices.binary_search(&from_identity_hash).is_ok())
+) -> Result<OwnerAddr, DmReceiveError> {
+    let matches: Vec<OwnerAddr> = cache.devices.iter()
+        .filter(|(_, entry)| entry.devices.binary_search(&from_identity_hash).is_ok())
         .map(|(addr, _)| *addr)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(DmReceiveError::UnknownLinkOrigin),
+        _ => Err(DmReceiveError::AmbiguousLinkOrigin),
+    }
 }
 
 // For DmCidNotify and DmAck:
-let resolved_owner = match resolve_link_origin_owner(cache, from_identity_hash) {
-    Some(o) => o,
-    None => return Err(DmReceiveError::UnknownLinkOrigin),  // drop + telemetry
-};
+let resolved_owner = resolve_link_origin_owner(cache, from_identity_hash)?;  // drop + telemetry on Err
 if payload_owner_field != resolved_owner {
     return Err(DmReceiveError::OwnerFieldMismatch);  // drop + telemetry
 }
@@ -626,10 +658,21 @@ Alice A1 (sender)                         Bob B1 (recipient)
      + random nonce → storage_blob
    - CAS write: CasOp::PutLocal(storage_blob)
      → message_cid (BLAKE3 over storage_blob)
+   - derive recipient_owners from
+     Space.members:
+       1. exclude sender's own OwnerAddr
+       2. dedupe (set semantics)
+       3. sort lex (deterministic order
+          for equality checks across
+          sender's bound devices)
+     For 1:1 DM: recipient_owners = [Bob].
+     For group-DM with members
+     [Alice, Bob, Carol, Carol]: result is
+     [Bob, Carol] (sorted, deduped).
    - create OutboxEntry {id: ULID, space_id,
-     message_cid, recipient_owners: [Bob],
-     delivered_to: [], status: 'pending',
-     created_at: HLC now}
+     message_cid, recipient_owners (derived
+     above), delivered_to: [],
+     status: 'pending', created_at: HLC now}
    - apply_outbox() locally → CRDT
    - returns MessageId to UI immediately
 4. Owner-state Flow A: A2, A3, ... see
@@ -672,17 +715,38 @@ Alice A1 (sender)                         Bob B1 (recipient)
                                           12. verify_sender_binding(payload.sender
                                               == Alice_addr from link_origin lookup)
                                           13. if ok:
-                                              - apply_inbox(InboxEntry {space_id,
-                                                message_cid, from: Alice,
-                                                received_at: HLC})
-                                              - emit IPC dm-received
-                                              - SendUnicastToDevice(A1,
-                                                [0x03]||cbor(DmAck{...}))
+                                              - outcome = apply_inbox(InboxEntry
+                                                {space_id, message_cid, from:
+                                                Alice, received_at: HLC})
+                                              - if outcome == ApplyOutcome::Applied:
+                                                  emit IPC dm-received
+                                                (NoOp = duplicate, no IPC emit)
+                                              - For each device in
+                                                notify.sender_devices (fan out
+                                                ack to ALL sender devices, not
+                                                just A1):
+                                                  SendUnicastToDevice(device,
+                                                    [0x03]||cbor(DmAck{...}))
+                                                Cost: K_sender_devices unicast
+                                                sends per ack (~12 × 120 bytes
+                                                = 1.4KB). Liveness benefit:
+                                                ack reaches sender even if A1
+                                                went offline between notify
+                                                and ack. Failed sends are
+                                                silent (no retry on the ack
+                                                itself; sender's drain will
+                                                retry the original notify if
+                                                no ack lands anywhere).
                                           14. Owner-state Flow A: B2, B3 see the
                                               new InboxEntry. They each
                                               CasOp::GetOrFetch(message_cid),
-                                              decrypt locally, render. Each may
-                                              also send its own DmAck (sender's
+                                              decrypt locally, render. Their
+                                              local apply_inbox returns NoOp
+                                              (entry already present from
+                                              Flow A merge or their own
+                                              direct receive), so no duplicate
+                                              dm-received. Each may also send
+                                              its own DmAck fan-out (sender's
                                               drain treats duplicate acks as
                                               idempotent).
 15. UnicastReceived(from=B1,
@@ -751,7 +815,10 @@ Alice A1
 ────────
 N+1th drain tick (where N covers 30 days):
   for entry in outbox where status ∈ {pending, partial}:
-    if (now - entry.created_at) > 30 days
+    // Boundary: at-or-after 30 days (>=, not strictly >).
+    // Picked >= so the 30-day mark is the LAST moment an entry can be
+    // "still trying"; tests + UI assert "expired at 30 days" semantics.
+    if (now - entry.created_at) >= 30.days()
        and entry.delivered_to.len() < entry.recipient_owners.len():
       entry.delivery_status = 'expired'
       apply_outbox(entry)
@@ -768,7 +835,7 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - **Within-tick deduplication.** `dm_outbox` maintains an in-process `HashSet<(OutboxEntryId, DeviceIdentityHash)>` of in-flight sends; drain tick clears entries on transport result. Prevents duplicate sends within a single tick.
 - **Cross-device drain duplication tolerated.** Two of sender's devices may both run drain on the same OutboxEntry. Cost: marginal extra Reticulum traffic. Recipient's `apply_inbox` is idempotent (composite key `(space_id, message_cid)`), and sender's `apply_outbox` merges `delivered_to` via union — no corruption. Future optimization: HLC-based delivery lease.
 - **DmAck idempotent.** Same `(space_id, message_cid, ack_from_owner_addr)` arriving twice — `delivered_to.insert(addr)` is set-semantics; second ack is a no-op.
-- **Inbound DmCidNotify idempotent.** If recipient receives the same notify twice (e.g., sender's two drain devices both sent), `apply_inbox` upserts on `(space_id, message_cid)` — single InboxEntry exists. Second `dm-received` IPC event suppressed by checking pre-write existence.
+- **Inbound DmCidNotify idempotent (atomic-emit semantics).** If recipient receives the same notify twice (e.g., sender's two drain devices both sent), `apply_inbox` upserts on `(space_id, message_cid)` — single InboxEntry exists. `apply_inbox` returns `ApplyOutcome::Applied` for the first call (new entry written) and `ApplyOutcome::NoOp` for the duplicate. The `dm-received` IPC event MUST be emitted **only when `apply_inbox` returns `Applied`** — the inserted-vs-already-present discriminant is the atomic boundary, not a separate pre-write existence check (which would race between concurrent handlers on the same device).
 - **Reticulum link encryption is not authentication of OwnerAddr.** The link-layer ECDH proves "this packet came from a device holding the private key for `from_identity_hash`," but `from_identity_hash` is a *device* identifier. The receive-time `verify_sender_binding` check is what binds the encrypted-payload `sender` field to the link-origin OwnerAddr. Sender impersonation across owners requires both subverting Reticulum link-layer crypto AND owning the encryption content_key — not separately defensible.
 
 ## 30-day expiration mechanism
@@ -801,8 +868,14 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `owner_state_crdt::validate_invariants_folder_rejects_content_key` — Folder with content_key → InvariantError
 - `owner_state_crdt::validate_invariants_content_key_in_prior_rejects`
 - `owner_state_crdt::validate_invariants_prior_cap_exceeded_rejects`
-- `owner_state_crdt::dedupe_merge_prior_content_keys_cap_convergent` — the 5-Space scenario from ZEB-219: K₃<K₂<K₄<K₅<K₁ lex, cap=2, two distinct merge orders → both yield prior_content_keys = [K₂, K₃]
+- `owner_state_crdt::dedupe_merge_prior_content_keys_cap_convergent` — the 5-Space scenario from ZEB-219: K₃<K₂<K₄<K₅<K₁ lex, cap=2, two distinct merge orders → both yield prior_content_keys Vec equal to `[K₃, K₂]` (smallest two in ascending lex order — `merge_prior_content_keys` sorts ascending then truncates, so the stored Vec preserves ascending order). The set-equivalence `{K₂, K₃}` referenced in ZEB-219 prose is identical; the test asserts the ordered Vec for byte-equality regression coverage.
 - `owner_state_crdt::owner_device_cache_lww_apply` — newer learned_at replaces; older is no-op
+- `owner_state_crdt::owner_device_cache_apply_dedupes_devices` — input `[d1, d2, d1]` results in stored `[d1, d2]` (sorted, deduped)
+- `owner_state_crdt::owner_device_cache_apply_caps_at_max` — input of 100 devices results in stored Vec of length 32, comprising the lex-smallest 32 entries
+- `dm_outbox::resolve_link_origin_owner_one_match_returns_owner`
+- `dm_outbox::resolve_link_origin_owner_zero_matches_returns_unknown`
+- `dm_outbox::resolve_link_origin_owner_multi_match_returns_ambiguous` — same DeviceIdentityHash present under two OwnerAddr entries → AmbiguousLinkOrigin (regression for cache-poisoning attack via duplicate-claim)
+- `dm_outbox::send_dm_recipient_owners_excludes_sender_dedup_sort` — group-DM with members [Alice, Bob, Carol, Carol] produces OutboxEntry.recipient_owners = [Bob, Carol] (sorted, deduped, sender excluded)
 - `owner_state_persist::full_roundtrip_with_dm_state` — DM Space + OwnerDeviceCache entries persist + reload identically
 
 ### Phase 2 — outbox skeleton + send_dm IPC, stub transport
@@ -830,7 +903,9 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 
 - All Phase 2 stub-transport tests re-run with real harmony-runtime transport (mocked at the RuntimeAction-channel boundary, not over the wire)
 - `dm_outbox::handle_unicast_invite_creates_space` — inject UnicastReceived(disc=0x01, ...) → new Space + OwnerDeviceCache update
-- `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, ...) + mock CasOp::GetOrFetch → InboxEntry written, dm-received emitted, DmAck queued
+- `dm_outbox::handle_unicast_invite_decline_writes_no_state` — UI declines → no Space written, no cache update, no IPC emitted, no notification to inviter
+- `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, ...) + mock CasOp::GetOrFetch → InboxEntry written, dm-received emitted, DmAck fan-out queued to all sender_devices
+- `dm_outbox::handle_unicast_cidnotify_duplicate_no_dm_received_emit` — second receive of same notify → apply_inbox returns NoOp → no second dm-received IPC event (atomic-emit regression)
 - `dm_outbox::handle_unicast_cidnotify_sender_binding_mismatch_drops` — `MessagePayload.sender` ≠ link_origin → no InboxEntry, no ack, telemetry logged
 - `dm_outbox::handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update` — `notify.sender_owner_addr` ≠ resolved owner from `from_identity_hash` → no `apply_owner_device_update`, no InboxEntry, no ack, telemetry logged (cache-poisoning regression)
 - `dm_outbox::handle_unicast_cidnotify_unknown_link_origin_drops` — `from_identity_hash` not in any OwnerDeviceCache entry → drop with `UnknownLinkOrigin` telemetry
@@ -838,6 +913,9 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `dm_outbox::handle_unicast_ack_updates_outbox_delivered_to` — inject (disc=0x03, ...) → OutboxEntry update, dm-delivered emitted
 - `dm_outbox::handle_unicast_ack_owner_field_mismatch_drops` — `ack.ack_from_owner_addr` ≠ resolved owner → no delivered_to mutation, telemetry logged
 - `dm_outbox::handle_unicast_ack_from_non_recipient_drops` — resolved owner not in `OutboxEntry.recipient_owners` → no delivered_to mutation, telemetry logged (forged-ack regression)
+- `dm_outbox::handle_unicast_ack_ambiguous_link_origin_drops` — same DeviceIdentityHash claimed by two OwnerAddr entries → AmbiguousLinkOrigin → no mutation
+- `dm_outbox::expiration_at_30day_boundary_marks_expired` — entry with `created_at = now - 30.days()` (exactly at the boundary) → status transitions to `'expired'` on this drain tick (verifies `>=` not `>` semantics)
+- `dm_outbox::expiration_29day_old_entry_stays_pending` — entry with `created_at = now - 29.days()` → status remains `'pending'` (boundary regression)
 - `dm_outbox::expiration_30day_real_transport_path`
 
 ### Phase 4 — NavService + IPC events + UI
