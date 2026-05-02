@@ -137,7 +137,10 @@ pub enum CasOp {
     PutLocal {
         cid: ContentId,
         blob: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<(), ContentStoreError>>,
+        // `Some(tx)` for round-trip callers (RuntimeContentStore::put);
+        // `None` for fire-and-forget callers (the spawned-fetch admit hop
+        // in `GetOrFetch`). Encodes the no-observation intent in the type.
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), ContentStoreError>>>,
     },
     GetOrFetch {
         cid: ContentId,
@@ -181,7 +184,11 @@ Some(op) = cas_op_rx.recv() => {
                 dispatch_action(action, &session, &zenoh_tx, &udp,
                                 &broadcast_addr, &app, &closing, &own_zid).await;
             }
-            let _ = reply.send(Ok(()));
+            // Reply only if a Sender was provided. Fire-and-forget callers
+            // (the spawned-fetch admit hop) pass None to skip this.
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(()));
+            }
         }
         CasOp::GetOrFetch { cid, timeout, reply } => {
             // 1. Cache check first.
@@ -207,11 +214,10 @@ Some(op) = cas_op_rx.recv() => {
                         //    If the cas_op channel is full or closed,
                         //    caching is skipped; subsequent GetOrFetch on
                         //    this CID will re-fetch over the network.
-                        let (admit_tx, _admit_rx) = tokio::sync::oneshot::channel();
                         let _ = cas_op_tx_for_admit.try_send(CasOp::PutLocal {
                             cid,
                             blob: bytes.clone(),
-                            reply: admit_tx,
+                            reply: None,  // fire-and-forget; no oneshot allocation
                         });
                         let _ = reply.send(Ok(Some(bytes)));
                     }
@@ -337,7 +343,7 @@ Three test layers, each catching different bugs:
 
 - **Existing `InMemoryStub` round-trip** — verifies the trait surface still works for in-process testing. Phase 3a's three tests stay; only the test functions become `#[tokio::test]` and the calls add `.await`.
 - **New: `RuntimeContentStore` happy path** — construct with a stub mpsc receiver loop that returns canned `Ok(...)` replies. Verify the channel send + reply-await dance for both `put` and `get`.
-- **New: `RuntimeContentStore` error paths** — receiver replies with `Err(...)` (admit rejection); receiver dropped (channel closed); oneshot dropped before reply (caller-side cancellation).
+- **New: `RuntimeContentStore` error paths** — stub receiver replies with `Err(...)` (covers the generic Err-propagation path on the channel reply, e.g. fetch/io errors from `GetOrFetch`); receiver dropped (channel closed); oneshot dropped before reply (caller-side cancellation). Note: the production `PutLocal` handler always replies `Ok(())` — there is no admit-rejection signal.
 - **New: `RuntimeContentStore` timeout simulation** — receiver delays past `fetch_timeout`; verify `get` returns `Ok(None)`. (The actual `tokio::time::timeout` is in the event loop; this test verifies the `RuntimeContentStore` correctly propagates whatever the event loop replied — including `Ok(None)`.)
 
 ### Integration tests in `owner_state_sync.rs`

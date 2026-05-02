@@ -44,7 +44,7 @@ async fn ingest_list_pin_burn_roundtrip() {
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
     let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
     let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
-    let (_cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
+    let (cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -125,7 +125,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     fetch_rx,
                     ingest_rx,
                     content_verb_rx,
-                    _cas_op_tx,
+                    cas_op_tx,
                     cas_op_rx,
                     follow_rx,
                     voice_rx,
@@ -291,7 +291,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
     let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
     let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
-    let (_cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
+    let (cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -367,7 +367,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     fetch_rx,
                     ingest_rx,
                     content_verb_rx,
-                    _cas_op_tx,
+                    cas_op_tx,
                     cas_op_rx,
                     follow_rx,
                     voice_rx,
@@ -608,7 +608,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
     let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
     let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
     let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
-    let (_cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
+    let (cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
     let (ready_tx, ready_rx) = oneshot::channel();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -687,7 +687,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     fetch_rx,
                     ingest_rx,
                     content_verb_rx,
-                    _cas_op_tx,
+                    cas_op_tx,
                     cas_op_rx,
                     follow_rx,
                     voice_rx,
