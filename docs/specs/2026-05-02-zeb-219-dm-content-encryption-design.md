@@ -65,7 +65,7 @@ Encryption sits at the harmony-client application layer between the message-comp
 │         recipient's bound device(s).                        │
 ├─────────────────────────────────────────────────────────────┤
 │ harmony-content (unmodified, upstream)                      │
-│   stores storage_blob = nonce_12 || ciphertext_with_tag     │
+│   stores storage_blob = version || nonce_12 || ct || tag    │
 │   at message_cid = ContentId::for_book(blob, encrypted=true)│
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -121,28 +121,36 @@ Same as the parent Space — created at `add_dm_space`, persists until manual de
 For each outgoing DM message:
 
 ```text
-content_key      = Space.content_key                              // 32 bytes (the active key)
-plaintext_cbor   = canonical_cbor_encode(MessagePayload { .. })
-nonce_12         = OsRng.fill_bytes(12)                           // fresh CSPRNG per message
-aad              = canonical_cbor_encode(space.dedupe_key())      // see "Why AAD = ..." below
-ciphertext_tag   = ChaCha20Poly1305::encrypt(
-                     key       = content_key,
-                     nonce     = nonce_12,
-                     aad       = aad,                              // relocation + dedupe-stable binding
-                     plaintext = plaintext_cbor)                  // appends 16-byte Poly1305 tag
-storage_blob     = nonce_12 || ciphertext_tag                     // 12 + N + 16 = N + 28 bytes
-message_cid      = ContentId::for_book(
-                     &storage_blob,
-                     ContentFlags { encrypted: true, ..Default::default() })?  // fallible
+content_key       = space.content_key                             // 32 bytes (the active key)
+plaintext_cbor    = canonical_cbor_encode(MessagePayload { .. }) // length = N
+nonce_12          = OsRng.fill_bytes(12)                          // fresh CSPRNG per message
+aad               = canonical_cbor_encode(space.dedupe_key())     // see "Why AAD = ..." below
+version_byte      = 0x01                                          // v1; reserved for v1→v2 migration
+ciphertext        = ChaCha20Poly1305::encrypt(
+                      key       = content_key,
+                      nonce     = nonce_12,
+                      aad       = aad,
+                      plaintext = plaintext_cbor)                 // length = N
+poly1305_tag      = (16-byte Poly1305 authenticator)              // returned alongside ciphertext
+ciphertext_with_tag = ciphertext || poly1305_tag                  // length = N + 16
+storage_blob      = version_byte || nonce_12 || ciphertext_with_tag
+                  //  1 byte      || 12 bytes || N + 16 bytes
+                  // total length = N + 29 bytes
+message_cid       = ContentId::for_book(
+                      &storage_blob,
+                      ContentFlags { encrypted: true, ..Default::default() })?  // fallible
 ```
 
-Decrypt is the inverse with **multi-key fallback** (see "DM dedupe + content_key collisions" below):
+Decrypt is the inverse with **multi-key fallback in deterministic order** (see "DM dedupe + content_key collisions" below):
 
-1. Take `storage_blob[0..12]` as the nonce; the remainder is `ciphertext_with_tag`.
-2. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below).
-3. Try `ChaCha20Poly1305::decrypt(content_key, nonce, aad, ciphertext_with_tag)`. On AEAD success, return plaintext.
-4. On AEAD failure, iterate `space.prior_content_keys` in any order, retrying decrypt with each. Return on first success.
-5. If all keys fail, drop the blob (could be relocation attack, corrupted ciphertext, or genuinely wrong-key payload from a non-member).
+1. Read the 1-byte `version` prefix from `storage_blob[0]`. v1 uses `0x01`. If the byte is anything other than a recognized version, drop the blob.
+2. Take `storage_blob[1..13]` as the nonce; `storage_blob[13..]` is the `ciphertext_with_tag` (length `N + 16` for plaintext length `N`).
+3. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below).
+4. Try `ChaCha20Poly1305::decrypt(space.content_key, nonce, aad, ciphertext_with_tag)` first — the active key. On AEAD success, return plaintext.
+5. On AEAD failure, iterate `space.prior_content_keys` **in stored order** (which is lexicographically sorted and deduplicated — see invariants below), retrying decrypt with each candidate. Return plaintext on first success.
+6. If all keys fail, drop the blob (could be relocation attack, corrupted ciphertext, or genuinely wrong-key payload from a non-member).
+
+Stored order matters for test determinism — the "DM dedupe collision preserves decryptability" verification gate depends on a fixed iteration sequence to avoid flake.
 
 ### Why random nonce, not deterministic
 
@@ -201,7 +209,8 @@ fn encrypt_dm_payload(
         .map_err(DmEncryptError::Aead)?;
 
     let mut storage_blob =
-        Vec::with_capacity(nonce_bytes.len() + ciphertext_with_tag.len());
+        Vec::with_capacity(1 + nonce_bytes.len() + ciphertext_with_tag.len());
+    storage_blob.push(DM_ENCRYPTION_VERSION_V1);  // 0x01 — see "Version-byte prefix" below
     storage_blob.extend_from_slice(&nonce_bytes);
     storage_blob.extend_from_slice(&ciphertext_with_tag);
 
@@ -212,6 +221,8 @@ fn encrypt_dm_payload(
     .map_err(DmEncryptError::Cid)?;
     Ok((storage_blob, message_cid))
 }
+
+const DM_ENCRYPTION_VERSION_V1: u8 = 0x01;
 ```
 
 `ContentId::for_book` is fallible (matches the existing call sites in `owner_state_sync.rs:415-422`, `folders.rs:78-82`); `DmEncryptError::Cid` wraps the upstream error. The function takes `&Space` rather than `(&[u8; 32], &SpaceId)` so the dedupe-key AAD is computed from the same source-of-truth that the encryption key comes from — this prevents a class of caller-side bugs where the wrong `SpaceId` is paired with a different Space's `content_key`.
@@ -240,7 +251,11 @@ These could equally live only on `OutboxEntry`/`InboxEntry` CRDT metadata. Bindi
 
 **The bind alone is not sufficient.** Any co-member of a group-DM holds the `content_key` and can produce ciphertext with arbitrary `sender` field values. To prevent cross-member impersonation, the receive path MUST verify the bind against the authenticated message origin.
 
-### Receive-time sender-binding check (normative)
+### Sender-binding check (normative — applies to ALL InboxEntry write paths)
+
+The sender-binding check is required at **every code path that writes or updates an `InboxEntry` from decrypted payload bytes**. v1 has exactly one such path (live Reticulum receive), but the requirement is phrased to forward-protect any path that ever decrypts a `MessagePayload` and creates an `InboxEntry` from it.
+
+#### Live Reticulum receive (the only v1 path)
 
 When a DM ciphertext arrives via Reticulum unicast at a recipient's bound device, **before** writing an `InboxEntry`, the receiver MUST:
 
@@ -250,11 +265,28 @@ When a DM ciphertext arrives via Reticulum unicast at a recipient's bound device
 4. If they match → write the `InboxEntry` with the bound sender; render normally.
 5. If they mismatch → drop the ciphertext, do NOT write `InboxEntry`, surface a `dm-impersonation-rejected` telemetry event so the malicious-co-member case is observable in production.
 
-This check is the load-bearing defense against cross-member sender impersonation. The plaintext bind is what makes the check possible (without the bind, the receiver would have no ground-truth sender to compare against the Reticulum origin); the check is what gives the bind its protective value.
+The plaintext bind makes the check possible (without the bind, the receiver would have no ground-truth sender to compare against the Reticulum origin); the check is what gives the bind its protective value.
 
-For self-write paths (e.g., a sender's bound device writing its own `OutboxEntry`), the same check applies trivially — the bound sender must equal the local owner address.
+#### Why CRDT replication of an existing `InboxEntry` does NOT need a re-check
 
-This receive-time check is a v1 hard requirement. Per-message Ed25519 signing (Future Work) would extend the same protection to scenarios where Reticulum origin authentication is unavailable or weakened (e.g., relayed delivery via a non-Reticulum transport).
+Owner-state CRDT sync replicates the `InboxEntry` *record* (a CRDT data structure) across the recipient's bound devices. It does NOT re-decrypt the underlying ciphertext. The `InboxEntry` was written exactly once on the originating device — the device that received the live Reticulum delivery and ran the check — and the resulting CRDT record (with its bound sender) is what propagates. The originating device's check is the only check that runs, and that's sufficient because the per-owner CRDT replication boundary means all of the recipient's bound devices share the same trust domain (same master seed, same owner identity); a downstream bound device trusts an upstream bound device of the same owner by design.
+
+If a downstream bound device somehow received a malicious `InboxEntry` from an *upstream* malicious bound device of its own owner, that's the "compromised bound device" case which is out-of-scope per the threat model (full-master-seed compromise = full owner compromise).
+
+#### Forward requirement for hypothetical future paths
+
+Any future feature that creates or updates an `InboxEntry` from decrypted ciphertext bytes — for example, a "reimport from CAS after device migration" flow, a "merge in archived ciphertexts from external backup" flow, or a non-Reticulum transport — MUST satisfy at least ONE of:
+
+- **(a)** the path has access to an authenticated message origin (e.g., a transport-layer authenticated peer identity or a per-message signature) and runs the equivalent of steps 1-5 above; OR
+- **(b)** the path persists a verified bound-sender marker into the `InboxEntry` at the time of original receipt (e.g., a flag `sender_verified_via: ReticulumLink | Ed25519Sig | ...`), and the rehydration code asserts the marker is present before rendering.
+
+Implementations MUST NOT create or update an `InboxEntry` from raw decrypted bytes via a path that lacks both (a) and (b). On mismatch, the path MUST drop the payload and emit `dm-impersonation-rejected`. This forward requirement is documented here so downstream features cannot accidentally regress the impersonation defense.
+
+#### Self-write paths (sender-side)
+
+For a sender's bound device writing its own `OutboxEntry`, the bound `sender` field MUST equal the local owner address. This is a trivially-passing check in normal operation but the spec mandates it explicitly to catch any bug that would write a misbound `OutboxEntry` (which would later replicate via owner-state sync to the sender's other bound devices and surface as "Did I send this?").
+
+This receive-time check is a v1 hard requirement. Per-message Ed25519 signing (Future Work) would extend the same protection to scenarios where the authenticated link origin is unavailable or weakened.
 
 ### Why determinism in canonical-CBOR encoding even with random nonces
 
@@ -264,12 +296,30 @@ The plaintext encoding uses RFC 8949 §4.2 deterministic CBOR (bytewise key sort
 
 ### Storage blob (in CAS at `message_cid`)
 
+Let `N := len(plaintext_cbor)` (the canonical-CBOR encoding of `MessagePayload`). Then:
+
 ```text
-storage_blob[0..12]     = nonce_12                                  (12 bytes random)
-storage_blob[12..N+12]  = ChaCha20 keystream XOR plaintext_cbor     (N bytes)
-storage_blob[N+12..]    = Poly1305 authentication tag               (16 bytes)
-total overhead per msg  = 28 bytes (12 nonce + 16 tag)
+storage_blob[0]              = version_byte                    (1 byte; v1 = 0x01)
+storage_blob[1..13]          = nonce_12                        (12 bytes random)
+storage_blob[13..13+N]       = ciphertext                      (N bytes)
+storage_blob[13+N..13+N+16]  = poly1305_tag                    (16 bytes)
+total length                 = N + 29 bytes
 ```
+
+Where:
+- `ciphertext` = `ChaCha20(content_key, nonce_12) XOR plaintext_cbor`, of length `N`.
+- `poly1305_tag` = the 16-byte Poly1305 authenticator over `(aad, nonce_12, ciphertext)` under `content_key`.
+- `ciphertext_with_tag` (used internally by RustCrypto's `Aead::encrypt` API) = `ciphertext || poly1305_tag`, of length `N + 16`.
+
+`message_cid = ContentId::for_book(storage_blob, ContentFlags { encrypted: true, ..Default::default() })` is computed over the **exact bytes of `storage_blob`** (i.e., over `version_byte || nonce_12 || ciphertext || poly1305_tag`). Total per-message overhead vs. plaintext: **29 bytes** (1 version + 12 nonce + 16 tag).
+
+### Version-byte prefix and v1→v2 migration
+
+The leading version byte is reserved for forward-compatibility with future encryption-scheme migrations (see Migration path). v1 ciphertexts always start with `0x01`; v2 (when defined) would use `0x02`; etc. The byte is part of `storage_blob` and is therefore part of the input to `ContentId::for_book`, so v1 and v2 ciphertexts of the same plaintext + key + nonce produce different CIDs.
+
+Decryption reads the version byte first and dispatches to the matching primitive — see the decrypt step list in "Per-message encryption scheme". This makes mixed-version dedupe collisions safe (see "DM dedupe + content_key collisions" below): a merged Space can hold ciphertexts produced under different schemes, and decrypt picks the right primitive per ciphertext rather than per Space. The active encryption scheme used for **new** writes is governed by the local build's compiled-in default; v1 implementations always write `0x01`.
+
+Receivers MUST reject ciphertexts whose version byte they do not recognize. v1 receivers reject anything other than `0x01`; v2 receivers accept `0x01` (with v1 primitives) and `0x02` (with v2 primitives). This forward-compatibility scheme means a fleet running mixed v1/v2 builds during a rollout can still exchange messages with each other — v1 senders' messages decrypt on v2 receivers; v2 senders' messages are dropped on v1 receivers (which cannot decrypt them).
 
 ### `Space.content_key` and `Space.prior_content_keys` fields
 
@@ -306,7 +356,13 @@ Add the following kind-specific rules to the existing `validate_invariants` func
 | `Folder` | MUST be `None` | MUST be empty |
 | `Channel`, `PublicChannel` | MUST be `None` | MUST be empty |
 | `Community` | MUST be `None` | MUST be empty |
-| `Dm`, `GroupDm` | MUST be `Some` | MAY be empty or non-empty |
+| `Dm`, `GroupDm` | MUST be `Some` | MAY be empty or non-empty (subject to the rules below) |
+
+In addition, for any `Space` (regardless of `kind`), `prior_content_keys` MUST satisfy:
+
+- **Strictly sorted lexicographically:** for all adjacent pairs `(prior_content_keys[i], prior_content_keys[i+1])`, the bytewise comparison MUST yield `<` (strict; equality is forbidden — see uniqueness).
+- **Unique:** no two entries are byte-equal. (Implied by strict sortedness, but stated explicitly because the merge rule produces sorted-deduplicated unions and a callsite that bypasses that path would not catch a duplicate without an explicit invariant.)
+- **Bounded length:** `prior_content_keys.len() <= MAX_PRIOR_CONTENT_KEYS` (defined in "DoS bound on `prior_content_keys`" below).
 
 These are MUST-level invariants — `validate_invariants` MUST return `Err(InvariantError(...))` if any is violated. The function is called on every locally-produced write AND on every incoming merge, so a malformed Space cannot enter the CRDT through any code path. There is no fallback-to-cleartext path: every encrypt/decrypt site that operates on a `kind=Dm/GroupDm` Space MUST treat `content_key.is_none()` as a hard error.
 
@@ -326,11 +382,25 @@ Implementation note: this happens inside `lww_merge_space` (or its DM-specific s
 
 **Behavioral consequences:**
 - Encrypt always uses the active `content_key`. New messages are decryptable by anyone holding the active key.
-- Decrypt iterates `[content_key] + prior_content_keys` until one AEAD verification succeeds (per "Decrypt is the inverse" in "Per-message encryption scheme"). Old messages encrypted under any historically-active key remain decryptable as long as the bound device still holds the relevant key bytes.
-- The set is monotonically growing. In v1 there is no GC of `prior_content_keys`. In practice the set typically holds 0 or 1 entries (dedupe collisions are uncommon outside the offline-creation case).
+- Decrypt iterates `[content_key] + prior_content_keys` (in stored order) until one AEAD verification succeeds (per "Decrypt is the inverse" in "Per-message encryption scheme"). Old messages encrypted under any historically-active retained key remain decryptable as long as the bound device still holds the relevant key bytes.
 - New members invited AFTER a collision settles receive only the active `content_key` via `DmInvite` — they cannot decrypt messages encrypted under any prior key. This matches v1's "no rotation" + "no automatic share-history" stance and is consistent with `DmInvite`'s wire format below (active key only).
 
-**Merge ordering on a single device.** A device may apply incoming Spaces in any order, but the merge rule is associative and commutative over the set of historically-active keys: regardless of which side a device sees first, the final `prior_content_keys` set is the union of all keys ever associated with the dedupe identity, with the LWW winner as the active key. CRDT convergence is preserved.
+**Merge ordering on a single device.** A device may apply incoming Spaces in any order, but the merge rule (after the cap below) is order-independent: the final `prior_content_keys` set on a converged device is a deterministic function of the set of historically-active keys it has observed for that dedupe identity, plus the cap policy. CRDT convergence is preserved.
+
+#### DoS bound on `prior_content_keys`
+
+A malicious co-member of a DM can repeatedly send `DmInvite`s for the same `(sorted_members)` identity, each with a fresh random `content_key`. Each invite, when applied on the victim's device, triggers a dedupe collision and (under the naive merge rule) appends to `prior_content_keys`. Decryption cost grows linearly with the set size; an attacker can cheaply force unbounded growth and pump per-message decrypt latency.
+
+**Cap (normative).** `MAX_PRIOR_CONTENT_KEYS = 16`. The merge rule MUST refuse to grow `prior_content_keys` beyond this size:
+
+1. Compute the candidate merged set per the union-and-dedupe rule above.
+2. If the candidate length is `<= 16`, accept the merge.
+3. If the candidate length is `> 16`, **reject the new key contribution** (i.e., drop the loser's `content_key` and any historical keys from the loser side that would push past the cap). Keep the existing `prior_content_keys` and `content_key`. Apply the rest of the merge (Space metadata, members, etc.) normally.
+4. Emit a `dm-prior-keys-cap-exceeded` telemetry event with `(space_id, current_size)` so operators can observe attacker activity. The user-facing UI MAY surface a warning prompting the user to delete the DM Space (treating it as adversarial).
+
+Cap policy choice rationale: 16 chosen to match the group-DM member cap (the "natural maximum participation" heuristic). Reject-overflow rather than drop-oldest because we have no HLC ordering on retained keys (they're just byte values), so "oldest" is undefined; reject-overflow is deterministic and safe. The trade-off is that legitimate offline-creation collisions remain decryptable (the realistic count is 0-1 entries), while adversarial pumping is bounded.
+
+**Decrypt-after-cap behavior.** Messages encrypted under keys that were rejected by the cap are silently undecryptable on the affected device. This matches the existing "non-member can't decrypt" property — a spammer's keys are non-members from the perspective of the legitimate DM. No silent fallback to cleartext.
 
 ### `DmInvite` (Reticulum payload)
 
@@ -342,7 +412,7 @@ Per encrypt or decrypt of a 200-byte text message:
 
 - CSPRNG nonce (12 bytes via `OsRng`): ~50 ns
 - ChaCha20-Poly1305 encrypt/decrypt (200 bytes): ~2 μs
-- BLAKE3 hash via `ContentId::for_book` (228 bytes): ~1 μs
+- BLAKE3 hash via `ContentId::for_book` (229 bytes for storage_blob: 1 version + 12 nonce + 200 ct + 16 tag): ~1 μs
 - Canonical-CBOR encode (~140 bytes for `MessagePayload`): ~1 μs
 
 Total: ~5 μs per send or receive. Negligible vs Reticulum link establishment (typical ~ms) or owner-state CRDT bookkeeping. No blocking I/O on the encrypt/decrypt path.
@@ -351,13 +421,17 @@ Total: ~5 μs per send or receive. Negligible vs Reticulum link establishment (t
 
 ### v1 → v2 (future, e.g. switching to XChaCha20-Poly1305)
 
-**Per-Space, not global.** Existing v1 Spaces keep their existing `content_key` and v1 scheme; new Spaces created post-upgrade use v2. Flow:
+**Per-message, not per-Space.** v1 ships a 1-byte version prefix on every `storage_blob` (see "Version-byte prefix and v1→v2 migration" in Wire format). v2 implementations switch to writing `0x02` for new ciphertexts; v1 ciphertexts in CAS continue to be readable because their version-byte tells the decryptor to use the v1 primitive.
 
-1. Bump the encryption-scheme indicator on the `Space` CRDT type — e.g., add `encryption_version: u8` (defaulting to 1 for old entries, 2 for new ones). `MessagePayload` parsing branches on the parent Space's `encryption_version`.
-2. Existing Spaces continue to use ChaCha20-Poly1305 with 12-byte nonce indefinitely. Spaces created after the upgrade use the v2 primitive.
-3. No flag day, no global re-encryption migration, no first-byte-version-tag ambiguity in the storage blob.
+Flow:
 
-Cost: mixed-version users have a heterogeneous Space set during the rollout. Acceptable for a v1→v2 transition since each Space's lifetime is independent.
+1. v2 builds add the v2 primitive (e.g., XChaCha20-Poly1305 with 24-byte nonce) and a new compiled-in `DM_ENCRYPTION_VERSION_V2 = 0x02`. New writes use `0x02`.
+2. v2 decrypt branches on the version byte: `0x01` → v1 primitive (existing); `0x02` → v2 primitive. Both branches share the same key-fallback iteration over `[content_key] + prior_content_keys`.
+3. **Mixed-version dedupe collisions are safe.** When a v1 device and a v2 device independently create a Space with the same `sorted_members` and later sync, the dedupe-merge proceeds normally. Some ciphertexts in the merged Space are tagged `0x01` and others `0x02`; decrypt picks the right primitive per ciphertext. The merged Space's `content_key` and `prior_content_keys` are scheme-agnostic (32-byte values usable by both primitives — both happen to use 256-bit keys; if a future v3 changed key length, the design would need extension).
+4. v1 builds reject `0x02` ciphertexts (cannot decrypt). v2 senders' messages are silently dropped on v1 receivers — same fail-closed semantics as a wrong-key payload from a non-member. Operators rolling out v2 should target a coordinated fleet upgrade or accept the asymmetric-readability window.
+5. No flag day, no global re-encryption migration. Mixed-version fleets converge as devices upgrade.
+
+The 1-byte cost in v1 is the price of forward-compatibility; without it, v1→v2 migration would face the dedupe-collision-with-different-primitives problem (one merged Space, two ciphertexts under different primitives, no way to disambiguate without a per-message marker).
 
 ## Future work (follow-up tickets — file as descriptive phrases, get IDs from Linear)
 
@@ -376,7 +450,11 @@ Before ZEB-219 implementation lands (note: this spec is design-only; implementat
 - **DM dedupe collision preserves decryptability:** create two `Dm` Spaces on simulated bound devices (same sorted-members, different SpaceIds, different `content_key`s); encrypt one message under each; merge the Spaces via `apply_space_with_canonicalization`; assert both ciphertexts decrypt successfully against the merged Space (one via active key, one via `prior_content_keys` fallback).
 - **AAD stability across canonicalization:** encrypt a message with the loser's `SpaceId` in scope; trigger CRDT canonicalization (loser → winner SpaceId rewrite); recompute AAD = `canonical_cbor_encode(merged_space.dedupe_key())`; assert AEAD verification still succeeds. (This is the regression test for the original `space_id.0` AAD bug.)
 - **Sender-binding mismatch rejection:** simulate Reticulum delivery from origin owner Charlie carrying a payload with `MessagePayload.sender = Bob`; assert the receive path rejects (no `InboxEntry` written) and emits the `dm-impersonation-rejected` telemetry event.
-- **Invariant enforcement:** call `Space::validate_invariants` against malformed Spaces — `kind=Dm` with `content_key=None`, `kind=Folder` with `content_key=Some(...)`, `kind=Folder` with non-empty `prior_content_keys` — assert each returns `Err(InvariantError(...))`.
+- **Invariant enforcement:** call `Space::validate_invariants` against malformed Spaces — `kind=Dm` with `content_key=None`, `kind=Folder` with `content_key=Some(...)`, `kind=Folder` with non-empty `prior_content_keys`, `kind=Dm` with unsorted `prior_content_keys`, `kind=Dm` with duplicate entries in `prior_content_keys`, `kind=Dm` with `prior_content_keys.len() > MAX_PRIOR_CONTENT_KEYS` — assert each returns `Err(InvariantError(...))`.
+- **DoS-cap rejection:** simulate 17+ dedupe-collision merges against a single DM Space; assert `prior_content_keys.len() <= MAX_PRIOR_CONTENT_KEYS` after every merge; assert `dm-prior-keys-cap-exceeded` telemetry fires on the overflow attempt; assert ciphertexts encrypted under the rejected key are NOT decryptable on the post-cap Space.
+- **Version-byte rejection:** craft a `storage_blob` with `version_byte = 0x99` (unknown); assert decrypt rejects without attempting any primitive.
+- **Mixed-version dedupe simulation:** craft two ciphertexts under the same Space with `version_byte = 0x01` (v1 ChaCha20-Poly1305) and a stub `0x02` primitive (test-only fixture); merge two Spaces with one ciphertext each; assert decrypt branches correctly per byte and both ciphertexts decode. (This gate locks the forward-compat contract before v2 lands.)
+- **Deterministic-iteration order test:** populate `prior_content_keys` with 3 keys in unsorted order; assert that after `validate_invariants` accepts (or after the canonicalizing constructor), the stored order is lexicographically sorted; encrypt one ciphertext under the lexicographically-largest key; assert decrypt iterates active → prior[0] → prior[1] → prior[2] (the last) in that exact order.
 - **No-cleartext-write gate:** static / lint check (or manual code review item) confirming there is no code path in the DM send/receive flow that writes plaintext `MessagePayload` bytes to CAS or Reticulum without going through `encrypt_dm_payload`. Gates against accidental regressions.
 - **Canonical-CBOR cross-encoder gate:** serialize the same `MessagePayload` via two encoder paths (or two separate processes), assert byte-identical output. Sanity check; not load-bearing for convergence here but cheap.
 - **`DmInvite` round-trip:** serialize/deserialize, assert `members` set + `content_key` bytes intact.
