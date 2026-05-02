@@ -142,6 +142,10 @@ pub async fn run<R: Runtime>(
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     mut ingest_rx: mpsc::Receiver<IngestRequest>,
     mut content_verb_rx: mpsc::Receiver<ContentVerbRequest>,
+    #[allow(unused_variables)] cas_op_tx: mpsc::Sender<crate::content_store::CasOp>,
+    #[allow(unused_mut, unused_variables)] mut cas_op_rx: mpsc::Receiver<
+        crate::content_store::CasOp,
+    >,
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,

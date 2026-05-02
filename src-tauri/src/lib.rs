@@ -497,6 +497,12 @@ async fn start_node(
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
     let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
+    // Phase 3b: CasOp channel for SyncEngine ↔ event_loop.
+    // Capacity 8 is chosen because the SyncEngine serializes its publishes
+    // (debounce window) so at most one PutLocal is in flight at a time;
+    // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
+    // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
+    let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -808,6 +814,7 @@ async fn start_node(
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
+        let cas_op_tx_for_loop = cas_op_tx.clone();
         let sync_handles_for_loop = sync_handles_opt;
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
@@ -847,6 +854,8 @@ async fn start_node(
                         fetch_rx,
                         ingest_rx,
                         content_verb_rx,
+                        cas_op_tx_for_loop,
+                        cas_op_rx,
                         follow_rx,
                         voice_rx,
                         voice_channel_rx,
