@@ -74,7 +74,7 @@ mod tests {
         assert!(store.get(&cid(99)).await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_all_land() {
         use std::sync::Arc;
 

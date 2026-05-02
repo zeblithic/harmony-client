@@ -546,10 +546,11 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // Phase 3b will replace InMemoryStub with real CAS; for
-            // 3a, a missing blob means the subscriber and publisher
-            // aren't sharing the same stub (e.g. cross-process). Log
-            // and skip — never panic.
+            // Until Task 7 (RuntimeContentStore wired into lib.rs), a missing
+            // blob means the subscriber and publisher aren't sharing the same
+            // InMemoryStub (e.g. cross-process). After Task 7, a missing blob
+            // also covers fetch timeouts and corrupted-admit drops — see
+            // Phase 3b spec §"Error handling". Log and drop — never panic.
             return IncomingOutcome::ErrPostMutation(SyncError::Crypto(
                 "ContentStore returned None for root_cid".into(),
             ));
