@@ -154,15 +154,16 @@ message_cid       = ContentId::for_book(
 
 Decrypt is the inverse with **multi-key fallback in deterministic order** (see "DM dedupe + content_key collisions" below):
 
-1. Read the 1-byte `version` prefix from `storage_blob[0]`. If it's not a version this build recognizes, drop the blob.
-2. **Select the per-version wire-format layout and the matching primitive** (this is what makes mixed-version dedupe collisions safe — see "DM dedupe + content_key collisions" and "Migration path"):
-   - `version == 0x01` (v1, ChaCha20-Poly1305): `nonce_len = 12`. Slice `nonce = storage_blob[1..13]` and `ciphertext_with_tag = storage_blob[13..]`. Use `ChaCha20Poly1305::decrypt`.
-   - `version == 0x02` (v2, XChaCha20-Poly1305) — *reserved for future use; not implemented in v1 builds:* `nonce_len = 24`. Slice `nonce = storage_blob[1..25]` and `ciphertext_with_tag = storage_blob[25..]`. Use `XChaCha20Poly1305::decrypt`.
-   - In all versions, `poly1305_tag_len = 16` and the plaintext length is implicit: `N = storage_blob.len() - 1 - nonce_len - 16`.
-3. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below). AAD is independent of version.
-4. Try `decrypt(key=space.content_key, nonce, aad, ciphertext_with_tag)` first — the active key, with the version-selected primitive. On AEAD success, return plaintext.
-5. On AEAD failure, iterate `space.prior_content_keys` **in stored order** (which is lexicographically sorted and deduplicated — see invariants below), retrying decrypt with each candidate using the same version-selected primitive. Return plaintext on first success.
-6. If all keys fail, drop the blob (could be relocation attack, corrupted ciphertext, or genuinely wrong-key payload from a non-member).
+1. **Length gate (MUST, comes first).** Before reading the version byte, verify `storage_blob.len() >= 1` (the version byte itself). After selecting `nonce_len` from the version (step 2), verify `storage_blob.len() >= 1 + nonce_len + 16` (version + nonce + Poly1305 tag — the minimum for a zero-length plaintext). If either check fails, drop the blob without attempting any slicing or AEAD operation. This precondition prevents a pathological short blob from triggering a Rust slice panic or producing a negative implicit `N`.
+2. Read the 1-byte `version` prefix from `storage_blob[0]`. If it's not a version this build recognizes, drop the blob.
+3. **Select the per-version wire-format layout and the matching primitive** (this is what makes mixed-version dedupe collisions safe — see "DM dedupe + content_key collisions" and "Migration path"):
+   - `version == 0x01` (v1, ChaCha20-Poly1305): `nonce_len = 12`. After the length gate above, slice `nonce = storage_blob[1..13]` and `ciphertext_with_tag = storage_blob[13..]`. Use `ChaCha20Poly1305::decrypt`.
+   - `version == 0x02` (v2, XChaCha20-Poly1305) — *reserved for future use; not implemented in v1 builds:* `nonce_len = 24`. After the length gate, slice `nonce = storage_blob[1..25]` and `ciphertext_with_tag = storage_blob[25..]`. Use `XChaCha20Poly1305::decrypt`.
+   - In all versions, `poly1305_tag_len = 16` and the plaintext length is implicit: `N = storage_blob.len() - 1 - nonce_len - 16` (well-defined and non-negative because of the length gate).
+4. Recompute `aad = canonical_cbor_encode(space.dedupe_key())` using the merged Space's current dedupe key (which is dedupe-stable — see "Why AAD ..." below). AAD is independent of version.
+5. Try `decrypt(key=space.content_key, nonce, aad, ciphertext_with_tag)` first — the active key, with the version-selected primitive. On AEAD success, return plaintext.
+6. On AEAD failure, iterate `space.prior_content_keys` **in stored order** (which is lexicographically sorted and deduplicated — see invariants below), retrying decrypt with each candidate using the same version-selected primitive. Return plaintext on first success.
+7. If all keys fail, drop the blob (could be relocation attack, corrupted ciphertext, or genuinely wrong-key payload from a non-member).
 
 Stored order matters for test determinism — the "DM dedupe collision preserves decryptability" verification gate depends on a fixed iteration sequence to avoid flake.
 
@@ -363,7 +364,13 @@ pub struct Space {
     /// drop — this is a security MUST, not a SHOULD. Wire format is identical
     /// to a bare `[u8; 32]` because `Zeroizing<T>` delegates serde
     /// Serialize/Deserialize to `T` transparently.
-    #[serde(rename = "ck", skip_serializing_if = "Option::is_none")]
+    ///
+    /// `serde(default)` is required alongside `skip_serializing_if`: when the
+    /// field is omitted from the wire (every non-DM Space), deserialization
+    /// would otherwise raise a missing-field error. With `default`, the
+    /// field deserializes to `None` (the `Option` default), matching the
+    /// invariant that non-DM Spaces have no content_key.
+    #[serde(rename = "ck", skip_serializing_if = "Option::is_none", default)]
     pub content_key: Option<Zeroizing<[u8; 32]>>,
 
     /// Historical keys retained for DECRYPTION only — never used for new
@@ -427,22 +434,29 @@ Implementation note: this happens inside `lww_merge_space` (or its DM-specific s
 
 A malicious co-member of a DM can repeatedly send `DmInvite`s for the same `(sorted_members)` identity, each with a fresh random `content_key`. Each invite, when applied on the victim's device, triggers a dedupe collision and (under the naive merge rule) appends to `prior_content_keys`. Decryption cost grows linearly with the set size; an attacker can cheaply force unbounded growth and pump per-message decrypt latency.
 
-**Cap (normative).** `MAX_PRIOR_CONTENT_KEYS = 16`. After steps 1-4 of the merge rule (union, dedupe, sort, filter winner's active key), the merge MUST cap the size:
+**Cap (normative — order-independent retention).** `MAX_PRIOR_CONTENT_KEYS = 16`. After steps 1-4 of the merge rule (union, dedupe, sort, filter winner's active key), the merge MUST cap the size by retaining the lexicographically-smallest `MAX_PRIOR_CONTENT_KEYS` entries from the merged sorted set:
 
-1. Let `merged = winner.prior_content_keys ∪ {loser.content_key} ∪ loser.prior_content_keys`, deduplicated, sorted lexicographically, with the winner's `content_key` removed (per merge step 4).
-2. If `merged.len() <= 16`, accept the merge with `prior_content_keys = merged`.
-3. If `merged.len() > 16`, **deterministically reject the loser-side contribution that would push past the cap.** Concretely: the merged set is `winner.prior_content_keys` (kept verbatim) plus as many keys from `{loser.content_key} ∪ loser.prior_content_keys` (in lexicographic order) as fit. Keys from the loser side that would push past 16 are discarded. The winner's active `content_key` is also kept verbatim. Apply the rest of the merge (Space metadata, members, etc.) normally.
-4. Emit a `dm-prior-keys-cap-exceeded` telemetry event with `(space_id, current_size)` so operators can observe attacker activity. The user-facing UI MAY surface a warning prompting the user to delete the DM Space (treating it as adversarial).
+1. Let `merged = (winner.prior_content_keys ∪ {loser.content_key} ∪ loser.prior_content_keys)`, deduplicated, sorted lexicographically, with the winner's `content_key` removed (per merge step 4).
+2. If `merged.len() <= MAX_PRIOR_CONTENT_KEYS`, accept the merge with `prior_content_keys = merged`.
+3. If `merged.len() > MAX_PRIOR_CONTENT_KEYS`, set `prior_content_keys = merged[0..MAX_PRIOR_CONTENT_KEYS]` (i.e., keep the lexicographically-smallest 16 keys; discard `merged[MAX_PRIOR_CONTENT_KEYS..]`). Apply the rest of the merge (Space metadata, members, etc.) normally.
+4. Emit a `dm-prior-keys-cap-exceeded` telemetry event with `(space_id, current_size, discarded_count)` and (optionally) the byte-equality intersection of the discarded-set with `{loser.content_key} ∪ loser.prior_content_keys` so operators can attribute the overflow to loser-side contributions when applicable. The user-facing UI MAY surface a warning prompting the user to delete the DM Space (treating it as adversarial).
 
-Both peers compute the same final state because the input pair `(winner, loser)` is symmetric across devices (both observe the same two Spaces and both apply the same lexicographic SpaceId tie-break). The cap-rejection step therefore deterministically converges.
+**Why "first N of sorted" instead of "winner.prior verbatim".** The earlier version of this spec described retention as "winner.prior_content_keys kept verbatim, plus as many loser-side keys as fit." That rule is path-dependent under multi-merge ordering: with three or more Spaces colliding, the accumulated `winner.prior_content_keys` differs depending on which previous merges have already been applied, which violates CRDT convergence. Concrete counter-example: 5 Spaces with content_keys `K1..K5` where `K3 < K2 < K4 < K5 < K1` lexicographically. Under "winner-verbatim" with cap=2, applying `S2,S3,S4,S5,S1` yields `prior=[K2,K3]`; applying `S5,S4,S3,S2,S1` yields `prior=[K3,K4]`. "First N of sorted merged" yields `[K2,K3]` in both orders because it's a function of the union (set), not the application order (sequence).
 
-Cap policy choice rationale: 16 chosen to match the group-DM member cap (the "natural maximum participation" heuristic). Reject-overflow rather than drop-oldest because we have no HLC ordering on retained keys (they're just byte values), so "oldest" is undefined; reject-overflow is deterministic and safe. The trade-off is that legitimate offline-creation collisions remain decryptable (the realistic count is 0-1 entries), while adversarial pumping is bounded.
+**Security trade-off documented.** "First N of sorted" opens a lex-grinding attack: a malicious co-member can grind random keys until they find ones with low byte prefixes (e.g., starting with `0x00`), which lex-sort first and therefore survive the cap preferentially. Approximate cost to push out one legitimate uniform-random key: ~256 grind attempts to find a `0x00`-prefix key; ~65k for a `0x0000`-prefix key. Under sustained grinding the legitimate user's keys can be displaced from `prior_content_keys` and become undecryptable.
 
-**Decrypt-after-cap behavior — winner side.** Messages encrypted under loser-side keys that were rejected by the cap are silently undecryptable on the winner-side device. This matches the "non-member can't decrypt" property — a spammer's keys are effectively non-members from the perspective of the legitimate DM. No silent fallback to cleartext.
+This trade-off is accepted because:
 
-**Decrypt-after-cap behavior — loser side (footgun for legitimate cases).** When the cap fires on a *loser-side device* — e.g., Alice-phone in an intra-owner offline-creation collision where Alice-phone's locally-active `content_key` is the "loser" because Alice-phone's SpaceId is larger than Alice-laptop's — the merge step that drops loser-side contributions ALSO drops Alice-phone's previously-active `content_key` from the merged state. As a result, **Alice-phone loses the ability to decrypt its own pre-merge messages on this device**. The messages remain decryptable on Alice-laptop (which has Alice-phone's old key in `prior_content_keys` if the cap hasn't fired there) and on any other bound device that synced before the cap fired — but the loser-originating device itself cannot decrypt its own history once the cap rejects its own key.
+- Legitimate dedupe collisions yield 0-1 entries in practice, so the cap does not fire under normal use.
+- The legitimate user's `content_key` (active key, separate from `prior_content_keys`) is never displaced — only historical keys are at risk.
+- A DmInvite rate-limiter at the Reticulum receive layer (Future Work) is a complementary defense at a different layer; the cap is the last-line backstop, not the only defense.
+- Adversarial pumping past `MAX_PRIOR_CONTENT_KEYS` is still bounded — the attacker fills the slots they win, then their further invites are no-ops on the victim's `prior_content_keys` (since deduped).
 
-This is a footgun for legitimate dedupe collisions when the cap fires (rare in practice — `prior_content_keys` typically has 0-1 entries). For adversarial cases this is the desired property: the cap is meant to bound attacker damage, not preserve every-device-decrypts-everything semantics. Implementations SHOULD surface the `dm-prior-keys-cap-exceeded` telemetry event prominently in operator dashboards so the asymmetry is observable when it bites.
+Cap policy choice rationale: 16 chosen to match the group-DM member cap (the "natural maximum participation" heuristic). The "first N of sorted" rule is deterministic, order-independent (CRDT-convergent), and trivial to implement.
+
+**Decrypt-after-cap behavior.** Messages encrypted under any key that was discarded by the cap (i.e., a key in `merged[MAX_PRIOR_CONTENT_KEYS..]`) are silently undecryptable on every device once that device applies the merge. Because the cap rule is a function of the merged set (not application order), all bound devices of the affected owner converge to the same `prior_content_keys` and therefore to the same set of decryptable messages. There is no silent fallback to cleartext.
+
+**Symmetry of the legitimate-collision footgun.** Under "first N of sorted merged," whether a key survives the cap depends purely on its lexicographic rank within the merged set, not on which side of the dedupe contributed it. So in an intra-owner offline-creation collision (e.g., Alice-laptop and Alice-phone both created a DM with Bob), the surviving keys are deterministic — but they may not include either device's originally-active key if the merged set is large and the device's key happens to lex-sort outside the top 16. In practice this is rare (legitimate dedupe collisions yield 0-1 keys total, well below the cap). Implementations SHOULD surface the `dm-prior-keys-cap-exceeded` telemetry event prominently in operator dashboards so when the cap does fire, ops can investigate.
 
 ### `DmInvite` (Reticulum payload)
 
@@ -494,7 +508,10 @@ Before ZEB-219 implementation lands (note: this spec is design-only; implementat
 - **Sender-binding mismatch rejection:** simulate Reticulum delivery from origin owner Charlie carrying a payload with `MessagePayload.sender = Bob`; assert the receive path rejects (no `InboxEntry` written) and emits the `dm-impersonation-rejected` telemetry event.
 - **Invariant enforcement:** call `Space::validate_invariants` against malformed Spaces — `kind=Dm` with `content_key=None`, `kind=Folder` with `content_key=Some(...)`, `kind=Folder` with non-empty `prior_content_keys`, `kind=Dm` with unsorted `prior_content_keys`, `kind=Dm` with duplicate entries in `prior_content_keys`, `kind=Dm` with `prior_content_keys.len() > MAX_PRIOR_CONTENT_KEYS`, `kind=Dm` where `content_key` is also present in `prior_content_keys` (disjoint invariant) — assert each returns `Err(InvariantError(...))`.
 - **Two-step dedupe collision (winner's key in both fields):** simulate the Greptile-flagged scenario — Device A has `{content_key: K1, prior: []}`, Device B has `{content_key: K2, prior: [K1]}` (B previously merged with someone whose key was K1). Trigger A↔B dedupe-merge with A's SpaceId smaller (so K1 wins as active). Assert the merged Space has `content_key = K1` and `K1 ∉ prior_content_keys` (i.e., the merge-rule step 4 filter ran and K1 was removed from the candidate prior set). Assert messages encrypted under K1 decrypt via the active path; messages encrypted under K2 decrypt via the prior-fallback path.
-- **DoS-cap rejection:** simulate 17+ dedupe-collision merges against a single DM Space; assert `prior_content_keys.len() <= MAX_PRIOR_CONTENT_KEYS` after every merge; assert `dm-prior-keys-cap-exceeded` telemetry fires on the overflow attempt; assert ciphertexts encrypted under the rejected key are NOT decryptable on the post-cap Space.
+- **DoS-cap retention is the lex-smallest-N:** simulate 20 dedupe-collision merges against a single DM Space using known content_keys spanning the lex range; after each merge assert `prior_content_keys.len() <= MAX_PRIOR_CONTENT_KEYS`; after the final merge assert `prior_content_keys` equals the lexicographically-smallest 16 entries of the union; assert `dm-prior-keys-cap-exceeded` telemetry fires on overflow; assert ciphertexts encrypted under a discarded key are NOT decryptable on the post-cap Space.
+- **Cap convergence under multi-merge ordering:** construct 5 Spaces with content_keys spanning the lex range; apply them to the CRDT in two different orders (e.g., `[S1,S2,S3,S4,S5]` and `[S5,S4,S3,S2,S1]`); assert the final `prior_content_keys` is byte-identical across the two orderings (CRDT convergence regression test for the cap rule).
+- **Length-gate rejection:** craft `storage_blob`s of length 0, 1, 12 (v1: missing tag), and 28 (v1: missing nonce by 1 byte); assert decrypt rejects each without panic and without attempting AEAD.
+- **`serde(default)` round-trip for non-DM Spaces:** serialize a `Folder` Space (where `content_key=None`, `prior_content_keys=[]`); deserialize the bytes back; assert the Space round-trips without error and the fields are `None` and `[]` respectively. This locks in the `serde(default)` requirement against accidental removal.
 - **Version-byte rejection:** craft a `storage_blob` with `version_byte = 0x99` (unknown); assert decrypt rejects without attempting any primitive.
 - **Mixed-version dedupe simulation:** craft two ciphertexts under the same Space with `version_byte = 0x01` (v1 ChaCha20-Poly1305) and a stub `0x02` primitive (test-only fixture); merge two Spaces with one ciphertext each; assert decrypt branches correctly per byte and both ciphertexts decode. (This gate locks the forward-compat contract before v2 lands.)
 - **Deterministic-iteration order test:** populate `prior_content_keys` with 3 keys in unsorted order; assert that after `validate_invariants` accepts (or after the canonicalizing constructor), the stored order is lexicographically sorted; encrypt one ciphertext under the lexicographically-largest key; assert decrypt iterates active → prior[0] → prior[1] → prior[2] (the last) in that exact order.
