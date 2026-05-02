@@ -1687,7 +1687,9 @@ mod cas_op_protocol_tests {
                 match op {
                     CasOp::PutLocal { cid, blob, reply } => {
                         store.lock().await.insert(cid, blob);
-                        let _ = reply.send(Ok(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     CasOp::GetOrFetch { cid, reply, .. } => {
                         let bytes = store.lock().await.get(&cid).cloned();
@@ -1767,7 +1769,9 @@ mod cas_op_protocol_tests {
                 match op {
                     CasOp::PutLocal { cid, blob, reply } => {
                         store_ref.lock().await.insert(cid, blob);
-                        let _ = reply.send(Ok(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     CasOp::GetOrFetch { cid, reply, .. } => {
                         if first_get {
@@ -1881,7 +1885,9 @@ mod cas_op_protocol_tests {
                 match op {
                     CasOp::PutLocal { cid, blob, reply } => {
                         store_for_stub.lock().await.insert(cid, blob);
-                        let _ = reply.send(Ok(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     CasOp::GetOrFetch { reply, .. } => {
                         // Always None — simulates StorageTier silently

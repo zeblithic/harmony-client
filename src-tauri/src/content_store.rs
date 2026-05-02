@@ -71,7 +71,12 @@ pub enum CasOp {
     PutLocal {
         cid: ContentId,
         blob: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<(), ContentStoreError>>,
+        /// `Some` for synchronous round-trip callers (e.g.
+        /// `RuntimeContentStore::put`); `None` for fire-and-forget
+        /// admit hops from the spawned-fetch task in `event_loop.rs`'s
+        /// `GetOrFetch` arm. The PutLocal handler only replies if
+        /// `Some`, avoiding wasted work on already-dropped receivers.
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), ContentStoreError>>>,
     },
     /// Cache check, then on miss spawn a Zenoh GET wrapped in
     /// `tokio::time::timeout(timeout, ...)`. On fetch success,
@@ -120,7 +125,7 @@ impl ContentStore for RuntimeContentStore {
             .send(CasOp::PutLocal {
                 cid,
                 blob,
-                reply: reply_tx,
+                reply: Some(reply_tx),
             })
             .await
             .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
@@ -196,12 +201,17 @@ mod tests {
 
         // Stub receiver: handle exactly one PutLocal then exit.
         let stub = tokio::spawn(async move {
-            if let Some(CasOp::PutLocal { cid, blob, reply }) = cas_op_rx.recv().await {
+            if let Some(CasOp::PutLocal {
+                cid,
+                blob,
+                reply: Some(reply),
+            }) = cas_op_rx.recv().await
+            {
                 assert_eq!(cid, ContentId::from_bytes([0x42; 32]));
                 assert_eq!(blob, vec![1, 2, 3]);
                 let _ = reply.send(Ok(()));
             } else {
-                panic!("expected CasOp::PutLocal");
+                panic!("expected CasOp::PutLocal with reply");
             }
         });
 
@@ -243,7 +253,10 @@ mod tests {
         let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
 
         let stub = tokio::spawn(async move {
-            if let Some(CasOp::PutLocal { reply, .. }) = cas_op_rx.recv().await {
+            if let Some(CasOp::PutLocal {
+                reply: Some(reply), ..
+            }) = cas_op_rx.recv().await
+            {
                 let _ = reply.send(Err(ContentStoreError::Io("admit rejected".into())));
             }
         });
@@ -308,7 +321,10 @@ mod tests {
 
         let stub = tokio::spawn(async move {
             // Receive the message but drop the reply sender without replying.
-            if let Some(CasOp::PutLocal { reply, .. }) = cas_op_rx.recv().await {
+            if let Some(CasOp::PutLocal {
+                reply: Some(reply), ..
+            }) = cas_op_rx.recv().await
+            {
                 drop(reply);
             }
         });

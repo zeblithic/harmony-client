@@ -66,7 +66,7 @@ impl Serialize for ContentId {
 }
 ```
 
-Plus a unit test asserting ciborium encodes a `ContentId` as a 33-byte CBOR `bstr(32)` (1-byte tag + 32 payload).
+Plus a unit test asserting ciborium encodes a `ContentId` as a 34-byte CBOR `bstr(32)` (1-byte major-type tag `0x58` + 1-byte length `0x20` + 32-byte payload).
 
 This change is bytewise-identical in postcard (the workspace's primary codec, which encodes both `[u8; 32]` and `&[u8]` of known length as 32 raw bytes). harmony-content's existing consumers — harmony-mail, harmony-runtime, harmony-mailbox — all use postcard for wire shapes, so the change is non-breaking on their hot paths. Audit step before merging the harmony-content PR: grep for any consumer that does CBOR-style serde of a `ContentId`. Expectation: none today.
 
@@ -323,7 +323,7 @@ All Phase 3a `.put()` / `.get()` call sites in `owner_state_sync.rs` pick up `.a
 
 Three new failure modes fold into existing `ContentStoreError` / `SyncError` variants:
 
-1. **Cache admit rejected (StorageTier policy).** `runtime.tick()` after a `PublishContent` event can yield a `RuntimeAction` indicating the content was rejected (e.g., budget exhausted). The `PutLocal` arm inspects actions for rejection and surfaces as `ContentStoreError::Io("admit rejected: ...")`. With Phase 3a's StorageBudget (`cache_capacity: 512`, `max_pinned_bytes: 50_000_000`), single-digit-KB owner-state blobs will not realistically hit this — but failing loudly beats silent corruption. Bubbles through `SyncError::ContentStore` into the existing degraded-path logging.
+1. **Cache admit (best-effort, no rejection signal exposed).** The `PutLocal` arm pushes `RuntimeEvent::SubscriptionMessage` into the runtime and ticks, parity with the existing `ingest_rx` pattern. It does NOT inspect tick() actions for rejection — StorageTier silently drops corrupted bytes from the cache. A subsequent `GetOrFetch` on a corrupted CID hits a real cache miss and re-fetches over Zenoh, where harmony-content's transport-side hash check provides integrity. With Phase 3b's StorageBudget (`cache_capacity: 512`, `max_pinned_bytes: 50_000_000`), single-digit-KB owner-state blobs will not realistically be evicted. Fire-and-forget callers (the spawned-fetch admit hop in `GetOrFetch`) pass `reply: None` to make the no-observation intent explicit; round-trip callers (e.g., `RuntimeContentStore::put`) pass `Some(reply_tx)` and observe `Ok(())` on completion (which still doesn't reflect admit success — the reply means "PutLocal handler ran to completion," not "bytes are in cache").
 2. **Network fetch timeout (GetOrFetch).** Returned as `Ok(None)` — semantically "blob not present in network within deadline." SyncEngine logs at `WARN` with the CID hex and HLC, drops the publish. CRDT eventual consistency carries the recovery via the next state-root from any peer.
 3. **Hash verify failure on receipt.** `runtime.push_event(SubscriptionMessage{...}) + tick()` validates `cid.verify_hash(data)` inside StorageTier before admitting. With the fire-and-forget admit design, a hash-verify failure causes StorageTier to silently drop the admit; the cache stays empty for this CID. The caller of `GetOrFetch` already received the (corrupt) bytes, but they fail downstream decryption (`decrypt_entry`) which surfaces as `SyncError::Crypto` and the publish is dropped. CRDT eventual consistency carries the recovery. Admit observability (previously `Ok(None)` returned to caller on reject) is intentionally removed — bounded latency is the higher priority.
 

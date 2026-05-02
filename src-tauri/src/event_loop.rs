@@ -853,7 +853,11 @@ pub async fn run<R: Runtime>(
                         // content's transport-side hash check provides
                         // integrity. See plan §"Pre-flight: admit-rejection
                         // signal".
-                        let _ = reply.send(Ok(()));
+                        // Reply only if a Sender was provided — fire-and-forget
+                        // callers (spawned-fetch admit hop) pass None.
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
@@ -892,11 +896,15 @@ pub async fn run<R: Runtime>(
                                         //    PutLocal.blob consumes the bytes,
                                         //    but the caller's reply still needs
                                         //    them.
-                                        let (admit_tx, _admit_rx) = tokio::sync::oneshot::channel();
+                                        //    reply: None signals fire-and-forget
+                                        //    intent — the PutLocal handler skips
+                                        //    its reply.send when reply is None,
+                                        //    avoiding wasted work on a dropped
+                                        //    oneshot receiver.
                                         let _ = cas_op_tx_for_admit.try_send(crate::content_store::CasOp::PutLocal {
                                             cid,
                                             blob: bytes.clone(),
-                                            reply: admit_tx,
+                                            reply: None,
                                         });
                                         let _ = reply.send(Ok(Some(bytes)));
                                     }
