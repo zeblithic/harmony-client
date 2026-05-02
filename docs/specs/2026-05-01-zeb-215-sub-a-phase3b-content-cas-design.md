@@ -268,7 +268,7 @@ Step 5 must happen before step 6 so SyncEngine takes the `Sender` end at constru
 
 The `state-root-sync-degraded` emit at the end of `start_node` deletes — Phase 3a's documented stub-shaped hole closes here.
 
-Shutdown (extends Phase 3a's `stop_inner` flow). SyncEngine's existing shutdown path (force-publish + persist) sends one final `PutLocal` through `cas_op_tx` if dirty before signaling complete. The event loop's existing shutdown path drains `cas_op_rx` before exiting — mirroring how `publish_rx` and `fetch_rx` already drain. No new ordering invariant.
+Shutdown (extends Phase 3a's `stop_inner` flow). SyncEngine's existing shutdown path (force-publish + persist) sends one final `PutLocal` through `cas_op_tx` if dirty *before* signaling shutdown via the watch channel; the event loop is still selecting at that point and processes the message normally. When `shutdown.changed()` then fires, the event loop breaks out of its select and exits — it does not drain `cas_op_rx`, `publish_rx`, or `fetch_rx` (matching today's behavior for the existing channels). Any stragglers queued after the watch fires are dropped on receiver close. No new ordering invariant; correctness rests on `stop_inner` completing the final put before flipping the watch.
 
 ## Wire format
 
