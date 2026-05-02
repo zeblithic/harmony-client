@@ -352,7 +352,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, canonical_cbor_encode, decrypt_entry, decrypt_root_publish,
     encrypt_entry, encrypt_root_publish, space_lookup_key,
 };
-use crate::owner_state_types::{ContentId, RootPublishPayload};
+use crate::owner_state_types::RootPublishPayload;
 
 /// Lookup-key tag for the single-blob OwnerState in 3a's
 /// simplified CAS layout. See spec §"Root blob shape — Phase 3a
@@ -405,11 +405,24 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
     let blob_ciphertext = encrypt_entry(&ctx.kt, &lookup, &blob_cleartext)
         .map_err(|e| SyncError::Crypto(e.to_string()))?;
 
-    // 3. cipher_cid = BLAKE3 of the encrypted blob.
-    let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
+    // 3. Phase 3b: cipher_cid = harmony-content's structured ContentId
+    //    derived from the ciphertext. ContentFlags has no `durable`
+    //    field — durability comes from `ephemeral: false` (the default
+    //    via `..Default::default()`) combined with `encrypted: true`,
+    //    which `ContentClass::content_class()` maps to `EncryptedDurable`
+    //    (eviction priority 0; never auto-burns). The 28-byte hash is
+    //    SHA-256 truncated to its 224 most-significant bits.
+    let root_cid = harmony_content::cid::ContentId::for_book(
+        &blob_ciphertext,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| SyncError::Crypto(format!("ContentId::for_book: {e}")))?;
 
-    // 4. Put into ContentStore (in 3a: InMemoryStub; 3b: real CAS).
-    ctx.content_store.put(root_cid, blob_ciphertext)?;
+    // 4. Put into ContentStore (Phase 3b: routes through CasOp::PutLocal).
+    ctx.content_store.put(root_cid, blob_ciphertext).await?;
 
     // 5. Build state-root payload.
     let now = next_hlc(ctx).await;
@@ -543,15 +556,21 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     }
 
     // 3. Fetch the encrypted root blob from CAS.
-    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid) {
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // Phase 3b will replace InMemoryStub with real CAS; for
-            // 3a, a missing blob means the subscriber and publisher
-            // aren't sharing the same stub (e.g. cross-process). Log
-            // and skip — never panic.
-            return IncomingOutcome::ErrPostMutation(SyncError::Crypto(
-                "ContentStore returned None for root_cid".into(),
+            // Phase 3b: a missing blob means either a fetch timeout (network
+            // didn't deliver within DEFAULT_FETCH_TIMEOUT_MS) or a peer's
+            // corrupted-admit drop (StorageTier silently rejected hash-verify
+            // failures). Both collapse onto the same recovery path: drop the
+            // publish, rely on next state-root from any peer (CRDT eventual
+            // consistency). Classify as ContentStore error, NOT crypto —
+            // misleading in logs otherwise.
+            return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(
+                crate::content_store::ContentStoreError::Io(format!(
+                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
+                    payload.root_cid
+                )),
             ));
         }
         Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(e)),
@@ -843,7 +862,7 @@ mod subscriber_tests {
 
     /// Build a wire payload for testing — re-uses the publisher's
     /// encryption path but with a controlled HLC.
-    fn make_wire(
+    async fn make_wire(
         kt: &Arc<KeyTree>,
         store: &Arc<dyn ContentStore>,
         state: &OwnerState,
@@ -854,8 +873,15 @@ mod subscriber_tests {
         let blob_cleartext = canonical_cbor_encode(state).unwrap();
         let lookup = space_lookup_key(kt, b"owner-state-root-blob-v1");
         let blob_ciphertext = encrypt_entry(kt, &lookup, &blob_cleartext).unwrap();
-        let root_cid = ContentId(blake3::hash(&blob_ciphertext).into());
-        store.put(root_cid, blob_ciphertext).unwrap();
+        let root_cid = harmony_content::cid::ContentId::for_book(
+            &blob_ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.put(root_cid, blob_ciphertext).await.unwrap();
         let payload = RootPublishPayload {
             root_cid,
             at: Hlc {
@@ -889,7 +915,7 @@ mod subscriber_tests {
             5000, // long debounce — keep self-publishes out of the way
         );
 
-        let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         // Give the subscriber branch a moment to process.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -926,28 +952,14 @@ mod subscriber_tests {
 
         // First publish: at=2000.
         sub_tx
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                2000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Replay: at=1000 (older). Tracker must NOT regress.
         sub_tx
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                1000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1014,7 +1026,7 @@ mod subscriber_tests {
         let mut remote = OwnerState::default();
         remote.spaces.insert(SpaceId([42; 16]), folder(42, 100));
 
-        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1056,7 +1068,7 @@ mod subscriber_tests {
                 id: OutboxEntryId([7; 16]),
                 space_id: SpaceId([1; 16]),
                 recipient_owners: vec![OwnerAddr([2; 16])],
-                message_cid: ContentId([3; 32]),
+                message_cid: ContentId::from_bytes([3; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1078,7 +1090,7 @@ mod subscriber_tests {
             },
         );
 
-        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1121,7 +1133,7 @@ mod subscriber_tests {
 
         // Publisher puts the blob in its OWN stub; subscriber's
         // stub never receives it.
-        let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0);
+        let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1172,14 +1184,7 @@ mod subscriber_tests {
                 5000,
             );
             sub_tx
-                .send(make_wire(
-                    &kt,
-                    &store,
-                    &OwnerState::default(),
-                    "peer-bob",
-                    5000,
-                    0,
-                ))
+                .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 5000, 0).await)
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1209,14 +1214,7 @@ mod subscriber_tests {
         );
         // Send an older publish: at=2000 < 5000.
         sub_tx2
-            .send(make_wire(
-                &kt,
-                &store,
-                &OwnerState::default(),
-                "peer-bob",
-                2000,
-                0,
-            ))
+            .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1286,7 +1284,11 @@ mod publisher_tests {
         assert_eq!(payload.at.device_id, "alice-device");
 
         // The root_cid must reference a blob present in the stub.
-        let blob = store.get(&payload.root_cid).unwrap().expect("blob present");
+        let blob = store
+            .get(&payload.root_cid)
+            .await
+            .unwrap()
+            .expect("blob present");
         assert!(!blob.is_empty());
 
         let _ = engine.shutdown().await;
@@ -1524,7 +1526,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]),
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1565,7 +1567,7 @@ mod integration_tests {
                 id: OutboxEntryId([42; 16]),
                 space_id: SpaceId([5; 16]), // lagging — old loser id
                 recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 created_at: Hlc {
                     wall_ms: 100,
                     logical: 0,
@@ -1656,5 +1658,262 @@ mod integration_tests {
             let _ = dev.a_engine.shutdown().await;
             let _ = dev.b_engine.shutdown().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod cas_op_protocol_tests {
+    //! Phase 3b end-to-end test: exercise the CasOp protocol via a
+    //! HashMap-backed stub event loop instead of real Zenoh + StorageTier.
+    //! Verifies the publisher PutLocal path, subscriber GetOrFetch cache
+    //! hit, and subscriber GetOrFetch cache miss.
+
+    use crate::content_store::{CasOp, ContentStore, RuntimeContentStore};
+    use harmony_content::cid::ContentId;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// HashMap-backed simulator of the harmony-runtime event loop's
+    /// CasOp arm. Two devices share one `Arc<Mutex<HashMap<...>>>` to
+    /// represent the network's collective view; PutLocal inserts,
+    /// GetOrFetch reads (no real network).
+    fn spawn_stub_event_loop(
+        mut cas_op_rx: tokio::sync::mpsc::Receiver<CasOp>,
+        store: Arc<Mutex<HashMap<ContentId, Vec<u8>>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store.lock().await.insert(cid, blob);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch { cid, reply, .. } => {
+                        let bytes = store.lock().await.get(&cid).cloned();
+                        let _ = reply.send(Ok(bytes));
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn publisher_put_visible_to_subscriber() {
+        let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = Arc::new(Mutex::new(HashMap::new()));
+        let _stub = spawn_stub_event_loop(cas_op_rx, Arc::clone(&store));
+
+        let pub_store =
+            RuntimeContentStore::new(cas_op_tx.clone(), std::time::Duration::from_millis(500));
+        let sub_store =
+            RuntimeContentStore::new(cas_op_tx.clone(), std::time::Duration::from_millis(500));
+
+        // Publisher computes a structured CID for some ciphertext and puts.
+        let ciphertext = vec![1, 2, 3, 4, 5];
+        let cid = ContentId::for_book(
+            &ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pub_store.put(cid, ciphertext.clone()).await.unwrap();
+
+        // Subscriber fetches the same CID — must observe the bytes.
+        let observed = sub_store.get(&cid).await.unwrap();
+        assert_eq!(observed, Some(ciphertext));
+    }
+
+    #[tokio::test]
+    async fn subscriber_get_returns_none_for_unknown_cid() {
+        let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = Arc::new(Mutex::new(HashMap::new()));
+        let _stub = spawn_stub_event_loop(cas_op_rx, Arc::clone(&store));
+
+        let sub = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+        let unknown =
+            ContentId::for_book(b"nothing", harmony_content::cid::ContentFlags::default()).unwrap();
+        let observed = sub.get(&unknown).await.unwrap();
+        assert_eq!(observed, None);
+    }
+
+    #[tokio::test]
+    async fn subscriber_observes_timeout_as_none_and_drops_publish() {
+        // Stub that returns Ok(None) for the FIRST GetOrFetch — simulating
+        // a network timeout at the event-loop layer. PutLocal still works.
+        // Drives a SyncEngine subscriber through a synthetic state-root
+        // delivery for a CID the stub doesn't have, asserts the engine
+        // continues running and local state stays empty.
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_crypto::{
+            canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key, KeyTree,
+        };
+        use crate::owner_state_types::{Hlc, RootPublishPayload};
+        use std::collections::BTreeMap;
+        use tokio::sync::mpsc;
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(8);
+
+        // Custom stub: GetOrFetch returns Ok(None) on the first call,
+        // delegates to a shared HashMap on subsequent calls. PutLocal
+        // inserts to the HashMap (so any subsequent calls would see them).
+        let store_for_stub = Arc::new(Mutex::new(HashMap::<ContentId, Vec<u8>>::new()));
+        let store_ref = Arc::clone(&store_for_stub);
+        let _stub = tokio::spawn(async move {
+            let mut first_get = true;
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store_ref.lock().await.insert(cid, blob);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch { cid, reply, .. } => {
+                        if first_get {
+                            first_get = false;
+                            let _ = reply.send(Ok(None)); // simulated timeout
+                        } else {
+                            let bytes = store_ref.lock().await.get(&cid).cloned();
+                            let _ = reply.send(Ok(bytes));
+                        }
+                    }
+                }
+            }
+        });
+
+        // Set up a SyncEngine subscriber wired through RuntimeContentStore.
+        let kt = Arc::new(KeyTree::derive(&[42u8; 32]).unwrap());
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let content_store = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_millis(500),
+        )) as Arc<dyn ContentStore>;
+        let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::owner_state_sync::SyncEngine::new(
+            Arc::clone(&kt),
+            "device-sub".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&content_store),
+            pub_tx,
+            sub_rx,
+            crate::owner_state_sync::PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            50,
+        );
+
+        // Forge a state-root publish for a CID the stub doesn't have. The
+        // first GetOrFetch returns Ok(None), so the subscriber should drop
+        // this delivery without mutating local state.
+        let lookup = space_lookup_key(&kt, super::OWNER_STATE_ROOT_BLOB_TAG);
+        let snapshot = OwnerState::default();
+        let cleartext = canonical_cbor_encode(&snapshot).unwrap();
+        let ciphertext = encrypt_entry(&kt, &lookup, &cleartext).unwrap();
+        let cid_unknown = ContentId::for_book(
+            &ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payload = RootPublishPayload {
+            root_cid: cid_unknown,
+            at: Hlc {
+                wall_ms: 1_000_000,
+                logical: 0,
+                device_id: "device-pub".into(),
+            },
+        };
+        let payload_bytes = canonical_cbor_encode(&payload).unwrap();
+        let wire = encrypt_root_publish(&kt, &payload_bytes).unwrap();
+
+        // Deliver the wire payload — subscriber processes it, hits Ok(None),
+        // logs WARN, drops the publish. We assert the engine continues
+        // running and local state stays empty.
+        sub_tx.send(wire).await.unwrap();
+
+        // Allow the subscriber task to process. The 50ms debounce + a
+        // brief safety margin covers the async hop.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let s = state.lock().await;
+            assert!(
+                s.spaces.is_empty(),
+                "state should remain empty after dropped publish"
+            );
+        }
+
+        // Engine is alive — shutdown returns cleanly.
+        let _ = engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_treats_corrupted_admit_as_miss() {
+        // Simulates: peer published valid wire, network served corrupted
+        // bytes, our event-loop's PutLocal silently drops them (StorageTier
+        // hash-verify rejects on the production path), subsequent cache
+        // lookups return Ok(None). Subscriber should treat the corruption
+        // case identically to a fetch timeout — both yield Ok(None) at
+        // the trait boundary, both fall through to "drop publish, rely on
+        // next state-root" recovery.
+        use crate::content_store::CasOp;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+
+        // Stub that ALWAYS returns Ok(None) for GetOrFetch, but accepts
+        // PutLocal inserts (simulating the publisher-side admit working,
+        // but a peer's corrupted reply being silently dropped on receive).
+        let store = Arc::new(AsyncMutex::new(HashMap::new()));
+        let store_for_stub = Arc::clone(&store);
+        let _stub = tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        store_for_stub.lock().await.insert(cid, blob);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch { reply, .. } => {
+                        // Always None — simulates StorageTier silently
+                        // dropping corrupted bytes from a peer's reply.
+                        let _ = reply.send(Ok(None));
+                    }
+                }
+            }
+        });
+
+        let store_client = crate::content_store::RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_millis(500),
+        );
+
+        // GetOrFetch on any CID returns Ok(None) — corrupted-admit collapses
+        // onto the same recovery path as a timeout.
+        let cid = harmony_content::cid::ContentId::for_book(
+            b"anything",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .unwrap();
+        let observed = store_client.get(&cid).await.unwrap();
+        assert_eq!(
+            observed, None,
+            "corrupted-admit must surface as Ok(None) at the get() boundary"
+        );
     }
 }

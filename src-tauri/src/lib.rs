@@ -497,6 +497,12 @@ async fn start_node(
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
     let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(64);
+    // Phase 3b: CasOp channel for SyncEngine ↔ event_loop.
+    // Capacity 8 is chosen because the SyncEngine serializes its publishes
+    // (debounce window) so at most one PutLocal is in flight at a time;
+    // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
+    // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
+    let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -684,18 +690,18 @@ async fn start_node(
 
                     let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
                     let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
-                    // Phase 3a uses a per-process InMemoryStub for the
-                    // ContentStore; cross-device convergence only works
-                    // in the test-only shared-stub setup. Production
-                    // multi-device will silently fail until Phase 3b
-                    // wires a real harmony-content CAS. The GUI gets
-                    // a `state-root-sync-degraded` event AFTER the
-                    // event loop reports startup success — emitting
-                    // here would race the runtime-thread spawn and
-                    // could leave the banner up for nodes that never
-                    // came up.
+                    // Phase 3b: real harmony-content CAS via RuntimeContentStore.
+                    // Sends CasOp messages over cas_op_tx into the harmony-
+                    // runtime event loop, which admits/queries through the
+                    // shared NodeRuntime + StorageTier. See spec
+                    // §"Architecture / High-level flow".
                     let content_store: std::sync::Arc<dyn crate::content_store::ContentStore> =
-                        std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+                        std::sync::Arc::new(crate::content_store::RuntimeContentStore::new(
+                            cas_op_tx.clone(),
+                            std::time::Duration::from_millis(
+                                crate::content_store::DEFAULT_FETCH_TIMEOUT_MS,
+                            ),
+                        ));
 
                     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -808,6 +814,7 @@ async fn start_node(
         let app_clone = app.clone();
         let mail_mgr_clone = mail_mgr.clone();
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
+        let cas_op_tx_for_loop = cas_op_tx.clone();
         let sync_handles_for_loop = sync_handles_opt;
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
@@ -847,6 +854,8 @@ async fn start_node(
                         fetch_rx,
                         ingest_rx,
                         content_verb_rx,
+                        cas_op_tx_for_loop,
+                        cas_op_rx,
                         follow_rx,
                         voice_rx,
                         voice_channel_rx,
@@ -927,25 +936,13 @@ async fn start_node(
     // stop_node can cancel this by signaling shutdown_tx (now registered).
     let result = match ready_rx.await {
         Ok(Ok(())) => 'arm: {
-            // Phase 3a: now that the event loop has signaled startup
-            // success, surface the InMemoryStub limitation to the GUI.
-            // Emitting earlier (during engine construction) could leave
-            // the degraded banner up for nodes that never came up.
-            // Gated on `engine_for_cleanup.is_some()` because nodes
-            // without a master_seed (pre-mint state) have no engine and
-            // shouldn't display a sync-degraded banner.
-            if engine_for_cleanup.is_some() {
-                use tauri::Emitter;
-                let _ = app.emit(
-                    "state-root-sync-degraded",
-                    serde_json::json!({
-                        "reason": "phase_3a_in_memory_stub",
-                        "message": "Phase 3a uses an in-process content stub; \
-                                    cross-device state sync will not work until \
-                                    Phase 3b lands a real CAS backend.",
-                    }),
-                );
-            }
+            // Phase 3b: cross-device sync now works through real CAS
+            // (RuntimeContentStore); the Phase 3a degraded banner is
+            // retired. Transport-layer failures (subscriber declare,
+            // key_expr invalid, subscriber closed mid-session) still
+            // fire `state-root-sync-degraded` from event_loop.rs as
+            // genuine degradation signals.
+            //
             // ZEB-197: spawn the pairing state machine now that the
             // event loop is up. Construct ZenohPairingTransport with
             // a clone of publish_tx (publishes go through the running

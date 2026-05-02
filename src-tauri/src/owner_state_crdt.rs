@@ -720,7 +720,7 @@ mod apply_outbox_tests {
             id: OutboxEntryId([id; 16]),
             space_id: SpaceId([1; 16]),
             recipient_owners: recipients.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
-            message_cid: ContentId([2; 32]),
+            message_cid: ContentId::from_bytes([2; 32]),
             created_at: hlc(100),
             delivered_to: delivered.into_iter().map(|i| OwnerAddr([i; 16])).collect(),
             delivery_status: DeliveryStatus::Pending,
@@ -933,7 +933,7 @@ mod apply_outbox_tests {
         let mut s = OwnerState::default();
         s.apply_outbox(entry(1, vec![10, 20], vec![10]));
         let mut diverged = entry(1, vec![10, 20], vec![20]);
-        diverged.message_cid = ContentId([99; 32]);
+        diverged.message_cid = ContentId::from_bytes([99; 32]);
         let outcome = s.apply_outbox(diverged);
         assert!(matches!(
             outcome,
@@ -983,7 +983,7 @@ mod apply_inbox_tests {
     fn entry(space: u8, msg: u8, from: u8, ts: u64) -> InboxEntry {
         InboxEntry {
             space_id: SpaceId([space; 16]),
-            message_cid: ContentId([msg; 32]),
+            message_cid: ContentId::from_bytes([msg; 32]),
             from: OwnerAddr([from; 16]),
             received_at: hlc(ts),
         }
@@ -1006,7 +1006,7 @@ mod apply_inbox_tests {
         // Earliest wins.
         let key = InboxKey {
             space_id: SpaceId([1; 16]),
-            message_cid: ContentId([2; 32]),
+            message_cid: ContentId::from_bytes([2; 32]),
         };
         assert_eq!(s.inbox.get(&key).unwrap().received_at.wall_ms, 100);
     }
@@ -1166,14 +1166,14 @@ mod canonicalization_tests {
             id: OutboxEntryId([100; 16]),
             space_id: SpaceId([5; 16]),
             recipient_owners: vec![OwnerAddr([2; 16])],
-            message_cid: ContentId([1; 32]),
+            message_cid: ContentId::from_bytes([1; 32]),
             created_at: hlc(100),
             delivered_to: Default::default(),
             delivery_status: DeliveryStatus::Pending,
         });
         s.apply_inbox(InboxEntry {
             space_id: SpaceId([5; 16]),
-            message_cid: ContentId([2; 32]),
+            message_cid: ContentId::from_bytes([2; 32]),
             from: OwnerAddr([2; 16]),
             received_at: hlc(100),
         });
@@ -1198,11 +1198,11 @@ mod canonicalization_tests {
         // itself rewrites — old key is gone, new key present.
         let new_inbox_key = InboxKey {
             space_id: SpaceId([1; 16]),
-            message_cid: ContentId([2; 32]),
+            message_cid: ContentId::from_bytes([2; 32]),
         };
         let old_inbox_key = InboxKey {
             space_id: SpaceId([5; 16]),
-            message_cid: ContentId([2; 32]),
+            message_cid: ContentId::from_bytes([2; 32]),
         };
         assert!(s.inbox.contains_key(&new_inbox_key));
         assert!(!s.inbox.contains_key(&old_inbox_key));
@@ -1221,7 +1221,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([99; 16]),
             space_id: SpaceId([1; 16]),
             recipient_owners: vec![OwnerAddr([2; 16])],
-            message_cid: ContentId([1; 32]),
+            message_cid: ContentId::from_bytes([1; 32]),
             created_at: hlc(100),
             delivered_to: Default::default(),
             delivery_status: DeliveryStatus::Pending,
@@ -1250,7 +1250,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([42; 16]),
             space_id: SpaceId([5; 16]),
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId([7; 32]),
+            message_cid: ContentId::from_bytes([7; 32]),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,
@@ -1273,7 +1273,7 @@ mod canonicalization_tests {
             id: OutboxEntryId([42; 16]),
             space_id: SpaceId([5; 16]), // peer is still on the old loser id
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId([7; 32]),
+            message_cid: ContentId::from_bytes([7; 32]),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([2; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,
@@ -1308,11 +1308,11 @@ mod canonicalization_tests {
         s.inbox.insert(
             InboxKey {
                 space_id: SpaceId([5; 16]),
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
             },
             InboxEntry {
                 space_id: SpaceId([5; 16]),
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 from: OwnerAddr([2; 16]),
                 received_at: hlc(200), // later
             },
@@ -1320,11 +1320,11 @@ mod canonicalization_tests {
         s.inbox.insert(
             InboxKey {
                 space_id: SpaceId([1; 16]),
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
             },
             InboxEntry {
                 space_id: SpaceId([1; 16]),
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
                 from: OwnerAddr([2; 16]),
                 received_at: hlc(100), // earlier — should win
             },
@@ -1335,13 +1335,13 @@ mod canonicalization_tests {
         // Old loser key gone; only the winner key remains.
         assert!(!s.inbox.contains_key(&InboxKey {
             space_id: SpaceId([5; 16]),
-            message_cid: ContentId([7; 32]),
+            message_cid: ContentId::from_bytes([7; 32]),
         }));
         let winner_entry = s
             .inbox
             .get(&InboxKey {
                 space_id: SpaceId([1; 16]),
-                message_cid: ContentId([7; 32]),
+                message_cid: ContentId::from_bytes([7; 32]),
             })
             .unwrap();
         // Earlier (winner-side) received_at wins, NOT loser's later 200.
@@ -1492,7 +1492,7 @@ mod crypto_integration_tests {
             id: OutboxEntryId([7; 16]),
             space_id: SpaceId([8; 16]),
             recipient_owners: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-            message_cid: ContentId([3; 32]),
+            message_cid: ContentId::from_bytes([3; 32]),
             created_at: hlc(100),
             delivered_to: [OwnerAddr([1; 16])].into_iter().collect(),
             delivery_status: DeliveryStatus::Partial,
