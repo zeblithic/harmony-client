@@ -865,6 +865,11 @@ pub async fn run<R: Runtime>(
                             //    tokio::time::timeout. Spawning avoids holding
                             //    the select arm during the network I/O.
                             let cid_hex = hex::encode(cid.0);
+                            // Always Some: cid.0 is [u8; 32], so cid_hex is
+                            // exactly 64 chars. The unwrap_or("") fallback is
+                            // defensive but unreachable in practice; the empty
+                            // string would produce a malformed double-slash
+                            // key, so no graceful-degradation guarantee.
                             let prefix = cid_hex.get(1..2).unwrap_or("").to_string();
                             let key = format!("harmony/content/{prefix}/{cid_hex}");
                             let session_clone = session.clone();
@@ -876,6 +881,10 @@ pub async fn run<R: Runtime>(
                                         // 3. Admit via second-mpsc-hop. The
                                         //    select arm processes this PutLocal,
                                         //    then we reply Ok(Some(bytes)).
+                                        //    bytes.clone() is load-bearing —
+                                        //    PutLocal.blob consumes the bytes,
+                                        //    but the caller's reply still needs
+                                        //    them after admit succeeds.
                                         let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
                                         if cas_op_tx_for_admit.send(crate::content_store::CasOp::PutLocal {
                                             cid,
