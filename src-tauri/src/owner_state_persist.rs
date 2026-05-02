@@ -55,6 +55,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
+/// Phase 3a's stub-only sync never persisted ContentId-containing inbox
+/// entries (the inbox was always empty in practice — nothing was actually
+/// received via the stub). Phase 3b changes the meaning of ContentId's 32
+/// bytes (raw BLAKE3 → harmony-content structured CID with SHA-256-MSB-
+/// truncated hash), but the CBOR wire shape is still bstr(32), so V1 files
+/// continue to round-trip structurally. A formal V1→V2 schema bump with
+/// discard-on-load is unneeded for current realities; if Phase 3a-era
+/// persisted inbox entries with BLAKE3 ContentIds ever surface in practice,
+/// bump to V2 with explicit migration semantics. See Phase 3b spec §"Wire
+/// format" + §"Persistence layer".
 const CRDT_FILE_SCHEMA_V1: u8 = 1;
 
 #[derive(Serialize, Deserialize)]

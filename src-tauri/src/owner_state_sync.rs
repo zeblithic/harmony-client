@@ -406,9 +406,11 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), SyncError> {
         .map_err(|e| SyncError::Crypto(e.to_string()))?;
 
     // 3. Phase 3b: cipher_cid = harmony-content's structured ContentId
-    //    derived from the ciphertext. Encrypted+durable flag set so
-    //    StorageTier classifies as EncryptedDurable (eviction priority
-    //    matches PublicDurable; never auto-burns). The 28-byte hash is
+    //    derived from the ciphertext. ContentFlags has no `durable`
+    //    field — durability comes from `ephemeral: false` (the default
+    //    via `..Default::default()`) combined with `encrypted: true`,
+    //    which `ContentClass::content_class()` maps to `EncryptedDurable`
+    //    (eviction priority 0; never auto-burns). The 28-byte hash is
     //    SHA-256 truncated to its 224 most-significant bits.
     let root_cid = harmony_content::cid::ContentId::for_book(
         &blob_ciphertext,
@@ -557,13 +559,18 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // Until Task 7 (RuntimeContentStore wired into lib.rs), a missing
-            // blob means the subscriber and publisher aren't sharing the same
-            // InMemoryStub (e.g. cross-process). After Task 7, a missing blob
-            // also covers fetch timeouts and corrupted-admit drops — see
-            // Phase 3b spec §"Error handling". Log and drop — never panic.
-            return IncomingOutcome::ErrPostMutation(SyncError::Crypto(
-                "ContentStore returned None for root_cid".into(),
+            // Phase 3b: a missing blob means either a fetch timeout (network
+            // didn't deliver within DEFAULT_FETCH_TIMEOUT_MS) or a peer's
+            // corrupted-admit drop (StorageTier silently rejected hash-verify
+            // failures). Both collapse onto the same recovery path: drop the
+            // publish, rely on next state-root from any peer (CRDT eventual
+            // consistency). Classify as ContentStore error, NOT crypto —
+            // misleading in logs otherwise.
+            return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(
+                crate::content_store::ContentStoreError::Io(format!(
+                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
+                    payload.root_cid
+                )),
             ));
         }
         Err(e) => return IncomingOutcome::ErrPostMutation(SyncError::ContentStore(e)),

@@ -330,7 +330,7 @@ Three new failure modes fold into existing `ContentStoreError` / `SyncError` var
 2. **Network fetch timeout (GetOrFetch).** Returned as `Ok(None)` — semantically "blob not present in network within deadline." SyncEngine logs at `WARN` with the CID hex and HLC, drops the publish. CRDT eventual consistency carries the recovery via the next state-root from any peer.
 3. **Hash verify failure on receipt.** `runtime.push_event(SubscriptionMessage{...}) + tick()` validates `cid.verify_hash(data)` inside StorageTier before admitting. Mismatch → admit rejected, `Ok(None)` returned (same path as timeout). The peer-served-corrupted-bytes case; protected by harmony-content's own hash chain, no integrity exposure.
 
-Existing `SyncError::ContentStore` and `SyncError::MissingBlob` cover these. No new variants.
+Existing `SyncError::ContentStore` (for CAS misses, timeouts, and corrupted-admit drops) and `SyncError::Crypto`/`SyncError::CborDecode` (for decrypt and decode failures) cover all three failure modes. No new variants.
 
 ## Testing strategy
 

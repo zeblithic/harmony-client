@@ -6,7 +6,7 @@
 
 **Architecture:** Async `ContentStore` trait + `RuntimeContentStore` adapter that sends `CasOp` messages on a new mpsc channel into the existing `harmony-runtime` thread; one new select arm in `event_loop.rs` handles `PutLocal` (admit to local cache via `RuntimeEvent::SubscriptionMessage`) and `GetOrFetch` (cache check → spawned Zenoh GET with 500ms timeout → second-mpsc-hop re-entry to admit). Wire-format reinterpretation of `RootPublishPayload.root_cid` from raw BLAKE3 to harmony-content's structured `ContentId` (4-byte header + SHA-256-MSB-truncated 28-byte hash); v1 was stub-only so the change is silent.
 
-**Tech Stack:** Rust 2021 (rust-toolchain 1.88), Tauri 2, tokio (existing), `async-trait = "0.1"` (already in Cargo.toml), `harmony-content = { git = "...", branch = "main" }` (existing), ciborium for canonical CBOR, postcard (workspace-wide for harmony-content's own consumers).
+**Tech Stack:** Rust 2021 (rust-toolchain 1.88), Tauri 2, tokio (existing), `async-trait = "0.1"` (already in Cargo.toml), all 7 `harmony-*` git deps pinned to a single revision (the merged Task 1 commit) to keep Cargo's git-source identity stable across the workspace, ciborium for canonical CBOR, postcard (workspace-wide for harmony-content's own consumers).
 
 **Spec:** `docs/specs/2026-05-01-zeb-215-sub-a-phase3b-content-cas-design.md` (commit `b768109`).
 
@@ -273,7 +273,7 @@ Replace with (substituting the actual SHA):
 harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "<HARMONY_SHA>" }
 ```
 
-This pins to the exact merged commit. (Other harmony-* deps stay on `branch = "main"` — only harmony-content needs the pin because only it carries the wire-format change.)
+This pins to the exact merged commit. (Note: during execution this approach failed — Cargo treats `{branch="main"}` and `{rev=hash}` as DIFFERENT git sources even when they resolve to the same commit, causing two harmony_content versions in the dep graph. The actual fix is to pin ALL 7 harmony-* deps to the same rev, which lands as a follow-up commit in this task. See commit `27a9183` for the unified pin.)
 
 - [ ] **Step 4: Refresh the lockfile**
 

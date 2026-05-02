@@ -877,35 +877,28 @@ pub async fn run<R: Runtime>(
                                 let fetch = fetch_via_zenoh(&session_clone, &key);
                                 match tokio::time::timeout(timeout, fetch).await {
                                     Ok(Ok(bytes)) => {
-                                        // 3. Admit via second-mpsc-hop. The
-                                        //    select arm processes this PutLocal,
-                                        //    then we reply Ok(Some(bytes)).
+                                        // 3. Best-effort admit via try_send.
+                                        //    We have the bytes for the caller
+                                        //    regardless of whether caching
+                                        //    succeeds — admit is fire-and-forget
+                                        //    so network-fetch latency isn't
+                                        //    blocked on local cache contention
+                                        //    or event-loop progress. If the
+                                        //    cas_op channel is full or closed,
+                                        //    caching is skipped; the next
+                                        //    GetOrFetch on this CID will
+                                        //    re-fetch over the network.
                                         //    bytes.clone() is load-bearing —
                                         //    PutLocal.blob consumes the bytes,
                                         //    but the caller's reply still needs
-                                        //    them after admit succeeds.
-                                        let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
-                                        if cas_op_tx_for_admit.send(crate::content_store::CasOp::PutLocal {
+                                        //    them.
+                                        let (admit_tx, _admit_rx) = tokio::sync::oneshot::channel();
+                                        let _ = cas_op_tx_for_admit.try_send(crate::content_store::CasOp::PutLocal {
                                             cid,
                                             blob: bytes.clone(),
                                             reply: admit_tx,
-                                        }).await.is_err() {
-                                            // Event loop shutting down; reply
-                                            // Ok(Some) since we have the bytes
-                                            // — the caller still gets to merge.
-                                            let _ = reply.send(Ok(Some(bytes)));
-                                            return;
-                                        }
-                                        match admit_rx.await {
-                                            Ok(Ok(())) => {
-                                                let _ = reply.send(Ok(Some(bytes)));
-                                            }
-                                            // Admit channel reply error or admit
-                                            // returned Err — treat as miss.
-                                            Ok(Err(_)) | Err(_) => {
-                                                let _ = reply.send(Ok(None));
-                                            }
-                                        }
+                                        });
+                                        let _ = reply.send(Ok(Some(bytes)));
                                     }
                                     Ok(Err(e)) => {
                                         let _ = reply.send(Err(crate::content_store::ContentStoreError::Io(
