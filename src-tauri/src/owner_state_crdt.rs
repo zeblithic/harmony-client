@@ -555,6 +555,45 @@ mod apply_space_tests {
     }
 
     #[test]
+    fn lww_merge_content_key_from_newer_wins() {
+        use crate::owner_state_types::DmContentKey;
+
+        fn dm_at(content_key_byte: u8, hlc_ms: u64) -> Space {
+            Space {
+                id: SpaceId([1; 16]),
+                kind: SpaceKind::Dm,
+                parent: None,
+                community_id: None,
+                name: "x".into(),
+                transport: Some(TransportBinding::Reticulum {
+                    participants: vec![],
+                }),
+                members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: hlc(1),
+                updated_at: hlc(hlc_ms),
+                content_key: Some(DmContentKey::new([content_key_byte; 32])),
+                prior_content_keys: vec![],
+            }
+        }
+
+        let older = dm_at(0xaa, 1);
+        let newer = dm_at(0xbb, 2);
+        let merged_a = lww_merge_space(&older, &newer);
+        let merged_b = lww_merge_space(&newer, &older);
+        assert_eq!(
+            merged_a.content_key.as_ref().unwrap().as_bytes(),
+            &[0xbb; 32]
+        );
+        assert_eq!(
+            merged_b.content_key.as_ref().unwrap().as_bytes(),
+            &[0xbb; 32]
+        );
+    }
+
+    #[test]
     fn created_at_is_monotonically_earliest() {
         let mut s = OwnerState::default();
         s.apply_space(folder(7, 200));

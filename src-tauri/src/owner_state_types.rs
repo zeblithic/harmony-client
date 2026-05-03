@@ -673,6 +673,7 @@ pub struct Space {
 
     /// Per-DM-Space symmetric content key (ChaCha20-Poly1305).
     /// MUST be Some for kind ∈ {dm, group-dm}; MUST be None otherwise.
+    /// (Enforcement via validate_invariants lands in Task 3.)
     /// Wire format: bstr(32) inside the Space CBOR map under key "ck".
     /// In-memory: zeroized on drop via DmContentKey's ZeroizeOnDrop impl.
     /// See ZEB-216 §"Space struct additions (Phase 1)".
@@ -681,8 +682,8 @@ pub struct Space {
 
     /// Historical content keys retained from past dedupe-collision merges.
     /// Used as fallback decryption for messages encrypted under a now-
-    /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16 (enforced
-    /// in validate_invariants and merge_prior_content_keys).
+    /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16.
+    /// (Validation lands in Task 3; cap-rule merge in Task 7.)
     /// MUST NOT contain the current `content_key`.
     /// MUST be empty for non-DM kinds.
     /// Wire format: array of bstr(32) under key "pk".
@@ -1473,18 +1474,7 @@ mod space_tests {
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
         let recovered: Space = from_reader(&bytes[..]).unwrap();
-        assert_eq!(
-            s.content_key.as_ref().map(|k| *k.as_bytes()),
-            recovered.content_key.as_ref().map(|k| *k.as_bytes())
-        );
-        assert_eq!(
-            s.prior_content_keys.len(),
-            recovered.prior_content_keys.len()
-        );
-        assert_eq!(
-            s.prior_content_keys[0].as_bytes(),
-            recovered.prior_content_keys[0].as_bytes()
-        );
+        assert_eq!(s, recovered);
     }
 
     #[test]
