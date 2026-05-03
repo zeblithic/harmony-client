@@ -95,20 +95,6 @@ impl DmTransport for StubTransport {
     }
 }
 
-// Backoff schedule + 30-day expiration constants. Consumed by Task 3
-// (`send_dm` / `drain`); annotated for now so the lib build stays
-// `-D warnings`-clean ahead of those consumers landing.
-#[allow(dead_code)]
-const BACKOFF_BASE_MS: u64 = 5_000;
-#[allow(dead_code)]
-const BACKOFF_MULTIPLIER: u64 = 2;
-#[allow(dead_code)]
-const BACKOFF_CAP_MS: u64 = 5 * 60 * 1_000;
-#[allow(dead_code)]
-const BACKOFF_MAX_EXPONENT: u32 = 8;
-#[allow(dead_code)]
-pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // fields read by Task 3's drain backoff logic
 struct AttemptState {
