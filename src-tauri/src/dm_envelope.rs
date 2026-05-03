@@ -2,8 +2,12 @@
 //!
 //! See `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md`
 //! §"Wire format" and §"Plaintext envelope (Phase 1, recap from ZEB-219)".
+//!
+//! All wire types use two-character serde renames so each struct's keys
+//! are the same encoded length at a single nesting level — the same-length-
+//! keys precondition documented on `crate::owner_state_crypto::canonical_cbor_encode`.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{
@@ -99,6 +103,14 @@ pub enum EncodeError {
     Cbor(String),
 }
 
+/// Errors produced by [`decode_packet`].
+///
+/// `Cbor(String)` stringifies the underlying `ciborium::de::Error` because
+/// that error type does not implement `Clone + Eq`, which `DecodeError`
+/// derives for use in tests and telemetry. Phase 3b's receive handler
+/// can't currently distinguish truncated packets from type-mismatch errors —
+/// if that distinction becomes load-bearing, widen this enum into specific
+/// variants (e.g., `Truncated`, `TypeMismatch`) at that time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     #[error("packet is empty")]
@@ -131,18 +143,26 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
     }
 }
 
+// Plain ciborium (not canonical_cbor_encode): Reticulum packets are not
+// AAD-bound, so canonical byte-stability isn't required for correctness.
+// Reticulum link-layer ECDH already provides per-packet integrity.
 fn encode_body<T: Serialize>(value: &T) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).map_err(|e| EncodeError::Cbor(e.to_string()))?;
     Ok(out)
 }
 
-fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
+fn decode_body<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
     ciborium::from_reader(bytes).map_err(|e| DecodeError::Cbor(e.to_string()))
 }
 
-// CanonicalPayload registrations — these wire types pass through
-// `canonical_cbor_encode` from owner_state_crypto.
+// CanonicalPayload registrations.
+// - MessagePayload: encoded via canonical_cbor_encode (required for AAD
+//   stability in CAS blobs — see dm_crypto Task 6).
+// - DmInvite/DmCidNotify/DmAck: Reticulum wire bodies use plain
+//   ciborium (see encode_body). Registered here so the Phase 2
+//   enforcement gate in owner_state_crypto.rs passes, and so future
+//   callers may use canonical_cbor_encode if they have reason to.
 impl CanonicalPayloadSealed for MessagePayload {}
 impl CanonicalPayload for MessagePayload {}
 impl CanonicalPayloadSealed for DmInvite {}
