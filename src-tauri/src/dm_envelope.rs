@@ -155,6 +155,41 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
                     "DmInvite.sender_devices exceeds MAX_DEVICES_PER_OWNER",
                 ));
             }
+            // Mirror Space::validate_invariants for Dm/GroupDm member-set
+            // shape (see owner_state_types.rs §"Distinct-member check"):
+            // members must be strictly-ascending sorted (catches both
+            // unsorted ordering AND duplicates in one predicate), the
+            // member count must match the kind's range, and the inviter
+            // must itself be a member. A peer violating any of these is
+            // either malicious or buggy — reject at the wire boundary so
+            // downstream code never sees a malformed DmInvite.
+            if !invite.members.windows(2).all(|w| w[0] < w[1]) {
+                return Err(DecodeError::Invalid(
+                    "DmInvite.members must be strictly-ascending sorted (catches unsorted and duplicate)",
+                ));
+            }
+            match invite.kind {
+                SpaceKind::Dm => {
+                    if invite.members.len() != 2 {
+                        return Err(DecodeError::Invalid(
+                            "DmInvite kind=Dm requires exactly 2 members",
+                        ));
+                    }
+                }
+                SpaceKind::GroupDm => {
+                    if !(3..=16).contains(&invite.members.len()) {
+                        return Err(DecodeError::Invalid(
+                            "DmInvite kind=GroupDm requires 3..=16 members",
+                        ));
+                    }
+                }
+                _ => unreachable!("kind already restricted to Dm or GroupDm above"),
+            }
+            if !invite.members.contains(&invite.inviter) {
+                return Err(DecodeError::Invalid(
+                    "DmInvite.inviter must be a member of DmInvite.members",
+                ));
+            }
             DmPacket::Invite(invite)
         }
         0x02 => {
@@ -376,6 +411,89 @@ mod tests {
         assert!(
             matches!(err, DecodeError::Invalid(msg) if msg.contains("sender_devices")),
             "expected DecodeError::Invalid with sender_devices, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_invite_unsorted_members_rejected() {
+        // Build a valid invite, then rotate members into descending
+        // order. Encoder still emits, but decoder must reject — the
+        // sorted-ascending invariant is part of the wire contract
+        // (matches Space::validate_invariants for Dm/GroupDm).
+        let mut invite = sample_invite();
+        invite.members = vec![OwnerAddr([2; 16]), OwnerAddr([1; 16])];
+        // Inviter must still be in members for this to isolate the sort
+        // check (otherwise the inviter-check would fire first).
+        invite.inviter = OwnerAddr([2; 16]);
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("members") && msg.contains("ascending")),
+            "expected DecodeError::Invalid mentioning members + ascending, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_invite_duplicate_members_rejected() {
+        // Strictly-ascending sort also catches adjacent duplicates —
+        // a single predicate covers both unsorted and duplicate
+        // members. Use a duplicated member to exercise that path.
+        let mut invite = sample_invite();
+        invite.members = vec![OwnerAddr([1; 16]), OwnerAddr([1; 16])];
+        invite.inviter = OwnerAddr([1; 16]);
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("members") && msg.contains("ascending")),
+            "expected DecodeError::Invalid mentioning members + ascending, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_invite_wrong_member_count_rejected() {
+        // Dm requires exactly 2 members — sending 3 must reject.
+        let mut invite = sample_invite();
+        invite.kind = SpaceKind::Dm;
+        invite.members = vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), OwnerAddr([3; 16])];
+        invite.inviter = OwnerAddr([1; 16]);
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("Dm") && msg.contains("2")),
+            "expected DecodeError::Invalid for Dm wrong-count, got {:?}",
+            err
+        );
+
+        // GroupDm requires 3..=16 — sending 2 must also reject.
+        let mut invite = sample_invite();
+        invite.kind = SpaceKind::GroupDm;
+        invite.members = vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])];
+        invite.inviter = OwnerAddr([1; 16]);
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("GroupDm") && msg.contains("3..=16")),
+            "expected DecodeError::Invalid for GroupDm wrong-count, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_invite_inviter_not_in_members_rejected() {
+        // Inviter ∉ members is a contract violation: receiver MUST
+        // verify inviter ∈ members before prompting the user (per the
+        // doc comment on DmInvite.inviter). Reject at the wire boundary.
+        let mut invite = sample_invite();
+        invite.members = vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])];
+        invite.inviter = OwnerAddr([3; 16]); // not in members
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("inviter")),
+            "expected DecodeError::Invalid mentioning inviter, got {:?}",
             err
         );
     }
