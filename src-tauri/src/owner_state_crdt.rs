@@ -483,6 +483,7 @@ mod apply_space_tests {
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         Space {
             id: SpaceId([id; 16]),
             kind: SpaceKind::Dm,
@@ -498,7 +499,7 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         }
     }
@@ -1189,6 +1190,7 @@ mod canonicalization_tests {
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         Space {
             id: SpaceId([id; 16]),
             kind: SpaceKind::Dm,
@@ -1204,7 +1206,7 @@ mod canonicalization_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         }
     }
@@ -1568,6 +1570,7 @@ mod crypto_integration_tests {
     /// to converge them.
     #[test]
     fn dm_with_members_yields_identical_cipher_cid_across_devices() {
+        use crate::owner_state_types::DmContentKey;
         let dm = Space {
             id: SpaceId([42; 16]),
             kind: SpaceKind::Dm,
@@ -1584,7 +1587,7 @@ mod crypto_integration_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xcc; 32])),
             prior_content_keys: vec![],
         };
         // Sanity: invariant check must pass for a well-formed DM.

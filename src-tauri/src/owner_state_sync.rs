@@ -1316,6 +1316,7 @@ mod integration_tests {
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         let mut sorted = members.clone();
         sorted.sort();
         Space {
@@ -1341,7 +1342,7 @@ mod integration_tests {
                 logical: 0,
                 device_id: "test".into(),
             },
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         }
     }

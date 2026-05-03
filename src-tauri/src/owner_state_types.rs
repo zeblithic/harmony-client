@@ -804,6 +804,53 @@ impl Space {
                 // — that lives in Sub-C scope, not validated here.
             }
         }
+
+        // Content-key invariants per ZEB-216 §"Validate invariants extension".
+        match self.kind {
+            SpaceKind::Dm | SpaceKind::GroupDm => {
+                if self.content_key.is_none() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind requires content_key",
+                        self.kind
+                    )));
+                }
+            }
+            _ => {
+                if self.content_key.is_some() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind must not have content_key",
+                        self.kind
+                    )));
+                }
+                if !self.prior_content_keys.is_empty() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind must not have prior_content_keys",
+                        self.kind
+                    )));
+                }
+            }
+        }
+
+        if self.prior_content_keys.len() > MAX_PRIOR_CONTENT_KEYS {
+            return Err(InvariantError(format!(
+                "prior_content_keys.len()={} exceeds MAX_PRIOR_CONTENT_KEYS={}",
+                self.prior_content_keys.len(),
+                MAX_PRIOR_CONTENT_KEYS
+            )));
+        }
+
+        if let Some(ck) = &self.content_key {
+            if self
+                .prior_content_keys
+                .iter()
+                .any(|p| p.as_bytes() == ck.as_bytes())
+            {
+                return Err(InvariantError(
+                    "content_key must not appear in prior_content_keys".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1171,7 +1218,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(mk_dm(0).validate_invariants().is_err());
@@ -1197,7 +1244,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(mk(2).validate_invariants().is_err());
@@ -1226,7 +1273,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
@@ -1257,7 +1304,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
@@ -1287,7 +1334,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
@@ -1442,6 +1489,195 @@ mod space_tests {
         ciborium::into_writer(&s, &mut bytes).unwrap();
         let recovered: Space = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(s, recovered);
+    }
+
+    #[test]
+    fn dm_must_have_content_key() {
+        let mut d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None, // ← invariant violation
+            prior_content_keys: vec![],
+        };
+        assert!(d.validate_invariants().is_err());
+        d.content_key = Some(DmContentKey::new([0xaa; 32]));
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn group_dm_must_have_content_key() {
+        let mut d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: (0u8..3).map(|i| OwnerAddr([i; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+        };
+        assert!(d.validate_invariants().is_err());
+        d.content_key = Some(DmContentKey::new([0xaa; 32]));
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn folder_rejects_content_key() {
+        let f = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])), // ← invariant violation
+            prior_content_keys: vec![],
+        };
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn folder_rejects_prior_content_keys() {
+        let f = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![DmContentKey::new([0xbb; 32])], // ← invariant violation
+        };
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn dm_content_key_in_prior_list_rejects() {
+        let dup = DmContentKey::new([0xaa; 32]);
+        let d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(dup.clone()),
+            prior_content_keys: vec![dup], // ← same as content_key — violation
+        };
+        assert!(d.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn dm_prior_content_keys_cap_exceeded_rejects() {
+        let d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: (0u8..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
+                .map(|i| DmContentKey::new([i; 32]))
+                .collect(),
+        };
+        assert!(d.validate_invariants().is_err());
     }
 
     #[test]
