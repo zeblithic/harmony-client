@@ -839,6 +839,7 @@ mod tests {
         assert_canonical::<ReticulumDest>();
         assert_canonical::<TransportBinding>();
         assert_canonical::<Space>();
+        assert_canonical::<DedupeKey>();
         assert_canonical::<DeliveryStatus>();
         assert_canonical::<OutboxEntry>();
         assert_canonical::<InboxKey>();

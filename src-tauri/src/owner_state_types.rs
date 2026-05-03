@@ -388,6 +388,7 @@ impl_canonical!(
     ReticulumDest,
     TransportBinding,
     Space,
+    DedupeKey,
     DeliveryStatus,
     OutboxEntry,
     InboxKey,
@@ -732,15 +733,26 @@ pub struct Space {
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
 /// across two devices' independent writes. See ZEB-206 spec
 /// §"Dedupe key per Space kind".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Also used as the AAD seed for DM encryption (see `dm_crypto::compute_aad`):
+/// canonical CBOR of the dedupe key is stable across cross-SpaceId collapses.
+/// Adjacently tagged: tag key `"tg"` (2 chars), content key `"vl"` (2 chars
+/// to match the same-length-keys precondition at this nesting level);
+/// variant codes `"n"/"i"/"t"/"s"` (1-char values, not keys).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "tg", content = "vl")]
 pub enum DedupeKey {
     /// Folders never dedupe — same name on different devices = different folders.
+    #[serde(rename = "n")]
     None,
     /// Community / channel / group-dm: by Space.id.
+    #[serde(rename = "i")]
     Id(SpaceId),
     /// public-channel: by Zenoh topic string.
+    #[serde(rename = "t")]
     Topic(String),
     /// dm: by sorted members (immutable 2-member set).
+    #[serde(rename = "s")]
     SortedMembers(Vec<OwnerAddr>),
 }
 
