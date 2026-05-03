@@ -15,26 +15,9 @@
 //!   - Add `handle_unicast` for inbound `DmInvite`/`DmCidNotify`/`DmAck`
 //!     demux (which routes `DmAck` packets through `handle_ack`).
 
-// Imports staged for subsequent Phase 2 tasks (DmOutbox orchestrator,
-// send_dm, drain, handle_ack). Allowed-unused at module level so the
-// Phase 2 Task 1 skeleton compiles cleanly under `clippy -D warnings`;
-// later tasks consume them.
-#[allow(unused_imports)]
-use crate::content_store::{ContentStore, ContentStoreError};
-#[allow(unused_imports)]
-use crate::dm_crypto::{compute_aad, encrypt_dm_message, DmEncryptError};
-#[allow(unused_imports)]
-use crate::dm_envelope::MessagePayload;
-#[allow(unused_imports)]
-use crate::owner_state_crdt::{ApplyOutcome, OwnerState, RejectionReason};
-#[allow(unused_imports)]
-use crate::owner_state_types::{
-    ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, Space, SpaceId,
-    SpaceKind,
-};
+use crate::owner_state_types::{OutboxEntry, OutboxEntryId, OwnerAddr};
 use async_trait::async_trait;
-#[allow(unused_imports)]
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub type MessageId = OutboxEntryId;
@@ -115,7 +98,7 @@ impl DmTransport for StubTransport {
 #[cfg(test)]
 mod stub_tests {
     use super::*;
-    use crate::owner_state_types::ContentId;
+    use crate::owner_state_types::{ContentId, DeliveryStatus, Hlc, SpaceId};
     use std::collections::BTreeSet;
 
     fn entry(id: u8) -> OutboxEntry {
