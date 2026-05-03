@@ -311,6 +311,27 @@ where
     Ok(devices)
 }
 
+/// Deserialize a `Vec<DmContentKey>` and re-establish the
+/// `Space::prior_content_keys` canonical-form invariant (sorted ascending
+/// by raw bytes + deduped + truncated to `MAX_PRIOR_CONTENT_KEYS`). Mirrors
+/// the rationale on `deserialize_device_identities`: `validate_invariants`
+/// runs on apply paths only, NOT on initial load, so without this hook a
+/// corrupted on-disk file with non-canonical priors would sit in
+/// `state.spaces` unchecked, get re-serialized on the next `save_crdt`,
+/// and produce a different `root_cid` than correctly-converged peers
+/// (silent convergence break — replicas with semantically-equal but
+/// differently-ordered priors disagree on `canonical_cbor_encode` bytes).
+fn deserialize_prior_content_keys<'de, D>(d: D) -> Result<Vec<DmContentKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut keys = Vec::<DmContentKey>::deserialize(d)?;
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    keys.truncate(MAX_PRIOR_CONTENT_KEYS);
+    Ok(keys)
+}
+
 impl OwnerDeviceCache {
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty()
@@ -744,11 +765,22 @@ pub struct Space {
     /// Historical content keys retained from past dedupe-collision merges.
     /// Used as fallback decryption for messages encrypted under a now-
     /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16.
-    /// (Validation lands in Task 3; cap-rule merge in Task 7.)
     /// MUST NOT contain the current `content_key`.
     /// MUST be empty for non-DM kinds.
     /// Wire format: array of bstr(32) under key "pk".
-    #[serde(rename = "pk", skip_serializing_if = "Vec::is_empty", default)]
+    ///
+    /// `deserialize_with` re-normalizes (sort + dedup + truncate) on every
+    /// load so persisted-state files and remote replicas can't hand us a
+    /// `Vec` that violates the canonical-form invariant — `validate_
+    /// invariants` runs only on apply, not on initial load, so without
+    /// this hook a corrupted file's malformed priors would round-trip
+    /// through `save_crdt` and break root_cid convergence with peers.
+    #[serde(
+        rename = "pk",
+        skip_serializing_if = "Vec::is_empty",
+        default,
+        deserialize_with = "deserialize_prior_content_keys"
+    )]
     pub prior_content_keys: Vec<DmContentKey>,
 }
 
@@ -1860,6 +1892,64 @@ mod space_tests {
             DmContentKey::new([0x33; 32]),
         ]);
         assert!(many.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_oversized_prior_content_keys() {
+        use ciborium::{from_reader, into_writer};
+        // Build a Space with all three pathologies in prior_content_keys:
+        //   (a) duplicates    — 5 copies of [0xff; 32]
+        //   (b) unsorted      — 30 distinct keys descending below the dups
+        //   (c) oversized     — total 35 entries > MAX_PRIOR_CONTENT_KEYS (16)
+        // Constructed in-memory bypassing validate_invariants. After a
+        // CBOR encode/decode round-trip, the deserialize_with hook MUST
+        // restore canonical form (strictly-ascending bytes, no duplicates,
+        // length ≤ 16). Without this hook a corrupted on-disk file would
+        // round-trip through save_crdt unchanged and break root_cid
+        // convergence with peers.
+        let mut malformed: Vec<DmContentKey> = Vec::with_capacity(35);
+        for _ in 0..5 {
+            malformed.push(DmContentKey::new([0xee; 32]));
+        }
+        for i in (0..30u8).rev() {
+            malformed.push(DmContentKey::new([i; 32]));
+        }
+        // dm_with_priors uses content_key = [0xff; 32]; the malformed vec
+        // uses bytes 0..30 plus 0xee, so content_key never appears in priors.
+        let space = dm_with_priors(malformed);
+
+        let mut bytes = Vec::new();
+        into_writer(&space, &mut bytes).expect("encode space with malformed priors");
+
+        let decoded: Space = from_reader(&bytes[..]).expect("decode space");
+
+        // Capped at MAX_PRIOR_CONTENT_KEYS.
+        assert_eq!(
+            decoded.prior_content_keys.len(),
+            MAX_PRIOR_CONTENT_KEYS,
+            "expected truncation to MAX_PRIOR_CONTENT_KEYS"
+        );
+        // Strictly ascending by raw bytes — required for canonical-form
+        // convergence and for validate_invariants to accept on next apply.
+        assert!(
+            decoded
+                .prior_content_keys
+                .windows(2)
+                .all(|w| w[0].as_bytes() < w[1].as_bytes()),
+            "expected strictly-ascending priors after normalization"
+        );
+        // Lex-smallest survives truncation: bytes 0..30 sort below 0xee,
+        // so position 0 must be the all-zeros key.
+        assert_eq!(
+            decoded.prior_content_keys[0].as_bytes(),
+            &[0u8; 32],
+            "expected lex-smallest key (all zeros) at position 0"
+        );
+        // Round-tripped Space must still pass validate_invariants —
+        // proves the normalized form satisfies every downstream check.
+        decoded
+            .validate_invariants()
+            .expect("normalized priors must pass validate_invariants");
     }
 
     #[test]
