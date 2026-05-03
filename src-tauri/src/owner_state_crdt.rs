@@ -422,12 +422,16 @@ impl OwnerState {
     /// storage to bound cache memory and prevent cache-growth DoS via spoofed
     /// updates.
     ///
-    /// Equal-HLC semantics match `apply_marker`: an identical HLC is treated
-    /// as an idempotent replay (returns `Merged { old_id: None }` without
-    /// mutation). Flow A sync replay paths deliver the same update to multiple
-    /// devices; rejecting equal HLCs would produce spurious `StaleHlc` errors
-    /// that callers would need to filter out. `Rejected` is reserved for
-    /// genuinely older HLCs only.
+    /// Equal-HLC semantics deliberately differ from `apply_marker`. A marker's
+    /// payload is uniquely identified by its HLC (the marker IS the HLC), so
+    /// equal-HLC replay is always idempotent. `OwnerDeviceEntry` carries a
+    /// separate `devices` payload, so equal-HLC must additionally check that
+    /// the payload matches before treating it as a replay; otherwise two
+    /// replicas that concurrently issue different `devices` lists under the
+    /// same HLC would each keep their local list and report success, leaving
+    /// the cache permanently divergent. Equal-HLC + matching devices →
+    /// idempotent `Merged { old_id: None }`; equal-HLC + diverging devices →
+    /// `Rejected(InvariantFail)`.
     ///
     /// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
     pub fn apply_owner_device_update(
@@ -436,7 +440,14 @@ impl OwnerState {
         devices: Vec<DeviceIdentityHash>,
         learned_at: Hlc,
     ) -> ApplyOutcome {
-        // LWW guard — mirrors apply_marker's three-way comparison.
+        // Sanitize first so the equal-HLC payload check below can compare
+        // semantically-equal lists (the on-the-wire vec might be unsorted /
+        // duplicated / oversized; the stored vec is always normalized).
+        let mut sanitized = devices;
+        sanitized.sort();
+        sanitized.dedup();
+        sanitized.truncate(MAX_DEVICES_PER_OWNER);
+        // LWW guard.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
             if existing.learned_at.is_strictly_newer_than(&learned_at) {
                 return ApplyOutcome::Rejected(RejectionReason::StaleHlc {
@@ -445,15 +456,19 @@ impl OwnerState {
                 });
             }
             if existing.learned_at == learned_at {
-                // Idempotent replay — sync flows replay the same update freely
-                // and Rejected should be reserved for genuinely older HLCs.
-                return ApplyOutcome::Merged { old_id: None };
+                // Equal HLC — only idempotent if the payload matches. Two
+                // replicas concurrently issuing different `devices` under the
+                // same HLC would otherwise diverge silently.
+                if existing.devices == sanitized {
+                    return ApplyOutcome::Merged { old_id: None };
+                }
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "owner_device_entry for {:?} diverges at identical learned_at \
+                     (concurrent updates with same HLC but different devices)",
+                    addr
+                )));
             }
         }
-        let mut sanitized = devices;
-        sanitized.sort();
-        sanitized.dedup();
-        sanitized.truncate(MAX_DEVICES_PER_OWNER);
         let was_present = self.owner_device_cache.devices.contains_key(&addr);
         self.owner_device_cache.devices.insert(
             addr,
@@ -1884,15 +1899,16 @@ mod owner_device_cache_tests {
 
     #[test]
     fn lww_equal_hlc_is_idempotent_replay() {
-        // Mirrors apply_marker's equal-HLC semantics: sync replay flows
-        // deliver the same update to multiple devices, and equal HLC must
-        // not produce a spurious StaleHlc — return Merged without mutation.
+        // Sync replay flows deliver the same update to multiple devices, so
+        // an equal HLC + matching devices payload must not produce a spurious
+        // StaleHlc — return Merged without mutation.
         let mut c = OwnerDeviceCache::default();
         let addr = OwnerAddr([1; 16]);
         let d = vec![DeviceIdentityHash([1; 16])];
         let outcome1 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
         assert!(matches!(outcome1, ApplyOutcome::Inserted));
-        // Second call at SAME HLC — must be idempotent Merged, not Rejected.
+        // Second call at SAME HLC AND SAME devices — must be idempotent
+        // Merged, not Rejected.
         let outcome2 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
         assert!(
             matches!(outcome2, ApplyOutcome::Merged { old_id: None }),
@@ -1901,6 +1917,50 @@ mod owner_device_cache_tests {
         );
         // Cache unchanged.
         assert_eq!(c.devices.get(&addr).unwrap().devices, d);
+    }
+
+    #[test]
+    fn lww_equal_hlc_diverging_devices_is_rejected() {
+        // Equal HLC + DIFFERENT devices payload is NOT a replay — it's a
+        // concurrent-update divergence. Without explicit rejection, two
+        // replicas that produced the entries independently would each keep
+        // their own list and report Merged, leaving the cache permanently
+        // divergent. Reject as InvariantFail and preserve the local list.
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d_a = vec![DeviceIdentityHash([1; 16])];
+        let d_b = vec![DeviceIdentityHash([2; 16])];
+
+        // Establish at hlc(5) with devices = d_a.
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d_a.clone(), hlc(5));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+
+        // Same hlc(5) but different devices = d_b → Rejected(InvariantFail).
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d_b, hlc(5));
+        match outcome2 {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("owner_device_entry"),
+                    "expected message mentioning owner_device_entry, got: {msg}"
+                );
+                assert!(
+                    msg.contains("identical learned_at") || msg.contains("learned_at"),
+                    "expected message to reference identical-HLC divergence, got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(InvariantFail), got {:?}", other),
+        }
+        // Local list preserved unchanged.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d_a);
+
+        // True replay (same HLC, same devices) is still Merged{old_id: None}.
+        let outcome3 = apply_owner_device_update_helper(&mut c, addr, d_a.clone(), hlc(5));
+        assert!(
+            matches!(outcome3, ApplyOutcome::Merged { old_id: None }),
+            "expected Merged on equal-HLC equal-devices replay, got {:?}",
+            outcome3
+        );
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d_a);
     }
 
     #[test]

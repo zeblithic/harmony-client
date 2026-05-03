@@ -276,17 +276,39 @@ pub struct OwnerDeviceEntry {
     /// Sorted invariant means binary_search works for lookup
     /// (used by resolve_link_origin_owner in Phase 3b).
     ///
+    /// `deserialize_with` re-normalizes (sort + dedup + truncate) on every
+    /// load so persisted-state files and remote replicas can't hand us a
+    /// `Vec` that violates the invariant — a corrupted on-disk snapshot
+    /// or a malicious peer's `OwnerState` blob can otherwise break the
+    /// binary_search precondition Phase 3b's link-origin resolver depends on.
+    ///
     /// SECURITY NOTE: truncation keeps lex-smallest entries; an attacker
     /// who controls injected DeviceIdentityHash values could grind low-byte
     /// prefixes to displace legitimate devices. Acceptable in Phase 1 since
     /// updates must win the LWW HLC check (i.e., the owner's own device must
     /// publish the update). See ZEB-219 for the analogous prior_content_keys
     /// concern.
-    #[serde(rename = "v")]
+    #[serde(rename = "v", deserialize_with = "deserialize_device_identities")]
     pub devices: Vec<DeviceIdentityHash>,
     /// HLC of when this entry was learned. LWW key for merge.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
+}
+
+/// Deserialize a `Vec<DeviceIdentityHash>` and re-establish the
+/// `OwnerDeviceEntry::devices` invariant (sorted + deduped + truncated to
+/// `MAX_DEVICES_PER_OWNER`). This runs at every load — persisted-state files
+/// and remote `OwnerState` snapshots are equally untrusted with respect to
+/// the in-memory invariant.
+fn deserialize_device_identities<'de, D>(d: D) -> Result<Vec<DeviceIdentityHash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut devices = Vec::<DeviceIdentityHash>::deserialize(d)?;
+    devices.sort();
+    devices.dedup();
+    devices.truncate(MAX_DEVICES_PER_OWNER);
+    Ok(devices)
 }
 
 impl OwnerDeviceCache {
@@ -1805,5 +1827,73 @@ mod space_tests {
             !bytes.windows(2).any(|w| w == needle_pk),
             "Folder serialization unexpectedly contains 'pk' key"
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_device_entry_deserialize_tests {
+    use super::*;
+
+    /// Parallel struct that bypasses `OwnerDeviceEntry`'s `deserialize_with`
+    /// hook so the test can plant a malformed `devices` Vec on the wire and
+    /// assert the real type re-normalizes on load.
+    #[derive(Serialize)]
+    struct RawOwnerDeviceEntry {
+        #[serde(rename = "v")]
+        v: Vec<DeviceIdentityHash>,
+        #[serde(rename = "l")]
+        l: Hlc,
+    }
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc {
+            wall_ms: ms,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_oversized_devices() {
+        // Build a payload with all three pathologies at once:
+        //   (a) duplicates    — [42, 42, 42, ...]
+        //   (b) unsorted      — values descending below a smaller hash
+        //   (c) oversized     — 100 entries > MAX_DEVICES_PER_OWNER (32)
+        // After normalization the result must be sorted, deduped, and capped
+        // at 32 — anything else breaks binary_search in
+        // resolve_link_origin_owner (Phase 3b).
+        let mut malformed: Vec<DeviceIdentityHash> = Vec::with_capacity(100);
+        // 50 identical entries of hash 0xff...
+        for _ in 0..50 {
+            malformed.push(DeviceIdentityHash([0xff; 16]));
+        }
+        // Then 50 distinct descending hashes 0..50 (so total length = 100,
+        // and the hashes are NOT in sorted order).
+        for i in (0..50u8).rev() {
+            malformed.push(DeviceIdentityHash([i; 16]));
+        }
+
+        let raw = RawOwnerDeviceEntry {
+            v: malformed,
+            l: hlc(7),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
+
+        // Capped at MAX_DEVICES_PER_OWNER.
+        assert_eq!(entry.devices.len(), MAX_DEVICES_PER_OWNER);
+        // Sorted ascending — required for binary_search.
+        assert!(entry.devices.windows(2).all(|w| w[0] <= w[1]));
+        // Deduped — no consecutive equal entries (and given sorted, no dups
+        // anywhere).
+        assert!(entry.devices.windows(2).all(|w| w[0] != w[1]));
+        // Lex-smallest survives truncation: the smallest hashes are
+        // [0; 16], [1; 16], ..., so position 0 must be [0; 16].
+        assert_eq!(entry.devices[0], DeviceIdentityHash([0; 16]));
+        // learned_at preserved from the wire.
+        assert_eq!(entry.learned_at, hlc(7));
     }
 }

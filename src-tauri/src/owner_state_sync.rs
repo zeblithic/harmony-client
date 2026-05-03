@@ -592,23 +592,44 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     // 6. Merge each entry through Phase 2's CRDT methods. Order
     //    matters slightly — Spaces must merge first because outbox/
     //    inbox/markers reference SpaceIds that the canonicalization
-    //    rewrite needs to see resolved.
+    //    rewrite needs to see resolved. owner_device_cache is
+    //    independent of the others (keyed by OwnerAddr, not SpaceId)
+    //    so its merge order doesn't matter — placed last for grouping.
+    //
+    // Destructure `remote` up front so each field can be moved through
+    // its own loop without partial-move conflicts later.
+    let OwnerState {
+        spaces,
+        outbox,
+        inbox,
+        markers,
+        tombstones,
+        owner_device_cache,
+    } = remote;
     {
         let mut local = ctx.state.lock().await;
-        for (_, space) in remote.spaces {
+        for (_, space) in spaces {
             local.apply_space_with_canonicalization(space);
         }
-        for (_, entry) in remote.outbox {
+        for (_, entry) in outbox {
             local.apply_outbox(entry);
         }
-        for (_, entry) in remote.inbox {
+        for (_, entry) in inbox {
             local.apply_inbox(entry);
         }
-        for (_, marker) in remote.markers {
+        for (_, marker) in markers {
             local.apply_marker(marker);
         }
-        for tomb in remote.tombstones {
+        for tomb in tombstones {
             local.tombstones.insert(tomb);
+        }
+        // Replicate the remote's per-OwnerAddr device cache. Without this
+        // loop, OwnerDeviceCache updates on one of the user's devices
+        // never propagate to the others (Phase 3b's link-origin resolver
+        // would only see entries learned locally), breaking DM unicast
+        // addressing convergence across bound devices.
+        for (addr, entry) in owner_device_cache.devices {
+            local.apply_owner_device_update(addr, entry.devices, entry.learned_at);
         }
     }
 
@@ -1593,6 +1614,55 @@ mod integration_tests {
         assert_eq!(entry.delivered_to.len(), 2);
         assert_eq!(entry.delivery_status, DeliveryStatus::Complete);
         drop(a);
+
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
+    }
+
+    /// OwnerDeviceCache must replicate over Flow A sync. Without the
+    /// owner_device_cache loop in `handle_incoming_publish`, an entry
+    /// learned on device A would never appear on device B even after
+    /// successful state-root sync — Phase 3b's link-origin resolver on
+    /// B would fail to bind incoming DM messages from the same OwnerAddr
+    /// to the right contact.
+    #[tokio::test]
+    async fn owner_device_cache_converges_through_sync() {
+        use crate::owner_state_types::DeviceIdentityHash;
+
+        let dev = spawn_two_devices(231);
+
+        let owner = OwnerAddr([0x42; 16]);
+        let learned = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "device-a".into(),
+        };
+        let devices = vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([9; 16])];
+
+        // A learns a per-OwnerAddr device list.
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_owner_device_update(owner, devices.clone(), learned.clone());
+        }
+        dev.a_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // B must see the same entry replicated through state-root sync.
+        let b = dev.b_state.lock().await;
+        let b_entry = b
+            .owner_device_cache
+            .devices
+            .get(&owner)
+            .expect("B should have replicated the OwnerDeviceCache entry from A");
+        assert_eq!(
+            b_entry.devices, devices,
+            "B's replicated devices vec must match A's"
+        );
+        assert_eq!(
+            b_entry.learned_at, learned,
+            "B's replicated learned_at HLC must match A's"
+        );
+        drop(b);
 
         let _ = dev.a_engine.shutdown().await;
         let _ = dev.b_engine.shutdown().await;
