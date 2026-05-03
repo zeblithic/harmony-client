@@ -118,9 +118,7 @@ struct AttemptState {
 pub struct DmOutbox {
     pub(crate) device_id: String,
     pub(crate) self_owner: OwnerAddr,
-    #[allow(dead_code)] // read by Task 5's drain backoff logic
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
-    #[allow(dead_code)] // read by Task 5's drain backoff logic
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
 }
 
@@ -224,6 +222,51 @@ impl DmOutbox {
             }
             ApplyOutcome::Rejected(r) => Err(SendDmError::CrdtRejected(r)),
         }
+    }
+
+    /// Mark `recipient` as delivered for `entry_id`. Idempotent.
+    /// Returns true iff this call mutated `delivered_to` (i.e., recipient
+    /// was not already present). Caller emits `dm-delivered` IPC event
+    /// only on `true`.
+    ///
+    /// Drops with telemetry on:
+    ///   - unknown entry_id (likely stale ack from before app restart)
+    ///   - recipient not in entry.recipient_owners (forged ack)
+    ///
+    /// Both mismatches log at warn level; neither mutates state.
+    pub fn handle_ack(
+        &mut self,
+        state: &mut OwnerState,
+        entry_id: OutboxEntryId,
+        recipient: OwnerAddr,
+    ) -> bool {
+        let Some(entry) = state.outbox.get_mut(&entry_id) else {
+            tracing::warn!(?entry_id, ?recipient, "DmAck dropped: unknown entry");
+            return false;
+        };
+        if !entry.recipient_owners.contains(&recipient) {
+            tracing::warn!(
+                ?entry_id,
+                ?recipient,
+                "DmAck dropped: recipient not in entry.recipient_owners (forged ack)"
+            );
+            return false;
+        }
+        let inserted = entry.delivered_to.insert(recipient);
+        if inserted {
+            // Re-derive status. is_expired=false because handle_ack is the
+            // happy-path mutation; expiration is owned by drain's wall-clock
+            // sweep. If drain has already marked Expired, compute_status
+            // will preserve Expired only when (a) is_expired is passed true
+            // — so we must check the current state to keep Expired sticky.
+            let was_expired = matches!(entry.delivery_status, DeliveryStatus::Expired);
+            entry.delivery_status = entry.compute_status(was_expired);
+            // Clear in-flight + backoff for this (entry, recipient) so a
+            // subsequent drain doesn't re-attempt a now-completed delivery.
+            self.in_flight.remove(&(entry_id, recipient));
+            self.backoff.remove(&(entry_id, recipient));
+        }
+        inserted
     }
 }
 
@@ -437,5 +480,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SendDmError::UnknownSpace(_)));
+    }
+
+    fn install_outbox_entry(state: &mut OwnerState, entry: OutboxEntry) {
+        match state.apply_outbox(entry) {
+            ApplyOutcome::Inserted => {}
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+    }
+
+    fn outbox_entry_with_recipients(id: u8, recipients: Vec<OwnerAddr>) -> OutboxEntry {
+        OutboxEntry {
+            id: OutboxEntryId([id; 16]),
+            space_id: SpaceId([1u8; 16]),
+            recipient_owners: recipients,
+            message_cid: ContentId::from_bytes([3u8; 32]),
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn handle_ack_updates_delivered_to() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = outbox_entry_with_recipients(7, vec![bob]);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let inserted = o.handle_ack(&mut state, entry_id, bob);
+
+        assert!(inserted, "first ack inserts");
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.contains(&bob));
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[test]
+    fn handle_ack_duplicate_is_idempotent() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = outbox_entry_with_recipients(7, vec![bob]);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let first = o.handle_ack(&mut state, entry_id, bob);
+        let second = o.handle_ack(&mut state, entry_id, bob);
+
+        assert!(first);
+        assert!(!second, "duplicate ack returns false");
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert_eq!(stored.delivered_to.len(), 1);
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
     }
 }
