@@ -1370,7 +1370,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
@@ -1441,7 +1441,7 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         let a = OwnerAddr([1u8; 16]);

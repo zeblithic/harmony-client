@@ -677,6 +677,7 @@ mod apply_space_tests {
     /// and would slip through dedupe_key equality alone.
     #[test]
     fn same_id_kind_change_rejects() {
+        use crate::owner_state_types::DmContentKey;
         let mut s = OwnerState::default();
         // Seed a Channel.
         let channel = Space {
@@ -716,7 +717,7 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(200),
             updated_at: hlc(200),
-            content_key: None,
+            content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
         };
         let outcome = s.apply_space(group_dm);
