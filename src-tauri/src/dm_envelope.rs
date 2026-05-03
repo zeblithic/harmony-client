@@ -11,8 +11,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{
-    ContentId, DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, SpaceId, SpaceKind,
-    MAX_DEVICES_PER_OWNER,
+    deserialize_vec_from_bstr, serialize_vec_as_bstr, ContentId, DeviceIdentityHash, DmContentKey,
+    Hlc, OwnerAddr, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER,
 };
 
 /// Plaintext envelope encrypted into the CAS storage_blob. Bound by AAD
@@ -20,7 +20,17 @@ use crate::owner_state_types::{
 /// See ZEB-216 §"Plaintext envelope" / ZEB-219 §"Wire format".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagePayload {
-    #[serde(rename = "bd")]
+    /// Message body bytes. Encoded as CBOR bstr (major type 2): one
+    /// header byte plus the raw bytes. The default `Vec<u8>` derive
+    /// would emit a CBOR array of u8 (major type 4) — two bytes per
+    /// byte once values exceed 0x17 — roughly doubling ciphertext
+    /// overhead. Lock the byte-efficient form in pre-Phase-2 so Phase 2's
+    /// receive path doesn't get to silently regress it.
+    #[serde(
+        rename = "bd",
+        serialize_with = "serialize_vec_as_bstr",
+        deserialize_with = "deserialize_vec_from_bstr"
+    )]
     pub body: Vec<u8>,
     #[serde(rename = "mt")]
     pub mime_type: String,
@@ -291,6 +301,52 @@ mod tests {
         let recovered: MessagePayload =
             crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
         assert_eq!(m, recovered);
+    }
+
+    #[test]
+    fn message_payload_body_encodes_as_cbor_bstr_not_array() {
+        // Golden-byte pin: MessagePayload.body MUST encode as CBOR bstr
+        // (major type 2) — one header byte plus the raw bytes — NOT as
+        // CBOR array of u8 (major type 4) where each byte > 0x17 takes
+        // two bytes. The body field will dominate ciphertext size in
+        // production; locking the byte-efficient form here means a
+        // future refactor can't silently double on-wire overhead.
+        let m = MessagePayload {
+            body: vec![0xde, 0xad, 0xbe, 0xef],
+            mime_type: "application/octet-stream".into(),
+            sender: OwnerAddr([1; 16]),
+            sent_at: hlc(1),
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&m).unwrap();
+
+        // bstr(4) header is 0x44 (major type 2 << 5 | length 4) followed
+        // by the raw 4 bytes. This sequence MUST appear in the encoded
+        // output.
+        let bstr_form: [u8; 5] = [0x44, 0xde, 0xad, 0xbe, 0xef];
+        assert!(
+            bytes.windows(bstr_form.len()).any(|w| w == bstr_form),
+            "expected CBOR bstr(4) form [0x44, 0xde, 0xad, 0xbe, 0xef] in encoded bytes; got {:02x?}",
+            bytes
+        );
+
+        // array(4) of u8 form: 0x84 (major type 4 << 5 | length 4)
+        // followed by four uint(0x18 N) tagged bytes (since each byte
+        // > 0x17 needs the one-byte-uint header). This sequence MUST
+        // NOT appear — that would mean the deserialize hook was lost
+        // and we regressed to the old, ~2x-overhead encoding.
+        let array_form: [u8; 9] = [0x84, 0x18, 0xde, 0x18, 0xad, 0x18, 0xbe, 0x18, 0xef];
+        assert!(
+            !bytes.windows(array_form.len()).any(|w| w == array_form),
+            "encoded bytes contain forbidden array-of-u8 form for body: {:02x?}",
+            bytes
+        );
+
+        // Round-trip: the decode hook must accept the bstr form and
+        // produce the original Vec<u8>.
+        let recovered: MessagePayload =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(recovered.body, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(recovered, m);
     }
 
     fn sample_invite() -> DmInvite {

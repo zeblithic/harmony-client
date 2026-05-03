@@ -25,7 +25,14 @@ where
 /// Helper: serialize a `Vec<u8>` as CBOR bstr (major type 2). Used by
 /// variable-length opaque-bytes wrapper types like `ReticulumDest` so
 /// they don't accidentally encode as a CBOR array of u8 (major type 4).
-fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
+///
+/// Crate-public so DM wire types (`dm_envelope::MessagePayload.body`)
+/// and future Phase 2/3b modules can reuse the same byte-efficient
+/// encoding without redefining the helper. The bstr form is one CBOR
+/// header byte plus the raw bytes, vs. array-of-u8's two bytes per
+/// byte once values exceed 0x17 — load-bearing for ciphertext-bearing
+/// fields where overhead dominates packet size.
+pub(crate) fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -34,7 +41,11 @@ where
 
 /// Helper: deserialize a CBOR bstr into a `Vec<u8>`. Pair with
 /// `serialize_vec_as_bstr`.
-fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+///
+/// Crate-public alongside its serialize partner so DM wire types
+/// (`dm_envelope::MessagePayload.body`) and future Phase 2/3b modules
+/// can reuse the same bstr decoding contract.
+pub(crate) fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
