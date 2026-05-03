@@ -311,15 +311,84 @@ pub struct OwnerDeviceEntry {
 /// `MAX_DEVICES_PER_OWNER`). This runs at every load — persisted-state files
 /// and remote `OwnerState` snapshots are equally untrusted with respect to
 /// the in-memory invariant.
+///
+/// Streams items via a `Visitor` rather than calling `Vec::deserialize`
+/// to bound peak memory: a peer (or corrupted file) declaring
+/// `array(2^32-1)` of 16-byte hashes would otherwise force a multi-GB
+/// allocation BEFORE any cap could take effect. The visitor:
+///   1. Rejects up-front via `seq.size_hint()` when the deserializer
+///      can tell us a definite-length array exceeds the cap (cheap path).
+///   2. Pre-allocates `min(cap, size_hint)` so a small honest payload
+///      doesn't grow the vec needlessly.
+///   3. Returns `Err` immediately on the (cap+1)-th element, refusing to
+///      consume the rest of the stream.
+///
+/// Reject vs. truncate: `apply_owner_device_update` always emits a vec
+/// already capped at `MAX_DEVICES_PER_OWNER`, so any wire input above
+/// the cap is malformed by definition. Reject is semantically correct
+/// AND surfaces buggy peers that "silently truncate" would mask
+/// (e.g., a peer emitting >cap entries is dropping device entries we
+/// might need for DM delivery — better to fail loudly).
 fn deserialize_device_identities<'de, D>(d: D) -> Result<Vec<DeviceIdentityHash>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let mut devices = Vec::<DeviceIdentityHash>::deserialize(d)?;
-    devices.sort();
-    devices.dedup();
-    devices.truncate(MAX_DEVICES_PER_OWNER);
-    Ok(devices)
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<DeviceIdentityHash>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} DeviceIdentityHash entries",
+                MAX_DEVICES_PER_OWNER
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Cheap upfront rejection if the deserializer can tell us
+            // the length (definite-length CBOR arrays carry it).
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "DeviceIdentityHash array length {} exceeds MAX_DEVICES_PER_OWNER ({})",
+                        n, MAX_DEVICES_PER_OWNER
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_DEVICES_PER_OWNER)
+                .min(MAX_DEVICES_PER_OWNER);
+            let mut out: Vec<DeviceIdentityHash> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<DeviceIdentityHash>()? {
+                if out.len() >= MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "DeviceIdentityHash array exceeds MAX_DEVICES_PER_OWNER ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+                out.push(item);
+            }
+            // Re-establish canonical form (sorted + deduped). Truncate
+            // is now redundant given the cap rejection above but kept as
+            // cheap defense-in-depth against any future cap-edge bug.
+            out.sort();
+            out.dedup();
+            out.truncate(MAX_DEVICES_PER_OWNER);
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
 }
 
 /// Deserialize a `Vec<DmContentKey>` and re-establish the
@@ -332,15 +401,70 @@ where
 /// and produce a different `root_cid` than correctly-converged peers
 /// (silent convergence break — replicas with semantically-equal but
 /// differently-ordered priors disagree on `canonical_cbor_encode` bytes).
+///
+/// Same OOM-safe streaming pattern as `deserialize_device_identities`:
+/// a peer/file declaring `array(2^32-1)` of 32-byte keys would otherwise
+/// force a multi-GB allocation before truncation runs. Reject (rather
+/// than truncate) above the cap — `merge_prior_content_keys` always
+/// produces ≤ cap entries, so anything more on the wire is malformed.
 fn deserialize_prior_content_keys<'de, D>(d: D) -> Result<Vec<DmContentKey>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let mut keys = Vec::<DmContentKey>::deserialize(d)?;
-    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    keys.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
-    keys.truncate(MAX_PRIOR_CONTENT_KEYS);
-    Ok(keys)
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<DmContentKey>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} DmContentKey entries",
+                MAX_PRIOR_CONTENT_KEYS
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_PRIOR_CONTENT_KEYS {
+                    return Err(A::Error::custom(format!(
+                        "DmContentKey array length {} exceeds MAX_PRIOR_CONTENT_KEYS ({})",
+                        n, MAX_PRIOR_CONTENT_KEYS
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_PRIOR_CONTENT_KEYS)
+                .min(MAX_PRIOR_CONTENT_KEYS);
+            let mut out: Vec<DmContentKey> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<DmContentKey>()? {
+                if out.len() >= MAX_PRIOR_CONTENT_KEYS {
+                    return Err(A::Error::custom(format!(
+                        "DmContentKey array exceeds MAX_PRIOR_CONTENT_KEYS ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_PRIOR_CONTENT_KEYS
+                    )));
+                }
+                out.push(item);
+            }
+            // Re-establish canonical form. DmContentKey doesn't impl Ord
+            // directly; sort/dedup by raw bytes (matches the round-7
+            // helper convention).
+            out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            out.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+            out.truncate(MAX_PRIOR_CONTENT_KEYS);
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
 }
 
 impl OwnerDeviceCache {
@@ -1906,27 +2030,60 @@ mod space_tests {
     }
 
     #[test]
-    fn deserialize_normalizes_unsorted_duplicated_oversized_prior_content_keys() {
+    fn deserialize_rejects_oversized_prior_content_keys() {
         use ciborium::{from_reader, into_writer};
-        // Build a Space with all three pathologies in prior_content_keys:
-        //   (a) duplicates    — 5 copies of [0xff; 32]
-        //   (b) unsorted      — 30 distinct keys descending below the dups
-        //   (c) oversized     — total 35 entries > MAX_PRIOR_CONTENT_KEYS (16)
-        // Constructed in-memory bypassing validate_invariants. After a
-        // CBOR encode/decode round-trip, the deserialize_with hook MUST
-        // restore canonical form (strictly-ascending bytes, no duplicates,
-        // length ≤ 16). Without this hook a corrupted on-disk file would
-        // round-trip through save_crdt unchanged and break root_cid
-        // convergence with peers.
-        let mut malformed: Vec<DmContentKey> = Vec::with_capacity(35);
-        for _ in 0..5 {
+        // Build a Space with MAX_PRIOR_CONTENT_KEYS+1 distinct prior keys.
+        // `merge_prior_content_keys` always emits ≤ cap entries, so any
+        // wire input above the cap is malformed by definition. The
+        // streaming visitor MUST reject (rather than silently truncate)
+        // so a buggy peer dropping prior keys we'd need for fallback
+        // decryption surfaces loudly instead of being hidden by a quiet
+        // truncate.
+        let oversized: Vec<DmContentKey> = (0..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
+            .map(|i| DmContentKey::new([i; 32]))
+            .collect();
+        // dm_with_priors uses content_key = [0xff; 32]; oversized uses
+        // bytes 0..=cap which never reaches 0xff, so content_key never
+        // appears in priors.
+        let space = dm_with_priors(oversized);
+
+        let mut bytes = Vec::new();
+        into_writer(&space, &mut bytes).expect("encode space with oversized priors");
+
+        let err = from_reader::<Space, _>(&bytes[..]).expect_err("decode must reject oversized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_PRIOR_CONTENT_KEYS") || msg.contains("DmContentKey"),
+            "expected error mentioning cap/type, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_prior_content_keys() {
+        use ciborium::{from_reader, into_writer};
+        // Build a Space with within-cap pathologies (unsorted +
+        // duplicates) — total entries ≤ MAX_PRIOR_CONTENT_KEYS so the
+        // cap-rejection path doesn't fire. After CBOR round-trip the
+        // deserialize_with hook MUST restore canonical form
+        // (strictly-ascending bytes, no duplicates). Without this hook
+        // a corrupted on-disk file would round-trip through save_crdt
+        // unchanged and break root_cid convergence with peers.
+        //
+        // Layout: 4 copies of [0xee; 32] (dups) + 10 distinct descending
+        // keys = 14 entries total (within the 16-key cap).
+        let mut malformed: Vec<DmContentKey> = Vec::with_capacity(14);
+        for _ in 0..4 {
             malformed.push(DmContentKey::new([0xee; 32]));
         }
-        for i in (0..30u8).rev() {
+        for i in (0..10u8).rev() {
             malformed.push(DmContentKey::new([i; 32]));
         }
-        // dm_with_priors uses content_key = [0xff; 32]; the malformed vec
-        // uses bytes 0..30 plus 0xee, so content_key never appears in priors.
+        assert!(
+            malformed.len() <= MAX_PRIOR_CONTENT_KEYS,
+            "test fixture must stay within cap to isolate the normalize path"
+        );
+        // dm_with_priors uses content_key = [0xff; 32]; malformed uses
+        // bytes 0..10 plus 0xee, so content_key never appears in priors.
         let space = dm_with_priors(malformed);
 
         let mut bytes = Vec::new();
@@ -1934,11 +2091,11 @@ mod space_tests {
 
         let decoded: Space = from_reader(&bytes[..]).expect("decode space");
 
-        // Capped at MAX_PRIOR_CONTENT_KEYS.
+        // After dedup we have 10 distinct + 1 [0xee] = 11 keys.
         assert_eq!(
             decoded.prior_content_keys.len(),
-            MAX_PRIOR_CONTENT_KEYS,
-            "expected truncation to MAX_PRIOR_CONTENT_KEYS"
+            11,
+            "expected 11 unique keys after dedup"
         );
         // Strictly ascending by raw bytes — required for canonical-form
         // convergence and for validate_invariants to accept on next apply.
@@ -1949,8 +2106,7 @@ mod space_tests {
                 .all(|w| w[0].as_bytes() < w[1].as_bytes()),
             "expected strictly-ascending priors after normalization"
         );
-        // Lex-smallest survives truncation: bytes 0..30 sort below 0xee,
-        // so position 0 must be the all-zeros key.
+        // Position 0 is lex-smallest: the [0; 32] key.
         assert_eq!(
             decoded.prior_content_keys[0].as_bytes(),
             &[0u8; 32],
@@ -2065,24 +2221,56 @@ mod owner_device_entry_deserialize_tests {
     }
 
     #[test]
-    fn deserialize_normalizes_unsorted_duplicated_oversized_devices() {
-        // Build a payload with all three pathologies at once:
-        //   (a) duplicates    — [42, 42, 42, ...]
-        //   (b) unsorted      — values descending below a smaller hash
-        //   (c) oversized     — 100 entries > MAX_DEVICES_PER_OWNER (32)
-        // After normalization the result must be sorted, deduped, and capped
-        // at 32 — anything else breaks binary_search in
-        // resolve_link_origin_owner (Phase 3b).
-        let mut malformed: Vec<DeviceIdentityHash> = Vec::with_capacity(100);
-        // 50 identical entries of hash 0xff...
-        for _ in 0..50 {
+    fn deserialize_rejects_oversized_devices() {
+        // A wire input with > MAX_DEVICES_PER_OWNER (32) device hashes
+        // is malformed by definition: `apply_owner_device_update` always
+        // emits ≤ cap entries. The streaming visitor MUST reject (rather
+        // than silently truncate) so a buggy peer dropping device entries
+        // we'd need for DM delivery surfaces loudly. This is also the
+        // OOM-safety property: an attacker declaring `array(2^32-1)` of
+        // 16-byte hashes would otherwise force a multi-GB allocation
+        // before any cap took effect.
+        let oversized: Vec<DeviceIdentityHash> = (0..(MAX_DEVICES_PER_OWNER as u8 + 1))
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        let raw = RawOwnerDeviceEntry {
+            v: oversized,
+            l: hlc(7),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let err = ciborium::from_reader::<OwnerDeviceEntry, _>(&bytes[..])
+            .expect_err("decode must reject oversized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_DEVICES_PER_OWNER") || msg.contains("DeviceIdentityHash"),
+            "expected error mentioning cap/type, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_devices() {
+        // Build a payload with within-cap pathologies (duplicates +
+        // unsorted) — total entries ≤ MAX_DEVICES_PER_OWNER so the
+        // cap-rejection path doesn't fire. After normalization the
+        // result must be sorted and deduped — anything else breaks
+        // binary_search in resolve_link_origin_owner (Phase 3b).
+        //
+        // Layout: 5 copies of [0xff; 16] + 25 distinct descending
+        // hashes = 30 entries total (within the 32-device cap).
+        let mut malformed: Vec<DeviceIdentityHash> = Vec::with_capacity(30);
+        for _ in 0..5 {
             malformed.push(DeviceIdentityHash([0xff; 16]));
         }
-        // Then 50 distinct descending hashes 0..50 (so total length = 100,
-        // and the hashes are NOT in sorted order).
-        for i in (0..50u8).rev() {
+        for i in (0..25u8).rev() {
             malformed.push(DeviceIdentityHash([i; 16]));
         }
+        assert!(
+            malformed.len() <= MAX_DEVICES_PER_OWNER,
+            "test fixture must stay within cap to isolate the normalize path"
+        );
 
         let raw = RawOwnerDeviceEntry {
             v: malformed,
@@ -2094,15 +2282,15 @@ mod owner_device_entry_deserialize_tests {
 
         let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
 
-        // Capped at MAX_DEVICES_PER_OWNER.
-        assert_eq!(entry.devices.len(), MAX_DEVICES_PER_OWNER);
+        // After dedup: 25 distinct (0..25) + 1 [0xff; 16] = 26 hashes.
+        assert_eq!(entry.devices.len(), 26);
         // Sorted ascending — required for binary_search.
         assert!(entry.devices.windows(2).all(|w| w[0] <= w[1]));
         // Deduped — no consecutive equal entries (and given sorted, no dups
         // anywhere).
         assert!(entry.devices.windows(2).all(|w| w[0] != w[1]));
-        // Lex-smallest survives truncation: the smallest hashes are
-        // [0; 16], [1; 16], ..., so position 0 must be [0; 16].
+        // Lex-smallest survives normalization: the smallest hash is
+        // [0; 16], so position 0 must be [0; 16].
         assert_eq!(entry.devices[0], DeviceIdentityHash([0; 16]));
         // learned_at preserved from the wire.
         assert_eq!(entry.learned_at, hlc(7));
