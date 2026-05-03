@@ -141,7 +141,7 @@ pub fn compute_aad(space: &Space) -> Result<Vec<u8>, AadComputeError> {
 mod tests {
     use super::*;
     use crate::dm_envelope::MessagePayload;
-    use crate::owner_state_types::{DmContentKey, Hlc, OwnerAddr, SpaceId, SpaceKind};
+    use crate::owner_state_types::{DedupeKey, DmContentKey, Hlc, OwnerAddr, SpaceId, SpaceKind};
 
     fn payload(sender: OwnerAddr) -> MessagePayload {
         MessagePayload {
@@ -266,5 +266,143 @@ mod tests {
         s2.content_key = Some(DmContentKey::new([0xbb; 32])); // different key
                                                               // Same members → same dedupe_key → same AAD.
         assert_eq!(compute_aad(&s1).unwrap(), compute_aad(&s2).unwrap());
+    }
+
+    // ── DedupeKey CBOR golden-byte tests ──────────────────────────────────────
+    //
+    // DedupeKey is the AAD seed for every encrypted DM message: compute_aad()
+    // calls `canonical_cbor_encode(&space.dedupe_key())`. If a serde rename or
+    // variant-code change alters the encoded bytes, the AEAD tag will no longer
+    // verify for any existing ciphertext — every live DM becomes undecryptable.
+    //
+    // Adjacent-tagging layout (`#[serde(tag = "tg", content = "vl")]`):
+    //   map(2) { "tg": <variant-code>, "vl": <content> }
+    //
+    // CBOR integer reference used below:
+    //   0xa2 = map(2)    0x62 = text(2)    0x61 = text(1)
+    //   0x82 = array(2)  0x50 = bstr(16)   0xf6 = null
+
+    #[test]
+    fn dedupe_key_sorted_members_cbor_golden_bytes() {
+        // DedupeKey::SortedMembers is the load-bearing variant — it is what
+        // compute_aad produces for every DM Space. Lock in its wire bytes so
+        // any future serde rename is caught immediately.
+        let key = DedupeKey::SortedMembers(vec![OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16])]);
+        let encoded = canonical_cbor_encode(&key).unwrap();
+
+        // Wire layout:
+        //   map(2)             0xa2
+        //   text(2) "tg"       0x62 't' 'g'
+        //   text(1) "s"        0x61 's'         ← variant rename = "s"
+        //   text(2) "vl"       0x62 'v' 'l'
+        //   array(2)           0x82
+        //   bstr(16) [0x01;16] 0x50 || 16 × 0x01
+        //   bstr(16) [0x02;16] 0x50 || 16 × 0x02
+        //
+        // Total: 1 + 3 + 2 + 3 + 1 + 17 + 17 = 44 bytes
+        let mut expected: Vec<u8> = vec![
+            0xa2, // map(2)
+            0x62, b't', b'g', // "tg"
+            0x61, b's', // "s"  — SortedMembers variant code
+            0x62, b'v', b'l', // "vl"
+            0x82, // array(2)
+            0x50, // bstr(16)
+        ];
+        expected.extend([0x01u8; 16]);
+        expected.push(0x50); // bstr(16)
+        expected.extend([0x02u8; 16]);
+
+        assert_eq!(
+            encoded, expected,
+            "DedupeKey::SortedMembers CBOR wire format MUST NOT change — it is the AAD \
+             on every encrypted DM message. If this assertion fails, you have broken AAD \
+             stability; every existing live DM will become undecryptable under the new AAD.",
+        );
+    }
+
+    #[test]
+    fn dedupe_key_none_cbor_golden_bytes() {
+        // DedupeKey::None is assigned to Folder Spaces (which never dedupe).
+        // Lock in the unit-variant encoding so adjacent-tagging `vl: null`
+        // stays pinned.
+        let key = DedupeKey::None;
+        let encoded = canonical_cbor_encode(&key).unwrap();
+
+        // Serde adjacent tagging for a unit variant omits the "vl" (content)
+        // key entirely — it only emits the tag field.
+        //
+        // Wire layout:
+        //   map(1)       0xa1
+        //   text(2) "tg" 0x62 't' 'g'
+        //   text(1) "n"  0x61 'n'   ← variant rename = "n"
+        //
+        // Total: 1 + 3 + 2 = 6 bytes
+        let expected: Vec<u8> = vec![
+            0xa1, // map(1)  — no "vl" key for unit variant
+            0x62, b't', b'g', // "tg"
+            0x61, b'n', // "n"  — None variant code
+        ];
+
+        assert_eq!(
+            encoded, expected,
+            "DedupeKey::None CBOR wire format pinned — variant code must stay \"n\"",
+        );
+    }
+
+    #[test]
+    fn dedupe_key_id_cbor_golden_bytes() {
+        // DedupeKey::Id is assigned to Community/Channel/Group-DM Spaces.
+        let key = DedupeKey::Id(SpaceId([0xab; 16]));
+        let encoded = canonical_cbor_encode(&key).unwrap();
+
+        // Wire layout:
+        //   map(2)             0xa2
+        //   text(2) "tg"       0x62 't' 'g'
+        //   text(1) "i"        0x61 'i'   ← variant rename = "i"
+        //   text(2) "vl"       0x62 'v' 'l'
+        //   bstr(16) [0xab;16] 0x50 || 16 × 0xab
+        //
+        // Total: 1 + 3 + 2 + 3 + 17 = 26 bytes
+        let mut expected: Vec<u8> = vec![
+            0xa2, // map(2)
+            0x62, b't', b'g', // "tg"
+            0x61, b'i', // "i"  — Id variant code
+            0x62, b'v', b'l', // "vl"
+            0x50, // bstr(16)
+        ];
+        expected.extend([0xabu8; 16]);
+
+        assert_eq!(
+            encoded, expected,
+            "DedupeKey::Id CBOR wire format pinned — variant code must stay \"i\"",
+        );
+    }
+
+    #[test]
+    fn dedupe_key_topic_cbor_golden_bytes() {
+        // DedupeKey::Topic is assigned to public-channel Spaces (Zenoh topic).
+        let key = DedupeKey::Topic("dm:test".to_string());
+        let encoded = canonical_cbor_encode(&key).unwrap();
+
+        // Wire layout:
+        //   map(2)             0xa2
+        //   text(2) "tg"       0x62 't' 'g'
+        //   text(1) "t"        0x61 't'   ← variant rename = "t"
+        //   text(2) "vl"       0x62 'v' 'l'
+        //   text(7) "dm:test"  0x67 'd' 'm' ':' 't' 'e' 's' 't'
+        //
+        // Total: 1 + 3 + 2 + 3 + 8 = 17 bytes
+        let expected: Vec<u8> = vec![
+            0xa2, // map(2)
+            0x62, b't', b'g', // "tg"
+            0x61, b't', // "t"  — Topic variant code
+            0x62, b'v', b'l', // "vl"
+            0x67, b'd', b'm', b':', b't', b'e', b's', b't', // text(7) "dm:test"
+        ];
+
+        assert_eq!(
+            encoded, expected,
+            "DedupeKey::Topic CBOR wire format pinned — variant code must stay \"t\"",
+        );
     }
 }
