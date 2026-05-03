@@ -485,6 +485,15 @@ impl OwnerState {
 /// Order-independent (CRDT-convergent) under multi-merge — see ZEB-219
 /// §"Why first N of sorted" for the proof and the 5-Space convergence
 /// regression test in this module.
+///
+/// SECURITY NOTE: truncation keeps lex-smallest entries. An attacker
+/// who can publish a Space (winning the LWW gate) with a chosen
+/// content_key could grind low-byte keys to displace legitimate prior
+/// keys from the cap, making earlier messages encrypted under those
+/// keys silently undecryptable. Acceptable in Phase 1 since the LWW
+/// gate (HLC + ULID) limits attack feasibility. Same class as the
+/// OwnerDeviceCache lex-grinding concern documented on
+/// OwnerDeviceEntry.devices and ZEB-219's prior_content_keys discussion.
 pub(crate) fn merge_prior_content_keys(
     winner_current: &DmContentKey,
     winner_prior: &[DmContentKey],
@@ -1942,8 +1951,10 @@ mod owner_device_cache_tests {
         devices: Vec<DeviceIdentityHash>,
         learned_at: Hlc,
     ) -> ApplyOutcome {
-        let mut state = OwnerState::default();
-        state.owner_device_cache = std::mem::take(cache);
+        let mut state = OwnerState {
+            owner_device_cache: std::mem::take(cache),
+            ..Default::default()
+        };
         let outcome = state.apply_owner_device_update(addr, devices, learned_at);
         *cache = state.owner_device_cache;
         outcome
@@ -2092,7 +2103,7 @@ mod merge_prior_content_keys_tests {
         let winner_prior = vec![];
         let loser_current = key(0xfe);
         // Loser's prior has way more than MAX_PRIOR_CONTENT_KEYS entries.
-        let loser_prior: Vec<DmContentKey> = (0u8..30).map(|i| key(i)).collect();
+        let loser_prior: Vec<DmContentKey> = (0u8..30).map(key).collect();
         let merged =
             merge_prior_content_keys(&winner_current, &winner_prior, &loser_current, &loser_prior);
         // Cap is 16. Smallest 16 of {0..29, loser_current=0xfe, winner_prior empty}
@@ -2107,5 +2118,127 @@ mod merge_prior_content_keys_tests {
         for (i, k) in merged.iter().enumerate() {
             assert_eq!(k.as_bytes(), &[i as u8; 32]);
         }
+    }
+}
+
+#[cfg(test)]
+mod dm_crypto_integration_tests {
+    use super::*;
+    use crate::dm_crypto::{compute_aad, decrypt_dm_message, encrypt_dm_message};
+    use crate::dm_envelope::MessagePayload;
+    use crate::owner_state_types::{
+        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    fn dm_at(id_byte: u8, ck: DmContentKey) -> Space {
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc.clone(),
+            updated_at: hlc,
+            content_key: Some(ck),
+            prior_content_keys: vec![],
+        }
+    }
+
+    /// Full-chain invariant test: encrypt under pre-collapse keys, apply cross-SpaceId
+    /// dedupe collapse, then verify decrypt still works under the merged Space's key
+    /// set, and that AAD is stable throughout.
+    ///
+    /// Exercises four invariants:
+    ///   1. AAD is identical before the merge (same dedupe_key, different SpaceId).
+    ///   2. AAD is identical after the dedupe collapse.
+    ///   3. blob_a (encrypted under winner's key) decrypts under merged content_key.
+    ///   4. blob_b (encrypted under loser's key) decrypts via merged prior_content_keys.
+    #[test]
+    fn encrypt_then_dedupe_collapse_then_decrypt_with_merged_keys() {
+        let key_a = DmContentKey::new([0x10; 32]); // 0x10 < 0x20 → winner content_key
+        let key_b = DmContentKey::new([0x20; 32]);
+        let space_a = dm_at(0x01, key_a.clone()); // smaller SpaceId byte → ULID winner
+        let space_b = dm_at(0x02, key_b.clone()); // larger SpaceId byte → ULID loser
+
+        let payload_a = MessagePayload {
+            body: b"hello from A".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: OwnerAddr([1; 16]),
+            sent_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let payload_b = MessagePayload {
+            body: b"hello from B".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: OwnerAddr([2; 16]),
+            sent_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+
+        // Each device computes its own AAD (from its own Space) and encrypts.
+        let aad_a = compute_aad(&space_a).unwrap();
+        let aad_b = compute_aad(&space_b).unwrap();
+
+        // INVARIANT 1: AAD is identical before merge (same dedupe_key, different SpaceId).
+        assert_eq!(
+            aad_a, aad_b,
+            "AAD must be stable across SpaceIds with the same dedupe_key"
+        );
+
+        let blob_a = encrypt_dm_message(&key_a, &aad_a, &payload_a).unwrap();
+        let blob_b = encrypt_dm_message(&key_b, &aad_b, &payload_b).unwrap();
+
+        // Cross-SpaceId dedupe collapse: space_a wins (smaller ULID / id_byte).
+        let mut state = OwnerState::default();
+        state.apply_space_with_canonicalization(space_a.clone());
+        state.apply_space_with_canonicalization(space_b.clone());
+
+        let merged = state
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("Space A wins (smaller id)");
+
+        // INVARIANT 2: AAD is identical AFTER the dedupe collapse.
+        let aad_merged = compute_aad(merged).unwrap();
+        assert_eq!(
+            aad_merged, aad_a,
+            "AAD must be stable across the dedupe collapse"
+        );
+
+        let merged_ck = merged
+            .content_key
+            .as_ref()
+            .expect("merged Space has content_key");
+        let merged_prior = &merged.prior_content_keys;
+
+        // INVARIANT 3: blob_a decrypts using merged Space's content_key
+        // (Space A was the winner — key_a is the current content_key after merge).
+        let recovered_a = decrypt_dm_message(merged_ck, merged_prior, &aad_merged, &blob_a)
+            .expect("blob_a must decrypt under the merged Space's content_key (winner side)");
+        assert_eq!(recovered_a, payload_a);
+
+        // INVARIANT 4: blob_b ALSO decrypts using merged Space's prior_content_keys
+        // (Space B was the loser — key_b migrated into prior_content_keys).
+        let recovered_b = decrypt_dm_message(merged_ck, merged_prior, &aad_merged, &blob_b)
+            .expect("blob_b must decrypt under the merged Space's prior_content_keys (loser side)");
+        assert_eq!(recovered_b, payload_b);
     }
 }

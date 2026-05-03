@@ -678,7 +678,7 @@ mod enum_tests {
 /// The unified Space CRDT entry — see ZEB-206 spec §"Space — unified
 /// entry in owner-state CRDT".
 ///
-/// Wire-format note: every field is renamed to a 2-char code so all 12
+/// Wire-format note: every field is renamed to a 2-char code so all 14
 /// keys at this nesting level have identical encoded length (CBOR
 /// text(2) = 3 bytes per key). Mixing 1-char and 2-char renames here
 /// would re-introduce the same-length-keys violation Hlc had before

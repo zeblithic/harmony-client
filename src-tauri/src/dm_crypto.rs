@@ -9,7 +9,7 @@ use chacha20poly1305::{
 };
 
 use crate::dm_envelope::MessagePayload;
-use crate::owner_state_crypto::canonical_cbor_encode;
+use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use crate::owner_state_types::{DmContentKey, OwnerAddr, Space};
 
 /// Storage-blob layout per ZEB-219 §"Wire format":
@@ -110,7 +110,7 @@ pub fn decrypt_dm_message(
                 aad,
             },
         ) {
-            return ciborium::from_reader(&plaintext[..])
+            return canonical_cbor_decode::<MessagePayload>(&plaintext)
                 .map_err(|e| DmDecryptError::PayloadDecode(e.to_string()));
         }
     }
