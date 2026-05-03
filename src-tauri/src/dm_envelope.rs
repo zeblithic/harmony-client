@@ -12,6 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{
     ContentId, DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, SpaceId, SpaceKind,
+    MAX_DEVICES_PER_OWNER,
 };
 
 /// Plaintext envelope encrypted into the CAS storage_blob. Bound by AAD
@@ -119,6 +120,10 @@ pub enum DecodeError {
     UnknownDiscriminant(u8),
     #[error("CBOR decode failed: {0}")]
     Cbor(String),
+    #[error("trailing bytes after CBOR body: consumed {consumed} of {total}")]
+    TrailingBytes { consumed: u64, total: u64 },
+    #[error("payload invariant violated: {0}")]
+    Invalid(&'static str),
 }
 
 pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
@@ -135,12 +140,44 @@ pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
 
 pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
     let (disc, body) = bytes.split_first().ok_or(DecodeError::Empty)?;
-    match disc {
-        0x01 => Ok(DmPacket::Invite(decode_body(body)?)),
-        0x02 => Ok(DmPacket::CidNotify(decode_body(body)?)),
-        0x03 => Ok(DmPacket::Ack(decode_body(body)?)),
-        other => Err(DecodeError::UnknownDiscriminant(*other)),
-    }
+    let packet = match disc {
+        0x01 => {
+            let invite: DmInvite = decode_body(body)?;
+            // Phase 1 invariant: invites only flow over the DM transport
+            // (Reticulum-unicast Dm/GroupDm). A non-DM kind on the wire is
+            // either a malicious cross-protocol confusion attempt or a
+            // sender bug; reject at the boundary, not in downstream code.
+            if !matches!(invite.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+                return Err(DecodeError::Invalid("DmInvite.kind must be Dm or GroupDm"));
+            }
+            if invite.sender_devices.len() > MAX_DEVICES_PER_OWNER {
+                return Err(DecodeError::Invalid(
+                    "DmInvite.sender_devices exceeds MAX_DEVICES_PER_OWNER",
+                ));
+            }
+            DmPacket::Invite(invite)
+        }
+        0x02 => {
+            let pkt: DmCidNotify = decode_body(body)?;
+            if pkt.sender_devices.len() > MAX_DEVICES_PER_OWNER {
+                return Err(DecodeError::Invalid(
+                    "DmCidNotify.sender_devices exceeds MAX_DEVICES_PER_OWNER",
+                ));
+            }
+            DmPacket::CidNotify(pkt)
+        }
+        0x03 => {
+            let pkt: DmAck = decode_body(body)?;
+            if pkt.ack_from_devices.len() > MAX_DEVICES_PER_OWNER {
+                return Err(DecodeError::Invalid(
+                    "DmAck.ack_from_devices exceeds MAX_DEVICES_PER_OWNER",
+                ));
+            }
+            DmPacket::Ack(pkt)
+        }
+        other => return Err(DecodeError::UnknownDiscriminant(*other)),
+    };
+    Ok(packet)
 }
 
 // Plain ciborium (not canonical_cbor_encode): Reticulum packets are not
@@ -152,8 +189,23 @@ fn encode_body<T: Serialize>(value: &T) -> Result<Vec<u8>, EncodeError> {
     Ok(out)
 }
 
+/// Decode a CBOR body, rejecting any trailing bytes after the first valid
+/// value. Mirrors `canonical_cbor_decode` in owner_state_crypto: without
+/// this check an attacker can append arbitrary bytes to a valid packet
+/// body, defeating any downstream code that fingerprints the encoded form
+/// and weakening wire-format malleability resistance.
 fn decode_body<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
-    ciborium::from_reader(bytes).map_err(|e| DecodeError::Cbor(e.to_string()))
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: T =
+        ciborium::from_reader(&mut cursor).map_err(|e| DecodeError::Cbor(e.to_string()))?;
+    let consumed = cursor.position();
+    if consumed as usize != bytes.len() {
+        return Err(DecodeError::TrailingBytes {
+            consumed,
+            total: bytes.len() as u64,
+        });
+    }
+    Ok(value)
 }
 
 // CanonicalPayload registrations.
@@ -269,5 +321,92 @@ mod tests {
     fn dm_packet_empty_bytes_rejects() {
         let err = decode_packet(&[]).unwrap_err();
         assert!(matches!(err, DecodeError::Empty));
+    }
+
+    #[test]
+    fn dm_packet_trailing_bytes_after_body_reject() {
+        // Encode a valid invite, then append one extra byte to the body
+        // portion (after the discriminant). decode_body must reject —
+        // matches canonical_cbor_decode and avoids wire-format malleability.
+        let p = DmPacket::Invite(sample_invite());
+        let mut encoded = encode_packet(&p).unwrap();
+        encoded.push(0x00);
+        let err = decode_packet(&encoded).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::TrailingBytes { .. }),
+            "expected TrailingBytes, got {:?}",
+            err
+        );
+
+        // Sanity: without the trailing byte, the same packet decodes fine.
+        let clean = encode_packet(&p).unwrap();
+        let decoded = decode_packet(&clean).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn dm_packet_invite_non_dm_kind_rejected() {
+        // A peer sending an invite with kind=PublicChannel is either
+        // malicious (cross-protocol confusion) or buggy. Reject at the
+        // wire boundary instead of letting consumers see a mis-typed
+        // Space proposal.
+        let mut invite = sample_invite();
+        invite.kind = SpaceKind::PublicChannel;
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        match err {
+            DecodeError::Invalid(msg) => {
+                assert!(
+                    msg.contains("kind") && msg.contains("DmInvite"),
+                    "expected message mentioning DmInvite.kind, got: {msg}"
+                );
+            }
+            other => panic!("expected DecodeError::Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dm_packet_invite_oversized_sender_devices_rejected() {
+        let mut invite = sample_invite();
+        invite.sender_devices = (0..(MAX_DEVICES_PER_OWNER as u8 + 1))
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        let bytes = encode_packet(&DmPacket::Invite(invite)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("sender_devices")),
+            "expected DecodeError::Invalid with sender_devices, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_cidnotify_oversized_sender_devices_rejected() {
+        let mut pkt = sample_cidnotify();
+        pkt.sender_devices = (0..(MAX_DEVICES_PER_OWNER as u8 + 1))
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        let bytes = encode_packet(&DmPacket::CidNotify(pkt)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("sender_devices")),
+            "expected DecodeError::Invalid with sender_devices, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn dm_packet_ack_oversized_ack_from_devices_rejected() {
+        let mut pkt = sample_ack();
+        pkt.ack_from_devices = (0..(MAX_DEVICES_PER_OWNER as u8 + 1))
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        let bytes = encode_packet(&DmPacket::Ack(pkt)).unwrap();
+        let err = decode_packet(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Invalid(msg) if msg.contains("ack_from_devices")),
+            "expected DecodeError::Invalid with ack_from_devices, got {:?}",
+            err
+        );
     }
 }
