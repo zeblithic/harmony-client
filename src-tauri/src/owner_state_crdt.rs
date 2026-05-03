@@ -6,9 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, DeviceIdentityHash, Hlc, InboxEntry, InboxKey, OutboxEntry,
-    OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space, SpaceId,
-    MAX_DEVICES_PER_OWNER,
+    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
+    OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space,
+    SpaceId, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -470,6 +470,40 @@ impl OwnerState {
     }
 }
 
+/// Merge two sides' content keys per ZEB-216 §"Dedupe-merge cap rule":
+///   1. Take winner.prior, plus loser.current as a one-element addition,
+///      plus loser.prior.
+///   2. Filter out winner.current (the active key MUST NOT appear in prior
+///      per validate_invariants).
+///   3. Sort ascending lex by raw key bytes.
+///   4. Dedup (set-semantics on byte equality).
+///   5. Truncate to MAX_PRIOR_CONTENT_KEYS.
+///
+/// For same-SpaceId LWW merges, pass `loser_current == winner_current` —
+/// the duplicate gets filtered in step 2 so the operation is the same.
+///
+/// Order-independent (CRDT-convergent) under multi-merge — see ZEB-219
+/// §"Why first N of sorted" for the proof and the 5-Space convergence
+/// regression test in this module.
+pub(crate) fn merge_prior_content_keys(
+    winner_current: &DmContentKey,
+    winner_prior: &[DmContentKey],
+    loser_current: &DmContentKey,
+    loser_prior: &[DmContentKey],
+) -> Vec<DmContentKey> {
+    let mut all: Vec<DmContentKey> = winner_prior
+        .iter()
+        .cloned()
+        .chain(std::iter::once(loser_current.clone()))
+        .chain(loser_prior.iter().cloned())
+        .filter(|k| k.as_bytes() != winner_current.as_bytes())
+        .collect();
+    all.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    all.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    all.truncate(MAX_PRIOR_CONTENT_KEYS);
+    all
+}
+
 /// Merge two Space values using last-writer-wins per-field on
 /// `updated_at` HLC. `created_at` always takes the earlier HLC.
 /// Caller is responsible for setting the merged Space's `id` correctly
@@ -481,12 +515,57 @@ impl OwnerState {
 /// HLC's logical+device_id components mean exact-equality is rare in
 /// practice (two devices would need identical wall_ms AND identical
 /// logical AND identical device_id, which collapses to "the same write").
+///
+/// content_key/prior_content_keys: for DM spaces, applies the
+/// ZEB-216 §"Dedupe-merge cap rule" via `merge_prior_content_keys`.
+/// The winner for content_key purposes is the Space with the lex-smaller
+/// `id` ULID (stable across same-SpaceId and cross-SpaceId merges).
+/// For same-SpaceId merges, both sides have the same id so the winner
+/// pick is moot; v1 has no key rotation so content_key is identical on
+/// both sides anyway.
 fn lww_merge_space(a: &Space, b: &Space) -> Space {
     let newer = if b.updated_at.is_strictly_newer_than(&a.updated_at) {
         b
     } else {
         a
     };
+
+    // content_key/prior_content_keys: apply cap-rule merge for DM spaces.
+    // For same-SpaceId merges a.id == b.id so winner_is_a is arbitrary
+    // (content_key is identical in v1). For cross-SpaceId dedupe collapse,
+    // the lex-smaller ULID is the canonical winner.
+    let (content_key, prior_content_keys) = match (&a.content_key, &b.content_key) {
+        (Some(a_ck), Some(b_ck)) => {
+            // Determine winner by ULID lex order (smaller = winner).
+            let (winner_ck, winner_prior, loser_ck, loser_prior) = if a.id <= b.id {
+                (
+                    a_ck,
+                    &a.prior_content_keys[..],
+                    b_ck,
+                    &b.prior_content_keys[..],
+                )
+            } else {
+                (
+                    b_ck,
+                    &b.prior_content_keys[..],
+                    a_ck,
+                    &a.prior_content_keys[..],
+                )
+            };
+            let merged_prior =
+                merge_prior_content_keys(winner_ck, winner_prior, loser_ck, loser_prior);
+            (Some(winner_ck.clone()), merged_prior)
+        }
+        // Non-DM kinds have no content_key; keep as-is.
+        (None, None) => (None, vec![]),
+        // Mixed Some/None across the same dedupe_key is an invariant
+        // violation. validate_invariants runs before any merge, so this
+        // branch is only reachable if the caller bypassed it. Defensive:
+        // prefer whichever side has Some, carry no prior.
+        (Some(ck), None) => (Some(ck.clone()), vec![]),
+        (None, Some(ck)) => (Some(ck.clone()), vec![]),
+    };
+
     Space {
         id: newer.id,
         kind: newer.kind, // kind shouldn't change in practice; LWW for safety
@@ -506,10 +585,8 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
             a.created_at.clone()
         },
         updated_at: newer.updated_at.clone(),
-        // content_key and prior_content_keys: straight LWW — winner provides both.
-        // The actual cap-rule merge for prior_content_keys lands in Task 7.
-        content_key: newer.content_key.clone(),
-        prior_content_keys: newer.prior_content_keys.clone(),
+        content_key,
+        prior_content_keys,
     }
 }
 
@@ -618,43 +695,84 @@ mod apply_space_tests {
         );
     }
 
+    /// Same-SpaceId LWW merge: v1 has no key rotation so both sides have the
+    /// same content_key. The cap-rule merge on prior_content_keys must union
+    /// both sides' priors, dedup, sort, and cap. Winner content_key is
+    /// preserved unchanged.
     #[test]
-    fn lww_merge_content_key_from_newer_wins() {
+    fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
 
-        fn dm_at(content_key_byte: u8, hlc_ms: u64) -> Space {
-            Space {
-                id: SpaceId([1; 16]),
-                kind: SpaceKind::Dm,
-                parent: None,
-                community_id: None,
-                name: "x".into(),
-                transport: Some(TransportBinding::Reticulum {
-                    participants: vec![],
-                }),
-                members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-                custom_name: None,
-                notification_pref: None,
-                left_at: None,
-                created_at: hlc(1),
-                updated_at: hlc(hlc_ms),
-                content_key: Some(DmContentKey::new([content_key_byte; 32])),
-                prior_content_keys: vec![],
-            }
-        }
+        let shared_key = DmContentKey::new([0xaa; 32]);
 
-        let older = dm_at(0xaa, 1);
-        let newer = dm_at(0xbb, 2);
-        let merged_a = lww_merge_space(&older, &newer);
-        let merged_b = lww_merge_space(&newer, &older);
+        let a = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(shared_key.clone()),
+            prior_content_keys: vec![DmContentKey::new([0x10; 32])],
+        };
+        let b = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(2),
+            content_key: Some(shared_key.clone()),
+            prior_content_keys: vec![DmContentKey::new([0x20; 32])],
+        };
+
+        // Order-independent: both call orderings yield the same merged prior.
+        let merged_ab = lww_merge_space(&a, &b);
+        let merged_ba = lww_merge_space(&b, &a);
+
+        // content_key is unchanged.
         assert_eq!(
-            merged_a.content_key.as_ref().unwrap().as_bytes(),
-            &[0xbb; 32]
+            merged_ab.content_key.as_ref().unwrap().as_bytes(),
+            &[0xaa; 32]
         );
         assert_eq!(
-            merged_b.content_key.as_ref().unwrap().as_bytes(),
-            &[0xbb; 32]
+            merged_ba.content_key.as_ref().unwrap().as_bytes(),
+            &[0xaa; 32]
         );
+
+        // prior_content_keys is the union of both sides, sorted ascending,
+        // with winner_current (0xaa) filtered out. Result: [0x10, 0x20].
+        let ab_prior: Vec<[u8; 32]> = merged_ab
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        let ba_prior: Vec<[u8; 32]> = merged_ba
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        assert_eq!(
+            ab_prior, ba_prior,
+            "same-SpaceId merge must be order-independent"
+        );
+        assert_eq!(ab_prior, vec![[0x10; 32], [0x20; 32]]);
     }
 
     #[test]
@@ -1820,5 +1938,164 @@ mod owner_device_cache_tests {
         let outcome = state.apply_owner_device_update(addr, devices, learned_at);
         *cache = state.owner_device_cache;
         outcome
+    }
+}
+
+#[cfg(test)]
+mod merge_prior_content_keys_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    fn key(byte: u8) -> DmContentKey {
+        DmContentKey::new([byte; 32])
+    }
+
+    fn dm_space(id_byte: u8, content_key: DmContentKey, hlc_ms: u64) -> Space {
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(content_key),
+            prior_content_keys: vec![],
+        }
+    }
+
+    /// 5-Space convergence test from ZEB-219 §"Why first N of sorted":
+    /// K₃<K₂<K₄<K₅<K₁ lex, two distinct merge orders → both yield
+    /// the same prior_content_keys Vec (sorted ascending). With cap=16
+    /// (production), all 4 losers fit, so result is [K₃, K₂, K₄, K₅].
+    #[test]
+    fn dedupe_merge_prior_content_keys_5_space_convergence() {
+        // Choose first bytes that give us the desired lex ordering:
+        // K3 = [0x10..], K2 = [0x20..], K4 = [0x30..], K5 = [0x40..], K1 = [0x50..]
+        // So K3 < K2 < K4 < K5 < K1 lex.
+        let k1 = key(0x50);
+        let k2 = key(0x20);
+        let k3 = key(0x10);
+        let k4 = key(0x30);
+        let k5 = key(0x40);
+
+        // Each of S1..S5 has a different ULID byte (so they're distinct
+        // by id) but all share the same dedupe_key (sorted members).
+        // S1 has the smallest id_byte so it'll be the dedupe winner.
+        let s1 = dm_space(0x01, k1.clone(), 5);
+        let s2 = dm_space(0x02, k2.clone(), 1);
+        let s3 = dm_space(0x03, k3.clone(), 2);
+        let s4 = dm_space(0x04, k4.clone(), 3);
+        let s5 = dm_space(0x05, k5.clone(), 4);
+
+        // Apply order P: [S2, S3, S4, S5, S1]
+        let mut state_p = OwnerState::default();
+        for s in [s2.clone(), s3.clone(), s4.clone(), s5.clone(), s1.clone()] {
+            state_p.apply_space_with_canonicalization(s);
+        }
+
+        // Apply order Q: [S5, S4, S3, S2, S1]
+        let mut state_q = OwnerState::default();
+        for s in [s5.clone(), s4.clone(), s3.clone(), s2.clone(), s1.clone()] {
+            state_q.apply_space_with_canonicalization(s);
+        }
+
+        // Convergence assertion: both orders yield byte-identical
+        // prior_content_keys on the surviving (S1) Space.
+        let p_winner = state_p
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("S1 survives");
+        let q_winner = state_q
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("S1 survives");
+
+        let p_prior: Vec<[u8; 32]> = p_winner
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        let q_prior: Vec<[u8; 32]> = q_winner
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+
+        assert_eq!(
+            p_prior, q_prior,
+            "convergence: orders P and Q must yield identical prior_content_keys"
+        );
+
+        // Identity-of-content assertion: cap=MAX_PRIOR_CONTENT_KEYS=16 for
+        // production, but with 5 keys total all four losers fit. The loser
+        // current_keys are k2..k5; winner current is k1, which MUST NOT
+        // appear in prior. Sorted ascending: [k3, k2, k4, k5].
+        assert_eq!(p_prior.len(), 4);
+        assert_eq!(p_prior[0], *k3.as_bytes());
+        assert_eq!(p_prior[1], *k2.as_bytes());
+        assert_eq!(p_prior[2], *k4.as_bytes());
+        assert_eq!(p_prior[3], *k5.as_bytes());
+
+        // Winner's content_key is unchanged (S1's k1).
+        assert_eq!(
+            p_winner.content_key.as_ref().unwrap().as_bytes(),
+            k1.as_bytes()
+        );
+    }
+
+    #[test]
+    fn merge_prior_content_keys_filters_winner_current() {
+        let winner_current = key(0x10);
+        let loser_current = key(0x20);
+        // Winner's prior includes a duplicate of winner_current — must
+        // be filtered out.
+        let winner_prior = vec![winner_current.clone(), key(0x30)];
+        let loser_prior = vec![key(0x40)];
+        let merged =
+            merge_prior_content_keys(&winner_current, &winner_prior, &loser_current, &loser_prior);
+        let merged_bytes: Vec<[u8; 32]> = merged.iter().map(|k| *k.as_bytes()).collect();
+        // Sorted ascending: 0x20, 0x30, 0x40 (no 0x10).
+        assert_eq!(merged_bytes, vec![[0x20; 32], [0x30; 32], [0x40; 32]]);
+    }
+
+    #[test]
+    fn merge_prior_content_keys_caps_at_max() {
+        let winner_current = key(0xff);
+        let winner_prior = vec![];
+        let loser_current = key(0xfe);
+        // Loser's prior has way more than MAX_PRIOR_CONTENT_KEYS entries.
+        let loser_prior: Vec<DmContentKey> = (0u8..30).map(|i| key(i)).collect();
+        let merged =
+            merge_prior_content_keys(&winner_current, &winner_prior, &loser_current, &loser_prior);
+        // Cap is 16. Smallest 16 of {0..29, loser_current=0xfe, winner_prior empty}
+        // after sort = [0..15] (loser_current and keys 16..29 don't make the cut).
+        // Note: keys are filtered to remove winner_current (0xff), but 0xff isn't
+        // in the input set anyway, so all 30+1=31 inputs are eligible.
+        // Sorted: [0,1,2,...,29, 0xfe]. Truncated to 16: [0..15].
+        assert_eq!(
+            merged.len(),
+            crate::owner_state_types::MAX_PRIOR_CONTENT_KEYS
+        );
+        for (i, k) in merged.iter().enumerate() {
+            assert_eq!(k.as_bytes(), &[i as u8; 32]);
+        }
     }
 }
