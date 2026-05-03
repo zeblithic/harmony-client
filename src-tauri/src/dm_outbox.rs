@@ -15,9 +15,15 @@
 //!   - Add `handle_unicast` for inbound `DmInvite`/`DmCidNotify`/`DmAck`
 //!     demux (which routes `DmAck` packets through `handle_ack`).
 
-use crate::owner_state_types::{OutboxEntry, OutboxEntryId, OwnerAddr};
+use crate::content_store::{ContentStore, ContentStoreError};
+use crate::dm_crypto::{compute_aad, encrypt_dm_message, DmEncryptError};
+use crate::dm_envelope::MessagePayload;
+use crate::owner_state_crdt::{ApplyOutcome, OwnerState, RejectionReason};
+use crate::owner_state_types::{
+    DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId, SpaceKind,
+};
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 pub type MessageId = OutboxEntryId;
@@ -109,11 +115,12 @@ struct AttemptState {
 /// (constructed in `start_node`) and passed in by callers that have just
 /// acquired its lock. This `DmOutbox` owns only ephemeral per-process state
 /// (in-flight set, backoff timestamps); CRDT state lives in `OwnerState`.
-#[allow(dead_code)] // fields read by Task 3-5 (`send_dm`, `drain`, `handle_ack`)
 pub struct DmOutbox {
     pub(crate) device_id: String,
     pub(crate) self_owner: OwnerAddr,
+    #[allow(dead_code)] // read by Task 5's drain backoff logic
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
+    #[allow(dead_code)] // read by Task 5's drain backoff logic
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
 }
 
@@ -126,13 +133,151 @@ impl DmOutbox {
             backoff: HashMap::new(),
         }
     }
+
+    /// Encrypt `content` under `Space.content_key`, write the storage blob to
+    /// CAS, mint a fresh OutboxEntry, install it. Returns the new MessageId.
+    /// Drain (next tick) attempts delivery; this call returns immediately.
+    ///
+    /// `wall_now_ms` and `prev_hlc` are passed in (not derived) so tests can
+    /// drive deterministic HLCs and so the IPC handler can keep the per-device
+    /// HLC monotone via the existing SyncEngine HLC tracker.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_dm(
+        &mut self,
+        state: &mut OwnerState,
+        cas: &dyn ContentStore,
+        space_id: SpaceId,
+        content: Vec<u8>,
+        mime_type: String,
+        wall_now_ms: u64,
+        prev_hlc: Option<&Hlc>,
+    ) -> Result<MessageId, SendDmError> {
+        // 1. Look up Space, check kind + content_key.
+        let space = state
+            .spaces
+            .get(&space_id)
+            .ok_or(SendDmError::UnknownSpace(space_id))?;
+        match space.kind {
+            SpaceKind::Dm | SpaceKind::GroupDm => {}
+            SpaceKind::Folder => return Err(SendDmError::InvalidSpaceKind(space_id, "Folder")),
+            SpaceKind::Community => {
+                return Err(SendDmError::InvalidSpaceKind(space_id, "Community"))
+            }
+            SpaceKind::Channel => return Err(SendDmError::InvalidSpaceKind(space_id, "Channel")),
+            SpaceKind::PublicChannel => {
+                return Err(SendDmError::InvalidSpaceKind(space_id, "PublicChannel"))
+            }
+        }
+
+        let content_key = space
+            .content_key
+            .as_ref()
+            .ok_or(SendDmError::MissingContentKey(space_id))?;
+
+        // 2. Derive recipient_owners — exclude self, dedup, sort.
+        let recipients = derive_recipients(&space.members, &self.self_owner);
+
+        // 3. Build MessagePayload + HLC stamp.
+        let sent_at = next_hlc(prev_hlc, wall_now_ms, &self.device_id);
+        let payload = MessagePayload {
+            body: content,
+            mime_type,
+            sender: self.self_owner,
+            sent_at: sent_at.clone(),
+        };
+
+        // 4. Encrypt under (content_key, AAD = canonical_cbor(dedupe_key)).
+        let aad =
+            compute_aad(space).map_err(|e| SendDmError::Encode(format!("compute_aad: {e}")))?;
+        let storage_blob = encrypt_dm_message(content_key, &aad, &payload)?;
+
+        // 5. Compute message_cid + write to CAS. Mirror publish_root_now's
+        //    EncryptedDurable flag pair: encrypted=true, ephemeral=false
+        //    (default). DM bodies should never auto-burn from the
+        //    StorageTier — they're chat history.
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &storage_blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| SendDmError::Encode(format!("ContentId::for_book: {e}")))?;
+        cas.put(message_cid, storage_blob).await?;
+
+        // 6. Mint OutboxEntry, install via apply_outbox.
+        let entry_id = OutboxEntryId(ulid::Ulid::new().to_bytes());
+        let entry = OutboxEntry {
+            id: entry_id,
+            space_id,
+            recipient_owners: recipients,
+            message_cid,
+            created_at: sent_at,
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+        match state.apply_outbox(entry) {
+            ApplyOutcome::Inserted => Ok(entry_id),
+            ApplyOutcome::Merged { .. } => {
+                // Should not happen — fresh ULID can't collide with any existing entry.
+                Ok(entry_id)
+            }
+            ApplyOutcome::Rejected(r) => Err(SendDmError::CrdtRejected(r)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendDmError {
+    #[error("space {0:?} not found")]
+    UnknownSpace(SpaceId),
+    #[error("space {0:?} kind {1:?} is not Dm or GroupDm")]
+    InvalidSpaceKind(SpaceId, &'static str),
+    #[error("space {0:?} has no content_key (DM/group-dm invariant violated)")]
+    MissingContentKey(SpaceId),
+    #[error("encryption failed: {0}")]
+    Encrypt(#[from] DmEncryptError),
+    #[error("CAS write failed: {0}")]
+    Cas(#[from] ContentStoreError),
+    #[error("CRDT rejected outbox entry: {0:?}")]
+    CrdtRejected(RejectionReason),
+    #[error("encoding failed: {0}")]
+    Encode(String),
+}
+
+fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerAddr> {
+    let mut set: BTreeSet<OwnerAddr> = members.iter().copied().collect();
+    set.remove(self_addr);
+    set.into_iter().collect() // BTreeSet → ascending lex order, deduped
+}
+
+// Mirrors `owner_state_sync.rs:452`'s `next_hlc` helper but is duplicated
+// rather than re-exported because the SyncEngine's version reaches into
+// its private `tracker: BTreeMap<String, Hlc>` and we don't want
+// `dm_outbox` coupling to that internal. Phase 2 acceptable; Task 6
+// (IPC wiring) will pass the SyncEngine's tracker entry as `prev` to
+// keep production HLCs monotone with state-root publishes. (A future
+// cleanup could promote this to a shared module — out of Phase 2 scope.)
+fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
+    let (logical, base_wall) = match prev {
+        Some(p) if p.wall_ms == wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) if p.wall_ms > wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) => (0, p.wall_ms),
+        None => (0, 0),
+    };
+    let effective_wall = std::cmp::max(wall_now_ms, base_wall);
+    Hlc {
+        wall_ms: effective_wall,
+        logical,
+        device_id: device_id.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_state_types::{ContentId, DeliveryStatus, Hlc, SpaceId};
-    use std::collections::BTreeSet;
+    use crate::content_store::InMemoryStub;
+    use crate::owner_state_types::{ContentId, DmContentKey, Space, TransportBinding};
 
     fn entry(id: u8) -> OutboxEntry {
         OutboxEntry {
@@ -148,6 +293,47 @@ mod tests {
             delivered_to: BTreeSet::new(),
             delivery_status: DeliveryStatus::Pending,
         }
+    }
+
+    /// Build a minimal-but-valid DM Space. Members must be sorted ascending
+    /// (DM invariant), transport must be Reticulum (DM invariant), content_key
+    /// must be Some (DM invariant). Tests that want a different kind must reset
+    /// these fields after calling.
+    fn make_dm_space(id_byte: u8, members: Vec<OwnerAddr>) -> Space {
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Bob".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0x42u8; 32])),
+            prior_content_keys: vec![],
+        }
+    }
+
+    fn install_space(state: &mut OwnerState, sp: Space) {
+        let outcome = state.apply_space_with_canonicalization(sp);
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "fixture install must succeed, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -167,5 +353,89 @@ mod tests {
         assert_eq!(o.self_owner, OwnerAddr([0xaa; 16]));
         assert!(o.in_flight.is_empty());
         assert!(o.backoff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_dm_creates_outbox_entry() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let msg_id = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"hello".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+
+        let stored = state.outbox.get(&msg_id).expect("entry installed");
+        assert_eq!(stored.space_id, space_id);
+        assert_eq!(stored.recipient_owners, vec![bob], "Alice excluded");
+        assert!(stored.delivered_to.is_empty());
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn send_dm_invalid_space_kind_rejects() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let mut sp = make_dm_space(7, vec![alice, OwnerAddr([0x02; 16])]);
+        // Mutate to a Folder Space — this is the kind that send_dm must reject.
+        // Folder invariant requires transport=None, members=[], content_key=None
+        // (and no prior_content_keys). Reset all four together so the fixture
+        // installs cleanly.
+        sp.kind = SpaceKind::Folder;
+        sp.transport = None;
+        sp.content_key = None;
+        sp.members = vec![];
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let err = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"x".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendDmError::InvalidSpaceKind(_, "Folder")));
+    }
+
+    #[tokio::test]
+    async fn send_dm_unknown_space_rejects() {
+        let mut state = OwnerState::default();
+        let cas = InMemoryStub::default();
+        let mut o = DmOutbox::new("dev".into(), OwnerAddr([0x01; 16]));
+        let err = o
+            .send_dm(
+                &mut state,
+                &cas,
+                SpaceId([0x99; 16]),
+                b"x".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendDmError::UnknownSpace(_)));
     }
 }
