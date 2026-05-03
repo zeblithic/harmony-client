@@ -499,7 +499,7 @@ pub(crate) fn merge_prior_content_keys(
         .filter(|k| k.as_bytes() != winner_current.as_bytes())
         .collect();
     all.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    all.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+    all.dedup(); // PartialEq is byte-equality on the inner [u8; 32]
     all.truncate(MAX_PRIOR_CONTENT_KEYS);
     all
 }
@@ -523,6 +523,15 @@ pub(crate) fn merge_prior_content_keys(
 /// For same-SpaceId merges, both sides have the same id so the winner
 /// pick is moot; v1 has no key rotation so content_key is identical on
 /// both sides anyway.
+///
+/// Dual-semantics rationale: mutable fields (name, parent, custom_name,
+/// etc.) use HLC LWW — the side with the strictly-newer `updated_at`
+/// wins. content_key/prior_content_keys use ULID LWW (lex-smaller `id`
+/// wins) instead. This is intentional: content_key must be
+/// topology-independent and stable across all merge orderings
+/// (CRDT-convergent), and `id` is set at creation and never updated,
+/// making it safe for that role. HLC could in principle be tied across
+/// two divergent devices and would not give a deterministic winner.
 fn lww_merge_space(a: &Space, b: &Space) -> Space {
     let newer = if b.updated_at.is_strictly_newer_than(&a.updated_at) {
         b
@@ -1952,7 +1961,14 @@ mod merge_prior_content_keys_tests {
         DmContentKey::new([byte; 32])
     }
 
-    fn dm_space(id_byte: u8, content_key: DmContentKey, hlc_ms: u64) -> Space {
+    fn dm_space(id_byte: u8, content_key: DmContentKey) -> Space {
+        // hlc_ms is intentionally fixed: the 5-Space cap-rule convergence
+        // proof depends on ULID order (id_byte), not HLC.
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
         Space {
             id: SpaceId([id_byte; 16]),
             kind: SpaceKind::Dm,
@@ -1966,25 +1982,19 @@ mod merge_prior_content_keys_tests {
             custom_name: None,
             notification_pref: None,
             left_at: None,
-            created_at: Hlc {
-                wall_ms: hlc_ms,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            updated_at: Hlc {
-                wall_ms: hlc_ms,
-                logical: 0,
-                device_id: "d".into(),
-            },
+            created_at: hlc.clone(),
+            updated_at: hlc,
             content_key: Some(content_key),
             prior_content_keys: vec![],
         }
     }
 
     /// 5-Space convergence test from ZEB-219 §"Why first N of sorted":
-    /// K₃<K₂<K₄<K₅<K₁ lex, two distinct merge orders → both yield
-    /// the same prior_content_keys Vec (sorted ascending). With cap=16
-    /// (production), all 4 losers fit, so result is [K₃, K₂, K₄, K₅].
+    /// K₃<K₂<K₄<K₅<K₁ lex (subscript indexes the Space-ID byte, NOT key
+    /// lex order — see byte-value comments in the test body), two distinct
+    /// merge orders → both yield the same prior_content_keys Vec
+    /// (sorted ascending). With cap=16 (production), all 4 losers fit, so
+    /// result is [K₃, K₂, K₄, K₅].
     #[test]
     fn dedupe_merge_prior_content_keys_5_space_convergence() {
         // Choose first bytes that give us the desired lex ordering:
@@ -1999,11 +2009,11 @@ mod merge_prior_content_keys_tests {
         // Each of S1..S5 has a different ULID byte (so they're distinct
         // by id) but all share the same dedupe_key (sorted members).
         // S1 has the smallest id_byte so it'll be the dedupe winner.
-        let s1 = dm_space(0x01, k1.clone(), 5);
-        let s2 = dm_space(0x02, k2.clone(), 1);
-        let s3 = dm_space(0x03, k3.clone(), 2);
-        let s4 = dm_space(0x04, k4.clone(), 3);
-        let s5 = dm_space(0x05, k5.clone(), 4);
+        let s1 = dm_space(0x01, k1.clone());
+        let s2 = dm_space(0x02, k2.clone());
+        let s3 = dm_space(0x03, k3.clone());
+        let s4 = dm_space(0x04, k4.clone());
+        let s5 = dm_space(0x05, k5.clone());
 
         // Apply order P: [S2, S3, S4, S5, S1]
         let mut state_p = OwnerState::default();
