@@ -259,6 +259,35 @@ pub struct DeviceIdentityHash(
     pub [u8; 16],
 );
 
+/// Per-OwnerAddr cache of known bound-device identity hashes. Replicated
+/// across the user's bound devices via Flow A (owner-state CRDT sync).
+/// Each entry maintained via LWW on `learned_at` HLC.
+///
+/// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDeviceCache {
+    #[serde(rename = "d")]
+    pub devices: BTreeMap<OwnerAddr, OwnerDeviceEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDeviceEntry {
+    /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
+    /// Sorted invariant means binary_search works for lookup
+    /// (used by resolve_link_origin_owner in Phase 3b).
+    #[serde(rename = "v")]
+    pub devices: Vec<DeviceIdentityHash>,
+    /// HLC of when this entry was learned. LWW key for merge.
+    #[serde(rename = "l")]
+    pub learned_at: Hlc,
+}
+
+impl OwnerDeviceCache {
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+}
+
 /// Six SpaceKind variants. Wire format: single-char string per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceKind {
@@ -345,6 +374,8 @@ impl_canonical!(
     OutboxEntryId,
     DmContentKey,
     DeviceIdentityHash,
+    OwnerDeviceCache,
+    OwnerDeviceEntry,
     SpaceKind,
     NotificationPref,
     ReticulumDest,
@@ -875,7 +906,7 @@ impl Space {
     }
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryStatus {

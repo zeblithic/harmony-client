@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, OwnerAddr,
-    ReadMarker, Space, SpaceId,
+    DedupeKey, DeliveryStatus, DeviceIdentityHash, Hlc, InboxEntry, InboxKey, OutboxEntry,
+    OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space, SpaceId,
+    MAX_DEVICES_PER_OWNER,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,16 @@ pub struct OwnerState {
     /// `Space.left_at` which is reversible.
     #[serde(rename = "tm")]
     pub tombstones: BTreeSet<SpaceId>,
+    /// ZEB-216 Sub-B Phase 1: per-OwnerAddr device cache for DM unicast
+    /// addressing. Replicates across the owner's bound devices via Flow A.
+    /// (Phase 3b will use this to resolve from_identity_hash → OwnerAddr
+    /// for link-origin binding.)
+    #[serde(
+        rename = "od",
+        skip_serializing_if = "OwnerDeviceCache::is_empty",
+        default
+    )]
+    pub owner_device_cache: OwnerDeviceCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +414,48 @@ impl OwnerState {
                     ApplyOutcome::Merged { old_id: None }
                 }
             }
+        }
+    }
+
+    /// Apply a device-list update for an OwnerAddr. LWW on `learned_at` HLC;
+    /// devices are deduped + sorted + capped at MAX_DEVICES_PER_OWNER before
+    /// storage to bound cache memory and prevent cache-growth DoS via spoofed
+    /// updates.
+    ///
+    /// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
+    pub fn apply_owner_device_update(
+        &mut self,
+        addr: OwnerAddr,
+        devices: Vec<DeviceIdentityHash>,
+        learned_at: Hlc,
+    ) -> ApplyOutcome {
+        // LWW: existing ≥ incoming → reject as stale. (Equal HLCs are
+        // rejected — there's no merge ambiguity in v1, two devices writing
+        // the same learned_at HLC implies a clock-collision worth surfacing.)
+        if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
+            if !learned_at.is_strictly_newer_than(&existing.learned_at) {
+                return ApplyOutcome::Rejected(RejectionReason::StaleHlc {
+                    kind: "owner_device_entry",
+                    device_id: learned_at.device_id.clone(),
+                });
+            }
+        }
+        let mut sanitized = devices;
+        sanitized.sort();
+        sanitized.dedup();
+        sanitized.truncate(MAX_DEVICES_PER_OWNER);
+        let was_present = self.owner_device_cache.devices.contains_key(&addr);
+        self.owner_device_cache.devices.insert(
+            addr,
+            OwnerDeviceEntry {
+                devices: sanitized,
+                learned_at,
+            },
+        );
+        if was_present {
+            ApplyOutcome::Merged { old_id: None }
+        } else {
+            ApplyOutcome::Inserted
         }
     }
 }
@@ -1631,5 +1684,110 @@ mod crypto_integration_tests {
         let cid_a = blake3::hash(&blob_a);
         let cid_b = blake3::hash(&blob_b);
         assert_eq!(cid_a.as_bytes(), cid_b.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod owner_device_cache_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        DeviceIdentityHash, OwnerAddr, OwnerDeviceCache, MAX_DEVICES_PER_OWNER,
+    };
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc {
+            wall_ms: ms,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    #[test]
+    fn lww_newer_replaces() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = vec![DeviceIdentityHash([1; 16])];
+        let d2 = vec![DeviceIdentityHash([2; 16])];
+        // First insert at HLC=1 → Inserted
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d1.clone(), hlc(1));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+        // Second update at newer HLC=2 → Merged
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d2.clone(), hlc(2));
+        assert!(matches!(outcome2, ApplyOutcome::Merged { .. }));
+        // Cache reflects newer
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d2);
+    }
+
+    #[test]
+    fn lww_older_is_rejected() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = vec![DeviceIdentityHash([1; 16])];
+        let d2 = vec![DeviceIdentityHash([2; 16])];
+        // Establish at HLC=2
+        apply_owner_device_update_helper(&mut c, addr, d2.clone(), hlc(2));
+        // Older write at HLC=1 → Rejected (StaleHlc)
+        let outcome = apply_owner_device_update_helper(&mut c, addr, d1, hlc(1));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::StaleHlc { .. })
+        ));
+        // Cache unchanged
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d2);
+    }
+
+    #[test]
+    fn dedupes_input() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = DeviceIdentityHash([1; 16]);
+        let d2 = DeviceIdentityHash([2; 16]);
+        apply_owner_device_update_helper(&mut c, addr, vec![d1, d2, d1], hlc(1));
+        // Stored vec must be deduped + sorted.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, vec![d1, d2]);
+    }
+
+    #[test]
+    fn caps_at_max_devices_per_owner() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let big: Vec<DeviceIdentityHash> =
+            (0..100u8).map(|i| DeviceIdentityHash([i; 16])).collect();
+        apply_owner_device_update_helper(&mut c, addr, big, hlc(1));
+        let stored = &c.devices.get(&addr).unwrap().devices;
+        assert_eq!(stored.len(), MAX_DEVICES_PER_OWNER);
+        // Lex-smallest entries survive — first 32 of [0..100].
+        assert_eq!(stored[0], DeviceIdentityHash([0; 16]));
+        assert_eq!(stored[31], DeviceIdentityHash([31; 16]));
+    }
+
+    #[test]
+    fn binary_search_works_after_apply() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let target = DeviceIdentityHash([5; 16]);
+        let big: Vec<DeviceIdentityHash> = (0..10u8).map(|i| DeviceIdentityHash([i; 16])).collect();
+        apply_owner_device_update_helper(&mut c, addr, big, hlc(1));
+        // The cache stores devices sorted, so binary_search works (used by
+        // resolve_link_origin_owner in Phase 3b).
+        let stored = &c.devices.get(&addr).unwrap().devices;
+        assert!(stored.binary_search(&target).is_ok());
+    }
+
+    // Helper that lets the test pass without naming the public method twice.
+    // If apply_owner_device_update is a method on OwnerState rather than a
+    // free function, adapt: the helper either calls a free function in
+    // owner_state_crdt or a method on a fresh OwnerState wrapping the cache.
+    fn apply_owner_device_update_helper(
+        cache: &mut OwnerDeviceCache,
+        addr: OwnerAddr,
+        devices: Vec<DeviceIdentityHash>,
+        learned_at: Hlc,
+    ) -> ApplyOutcome {
+        let mut state = OwnerState::default();
+        state.owner_device_cache = std::mem::take(cache);
+        let outcome = state.apply_owner_device_update(addr, devices, learned_at);
+        *cache = state.owner_device_cache;
+        outcome
     }
 }

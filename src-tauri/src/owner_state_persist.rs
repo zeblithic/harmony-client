@@ -105,6 +105,7 @@ impl From<CrdtFileV2> for OwnerState {
             inbox: f.inbox,
             markers: f.markers,
             tombstones: f.tombstones,
+            owner_device_cache: Default::default(),
         }
     }
 }
