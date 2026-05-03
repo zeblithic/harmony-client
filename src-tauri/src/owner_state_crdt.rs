@@ -142,6 +142,22 @@ impl OwnerState {
                     incoming.id
                 )));
             }
+            // Reject same-SpaceId content_key changes. lww_merge_space picks
+            // the current content_key by ULID order, but on a same-SpaceId
+            // merge both sides share the same `id` so "winner" is undefined
+            // — each replica's local Space wins on its own machine and the
+            // active key diverges permanently. Phase 1 has no key rotation
+            // API; content_key is set at Space creation and is immutable for
+            // that ULID. Future explicit rotation will need its own merge
+            // semantics.
+            if existing.content_key != incoming.content_key {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "same-SpaceId update changes content_key for {:?} \
+                     (key rotation needs explicit semantics; current-key \
+                     merges must stay deterministic on the same ULID)",
+                    incoming.id
+                )));
+            }
             let merged = lww_merge_space(existing, &incoming);
             self.spaces.insert(incoming.id, merged);
             return ApplyOutcome::Merged { old_id: None };
@@ -947,6 +963,48 @@ mod apply_space_tests {
         assert_eq!(
             s.spaces.get(&SpaceId([7; 16])).unwrap().kind,
             SpaceKind::Channel
+        );
+    }
+
+    /// Regression: a same-SpaceId DM update that swaps content_key must be
+    /// rejected. lww_merge_space picks the current content_key by ULID
+    /// order, but on a same-SpaceId merge both sides share the same `id` so
+    /// "winner" is undefined — each replica's local Space wins on its own
+    /// machine and the active key diverges silently. Phase 1 has no key
+    /// rotation API, so this is an outright invariant violation.
+    #[test]
+    fn same_id_dm_content_key_change_rejects() {
+        use crate::owner_state_types::DmContentKey;
+        let mut s = OwnerState::default();
+        // Seed DM with content_key = [0xaa; 32] (the helper's default).
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 100)),
+            ApplyOutcome::Inserted
+        );
+
+        // Same SpaceId, same members, same kind, BUT content_key swapped to
+        // [0xbb; 32]. Must be rejected with a content_key-flavored message.
+        let mut rotated = dm(1, vec![1, 2], 200);
+        rotated.content_key = Some(DmContentKey::new([0xbb; 32]));
+        let outcome = s.apply_space(rotated);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("content_key"),
+                    "expected message mentioning content_key, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Rejected(InvariantFail) on content_key change, got {:?}",
+                other
+            ),
+        }
+        // Stored Space must still have the original content_key.
+        let stored = s.spaces.get(&SpaceId([1; 16])).unwrap();
+        assert_eq!(
+            stored.content_key,
+            Some(DmContentKey::new([0xaa; 32])),
+            "local content_key must not have changed"
         );
     }
 
