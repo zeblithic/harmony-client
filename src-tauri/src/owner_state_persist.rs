@@ -269,6 +269,8 @@ mod tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         s.spaces.insert(folder.id, folder);
         s.outbox.insert(

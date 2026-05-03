@@ -999,6 +999,8 @@ mod subscriber_tests {
                 logical: 0,
                 device_id: "test".into(),
             },
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1339,6 +1341,8 @@ mod integration_tests {
                 logical: 0,
                 device_id: "test".into(),
             },
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 

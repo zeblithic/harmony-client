@@ -443,6 +443,10 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
             a.created_at.clone()
         },
         updated_at: newer.updated_at.clone(),
+        // content_key and prior_content_keys: straight LWW — winner provides both.
+        // The actual cap-rule merge for prior_content_keys lands in Task 7.
+        content_key: newer.content_key.clone(),
+        prior_content_keys: newer.prior_content_keys.clone(),
     }
 }
 
@@ -473,6 +477,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -492,6 +498,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -646,6 +654,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -666,6 +676,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(200),
             updated_at: hlc(200),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -1153,6 +1165,8 @@ mod canonicalization_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1443,6 +1457,8 @@ mod crypto_integration_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1529,6 +1545,8 @@ mod crypto_integration_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");

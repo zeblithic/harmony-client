@@ -670,6 +670,24 @@ pub struct Space {
     pub created_at: Hlc,
     #[serde(rename = "ua")]
     pub updated_at: Hlc,
+
+    /// Per-DM-Space symmetric content key (ChaCha20-Poly1305).
+    /// MUST be Some for kind ∈ {dm, group-dm}; MUST be None otherwise.
+    /// Wire format: bstr(32) inside the Space CBOR map under key "ck".
+    /// In-memory: zeroized on drop via DmContentKey's ZeroizeOnDrop impl.
+    /// See ZEB-216 §"Space struct additions (Phase 1)".
+    #[serde(rename = "ck", skip_serializing_if = "Option::is_none", default)]
+    pub content_key: Option<DmContentKey>,
+
+    /// Historical content keys retained from past dedupe-collision merges.
+    /// Used as fallback decryption for messages encrypted under a now-
+    /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16 (enforced
+    /// in validate_invariants and merge_prior_content_keys).
+    /// MUST NOT contain the current `content_key`.
+    /// MUST be empty for non-DM kinds.
+    /// Wire format: array of bstr(32) under key "pk".
+    #[serde(rename = "pk", skip_serializing_if = "Vec::is_empty", default)]
+    pub prior_content_keys: Vec<DmContentKey>,
 }
 
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
@@ -1111,6 +1129,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1150,6 +1170,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(mk_dm(0).validate_invariants().is_err());
         assert!(mk_dm(1).validate_invariants().is_err());
@@ -1174,6 +1196,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(mk(2).validate_invariants().is_err());
         assert!(mk(3).validate_invariants().is_ok());
@@ -1201,6 +1225,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
         // Distinct members still pass.
@@ -1230,6 +1256,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
         // Sorted ascending passes.
@@ -1258,6 +1286,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
         g.members = vec![
@@ -1292,6 +1322,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
     }
@@ -1312,6 +1344,8 @@ mod space_tests {
                 left_at: None,
                 created_at: hlc(1),
                 updated_at: hlc(1),
+                content_key: None,
+                prior_content_keys: vec![],
             };
         // Missing community_id → reject.
         assert!(
@@ -1359,6 +1393,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         let a = OwnerAddr([1u8; 16]);
         let b = OwnerAddr([2u8; 16]);
@@ -1386,6 +1422,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert_eq!(
             pc.dedupe_key(),
@@ -1403,5 +1441,93 @@ mod space_tests {
         ciborium::into_writer(&s, &mut bytes).unwrap();
         let recovered: Space = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(s, recovered);
+    }
+
+    #[test]
+    fn space_dm_with_content_key_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "alice-bob".to_string(),
+            transport: None,
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
+        };
+        let mut bytes = Vec::new();
+        into_writer(&s, &mut bytes).unwrap();
+        let recovered: Space = from_reader(&bytes[..]).unwrap();
+        assert_eq!(
+            s.content_key.as_ref().map(|k| *k.as_bytes()),
+            recovered.content_key.as_ref().map(|k| *k.as_bytes())
+        );
+        assert_eq!(
+            s.prior_content_keys.len(),
+            recovered.prior_content_keys.len()
+        );
+        assert_eq!(
+            s.prior_content_keys[0].as_bytes(),
+            recovered.prior_content_keys[0].as_bytes()
+        );
+    }
+
+    #[test]
+    fn space_folder_omits_content_key_keys_in_cbor() {
+        use ciborium::into_writer;
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".to_string(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+        };
+        let mut bytes = Vec::new();
+        into_writer(&s, &mut bytes).unwrap();
+        // Folder serialization MUST NOT contain the "ck" or "pk" map keys —
+        // the skip_serializing_if attributes elide them. Crude check: the
+        // text strings "ck" and "pk" should not appear in the encoded bytes.
+        let needle_ck = b"ck";
+        let needle_pk = b"pk";
+        assert!(
+            !bytes.windows(2).any(|w| w == needle_ck),
+            "Folder serialization unexpectedly contains 'ck' key"
+        );
+        assert!(
+            !bytes.windows(2).any(|w| w == needle_pk),
+            "Folder serialization unexpectedly contains 'pk' key"
+        );
     }
 }
