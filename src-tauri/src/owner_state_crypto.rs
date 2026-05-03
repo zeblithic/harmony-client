@@ -844,6 +844,11 @@ mod tests {
         assert_canonical::<InboxKey>();
         assert_canonical::<InboxEntry>();
         assert_canonical::<ReadMarker>();
+        // dm_envelope wire types (ZEB-216 Sub-B Phase 1)
+        assert_canonical::<crate::dm_envelope::MessagePayload>();
+        assert_canonical::<crate::dm_envelope::DmInvite>();
+        assert_canonical::<crate::dm_envelope::DmCidNotify>();
+        assert_canonical::<crate::dm_envelope::DmAck>();
     }
 
     #[test]
