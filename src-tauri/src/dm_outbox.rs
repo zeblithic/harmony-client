@@ -17,7 +17,7 @@
 
 use crate::owner_state_types::{OutboxEntry, OutboxEntryId, OwnerAddr};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 pub type MessageId = OutboxEntryId;
@@ -95,8 +95,55 @@ impl DmTransport for StubTransport {
     }
 }
 
+// Backoff schedule + 30-day expiration constants. Consumed by Task 3
+// (`send_dm` / `drain`); annotated for now so the lib build stays
+// `-D warnings`-clean ahead of those consumers landing.
+#[allow(dead_code)]
+const BACKOFF_BASE_MS: u64 = 5_000;
+#[allow(dead_code)]
+const BACKOFF_MULTIPLIER: u64 = 2;
+#[allow(dead_code)]
+const BACKOFF_CAP_MS: u64 = 5 * 60 * 1_000;
+#[allow(dead_code)]
+const BACKOFF_MAX_EXPONENT: u32 = 8;
+#[allow(dead_code)]
+pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // fields read by Task 3's drain backoff logic
+struct AttemptState {
+    last_attempt_wall_ms: u64,
+    failure_count: u32,
+}
+
+/// Per-process DM-outbox state. One instance per running node, shared between
+/// the IPC handler (writes via `send_dm`) and the event-loop drain tick.
+///
+/// `OwnerState` is held in a separate `Arc<tokio::sync::Mutex<OwnerState>>`
+/// (constructed in `start_node`) and passed in by callers that have just
+/// acquired its lock. This `DmOutbox` owns only ephemeral per-process state
+/// (in-flight set, backoff timestamps); CRDT state lives in `OwnerState`.
+#[allow(dead_code)] // fields read by Task 3-5 (`send_dm`, `drain`, `handle_ack`)
+pub struct DmOutbox {
+    pub(crate) device_id: String,
+    pub(crate) self_owner: OwnerAddr,
+    in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
+    backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
+}
+
+impl DmOutbox {
+    pub fn new(device_id: String, self_owner: OwnerAddr) -> Self {
+        Self {
+            device_id,
+            self_owner,
+            in_flight: HashSet::new(),
+            backoff: HashMap::new(),
+        }
+    }
+}
+
 #[cfg(test)]
-mod stub_tests {
+mod tests {
     use super::*;
     use crate::owner_state_types::{ContentId, DeliveryStatus, Hlc, SpaceId};
     use std::collections::BTreeSet;
@@ -125,5 +172,14 @@ mod stub_tests {
         let res = t.send(&e, r).await;
         assert!(res.is_ok(), "default outcome is Ok: {res:?}");
         assert_eq!(t.sends(), vec![(e.id, r)]);
+    }
+
+    #[test]
+    fn dm_outbox_constructs_with_empty_state() {
+        let o = DmOutbox::new("dev".into(), OwnerAddr([0xaa; 16]));
+        assert_eq!(o.device_id, "dev");
+        assert_eq!(o.self_owner, OwnerAddr([0xaa; 16]));
+        assert!(o.in_flight.is_empty());
+        assert!(o.backoff.is_empty());
     }
 }
