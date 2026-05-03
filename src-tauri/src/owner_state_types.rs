@@ -235,9 +235,10 @@ impl DmContentKey {
     /// new DM/group-DM Space.
     pub fn random() -> Self {
         use rand::RngCore;
-        let mut k = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut k);
-        Self(k)
+        use zeroize::Zeroizing;
+        let mut k = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(k.as_mut());
+        Self(*k)
     }
 }
 
@@ -342,6 +343,8 @@ impl_canonical!(
     OwnerAddr,
     ContentId,
     OutboxEntryId,
+    DmContentKey,
+    DeviceIdentityHash,
     SpaceKind,
     NotificationPref,
     ReticulumDest,

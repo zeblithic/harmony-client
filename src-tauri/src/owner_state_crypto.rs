@@ -830,6 +830,8 @@ mod tests {
         assert_canonical::<OwnerAddr>();
         assert_canonical::<ContentId>();
         assert_canonical::<OutboxEntryId>();
+        assert_canonical::<DmContentKey>();
+        assert_canonical::<DeviceIdentityHash>();
         assert_canonical::<SpaceKind>();
         assert_canonical::<NotificationPref>();
         assert_canonical::<ReticulumDest>();
