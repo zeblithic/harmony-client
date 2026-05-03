@@ -85,6 +85,12 @@ struct CrdtFileV2 {
     tombstones: BTreeSet<crate::owner_state_types::SpaceId>,
 }
 
+// NOTE: owner_device_cache (ZEB-216 Sub-B Phase 1) is intentionally
+// excluded from CrdtFileV2 — V2 is a frozen schema. Task 8 of the
+// Phase 1 implementation plan must add a CrdtFileV3 (or an optional
+// "od" field) to persist this. Until then the cache is rebuilt from
+// owner-state sync (Flow A) on every restart, which is correct but
+// slower than persisting it.
 impl From<&OwnerState> for CrdtFileV2 {
     fn from(s: &OwnerState) -> Self {
         Self {

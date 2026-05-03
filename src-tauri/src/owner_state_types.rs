@@ -275,6 +275,13 @@ pub struct OwnerDeviceEntry {
     /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
     /// Sorted invariant means binary_search works for lookup
     /// (used by resolve_link_origin_owner in Phase 3b).
+    ///
+    /// SECURITY NOTE: truncation keeps lex-smallest entries; an attacker
+    /// who controls injected DeviceIdentityHash values could grind low-byte
+    /// prefixes to displace legitimate devices. Acceptable in Phase 1 since
+    /// updates must win the LWW HLC check (i.e., the owner's own device must
+    /// publish the update). See ZEB-219 for the analogous prior_content_keys
+    /// concern.
     #[serde(rename = "v")]
     pub devices: Vec<DeviceIdentityHash>,
     /// HLC of when this entry was learned. LWW key for merge.

@@ -422,6 +422,13 @@ impl OwnerState {
     /// storage to bound cache memory and prevent cache-growth DoS via spoofed
     /// updates.
     ///
+    /// Equal-HLC semantics match `apply_marker`: an identical HLC is treated
+    /// as an idempotent replay (returns `Merged { old_id: None }` without
+    /// mutation). Flow A sync replay paths deliver the same update to multiple
+    /// devices; rejecting equal HLCs would produce spurious `StaleHlc` errors
+    /// that callers would need to filter out. `Rejected` is reserved for
+    /// genuinely older HLCs only.
+    ///
     /// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
     pub fn apply_owner_device_update(
         &mut self,
@@ -429,15 +436,18 @@ impl OwnerState {
         devices: Vec<DeviceIdentityHash>,
         learned_at: Hlc,
     ) -> ApplyOutcome {
-        // LWW: existing ≥ incoming → reject as stale. (Equal HLCs are
-        // rejected — there's no merge ambiguity in v1, two devices writing
-        // the same learned_at HLC implies a clock-collision worth surfacing.)
+        // LWW guard — mirrors apply_marker's three-way comparison.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
-            if !learned_at.is_strictly_newer_than(&existing.learned_at) {
+            if existing.learned_at.is_strictly_newer_than(&learned_at) {
                 return ApplyOutcome::Rejected(RejectionReason::StaleHlc {
                     kind: "owner_device_entry",
                     device_id: learned_at.device_id.clone(),
                 });
+            }
+            if existing.learned_at == learned_at {
+                // Idempotent replay — sync flows replay the same update freely
+                // and Rejected should be reserved for genuinely older HLCs.
+                return ApplyOutcome::Merged { old_id: None };
             }
         }
         let mut sanitized = devices;
@@ -1734,6 +1744,27 @@ mod owner_device_cache_tests {
         ));
         // Cache unchanged
         assert_eq!(c.devices.get(&addr).unwrap().devices, d2);
+    }
+
+    #[test]
+    fn lww_equal_hlc_is_idempotent_replay() {
+        // Mirrors apply_marker's equal-HLC semantics: sync replay flows
+        // deliver the same update to multiple devices, and equal HLC must
+        // not produce a spurious StaleHlc — return Merged without mutation.
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d = vec![DeviceIdentityHash([1; 16])];
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+        // Second call at SAME HLC — must be idempotent Merged, not Rejected.
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
+        assert!(
+            matches!(outcome2, ApplyOutcome::Merged { old_id: None }),
+            "expected Merged on equal-HLC replay, got {:?}",
+            outcome2
+        );
+        // Cache unchanged.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d);
     }
 
     #[test]
