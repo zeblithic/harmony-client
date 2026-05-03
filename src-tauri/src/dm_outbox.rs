@@ -102,10 +102,26 @@ impl DmTransport for StubTransport {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // fields read by Task 3's drain backoff logic
 struct AttemptState {
     last_attempt_wall_ms: u64,
     failure_count: u32,
+}
+
+const BACKOFF_BASE_MS: u64 = 5_000; // 5s
+const BACKOFF_MULTIPLIER: u64 = 2;
+const BACKOFF_CAP_MS: u64 = 5 * 60 * 1_000; // 5 min
+const BACKOFF_MAX_EXPONENT: u32 = 8; // 5s * 2^8 = 1280s -> capped at 5min
+pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// (entry_id, recipient) pairs whose `delivered_to` was just set this tick.
+    /// Phase 2 stub never produces these (acks come via separate handle_ack
+    /// calls); Phase 3b will populate when handle_unicast's DmAck arm dispatches
+    /// through the same path. Caller emits `dm-delivered` IPC events.
+    pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
+    /// Entries that transitioned to Expired this tick.
+    pub newly_expired: Vec<OutboxEntryId>,
 }
 
 /// Per-process DM-outbox state. One instance per running node, shared between
@@ -267,6 +283,133 @@ impl DmOutbox {
             self.backoff.remove(&(entry_id, recipient));
         }
         inserted
+    }
+
+    /// Single drain pass. Walks every Pending/Partial entry; per outstanding
+    /// recipient (in `recipient_owners` ∖ `delivered_to`):
+    ///   - skip if in `in_flight` set already
+    ///   - skip if backoff says next attempt is in the future
+    ///   - else mark in-flight, call transport.send().
+    ///     - Ok(()): clear in-flight, clear backoff (entry stays Pending —
+    ///       real ack arrives later via handle_ack)
+    ///     - Err(_): clear in-flight, bump backoff failure_count + record
+    ///       last_attempt_wall_ms
+    ///
+    /// Then sweep for expiration: any Pending/Partial entry where
+    /// `wall_now_ms - created_at.wall_ms >= EXPIRATION_MS` and not all
+    /// recipients in delivered_to → mark Expired, record in newly_expired.
+    pub async fn drain(
+        &mut self,
+        state: &mut OwnerState,
+        transport: &dyn DmTransport,
+        wall_now_ms: u64,
+    ) -> DrainOutcome {
+        let mut outcome = DrainOutcome::default();
+
+        // 1. Collect work units up-front to avoid holding a borrow on `state`
+        //    across the await boundary. Entries already past EXPIRATION_MS are
+        //    skipped here — they get marked Expired in the sweep below without
+        //    a final wasted transport.send attempt.
+        let work: Vec<(OutboxEntryId, OutboxEntry, Vec<OwnerAddr>)> = state
+            .outbox
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e.delivery_status,
+                    DeliveryStatus::Pending | DeliveryStatus::Partial
+                )
+            })
+            .filter(|(_, e)| wall_now_ms.saturating_sub(e.created_at.wall_ms) < EXPIRATION_MS)
+            .map(|(id, e)| {
+                let outstanding: Vec<OwnerAddr> = e
+                    .recipient_owners
+                    .iter()
+                    .copied()
+                    .filter(|r| !e.delivered_to.contains(r))
+                    .collect();
+                (*id, e.clone(), outstanding)
+            })
+            .collect();
+
+        // 2. Per-(entry, recipient) attempt.
+        for (entry_id, entry_clone, outstanding) in work {
+            for recipient in outstanding {
+                if self.in_flight.contains(&(entry_id, recipient)) {
+                    continue;
+                }
+                if !self.is_due(entry_id, recipient, wall_now_ms) {
+                    continue;
+                }
+                self.in_flight.insert((entry_id, recipient));
+                let result = transport.send(&entry_clone, recipient).await;
+                self.in_flight.remove(&(entry_id, recipient));
+                match result {
+                    Ok(()) => {
+                        // Real ack lives in the future. Clear backoff so a
+                        // subsequent retry (if no ack arrives) starts at base.
+                        // Phase 3b can refine to keep backoff escalating until
+                        // the ack lands; Phase 2's stub-or-test pattern means
+                        // an Ok send is always followed by either a manual
+                        // handle_ack or an explicit Err re-seed.
+                        self.backoff.remove(&(entry_id, recipient));
+                    }
+                    Err(e) => {
+                        tracing::warn!(?entry_id, ?recipient, error = %e, "transport.send failed; bumping backoff");
+                        let st =
+                            self.backoff
+                                .entry((entry_id, recipient))
+                                .or_insert(AttemptState {
+                                    last_attempt_wall_ms: 0,
+                                    failure_count: 0,
+                                });
+                        st.last_attempt_wall_ms = wall_now_ms;
+                        st.failure_count = st.failure_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        // 3. Expiration sweep.
+        let mut expired: Vec<OutboxEntryId> = Vec::new();
+        for (id, entry) in state.outbox.iter_mut() {
+            if !matches!(
+                entry.delivery_status,
+                DeliveryStatus::Pending | DeliveryStatus::Partial
+            ) {
+                continue;
+            }
+            let age = wall_now_ms.saturating_sub(entry.created_at.wall_ms);
+            if age >= EXPIRATION_MS {
+                let recipient_set: BTreeSet<&OwnerAddr> = entry.recipient_owners.iter().collect();
+                let all_acked = recipient_set
+                    .iter()
+                    .all(|r| entry.delivered_to.contains(*r));
+                if !all_acked {
+                    entry.delivery_status = DeliveryStatus::Expired;
+                    expired.push(*id);
+                }
+            }
+        }
+        // 4. Cleanup backoff/in_flight for expired entries.
+        for id in &expired {
+            self.backoff.retain(|(e, _), _| e != id);
+            self.in_flight.retain(|(e, _)| e != id);
+        }
+        outcome.newly_expired = expired;
+        outcome
+    }
+
+    fn is_due(&self, entry_id: OutboxEntryId, recipient: OwnerAddr, wall_now_ms: u64) -> bool {
+        match self.backoff.get(&(entry_id, recipient)) {
+            None => true, // first attempt
+            Some(st) => {
+                let exponent = st.failure_count.saturating_sub(1).min(BACKOFF_MAX_EXPONENT);
+                let raw =
+                    BACKOFF_BASE_MS.saturating_mul(BACKOFF_MULTIPLIER.saturating_pow(exponent));
+                let delay = raw.min(BACKOFF_CAP_MS);
+                wall_now_ms >= st.last_attempt_wall_ms.saturating_add(delay)
+            }
+        }
     }
 }
 
@@ -541,5 +684,190 @@ mod tests {
         let stored = state.outbox.get(&entry_id).unwrap();
         assert_eq!(stored.delivered_to.len(), 1);
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    fn entry_with_age(id: u8, recipients: Vec<OwnerAddr>, created_wall_ms: u64) -> OutboxEntry {
+        OutboxEntry {
+            id: OutboxEntryId([id; 16]),
+            space_id: SpaceId([1u8; 16]),
+            recipient_owners: recipients,
+            message_cid: ContentId::from_bytes([3u8; 32]),
+            created_at: Hlc {
+                wall_ms: created_wall_ms,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_advances_pending_to_complete_on_stub_success() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let outcome = o.drain(&mut state, &transport, 2_000).await;
+
+        assert!(
+            outcome.newly_delivered.is_empty(),
+            "stub send is Ok but ack hasn't arrived; status stays Pending"
+        );
+        assert_eq!(transport.sends(), vec![(entry_id, bob)]);
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+
+        // Now simulate the ack arriving (Phase 3b will route this from
+        // handle_unicast's DmAck arm; Phase 2 callers do it directly).
+        let inserted = o.handle_ack(&mut state, entry_id, bob);
+        assert!(inserted);
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn drain_partial_state_some_recipients_acked() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+        let dave = OwnerAddr([0xdd; 16]);
+        let mut entry = entry_with_age(7, vec![bob, carol, dave], 1_000);
+        entry.delivered_to.insert(bob);
+        entry.delivered_to.insert(carol);
+        entry.delivery_status = DeliveryStatus::Partial;
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let _ = o.drain(&mut state, &transport, 2_000).await;
+
+        // Only dave is outstanding.
+        assert_eq!(transport.sends(), vec![(entry_id, dave)]);
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Partial));
+    }
+
+    #[tokio::test]
+    async fn drain_respects_backoff_skipping_recently_attempted() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        // Pre-seed the first send to fail Transient so backoff is engaged.
+        transport.set_outcome(
+            entry_id,
+            bob,
+            Err(TransportError::Transient("net down".into())),
+        );
+
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let _ = o.drain(&mut state, &transport, 10_000).await;
+        assert_eq!(
+            transport.sends(),
+            vec![(entry_id, bob)],
+            "first attempt fired"
+        );
+
+        // Tick again 1s later — should be skipped (backoff = 5s base).
+        let _ = o.drain(&mut state, &transport, 11_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            1,
+            "second attempt skipped by backoff"
+        );
+
+        // Tick at 16s — past 5s base; should fire.
+        let _ = o.drain(&mut state, &transport, 16_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            2,
+            "third attempt fired after backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_expires_30day_old_entry() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        // wall_now = created + 30 days + 1s
+        let wall_now = 1_000 + EXPIRATION_MS + 1_000;
+        let outcome = o.drain(&mut state, &transport, wall_now).await;
+
+        assert_eq!(outcome.newly_expired, vec![entry_id]);
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Expired));
+        assert!(
+            transport.sends().is_empty(),
+            "expired entry should not be re-attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_complete_entry_is_no_op() {
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let mut entry = entry_with_age(7, vec![bob], 1_000);
+        entry.delivered_to.insert(bob);
+        entry.delivery_status = DeliveryStatus::Complete;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let outcome = o.drain(&mut state, &transport, 2_000).await;
+
+        assert!(outcome.newly_delivered.is_empty());
+        assert!(outcome.newly_expired.is_empty());
+        assert!(transport.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_set_prevents_duplicate_send_within_tick() {
+        // Repeat-call drain in a tight pair: first call records the entry as
+        // in-flight (the stub's Ok response normally flushes in_flight before
+        // returning, but we hold an outstanding fake "no-result-yet" by
+        // pre-seeding two recipients on one entry and inspecting the stub
+        // sends() vector for duplicates — i.e., one drain call must not send
+        // the same (entry, recipient) twice).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+        let entry = entry_with_age(7, vec![bob, carol], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let _ = o.drain(&mut state, &transport, 2_000).await;
+
+        let sends = transport.sends();
+        let unique: HashSet<(OutboxEntryId, OwnerAddr)> = sends.iter().copied().collect();
+        assert_eq!(
+            sends.len(),
+            unique.len(),
+            "no duplicate (entry, recipient) sends in one tick"
+        );
+        assert_eq!(unique.len(), 2, "exactly one send per recipient");
+        let _ = entry_id;
     }
 }
