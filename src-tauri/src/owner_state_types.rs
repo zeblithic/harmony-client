@@ -911,6 +911,29 @@ impl Space {
             )));
         }
 
+        // Canonical-form invariant: prior_content_keys must be
+        // strictly-ascending sorted (catches both unsorted ordering
+        // and adjacent duplicates in one predicate).
+        // `merge_prior_content_keys` always emits canonical
+        // (sorted+deduped) output, so a non-canonical value here
+        // represents malformed wire data, corrupted on-disk state,
+        // or a bug elsewhere. Space serializes via canonical_cbor_encode
+        // into the encrypted root blob — two replicas with semantically-
+        // equal but differently-ordered prior_content_keys would
+        // produce different canonical bytes (and thus different
+        // root_cids), breaking convergence. Enforce strictly so this
+        // invariant remains load-bearing.
+        if !self
+            .prior_content_keys
+            .windows(2)
+            .all(|w| w[0].as_bytes() < w[1].as_bytes())
+        {
+            return Err(InvariantError(
+                "prior_content_keys must be sorted ascending lex (catches unsorted and duplicated)"
+                    .into(),
+            ));
+        }
+
         if let Some(ck) = &self.content_key {
             if self
                 .prior_content_keys
@@ -1750,6 +1773,93 @@ mod space_tests {
                 .collect(),
         };
         assert!(d.validate_invariants().is_err());
+    }
+
+    /// Builds a valid DM Space with the supplied prior_content_keys
+    /// vec. Used by the canonical-form tests below to isolate the
+    /// new sorted-strict invariant from unrelated DM-shape rules.
+    fn dm_with_priors(priors: Vec<DmContentKey>) -> Space {
+        Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            // Pick a content_key disjoint from the prior fixtures
+            // below so the existing "content_key not in priors" check
+            // never fires by accident.
+            content_key: Some(DmContentKey::new([0xff; 32])),
+            prior_content_keys: priors,
+        }
+    }
+
+    #[test]
+    fn validate_invariants_rejects_unsorted_prior_content_keys() {
+        // Descending order violates the canonical-form invariant:
+        // merge_prior_content_keys always emits sorted output, so a
+        // non-canonical value here means malformed wire data,
+        // corrupted on-disk state, or a bug elsewhere. Two replicas
+        // with semantically-equal but differently-ordered priors
+        // would produce different canonical CBOR bytes (and thus
+        // different root_cids), breaking convergence.
+        let d = dm_with_priors(vec![
+            DmContentKey::new([0x22; 32]),
+            DmContentKey::new([0x11; 32]),
+        ]);
+        let err = d.validate_invariants().unwrap_err();
+        assert!(
+            err.0.contains("prior_content_keys") && err.0.contains("ascending"),
+            "expected prior_content_keys + ascending in error, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_invariants_rejects_duplicate_prior_content_keys() {
+        // Strict `<` collapses both unsorted and adjacent-duplicate
+        // checks into one predicate. A duplicated key must reject
+        // for the same convergence reason as unsorted.
+        let dup = DmContentKey::new([0x11; 32]);
+        let d = dm_with_priors(vec![dup.clone(), dup]);
+        let err = d.validate_invariants().unwrap_err();
+        assert!(
+            err.0.contains("prior_content_keys") && err.0.contains("ascending"),
+            "expected prior_content_keys + ascending in error, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_invariants_accepts_sorted_deduped_prior_content_keys() {
+        // Smoke check: the canonical form (strictly-ascending,
+        // deduped) must still pass. Single-element and multi-element
+        // sorted vectors both validate.
+        let one = dm_with_priors(vec![DmContentKey::new([0x11; 32])]);
+        assert!(one.validate_invariants().is_ok());
+
+        let many = dm_with_priors(vec![
+            DmContentKey::new([0x11; 32]),
+            DmContentKey::new([0x22; 32]),
+            DmContentKey::new([0x33; 32]),
+        ]);
+        assert!(many.validate_invariants().is_ok());
     }
 
     #[test]
