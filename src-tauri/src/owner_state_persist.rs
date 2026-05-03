@@ -83,6 +83,21 @@ struct CrdtFileV2 {
     inbox: BTreeMap<crate::owner_state_types::InboxKey, crate::owner_state_types::InboxEntry>,
     markers: BTreeMap<crate::owner_state_types::SpaceId, crate::owner_state_types::ReadMarker>,
     tombstones: BTreeSet<crate::owner_state_types::SpaceId>,
+    /// ZEB-216 Sub-B Phase 1: owner device identity cache. Absent in
+    /// pre-Task-8 V2 files; `serde(default)` loads those as an empty
+    /// cache. `skip_serializing_if` omits the field when empty so files
+    /// written with an empty cache stay compact.
+    ///
+    /// Field name uses the default Rust identifier (no `rename`) for
+    /// consistency with the other five `CrdtFileV2` fields. Short renames
+    /// are reserved for `OwnerState`'s wire/AAD encoding (where Reticulum
+    /// MTU pressure justifies the abbreviation); `CrdtFileV2` is the
+    /// on-disk wrapper using plain ciborium with no MTU constraint.
+    #[serde(
+        skip_serializing_if = "crate::owner_state_types::OwnerDeviceCache::is_empty",
+        default
+    )]
+    owner_device_cache: crate::owner_state_types::OwnerDeviceCache,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -93,6 +108,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             inbox: s.inbox.clone(),
             markers: s.markers.clone(),
             tombstones: s.tombstones.clone(),
+            owner_device_cache: s.owner_device_cache.clone(),
         }
     }
 }
@@ -105,6 +121,7 @@ impl From<CrdtFileV2> for OwnerState {
             inbox: f.inbox,
             markers: f.markers,
             tombstones: f.tombstones,
+            owner_device_cache: f.owner_device_cache,
         }
     }
 }
@@ -269,6 +286,8 @@ mod tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         s.spaces.insert(folder.id, folder);
         s.outbox.insert(
@@ -419,5 +438,130 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let err = load_crdt(&path).expect_err("should error");
         assert!(matches!(err, PersistError::Corrupt));
+    }
+
+    /// Verifies that the new Phase 1 fields (Space.content_key,
+    /// Space.prior_content_keys, OwnerState.owner_device_cache) survive a
+    /// full persistence round-trip through save_crdt / load_crdt.
+    ///
+    /// This test was written first (TDD) and was expected to fail on the
+    /// owner_device_cache assertions before the CrdtFileV2 fix in Task 8.
+    #[test]
+    fn persist_round_trip_with_dm_state() {
+        use crate::owner_state_types::{DeviceIdentityHash, DmContentKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dm_state.cbor");
+
+        let mut state = OwnerState::default();
+
+        // Insert a DM Space with content_key + prior_content_keys.
+        let dm_space = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "alice-bob".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
+        };
+        state.apply_space_with_canonicalization(dm_space);
+
+        // Insert OwnerDeviceCache entries.
+        state.apply_owner_device_update(
+            OwnerAddr([2; 16]),
+            vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([8; 16])],
+            hlc(1),
+        );
+
+        // Round-trip through the production file-based save/load path.
+        save_crdt(&path, &state).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+
+        // -- Space fields --
+        let loaded_space = loaded
+            .spaces
+            .get(&SpaceId([1; 16]))
+            .expect("DM Space should round-trip");
+        assert_eq!(
+            loaded_space.content_key.as_ref().map(|k| *k.as_bytes()),
+            Some([0xaa; 32]),
+            "Space.content_key must persist",
+        );
+        assert_eq!(
+            loaded_space.prior_content_keys.len(),
+            1,
+            "Space.prior_content_keys must persist (len)",
+        );
+        assert_eq!(
+            loaded_space.prior_content_keys[0].as_bytes(),
+            &[0xbb; 32],
+            "Space.prior_content_keys[0] must persist",
+        );
+
+        // -- OwnerDeviceCache --
+        let cache_entry = loaded
+            .owner_device_cache
+            .devices
+            .get(&OwnerAddr([2; 16]))
+            .expect("OwnerDeviceCache entry should round-trip");
+        assert_eq!(
+            cache_entry.devices.len(),
+            2,
+            "OwnerDeviceCache entry should have 2 devices",
+        );
+        // apply_owner_device_update sorts and dedupes; [7;16] < [8;16].
+        assert_eq!(
+            cache_entry.devices[0],
+            DeviceIdentityHash([7; 16]),
+            "first device hash",
+        );
+        assert_eq!(
+            cache_entry.devices[1],
+            DeviceIdentityHash([8; 16]),
+            "second device hash",
+        );
+    }
+
+    /// Verifies backward compatibility: a V2 file written WITHOUT the
+    /// `owner_device_cache` field (pre-Task-8 format) loads cleanly with
+    /// an empty cache.
+    #[test]
+    fn crdt_load_v2_without_owner_device_cache_field_yields_empty_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old_v2.cbor");
+
+        // Write a file using an OwnerState with an empty cache — the
+        // skip_serializing_if will omit the field entirely, mimicking
+        // a pre-Task-8 file on disk.
+        let state_no_cache = OwnerState::default();
+        save_crdt(&path, &state_no_cache).unwrap();
+
+        // Confirm the field key was omitted by scanning raw bytes for
+        // the literal UTF-8 of the CBOR text key (CBOR text strings
+        // include the field name verbatim in the byte stream, so a
+        // substring check is sufficient).
+        let raw = std::fs::read(&path).unwrap();
+        let key = b"owner_device_cache";
+        assert!(
+            !raw.windows(key.len()).any(|w| w == key),
+            "`owner_device_cache` key should not appear in file when cache is empty",
+        );
+
+        // Loading must succeed with an empty cache, not error.
+        let loaded = load_crdt(&path).unwrap();
+        assert!(
+            loaded.owner_device_cache.is_empty(),
+            "pre-Task-8 V2 files must load with empty owner_device_cache",
+        );
     }
 }

@@ -25,7 +25,14 @@ where
 /// Helper: serialize a `Vec<u8>` as CBOR bstr (major type 2). Used by
 /// variable-length opaque-bytes wrapper types like `ReticulumDest` so
 /// they don't accidentally encode as a CBOR array of u8 (major type 4).
-fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
+///
+/// Crate-public so DM wire types (`dm_envelope::MessagePayload.body`)
+/// and future Phase 2/3b modules can reuse the same byte-efficient
+/// encoding without redefining the helper. The bstr form is one CBOR
+/// header byte plus the raw bytes, vs. array-of-u8's two bytes per
+/// byte once values exceed 0x17 — load-bearing for ciphertext-bearing
+/// fields where overhead dominates packet size.
+pub(crate) fn serialize_vec_as_bstr<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -34,7 +41,11 @@ where
 
 /// Helper: deserialize a CBOR bstr into a `Vec<u8>`. Pair with
 /// `serialize_vec_as_bstr`.
-fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+///
+/// Crate-public alongside its serialize partner so DM wire types
+/// (`dm_envelope::MessagePayload.body`) and future Phase 2/3b modules
+/// can reuse the same bstr decoding contract.
+pub(crate) fn deserialize_vec_from_bstr<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -197,6 +208,271 @@ pub struct OutboxEntryId(
     pub [u8; 16],
 );
 
+/// Maximum number of historical content keys retained per Space.
+/// See ZEB-219 §"Cap policy" and ZEB-216 §"Dedupe-merge cap rule".
+pub const MAX_PRIOR_CONTENT_KEYS: usize = 16;
+
+/// Maximum number of device identities retained per OwnerAddr in
+/// OwnerDeviceCache. Bounds the cache's memory footprint AND the
+/// Reticulum-MTU cost of any piggybacked sender_devices lists.
+/// See ZEB-216 §"OwnerDeviceCache".
+pub const MAX_DEVICES_PER_OWNER: usize = 32;
+
+/// 32-byte symmetric content key for DM/group-DM ChaCha20-Poly1305
+/// encryption. Wire format: bstr(32). In-memory: zeroized on drop
+/// (custom Drop via ZeroizeOnDrop derive). Debug redacts the bytes
+/// to avoid accidental leakage to logs.
+///
+/// See ZEB-216 §"Wire-format newtypes (Phase 1)".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+pub struct DmContentKey(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    [u8; 32],
+);
+
+impl DmContentKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Generate a fresh random key from OS entropy. Used when creating a
+    /// new DM/group-DM Space.
+    pub fn random() -> Self {
+        use rand::RngCore;
+        use zeroize::Zeroizing;
+        let mut k = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(k.as_mut());
+        Self(*k)
+    }
+}
+
+impl std::fmt::Debug for DmContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DmContentKey(<32 bytes redacted>)")
+    }
+}
+
+/// 16-byte Reticulum device identity hash. Wire format: bstr(16).
+/// See ZEB-216 §"OwnerDeviceCache".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeviceIdentityHash(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
+
+/// Per-OwnerAddr cache of known bound-device identity hashes. Replicated
+/// across the user's bound devices via Flow A (owner-state CRDT sync).
+/// Each entry maintained via LWW on `learned_at` HLC.
+///
+/// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDeviceCache {
+    #[serde(rename = "d")]
+    pub devices: BTreeMap<OwnerAddr, OwnerDeviceEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDeviceEntry {
+    /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
+    /// Sorted invariant means binary_search works for lookup
+    /// (used by resolve_link_origin_owner in Phase 3b).
+    ///
+    /// `deserialize_with` re-normalizes (sort + dedup + truncate) on every
+    /// load so persisted-state files and remote replicas can't hand us a
+    /// `Vec` that violates the invariant — a corrupted on-disk snapshot
+    /// or a malicious peer's `OwnerState` blob can otherwise break the
+    /// binary_search precondition Phase 3b's link-origin resolver depends on.
+    ///
+    /// SECURITY NOTE: truncation keeps lex-smallest entries; an attacker
+    /// who controls injected DeviceIdentityHash values could grind low-byte
+    /// prefixes to displace legitimate devices. Acceptable in Phase 1 since
+    /// updates must win the LWW HLC check (i.e., the owner's own device must
+    /// publish the update). See ZEB-219 for the analogous prior_content_keys
+    /// concern.
+    #[serde(rename = "v", deserialize_with = "deserialize_device_identities")]
+    pub devices: Vec<DeviceIdentityHash>,
+    /// HLC of when this entry was learned. LWW key for merge.
+    #[serde(rename = "l")]
+    pub learned_at: Hlc,
+}
+
+/// Deserialize a `Vec<DeviceIdentityHash>` and re-establish the
+/// `OwnerDeviceEntry::devices` invariant (sorted + deduped + truncated to
+/// `MAX_DEVICES_PER_OWNER`). This runs at every load — persisted-state files
+/// and remote `OwnerState` snapshots are equally untrusted with respect to
+/// the in-memory invariant.
+///
+/// Streams items via a `Visitor` rather than calling `Vec::deserialize`
+/// to bound peak memory: a peer (or corrupted file) declaring
+/// `array(2^32-1)` of 16-byte hashes would otherwise force a multi-GB
+/// allocation BEFORE any cap could take effect. The visitor:
+///   1. Rejects up-front via `seq.size_hint()` when the deserializer
+///      can tell us a definite-length array exceeds the cap (cheap path).
+///   2. Pre-allocates `min(cap, size_hint)` so a small honest payload
+///      doesn't grow the vec needlessly.
+///   3. Returns `Err` immediately on the (cap+1)-th element, refusing to
+///      consume the rest of the stream.
+///
+/// Reject vs. truncate: `apply_owner_device_update` always emits a vec
+/// already capped at `MAX_DEVICES_PER_OWNER`, so any wire input above
+/// the cap is malformed by definition. Reject is semantically correct
+/// AND surfaces buggy peers that "silently truncate" would mask
+/// (e.g., a peer emitting >cap entries is dropping device entries we
+/// might need for DM delivery — better to fail loudly).
+fn deserialize_device_identities<'de, D>(d: D) -> Result<Vec<DeviceIdentityHash>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<DeviceIdentityHash>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} DeviceIdentityHash entries",
+                MAX_DEVICES_PER_OWNER
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Cheap upfront rejection if the deserializer can tell us
+            // the length (definite-length CBOR arrays carry it).
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "DeviceIdentityHash array length {} exceeds MAX_DEVICES_PER_OWNER ({})",
+                        n, MAX_DEVICES_PER_OWNER
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_DEVICES_PER_OWNER)
+                .min(MAX_DEVICES_PER_OWNER);
+            let mut out: Vec<DeviceIdentityHash> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<DeviceIdentityHash>()? {
+                if out.len() >= MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "DeviceIdentityHash array exceeds MAX_DEVICES_PER_OWNER ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+                out.push(item);
+            }
+            // Re-establish canonical form (sorted + deduped). Truncate
+            // is now redundant given the cap rejection above but kept as
+            // cheap defense-in-depth against any future cap-edge bug.
+            out.sort();
+            out.dedup();
+            out.truncate(MAX_DEVICES_PER_OWNER);
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
+}
+
+/// Deserialize a `Vec<DmContentKey>` and re-establish the
+/// `Space::prior_content_keys` canonical-form invariant (sorted ascending
+/// by raw bytes + deduped + truncated to `MAX_PRIOR_CONTENT_KEYS`). Mirrors
+/// the rationale on `deserialize_device_identities`: `validate_invariants`
+/// runs on apply paths only, NOT on initial load, so without this hook a
+/// corrupted on-disk file with non-canonical priors would sit in
+/// `state.spaces` unchecked, get re-serialized on the next `save_crdt`,
+/// and produce a different `root_cid` than correctly-converged peers
+/// (silent convergence break — replicas with semantically-equal but
+/// differently-ordered priors disagree on `canonical_cbor_encode` bytes).
+///
+/// Same OOM-safe streaming pattern as `deserialize_device_identities`:
+/// a peer/file declaring `array(2^32-1)` of 32-byte keys would otherwise
+/// force a multi-GB allocation before truncation runs. Reject (rather
+/// than truncate) above the cap — `merge_prior_content_keys` always
+/// produces ≤ cap entries, so anything more on the wire is malformed.
+fn deserialize_prior_content_keys<'de, D>(d: D) -> Result<Vec<DmContentKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<DmContentKey>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} DmContentKey entries",
+                MAX_PRIOR_CONTENT_KEYS
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_PRIOR_CONTENT_KEYS {
+                    return Err(A::Error::custom(format!(
+                        "DmContentKey array length {} exceeds MAX_PRIOR_CONTENT_KEYS ({})",
+                        n, MAX_PRIOR_CONTENT_KEYS
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_PRIOR_CONTENT_KEYS)
+                .min(MAX_PRIOR_CONTENT_KEYS);
+            let mut out: Vec<DmContentKey> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<DmContentKey>()? {
+                if out.len() >= MAX_PRIOR_CONTENT_KEYS {
+                    return Err(A::Error::custom(format!(
+                        "DmContentKey array exceeds MAX_PRIOR_CONTENT_KEYS ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_PRIOR_CONTENT_KEYS
+                    )));
+                }
+                out.push(item);
+            }
+            // Re-establish canonical form. DmContentKey doesn't impl Ord
+            // directly; sort/dedup by raw bytes (matches the round-7
+            // helper convention).
+            out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            out.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+            out.truncate(MAX_PRIOR_CONTENT_KEYS);
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
+}
+
+impl OwnerDeviceCache {
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+}
+
 /// Six SpaceKind variants. Wire format: single-char string per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceKind {
@@ -281,11 +557,16 @@ impl_canonical!(
     OwnerAddr,
     ContentId,
     OutboxEntryId,
+    DmContentKey,
+    DeviceIdentityHash,
+    OwnerDeviceCache,
+    OwnerDeviceEntry,
     SpaceKind,
     NotificationPref,
     ReticulumDest,
     TransportBinding,
     Space,
+    DedupeKey,
     DeliveryStatus,
     OutboxEntry,
     InboxKey,
@@ -421,6 +702,69 @@ mod newtype_tests {
         assert_eq!(bytes[0], 0x58);
         assert_eq!(bytes[1], 0x20);
     }
+
+    #[test]
+    fn dm_content_key_serializes_as_bstr_32() {
+        use ciborium::into_writer;
+        let k = DmContentKey::new([0u8; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        // bstr(32): 0x58 0x20 || <32 bytes> = 34 bytes total.
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
+    fn dm_content_key_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let k = DmContentKey::new([0xab; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        let recovered: DmContentKey = from_reader(&bytes[..]).unwrap();
+        assert_eq!(k.as_bytes(), recovered.as_bytes());
+    }
+
+    #[test]
+    fn dm_content_key_debug_redacts_bytes() {
+        let k = DmContentKey::new([0xab; 32]);
+        let s = format!("{:?}", k);
+        // No raw byte values, no hex, no decimal — must be a fixed redacted form.
+        assert!(!s.contains("0xab"));
+        assert!(!s.contains("171")); // 0xab as decimal
+        assert!(s.contains("redacted") || s.contains("REDACTED") || s.contains("***"));
+    }
+
+    #[test]
+    fn dm_content_key_zeroized_on_drop() {
+        // Use ZeroizeOnDrop's invariant: dropping the wrapper zeros the
+        // underlying [u8; 32]. We can't easily observe the freed memory,
+        // but we can verify the trait is implemented by constraining a
+        // generic function.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<DmContentKey>();
+    }
+
+    #[test]
+    fn device_identity_hash_serializes_as_bstr_16() {
+        use ciborium::into_writer;
+        let d = DeviceIdentityHash([0u8; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&d, &mut bytes).unwrap();
+        // bstr(16): 0x50 || <16 bytes> = 17 bytes total.
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x50);
+    }
+
+    #[test]
+    fn device_identity_hash_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let d = DeviceIdentityHash([0xcd; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&d, &mut bytes).unwrap();
+        let recovered: DeviceIdentityHash = from_reader(&bytes[..]).unwrap();
+        assert_eq!(d, recovered);
+    }
 }
 
 #[cfg(test)]
@@ -512,7 +856,7 @@ mod enum_tests {
 /// The unified Space CRDT entry — see ZEB-206 spec §"Space — unified
 /// entry in owner-state CRDT".
 ///
-/// Wire-format note: every field is renamed to a 2-char code so all 12
+/// Wire-format note: every field is renamed to a 2-char code so all 14
 /// keys at this nesting level have identical encoded length (CBOR
 /// text(2) = 3 bytes per key). Mixing 1-char and 2-char renames here
 /// would re-introduce the same-length-keys violation Hlc had before
@@ -543,20 +887,61 @@ pub struct Space {
     pub created_at: Hlc,
     #[serde(rename = "ua")]
     pub updated_at: Hlc,
+
+    /// Per-DM-Space symmetric content key (ChaCha20-Poly1305).
+    /// MUST be Some for kind ∈ {dm, group-dm}; MUST be None otherwise.
+    /// (Enforcement via validate_invariants lands in Task 3.)
+    /// Wire format: bstr(32) inside the Space CBOR map under key "ck".
+    /// In-memory: zeroized on drop via DmContentKey's ZeroizeOnDrop impl.
+    /// See ZEB-216 §"Space struct additions (Phase 1)".
+    #[serde(rename = "ck", skip_serializing_if = "Option::is_none", default)]
+    pub content_key: Option<DmContentKey>,
+
+    /// Historical content keys retained from past dedupe-collision merges.
+    /// Used as fallback decryption for messages encrypted under a now-
+    /// superseded key. Bounded by MAX_PRIOR_CONTENT_KEYS = 16.
+    /// MUST NOT contain the current `content_key`.
+    /// MUST be empty for non-DM kinds.
+    /// Wire format: array of bstr(32) under key "pk".
+    ///
+    /// `deserialize_with` re-normalizes (sort + dedup + truncate) on every
+    /// load so persisted-state files and remote replicas can't hand us a
+    /// `Vec` that violates the canonical-form invariant — `validate_
+    /// invariants` runs only on apply, not on initial load, so without
+    /// this hook a corrupted file's malformed priors would round-trip
+    /// through `save_crdt` and break root_cid convergence with peers.
+    #[serde(
+        rename = "pk",
+        skip_serializing_if = "Vec::is_empty",
+        default,
+        deserialize_with = "deserialize_prior_content_keys"
+    )]
+    pub prior_content_keys: Vec<DmContentKey>,
 }
 
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
 /// across two devices' independent writes. See ZEB-206 spec
 /// §"Dedupe key per Space kind".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Also used as the AAD seed for DM encryption (see `dm_crypto::compute_aad`):
+/// canonical CBOR of the dedupe key is stable across cross-SpaceId collapses.
+/// Adjacently tagged: tag key `"tg"` (2 chars), content key `"vl"` (2 chars
+/// to match the same-length-keys precondition at this nesting level);
+/// variant codes `"n"/"i"/"t"/"s"` (1-char values, not keys).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "tg", content = "vl")]
 pub enum DedupeKey {
     /// Folders never dedupe — same name on different devices = different folders.
+    #[serde(rename = "n")]
     None,
     /// Community / channel / group-dm: by Space.id.
+    #[serde(rename = "i")]
     Id(SpaceId),
     /// public-channel: by Zenoh topic string.
+    #[serde(rename = "t")]
     Topic(String),
     /// dm: by sorted members (immutable 2-member set).
+    #[serde(rename = "s")]
     SortedMembers(Vec<OwnerAddr>),
 }
 
@@ -658,6 +1043,76 @@ impl Space {
                 // — that lives in Sub-C scope, not validated here.
             }
         }
+
+        // Content-key invariants per ZEB-216 §"Validate invariants extension".
+        match self.kind {
+            SpaceKind::Dm | SpaceKind::GroupDm => {
+                if self.content_key.is_none() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind requires content_key",
+                        self.kind
+                    )));
+                }
+            }
+            _ => {
+                if self.content_key.is_some() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind must not have content_key",
+                        self.kind
+                    )));
+                }
+                if !self.prior_content_keys.is_empty() {
+                    return Err(InvariantError(format!(
+                        "{:?} kind must not have prior_content_keys",
+                        self.kind
+                    )));
+                }
+            }
+        }
+
+        if self.prior_content_keys.len() > MAX_PRIOR_CONTENT_KEYS {
+            return Err(InvariantError(format!(
+                "prior_content_keys.len()={} exceeds MAX_PRIOR_CONTENT_KEYS={}",
+                self.prior_content_keys.len(),
+                MAX_PRIOR_CONTENT_KEYS
+            )));
+        }
+
+        // Canonical-form invariant: prior_content_keys must be
+        // strictly-ascending sorted (catches both unsorted ordering
+        // and adjacent duplicates in one predicate).
+        // `merge_prior_content_keys` always emits canonical
+        // (sorted+deduped) output, so a non-canonical value here
+        // represents malformed wire data, corrupted on-disk state,
+        // or a bug elsewhere. Space serializes via canonical_cbor_encode
+        // into the encrypted root blob — two replicas with semantically-
+        // equal but differently-ordered prior_content_keys would
+        // produce different canonical bytes (and thus different
+        // root_cids), breaking convergence. Enforce strictly so this
+        // invariant remains load-bearing.
+        if !self
+            .prior_content_keys
+            .windows(2)
+            .all(|w| w[0].as_bytes() < w[1].as_bytes())
+        {
+            return Err(InvariantError(
+                "prior_content_keys must be sorted ascending lex (catches unsorted and duplicated)"
+                    .into(),
+            ));
+        }
+
+        if let Some(ck) = &self.content_key {
+            if self
+                .prior_content_keys
+                .iter()
+                .any(|p| p.as_bytes() == ck.as_bytes())
+            {
+                return Err(InvariantError(
+                    "content_key must not appear in prior_content_keys".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -682,7 +1137,7 @@ impl Space {
     }
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryStatus {
@@ -984,6 +1439,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1023,6 +1480,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(mk_dm(0).validate_invariants().is_err());
         assert!(mk_dm(1).validate_invariants().is_err());
@@ -1047,6 +1506,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(mk(2).validate_invariants().is_err());
         assert!(mk(3).validate_invariants().is_ok());
@@ -1074,6 +1535,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
         // Distinct members still pass.
@@ -1103,6 +1566,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(d.validate_invariants().is_err());
         // Sorted ascending passes.
@@ -1131,6 +1596,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
         g.members = vec![
@@ -1165,6 +1632,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         assert!(g.validate_invariants().is_err());
     }
@@ -1185,6 +1654,8 @@ mod space_tests {
                 left_at: None,
                 created_at: hlc(1),
                 updated_at: hlc(1),
+                content_key: None,
+                prior_content_keys: vec![],
             };
         // Missing community_id → reject.
         assert!(
@@ -1232,6 +1703,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         let a = OwnerAddr([1u8; 16]);
         let b = OwnerAddr([2u8; 16]);
@@ -1259,6 +1732,8 @@ mod space_tests {
             left_at: None,
             created_at: hlc(1),
             updated_at: hlc(1),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert_eq!(
             pc.dedupe_key(),
@@ -1276,5 +1751,548 @@ mod space_tests {
         ciborium::into_writer(&s, &mut bytes).unwrap();
         let recovered: Space = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(s, recovered);
+    }
+
+    #[test]
+    fn dm_must_have_content_key() {
+        let mut d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None, // ← invariant violation
+            prior_content_keys: vec![],
+        };
+        assert!(d.validate_invariants().is_err());
+        d.content_key = Some(DmContentKey::new([0xaa; 32]));
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn group_dm_must_have_content_key() {
+        let mut d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: (0u8..3).map(|i| OwnerAddr([i; 16])).collect(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+        };
+        assert!(d.validate_invariants().is_err());
+        d.content_key = Some(DmContentKey::new([0xaa; 32]));
+        assert!(d.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn folder_rejects_content_key() {
+        let f = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])), // ← invariant violation
+            prior_content_keys: vec![],
+        };
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn folder_rejects_prior_content_keys() {
+        let f = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![DmContentKey::new([0xbb; 32])], // ← invariant violation
+        };
+        assert!(f.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn dm_content_key_in_prior_list_rejects() {
+        let dup = DmContentKey::new([0xaa; 32]);
+        let d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(dup.clone()),
+            prior_content_keys: vec![dup], // ← same as content_key — violation
+        };
+        assert!(d.validate_invariants().is_err());
+    }
+
+    #[test]
+    fn dm_prior_content_keys_cap_exceeded_rejects() {
+        let d = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: (0u8..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
+                .map(|i| DmContentKey::new([i; 32]))
+                .collect(),
+        };
+        assert!(d.validate_invariants().is_err());
+    }
+
+    /// Builds a valid DM Space with the supplied prior_content_keys
+    /// vec. Used by the canonical-form tests below to isolate the
+    /// new sorted-strict invariant from unrelated DM-shape rules.
+    fn dm_with_priors(priors: Vec<DmContentKey>) -> Space {
+        Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            // Pick a content_key disjoint from the prior fixtures
+            // below so the existing "content_key not in priors" check
+            // never fires by accident.
+            content_key: Some(DmContentKey::new([0xff; 32])),
+            prior_content_keys: priors,
+        }
+    }
+
+    #[test]
+    fn validate_invariants_rejects_unsorted_prior_content_keys() {
+        // Descending order violates the canonical-form invariant:
+        // merge_prior_content_keys always emits sorted output, so a
+        // non-canonical value here means malformed wire data,
+        // corrupted on-disk state, or a bug elsewhere. Two replicas
+        // with semantically-equal but differently-ordered priors
+        // would produce different canonical CBOR bytes (and thus
+        // different root_cids), breaking convergence.
+        let d = dm_with_priors(vec![
+            DmContentKey::new([0x22; 32]),
+            DmContentKey::new([0x11; 32]),
+        ]);
+        let err = d.validate_invariants().unwrap_err();
+        assert!(
+            err.0.contains("prior_content_keys") && err.0.contains("ascending"),
+            "expected prior_content_keys + ascending in error, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_invariants_rejects_duplicate_prior_content_keys() {
+        // Strict `<` collapses both unsorted and adjacent-duplicate
+        // checks into one predicate. A duplicated key must reject
+        // for the same convergence reason as unsorted.
+        let dup = DmContentKey::new([0x11; 32]);
+        let d = dm_with_priors(vec![dup.clone(), dup]);
+        let err = d.validate_invariants().unwrap_err();
+        assert!(
+            err.0.contains("prior_content_keys") && err.0.contains("ascending"),
+            "expected prior_content_keys + ascending in error, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_invariants_accepts_sorted_deduped_prior_content_keys() {
+        // Smoke check: the canonical form (strictly-ascending,
+        // deduped) must still pass. Single-element and multi-element
+        // sorted vectors both validate.
+        let one = dm_with_priors(vec![DmContentKey::new([0x11; 32])]);
+        assert!(one.validate_invariants().is_ok());
+
+        let many = dm_with_priors(vec![
+            DmContentKey::new([0x11; 32]),
+            DmContentKey::new([0x22; 32]),
+            DmContentKey::new([0x33; 32]),
+        ]);
+        assert!(many.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_prior_content_keys() {
+        use ciborium::{from_reader, into_writer};
+        // Build a Space with MAX_PRIOR_CONTENT_KEYS+1 distinct prior keys.
+        // `merge_prior_content_keys` always emits ≤ cap entries, so any
+        // wire input above the cap is malformed by definition. The
+        // streaming visitor MUST reject (rather than silently truncate)
+        // so a buggy peer dropping prior keys we'd need for fallback
+        // decryption surfaces loudly instead of being hidden by a quiet
+        // truncate.
+        let oversized: Vec<DmContentKey> = (0..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
+            .map(|i| DmContentKey::new([i; 32]))
+            .collect();
+        // dm_with_priors uses content_key = [0xff; 32]; oversized uses
+        // bytes 0..=cap which never reaches 0xff, so content_key never
+        // appears in priors.
+        let space = dm_with_priors(oversized);
+
+        let mut bytes = Vec::new();
+        into_writer(&space, &mut bytes).expect("encode space with oversized priors");
+
+        let err = from_reader::<Space, _>(&bytes[..]).expect_err("decode must reject oversized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_PRIOR_CONTENT_KEYS") || msg.contains("DmContentKey"),
+            "expected error mentioning cap/type, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_prior_content_keys() {
+        use ciborium::{from_reader, into_writer};
+        // Build a Space with within-cap pathologies (unsorted +
+        // duplicates) — total entries ≤ MAX_PRIOR_CONTENT_KEYS so the
+        // cap-rejection path doesn't fire. After CBOR round-trip the
+        // deserialize_with hook MUST restore canonical form
+        // (strictly-ascending bytes, no duplicates). Without this hook
+        // a corrupted on-disk file would round-trip through save_crdt
+        // unchanged and break root_cid convergence with peers.
+        //
+        // Layout: 4 copies of [0xee; 32] (dups) + 10 distinct descending
+        // keys = 14 entries total (within the 16-key cap).
+        let mut malformed: Vec<DmContentKey> = Vec::with_capacity(14);
+        for _ in 0..4 {
+            malformed.push(DmContentKey::new([0xee; 32]));
+        }
+        for i in (0..10u8).rev() {
+            malformed.push(DmContentKey::new([i; 32]));
+        }
+        assert!(
+            malformed.len() <= MAX_PRIOR_CONTENT_KEYS,
+            "test fixture must stay within cap to isolate the normalize path"
+        );
+        // dm_with_priors uses content_key = [0xff; 32]; malformed uses
+        // bytes 0..10 plus 0xee, so content_key never appears in priors.
+        let space = dm_with_priors(malformed);
+
+        let mut bytes = Vec::new();
+        into_writer(&space, &mut bytes).expect("encode space with malformed priors");
+
+        let decoded: Space = from_reader(&bytes[..]).expect("decode space");
+
+        // After dedup we have 10 distinct + 1 [0xee] = 11 keys.
+        assert_eq!(
+            decoded.prior_content_keys.len(),
+            11,
+            "expected 11 unique keys after dedup"
+        );
+        // Strictly ascending by raw bytes — required for canonical-form
+        // convergence and for validate_invariants to accept on next apply.
+        assert!(
+            decoded
+                .prior_content_keys
+                .windows(2)
+                .all(|w| w[0].as_bytes() < w[1].as_bytes()),
+            "expected strictly-ascending priors after normalization"
+        );
+        // Position 0 is lex-smallest: the [0; 32] key.
+        assert_eq!(
+            decoded.prior_content_keys[0].as_bytes(),
+            &[0u8; 32],
+            "expected lex-smallest key (all zeros) at position 0"
+        );
+        // Round-tripped Space must still pass validate_invariants —
+        // proves the normalized form satisfies every downstream check.
+        decoded
+            .validate_invariants()
+            .expect("normalized priors must pass validate_invariants");
+    }
+
+    #[test]
+    fn space_dm_with_content_key_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "alice-bob".to_string(),
+            transport: None,
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
+        };
+        let mut bytes = Vec::new();
+        into_writer(&s, &mut bytes).unwrap();
+        let recovered: Space = from_reader(&bytes[..]).unwrap();
+        assert_eq!(s, recovered);
+    }
+
+    #[test]
+    fn space_folder_omits_content_key_keys_in_cbor() {
+        use ciborium::into_writer;
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "Work".to_string(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+        };
+        let mut bytes = Vec::new();
+        into_writer(&s, &mut bytes).unwrap();
+        // Folder serialization MUST NOT contain the "ck" or "pk" map keys —
+        // the skip_serializing_if attributes elide them. Crude check: the
+        // text strings "ck" and "pk" should not appear in the encoded bytes.
+        let needle_ck = b"ck";
+        let needle_pk = b"pk";
+        assert!(
+            !bytes.windows(2).any(|w| w == needle_ck),
+            "Folder serialization unexpectedly contains 'ck' key"
+        );
+        assert!(
+            !bytes.windows(2).any(|w| w == needle_pk),
+            "Folder serialization unexpectedly contains 'pk' key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_device_entry_deserialize_tests {
+    use super::*;
+
+    /// Parallel struct that bypasses `OwnerDeviceEntry`'s `deserialize_with`
+    /// hook so the test can plant a malformed `devices` Vec on the wire and
+    /// assert the real type re-normalizes on load.
+    #[derive(Serialize)]
+    struct RawOwnerDeviceEntry {
+        #[serde(rename = "v")]
+        v: Vec<DeviceIdentityHash>,
+        #[serde(rename = "l")]
+        l: Hlc,
+    }
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc {
+            wall_ms: ms,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_devices() {
+        // A wire input with > MAX_DEVICES_PER_OWNER (32) device hashes
+        // is malformed by definition: `apply_owner_device_update` always
+        // emits ≤ cap entries. The streaming visitor MUST reject (rather
+        // than silently truncate) so a buggy peer dropping device entries
+        // we'd need for DM delivery surfaces loudly. This is also the
+        // OOM-safety property: an attacker declaring `array(2^32-1)` of
+        // 16-byte hashes would otherwise force a multi-GB allocation
+        // before any cap took effect.
+        let oversized: Vec<DeviceIdentityHash> = (0..(MAX_DEVICES_PER_OWNER as u8 + 1))
+            .map(|i| DeviceIdentityHash([i; 16]))
+            .collect();
+        let raw = RawOwnerDeviceEntry {
+            v: oversized,
+            l: hlc(7),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let err = ciborium::from_reader::<OwnerDeviceEntry, _>(&bytes[..])
+            .expect_err("decode must reject oversized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_DEVICES_PER_OWNER") || msg.contains("DeviceIdentityHash"),
+            "expected error mentioning cap/type, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_duplicated_devices() {
+        // Build a payload with within-cap pathologies (duplicates +
+        // unsorted) — total entries ≤ MAX_DEVICES_PER_OWNER so the
+        // cap-rejection path doesn't fire. After normalization the
+        // result must be sorted and deduped — anything else breaks
+        // binary_search in resolve_link_origin_owner (Phase 3b).
+        //
+        // Layout: 5 copies of [0xff; 16] + 25 distinct descending
+        // hashes = 30 entries total (within the 32-device cap).
+        let mut malformed: Vec<DeviceIdentityHash> = Vec::with_capacity(30);
+        for _ in 0..5 {
+            malformed.push(DeviceIdentityHash([0xff; 16]));
+        }
+        for i in (0..25u8).rev() {
+            malformed.push(DeviceIdentityHash([i; 16]));
+        }
+        assert!(
+            malformed.len() <= MAX_DEVICES_PER_OWNER,
+            "test fixture must stay within cap to isolate the normalize path"
+        );
+
+        let raw = RawOwnerDeviceEntry {
+            v: malformed,
+            l: hlc(7),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
+
+        // After dedup: 25 distinct (0..25) + 1 [0xff; 16] = 26 hashes.
+        assert_eq!(entry.devices.len(), 26);
+        // Sorted ascending — required for binary_search.
+        assert!(entry.devices.windows(2).all(|w| w[0] <= w[1]));
+        // Deduped — no consecutive equal entries (and given sorted, no dups
+        // anywhere).
+        assert!(entry.devices.windows(2).all(|w| w[0] != w[1]));
+        // Lex-smallest survives normalization: the smallest hash is
+        // [0; 16], so position 0 must be [0; 16].
+        assert_eq!(entry.devices[0], DeviceIdentityHash([0; 16]));
+        // learned_at preserved from the wire.
+        assert_eq!(entry.learned_at, hlc(7));
     }
 }

@@ -526,6 +526,61 @@ impl IncomingOutcome {
     }
 }
 
+/// Merge each entry from a decoded remote `OwnerState` snapshot into
+/// `local`, in the load-bearing order documented inside (see the
+/// "spaces first → outbox → inbox → markers → tombstones →
+/// owner_device_cache" comment).
+///
+/// Extracted from `handle_incoming_publish` so the merge invariants
+/// (in particular, that tombstone application clears any matching
+/// live Space even if the snapshot carries both) are unit-testable
+/// without spinning up the SyncEngine wire harness.
+fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
+    // Destructure `remote` up front so each field can be moved through
+    // its own loop without partial-move conflicts later.
+    let OwnerState {
+        spaces,
+        outbox,
+        inbox,
+        markers,
+        tombstones,
+        owner_device_cache,
+    } = remote;
+    for (_, space) in spaces {
+        local.apply_space_with_canonicalization(space);
+    }
+    for (_, entry) in outbox {
+        local.apply_outbox(entry);
+    }
+    for (_, entry) in inbox {
+        local.apply_inbox(entry);
+    }
+    for (_, marker) in markers {
+        local.apply_marker(marker);
+    }
+    for tomb in tombstones {
+        // Route through tombstone_space (defined in
+        // owner_state_crdt.rs) so the live Space is removed in the
+        // same step the tombstone is recorded. A naked
+        // tombstones.insert leaves the spaces loop above in charge
+        // of dropping the live entry — but a malformed (or racing)
+        // remote snapshot can carry both spaces[id] AND
+        // tombstones[id] for the same id, which would leave local
+        // state with the live Space alongside its tombstone.
+        // tombstone_space's spaces.remove + tombstones.insert is
+        // idempotent and order-independent.
+        local.tombstone_space(tomb);
+    }
+    // Replicate the remote's per-OwnerAddr device cache. Without this
+    // loop, OwnerDeviceCache updates on one of the user's devices
+    // never propagate to the others (Phase 3b's link-origin resolver
+    // would only see entries learned locally), breaking DM unicast
+    // addressing convergence across bound devices.
+    for (addr, entry) in owner_device_cache.devices {
+        local.apply_owner_device_update(addr, entry.devices, entry.learned_at);
+    }
+}
+
 /// Process an incoming publish. See `IncomingOutcome` for the
 /// return-value semantics.
 #[allow(clippy::needless_pass_by_ref_mut)]
@@ -592,24 +647,17 @@ async fn handle_incoming_publish(ctx: &mut InternalCtx, wire: Vec<u8>) -> Incomi
     // 6. Merge each entry through Phase 2's CRDT methods. Order
     //    matters slightly — Spaces must merge first because outbox/
     //    inbox/markers reference SpaceIds that the canonicalization
-    //    rewrite needs to see resolved.
+    //    rewrite needs to see resolved. owner_device_cache is
+    //    independent of the others (keyed by OwnerAddr, not SpaceId)
+    //    so its merge order doesn't matter — placed last for grouping.
+    //    See `merge_remote_into_local` for the per-loop semantics
+    //    (in particular the tombstone arm: route through
+    //    `tombstone_space` so a malformed/racing remote carrying both
+    //    spaces[id] and tombstones[id] cannot leave a live entry
+    //    behind).
     {
         let mut local = ctx.state.lock().await;
-        for (_, space) in remote.spaces {
-            local.apply_space_with_canonicalization(space);
-        }
-        for (_, entry) in remote.outbox {
-            local.apply_outbox(entry);
-        }
-        for (_, entry) in remote.inbox {
-            local.apply_inbox(entry);
-        }
-        for (_, marker) in remote.markers {
-            local.apply_marker(marker);
-        }
-        for tomb in remote.tombstones {
-            local.tombstones.insert(tomb);
-        }
+        merge_remote_into_local(&mut local, remote);
     }
 
     // Tracker advanced and merge ran.
@@ -999,6 +1047,8 @@ mod subscriber_tests {
                 logical: 0,
                 device_id: "test".into(),
             },
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1314,6 +1364,7 @@ mod integration_tests {
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         let mut sorted = members.clone();
         sorted.sort();
         Space {
@@ -1339,6 +1390,8 @@ mod integration_tests {
                 logical: 0,
                 device_id: "test".into(),
             },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         }
     }
 
@@ -1591,6 +1644,93 @@ mod integration_tests {
 
         let _ = dev.a_engine.shutdown().await;
         let _ = dev.b_engine.shutdown().await;
+    }
+
+    /// OwnerDeviceCache must replicate over Flow A sync. Without the
+    /// owner_device_cache loop in `handle_incoming_publish`, an entry
+    /// learned on device A would never appear on device B even after
+    /// successful state-root sync — Phase 3b's link-origin resolver on
+    /// B would fail to bind incoming DM messages from the same OwnerAddr
+    /// to the right contact.
+    #[tokio::test]
+    async fn owner_device_cache_converges_through_sync() {
+        use crate::owner_state_types::DeviceIdentityHash;
+
+        let dev = spawn_two_devices(231);
+
+        let owner = OwnerAddr([0x42; 16]);
+        let learned = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "device-a".into(),
+        };
+        let devices = vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([9; 16])];
+
+        // A learns a per-OwnerAddr device list.
+        {
+            let mut a = dev.a_state.lock().await;
+            a.apply_owner_device_update(owner, devices.clone(), learned.clone());
+        }
+        dev.a_engine.notify_dirty();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // B must see the same entry replicated through state-root sync.
+        let b = dev.b_state.lock().await;
+        let b_entry = b
+            .owner_device_cache
+            .devices
+            .get(&owner)
+            .expect("B should have replicated the OwnerDeviceCache entry from A");
+        assert_eq!(
+            b_entry.devices, devices,
+            "B's replicated devices vec must match A's"
+        );
+        assert_eq!(
+            b_entry.learned_at, learned,
+            "B's replicated learned_at HLC must match A's"
+        );
+        drop(b);
+
+        let _ = dev.a_engine.shutdown().await;
+        let _ = dev.b_engine.shutdown().await;
+    }
+
+    /// Round-5 fix: a remote snapshot containing both `spaces[id]`
+    /// AND `tombstones[id]` for the same id (malformed, or a
+    /// genuine race between two devices) must NOT leave the local
+    /// state holding the live Space alongside its tombstone. The
+    /// pre-fix code did `tombstones.insert(id)` directly, so the
+    /// spaces loop running first would leave `local.spaces[id]`
+    /// behind. The new code routes through `tombstone_space`,
+    /// which removes the live entry idempotently regardless of
+    /// loop order.
+    #[tokio::test]
+    async fn remote_snapshot_with_both_space_and_tombstone_clears_live() {
+        let mut local = OwnerState::default();
+
+        let space_id = SpaceId([0x77; 16]);
+        let live = Space {
+            id: space_id,
+            ..dm(0x77, vec![1, 2], 1000)
+        };
+
+        // Build a remote snapshot whose `spaces` and `tombstones`
+        // both reference the same id — the racy/malformed shape
+        // the fix defends against.
+        let mut remote = OwnerState::default();
+        remote.spaces.insert(space_id, live);
+        remote.tombstones.insert(space_id);
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            local.tombstones.contains(&space_id),
+            "tombstone must be recorded"
+        );
+        assert!(
+            !local.spaces.contains_key(&space_id),
+            "live Space must be cleared even when remote snapshot carries both spaces[id] and tombstones[id]"
+        );
     }
 
     /// 50 randomized sequences of (mutate-on-A, mutate-on-B,

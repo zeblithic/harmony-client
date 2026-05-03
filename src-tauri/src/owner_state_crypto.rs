@@ -830,16 +830,26 @@ mod tests {
         assert_canonical::<OwnerAddr>();
         assert_canonical::<ContentId>();
         assert_canonical::<OutboxEntryId>();
+        assert_canonical::<DmContentKey>();
+        assert_canonical::<DeviceIdentityHash>();
+        assert_canonical::<OwnerDeviceCache>();
+        assert_canonical::<OwnerDeviceEntry>();
         assert_canonical::<SpaceKind>();
         assert_canonical::<NotificationPref>();
         assert_canonical::<ReticulumDest>();
         assert_canonical::<TransportBinding>();
         assert_canonical::<Space>();
+        assert_canonical::<DedupeKey>();
         assert_canonical::<DeliveryStatus>();
         assert_canonical::<OutboxEntry>();
         assert_canonical::<InboxKey>();
         assert_canonical::<InboxEntry>();
         assert_canonical::<ReadMarker>();
+        // dm_envelope wire types (ZEB-216 Sub-B Phase 1)
+        assert_canonical::<crate::dm_envelope::MessagePayload>();
+        assert_canonical::<crate::dm_envelope::DmInvite>();
+        assert_canonical::<crate::dm_envelope::DmCidNotify>();
+        assert_canonical::<crate::dm_envelope::DmAck>();
     }
 
     #[test]

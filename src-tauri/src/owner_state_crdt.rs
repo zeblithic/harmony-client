@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, InboxEntry, InboxKey, OutboxEntry, OutboxEntryId, OwnerAddr,
-    ReadMarker, Space, SpaceId,
+    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
+    OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space,
+    SpaceId, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,16 @@ pub struct OwnerState {
     /// `Space.left_at` which is reversible.
     #[serde(rename = "tm")]
     pub tombstones: BTreeSet<SpaceId>,
+    /// ZEB-216 Sub-B Phase 1: per-OwnerAddr device cache for DM unicast
+    /// addressing. Replicates across the owner's bound devices via Flow A.
+    /// (Phase 3b will use this to resolve from_identity_hash → OwnerAddr
+    /// for link-origin binding.)
+    #[serde(
+        rename = "od",
+        skip_serializing_if = "OwnerDeviceCache::is_empty",
+        default
+    )]
+    pub owner_device_cache: OwnerDeviceCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +139,22 @@ impl OwnerState {
                     "same-SpaceId update would change dedupe_key for {:?} \
                      (DM members or PublicChannel topic are immutable on \
                      the same SpaceId; logical identity changes need a fresh ULID)",
+                    incoming.id
+                )));
+            }
+            // Reject same-SpaceId content_key changes. lww_merge_space picks
+            // the current content_key by ULID order, but on a same-SpaceId
+            // merge both sides share the same `id` so "winner" is undefined
+            // — each replica's local Space wins on its own machine and the
+            // active key diverges permanently. Phase 1 has no key rotation
+            // API; content_key is set at Space creation and is immutable for
+            // that ULID. Future explicit rotation will need its own merge
+            // semantics.
+            if existing.content_key != incoming.content_key {
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "same-SpaceId update changes content_key for {:?} \
+                     (key rotation needs explicit semantics; current-key \
+                     merges must stay deterministic on the same ULID)",
                     incoming.id
                 )));
             }
@@ -405,6 +432,116 @@ impl OwnerState {
             }
         }
     }
+
+    /// Apply a device-list update for an OwnerAddr. LWW on `learned_at` HLC;
+    /// devices are deduped + sorted + capped at MAX_DEVICES_PER_OWNER before
+    /// storage to bound cache memory and prevent cache-growth DoS via spoofed
+    /// updates.
+    ///
+    /// Equal-HLC semantics deliberately differ from `apply_marker`. A marker's
+    /// payload is uniquely identified by its HLC (the marker IS the HLC), so
+    /// equal-HLC replay is always idempotent. `OwnerDeviceEntry` carries a
+    /// separate `devices` payload, so equal-HLC must additionally check that
+    /// the payload matches before treating it as a replay; otherwise two
+    /// replicas that concurrently issue different `devices` lists under the
+    /// same HLC would each keep their local list and report success, leaving
+    /// the cache permanently divergent. Equal-HLC + matching devices →
+    /// idempotent `Merged { old_id: None }`; equal-HLC + diverging devices →
+    /// `Rejected(InvariantFail)`.
+    ///
+    /// See ZEB-216 §"OwnerDeviceCache (Phase 1)".
+    pub fn apply_owner_device_update(
+        &mut self,
+        addr: OwnerAddr,
+        devices: Vec<DeviceIdentityHash>,
+        learned_at: Hlc,
+    ) -> ApplyOutcome {
+        // Sanitize first so the equal-HLC payload check below can compare
+        // semantically-equal lists (the on-the-wire vec might be unsorted /
+        // duplicated / oversized; the stored vec is always normalized).
+        let mut sanitized = devices;
+        sanitized.sort();
+        sanitized.dedup();
+        sanitized.truncate(MAX_DEVICES_PER_OWNER);
+        // LWW guard.
+        if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
+            if existing.learned_at.is_strictly_newer_than(&learned_at) {
+                return ApplyOutcome::Rejected(RejectionReason::StaleHlc {
+                    kind: "owner_device_entry",
+                    device_id: learned_at.device_id.clone(),
+                });
+            }
+            if existing.learned_at == learned_at {
+                // Equal HLC — only idempotent if the payload matches. Two
+                // replicas concurrently issuing different `devices` under the
+                // same HLC would otherwise diverge silently.
+                if existing.devices == sanitized {
+                    return ApplyOutcome::Merged { old_id: None };
+                }
+                return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                    "owner_device_entry for {:?} diverges at identical learned_at \
+                     (concurrent updates with same HLC but different devices)",
+                    addr
+                )));
+            }
+        }
+        let was_present = self.owner_device_cache.devices.contains_key(&addr);
+        self.owner_device_cache.devices.insert(
+            addr,
+            OwnerDeviceEntry {
+                devices: sanitized,
+                learned_at,
+            },
+        );
+        if was_present {
+            ApplyOutcome::Merged { old_id: None }
+        } else {
+            ApplyOutcome::Inserted
+        }
+    }
+}
+
+/// Merge two sides' content keys per ZEB-216 §"Dedupe-merge cap rule":
+///   1. Take winner.prior, plus loser.current as a one-element addition,
+///      plus loser.prior.
+///   2. Filter out winner.current (the active key MUST NOT appear in prior
+///      per validate_invariants).
+///   3. Sort ascending lex by raw key bytes.
+///   4. Dedup (set-semantics on byte equality).
+///   5. Truncate to MAX_PRIOR_CONTENT_KEYS.
+///
+/// For same-SpaceId LWW merges, pass `loser_current == winner_current` —
+/// the duplicate gets filtered in step 2 so the operation is the same.
+///
+/// Order-independent (CRDT-convergent) under multi-merge — see ZEB-219
+/// §"Why first N of sorted" for the proof and the 5-Space convergence
+/// regression test in this module.
+///
+/// SECURITY NOTE: truncation keeps lex-smallest entries. An attacker
+/// who can publish a Space (winning the LWW gate) with a chosen
+/// content_key could grind low-byte keys to displace legitimate prior
+/// keys from the cap, making earlier messages encrypted under those
+/// keys silently undecryptable. Acceptable in Phase 1 since the LWW
+/// gate (HLC + ULID) limits attack feasibility. Same class as the
+/// OwnerDeviceCache lex-grinding concern documented on
+/// OwnerDeviceEntry.devices and ZEB-219's prior_content_keys discussion.
+pub(crate) fn merge_prior_content_keys(
+    winner_current: &DmContentKey,
+    winner_prior: &[DmContentKey],
+    loser_current: &DmContentKey,
+    loser_prior: &[DmContentKey],
+) -> Vec<DmContentKey> {
+    let mut all: Vec<DmContentKey> = winner_prior
+        .iter()
+        .cloned()
+        .chain(std::iter::once(loser_current.clone()))
+        .chain(loser_prior.iter().cloned())
+        .filter(|k| k.as_bytes() != winner_current.as_bytes())
+        .collect();
+    all.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    all.dedup(); // PartialEq is byte-equality on the inner [u8; 32]
+    all.truncate(MAX_PRIOR_CONTENT_KEYS);
+    all
 }
 
 /// Merge two Space values using last-writer-wins per-field on
@@ -418,12 +555,66 @@ impl OwnerState {
 /// HLC's logical+device_id components mean exact-equality is rare in
 /// practice (two devices would need identical wall_ms AND identical
 /// logical AND identical device_id, which collapses to "the same write").
+///
+/// content_key/prior_content_keys: for DM spaces, applies the
+/// ZEB-216 §"Dedupe-merge cap rule" via `merge_prior_content_keys`.
+/// The winner for content_key purposes is the Space with the lex-smaller
+/// `id` ULID (stable across same-SpaceId and cross-SpaceId merges).
+/// For same-SpaceId merges, both sides have the same id so the winner
+/// pick is moot; v1 has no key rotation so content_key is identical on
+/// both sides anyway.
+///
+/// Dual-semantics rationale: mutable fields (name, parent, custom_name,
+/// etc.) use HLC LWW — the side with the strictly-newer `updated_at`
+/// wins. content_key/prior_content_keys use ULID LWW (lex-smaller `id`
+/// wins) instead. This is intentional: content_key must be
+/// topology-independent and stable across all merge orderings
+/// (CRDT-convergent), and `id` is set at creation and never updated,
+/// making it safe for that role. HLC could in principle be tied across
+/// two divergent devices and would not give a deterministic winner.
 fn lww_merge_space(a: &Space, b: &Space) -> Space {
     let newer = if b.updated_at.is_strictly_newer_than(&a.updated_at) {
         b
     } else {
         a
     };
+
+    // content_key/prior_content_keys: apply cap-rule merge for DM spaces.
+    // For same-SpaceId merges a.id == b.id so winner_is_a is arbitrary
+    // (content_key is identical in v1). For cross-SpaceId dedupe collapse,
+    // the lex-smaller ULID is the canonical winner.
+    let (content_key, prior_content_keys) = match (&a.content_key, &b.content_key) {
+        (Some(a_ck), Some(b_ck)) => {
+            // Determine winner by ULID lex order (smaller = winner).
+            let (winner_ck, winner_prior, loser_ck, loser_prior) = if a.id <= b.id {
+                (
+                    a_ck,
+                    &a.prior_content_keys[..],
+                    b_ck,
+                    &b.prior_content_keys[..],
+                )
+            } else {
+                (
+                    b_ck,
+                    &b.prior_content_keys[..],
+                    a_ck,
+                    &a.prior_content_keys[..],
+                )
+            };
+            let merged_prior =
+                merge_prior_content_keys(winner_ck, winner_prior, loser_ck, loser_prior);
+            (Some(winner_ck.clone()), merged_prior)
+        }
+        // Non-DM kinds have no content_key; keep as-is.
+        (None, None) => (None, vec![]),
+        // Mixed Some/None across the same dedupe_key is an invariant
+        // violation. validate_invariants runs before any merge, so this
+        // branch is only reachable if the caller bypassed it. Defensive:
+        // prefer whichever side has Some, carry no prior.
+        (Some(ck), None) => (Some(ck.clone()), vec![]),
+        (None, Some(ck)) => (Some(ck.clone()), vec![]),
+    };
+
     Space {
         id: newer.id,
         kind: newer.kind, // kind shouldn't change in practice; LWW for safety
@@ -443,6 +634,8 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
             a.created_at.clone()
         },
         updated_at: newer.updated_at.clone(),
+        content_key,
+        prior_content_keys,
     }
 }
 
@@ -473,10 +666,13 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         Space {
             id: SpaceId([id; 16]),
             kind: SpaceKind::Dm,
@@ -492,6 +688,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         }
     }
 
@@ -544,6 +742,86 @@ mod apply_space_tests {
             s.spaces.get(&SpaceId([5; 16])).unwrap().custom_name,
             Some("second".into())
         );
+    }
+
+    /// Same-SpaceId LWW merge: v1 has no key rotation so both sides have the
+    /// same content_key. The cap-rule merge on prior_content_keys must union
+    /// both sides' priors, dedup, sort, and cap. Winner content_key is
+    /// preserved unchanged.
+    #[test]
+    fn lww_merge_same_space_id_prior_content_keys_union() {
+        use crate::owner_state_types::DmContentKey;
+
+        let shared_key = DmContentKey::new([0xaa; 32]);
+
+        let a = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(shared_key.clone()),
+            prior_content_keys: vec![DmContentKey::new([0x10; 32])],
+        };
+        let b = Space {
+            id: SpaceId([1; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(2),
+            content_key: Some(shared_key.clone()),
+            prior_content_keys: vec![DmContentKey::new([0x20; 32])],
+        };
+
+        // Order-independent: both call orderings yield the same merged prior.
+        let merged_ab = lww_merge_space(&a, &b);
+        let merged_ba = lww_merge_space(&b, &a);
+
+        // content_key is unchanged.
+        assert_eq!(
+            merged_ab.content_key.as_ref().unwrap().as_bytes(),
+            &[0xaa; 32]
+        );
+        assert_eq!(
+            merged_ba.content_key.as_ref().unwrap().as_bytes(),
+            &[0xaa; 32]
+        );
+
+        // prior_content_keys is the union of both sides, sorted ascending,
+        // with winner_current (0xaa) filtered out. Result: [0x10, 0x20].
+        let ab_prior: Vec<[u8; 32]> = merged_ab
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        let ba_prior: Vec<[u8; 32]> = merged_ba
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        assert_eq!(
+            ab_prior, ba_prior,
+            "same-SpaceId merge must be order-independent"
+        );
+        assert_eq!(ab_prior, vec![[0x10; 32], [0x20; 32]]);
     }
 
     #[test]
@@ -629,6 +907,7 @@ mod apply_space_tests {
     /// and would slip through dedupe_key equality alone.
     #[test]
     fn same_id_kind_change_rejects() {
+        use crate::owner_state_types::DmContentKey;
         let mut s = OwnerState::default();
         // Seed a Channel.
         let channel = Space {
@@ -646,6 +925,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -666,6 +947,8 @@ mod apply_space_tests {
             left_at: None,
             created_at: hlc(200),
             updated_at: hlc(200),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -680,6 +963,48 @@ mod apply_space_tests {
         assert_eq!(
             s.spaces.get(&SpaceId([7; 16])).unwrap().kind,
             SpaceKind::Channel
+        );
+    }
+
+    /// Regression: a same-SpaceId DM update that swaps content_key must be
+    /// rejected. lww_merge_space picks the current content_key by ULID
+    /// order, but on a same-SpaceId merge both sides share the same `id` so
+    /// "winner" is undefined — each replica's local Space wins on its own
+    /// machine and the active key diverges silently. Phase 1 has no key
+    /// rotation API, so this is an outright invariant violation.
+    #[test]
+    fn same_id_dm_content_key_change_rejects() {
+        use crate::owner_state_types::DmContentKey;
+        let mut s = OwnerState::default();
+        // Seed DM with content_key = [0xaa; 32] (the helper's default).
+        assert_eq!(
+            s.apply_space(dm(1, vec![1, 2], 100)),
+            ApplyOutcome::Inserted
+        );
+
+        // Same SpaceId, same members, same kind, BUT content_key swapped to
+        // [0xbb; 32]. Must be rejected with a content_key-flavored message.
+        let mut rotated = dm(1, vec![1, 2], 200);
+        rotated.content_key = Some(DmContentKey::new([0xbb; 32]));
+        let outcome = s.apply_space(rotated);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("content_key"),
+                    "expected message mentioning content_key, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Rejected(InvariantFail) on content_key change, got {:?}",
+                other
+            ),
+        }
+        // Stored Space must still have the original content_key.
+        let stored = s.spaces.get(&SpaceId([1; 16])).unwrap();
+        assert_eq!(
+            stored.content_key,
+            Some(DmContentKey::new([0xaa; 32])),
+            "local content_key must not have changed"
         );
     }
 
@@ -1138,6 +1463,7 @@ mod canonicalization_tests {
     }
 
     fn dm(id: u8, members: Vec<u8>, ts: u64) -> Space {
+        use crate::owner_state_types::DmContentKey;
         Space {
             id: SpaceId([id; 16]),
             kind: SpaceKind::Dm,
@@ -1153,6 +1479,8 @@ mod canonicalization_tests {
             left_at: None,
             created_at: hlc(ts),
             updated_at: hlc(ts),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
         }
     }
 
@@ -1443,6 +1771,8 @@ mod crypto_integration_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
         }
     }
 
@@ -1513,6 +1843,7 @@ mod crypto_integration_tests {
     /// to converge them.
     #[test]
     fn dm_with_members_yields_identical_cipher_cid_across_devices() {
+        use crate::owner_state_types::DmContentKey;
         let dm = Space {
             id: SpaceId([42; 16]),
             kind: SpaceKind::Dm,
@@ -1529,6 +1860,8 @@ mod crypto_integration_tests {
             left_at: None,
             created_at: hlc(100),
             updated_at: hlc(100),
+            content_key: Some(DmContentKey::new([0xcc; 32])),
+            prior_content_keys: vec![],
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -1570,5 +1903,460 @@ mod crypto_integration_tests {
         let cid_a = blake3::hash(&blob_a);
         let cid_b = blake3::hash(&blob_b);
         assert_eq!(cid_a.as_bytes(), cid_b.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod owner_device_cache_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        DeviceIdentityHash, OwnerAddr, OwnerDeviceCache, MAX_DEVICES_PER_OWNER,
+    };
+
+    fn hlc(ms: u64) -> Hlc {
+        Hlc {
+            wall_ms: ms,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    #[test]
+    fn lww_newer_replaces() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = vec![DeviceIdentityHash([1; 16])];
+        let d2 = vec![DeviceIdentityHash([2; 16])];
+        // First insert at HLC=1 → Inserted
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d1.clone(), hlc(1));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+        // Second update at newer HLC=2 → Merged
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d2.clone(), hlc(2));
+        assert!(matches!(outcome2, ApplyOutcome::Merged { .. }));
+        // Cache reflects newer
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d2);
+    }
+
+    #[test]
+    fn lww_older_is_rejected() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = vec![DeviceIdentityHash([1; 16])];
+        let d2 = vec![DeviceIdentityHash([2; 16])];
+        // Establish at HLC=2
+        apply_owner_device_update_helper(&mut c, addr, d2.clone(), hlc(2));
+        // Older write at HLC=1 → Rejected (StaleHlc)
+        let outcome = apply_owner_device_update_helper(&mut c, addr, d1, hlc(1));
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectionReason::StaleHlc { .. })
+        ));
+        // Cache unchanged
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d2);
+    }
+
+    #[test]
+    fn lww_equal_hlc_is_idempotent_replay() {
+        // Sync replay flows deliver the same update to multiple devices, so
+        // an equal HLC + matching devices payload must not produce a spurious
+        // StaleHlc — return Merged without mutation.
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d = vec![DeviceIdentityHash([1; 16])];
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+        // Second call at SAME HLC AND SAME devices — must be idempotent
+        // Merged, not Rejected.
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d.clone(), hlc(5));
+        assert!(
+            matches!(outcome2, ApplyOutcome::Merged { old_id: None }),
+            "expected Merged on equal-HLC replay, got {:?}",
+            outcome2
+        );
+        // Cache unchanged.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d);
+    }
+
+    #[test]
+    fn lww_equal_hlc_diverging_devices_is_rejected() {
+        // Equal HLC + DIFFERENT devices payload is NOT a replay — it's a
+        // concurrent-update divergence. Without explicit rejection, two
+        // replicas that produced the entries independently would each keep
+        // their own list and report Merged, leaving the cache permanently
+        // divergent. Reject as InvariantFail and preserve the local list.
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d_a = vec![DeviceIdentityHash([1; 16])];
+        let d_b = vec![DeviceIdentityHash([2; 16])];
+
+        // Establish at hlc(5) with devices = d_a.
+        let outcome1 = apply_owner_device_update_helper(&mut c, addr, d_a.clone(), hlc(5));
+        assert!(matches!(outcome1, ApplyOutcome::Inserted));
+
+        // Same hlc(5) but different devices = d_b → Rejected(InvariantFail).
+        let outcome2 = apply_owner_device_update_helper(&mut c, addr, d_b, hlc(5));
+        match outcome2 {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("owner_device_entry"),
+                    "expected message mentioning owner_device_entry, got: {msg}"
+                );
+                assert!(
+                    msg.contains("identical learned_at") || msg.contains("learned_at"),
+                    "expected message to reference identical-HLC divergence, got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(InvariantFail), got {:?}", other),
+        }
+        // Local list preserved unchanged.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d_a);
+
+        // True replay (same HLC, same devices) is still Merged{old_id: None}.
+        let outcome3 = apply_owner_device_update_helper(&mut c, addr, d_a.clone(), hlc(5));
+        assert!(
+            matches!(outcome3, ApplyOutcome::Merged { old_id: None }),
+            "expected Merged on equal-HLC equal-devices replay, got {:?}",
+            outcome3
+        );
+        assert_eq!(c.devices.get(&addr).unwrap().devices, d_a);
+    }
+
+    #[test]
+    fn dedupes_input() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let d1 = DeviceIdentityHash([1; 16]);
+        let d2 = DeviceIdentityHash([2; 16]);
+        apply_owner_device_update_helper(&mut c, addr, vec![d1, d2, d1], hlc(1));
+        // Stored vec must be deduped + sorted.
+        assert_eq!(c.devices.get(&addr).unwrap().devices, vec![d1, d2]);
+    }
+
+    #[test]
+    fn caps_at_max_devices_per_owner() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let big: Vec<DeviceIdentityHash> =
+            (0..100u8).map(|i| DeviceIdentityHash([i; 16])).collect();
+        apply_owner_device_update_helper(&mut c, addr, big, hlc(1));
+        let stored = &c.devices.get(&addr).unwrap().devices;
+        assert_eq!(stored.len(), MAX_DEVICES_PER_OWNER);
+        // Lex-smallest entries survive — first 32 of [0..100].
+        assert_eq!(stored[0], DeviceIdentityHash([0; 16]));
+        assert_eq!(stored[31], DeviceIdentityHash([31; 16]));
+    }
+
+    #[test]
+    fn binary_search_works_after_apply() {
+        let mut c = OwnerDeviceCache::default();
+        let addr = OwnerAddr([1; 16]);
+        let target = DeviceIdentityHash([5; 16]);
+        let big: Vec<DeviceIdentityHash> = (0..10u8).map(|i| DeviceIdentityHash([i; 16])).collect();
+        apply_owner_device_update_helper(&mut c, addr, big, hlc(1));
+        // The cache stores devices sorted, so binary_search works (used by
+        // resolve_link_origin_owner in Phase 3b).
+        let stored = &c.devices.get(&addr).unwrap().devices;
+        assert!(stored.binary_search(&target).is_ok());
+    }
+
+    // Helper that lets the test pass without naming the public method twice.
+    // If apply_owner_device_update is a method on OwnerState rather than a
+    // free function, adapt: the helper either calls a free function in
+    // owner_state_crdt or a method on a fresh OwnerState wrapping the cache.
+    fn apply_owner_device_update_helper(
+        cache: &mut OwnerDeviceCache,
+        addr: OwnerAddr,
+        devices: Vec<DeviceIdentityHash>,
+        learned_at: Hlc,
+    ) -> ApplyOutcome {
+        let mut state = OwnerState {
+            owner_device_cache: std::mem::take(cache),
+            ..Default::default()
+        };
+        let outcome = state.apply_owner_device_update(addr, devices, learned_at);
+        *cache = state.owner_device_cache;
+        outcome
+    }
+}
+
+#[cfg(test)]
+mod merge_prior_content_keys_tests {
+    use super::*;
+    use crate::owner_state_types::{
+        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    fn key(byte: u8) -> DmContentKey {
+        DmContentKey::new([byte; 32])
+    }
+
+    fn dm_space(id_byte: u8, content_key: DmContentKey) -> Space {
+        // hlc_ms is intentionally fixed: the 5-Space cap-rule convergence
+        // proof depends on ULID order (id_byte), not HLC.
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc.clone(),
+            updated_at: hlc,
+            content_key: Some(content_key),
+            prior_content_keys: vec![],
+        }
+    }
+
+    /// 5-Space convergence test from ZEB-219 §"Why first N of sorted":
+    /// K₃<K₂<K₄<K₅<K₁ lex (subscript indexes the Space-ID byte, NOT key
+    /// lex order — see byte-value comments in the test body), two distinct
+    /// merge orders → both yield the same prior_content_keys Vec
+    /// (sorted ascending). With cap=16 (production), all 4 losers fit, so
+    /// result is [K₃, K₂, K₄, K₅].
+    #[test]
+    fn dedupe_merge_prior_content_keys_5_space_convergence() {
+        // Choose first bytes that give us the desired lex ordering:
+        // K3 = [0x10..], K2 = [0x20..], K4 = [0x30..], K5 = [0x40..], K1 = [0x50..]
+        // So K3 < K2 < K4 < K5 < K1 lex.
+        let k1 = key(0x50);
+        let k2 = key(0x20);
+        let k3 = key(0x10);
+        let k4 = key(0x30);
+        let k5 = key(0x40);
+
+        // Each of S1..S5 has a different ULID byte (so they're distinct
+        // by id) but all share the same dedupe_key (sorted members).
+        // S1 has the smallest id_byte so it'll be the dedupe winner.
+        let s1 = dm_space(0x01, k1.clone());
+        let s2 = dm_space(0x02, k2.clone());
+        let s3 = dm_space(0x03, k3.clone());
+        let s4 = dm_space(0x04, k4.clone());
+        let s5 = dm_space(0x05, k5.clone());
+
+        // Apply order P: [S2, S3, S4, S5, S1]
+        let mut state_p = OwnerState::default();
+        for s in [s2.clone(), s3.clone(), s4.clone(), s5.clone(), s1.clone()] {
+            state_p.apply_space_with_canonicalization(s);
+        }
+
+        // Apply order Q: [S5, S4, S3, S2, S1]
+        let mut state_q = OwnerState::default();
+        for s in [s5.clone(), s4.clone(), s3.clone(), s2.clone(), s1.clone()] {
+            state_q.apply_space_with_canonicalization(s);
+        }
+
+        // Convergence assertion: both orders yield byte-identical
+        // prior_content_keys on the surviving (S1) Space.
+        let p_winner = state_p
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("S1 survives");
+        let q_winner = state_q
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("S1 survives");
+
+        let p_prior: Vec<[u8; 32]> = p_winner
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+        let q_prior: Vec<[u8; 32]> = q_winner
+            .prior_content_keys
+            .iter()
+            .map(|k| *k.as_bytes())
+            .collect();
+
+        assert_eq!(
+            p_prior, q_prior,
+            "convergence: orders P and Q must yield identical prior_content_keys"
+        );
+
+        // Identity-of-content assertion: cap=MAX_PRIOR_CONTENT_KEYS=16 for
+        // production, but with 5 keys total all four losers fit. The loser
+        // current_keys are k2..k5; winner current is k1, which MUST NOT
+        // appear in prior. Sorted ascending: [k3, k2, k4, k5].
+        assert_eq!(p_prior.len(), 4);
+        assert_eq!(p_prior[0], *k3.as_bytes());
+        assert_eq!(p_prior[1], *k2.as_bytes());
+        assert_eq!(p_prior[2], *k4.as_bytes());
+        assert_eq!(p_prior[3], *k5.as_bytes());
+
+        // Winner's content_key is unchanged (S1's k1).
+        assert_eq!(
+            p_winner.content_key.as_ref().unwrap().as_bytes(),
+            k1.as_bytes()
+        );
+    }
+
+    #[test]
+    fn merge_prior_content_keys_filters_winner_current() {
+        let winner_current = key(0x10);
+        let loser_current = key(0x20);
+        // Winner's prior includes a duplicate of winner_current — must
+        // be filtered out.
+        let winner_prior = vec![winner_current.clone(), key(0x30)];
+        let loser_prior = vec![key(0x40)];
+        let merged =
+            merge_prior_content_keys(&winner_current, &winner_prior, &loser_current, &loser_prior);
+        let merged_bytes: Vec<[u8; 32]> = merged.iter().map(|k| *k.as_bytes()).collect();
+        // Sorted ascending: 0x20, 0x30, 0x40 (no 0x10).
+        assert_eq!(merged_bytes, vec![[0x20; 32], [0x30; 32], [0x40; 32]]);
+    }
+
+    #[test]
+    fn merge_prior_content_keys_caps_at_max() {
+        let winner_current = key(0xff);
+        let winner_prior = vec![];
+        let loser_current = key(0xfe);
+        // Loser's prior has way more than MAX_PRIOR_CONTENT_KEYS entries.
+        let loser_prior: Vec<DmContentKey> = (0u8..30).map(key).collect();
+        let merged =
+            merge_prior_content_keys(&winner_current, &winner_prior, &loser_current, &loser_prior);
+        // Cap is 16. Smallest 16 of {0..29, loser_current=0xfe, winner_prior empty}
+        // after sort = [0..15] (loser_current and keys 16..29 don't make the cut).
+        // Note: keys are filtered to remove winner_current (0xff), but 0xff isn't
+        // in the input set anyway, so all 30+1=31 inputs are eligible.
+        // Sorted: [0,1,2,...,29, 0xfe]. Truncated to 16: [0..15].
+        assert_eq!(
+            merged.len(),
+            crate::owner_state_types::MAX_PRIOR_CONTENT_KEYS
+        );
+        for (i, k) in merged.iter().enumerate() {
+            assert_eq!(k.as_bytes(), &[i as u8; 32]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dm_crypto_integration_tests {
+    use super::*;
+    use crate::dm_crypto::{compute_aad, decrypt_dm_message, encrypt_dm_message};
+    use crate::dm_envelope::MessagePayload;
+    use crate::owner_state_types::{
+        DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    fn dm_at(id_byte: u8, ck: DmContentKey) -> Space {
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        Space {
+            id: SpaceId([id_byte; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc.clone(),
+            updated_at: hlc,
+            content_key: Some(ck),
+            prior_content_keys: vec![],
+        }
+    }
+
+    /// Full-chain invariant test: encrypt under pre-collapse keys, apply cross-SpaceId
+    /// dedupe collapse, then verify decrypt still works under the merged Space's key
+    /// set, and that AAD is stable throughout.
+    ///
+    /// Exercises four invariants:
+    ///   1. AAD is identical before the merge (same dedupe_key, different SpaceId).
+    ///   2. AAD is identical after the dedupe collapse.
+    ///   3. blob_a (encrypted under winner's key) decrypts under merged content_key.
+    ///   4. blob_b (encrypted under loser's key) decrypts via merged prior_content_keys.
+    #[test]
+    fn encrypt_then_dedupe_collapse_then_decrypt_with_merged_keys() {
+        let key_a = DmContentKey::new([0x10; 32]); // 0x10 < 0x20 → winner content_key
+        let key_b = DmContentKey::new([0x20; 32]);
+        let space_a = dm_at(0x01, key_a.clone()); // smaller SpaceId byte → ULID winner
+        let space_b = dm_at(0x02, key_b.clone()); // larger SpaceId byte → ULID loser
+
+        let payload_a = MessagePayload {
+            body: b"hello from A".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: OwnerAddr([1; 16]),
+            sent_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let payload_b = MessagePayload {
+            body: b"hello from B".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: OwnerAddr([2; 16]),
+            sent_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+
+        // Each device computes its own AAD (from its own Space) and encrypts.
+        let aad_a = compute_aad(&space_a).unwrap();
+        let aad_b = compute_aad(&space_b).unwrap();
+
+        // INVARIANT 1: AAD is identical before merge (same dedupe_key, different SpaceId).
+        assert_eq!(
+            aad_a, aad_b,
+            "AAD must be stable across SpaceIds with the same dedupe_key"
+        );
+
+        let blob_a = encrypt_dm_message(&key_a, &aad_a, &payload_a).unwrap();
+        let blob_b = encrypt_dm_message(&key_b, &aad_b, &payload_b).unwrap();
+
+        // Cross-SpaceId dedupe collapse: space_a wins (smaller ULID / id_byte).
+        let mut state = OwnerState::default();
+        state.apply_space_with_canonicalization(space_a.clone());
+        state.apply_space_with_canonicalization(space_b.clone());
+
+        let merged = state
+            .spaces
+            .get(&SpaceId([0x01; 16]))
+            .expect("Space A wins (smaller id)");
+
+        // INVARIANT 2: AAD is identical AFTER the dedupe collapse.
+        let aad_merged = compute_aad(merged).unwrap();
+        assert_eq!(
+            aad_merged, aad_a,
+            "AAD must be stable across the dedupe collapse"
+        );
+
+        let merged_ck = merged
+            .content_key
+            .as_ref()
+            .expect("merged Space has content_key");
+        let merged_prior = &merged.prior_content_keys;
+
+        // INVARIANT 3: blob_a decrypts using merged Space's content_key
+        // (Space A was the winner — key_a is the current content_key after merge).
+        let recovered_a = decrypt_dm_message(merged_ck, merged_prior, &aad_merged, &blob_a)
+            .expect("blob_a must decrypt under the merged Space's content_key (winner side)");
+        assert_eq!(recovered_a, payload_a);
+
+        // INVARIANT 4: blob_b ALSO decrypts using merged Space's prior_content_keys
+        // (Space B was the loser — key_b migrated into prior_content_keys).
+        let recovered_b = decrypt_dm_message(merged_ck, merged_prior, &aad_merged, &blob_b)
+            .expect("blob_b must decrypt under the merged Space's prior_content_keys (loser side)");
+        assert_eq!(recovered_b, payload_b);
     }
 }
