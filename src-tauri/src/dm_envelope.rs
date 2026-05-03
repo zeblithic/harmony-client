@@ -217,7 +217,12 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
 
 // Plain ciborium (not canonical_cbor_encode): Reticulum packets are not
 // AAD-bound, so canonical byte-stability isn't required for correctness.
-// Reticulum link-layer ECDH already provides per-packet integrity.
+// Reticulum link-layer ECDH already provides per-packet confidentiality
+// and integrity. Confidentiality matters here, not just integrity:
+// `DmInvite.content_key` (the symmetric DM key) travels in this body
+// verbatim, so any code that logs or surfaces a packet body would leak
+// the key — Reticulum's link encryption is what keeps it private on
+// the wire.
 fn encode_body<T: Serialize>(value: &T) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     ciborium::into_writer(value, &mut out).map_err(|e| EncodeError::Cbor(e.to_string()))?;
