@@ -87,8 +87,13 @@ struct CrdtFileV2 {
     /// pre-Task-8 V2 files; `serde(default)` loads those as an empty
     /// cache. `skip_serializing_if` omits the field when empty so files
     /// written with an empty cache stay compact.
+    ///
+    /// Field name uses the default Rust identifier (no `rename`) for
+    /// consistency with the other five `CrdtFileV2` fields. Short renames
+    /// are reserved for `OwnerState`'s wire/AAD encoding (where Reticulum
+    /// MTU pressure justifies the abbreviation); `CrdtFileV2` is the
+    /// on-disk wrapper using plain ciborium with no MTU constraint.
     #[serde(
-        rename = "od",
         skip_serializing_if = "crate::owner_state_types::OwnerDeviceCache::is_empty",
         default
     )]
@@ -527,26 +532,29 @@ mod tests {
         );
     }
 
-    /// Verifies backward compatibility: a V2 file written WITHOUT the "od"
-    /// field (pre-Task-8 format) loads cleanly with an empty cache.
+    /// Verifies backward compatibility: a V2 file written WITHOUT the
+    /// `owner_device_cache` field (pre-Task-8 format) loads cleanly with
+    /// an empty cache.
     #[test]
-    fn crdt_load_v2_without_od_field_yields_empty_cache() {
+    fn crdt_load_v2_without_owner_device_cache_field_yields_empty_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old_v2.cbor");
 
         // Write a file using an OwnerState with an empty cache — the
-        // skip_serializing_if will omit "od" entirely, mimicking a
-        // pre-Task-8 file on disk.
+        // skip_serializing_if will omit the field entirely, mimicking
+        // a pre-Task-8 file on disk.
         let state_no_cache = OwnerState::default();
         save_crdt(&path, &state_no_cache).unwrap();
 
-        // Confirm "od" was omitted by reading raw bytes (optional sanity).
+        // Confirm the field key was omitted by scanning raw bytes for
+        // the literal UTF-8 of the CBOR text key (CBOR text strings
+        // include the field name verbatim in the byte stream, so a
+        // substring check is sufficient).
         let raw = std::fs::read(&path).unwrap();
-        // "od" in CBOR text key is 0x62 0x6F 0x64; check it's absent.
-        let payload = &raw[1..]; // strip version byte
+        let key = b"owner_device_cache";
         assert!(
-            !payload.windows(3).any(|w| w == [0x62, 0x6F, 0x64]),
-            "\"od\" key should not appear in file when cache is empty",
+            !raw.windows(key.len()).any(|w| w == key),
+            "`owner_device_cache` key should not appear in file when cache is empty",
         );
 
         // Loading must succeed with an empty cache, not error.
