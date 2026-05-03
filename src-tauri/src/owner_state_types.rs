@@ -197,6 +197,67 @@ pub struct OutboxEntryId(
     pub [u8; 16],
 );
 
+/// Maximum number of historical content keys retained per Space.
+/// See ZEB-219 §"Cap policy" and ZEB-216 §"Dedupe-merge cap rule".
+pub const MAX_PRIOR_CONTENT_KEYS: usize = 16;
+
+/// Maximum number of device identities retained per OwnerAddr in
+/// OwnerDeviceCache. Bounds the cache's memory footprint AND the
+/// Reticulum-MTU cost of any piggybacked sender_devices lists.
+/// See ZEB-216 §"OwnerDeviceCache".
+pub const MAX_DEVICES_PER_OWNER: usize = 32;
+
+/// 32-byte symmetric content key for DM/group-DM ChaCha20-Poly1305
+/// encryption. Wire format: bstr(32). In-memory: zeroized on drop
+/// (custom Drop via ZeroizeOnDrop derive). Debug redacts the bytes
+/// to avoid accidental leakage to logs.
+///
+/// See ZEB-216 §"Wire-format newtypes (Phase 1)".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+pub struct DmContentKey(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    [u8; 32],
+);
+
+impl DmContentKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Generate a fresh random key from OS entropy. Used when creating a
+    /// new DM/group-DM Space.
+    pub fn random() -> Self {
+        use rand::RngCore;
+        let mut k = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut k);
+        Self(k)
+    }
+}
+
+impl std::fmt::Debug for DmContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DmContentKey(<32 bytes redacted>)")
+    }
+}
+
+/// 16-byte Reticulum device identity hash. Wire format: bstr(16).
+/// See ZEB-216 §"OwnerDeviceCache".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeviceIdentityHash(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
+
 /// Six SpaceKind variants. Wire format: single-char string per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceKind {
@@ -420,6 +481,69 @@ mod newtype_tests {
         assert_eq!(bytes.len(), 34);
         assert_eq!(bytes[0], 0x58);
         assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
+    fn dm_content_key_serializes_as_bstr_32() {
+        use ciborium::into_writer;
+        let k = DmContentKey::new([0u8; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        // bstr(32): 0x58 0x20 || <32 bytes> = 34 bytes total.
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
+    fn dm_content_key_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let k = DmContentKey::new([0xab; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        let recovered: DmContentKey = from_reader(&bytes[..]).unwrap();
+        assert_eq!(k.as_bytes(), recovered.as_bytes());
+    }
+
+    #[test]
+    fn dm_content_key_debug_redacts_bytes() {
+        let k = DmContentKey::new([0xab; 32]);
+        let s = format!("{:?}", k);
+        // No raw byte values, no hex, no decimal — must be a fixed redacted form.
+        assert!(!s.contains("0xab"));
+        assert!(!s.contains("171")); // 0xab as decimal
+        assert!(s.contains("redacted") || s.contains("REDACTED") || s.contains("***"));
+    }
+
+    #[test]
+    fn dm_content_key_zeroized_on_drop() {
+        // Use ZeroizeOnDrop's invariant: dropping the wrapper zeros the
+        // underlying [u8; 32]. We can't easily observe the freed memory,
+        // but we can verify the trait is implemented by constraining a
+        // generic function.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<DmContentKey>();
+    }
+
+    #[test]
+    fn device_identity_hash_serializes_as_bstr_16() {
+        use ciborium::into_writer;
+        let d = DeviceIdentityHash([0u8; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&d, &mut bytes).unwrap();
+        // bstr(16): 0x50 || <16 bytes> = 17 bytes total.
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(bytes[0], 0x50);
+    }
+
+    #[test]
+    fn device_identity_hash_round_trip() {
+        use ciborium::{from_reader, into_writer};
+        let d = DeviceIdentityHash([0xcd; 16]);
+        let mut bytes = Vec::new();
+        into_writer(&d, &mut bytes).unwrap();
+        let recovered: DeviceIdentityHash = from_reader(&bytes[..]).unwrap();
+        assert_eq!(d, recovered);
     }
 }
 
