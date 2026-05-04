@@ -57,6 +57,10 @@ export class MessageService {
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
   private seenIds = new Set<string>();
+  /** Per-channel pagination cursor for `loadDmThread` — tracks the
+   *  oldest `received_at.wall_ms` we've fetched so the next page-up
+   *  call can ask for entries strictly older than this. */
+  private dmThreadCursors = new Map<string, number>();
 
   constructor() {
     // Seed with mock data — real messages append on top.
@@ -207,6 +211,90 @@ export class MessageService {
       hub,
     };
     this.messages = [...this.messages, msg];
+    this.onChange?.();
+  }
+
+  /**
+   * Phase 4 (ZEB-228) — Cold-start scrollback. Fetches decrypted DM
+   * history for `spaceId` via the `read_dm_thread` IPC and merges the
+   * results into the per-channel buffer in oldest-first display order.
+   *
+   * Tracks a per-channel `before_hlc` cursor so consecutive calls
+   * page backward through history (UI scrolls up to load more). On
+   * the first call the cursor is undefined → backend returns the
+   * newest page; subsequent calls pass the oldest `received_at.wall_ms`
+   * from the previous page so the backend skips entries we already have.
+   *
+   * Self-sent historical messages are stamped `deliveryState='delivered'`
+   * — if they're in our local inbox, peer ack is implicit (we got the
+   * dm-delivered IPC at the time, even if we since restarted).
+   *
+   * No-op when no adapter is connected (offline / pre-bootstrap), or
+   * when the IPC returns an empty page (already at the start of the
+   * thread; cursor stays put for retry).
+   */
+  async loadDmThread(spaceId: string, pageSize: number = 50): Promise<void> {
+    if (!this.adapter) return;
+    const cursor = this.dmThreadCursors.get(spaceId);
+    type Wire = {
+      messageCid: string;
+      from: string;
+      sentAt: number;
+      receivedAt: number;
+      body: string;
+      mimeType: string;
+      isSelfOutbound: boolean;
+    };
+    const results = await this.adapter.invoke('read_dm_thread', {
+      spaceId,
+      limit: pageSize,
+      beforeHlc: cursor,
+    }) as Wire[];
+    if (results.length === 0) return;
+
+    // Backend ships newest-first; UI displays oldest-first (scroll-to-
+    // bottom contract). reverse() flips the page, then prepend so any
+    // already-arrived live messages stay at the bottom.
+    const newMessages: Message[] = results
+      .map((r) => {
+        const text = hexToUtf8(r.body);
+        const sender = r.isSelfOutbound
+          ? { address: 'self', displayName: 'You' }
+          : { address: r.from, displayName: r.from.slice(0, 8) };
+        const msg: Message = {
+          id: r.messageCid,
+          sender,
+          text,
+          timestamp: r.sentAt,
+          media: [],
+          priority: 'standard',
+          channel: spaceId,
+        };
+        if (r.isSelfOutbound) {
+          // Self-sent historical message: it's in our inbox, so peer
+          // ack already happened. No messageId — lifecycle correlation
+          // only matters for in-flight sends, not retrospective ones.
+          msg.deliveryState = 'delivered';
+        }
+        return msg;
+      })
+      .reverse();
+
+    // Dedup: a `dm-received` IPC may have raced ahead of this fetch
+    // and already added the same messageCid. Skip those — the live
+    // entry is the canonical copy.
+    const filtered = newMessages.filter((m) => !this.seenIds.has(m.id));
+    for (const m of filtered) this.seenIds.add(m.id);
+
+    if (filtered.length > 0) {
+      this.messages = [...filtered, ...this.messages];
+    }
+
+    // Cursor for next page-up: oldest received_at from this page. The
+    // backend returns newest-first, so results[results.length-1] is the
+    // oldest. Stored even if we filtered everything (still want to
+    // advance past this page on the next call).
+    this.dmThreadCursors.set(spaceId, results[results.length - 1].receivedAt);
     this.onChange?.();
   }
 

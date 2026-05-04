@@ -389,3 +389,163 @@ describe('MessageService DM events', () => {
     expect(svc.messages[0].deliveryState).toBe('sending');
   });
 });
+
+// ── loadDmThread (Phase 4 — ZEB-228, Task 10) ────────────────────────
+//
+// Cold-start scrollback: when a user opens a DM Space for the first
+// time after launch, the UI calls loadDmThread to fetch decrypted
+// history via the read_dm_thread IPC. The IPC returns newest-first;
+// MessageService prepends them in oldest-first order to match the UI's
+// scroll-to-bottom display contract. Pagination uses a per-channel
+// before_hlc cursor (oldest received_at from the prior page).
+
+describe('MessageService loadDmThread', () => {
+  let svc: MessageService;
+
+  beforeEach(() => {
+    svc = new MessageService();
+    svc.messages = [];
+  });
+
+  function hexEncode(s: string): string {
+    return Array.from(new TextEncoder().encode(s))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  it('fetches read_dm_thread IPC and populates messages oldest-first', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, body: hexEncode('newest'), mimeType: 'text/plain', isSelfOutbound: true },
+      { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hexEncode('mid'), mimeType: 'text/plain', isSelfOutbound: false },
+      { messageCid: 'cid1', from: 'self-hex', sentAt: 1000, receivedAt: 1001, body: hexEncode('oldest'), mimeType: 'text/plain', isSelfOutbound: true },
+    ]);
+    await svc.connectAdapter(adapter);
+    await svc.loadDmThread('aabbcc');
+
+    const msgs = svc.messages.filter((m) => m.channel === 'aabbcc');
+    expect(msgs).toHaveLength(3);
+    // Display order: oldest first (UI scrolls to bottom).
+    expect(msgs[0].text).toBe('oldest');
+    expect(msgs[1].text).toBe('mid');
+    expect(msgs[2].text).toBe('newest');
+    // Self-sent historical messages get deliveryState='delivered'.
+    expect(msgs[0].deliveryState).toBe('delivered');
+    expect(msgs[2].deliveryState).toBe('delivered');
+    // Received messages have no deliveryState.
+    expect(msgs[1].deliveryState).toBeUndefined();
+  });
+
+  it('passes spaceId, limit, and undefined cursor on first call', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    await svc.connectAdapter(adapter);
+    await svc.loadDmThread('aabbcc');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('read_dm_thread', {
+      spaceId: 'aabbcc',
+      limit: 50,
+      beforeHlc: undefined,
+    });
+  });
+
+  it('tracks before_hlc cursor for pagination', async () => {
+    const { adapter } = createMockAdapter();
+    const invokeMock = adapter.invoke as ReturnType<typeof vi.fn>;
+    invokeMock
+      .mockResolvedValueOnce([
+        { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, body: hexEncode('p1-newest'), mimeType: 'text/plain', isSelfOutbound: true },
+        { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hexEncode('p1-oldest'), mimeType: 'text/plain', isSelfOutbound: false },
+      ])
+      .mockResolvedValueOnce([
+        { messageCid: 'cid1', from: 'self-hex', sentAt: 1000, receivedAt: 1001, body: hexEncode('p2-only'), mimeType: 'text/plain', isSelfOutbound: true },
+      ]);
+    await svc.connectAdapter(adapter);
+
+    await svc.loadDmThread('aabbcc', 2);
+    await svc.loadDmThread('aabbcc', 2);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'read_dm_thread', {
+      spaceId: 'aabbcc',
+      limit: 2,
+      beforeHlc: 2001, // oldest received_at from page 1
+    });
+  });
+
+  it('returns early when results are empty (no cursor update, no onChange)', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    svc.onChange = vi.fn();
+    await svc.connectAdapter(adapter);
+    await svc.loadDmThread('aabbcc');
+
+    expect(svc.messages).toHaveLength(0);
+    expect(svc.onChange).not.toHaveBeenCalled();
+  });
+
+  it('skips messages already in seenIds (race with dm-received)', async () => {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { messageCid: 'cid-shared', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hexEncode('via-thread'), mimeType: 'text/plain', isSelfOutbound: false },
+    ]);
+    await svc.connectAdapter(adapter);
+
+    // Simulate dm-received arriving before loadDmThread completes:
+    emit('dm-received', {
+      spaceId: 'aabbcc',
+      messageCid: 'cid-shared',
+      from: 'bob-hex',
+      sentAt: 2000,
+      receivedAt: 2001,
+      body: hexEncode('via-event'),
+      mimeType: 'text/plain',
+    });
+    expect(svc.messages).toHaveLength(1);
+
+    await svc.loadDmThread('aabbcc');
+
+    // Still only one copy — loadDmThread saw it in seenIds and skipped.
+    expect(svc.messages.filter((m) => m.id === 'cid-shared')).toHaveLength(1);
+    expect(svc.messages[0].text).toBe('via-event');
+  });
+
+  it('prepends history before existing messages', async () => {
+    const { adapter, emit } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { messageCid: 'old1', from: 'bob-hex', sentAt: 1000, receivedAt: 1001, body: hexEncode('history'), mimeType: 'text/plain', isSelfOutbound: false },
+    ]);
+    await svc.connectAdapter(adapter);
+
+    emit('dm-received', {
+      spaceId: 'aabbcc',
+      messageCid: 'live1',
+      from: 'bob-hex',
+      sentAt: 5000,
+      receivedAt: 5001,
+      body: hexEncode('live'),
+      mimeType: 'text/plain',
+    });
+
+    await svc.loadDmThread('aabbcc');
+
+    expect(svc.messages.map((m) => m.id)).toEqual(['old1', 'live1']);
+  });
+
+  it('calls onChange after merging results', async () => {
+    const { adapter } = createMockAdapter();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { messageCid: 'cid1', from: 'bob-hex', sentAt: 1000, receivedAt: 1001, body: hexEncode('hi'), mimeType: 'text/plain', isSelfOutbound: false },
+    ]);
+    await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn();
+    await svc.loadDmThread('aabbcc');
+    expect(svc.onChange).toHaveBeenCalledOnce();
+  });
+
+  it('no-op when adapter is not connected', async () => {
+    svc.onChange = vi.fn();
+    await svc.loadDmThread('aabbcc');
+    expect(svc.messages).toHaveLength(0);
+    expect(svc.onChange).not.toHaveBeenCalled();
+  });
+});
