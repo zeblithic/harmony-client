@@ -170,9 +170,10 @@ pub struct DmAckSigned {
 ///   `dm_signing::verify_dm_packet_signature` without re-encoding (the
 ///   captured bytes are exactly what the signature covers, so even if
 ///   the encoder were to drift this is the bit-exact verification input).
-///   On the send path `encode_packet` re-encodes from `signed` rather
-///   than trusting this field — see `encode_packet`'s invariant-guard
-///   doc comment for rationale.
+///   On the send path `encode_packet` re-encodes from `signed`, asserts
+///   byte-equality with `signed_bytes`, and emits `signed_bytes`
+///   verbatim — see `encode_packet`'s mutation-guard doc comment for
+///   rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmPacket {
     Invite {
@@ -203,6 +204,13 @@ pub enum EncodeError {
     /// generic Cbor encode failure.
     #[error("re-encode signed body failed: {0}")]
     ReSerialize(String),
+    /// `encode_packet` re-encoded `signed` and the result diverged from the
+    /// cached `signed_bytes` field — the only way this fires is post-build
+    /// mutation of the `signed` field (no in-crate code path does this, but
+    /// the guard catches future regressions cheaply: a stale `signature`
+    /// would otherwise ship on the wire over a body it doesn't cover).
+    #[error("signed body mutated post-build: {0}")]
+    SignedMutated(String),
 }
 
 /// Errors produced by [`decode_packet`].
@@ -232,48 +240,74 @@ pub enum DecodeError {
 /// Encode a fully-built DmPacket to the wire layout
 /// `[disc][signed_bytes][signature]`.
 ///
-/// **Invariant guard.** Re-encode the body from `signed` (rather than
-/// trusting the cached `signed_bytes` field) before concatenating with
-/// the signature. This eliminates the inconsistent-state class where a
-/// caller could hold `signed = A` but `signed_bytes` for some prior
-/// `B` — a re-encode here means whatever ships on the wire matches
-/// `signed` by construction. The cost is one extra CBOR encoding per
-/// send, which is cheap (signed bodies are ≤ ~200 bytes serialized).
+/// **Mutation guard.** Re-encodes `signed` and asserts byte-equality
+/// with the cached `signed_bytes` (which was the source for `signature`
+/// at build time). Mismatch → `SignedMutated` (the only way this fires
+/// is post-build mutation of the `signed` field; no in-crate code path
+/// does this, but the guard catches future regressions cheaply with a
+/// memcmp — no Ed25519 verify on the send path).
 ///
-/// `signature` is still written verbatim — recomputing it here would
-/// require the signing key, and the build_signed_* helpers already
-/// signed `signed_bytes` (which equals the freshly-re-encoded bytes by
-/// canonical-CBOR determinism, asserted in the build_signed_* tests).
+/// On success the function emits the cached `signed_bytes` verbatim
+/// (NOT the freshly re-encoded bytes). Since `signed_bytes` was signed
+/// during build, the `signature ↔ signed_bytes` invariant is
+/// constructed; the byte-equality check above transitively gives
+/// `signature ↔ signed`. Side benefit: emitting `signed_bytes`
+/// verbatim preserves byte-exactness on decode→encode round trips
+/// (relay scenarios), since the on-wire body is preserved bit-for-bit.
 pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
-    let (disc, signed_bytes, signature): (u8, Vec<u8>, &[u8; 64]) = match packet {
+    let (disc, signed_bytes, signature): (u8, &Vec<u8>, &[u8; 64]) = match packet {
         DmPacket::Invite {
-            signed, signature, ..
-        } => (
-            0x01,
-            crate::owner_state_crypto::canonical_cbor_encode(signed)
-                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
+            signed,
             signature,
-        ),
+            signed_bytes,
+        } => {
+            let re_encoded = crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(EncodeError::SignedMutated(
+                    "DmPacket Invite variant: signed mutated post-build (re-encode mismatches \
+                     cached signed_bytes; signature would not cover wire body)"
+                        .to_string(),
+                ));
+            }
+            (0x01, signed_bytes, signature)
+        }
         DmPacket::CidNotify {
-            signed, signature, ..
-        } => (
-            0x02,
-            crate::owner_state_crypto::canonical_cbor_encode(signed)
-                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
+            signed,
             signature,
-        ),
+            signed_bytes,
+        } => {
+            let re_encoded = crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(EncodeError::SignedMutated(
+                    "DmPacket CidNotify variant: signed mutated post-build (re-encode mismatches \
+                     cached signed_bytes; signature would not cover wire body)"
+                        .to_string(),
+                ));
+            }
+            (0x02, signed_bytes, signature)
+        }
         DmPacket::Ack {
-            signed, signature, ..
-        } => (
-            0x03,
-            crate::owner_state_crypto::canonical_cbor_encode(signed)
-                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
+            signed,
             signature,
-        ),
+            signed_bytes,
+        } => {
+            let re_encoded = crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(EncodeError::SignedMutated(
+                    "DmPacket Ack variant: signed mutated post-build (re-encode mismatches \
+                     cached signed_bytes; signature would not cover wire body)"
+                        .to_string(),
+                ));
+            }
+            (0x03, signed_bytes, signature)
+        }
     };
     let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
     out.push(disc);
-    out.extend_from_slice(&signed_bytes);
+    out.extend_from_slice(signed_bytes);
     out.extend_from_slice(signature);
     Ok(out)
 }
@@ -1136,16 +1170,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_packet_re_encodes_from_signed_not_signed_bytes() {
-        // Invariant guard: `encode_packet` must re-encode the body from
-        // `signed` and IGNORE the cached `signed_bytes` field. If a caller
-        // ever ends up with `signed = A` but `signed_bytes` corresponds
-        // to some other body B (e.g., from in-place mutation after a
-        // `build_signed_*` helper), the wire output must still match
-        // `signed = A`. This test simulates that inconsistent state by
-        // building a packet via `build_signed_cidnotify` and then
-        // overwriting `signed_bytes` with garbage, then verifying the
-        // wire output decodes back to the ORIGINAL `signed`.
+    fn encode_packet_returns_signed_mutated_when_signed_field_diverges_from_cached_bytes() {
+        // Mutation guard: if a caller mutates the `signed` field after
+        // `build_signed_*` (no in-crate path does this, but the guard
+        // catches future regressions), the cached `signature` would no
+        // longer cover the wire body. `encode_packet` re-encodes
+        // `signed`, compares with the cached `signed_bytes`, and rejects
+        // on mismatch with `EncodeError::SignedMutated`.
         let (private, _, device_hash) = make_test_identity(0x77);
         // Mirror the signing-key extraction from build_signed_invite_produces_verifiable_packet.
         use hkdf::Hkdf;
@@ -1157,12 +1188,60 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_arr);
 
         let original_signed = sample_cidnotify_with_hash(device_hash);
-        let packet = build_signed_cidnotify(original_signed.clone(), &signing_key).unwrap();
+        let packet = build_signed_cidnotify(original_signed, &signing_key).unwrap();
 
-        // Corrupt the cached signed_bytes — this is the inconsistent
-        // state we're guarding against. Use bytes that would never
-        // CBOR-decode to a valid DmCidNotifySigned (a leading 0xff
-        // is not a legal CBOR major type).
+        // Mutate the `signed` field — this simulates a post-build mutation.
+        // The cached `signed_bytes` (which was the input to `signature`) no
+        // longer matches a fresh re-encode of `signed`.
+        let mutated_packet = match packet {
+            DmPacket::CidNotify {
+                mut signed,
+                signature,
+                signed_bytes,
+            } => {
+                signed.message_cid = ContentId::from_bytes([0x99; 32]);
+                DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                }
+            }
+            other => panic!("expected CidNotify, got {:?}", other),
+        };
+
+        let err = encode_packet(&mutated_packet).unwrap_err();
+        match err {
+            EncodeError::SignedMutated(msg) => {
+                assert!(
+                    msg.contains("CidNotify") && msg.contains("signed mutated post-build"),
+                    "expected message mentioning CidNotify variant and post-build mutation, \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected EncodeError::SignedMutated, got {:?}", other),
+        }
+        let _ = private; // unused — kept to match make_test_identity tuple
+    }
+
+    #[test]
+    fn encode_packet_returns_signed_mutated_when_cached_signed_bytes_diverges() {
+        // The dual: corrupt the cached `signed_bytes` directly. The
+        // re-encoded `signed` no longer matches, so the same guard fires.
+        // Pre-fix this test asserted the corrupted bytes were IGNORED and
+        // the re-encode shipped — the new invariant is stricter (the
+        // cached bytes ARE what ships, and divergence MUST be surfaced).
+        let (private, _, device_hash) = make_test_identity(0x77);
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(None, &[0x77u8; 32]);
+        let mut ed_arr = [0u8; 32];
+        hk.expand(b"harmony-identity-ed25519-v1", &mut ed_arr)
+            .expect("HKDF length 32 within SHA-256 limit");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_arr);
+
+        let original_signed = sample_cidnotify_with_hash(device_hash);
+        let packet = build_signed_cidnotify(original_signed, &signing_key).unwrap();
+
         let corrupted_packet = match packet {
             DmPacket::CidNotify {
                 signed, signature, ..
@@ -1174,26 +1253,44 @@ mod tests {
             other => panic!("expected CidNotify, got {:?}", other),
         };
 
-        // Encode the corrupted packet — this MUST re-encode from `signed`
-        // and produce a wire-decodable result, NOT propagate the corrupted
-        // bytes.
-        let wire = encode_packet(&corrupted_packet).unwrap();
-        assert_eq!(wire[0], 0x02);
+        let err = encode_packet(&corrupted_packet).unwrap_err();
+        assert!(
+            matches!(err, EncodeError::SignedMutated(_)),
+            "expected SignedMutated, got {:?}",
+            err
+        );
+        let _ = private;
+    }
 
-        // Decode and confirm we recovered the ORIGINAL signed body, not
-        // the corrupted bytes (which would fail to decode).
-        let decoded = decode_packet(&wire).unwrap();
-        match decoded {
-            DmPacket::CidNotify { signed, .. } => {
-                let _ = private; // silence unused warning if path changes
-                assert_eq!(
-                    signed, original_signed,
-                    "decoded signed must match the ORIGINAL signed, proving encode_packet \
-                     re-encoded from `signed` and ignored the corrupted signed_bytes"
-                );
-            }
-            other => panic!("expected CidNotify after decode, got {:?}", other),
-        }
+    #[test]
+    fn encode_packet_round_trip_emits_byte_exact_cached_signed_bytes() {
+        // Side benefit of emitting `signed_bytes` verbatim: a
+        // decode→encode round trip preserves the on-wire body bit-for-
+        // bit (load-bearing for relay scenarios where intermediaries
+        // forward a verbatim copy). If `encode_packet` shipped the
+        // re-encoded bytes, canonical-CBOR determinism gives byte-
+        // equality in practice but doesn't *guarantee* it across
+        // encoder versions.
+        let (private, _, device_hash) = make_test_identity(0x77);
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(None, &[0x77u8; 32]);
+        let mut ed_arr = [0u8; 32];
+        hk.expand(b"harmony-identity-ed25519-v1", &mut ed_arr)
+            .expect("HKDF length 32 within SHA-256 limit");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_arr);
+
+        let signed = sample_cidnotify_with_hash(device_hash);
+        let packet = build_signed_cidnotify(signed, &signing_key).unwrap();
+
+        let wire1 = encode_packet(&packet).unwrap();
+        let decoded = decode_packet(&wire1).unwrap();
+        let wire2 = encode_packet(&decoded).unwrap();
+        assert_eq!(
+            wire1, wire2,
+            "decode→encode must preserve on-wire bytes exactly (byte-for-byte)"
+        );
+        let _ = private;
     }
 
     #[test]
