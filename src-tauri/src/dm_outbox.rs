@@ -615,19 +615,43 @@ mod tests {
     async fn stub_transport_caps_recorded_sends_at_max() {
         // StubTransport is wired into start_node as the production Phase 2
         // transport. Without the FIFO cap on `sends`, a long-lived node would
-        // accumulate one entry per send call forever (~32 bytes each). Verify
-        // the bound holds: push 2000, expect exactly STUB_MAX_RECORDED_SENDS
-        // retained, oldest evicted (FIFO).
+        // accumulate one entry per send call forever (~32 bytes each). Verify:
+        //   - count is bounded at STUB_MAX_RECORDED_SENDS
+        //   - eviction is FIFO (oldest evicted, not newest) — guards against
+        //     a future refactor accidentally using pop_back
         let t = StubTransport::new();
-        let e = entry(1);
         let r = OwnerAddr([2u8; 16]);
-        for _ in 0..2000 {
+        // Each call uses a unique entry_id (1, 2, ...) so we can verify which
+        // entries survived eviction by their byte-pattern.
+        let total = 2000u32;
+        for i in 1..=total {
+            let id = OutboxEntryId([i as u8; 16]);
+            let mut e = entry(0);
+            e.id = id;
             let _ = t.send(&e, r).await;
         }
+        let recorded = t.sends();
         assert_eq!(
-            t.sends().len(),
+            recorded.len(),
             StubTransport::STUB_MAX_RECORDED_SENDS,
             "ring buffer must cap at STUB_MAX_RECORDED_SENDS"
+        );
+        // FIFO: the oldest survivor is push #(total - cap + 1).
+        // total=2000, cap=1024 → first survivor is #977.
+        // entry_id is [u8; 16] of (i as u8), which wraps mod 256.
+        let first_survivor_index = total - StubTransport::STUB_MAX_RECORDED_SENDS as u32 + 1;
+        let expected_first_byte = first_survivor_index as u8;
+        assert_eq!(
+            recorded[0].0 .0[0], expected_first_byte,
+            "FIFO eviction: oldest survivor should be push #{first_survivor_index}, \
+             not the newest entry (would indicate pop_back regression)"
+        );
+        // Last survivor is push #total.
+        let expected_last_byte = total as u8;
+        assert_eq!(
+            recorded[recorded.len() - 1].0 .0[0],
+            expected_last_byte,
+            "FIFO eviction: newest survivor should be push #{total}"
         );
     }
 
