@@ -298,14 +298,20 @@ impl DmOutbox {
     ///   - skip if in `in_flight` set already
     ///   - skip if backoff says next attempt is in the future
     ///   - else mark in-flight, call transport.send().
-    ///     - Ok(()): clear in-flight, clear backoff (entry stays Pending —
-    ///       real ack arrives later via handle_ack)
+    ///     - Ok(()): clear in-flight, install AttemptState{failure_count: 1}
+    ///       so the next attempt waits the base backoff (5s) for an ack
+    ///       before re-sending. handle_ack clears the entry on real ack;
+    ///       drain's epilogue clears it on Complete-via-CRDT-merge.
     ///     - Err(_): clear in-flight, bump backoff failure_count + record
-    ///       last_attempt_wall_ms
+    ///       last_attempt_wall_ms (exponential escalation up to 5min cap).
     ///
     /// Then sweep for expiration: any Pending/Partial entry where
     /// `wall_now_ms - created_at.wall_ms >= EXPIRATION_MS` and not all
     /// recipients in delivered_to → mark Expired, record in newly_expired.
+    ///
+    /// Epilogue: drop backoff/in_flight entries for any OutboxEntry that's
+    /// no longer Pending/Partial — covers Complete via local handle_ack,
+    /// Complete via CRDT-merge replication of a peer's ack, and Expired.
     pub async fn drain(
         &mut self,
         state: &mut OwnerState,
