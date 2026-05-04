@@ -13,6 +13,7 @@ pub mod content_store;
 pub mod dm_crypto;
 pub mod dm_envelope;
 pub mod dm_outbox;
+pub mod dm_signing;
 pub mod event_loop;
 pub mod folders;
 mod follows;
@@ -214,6 +215,12 @@ pub struct NodeState {
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
     /// in production, InMemoryStub in some tests).
     content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
+    /// ZEB-227 Path B: outbound DM unicast channel sender.
+    /// `RuntimeUnicastTransport` (Task 6) holds a clone; `event_loop` drains
+    /// the receiver and forwards each `UnicastSendRequest` as
+    /// `RuntimeEvent::SendUnicastToDevice`. Cleared on stop_node so a
+    /// restart's transport doesn't carry a stale sender.
+    unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
 }
 
 impl NodeState {
@@ -256,6 +263,7 @@ impl Default for NodeState {
             dm_device_id: None,
             dm_self_owner: None,
             content_store: None,
+            unicast_send_tx: None,
         }
     }
 }
@@ -424,6 +432,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         dm_device_id,
         dm_self_owner,
         content_store,
+        unicast_send_tx,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -461,6 +470,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
+            guard.unicast_send_tx.take(),
         )
     };
 
@@ -493,6 +503,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // either way; the explicit binding is just for documentation).
     let _ = dm_self_owner;
     drop(content_store);
+    // ZEB-227 Path B: drop the outbound unicast sender so any clone held
+    // by the now-shutting-down RuntimeUnicastTransport (Task 11) sees its
+    // last reference reach the close threshold. The event_loop's receiver
+    // gets None on its next .recv() and the select arm de-registers.
+    drop(unicast_send_tx);
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -570,6 +585,22 @@ async fn start_node(
     // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
     // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
     let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
+    // ZEB-227 Path B: outbound DM unicast channel. Sized at 256 to absorb
+    // realistic group-DM fan-out spikes: a single send_dm to a group can
+    // emit up to 16 members × 4 devices = 64 UnicastSendRequests, and
+    // overlapping batches from concurrent send_dm + handle_cidnotify ack
+    // fan-out can stack on top. 256 is "doubled-and-then-some" of that
+    // single-send bound — production try_send call sites
+    // (RuntimeUnicastTransport::send + handle_cidnotify ack fan-out)
+    // surface Transient on full so back-pressure NEVER causes deadlock
+    // even if the cap is exceeded; the larger cap just keeps that
+    // recovery path off the hot path. Sender clone is lifted onto
+    // NodeState so Task 11 can reach it when instantiating
+    // RuntimeUnicastTransport; receiver is consumed by event_loop::run's
+    // new select! arm (forwards each request as
+    // RuntimeEvent::SendUnicastToDevice into NodeRuntime).
+    let (unicast_send_tx, unicast_send_rx) =
+        tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(256);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -638,6 +669,7 @@ async fn start_node(
         old_dm_device_id,
         old_dm_self_owner,
         old_content_store,
+        old_unicast_send_tx,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         let tup = (
@@ -664,6 +696,9 @@ async fn start_node(
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
+            // ZEB-227 Path B: take + drop the previous identity's outbound
+            // unicast sender so the new generation gets a fresh channel.
+            guard.unicast_send_tx.take(),
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
@@ -695,6 +730,10 @@ async fn start_node(
     // clippy::dropping_copy_types.
     let _ = old_dm_self_owner;
     drop(old_content_store);
+    // ZEB-227 Path B: drop the previous identity's outbound unicast sender
+    // so the new generation's RuntimeUnicastTransport (Task 11) sees no
+    // stale clones outside the new NodeState.
+    drop(old_unicast_send_tx);
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping
@@ -832,16 +871,71 @@ async fn start_node(
 
                     let self_owner = crate::owner_state_types::OwnerAddr(loaded.state.owner_id);
 
-                    // ZEB-225 Sub-B Phase 2: construct DmOutbox + StubTransport
+                    // ZEB-225 Sub-B Phase 2: construct DmOutbox + transport
                     // alongside SyncEngine. Both share device_id + self_owner
-                    // with the SyncEngine; the StubTransport is the in-process
-                    // Phase 2 stand-in (Phase 3b replaces with a real
-                    // RuntimeAction::SendUnicastToDevice adapter).
+                    // with the SyncEngine.
+                    //
+                    // ZEB-227 Phase 3b Task 11: DmOutbox + RuntimeUnicastTransport
+                    // both consume the SAME (signing_key, signing_device_hash)
+                    // pair sourced from the Reticulum identity loaded above.
+                    // The Reticulum identity's `address_hash` IS the
+                    // DeviceIdentityHash that peers cache in OwnerDeviceCache —
+                    // signing with any other key would produce signatures that
+                    // fail verification at the receiver's
+                    // `verify_dm_packet_signature` (key-substitution defense:
+                    // Step 1 derives the device hash from the identity_pub
+                    // and rejects if it doesn't match the wire-claimed hash).
+                    //
+                    // SigningKey extraction: `ed25519.to_private_bytes()`
+                    // returns `[32B X25519_secret][32B Ed25519_secret]` per
+                    // harmony_identity::PrivateIdentity::to_private_bytes
+                    // (identity.rs:308). The Ed25519 secret half occupies
+                    // bytes 32..64 and constructs an ed25519_dalek::SigningKey
+                    // bit-identical to the one PrivateIdentity::sign uses
+                    // internally (verified by sign_dm_packet_matches_private_identity_sign
+                    // in dm_signing.rs).
+                    // Wrap in Zeroizing — the signing seed must be scrubbed
+                    // when this scope ends, mirroring how
+                    // reticulum_identity_bytes is held above (line 772).
+                    // Without this the 32-byte stack copy would persist in
+                    // freed stack memory until overwritten.
+                    let ed25519_seed = zeroize::Zeroizing::new(
+                        <[u8; 32]>::try_from(
+                            &reticulum_identity_bytes
+                                .as_ref()
+                                .expect("reticulum_identity_bytes populated above")
+                                [32..64],
+                        )
+                        .expect("64 - 32 == 32"),
+                    );
+                    let signing_key_arc =
+                        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
+                    let our_signing_device_hash =
+                        crate::owner_state_types::DeviceIdentityHash(our_addr_bytes);
                     let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outbox::DmOutbox::new(device_id.clone(), self_owner),
+                        crate::dm_outbox::DmOutbox::new(
+                            device_id.clone(),
+                            self_owner,
+                            our_signing_device_hash,
+                            signing_key_arc.clone(),
+                        ),
                     ));
+                    // Production transport: RuntimeUnicastTransport pushes
+                    // signed CidNotify packets into unicast_send_tx, which
+                    // event_loop::run translates into
+                    // RuntimeEvent::SendUnicastToDevice. OwnerAddr →
+                    // device-hash resolution happens inside drain (which
+                    // has `&OwnerState` from the event-loop's mutex guard),
+                    // not in the transport — splitting resolution out
+                    // sidesteps the recursive-lock deadlock that broke
+                    // delivery in the original Phase 3b shape.
                     let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
-                        std::sync::Arc::new(crate::dm_outbox::StubTransport::new());
+                        std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
+                            unicast_send_tx.clone(),
+                            self_owner,
+                            our_signing_device_hash,
+                            signing_key_arc,
+                        ));
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
                         std::sync::Arc::clone(&kt),
@@ -966,6 +1060,15 @@ async fn start_node(
         let dm_outbox_for_loop = dm_outbox_arc.clone();
         let dm_transport_for_loop = dm_transport_arc.clone();
         let crdt_state_for_loop = crdt_state_for_state.clone();
+        // ZEB-227 Path B Task 11: extra handles for the
+        // RuntimeAction::UnicastReceived interception block in event_loop.
+        // cas_handle: handle_cidnotify does a 500ms-timeout cas.get; reuse
+        //   the same RuntimeContentStore the SyncEngine consumes.
+        // unicast_send_tx_for_loop: handle_cidnotify pushes DmAck fan-out
+        //   into the same channel the production transport uses for
+        //   outbound CidNotify. Same channel, both directions push.
+        let cas_handle_for_loop = content_store_for_state.clone();
+        let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -991,8 +1094,42 @@ async fn start_node(
                     .build()
                     .expect("failed to create tokio runtime for harmony-runtime");
                 rt.block_on(async move {
-                    let (runtime, startup_actions) =
+                    let (mut runtime, startup_actions) =
                         NodeRuntime::new(config, MemoryBookStore::new());
+
+                    // ZEB-227 Path B: register our DM destination so inbound
+                    // packets to it surface as RuntimeAction::UnicastReceived.
+                    // Without this registration, every inbound DmInvite /
+                    // DmCidNotify / DmAck would drop in the runtime as
+                    // NoLocalDestination before reaching
+                    // dm_outbox::handle_unicast.
+                    //
+                    // Our DM destination hash is computed from our local
+                    // Reticulum identity hash via the same
+                    // SHA256(SHA256("harmony.dm")[:10] || identity)[:16]
+                    // scheme that DmOutbox::drain uses to resolve outbound
+                    // destinations from OwnerDeviceCache (so a peer's
+                    // outbound dest_hash for us == our registered
+                    // dest_hash for ourselves).
+                    //
+                    // Unconditional: every node has a Reticulum identity
+                    // (loaded above via identity::load_or_generate, before
+                    // owner-loading). DMs themselves only flow once the owner
+                    // identity is loaded (which gates DmOutbox /
+                    // RuntimeUnicastTransport construction above), but the
+                    // raw destination registration is harmless when no owner
+                    // is loaded — it just means inbound packets surface but
+                    // event_loop's UnicastReceived arm has no DmOutbox to
+                    // dispatch to (and logs the drop).
+                    let our_identity_hash = runtime.local_identity_hash();
+                    let our_dm_dest =
+                        crate::dm_signing::compute_dm_destination_hash(our_identity_hash);
+                    runtime.register_local_destination(our_dm_dest);
+                    tracing::info!(
+                        dm_dest = hex::encode(our_dm_dest),
+                        "registered DM destination for inbound DmInvite/DmCidNotify/DmAck"
+                    );
+
                     event_loop::run(
                         runtime,
                         startup_actions,
@@ -1021,6 +1158,9 @@ async fn start_node(
                         dm_outbox_for_loop,
                         dm_transport_for_loop,
                         crdt_state_for_loop,
+                        Some(unicast_send_rx),
+                        cas_handle_for_loop,
+                        unicast_send_tx_for_loop,
                     )
                     .await;
                 });
@@ -1063,6 +1203,12 @@ async fn start_node(
                 guard.dm_device_id = device_id_for_state.clone();
                 guard.dm_self_owner = self_owner_for_state;
                 guard.content_store = content_store_for_state.clone();
+                // ZEB-227 Path B: store the outbound unicast sender so
+                // Task 11's RuntimeUnicastTransport instantiation in
+                // start_node can clone it. The receiver was moved into
+                // event_loop above; the sender remains unused-by-production
+                // until Task 11 wires it to the real transport.
+                guard.unicast_send_tx = Some(unicast_send_tx.clone());
                 thread_install_failure = None;
             }
             Err(e) => {

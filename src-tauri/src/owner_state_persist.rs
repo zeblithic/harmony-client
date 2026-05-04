@@ -476,10 +476,33 @@ mod tests {
         };
         state.apply_space_with_canonicalization(dm_space);
 
-        // Insert OwnerDeviceCache entries.
+        // Insert OwnerDeviceCache entries. Seed a non-empty
+        // `device_identity_pubs` parallel vec — Some + None mix exercises
+        // both branches of the bstr-or-null encoder. Without this seed
+        // the test goes green even if persist drops the parallel vec
+        // entirely (regression-of-omission).
+        //
+        // Real (hash, pub) pairs derived from PrivateIdentity so the
+        // pub-derives-to-hash invariant in apply_owner_device_update
+        // accepts the seed.
+        let private_a = harmony_identity::PrivateIdentity::from_seed(&[0xa1; 32]);
+        let public_a = private_a.public_identity();
+        let pub_a = public_a.to_public_bytes();
+        let hash_a = DeviceIdentityHash(public_a.address_hash);
+        let private_b = harmony_identity::PrivateIdentity::from_seed(&[0xb2; 32]);
+        let public_b = private_b.public_identity();
+        let hash_b = DeviceIdentityHash(public_b.address_hash);
+        // Pre-sort so the post-apply order is deterministic for the
+        // assertions below (apply sorts ascending by hash).
+        let (sorted_hashes, sorted_pubs) = if hash_a < hash_b {
+            (vec![hash_a, hash_b], vec![Some(pub_a), None])
+        } else {
+            (vec![hash_b, hash_a], vec![None, Some(pub_a)])
+        };
         state.apply_owner_device_update(
             OwnerAddr([2; 16]),
-            vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([8; 16])],
+            sorted_hashes.clone(),
+            sorted_pubs.clone(),
             hlc(1),
         );
 
@@ -519,16 +542,18 @@ mod tests {
             2,
             "OwnerDeviceCache entry should have 2 devices",
         );
-        // apply_owner_device_update sorts and dedupes; [7;16] < [8;16].
+        // apply_owner_device_update sorts ascending by hash; we pre-sorted
+        // above so sorted_hashes[0] < sorted_hashes[1].
         assert_eq!(
-            cache_entry.devices[0],
-            DeviceIdentityHash([7; 16]),
-            "first device hash",
+            cache_entry.devices, sorted_hashes,
+            "device hashes round-trip in sorted order",
         );
+        // Pin parallel-vec round-trip: persist must preserve the Some/None
+        // shape exactly. Without this assertion the test would go green
+        // even if persist dropped device_identity_pubs entirely.
         assert_eq!(
-            cache_entry.devices[1],
-            DeviceIdentityHash([8; 16]),
-            "second device hash",
+            cache_entry.device_identity_pubs, sorted_pubs,
+            "device_identity_pubs parallel vec must persist with Some + None preserved",
         );
     }
 

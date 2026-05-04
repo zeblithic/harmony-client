@@ -281,17 +281,21 @@ pub struct OwnerDeviceCache {
     pub devices: BTreeMap<OwnerAddr, OwnerDeviceEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnerDeviceEntry {
     /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
     /// Sorted invariant means binary_search works for lookup
     /// (used by resolve_link_origin_owner in Phase 3b).
     ///
-    /// `deserialize_with` re-normalizes (sort + dedup + truncate) on every
-    /// load so persisted-state files and remote replicas can't hand us a
-    /// `Vec` that violates the invariant — a corrupted on-disk snapshot
-    /// or a malicious peer's `OwnerState` blob can otherwise break the
-    /// binary_search precondition Phase 3b's link-origin resolver depends on.
+    /// The struct-level manual `Deserialize` impl re-normalizes
+    /// (sort + merge-by-hash + truncate) on every load JOINTLY with
+    /// `device_identity_pubs` so persisted-state files and remote
+    /// replicas can't hand us a `Vec` pair that violates either the
+    /// per-vec invariant or the parallel-vec correspondence — a
+    /// corrupted on-disk snapshot or a malicious peer's `OwnerState`
+    /// blob can otherwise break the binary_search precondition Phase
+    /// 3b's link-origin resolver depends on, OR (the parallel-vec
+    /// flavor) re-pair re-sorted devices with stale-indexed pubs.
     ///
     /// SECURITY NOTE: truncation keeps lex-smallest entries; an attacker
     /// who controls injected DeviceIdentityHash values could grind low-byte
@@ -299,18 +303,276 @@ pub struct OwnerDeviceEntry {
     /// updates must win the LWW HLC check (i.e., the owner's own device must
     /// publish the update). See ZEB-219 for the analogous prior_content_keys
     /// concern.
-    #[serde(rename = "v", deserialize_with = "deserialize_device_identities")]
+    #[serde(rename = "v", serialize_with = "serialize_devices_passthrough")]
     pub devices: Vec<DeviceIdentityHash>,
+
+    /// Per-device combined identity public-bytes (`X25519_pub(32) ||
+    /// Ed25519_pub(32)`, the canonical
+    /// `harmony_identity::Identity::to_public_bytes()` layout). Parallel
+    /// to `devices` — element i is the identity_pub for `devices[i]`
+    /// when present, or `None` when this device is known-by-hash but its
+    /// pub hasn't been propagated yet (the bootstrap-incompleteness case
+    /// from Path B per ZEB-216 spec §"Public-key storage on
+    /// OwnerDeviceCache"). Caller treats `None` as `UnknownSigningKey` —
+    /// signature verification cannot proceed without the cached pub.
+    ///
+    /// 64 bytes (not 32): `signing_device_hash = SHA256(X25519 ||
+    /// Ed25519)[:16]` per `harmony_identity::Identity::address_hash`.
+    /// Storing only the Ed25519 half would yield an Ed25519-only hash
+    /// that diverges from `DeviceIdentityHash` values stored in
+    /// `devices`, silently breaking every cache lookup in
+    /// `resolve_signed_origin_owner`.
+    ///
+    /// Pre-Phase-3b snapshots wrote no `p` field at all; the manual
+    /// `Deserialize` impl on this struct treats a missing or empty `p`
+    /// as `vec![None; devices.len()]` so the parallel-vec invariant
+    /// (`pubs.len() == devices.len()`) holds in-memory regardless of
+    /// wire shape. The receive path then drops signature-verification
+    /// packets from those devices as `UnknownSigningKey` until the next
+    /// invite-equivalent flow repopulates the pubs.
+    #[serde(rename = "p", serialize_with = "serialize_device_identity_pubs")]
+    pub device_identity_pubs: Vec<Option<[u8; 64]>>,
+
     /// HLC of when this entry was learned. LWW key for merge.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
 }
 
-/// Deserialize a `Vec<DeviceIdentityHash>` and re-establish the
-/// `OwnerDeviceEntry::devices` invariant (sorted + deduped + truncated to
-/// `MAX_DEVICES_PER_OWNER`). This runs at every load — persisted-state files
-/// and remote `OwnerState` snapshots are equally untrusted with respect to
-/// the in-memory invariant.
+/// Pass-through Serialize for `OwnerDeviceEntry::devices`. Required only
+/// so the per-field `serialize_with` signatures stay symmetric with
+/// `device_identity_pubs`'s custom `serialize_device_identity_pubs`; the
+/// derived behavior is what we want for the devices vec.
+fn serialize_devices_passthrough<S>(v: &[DeviceIdentityHash], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for d in v {
+        seq.serialize_element(d)?;
+    }
+    seq.end()
+}
+
+// Manual Deserialize for OwnerDeviceEntry. The previous setup —
+// `#[derive(Deserialize)]` plus per-field `deserialize_with` for
+// `devices` and `device_identity_pubs` — was a correctness hazard: the
+// two fields were normalized INDEPENDENTLY, so a non-canonical on-disk
+// snapshot (devices unsorted, pubs in wire order) would deserialize
+// into re-sorted devices paired with stale-indexed pubs, silently
+// breaking the parallel-vec correspondence that
+// `resolve_signed_origin_owner` and signature verification rely on.
+//
+// This impl reads BOTH vecs raw (cap-rejected at the per-element level
+// for OOM safety), pads `pubs` to `devices.len()` (handles old snapshots
+// where pubs == [] but devices is non-empty), zips them, sorts BY HASH,
+// walks-and-merges duplicates with the same merge rule as
+// `apply_owner_device_update` (prefer Some over None; reject conflicting
+// Somes via D::Error::custom), then splits back into parallel vecs.
+impl<'de> Deserialize<'de> for OwnerDeviceEntry {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        #[derive(serde::Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            #[serde(rename = "v")]
+            V,
+            #[serde(rename = "p")]
+            P,
+            #[serde(rename = "l")]
+            L,
+            #[serde(other)]
+            Other,
+        }
+
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = OwnerDeviceEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an OwnerDeviceEntry CBOR map with keys v/p/l")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut devices: Option<Vec<DeviceIdentityHash>> = None;
+                let mut pubs: Option<Vec<Option<[u8; 64]>>> = None;
+                let mut learned_at: Option<Hlc> = None;
+
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::V => {
+                            if devices.is_some() {
+                                return Err(A::Error::duplicate_field("v"));
+                            }
+                            // Use the raw cap-aware reader: it bounds
+                            // per-element memory but does NOT sort/dedup
+                            // (the join below does that with pubs).
+                            devices = Some(map.next_value_seed(RawDevicesSeed)?);
+                        }
+                        Field::P => {
+                            if pubs.is_some() {
+                                return Err(A::Error::duplicate_field("p"));
+                            }
+                            pubs = Some(map.next_value_seed(RawPubsSeed)?);
+                        }
+                        Field::L => {
+                            if learned_at.is_some() {
+                                return Err(A::Error::duplicate_field("l"));
+                            }
+                            learned_at = Some(map.next_value()?);
+                        }
+                        Field::Other => {
+                            // Unknown field — drain its value and ignore.
+                            // Matches `#[derive(Deserialize)]`'s default
+                            // forgiving-of-unknown-fields posture.
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let devices = devices.ok_or_else(|| A::Error::missing_field("v"))?;
+                let mut pubs = pubs.unwrap_or_default();
+                let learned_at = learned_at.ok_or_else(|| A::Error::missing_field("l"))?;
+
+                // Pre-Phase-3b snapshots wrote no `p` field at all (or wrote
+                // `p == []`); pad to devices.len() so the parallel-vec
+                // invariant holds before the join below. If `p.len() >
+                // devices.len()` (malformed peer), truncate — devices is
+                // the source of truth for length.
+                if pubs.len() < devices.len() {
+                    pubs.resize(devices.len(), None);
+                } else if pubs.len() > devices.len() {
+                    pubs.truncate(devices.len());
+                }
+
+                // Cap-reject BEFORE zip — cheap, mirrors the per-element
+                // streaming check inside the raw readers (which is the
+                // OOM-safety path; this catches the rarer case where both
+                // raw vecs landed within their per-vec cap individually
+                // but the joined collection still wants to exceed the
+                // shared cap).
+                if devices.len() > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "OwnerDeviceEntry.devices length {} exceeds \
+                         MAX_DEVICES_PER_OWNER ({})",
+                        devices.len(),
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+
+                // Zip + sort BY HASH (preserves parallel-vec correspondence)
+                // + merge duplicate-hash entries with the same rule as
+                // `apply_owner_device_update`:
+                //   both None → None
+                //   exactly one Some → keep the Some
+                //   both Some equal → keep one
+                //   both Some different → reject (real invariant fail).
+                let mut zipped: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
+                    devices.into_iter().zip(pubs).collect();
+                zipped.sort_by_key(|(d, _)| *d);
+
+                let mut merged: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
+                    Vec::with_capacity(zipped.len());
+                for (d, p) in zipped {
+                    match merged.last_mut() {
+                        Some((prev_d, prev_p)) if *prev_d == d => match (*prev_p, p) {
+                            (None, None) => {}
+                            (None, Some(_)) => *prev_p = p,
+                            (Some(_), None) => {}
+                            (Some(a), Some(b)) if a == b => {}
+                            (Some(_), Some(_)) => {
+                                return Err(A::Error::custom(format!(
+                                    "OwnerDeviceEntry has conflicting identity pubs \
+                                     for device {:?}",
+                                    d
+                                )));
+                            }
+                        },
+                        _ => merged.push((d, p)),
+                    }
+                }
+                merged.truncate(MAX_DEVICES_PER_OWNER);
+
+                // Defense-in-depth: every cached `Some(identity_pub)` MUST
+                // derive (via SHA256(pub)[:16] —
+                // `derive_device_hash_from_identity_pub`) to its paired
+                // `DeviceIdentityHash`. A poisoned snapshot or malicious
+                // peer's `OwnerState` blob could otherwise pair a hash
+                // with a non-matching pub, silently breaking every
+                // signature verify in `resolve_signed_origin_owner`.
+                // Reject at deserialize time so the bad state never enters
+                // the in-memory cache. Mirrors the parallel check in
+                // `apply_owner_device_update`.
+                for (d, p) in merged.iter() {
+                    if let Some(pub_bytes) = p {
+                        match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
+                            Some(derived) if derived == *d => {}
+                            Some(derived) => {
+                                return Err(A::Error::custom(format!(
+                                    "OwnerDeviceEntry has identity pub for device {:?} \
+                                     that derives to a different device hash {:?}",
+                                    d, derived
+                                )));
+                            }
+                            None => {
+                                return Err(A::Error::custom(format!(
+                                    "OwnerDeviceEntry has structurally-invalid identity pub \
+                                     for device {:?}",
+                                    d
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) =
+                    merged.into_iter().unzip();
+
+                Ok(OwnerDeviceEntry {
+                    devices: sanitized_devices,
+                    device_identity_pubs: sanitized_pubs,
+                    learned_at,
+                })
+            }
+        }
+
+        // DeserializeSeed wrappers that route to the existing raw
+        // (cap-aware, OOM-safe) sequence visitors without re-introducing
+        // the per-vec sort/dedup that the join above now owns.
+        struct RawDevicesSeed;
+        impl<'de> serde::de::DeserializeSeed<'de> for RawDevicesSeed {
+            type Value = Vec<DeviceIdentityHash>;
+            fn deserialize<De: Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
+                deserialize_raw_device_identities(d)
+            }
+        }
+        struct RawPubsSeed;
+        impl<'de> serde::de::DeserializeSeed<'de> for RawPubsSeed {
+            type Value = Vec<Option<[u8; 64]>>;
+            fn deserialize<De: Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
+                deserialize_device_identity_pubs(d)
+            }
+        }
+
+        d.deserialize_map(EntryVisitor)
+    }
+}
+
+/// Deserialize a `Vec<DeviceIdentityHash>` for `OwnerDeviceEntry::devices`
+/// with cap-rejection, but WITHOUT sort/dedup — the struct-level
+/// `Deserialize` impl on `OwnerDeviceEntry` owns sort/dedup because it
+/// must be performed jointly with the parallel `device_identity_pubs`
+/// vec to preserve the parallel-vec correspondence (sorting either
+/// independently leaves them misaligned).
 ///
 /// Streams items via a `Visitor` rather than calling `Vec::deserialize`
 /// to bound peak memory: a peer (or corrupted file) declaring
@@ -329,7 +591,7 @@ pub struct OwnerDeviceEntry {
 /// AND surfaces buggy peers that "silently truncate" would mask
 /// (e.g., a peer emitting >cap entries is dropping device entries we
 /// might need for DM delivery — better to fail loudly).
-fn deserialize_device_identities<'de, D>(d: D) -> Result<Vec<DeviceIdentityHash>, D::Error>
+fn deserialize_raw_device_identities<'de, D>(d: D) -> Result<Vec<DeviceIdentityHash>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -378,12 +640,184 @@ where
                 }
                 out.push(item);
             }
-            // Re-establish canonical form (sorted + deduped). Truncate
-            // is now redundant given the cap rejection above but kept as
-            // cheap defense-in-depth against any future cap-edge bug.
-            out.sort();
-            out.dedup();
-            out.truncate(MAX_DEVICES_PER_OWNER);
+            // No sort/dedup here — the struct-level Deserialize impl on
+            // OwnerDeviceEntry sorts+dedups jointly with the parallel
+            // `device_identity_pubs` vec. Sorting independently here
+            // would leave the two vecs misaligned (the original bug).
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
+}
+
+/// Serialize `Vec<Option<[u8; 64]>>` for
+/// `OwnerDeviceEntry::device_identity_pubs`. Each element is encoded as
+/// either CBOR null (for `None` — known-by-hash, pub not yet cached) or
+/// a CBOR bstr(64) (for `Some(pub_bytes)`). The 64-byte bstr form is
+/// significantly more compact than the default `[u8; 64]` Serialize impl
+/// (which emits a 64-element CBOR array, two bytes per element after
+/// 0x17) and matches the bstr-everywhere convention used elsewhere in
+/// this module (see `serialize_bytes_as_bstr`).
+///
+/// We need an explicit `serialize_with` here because serde's blanket
+/// `Serialize` impl on `[T; N]` only covers `N <= 32` (or per-version
+/// const-generic limits), so the derive-generated serialization for the
+/// outer struct can't see `[u8; 64]: Serialize`. Custom helper sidesteps
+/// the derive entirely by walking the vec and emitting each element via
+/// `serialize_bytes`.
+fn serialize_device_identity_pubs<S>(v: &[Option<[u8; 64]>], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeSeq;
+
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for opt in v {
+        // Wrap in a tiny newtype that overrides Serialize to emit
+        // bstr(64) for Some / null for None. SerializeSeq::serialize_element
+        // requires `T: Serialize`, so we can't pass the bare slice.
+        struct BstrOpt<'a>(&'a Option<[u8; 64]>);
+        impl serde::Serialize for BstrOpt<'_> {
+            fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                match self.0 {
+                    Some(bytes) => s.serialize_bytes(bytes),
+                    None => s.serialize_none(),
+                }
+            }
+        }
+        seq.serialize_element(&BstrOpt(opt))?;
+    }
+    seq.end()
+}
+
+/// Deserialize `Vec<Option<[u8; 64]>>` for
+/// `OwnerDeviceEntry::device_identity_pubs`. Mirrors
+/// `deserialize_raw_device_identities`'s cap behavior: rejects up-front via
+/// `size_hint` when possible, pre-allocates `min(cap, hint)`, refuses
+/// the (cap+1)-th element. Does NOT sort or dedup — order is meaningful
+/// (parallel-indexed to `OwnerDeviceEntry.devices`, so reordering would
+/// silently break the device→pub correspondence that
+/// `dm_signing::verify_dm_packet_signature` relies on).
+///
+/// Each element is decoded as either CBOR null (→ `None`) or CBOR
+/// bstr(64) (→ `Some([u8; 64])`). Length is enforced strictly: a bstr
+/// of any length other than 64 is rejected.
+fn deserialize_device_identity_pubs<'de, D>(d: D) -> Result<Vec<Option<[u8; 64]>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    /// One element: CBOR null (→ None) or bstr(64) (→ Some).
+    struct OptPubVisitor;
+
+    impl<'de> Visitor<'de> for OptPubVisitor {
+        type Value = Option<[u8; 64]>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "CBOR null or a 64-byte CBOR byte string")
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            // serde's deserialize_option fans out to visit_some when the
+            // wire value is non-null; delegate to a fresh bytes-visitor.
+            d.deserialize_bytes(BytesVisitor).map(Some)
+        }
+        // ciborium drives Option-shaped deserialization through the
+        // outer Visitor when the value is bytes (not via Option's
+        // visit_some path). Accept bstr directly here.
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            BytesVisitor.visit_bytes(value).map(Some)
+        }
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            BytesVisitor.visit_byte_buf(v).map(Some)
+        }
+    }
+
+    struct BytesVisitor;
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = [u8; 64];
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a 64-byte CBOR byte string")
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<[u8; 64], E> {
+            if value.len() != 64 {
+                return Err(E::custom(format!(
+                    "device identity pub must be 64 bytes, got {}",
+                    value.len()
+                )));
+            }
+            let mut out = [0u8; 64];
+            out.copy_from_slice(value);
+            Ok(out)
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<[u8; 64], E> {
+            self.visit_bytes(&v)
+        }
+    }
+
+    /// Wrapper newtype so we can dispatch the custom OptPubVisitor per
+    /// element without going through serde's default Option deserialize
+    /// (which would call deserialize_bytes on a non-existent
+    /// `[u8; 64]: Deserialize` for serde versions where that fails).
+    struct OptPub(Option<[u8; 64]>);
+    impl<'de> Deserialize<'de> for OptPub {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            d.deserialize_any(OptPubVisitor).map(OptPub)
+        }
+    }
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<Option<[u8; 64]>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} optional 64-byte identity pubs",
+                MAX_DEVICES_PER_OWNER
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_identity_pubs array length {} exceeds MAX_DEVICES_PER_OWNER ({})",
+                        n, MAX_DEVICES_PER_OWNER
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_DEVICES_PER_OWNER)
+                .min(MAX_DEVICES_PER_OWNER);
+            let mut out: Vec<Option<[u8; 64]>> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<OptPub>()? {
+                if out.len() >= MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_identity_pubs array exceeds MAX_DEVICES_PER_OWNER ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+                out.push(item.0);
+            }
             Ok(out)
         }
     }
@@ -394,7 +828,7 @@ where
 /// Deserialize a `Vec<DmContentKey>` and re-establish the
 /// `Space::prior_content_keys` canonical-form invariant (sorted ascending
 /// by raw bytes + deduped + truncated to `MAX_PRIOR_CONTENT_KEYS`). Mirrors
-/// the rationale on `deserialize_device_identities`: `validate_invariants`
+/// the rationale on `deserialize_raw_device_identities`: `validate_invariants`
 /// runs on apply paths only, NOT on initial load, so without this hook a
 /// corrupted on-disk file with non-canonical priors would sit in
 /// `state.spaces` unchecked, get re-serialized on the next `save_crdt`,
@@ -402,7 +836,7 @@ where
 /// (silent convergence break — replicas with semantically-equal but
 /// differently-ordered priors disagree on `canonical_cbor_encode` bytes).
 ///
-/// Same OOM-safe streaming pattern as `deserialize_device_identities`:
+/// Same OOM-safe streaming pattern as `deserialize_raw_device_identities`:
 /// a peer/file declaring `array(2^32-1)` of 32-byte keys would otherwise
 /// force a multi-GB allocation before truncation runs. Reject (rather
 /// than truncate) above the cap — `merge_prior_content_keys` always
@@ -2220,6 +2654,20 @@ mod owner_device_entry_deserialize_tests {
         }
     }
 
+    /// Build a real (DeviceIdentityHash, [u8; 64]) pair from a seed where
+    /// the hash IS `derive_device_hash_from_identity_pub(&pub)`. Required
+    /// for any test that exercises a path now gated by the
+    /// pub-derives-to-hash invariant added in this commit — placeholder
+    /// pubs (e.g., `[0x42u8; 64]`) would now be rejected as
+    /// `D::Error::custom(...)` and mask the test's intent.
+    fn matching_device_pair(seed_byte: u8) -> (DeviceIdentityHash, [u8; 64]) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[seed_byte; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+        (device_hash, identity_pub)
+    }
+
     #[test]
     fn deserialize_rejects_oversized_devices() {
         // A wire input with > MAX_DEVICES_PER_OWNER (32) device hashes
@@ -2294,5 +2742,308 @@ mod owner_device_entry_deserialize_tests {
         assert_eq!(entry.devices[0], DeviceIdentityHash([0; 16]));
         // learned_at preserved from the wire.
         assert_eq!(entry.learned_at, hlc(7));
+    }
+
+    #[test]
+    fn owner_device_entry_serialize_includes_identity_pubs() {
+        // Use a real matching (hash, pub) pair so the new
+        // pub-derives-to-hash invariant in struct-level Deserialize
+        // doesn't reject the round-trip.
+        let (h1, p1) = matching_device_pair(0xa1);
+        let entry = OwnerDeviceEntry {
+            devices: vec![h1],
+            device_identity_pubs: vec![Some(p1)],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(entry, recovered);
+    }
+
+    #[test]
+    fn owner_device_entry_serialize_handles_unknown_pubs() {
+        // Mid-bootstrap state: device hash is known but pub isn't yet
+        // cached. The Option::None entries must round-trip cleanly.
+        // The Some(pub) entry uses a real derive-matching pair so the
+        // new pub-derives-to-hash invariant doesn't fire.
+        let (h1, p1) = matching_device_pair(0xa1);
+        let (h2, _) = matching_device_pair(0xa2);
+        // Pre-sort so the post-deserialize sorted order is unambiguous
+        // (the deserialize impl re-sorts; the serialize side does not).
+        let (devices, pubs) = if h1 < h2 {
+            (vec![h1, h2], vec![Some(p1), None])
+        } else {
+            (vec![h2, h1], vec![None, Some(p1)])
+        };
+        let entry = OwnerDeviceEntry {
+            devices: devices.clone(),
+            device_identity_pubs: pubs.clone(),
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(entry, recovered);
+        // The Some(pub) entry survives round-trip; the None entry stays None.
+        assert!(recovered.device_identity_pubs.contains(&Some(p1)));
+        assert!(recovered.device_identity_pubs.contains(&None));
+    }
+
+    #[test]
+    fn owner_device_entry_loads_pre_phase3b_snapshot_pads_pubs_to_devices_len() {
+        // Phase 1/2 snapshots stored only `devices` and `learned_at`.
+        // Phase 3b adds `device_identity_pubs` — old snapshots load and
+        // the struct-level Deserialize impl pads pubs to
+        // `vec![None; devices.len()]` so the parallel-vec invariant
+        // (`pubs.len() == devices.len()`) holds in-memory regardless of
+        // wire shape. Path B's signature verification then drops packets
+        // from those devices as UnknownSigningKey (handler-side
+        // semantic; this test only verifies the deserializer-side
+        // contract).
+        //
+        // Construction: build the OLD shape via a stripped-down struct
+        // that mirrors Phase 1/2's OwnerDeviceEntry, encode it, then
+        // decode under the NEW OwnerDeviceEntry definition. This is
+        // more robust than pinning hand-crafted CBOR bytes (which would
+        // lock in serde's current encoding choices and become brittle).
+        #[derive(serde::Serialize)]
+        struct OldOwnerDeviceEntry {
+            #[serde(rename = "v")]
+            devices: Vec<DeviceIdentityHash>,
+            #[serde(rename = "l")]
+            learned_at: Hlc,
+        }
+        let old = OldOwnerDeviceEntry {
+            devices: vec![
+                DeviceIdentityHash([0xa1; 16]),
+                DeviceIdentityHash([0xa2; 16]),
+            ],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        // OldOwnerDeviceEntry is local to this test (cannot impl the
+        // sealed CanonicalPayload trait), so encode via ciborium
+        // directly. Decode goes through the sealed canonical decoder
+        // since OwnerDeviceEntry IS a registered canonical type.
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).expect("encode old shape");
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(
+            recovered.devices,
+            vec![
+                DeviceIdentityHash([0xa1; 16]),
+                DeviceIdentityHash([0xa2; 16]),
+            ]
+        );
+        assert_eq!(
+            recovered.device_identity_pubs,
+            vec![None, None],
+            "old snapshot must load with pubs padded to devices.len() (graceful upgrade)"
+        );
+        assert_eq!(recovered.learned_at.wall_ms, 1);
+    }
+
+    /// Variant of the parallel `RawOwnerDeviceEntry` that includes the
+    /// pubs field, so we can plant deliberately-malformed (non-canonical)
+    /// {devices, pubs} pairs on the wire and assert the new struct-level
+    /// `Deserialize` impl re-pairs them through a JOINT sort (the
+    /// pre-fix bug: independent per-field sort would shuffle pubs out
+    /// of alignment).
+    #[derive(Serialize)]
+    struct RawOwnerDeviceEntryWithPubs {
+        #[serde(rename = "v")]
+        v: Vec<DeviceIdentityHash>,
+        #[serde(rename = "p", serialize_with = "serialize_device_identity_pubs")]
+        p: Vec<Option<[u8; 64]>>,
+        #[serde(rename = "l")]
+        l: Hlc,
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_normalizes_unsorted_devices_and_pubs_together() {
+        // The pre-fix bug: `#[serde(deserialize_with = ...)]` on each
+        // field independently meant `devices` got sorted but `pubs`
+        // stayed in wire order. A non-canonical snapshot then loaded
+        // with re-ordered devices paired with the WRONG pubs.
+        //
+        // Wire shape (deliberately non-canonical):
+        //   devices = [d_high, d_low]  (descending — would be sorted to [d_low, d_high])
+        //   pubs    = [P_high, P_low]  (parallel to wire devices)
+        //
+        // Under the fix, devices and pubs are zipped, sorted by hash,
+        // then re-split — pubs follow devices through the sort and the
+        // result is [d_low, d_high] paired with [P_low, P_high].
+        //
+        // Each (hash, pub) is a real derive-matching pair so the
+        // pub-derives-to-hash invariant doesn't fire. We then
+        // disambiguate which is "low" vs "high" by lex order on the
+        // derived hashes.
+        let (h_a, p_a) = matching_device_pair(0xa1);
+        let (h_b, p_b) = matching_device_pair(0xa2);
+        let (low_h, low_p, high_h, high_p) = if h_a < h_b {
+            (h_a, p_a, h_b, p_b)
+        } else {
+            (h_b, p_b, h_a, p_a)
+        };
+
+        let raw = RawOwnerDeviceEntryWithPubs {
+            v: vec![high_h, low_h], // descending on the wire
+            p: vec![Some(high_p), Some(low_p)],
+            l: hlc(7),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
+
+        assert_eq!(
+            entry.devices,
+            vec![low_h, high_h],
+            "devices sorted ascending"
+        );
+        assert_eq!(
+            entry.device_identity_pubs,
+            vec![Some(low_p), Some(high_p)],
+            "pubs MUST follow devices through the sort \
+             (parallel-vec correspondence preserved)"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_old_snapshot_pads_pubs() {
+        // Old snapshot (pre-Phase-3b): pubs field absent entirely. The
+        // struct-level Deserialize impl pads to `vec![None;
+        // devices.len()]` so the parallel-vec invariant holds regardless
+        // of wire shape.
+        #[derive(Serialize)]
+        struct OldEntry {
+            #[serde(rename = "v")]
+            v: Vec<DeviceIdentityHash>,
+            #[serde(rename = "l")]
+            l: Hlc,
+        }
+        let old = OldEntry {
+            v: vec![
+                DeviceIdentityHash([0x01; 16]),
+                DeviceIdentityHash([0x02; 16]),
+                DeviceIdentityHash([0x03; 16]),
+            ],
+            l: hlc(11),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).expect("encode old");
+
+        let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
+
+        assert_eq!(entry.devices.len(), 3);
+        assert_eq!(
+            entry.device_identity_pubs,
+            vec![None, None, None],
+            "missing/empty pubs MUST be padded to devices.len() with None"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_rejects_conflicting_pubs() {
+        // Two entries with the SAME device hash but DIFFERENT identity
+        // pubs is a real invariant violation (a peer claimed two
+        // different identity pubs for the same DeviceIdentityHash —
+        // either malicious or a bug in their bootstrap path). The
+        // struct-level Deserialize impl rejects via D::Error::custom.
+        let d = DeviceIdentityHash([0x11; 16]);
+        let p_a = [0xaa; 64];
+        let p_b = [0xbb; 64];
+
+        let raw = RawOwnerDeviceEntryWithPubs {
+            v: vec![d, d],
+            p: vec![Some(p_a), Some(p_b)],
+            l: hlc(7),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let err = ciborium::from_reader::<OwnerDeviceEntry, _>(&bytes[..])
+            .expect_err("decode must reject conflicting pubs for same device");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflicting identity pubs"),
+            "expected error mentioning conflicting identity pubs, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_merges_some_over_none_on_duplicate_hash() {
+        // [d, d] with pubs = [None, Some(P)] must dedup to [d] with
+        // pub = Some(P) — the merge rule prefers Some over None
+        // regardless of order. The pre-fix `dedup_by_key` would have
+        // kept the FIRST entry and dropped the Some.
+        // Real (hash, pub) pair so the new pub-derives-to-hash invariant
+        // doesn't fire.
+        let (d, p) = matching_device_pair(0xa1);
+
+        let raw = RawOwnerDeviceEntryWithPubs {
+            v: vec![d, d],
+            p: vec![None, Some(p)],
+            l: hlc(7),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
+        assert_eq!(entry.devices, vec![d]);
+        assert_eq!(
+            entry.device_identity_pubs,
+            vec![Some(p)],
+            "merge MUST prefer Some over None"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_rejects_pub_with_mismatched_hash() {
+        // Defense-in-depth (mirror of `apply_owner_device_update`'s
+        // pub-derives-to-hash check): a snapshot or remote-replica blob
+        // that pairs a `Some(identity_pub)` with a `DeviceIdentityHash`
+        // that the pub does NOT derive to is malformed/poisoned.
+        // Loading it would silently break every later signature verify
+        // in `resolve_signed_origin_owner` — reject at deserialize time.
+        //
+        // Use a STRUCTURALLY-VALID pub (derived from a real
+        // PrivateIdentity) paired with a hash that does NOT derive from
+        // it — isolates the derives-to-different-hash branch.
+        let (real_hash, real_pub) = matching_device_pair(0xa1);
+        let mismatched_hash = DeviceIdentityHash([0x42; 16]);
+        assert_ne!(
+            real_hash, mismatched_hash,
+            "test fixture must keep mismatched_hash distinct from the derived hash"
+        );
+
+        let raw = RawOwnerDeviceEntryWithPubs {
+            v: vec![mismatched_hash],
+            p: vec![Some(real_pub)],
+            l: hlc(7),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let err = ciborium::from_reader::<OwnerDeviceEntry, _>(&bytes[..])
+            .expect_err("decode must reject pub that does not derive to its paired hash");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity pub") && msg.contains("device hash"),
+            "expected error mentioning identity pub deriving to a different device hash, got: {msg}"
+        );
     }
 }

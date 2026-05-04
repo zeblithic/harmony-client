@@ -159,6 +159,27 @@ pub async fn run<R: Runtime>(
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
     crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    // ZEB-227 Path B: outbound DM unicast receiver. None when no owner
+    // identity is loaded (mirrors the dm_outbox/dm_transport/crdt_state
+    // shape). The select! arm uses std::future::pending() to make the
+    // None case effectively skipped without polling overhead. `mut` is
+    // required because the arm calls `.as_mut()` on the Option.
+    mut unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>,
+    // ZEB-227 Path B Task 11: ContentStore handle for the
+    // RuntimeAction::UnicastReceived interception block. handle_cidnotify
+    // does a 500ms-timeout cas.get on the message_cid before
+    // decrypt+inbox-write; without this handle the interception block
+    // can't service inbound CidNotify packets. None when no owner identity
+    // is loaded (same gating as dm_outbox/crdt_state).
+    cas_handle: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
+    // ZEB-227 Path B Task 11: outbound DM unicast SENDER (clone of the
+    // tx half of `unicast_send_rx`'s channel). The interception block
+    // hands this to `DmOutbox.handle_unicast` so handle_cidnotify can
+    // push DmAck fan-out requests back through the same channel that
+    // RuntimeUnicastTransport uses for outbound CidNotify. Same channel,
+    // both directions push; event_loop drains via unicast_send_rx for
+    // both. None when no owner identity is loaded.
+    unicast_send_tx: Option<mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -576,6 +597,26 @@ pub async fn run<R: Runtime>(
     let mut voice_subs: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
+    // ZEB-227 PR #80 review fix: retry buffer for RuntimeActions whose
+    // dispatch transiently failed because dm_outbox/crdt_state locks were
+    // contended by an in-flight IPC handler. Today only
+    // `RuntimeAction::UnicastReceived` requeues here — dropping that
+    // packet on contention previously converted ordinary lock pressure
+    // into delivery failures with no caller-visible recovery (Reticulum
+    // is best-effort, so the upstream sender's CidNotify retransmit
+    // takes ~retransmit_interval to drive a redelivery).
+    //
+    // Capacity 32 caps the very-degraded fan-out (e.g. event-loop
+    // wedged behind a long-running IPC) so we don't unbounded-buffer.
+    // On full we drop+warn, which is no worse than the prior behavior.
+    // Each loop iteration drains AT MOST ONE queued action before
+    // entering the select! again; this keeps other arms (timer, UDP,
+    // shutdown) responsive even under a steady stream of contended
+    // packets.
+    let mut runtime_action_retry: std::collections::VecDeque<RuntimeAction> =
+        std::collections::VecDeque::with_capacity(32);
+    const RUNTIME_ACTION_RETRY_CAP: usize = 32;
+
     tracing::info!("event loop running");
 
     loop {
@@ -869,9 +910,12 @@ pub async fn run<R: Runtime>(
                     });
                     // Tick immediately so content is committed before replying.
                     for action in runtime.tick() {
-                        dispatch_action(
+                        handle_runtime_action_or_dispatch(
                             action, &session, &zenoh_tx, &udp,
                             &broadcast_addr, &app, &closing, &own_zid,
+                            dm_outbox.as_ref(), crdt_state.as_ref(),
+                            cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                            &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                         ).await;
                     }
                     let _ = req.reply.send(Ok(()));
@@ -896,9 +940,12 @@ pub async fn run<R: Runtime>(
                             payload: blob,
                         });
                         for action in runtime.tick() {
-                            dispatch_action(
+                            handle_runtime_action_or_dispatch(
                                 action, &session, &zenoh_tx, &udp,
                                 &broadcast_addr, &app, &closing, &own_zid,
+                                dm_outbox.as_ref(), crdt_state.as_ref(),
+                                cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                                &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                             ).await;
                         }
                         // We do NOT inspect tick() actions for a "rejected"
@@ -978,6 +1025,29 @@ pub async fn run<R: Runtime>(
                         }
                     }
                 }
+            }
+
+            // ── ZEB-227 Path B: outbound DM unicast → NodeRuntime ────────────
+            // RuntimeUnicastTransport (Task 6, dispatched per send_dm) pushes one
+            // UnicastSendRequest per recipient device hash into this channel; we
+            // forward each as a RuntimeEvent::SendUnicastToDevice into NodeRuntime,
+            // which queues into pending_unicast_sends and resolves on next tick
+            // against the path table (per ZEB-226's defer-then-drop semantics).
+            //
+            // The arm is gated by Optional rx — None is the inactive shape (no
+            // owner identity loaded), and the std::future::pending() shim makes
+            // the arm effectively skipped without polling overhead.
+            Some(req) = async {
+                match unicast_send_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                runtime.push_event(RuntimeEvent::SendUnicastToDevice {
+                    destination_hash: req.destination_hash,
+                    packet: req.packet,
+                });
+                should_tick = true;
             }
 
             // ── Content-verb requests (pin/unpin/burn/snapshot) ────
@@ -1136,7 +1206,7 @@ pub async fn run<R: Runtime>(
         if should_tick {
             let actions = runtime.tick();
             for action in actions {
-                dispatch_action(
+                handle_runtime_action_or_dispatch(
                     action,
                     &session,
                     &zenoh_tx,
@@ -1145,9 +1215,41 @@ pub async fn run<R: Runtime>(
                     &app,
                     &closing,
                     &own_zid,
+                    dm_outbox.as_ref(),
+                    crdt_state.as_ref(),
+                    cas_handle.as_ref(),
+                    unicast_send_tx.as_ref(),
+                    &mut runtime_action_retry,
+                    RUNTIME_ACTION_RETRY_CAP,
                 )
                 .await;
             }
+        }
+
+        // ZEB-227 PR #80 review fix: drain at most one queued
+        // RuntimeAction per loop iteration. Processing one-at-a-time
+        // means a steady stream of contended packets can't starve other
+        // select! arms (timer, UDP, shutdown). When locks are still
+        // contended on retry, `handle_runtime_action_or_dispatch`
+        // re-pushes onto the buffer; we'll try again next iteration.
+        if let Some(retry_action) = runtime_action_retry.pop_front() {
+            handle_runtime_action_or_dispatch(
+                retry_action,
+                &session,
+                &zenoh_tx,
+                &udp,
+                &broadcast_addr,
+                &app,
+                &closing,
+                &own_zid,
+                dm_outbox.as_ref(),
+                crdt_state.as_ref(),
+                cas_handle.as_ref(),
+                unicast_send_tx.as_ref(),
+                &mut runtime_action_retry,
+                RUNTIME_ACTION_RETRY_CAP,
+            )
+            .await;
         }
     }
 
@@ -1158,6 +1260,149 @@ pub async fn run<R: Runtime>(
     }
     let _ = session.close().await;
     tracing::info!("event loop stopped");
+}
+
+/// ZEB-227 Path B Task 11: handle a single `RuntimeAction`, peeling off
+/// `RuntimeAction::UnicastReceived` for inbound DM dispatch through
+/// `DmOutbox.handle_unicast`. Other variants fall through to the standard
+/// `dispatch_action` platform-I/O path.
+///
+/// `dispatch_action` has a catch-all `_ => {}` arm that would silently
+/// drop `UnicastReceived` — extracted here so all three `runtime.tick()`
+/// loops route consistently without duplicating the interception block.
+///
+/// Lock acquisition uses `try_lock`: contention requeues the action via
+/// `retry_buffer` so the next loop iteration retries once locks are free,
+/// instead of dropping the packet. `.lock().await` here would re-introduce
+/// the deadlock chain (send_dm IPC + cas_op processing both contend on
+/// dm_outbox + crdt_state). The retry buffer keeps inbound DMs reliable
+/// without the deadlock risk of awaiting on a contended lock.
+///
+/// `retry_buffer` is bounded: when full, the action is dropped+warned
+/// (very-degraded case; means event-loop is wedged behind a long IPC and
+/// >32 packets have queued — Reticulum CidNotify retransmit will redrive).
+///
+/// NOTE: a focused unit test for the requeue behavior is deferred — the
+/// `handle_runtime_action_or_dispatch` helper requires an `AppHandle`,
+/// `zenoh::Session`, `UdpSocket`, and several other handles to call,
+/// which the existing event_loop test modules don't currently scaffold.
+/// The fix-up is verified via type-checking of the requeue branch + the
+/// dm_outbox-side tests for the channel-pressure path.
+#[allow(clippy::too_many_arguments)]
+async fn handle_runtime_action_or_dispatch<R: Runtime>(
+    action: RuntimeAction,
+    session: &zenoh::Session,
+    zenoh_tx: &mpsc::Sender<ZenohEvent>,
+    udp: &UdpSocket,
+    broadcast_addr: &SocketAddr,
+    app: &AppHandle<R>,
+    closing: &Arc<AtomicBool>,
+    own_zid: &str,
+    dm_outbox: Option<&std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    crdt_state: Option<&std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    cas_handle: Option<&std::sync::Arc<dyn crate::content_store::ContentStore>>,
+    unicast_send_tx: Option<&mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    retry_buffer: &mut std::collections::VecDeque<RuntimeAction>,
+    retry_buffer_cap: usize,
+) {
+    if matches!(action, RuntimeAction::UnicastReceived { .. }) {
+        if let (Some(outbox), Some(state), Some(cas), Some(tx)) =
+            (dm_outbox, crdt_state, cas_handle, unicast_send_tx)
+        {
+            let outbox_try = outbox.try_lock();
+            let state_try = state.try_lock();
+            match (outbox_try, state_try) {
+                (Ok(mut outbox_g), Ok(mut state_g)) => {
+                    // Extract packet bytes from the action without cloning when
+                    // possible. We re-bind to take ownership inside the match
+                    // arm via destructuring of `action` itself.
+                    let packet = match &action {
+                        RuntimeAction::UnicastReceived { packet, .. } => packet.clone(),
+                        _ => unreachable!("matched UnicastReceived above"),
+                    };
+                    let wall_now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let result = outbox_g
+                        .handle_unicast(&mut state_g, cas.as_ref(), tx, packet, wall_now_ms)
+                        .await;
+                    // Drop locks before IPC emits.
+                    drop(state_g);
+                    drop(outbox_g);
+                    match result {
+                        Ok(outcome) => {
+                            for entry in outcome.newly_received {
+                                let _ = app.emit(
+                                    "dm-received",
+                                    serde_json::json!({
+                                        "spaceId": hex::encode(entry.space_id.0),
+                                        "messageCid": hex::encode(entry.message_cid.to_bytes()),
+                                        "from": hex::encode(entry.from.0),
+                                        "receivedAt": entry.received_at.wall_ms,
+                                    }),
+                                );
+                            }
+                            for (entry_id, recipient) in outcome.newly_delivered {
+                                let _ = app.emit(
+                                    "dm-delivered",
+                                    serde_json::json!({
+                                        "messageId": hex::encode(entry_id.0),
+                                        "recipient": hex::encode(recipient.0),
+                                    }),
+                                );
+                            }
+                            for entry_id in outcome.newly_expired {
+                                let _ = app.emit(
+                                    "dm-expired",
+                                    serde_json::json!({
+                                        "messageId": hex::encode(entry_id.0),
+                                    }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "handle_unicast dropped packet");
+                        }
+                    }
+                }
+                _ => {
+                    // Locks contended — requeue this action so the next
+                    // loop iteration retries once locks free up. Bounded:
+                    // drop+warn when the retry buffer is full.
+                    if retry_buffer.len() >= retry_buffer_cap {
+                        tracing::warn!(
+                            cap = retry_buffer_cap,
+                            "UnicastReceived retry buffer full; dropping packet \
+                             (event loop appears wedged behind contended IPC)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "handle_unicast deferred this tick (locks contended); requeued"
+                        );
+                        retry_buffer.push_back(action);
+                    }
+                }
+            }
+            return;
+        }
+        // No owner identity loaded — DM stack is uninitialized. Drop the
+        // packet silently; harmony-node has the same behavior (see
+        // event_loop.rs in harmony-node for the matching no-client-consumer
+        // diagnostic).
+        return;
+    }
+    dispatch_action(
+        action,
+        session,
+        zenoh_tx,
+        udp,
+        broadcast_addr,
+        app,
+        closing,
+        own_zid,
+    )
+    .await;
 }
 
 /// Dispatch a single RuntimeAction to the platform I/O layer.

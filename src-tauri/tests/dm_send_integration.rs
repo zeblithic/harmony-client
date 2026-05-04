@@ -1,6 +1,6 @@
 //! Phase 2 end-to-end test: invoke `send_dm` via the Tauri test harness,
 //! observe OutboxEntry installed in OwnerState, and (via direct
-//! handle_ack) walk it to Complete.
+//! mark_ack_delivered) walk it to Complete.
 //!
 //! This test does NOT cover the real frontend or real Reticulum transport.
 //! It validates that the IPC plumbing (Tauri command registration, NodeState
@@ -9,7 +9,7 @@
 use harmony_app::dm_outbox::{DmOutbox, StubTransport};
 use harmony_app::owner_state_crdt::{ApplyOutcome, OwnerState};
 use harmony_app::owner_state_types::{
-    DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
 };
 
 #[tokio::test]
@@ -65,7 +65,13 @@ async fn send_dm_round_trip_through_dm_outbox() {
     ));
 
     let cas = harmony_app::content_store::InMemoryStub::default();
-    let mut outbox = DmOutbox::new("dev".into(), alice);
+    // Phase 3b: DmOutbox::new takes signing_key + signing_device_hash for
+    // ack fan-out in handle_cidnotify. This Phase-2 test only exercises the
+    // sender-side path (send_dm + drain + mark_ack_delivered) so the values
+    // are inert — synthetic SigningKey + arbitrary DeviceIdentityHash.
+    let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+    let our_device_hash = DeviceIdentityHash([0xaa; 16]);
+    let mut outbox = DmOutbox::new("dev".into(), alice, our_device_hash, signing_key);
     let transport = StubTransport::new();
 
     // 1. send_dm
@@ -89,7 +95,7 @@ async fn send_dm_round_trip_through_dm_outbox() {
     assert_eq!(transport.sends().len(), 1, "drain attempted one send");
 
     // 3. simulate ack arrival
-    assert!(outbox.handle_ack(&mut state, msg_id, bob));
+    assert!(outbox.mark_ack_delivered(&mut state, msg_id, bob));
 
     // 4. assert Complete
     let stored = state.outbox.get(&msg_id).expect("entry still present");
