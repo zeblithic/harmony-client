@@ -1501,7 +1501,7 @@ fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerA
 // (IPC wiring) will pass the SyncEngine's tracker entry as `prev` to
 // keep production HLCs monotone with state-root publishes. (A future
 // cleanup could promote this to a shared module — out of Phase 2 scope.)
-fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
+pub(crate) fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
     let (logical, base_wall) = match prev {
         Some(p) if p.wall_ms == wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
         Some(p) if p.wall_ms > wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
@@ -2979,10 +2979,15 @@ mod tests {
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
 
-        // newly_received populated for the Inserted outcome.
+        // newly_received populated for the Inserted outcome — body +
+        // mime_type + sent_at flow through the widened ReceivedMessage
+        // payload (Phase 4 dm-received IPC depends on these fields).
         assert_eq!(outcome.newly_received.len(), 1);
         assert_eq!(outcome.newly_received[0].inbox_entry.from, alice);
         assert_eq!(outcome.newly_received[0].inbox_entry.space_id, space_id);
+        assert_eq!(outcome.newly_received[0].body, b"hi bob");
+        assert_eq!(outcome.newly_received[0].mime_type, "text/plain");
+        assert_eq!(outcome.newly_received[0].sent_at.wall_ms, 150);
 
         // One UnicastSendRequest emitted per sender device (one device
         // here, so exactly one).

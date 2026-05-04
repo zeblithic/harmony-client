@@ -1477,7 +1477,7 @@ is SpaceId hex (matches NavNode id from Task 8)."
 it('loadDmThread fetches read_dm_thread IPC and populates messages reverse-chrono', async () => {
   const svc = new MessageService();
   const adapter = makeMockAdapter();
-  adapter.invokeMock = jest.fn().mockResolvedValue([
+  adapter.invokeMock = vi.fn().mockResolvedValue([
     { messageCid: 'cid3', from: 'self-hex', sentAt: 3000, receivedAt: 3001, body: hex.encode('newest'), mimeType: 'text/plain', isSelfOutbound: true },
     { messageCid: 'cid2', from: 'bob-hex', sentAt: 2000, receivedAt: 2001, body: hex.encode('mid'), mimeType: 'text/plain', isSelfOutbound: false },
     { messageCid: 'cid1', from: 'self-hex', sentAt: 1000, receivedAt: 1001, body: hex.encode('oldest'), mimeType: 'text/plain', isSelfOutbound: true },

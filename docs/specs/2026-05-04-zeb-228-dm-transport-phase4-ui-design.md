@@ -236,13 +236,31 @@ Around line 654 (`switchMode`/`activeChannel` handling), modify the existing `on
 ```ts
 async function handleSend(text: string, priority: MessagePriority) {
   if (activeChannelType === 'dm' || activeChannelType === 'group-chat') {
-    await tauriAdapter.invoke('send_dm', {
-      spaceId: activeChannel,
-      content: Array.from(new TextEncoder().encode(text)), // bytes for Vec<u8>
-      mimeType: 'text/plain',
+    // Optimistic: push placeholder before IPC returns so the UI feels instant.
+    const optimisticId = crypto.randomUUID();
+    messageService.pushOptimistic({
+      id: optimisticId,
+      sender: { address: 'self', displayName: 'You' },
+      text,
+      timestamp: Date.now(),
+      media: [],
+      priority,
+      channel: activeChannel,
+      hub: '',  // top-level DMs use empty hub; matches App.svelte feed filter
+      deliveryState: 'sending',
     });
-    // dm-received fires for our self-InboxEntry write → MessageService picks it up
-    // (or directly push optimistically for instant UI feedback; pick one)
+    try {
+      // send_dm returns BOTH ids: messageCid (stable; matches dm-received +
+      // scrollback) and messageId (OutboxEntryId; lifecycle correlation).
+      const { messageId, messageCid } = await tauriAdapter.invoke('send_dm', {
+        spaceId: activeChannel,
+        content: Array.from(new TextEncoder().encode(text)),
+        mimeType: 'text/plain',
+      });
+      messageService.replaceOptimisticId(optimisticId, messageCid, messageId);
+    } catch (e) {
+      messageService.markFailed(optimisticId, String(e));
+    }
   } else {
     // existing channel publish path unchanged
     ...
@@ -250,7 +268,7 @@ async function handleSend(text: string, priority: MessagePriority) {
 }
 ```
 
-**Optimistic UI question:** for DMs, should the message appear in the timeline immediately (before `send_dm` returns), or wait for the IPC roundtrip + the self-InboxEntry write event? Discord/iMessage convention is optimistic-with-fallback. Phase 4 default: optimistic — push a placeholder Message with `id: messageId from send_dm response, deliveryState: 'sending'`, then when `dm-delivered` arrives transition to `'delivered'`, on `dm-expired` transition to `'expired'`. If `send_dm` itself errors, mark `'failed'` immediately.
+**Self-history persistence note:** `send_dm` writes a self-InboxEntry into `state.inbox` (Phase 4 backend §2), but does **not** emit a `dm-received` IPC event for it (`dm-received` is only emitted by the receiver-side `handle_cidnotify`). Self-history surfaces to the UI in two ways: (a) optimistic push (above) for the live message, and (b) `loadDmThread` scrollback (below) for messages persisted before the current session. `dm-delivered` later transitions optimistic Messages to `'delivered'`; `dm-expired` to `'expired'`; `send_dm` errors mark `'failed'` immediately.
 
 ### 5. Inline manual-delete on stuck/expired messages
 

@@ -2311,7 +2311,7 @@ pub fn add_space_dm_inner(
     //       The IPC shim's caller is responsible for keeping the HLC
     //       tracker monotone post-mint; this inner function doesn't
     //       touch the tracker. ───────────────────────────────────────
-    let creation_hlc = next_hlc(prev_hlc, wall_now_ms, device_id);
+    let creation_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
 
     // ── 5. Build the Space CRDT entry. ───────────────────────────────
     let space_id = SpaceId(rand::random());
@@ -2467,29 +2467,6 @@ pub fn add_space_dm_inner(
     }
 
     Ok((canonical_space_id, sends, false))
-}
-
-/// Helper mirroring `dm_outbox::next_hlc` for callers in this module.
-/// Inlined here to avoid widening `dm_outbox::next_hlc` from `fn` (file-
-/// private) to `pub(crate)` for one consumer; if a third caller emerges,
-/// promote it.
-fn next_hlc(
-    prev: Option<&crate::owner_state_types::Hlc>,
-    wall_now_ms: u64,
-    device_id: &str,
-) -> crate::owner_state_types::Hlc {
-    let (logical, base_wall) = match prev {
-        Some(p) if p.wall_ms == wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) if p.wall_ms > wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) => (0, p.wall_ms),
-        None => (0, 0),
-    };
-    let effective_wall = std::cmp::max(wall_now_ms, base_wall);
-    crate::owner_state_types::Hlc {
-        wall_ms: effective_wall,
-        logical,
-        device_id: device_id.to_string(),
-    }
 }
 
 /// ZEB-228 Phase 4 — Create a new Space.

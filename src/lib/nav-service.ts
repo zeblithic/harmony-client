@@ -181,12 +181,16 @@ export class NavService {
     } else if (action === 'modified') {
       // Patch in-place — preserve existing parentId/expanded/unread state
       // so user-applied folder placement and read state aren't clobbered
-      // by a name change.
+      // by a name change. Also preserve cached `peer` when the modified
+      // payload omits `members` (name-only update); only overwrite peer
+      // when the new payload actually carried member info we could
+      // derive a fresh peer from.
+      const peerWasDerivedFromPayload = members !== undefined;
       let found = false;
       this.nodes = this.nodes.map((n) => {
         if (n.id !== spaceId) return n;
         found = true;
-        return { ...n, name, peer };
+        return { ...n, name, peer: peerWasDerivedFromPayload ? peer : n.peer };
       });
       if (!found) {
         // Modified for an unknown spaceId — treat as added to stay
