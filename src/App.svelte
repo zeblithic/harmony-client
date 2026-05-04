@@ -18,6 +18,7 @@
   import MailCompose from './lib/components/MailCompose.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
+  import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
@@ -130,6 +131,40 @@
     vineService.toggleLike(vine).catch((err) => {
       console.error('Toggle like failed', err);
     });
+  }
+
+  // ── DM creation modal (ZEB-228 Phase 4 Task 13) ─────────────────────
+  // The "+ New DM" button at the bottom of the nav sidebar opens this
+  // modal. Submit invokes `add_space` (DM/GroupDm wire codes), which
+  // dispatches DmInvites; the backend's apply_space + nav-updated emit
+  // will trigger NavService to insert the new NavNode. We switch to it
+  // after a short tick so NavService has time to receive the event.
+  let dmCreateDialogOpen = $state(false);
+
+  async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const spaceId = (await invoke('add_space', {
+        kind: args.kind, // backend accepts the wire codes "dm" / "group-dm"
+        name: args.name,
+        members: args.members,
+      })) as string;
+      dmCreateDialogOpen = false;
+      // Give NavService a tick to apply the nav-updated event before we
+      // try to switch to the new node. The backend emits nav-updated as
+      // part of apply_space, but it travels through Tauri's IPC bridge
+      // asynchronously so a microtask isn't enough.
+      setTimeout(() => {
+        const newNode = navService.nodes.find((n) => n.id === spaceId);
+        if (newNode) handleNodeClick(newNode.id);
+      }, 50);
+    } catch (e) {
+      // Phase 4 v1: log to console. The dialog's client-side recipient cap
+      // catches the most common failure (16+ members); other failures
+      // (backend not ready, decoding errors) are rare and currently shown
+      // only in the dev console. Toast UX is a polish follow-up.
+      console.error('add_space failed:', e);
+    }
   }
 
   /** Detect video MIME type from magic bytes. */
@@ -855,23 +890,35 @@
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
   {#snippet nav()}
-    <NavPanel
-      nodes={navNodes}
-      {collapsed}
-      activeNodeId={activeChannel}
-      onNodeClick={handleNodeClick}
-      onSettingsClick={() => { showSettings = !showSettings; }}
-      profileLookup={(addr) => navService.profileLookup(addr)}
-      onModeChange={switchMode}
-      {appMode}
-      contentItems={allFileContents}
-      storageBuddies={fileBuddies}
-      {fileSection}
-      {currentFolderCid}
-      onFolderSelect={handleNavigateFolder}
-      filters={fileFilters}
-      onFilterChange={(filters) => { fileFilters = filters; }}
-    />
+    <div class="nav-with-dm-create">
+      <NavPanel
+        nodes={navNodes}
+        {collapsed}
+        activeNodeId={activeChannel}
+        onNodeClick={handleNodeClick}
+        onSettingsClick={() => { showSettings = !showSettings; }}
+        profileLookup={(addr) => navService.profileLookup(addr)}
+        onModeChange={switchMode}
+        {appMode}
+        contentItems={allFileContents}
+        storageBuddies={fileBuddies}
+        {fileSection}
+        {currentFolderCid}
+        onFolderSelect={handleNavigateFolder}
+        filters={fileFilters}
+        onFilterChange={(filters) => { fileFilters = filters; }}
+      />
+      {#if !collapsed && appMode === 'messages'}
+        <button
+          type="button"
+          class="new-dm-button"
+          onclick={() => { dmCreateDialogOpen = true; }}
+          title="New direct message"
+        >
+          <span aria-hidden="true">+</span> New DM
+        </button>
+      {/if}
+    </div>
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -1094,6 +1141,31 @@
   />
 {/if}
 
+{#if dmCreateDialogOpen}
+  <!-- ZEB-228 Phase 4: DM creation modal. Overlay-click and Esc dismiss;
+       inner content stops propagation so dialog clicks don't dismiss. -->
+  <div
+    class="modal-overlay"
+    role="presentation"
+    onclick={() => { dmCreateDialogOpen = false; }}
+    onkeydown={(e) => { if (e.key === 'Escape') dmCreateDialogOpen = false; }}
+  >
+    <div
+      class="modal-content"
+      role="dialog"
+      aria-modal="true"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      <DmCreateDialog
+        profiles={navService.profiles}
+        onSubmit={handleDmCreate}
+        onCancel={() => { dmCreateDialogOpen = false; }}
+      />
+    </div>
+  </div>
+{/if}
+
 <style>
   :global(.text-message) {
     transition: background 0.3s ease;
@@ -1109,5 +1181,52 @@
     justify-content: center;
     height: 100%;
     color: var(--text-muted, #949ba4);
+  }
+
+  /* ── DM creation: nav sidebar wrapper + button + modal ────────────── */
+  /* Wraps NavPanel + the "+ New DM" button in a flex column so the
+     button sits at the bottom of the nav sidebar without scrolling
+     out of view. NavPanel's outer .nav-panel is height:100% — we
+     override with flex:1 + min-height:0 so it shares space with the
+     button instead of forcing a vertical overflow. */
+  .nav-with-dm-create {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+  :global(.nav-with-dm-create > .nav-panel) {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+  }
+  .new-dm-button {
+    flex-shrink: 0;
+    width: 100%;
+    padding: 8px 12px;
+    background: rgba(120, 140, 200, 0.15);
+    color: var(--text-primary, #e8eaed);
+    border: none;
+    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+    cursor: pointer;
+    font-size: 13px;
+    text-align: center;
+  }
+  .new-dm-button:hover {
+    background: rgba(120, 140, 200, 0.3);
+  }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal-content {
+    background: var(--bg-secondary, #222);
+    border-radius: 8px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   }
 </style>
