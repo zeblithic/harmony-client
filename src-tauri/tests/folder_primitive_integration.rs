@@ -251,6 +251,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     None, // dm_outbox — DM outbox not exercised in this test
                     None, // dm_transport — DM outbox not exercised in this test
                     None, // crdt_state — DM outbox not exercised in this test
+                    None, // unicast_send_rx — DM transport not exercised in this test
                 )
                 .await;
             });

@@ -215,6 +215,12 @@ pub struct NodeState {
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
     /// in production, InMemoryStub in some tests).
     content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
+    /// ZEB-227 Path B: outbound DM unicast channel sender.
+    /// `RuntimeUnicastTransport` (Task 6) holds a clone; `event_loop` drains
+    /// the receiver and forwards each `UnicastSendRequest` as
+    /// `RuntimeEvent::SendUnicastToDevice`. Cleared on stop_node so a
+    /// restart's transport doesn't carry a stale sender.
+    unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
 }
 
 impl NodeState {
@@ -257,6 +263,7 @@ impl Default for NodeState {
             dm_device_id: None,
             dm_self_owner: None,
             content_store: None,
+            unicast_send_tx: None,
         }
     }
 }
@@ -425,6 +432,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         dm_device_id,
         dm_self_owner,
         content_store,
+        unicast_send_tx,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -462,6 +470,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
+            guard.unicast_send_tx.take(),
         )
     };
 
@@ -494,6 +503,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // either way; the explicit binding is just for documentation).
     let _ = dm_self_owner;
     drop(content_store);
+    // ZEB-227 Path B: drop the outbound unicast sender so any clone held
+    // by the now-shutting-down RuntimeUnicastTransport (Task 11) sees its
+    // last reference reach the close threshold. The event_loop's receiver
+    // gets None on its next .recv() and the select arm de-registers.
+    drop(unicast_send_tx);
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -571,6 +585,14 @@ async fn start_node(
     // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
     // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
     let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
+    // ZEB-227 Path B: outbound DM unicast channel. Sized at 64 to accommodate
+    // group-DM fan-out (16 members × 4 devices = 64 worst-case dispatches per
+    // send_dm). Sender clone is lifted onto NodeState so Task 11 can reach it
+    // when instantiating RuntimeUnicastTransport; receiver is consumed by
+    // event_loop::run's new select! arm (forwards each request as
+    // RuntimeEvent::SendUnicastToDevice into NodeRuntime).
+    let (unicast_send_tx, unicast_send_rx) =
+        tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(64);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
@@ -639,6 +661,7 @@ async fn start_node(
         old_dm_device_id,
         old_dm_self_owner,
         old_content_store,
+        old_unicast_send_tx,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         let tup = (
@@ -665,6 +688,9 @@ async fn start_node(
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
             guard.content_store.take(),
+            // ZEB-227 Path B: take + drop the previous identity's outbound
+            // unicast sender so the new generation gets a fresh channel.
+            guard.unicast_send_tx.take(),
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
@@ -696,6 +722,10 @@ async fn start_node(
     // clippy::dropping_copy_types.
     let _ = old_dm_self_owner;
     drop(old_content_store);
+    // ZEB-227 Path B: drop the previous identity's outbound unicast sender
+    // so the new generation's RuntimeUnicastTransport (Task 11) sees no
+    // stale clones outside the new NodeState.
+    drop(old_unicast_send_tx);
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping
@@ -1022,6 +1052,7 @@ async fn start_node(
                         dm_outbox_for_loop,
                         dm_transport_for_loop,
                         crdt_state_for_loop,
+                        Some(unicast_send_rx),
                     )
                     .await;
                 });
@@ -1064,6 +1095,12 @@ async fn start_node(
                 guard.dm_device_id = device_id_for_state.clone();
                 guard.dm_self_owner = self_owner_for_state;
                 guard.content_store = content_store_for_state.clone();
+                // ZEB-227 Path B: store the outbound unicast sender so
+                // Task 11's RuntimeUnicastTransport instantiation in
+                // start_node can clone it. The receiver was moved into
+                // event_loop above; the sender remains unused-by-production
+                // until Task 11 wires it to the real transport.
+                guard.unicast_send_tx = Some(unicast_send_tx.clone());
                 thread_install_failure = None;
             }
             Err(e) => {
