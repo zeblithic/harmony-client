@@ -1,44 +1,49 @@
-# ZEB-227 — ZEB-216 Sub-B Phase 3b: Real Reticulum DM Transport Implementation Plan
+# ZEB-227 — ZEB-216 Sub-B Phase 3b: Real Reticulum DM Transport (Path B — Application-Signature Binding) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the Phase 2 `StubTransport` with a real harmony-runtime `SendUnicastToDevice` adapter and add inbound `UnicastReceived` demux (`DmInvite` / `DmCidNotify` / `DmAck`) so DMs work end-to-end through real Reticulum transport, with full link-origin-binding security.
+**Goal:** Replace the Phase 2 `StubTransport` with a real harmony-runtime adapter (raw Type1 Data via `path_table`, NOT Reticulum links) and add inbound `UnicastReceived` demux (`DmInvite` / `DmCidNotify` / `DmAck`) with **per-device Ed25519 signature binding on every packet body** so DMs work end-to-end with full sender-impersonation defense.
 
-**Architecture:** Phase 2 already wired the entire drain state machine and `send_dm` IPC; Phase 3b grafts the real transport onto the existing `DmTransport` trait and adds inbound packet handling. Outbound: `DmOutbox::send_dm` → `DmTransport::send` → mpsc channel → `event_loop` arm pushes `RuntimeEvent::SendUnicastToDevice` into `NodeRuntime` → runtime emits `RuntimeAction::SendOnInterface` → existing `dispatch_action` arm. Inbound: UDP packet → runtime → `RuntimeAction::UnicastReceived { destination_hash, source: Some(identity_hash), packet }` → intercepted in the runtime-tick loop before `dispatch_action` → `dm_outbox::handle_unicast` decodes the packet, runs link-origin binding, and dispatches to `handle_invite` / `handle_cidnotify` / `handle_ack`. Tests mock at the `RuntimeAction` channel boundary (no real Reticulum wire transport in CI).
+**Architecture (Path B):** The original spec assumed Reticulum link-layer ECDH would provide authenticated source identity. Investigation revealed harmony's `Node` has no terminal-link state at endpoint destinations — `Link::respond` is unwired. Wiring it would be a multi-PR feature in its own right. **Path B** instead authenticates sender identity at the application layer: every Reticulum DM packet body carries a `signing_device_hash` field and an appended Ed25519 signature. Sender signs with their device-Identity Ed25519 key. Receiver verifies against the public key looked up via OwnerDeviceCache (post-bootstrap) or inline `inviter_signing_pub` (DmInvite bootstrap). On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream checks use the OwnerAddr resolved from this hash. See `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md` §"Application-signature binding rule" (commit `ea38132`).
 
-**Tech Stack:** Rust (`tokio`, `async-trait`, `chacha20poly1305`, `ciborium`, `tracing`), Tauri 2 IPC, harmony-runtime + harmony-content (cross-repo deps), Reticulum unicast plane B (via harmony-runtime).
+**Tech Stack:** Rust (`tokio`, `async-trait`, `chacha20poly1305`, `ed25519-dalek`, `ciborium`, `tracing`), Tauri 2 IPC, harmony-runtime + harmony-content (cross-repo deps), Reticulum unicast plane B (via harmony-runtime's existing `RuntimeAction::SendUnicastToDevice` / `RuntimeAction::UnicastReceived` per ZEB-226 Phase 3a).
 
-**Cross-repo:** A small companion PR in `~/work/zeblithic/harmony` lands first (Task 1) — terminal-link → identity binding so `DeliverLocally.source` is `Some(_)`, plus a public `NodeRuntime::register_local_destination` API so harmony-client can register its DM destination. harmony-client then bumps the dep pin to that SHA (Task 2) and proceeds.
+**Cross-repo:** A small companion PR in `~/work/zeblithic/harmony` lands first (Task 1) — exposes public `NodeRuntime::register_local_destination` + `NodeRuntime::lookup_destination_identity` accessors. harmony-client then bumps the dep pin to that SHA (Task 2) and proceeds. Phase 3a's `RuntimeAction::UnicastReceived.source: Option<[u8; 16]>` field stays `None` forever in Path B; harmony-client does not read it.
 
-**Spec:** `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md` (commit `55f30cd`).
+**Spec:** `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md` (commit `ea38132`).
 
 **Branch:** `zeb-227-dm-transport-phase3b` (branched from `origin/main` at `97c2e90`, the just-merged Phase 2 PR #79).
+
+**Important note on dropped Path A:** The branch `zeb-227-runtime-link-identity-binding` exists in `~/work/zeblithic/harmony` from the previous Path A attempt with no commits. Discard it before starting Task 1: `cd ~/work/zeblithic/harmony && git checkout main && git branch -D zeb-227-runtime-link-identity-binding`.
 
 ---
 
 ## File Structure
 
-### Cross-repo: harmony companion PR (Task 1, branch `zeb-227-runtime-link-identity-binding` in `~/work/zeblithic/harmony`)
+### Cross-repo: harmony companion PR (Task 1, branch `zeb-227-runtime-destination-api` in `~/work/zeblithic/harmony`)
 
 | File | Change | Why |
 |---|---|---|
-| `crates/harmony-reticulum/src/node.rs` | Modify `process_data_packet:1284-1306` to look up `Link::remote_identity` via the existing `link_table`, populate `DeliverLocally.source` with `Some(identity_hash_truncated)`. Add unit test. | Spec §"Link-origin binding rule" — DM security spine; without it every inbound DM is droppable as `UnknownLinkOrigin`. |
-| `crates/harmony-runtime/src/runtime.rs` | Add public `NodeRuntime::register_local_destination(&mut self, dest_hash: [u8; 16])` and `unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool` that delegate to the private `router.register_destination` / `router.unregister_destination`. Add unit tests. | harmony-client must register its DM destination so inbound packets surface as `DeliverLocally` → `UnicastReceived`. The router is a private field today (`runtime.rs:754`), so without these accessors the client literally cannot accept inbound DMs. |
+| `crates/harmony-runtime/src/runtime.rs` | Add public `NodeRuntime::register_local_destination(&mut self, dest_hash: [u8; 16])` and `unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool` delegating to the private `router.register_destination` / `router.unregister_destination`. Add public `NodeRuntime::lookup_destination_identity(&self, dest_hash: &[u8; 16]) -> Option<&Identity>` that reads from the existing announce / path table. Add unit tests for all three. | harmony-client must register its DM destination so inbound packets surface as `UnicastReceived`. It must also look up sender public keys for signature verification — both APIs are gated behind the private `router: Node` field today (`runtime.rs:754`). |
 
-Total harmony delta: ~80 lines + tests. Single squash-merge PR.
+Total harmony delta: ~60-90 lines + tests. Single squash-merge PR.
 
 ### harmony-client (Tasks 2-13, branch `zeb-227-dm-transport-phase3b`)
 
 | File | Action | Estimated lines |
 |---|---|---|
-| `src-tauri/Cargo.toml` | Modify: bump `harmony-runtime` and `harmony-content` git revs to the harmony companion-PR merge SHA (Task 2). | +4 modified lines |
-| `src-tauri/src/dm_outbox.rs` | Modify: add `DmReceiveError` enum variants, `resolve_link_origin_owner` helper, `handle_unicast` dispatcher, `handle_invite`, `handle_cidnotify`, `handle_ack`. Add `RuntimeUnicastTransport` adapter struct + `DmTransport` impl. Trim `StubTransport` to test-cfg only (it's still used by Phase 2 tests). | ~1129 → ~1900 |
-| `src-tauri/src/event_loop.rs` | Modify: add an mpsc channel for outbound `RuntimeEvent::SendUnicastToDevice` requests and wire its arm. Add a `RuntimeAction::UnicastReceived` interception block in each `for action in runtime.tick()` loop site, before `dispatch_action`. Pass through `cas_op_tx`, `dm_outbox`, `crdt_state`, `app` to the new handler. | +~120 |
-| `src-tauri/src/lib.rs` | Modify: replace `StubTransport::new()` at line 843-844 with `RuntimeUnicastTransport::new(unicast_send_tx, ...)`. Construct the new mpsc channel near `cas_op_tx` (line 572). Compute the local DM destination hash at start_node and call `runtime.register_local_destination(dm_dest)` once at startup. Add a follow-up Linear ticket for any remaining manual-LAN smoke surface. | +~60 |
-| `src-tauri/tests/dm_unicast_integration.rs` | Create: end-to-end integration test exercising `RealUnicastTransport` outbound + inbound `UnicastReceived` re-entry via a fake runtime-channel pair. Mocks at the channel boundary, NOT the wire. | +~250 (new) |
-| `src-tauri/tests/dm_send_integration.rs` | Modify: add Phase 3b coverage to the existing Phase 2 round-trip test (it currently only exercises `StubTransport`; assert the new transport adapter respects the same DmTransport contract under the same fixture shape). | +~30 |
+| `src-tauri/Cargo.toml` | Modify: bump `harmony-runtime` and `harmony-content` git revs to the harmony companion-PR merge SHA. Confirm `ed25519-dalek` is in deps (it likely already is via `harmony-identity` or `harmony-crypto` workspace re-export; verify and add direct dep if needed). | +4 modified |
+| `src-tauri/src/owner_state_types.rs` | Modify: extend `OwnerDeviceEntry` to store per-device Ed25519 verifying keys alongside identity hashes. Two parallel sorted vecs (preserves binary-search invariant) OR a single `Vec<(DeviceIdentityHash, [u8; 32])>` — pick the lower-friction option after reading the existing struct. Add `serde(default)` so persisted Phase 1/2 OwnerDeviceCache snapshots load with empty pubkey vec (graceful upgrade). | +~50 |
+| `src-tauri/src/dm_envelope.rs` | Modify: rename `DmInvite`/`DmCidNotify`/`DmAck` to `DmInviteSigned`/`DmCidNotifySigned`/`DmAckSigned` (the wire CBOR body); add `signing_device_hash` field to all three; add `inviter_signing_pub: [u8; 32]` to DmInviteSigned. Replace single-struct `DmPacket` variants with `{ signed: ..., signature: [u8; 64], signed_bytes: Vec<u8> }` (the receive handler needs the bytes the signature covers without re-encoding). Update `encode_packet` to canonical-CBOR-encode the body, append the 64-byte signature, prepend the discriminant. Update `decode_packet` to split `[disc][body][sig:64]` and capture `signed_bytes`. Add `DecodeError::TooShortForSignature`. | +~150 |
+| `src-tauri/src/dm_crypto.rs` | Modify: parameter rename `link_origin` → `resolved_owner` on `verify_sender_binding` (semantics unchanged; only the parameter name and doc comment). | +~5 modified |
+| `src-tauri/src/dm_signing.rs` | Create: pure-function module with `sign_dm_packet(body_bytes: &[u8], signing_key: &SigningKey) -> [u8; 64]` and `verify_dm_packet_signature(body_bytes: &[u8], signature: &[u8; 64], signing_pub: &VerifyingKey, expected_signing_device_hash: DeviceIdentityHash) -> Result<(), DmReceiveError>`. Plus `derive_device_hash_from_pubkey(pub: &VerifyingKey) -> DeviceIdentityHash` matching whatever scheme `harmony-identity` already uses for device hashes (read it; do not invent). Pure functions, no state, no I/O. | +~120 (new file) |
+| `src-tauri/src/dm_outbox.rs` | Modify: add `DmReceiveError` enum (Phase 3b-scoped; distinct from `dm_crypto::DmReceiveError`). Add `resolve_signed_origin_owner` helper. Add `lookup_pubkey_for_device` helper (reads OwnerDeviceCache). Add `handle_unicast` dispatcher that decodes + verifies signature + dispatches by discriminant. Add `handle_invite`, `handle_cidnotify`, `handle_ack`. Add `RuntimeUnicastTransport` adapter struct + `DmTransport` impl. Trim `StubTransport` documentation to note it's test-cfg surface (still needed by Phase 2 tests). | ~1129 → ~2000 |
+| `src-tauri/src/event_loop.rs` | Modify: add an mpsc channel for outbound `RuntimeEvent::SendUnicastToDevice` requests (`unicast_send_rx` parameter on `event_loop::run`). Add a `RuntimeAction::UnicastReceived` interception block in each `for action in runtime.tick()` loop site, before `dispatch_action`. Pass through `cas_handle`, `dm_outbox`, `crdt_state`, `app` to the new handler. | +~120 |
+| `src-tauri/src/lib.rs` | Modify: replace `StubTransport::new()` at line 843-844 with `RuntimeUnicastTransport::new(...)`. Construct `unicast_send_tx/rx` mpsc channel near `cas_op_tx` (line 572). Compute the local DM destination hash at start_node and call `runtime.register_local_destination(dm_dest)` once at startup. Wire NodeState fields for `unicast_send_tx`. Pull the device-Identity SigningKey from existing identity-management code (likely `harmony_identity` integration site near where `device_id` and `self_owner` come from) and inject into `RuntimeUnicastTransport`. | +~80 |
+| `src-tauri/tests/dm_unicast_integration.rs` | Create: end-to-end integration test exercising `RuntimeUnicastTransport` outbound + inbound `UnicastReceived` re-entry via a fake runtime-channel pair, including signature verification on both sides. Mocks at the channel boundary, NOT the wire. | +~280 (new) |
+| `src-tauri/tests/dm_send_integration.rs` | Modify: light update to confirm Phase 2 round-trip still works against the new `RuntimeUnicastTransport` (or remains valid against StubTransport which is preserved for tests). | +~10 |
 
-Total harmony-client delta: ~700-900 lines spread across 5 files, plus a new integration test.
+Total harmony-client delta: ~800-1000 lines spread across 8 files, plus a new integration test.
 
 ---
 
@@ -59,131 +64,33 @@ Tasks 12 (PR creation) and 13 (manual LAN smoke follow-up) are process tasks, no
 
 ---
 
-### Task 1: harmony companion PR — terminal-link identity binding + public destination registration
+### Task 1: harmony companion PR — public destination + identity-lookup APIs
 
 **Repo:** `~/work/zeblithic/harmony`
-**Branch:** `zeb-227-runtime-link-identity-binding` (branched from `origin/main` at `b721148`)
+**Branch:** `zeb-227-runtime-destination-api` (branched from `origin/main`)
 
 **Files:**
-- Modify: `crates/harmony-reticulum/src/node.rs:1284-1306` (link-identity binding) and `:454-465` area (verify register_destination is intact)
-- Modify: `crates/harmony-runtime/src/runtime.rs:754` (router field — surface a new public method around it; do NOT make the field public)
-- Test: `crates/harmony-reticulum/src/node.rs` test module (link-identity binding)
-- Test: `crates/harmony-runtime/src/runtime.rs` test module (public register API)
+- Modify: `crates/harmony-runtime/src/runtime.rs` — add the three public methods
+- Test: `crates/harmony-runtime/src/runtime.rs` test module
 
-This is a single PR with two coupled changes. Both are tiny but both are required for harmony-client Phase 3b. Sub-steps below.
+This is a much smaller PR than the original Path A Task 1. No `link.rs` changes, no `Node` state changes — just three thin accessors.
 
-- [ ] **Step 1.1: Branch off origin/main**
+**Pre-flight:** Discard the abandoned Path A branch first.
+
+- [ ] **Step 1.1: Clean up old Path A branch + branch off origin/main**
 
 ```bash
 cd ~/work/zeblithic/harmony
+git checkout main
+git branch -D zeb-227-runtime-link-identity-binding 2>/dev/null || true
 git fetch origin
-git checkout -b zeb-227-runtime-link-identity-binding origin/main
-git log --oneline -3   # confirm starts at b721148 or later
+git checkout -b zeb-227-runtime-destination-api origin/main
+git log --oneline -3   # confirm starts at e25a696 or later
 ```
 
-Expected: branch tracks `origin/main`, HEAD shows `b721148 feat(runtime): SendUnicastToDevice + UnicastReceived IPC kinds (ZEB-226) (#267)` or newer.
+Expected: branch tracks `origin/main`. The commit log should include the Phase 3a merge `b721148`.
 
-- [ ] **Step 1.2: Write a failing test for terminal-link identity binding**
-
-Add the following test to the test module at the end of `crates/harmony-reticulum/src/node.rs`:
-
-```rust
-#[test]
-fn process_data_packet_for_local_destination_populates_source_from_link_table() {
-    // After a Link is established to a local destination, an inbound data
-    // packet on that link MUST surface DeliverLocally.source = Some(identity_hash),
-    // not None. This is the link-origin-binding bedrock for ZEB-216 Sub-B
-    // Phase 3b — without it every inbound DM is droppable as UnknownLinkOrigin.
-    use crate::link::LinkState;
-
-    let mut node = Node::new(NodeIdentity::generate());
-    let dest_hash = [0xb0u8; 16];
-    let remote_identity_hash = [0xa1u8; 16];
-    node.register_destination(dest_hash);
-
-    // Seed a link_table entry so process_data_packet can look it up.
-    // The seam: link_table is keyed by destination_hash and each entry
-    // carries the remote identity established at handshake time.
-    seed_link_for_test(&mut node, dest_hash, remote_identity_hash);
-
-    let packet = build_type1_data_packet_for_test(dest_hash, b"hello");
-    let actions = node.process_data_packet(packet, Arc::from("udp0"), 0);
-
-    assert_eq!(actions.len(), 1);
-    match &actions[0] {
-        NodeAction::DeliverLocally { source, .. } => {
-            assert_eq!(
-                *source,
-                Some(remote_identity_hash),
-                "DeliverLocally.source must be the remote identity from the link handshake, not None"
-            );
-        }
-        other => panic!("expected DeliverLocally, got {:?}", other),
-    }
-}
-```
-
-The implementer will need to add `seed_link_for_test` and `build_type1_data_packet_for_test` test helpers (or use an existing equivalent — search the test module for similar packet builders before writing new ones).
-
-- [ ] **Step 1.3: Run test to verify it fails**
-
-```bash
-cd ~/work/zeblithic/harmony
-set -o pipefail
-cargo test --manifest-path crates/harmony-reticulum/Cargo.toml process_data_packet_for_local_destination_populates_source_from_link_table 2>&1 | tail -20
-```
-
-Expected: FAIL — `assertion `left == right` failed: left: None, right: Some(...)`. The current implementation hardcodes `source: None` at `node.rs:1305`.
-
-- [ ] **Step 1.4: Implement link-identity binding**
-
-In `crates/harmony-reticulum/src/node.rs`, modify `process_data_packet:1293-1306` to look up the link entry by `destination_hash` (or by some other available key — the implementer should investigate how `link_table` is keyed; if `destination_hash → remote_identity_hash` lookup isn't directly available, add a thin lookup helper on `Link` or maintain a parallel index). Replace the hardcoded `None`:
-
-```rust
-// 1. Local delivery takes priority
-if self.local_destinations.contains(&destination_hash) {
-    // Look up the remote identity from the link handshake state.
-    // The link_table maps destination_hash → Link state, and Link
-    // carries the remote_identity established during handshake.
-    let source = self
-        .link_table
-        .get(&destination_hash)
-        .and_then(|link| link.remote_identity_hash());
-    return vec![NodeAction::DeliverLocally {
-        destination_hash,
-        packet,
-        interface_name,
-        source,
-    }];
-}
-```
-
-If `link_table` does not currently carry `remote_identity_hash` (it might only carry handshake state), the implementer adds the field via a small follow-on edit and threads it through the handshake-completion path. Use file:line investigation — do not invent fields that don't exist.
-
-Update the doc comment on `NodeAction::DeliverLocally.source` (`node.rs:235-251`) to remove the "deferred to ZEB-227" note and replace with the current behavior: "populated when an established Link exists for the destination_hash; None when no link state is available (e.g., a packet arriving before handshake completes — should not happen for valid traffic)."
-
-- [ ] **Step 1.5: Run test to verify it passes**
-
-```bash
-cd ~/work/zeblithic/harmony
-set -o pipefail
-cargo test --manifest-path crates/harmony-reticulum/Cargo.toml process_data_packet_for_local_destination_populates_source_from_link_table 2>&1 | tail -5
-```
-
-Expected: PASS.
-
-- [ ] **Step 1.6: Run the full link-impacted test suite to verify no regression**
-
-```bash
-cd ~/work/zeblithic/harmony
-set -o pipefail
-cargo test --manifest-path crates/harmony-reticulum/Cargo.toml link 2>&1 | tail -20
-cargo test --manifest-path crates/harmony-runtime/Cargo.toml unicast 2>&1 | tail -20
-```
-
-Expected: all green. The existing `unicast_round_trip_a_to_b_surfaces_as_unicast_received` test (in `harmony-runtime`) currently asserts `received.0 == None`; if your binding work caused that test to start surfacing a real identity, update its assertion to expect `Some(_)` (the test is in `crates/harmony-runtime/src/runtime.rs`; see commit `b721148`'s test descriptions for reference). Per "test drift is our fault" — fix in this PR.
-
-- [ ] **Step 1.7: Write a failing test for public register_local_destination on NodeRuntime**
+- [ ] **Step 1.2: Write a failing test for register_local_destination**
 
 Add to the test module at the end of `crates/harmony-runtime/src/runtime.rs`:
 
@@ -193,15 +100,18 @@ fn node_runtime_register_local_destination_accepts_inbound_to_that_dest() {
     // harmony-client (ZEB-227) needs a public API to register the DM
     // destination. Without it the router is unreachable from outside the
     // crate. This test pins the API shape and round-trips through tick().
-    let identity = NodeIdentity::generate_for_tests();
     let config = NodeConfig::default();
     let store = MemoryBookStore::default();
     let (mut runtime, _startup) = NodeRuntime::new(config, store);
 
-    let dm_dest = [0xdmu8; 16].map(|_| 0xd1u8);  // pick any 16-byte hash
+    let dm_dest = [0xd1u8; 16];
     runtime.register_local_destination(dm_dest);
 
     // Build a Type1/Single/Data Reticulum packet addressed to dm_dest.
+    // (Reuse the same packet-builder helper that
+    // unicast_round_trip_a_to_b_surfaces_as_unicast_received uses —
+    // search for it in the runtime test module; it was added in ZEB-226
+    // Phase 3a, commit b721148.)
     let packet = build_type1_data_packet_for_test(dm_dest, b"hello");
 
     runtime.push_event(RuntimeEvent::InboundPacket {
@@ -238,21 +148,22 @@ fn node_runtime_unregister_local_destination_returns_bool() {
 }
 ```
 
-If `build_type1_data_packet_for_test` doesn't already exist as a runtime-test helper, the implementer reuses the corresponding helper from `harmony-reticulum`'s test module via `pub(crate) use` or copies the construction inline.
+If `build_type1_data_packet_for_test` doesn't already exist as a runtime-test helper, search for it in `harmony-reticulum` test modules (per `unicast_round_trip_a_to_b_surfaces_as_unicast_received`'s setup) and pull it in via `pub(crate) use` or copy inline.
 
-- [ ] **Step 1.8: Run tests to verify they fail**
+- [ ] **Step 1.3: Run tests to verify they fail**
 
 ```bash
 cd ~/work/zeblithic/harmony
 set -o pipefail
 cargo test --manifest-path crates/harmony-runtime/Cargo.toml node_runtime_register_local_destination 2>&1 | tail -20
+cargo test --manifest-path crates/harmony-runtime/Cargo.toml node_runtime_unregister_local_destination 2>&1 | tail -10
 ```
 
-Expected: FAIL with `no method named 'register_local_destination' found` (and similarly for `unregister_local_destination`).
+Expected: FAIL with `no method named 'register_local_destination' found` (and similarly for unregister).
 
-- [ ] **Step 1.9: Implement the public register/unregister API**
+- [ ] **Step 1.4: Implement register/unregister API**
 
-In `crates/harmony-runtime/src/runtime.rs`, add to the `impl<B: BookStore> NodeRuntime<B>` block (near the existing `local_identity_hash`/`set_local_*_announce` methods around `runtime.rs:1623-1644`):
+In `crates/harmony-runtime/src/runtime.rs`, add to the `impl<B: BookStore> NodeRuntime<B>` block (near the existing `local_identity_hash` / `set_local_*_announce` methods around `runtime.rs:1623-1644`):
 
 ```rust
 /// Register a 16-byte Reticulum destination hash for local delivery.
@@ -278,7 +189,9 @@ pub fn unregister_local_destination(&mut self, dest_hash: &[u8; 16]) -> bool {
 }
 ```
 
-- [ ] **Step 1.10: Run tests to verify they pass**
+The methods on `Node` they delegate to are confirmed to exist at `crates/harmony-reticulum/src/node.rs:454` (`register_destination`) and `:461` (`unregister_destination` returning `bool`).
+
+- [ ] **Step 1.5: Run tests to verify they pass**
 
 ```bash
 cd ~/work/zeblithic/harmony
@@ -289,7 +202,115 @@ cargo test --manifest-path crates/harmony-runtime/Cargo.toml node_runtime_unregi
 
 Expected: PASS for both.
 
-- [ ] **Step 1.11: Run full workspace verification**
+- [ ] **Step 1.6: Write a failing test for lookup_destination_identity**
+
+This is the API harmony-client uses to fetch a sender's public key for signature verification. Investigation needed: where does `Node` currently store identity material from announces? Search `crates/harmony-reticulum/src/node.rs` for `announce_table`, `path_table`, `ValidatedAnnounce`. Identity material (Ed25519 + X25519 public keys) propagates via announces and is accessible from one of these structures.
+
+Add the test:
+
+```rust
+#[test]
+fn node_runtime_lookup_destination_identity_returns_announced_identity() {
+    // harmony-client (ZEB-227) verifies inbound DM packet signatures by
+    // looking up the sender's Ed25519 verifying key. Public keys arrive
+    // via announces and live in the runtime's announce/path table.
+    let config = NodeConfig::default();
+    let store = MemoryBookStore::default();
+    let (mut runtime, _) = NodeRuntime::new(config, store);
+
+    // Inject a known announce. (Use the existing test helper for
+    // constructing + delivering an announce; mirror whatever
+    // `runtime::announces_*` tests do — search for them.)
+    let identity = NodeIdentity::generate_for_tests();
+    let dest_hash = inject_test_announce(&mut runtime, &identity);
+
+    let looked_up = runtime.lookup_destination_identity(&dest_hash);
+    assert!(looked_up.is_some(), "after announce, lookup must return Some(Identity)");
+    let id = looked_up.unwrap();
+    assert_eq!(id.address_hash(), identity.address_hash());
+}
+
+#[test]
+fn node_runtime_lookup_destination_identity_unknown_returns_none() {
+    let config = NodeConfig::default();
+    let store = MemoryBookStore::default();
+    let (runtime, _) = NodeRuntime::new(config, store);
+
+    let unknown = [0xff; 16];
+    assert!(runtime.lookup_destination_identity(&unknown).is_none());
+}
+```
+
+If the existing test infrastructure does not have `inject_test_announce` or similar, the implementer reuses whatever announce-injection pattern is used in `runtime::announces_*` or `runtime::path_table_*` tests. Do NOT invent new helpers; mirror existing ones.
+
+- [ ] **Step 1.7: Run tests to verify they fail**
+
+```bash
+cd ~/work/zeblithic/harmony
+set -o pipefail
+cargo test --manifest-path crates/harmony-runtime/Cargo.toml node_runtime_lookup_destination_identity 2>&1 | tail -20
+```
+
+Expected: FAIL with `no method named 'lookup_destination_identity' found`.
+
+- [ ] **Step 1.8: Implement lookup_destination_identity**
+
+INVESTIGATE FIRST: read the announce-table / path-table structure in `crates/harmony-reticulum/src/node.rs` to find where `Identity` is stored. The `Identity` type itself is in `crates/harmony-reticulum/src/identity.rs` (or similar — search for `pub struct Identity`). Identity material persists at the path-table level for routed destinations; it's also kept on `announce_table` while the announce is "fresh."
+
+Add to the same `impl<B: BookStore> NodeRuntime<B>` block:
+
+```rust
+/// Look up the announced Identity for a destination hash. Returns Some
+/// when an announce has been received for this destination and the
+/// identity material (Ed25519 verifying key + X25519 ECDH key) is
+/// available locally, None otherwise.
+///
+/// Used by harmony-client (ZEB-216 Sub-B Phase 3b) to resolve
+/// `DmCidNotify.signing_device_hash` to a public key for application-
+/// signature verification. The identity hash and public keys are
+/// related by `Identity::address_hash() == truncated_hash(verifying_key)`,
+/// which is the same scheme harmony-identity already uses.
+///
+/// Note: for first-contact DmInvite, harmony-client carries the
+/// inviter's signing pubkey inline (`inviter_signing_pub`) so this
+/// lookup is unnecessary at bootstrap. Subsequent DmCidNotify / DmAck
+/// from the inviter's already-cached devices use this lookup against
+/// pubkeys harmony-client cached locally on DmInvite accept — NOT
+/// against this announce-table identity (which may not have arrived
+/// yet for new contacts). See spec §"Application-signature binding rule"
+/// for the bootstrap detail.
+pub fn lookup_destination_identity(&self, dest_hash: &[u8; 16]) -> Option<&Identity> {
+    self.router.lookup_identity(dest_hash)
+}
+```
+
+If `Node` doesn't currently expose a `lookup_identity` helper, add a thin one in `crates/harmony-reticulum/src/node.rs`:
+
+```rust
+/// Returns the announced Identity for `dest_hash` if known. Reads from
+/// path_table (preferred — long-lived) falling back to announce_table
+/// (transient).
+pub fn lookup_identity(&self, dest_hash: &[u8; 16]) -> Option<&Identity> {
+    self.path_table.get(dest_hash)
+        .and_then(|entry| entry.identity.as_ref())
+        .or_else(|| self.announce_table.get(dest_hash)
+            .and_then(|entry| entry.identity.as_ref()))
+}
+```
+
+If the path_table entries don't carry full Identity (they may carry only the truncated hash), the implementer adapts: either propagate Identity into the path_table entry (small `path_table.rs` change), or rely solely on announce_table (acceptable if announces are stored long enough for the use case). **Investigate path_table and announce_table struct definitions before deciding** — file:line in your implementer notes.
+
+- [ ] **Step 1.9: Run tests to verify they pass**
+
+```bash
+cd ~/work/zeblithic/harmony
+set -o pipefail
+cargo test --manifest-path crates/harmony-runtime/Cargo.toml node_runtime_lookup_destination_identity 2>&1 | tail -10
+```
+
+Expected: PASS for both.
+
+- [ ] **Step 1.10: Run full workspace verification**
 
 ```bash
 cd ~/work/zeblithic/harmony
@@ -299,38 +320,44 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Expected: all green. Investigate and fix any breakage caused by the new API or the link-identity-binding change. Per the "test drift is our fault" rule, broken tests on main caused by your changes belong in this PR, not a follow-up.
+Expected: all green. Investigate and fix any breakage caused by the new APIs. Per "test drift is our fault" — broken tests on main caused by your changes belong in this PR.
 
 If pre-existing fmt drift or clippy warnings outside your diff are in the way, do NOT include them in this PR — leave them as their own follow-up. Phase 3a's PR #267 set the precedent of explicitly stating which pre-existing warnings are NOT in scope.
 
-- [ ] **Step 1.12: Commit**
+- [ ] **Step 1.11: Commit**
 
 ```bash
 cd ~/work/zeblithic/harmony
-git add crates/harmony-reticulum/src/node.rs crates/harmony-runtime/src/runtime.rs
+git add crates/harmony-runtime/src/runtime.rs crates/harmony-reticulum/src/node.rs
+# (only add files you actually changed; the node.rs add is conditional
+#  on whether you needed to add the lookup_identity helper)
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): wire link-identity binding + public register_local_destination
+feat(zeb-227): expose public NodeRuntime destination + identity APIs
 
-Two coupled changes the harmony-client DM transport (ZEB-216 Sub-B
-Phase 3b, ZEB-227) needs:
+Three accessors that harmony-client (ZEB-216 Sub-B Phase 3b, ZEB-227)
+needs to consume the existing private router state:
 
-1. process_data_packet now looks up the inbound link's remote_identity
-   from link_table and populates DeliverLocally.source with
-   Some(identity_hash) instead of the placeholder None left by Phase 3a
-   (ZEB-226). Without this every inbound DM packet on harmony-client
-   would drop as UnknownLinkOrigin (the link-origin-binding security
-   spine of ZEB-216 §"Link-origin binding rule").
+1. NodeRuntime::register_local_destination(dest_hash) — register a
+   16-byte Reticulum destination hash for local delivery. Without this,
+   harmony-client cannot tell the runtime to accept inbound packets at
+   the DM destination hash.
 
-2. NodeRuntime exposes pub fn register_local_destination + unregister
-   delegating to the previously-private router. harmony-client cannot
-   reach router::register_destination from outside the crate; without
-   these accessors it has no way to tell the runtime to accept inbound
-   packets at the DM destination hash.
+2. NodeRuntime::unregister_local_destination(dest_hash) -> bool —
+   matching cleanup API.
 
-The unicast_round_trip_a_to_b_surfaces_as_unicast_received test from
-ZEB-226 was asserting received.source == None as the placeholder. With
-real identity binding, that assertion now expects Some(remote_identity);
-test updated.
+3. NodeRuntime::lookup_destination_identity(dest_hash) -> Option<&Identity> —
+   read announced Identity (Ed25519 verifying key + X25519 ECDH key)
+   for a known destination. harmony-client uses this to look up sender
+   public keys for application-layer Ed25519 signature verification on
+   inbound DM packet bodies (Path B in the ZEB-216 spec — see spec
+   §"Application-signature binding rule" at commit ea38132).
+
+All three delegate to existing private state on the inner Node. This
+PR is intentionally minimal; no Link state, no handshake wiring, no
+protocol changes. The earlier-attempted Path A (terminal-link state +
+responder-side handshake) was confirmed during ZEB-227 investigation
+to be a multi-PR feature in its own right and is filed as a separate
+future ticket for when voice / file sync / streaming features need it.
 
 Test drift policy applied: any pre-existing fmt drift / clippy warnings
 in the surrounding tree are NOT addressed here; only the diff covered
@@ -339,33 +366,39 @@ EOF
 )"
 ```
 
-- [ ] **Step 1.13: Push and open PR**
+Pass it via heredoc to preserve formatting. Do NOT use `--no-verify` or skip hooks.
+
+- [ ] **Step 1.12: Push and open PR**
 
 ```bash
 cd ~/work/zeblithic/harmony
-git push -u origin zeb-227-runtime-link-identity-binding
-gh pr create --title "feat(zeb-227): link-identity binding + register_local_destination API" --body "$(cat <<'EOF'
+git push -u origin zeb-227-runtime-destination-api
+gh pr create --title "feat(zeb-227): expose public NodeRuntime destination + identity APIs" --body "$(cat <<'EOF'
 ## Summary
-- `process_data_packet` populates `DeliverLocally.source` from the inbound link's `remote_identity`, replacing Phase 3a's placeholder `None`.
-- `NodeRuntime::register_local_destination` / `unregister_local_destination` exposed as public APIs (delegating to the previously-private `router`).
+Three public accessors on \`NodeRuntime\` delegating to existing private router state:
+- \`register_local_destination(dest_hash)\` / \`unregister_local_destination(dest_hash)\`
+- \`lookup_destination_identity(dest_hash) -> Option<&Identity>\`
 
 ## Why
-Both changes are blocking dependencies for **harmony-client ZEB-227** (DM transport Phase 3b). Without (1), every inbound DM packet would drop as `UnknownLinkOrigin`. Without (2), harmony-client cannot register the DM destination, so the runtime would drop every inbound DM packet as `NoLocalDestination` before reaching the link-binding check.
+Blocking deps for **harmony-client ZEB-227** (DM transport Phase 3b — Path B). Without (1)/(2), harmony-client cannot register the DM destination, so the runtime would drop every inbound DM packet as \`NoLocalDestination\`. Without (3), harmony-client cannot look up sender public keys to verify per-device Ed25519 application-signature binding on inbound DM packets (the spec's "Application-signature binding rule" — see harmony-client spec at commit ea38132).
+
+The earlier-attempted Path A (terminal-link state + responder-side Reticulum handshake wiring) was confirmed during ZEB-227 investigation to be a multi-PR feature in its own right (terminal_links map, Link::respond wiring, handshake completion, link expiration, plus initiator-side link cache + runtime API redesign for "establish-then-send" semantics). It's filed as a separate future ticket for when voice / file sync / streaming features need it. Path B (this PR + harmony-client signature work) ships DM end-to-end without requiring any of that Reticulum link wiring.
 
 Companion PR pattern mirrors Phase 3a (PR #267) — small, targeted runtime-side surface change that the client-side PR consumes.
 
 ## Test plan
-- [ ] `cargo test -p harmony-reticulum link` — green, including the new `process_data_packet_for_local_destination_populates_source_from_link_table` test.
-- [ ] `cargo test -p harmony-runtime unicast` — green, including the updated `unicast_round_trip_a_to_b_surfaces_as_unicast_received` assertion (now `Some(...)` instead of `None`) and the new `node_runtime_register_local_destination_*` tests.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-- [ ] `cargo fmt --all -- --check` — clean.
+- [ ] \`cargo test -p harmony-runtime node_runtime_register_local_destination\` — green
+- [ ] \`cargo test -p harmony-runtime node_runtime_unregister_local_destination\` — green
+- [ ] \`cargo test -p harmony-runtime node_runtime_lookup_destination_identity\` — green
+- [ ] \`cargo clippy --workspace --all-targets -- -D warnings\` — clean
+- [ ] \`cargo fmt --all -- --check\` — clean
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
 ```
 
-Capture the PR URL printed by `gh pr create` — Task 2 will reference the merge SHA after a human approves and merges this PR. **Pause here.** Do not start Task 2 until Task 1 is merged to harmony main.
+Capture the PR URL printed by `gh pr create`. **Do NOT proceed past this step.** Task 2 starts after a human merges this PR; that's not your job.
 
 ---
 
@@ -384,16 +417,11 @@ Capture the PR URL printed by `gh pr create` — Task 2 will reference the merge
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
 git checkout zeb-227-dm-transport-phase3b
-git log --oneline -1   # confirm starts at 97c2e90
+git log --oneline -2   # confirm current HEAD includes the spec-update + plan commits
 grep -E "harmony-runtime|harmony-content" src-tauri/Cargo.toml
 ```
 
-Expected output for the grep:
-
-```
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "ddf2ce07109eb30526a10bd37af3b0ddc901faa8" }
-```
+Expected current pin (per the existing Phase 2 work): `ddf2ce07109eb30526a10bd37af3b0ddc901faa8` for both deps.
 
 - [ ] **Step 2.2: Resolve the Task 1 merge SHA**
 
@@ -403,7 +431,7 @@ git fetch origin main
 git log origin/main --oneline -3
 ```
 
-The first commit listed should be the squash-merge of Task 1 (subject prefix `feat(zeb-227): wire link-identity binding ...`). Capture its 40-char SHA. For documentation purposes this plan refers to it as `<TASK_1_SHA>`.
+The first commit listed should be the squash-merge of Task 1 (subject prefix `feat(zeb-227): expose public NodeRuntime destination + identity APIs`). Capture its 40-char SHA. Referred to as `<TASK_1_SHA>` below.
 
 - [ ] **Step 2.3: Bump both deps to TASK_1_SHA**
 
@@ -413,7 +441,16 @@ cd /Users/zeblith/work/zeblithic/harmony-client
 
 Edit `src-tauri/Cargo.toml`, replacing `ddf2ce07109eb30526a10bd37af3b0ddc901faa8` (both occurrences) with the Task 1 merge SHA. Use the Edit tool with `replace_all` on the substring.
 
-- [ ] **Step 2.4: Resolve dependencies and verify the build**
+- [ ] **Step 2.4: Confirm ed25519-dalek is reachable for signing**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cargo tree -e normal --depth 3 2>&1 | grep -E "ed25519|dalek" | head
+```
+
+If `ed25519-dalek` is already pulled in transitively by harmony deps (`harmony-identity` or `harmony-crypto` likely re-export the SigningKey type), no Cargo.toml addition needed — just `use harmony_identity::ed25519::SigningKey;` (or whatever the re-export path is). If NOT reachable, add as a direct dep with the version that matches the harmony workspace's pin. Do not pull a different version than the workspace uses — version skew on signing primitives is dangerous.
+
+- [ ] **Step 2.5: Resolve dependencies and verify the build**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
@@ -422,22 +459,21 @@ set -o pipefail
 cargo build --tests 2>&1 | tail -30
 ```
 
-Expected: clean build. If clippy warnings appear after the dep bump (new lint surface from upstream), fix them — they belong in this PR per "test drift is our fault."
+Expected: clean build. If clippy warnings appear after the dep bump, fix them — they belong in this PR per "test drift is our fault."
 
-- [ ] **Step 2.5: Verify the new public APIs are reachable**
+- [ ] **Step 2.6: Smoke check the new APIs**
 
-Quick smoke check that the new `NodeRuntime::register_local_destination` symbol is visible from harmony-client:
+Quick verification that the new symbols are reachable:
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 set -o pipefail
-cargo doc --no-deps --document-private-items 2>&1 | grep -E "register_local_destination|unregister_local_destination" | head -5
-# Or, faster: run a one-off cargo check that calls it.
+cargo doc --no-deps --document-private-items 2>&1 | grep -E "register_local_destination|unregister_local_destination|lookup_destination_identity" | head -10
 ```
 
-If the symbols don't appear, the dep bump didn't pick up Task 1 — recheck `cargo update` and `Cargo.lock`.
+If symbols don't appear, the dep bump didn't pick up Task 1 — recheck `cargo update` and `Cargo.lock`.
 
-- [ ] **Step 2.6: Run the full verification quartet**
+- [ ] **Step 2.7: Run the full verification quartet**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -448,155 +484,82 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npx tsc --noEmit
 ```
 
-Expected: all green. (vitest can be skipped on dep-only bumps but include it if any frontend types depend on the bumped Rust types via `tauri-bindgen` or similar.)
+Expected: all green. (vitest can be skipped on dep-only bumps.)
 
-- [ ] **Step 2.7: Commit**
+- [ ] **Step 2.8: Commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "$(cat <<'EOF'
-chore(zeb-227): bump harmony deps to absorb link-identity binding + register_local_destination
+chore(zeb-227): bump harmony deps to absorb Path-B accessors
 
 harmony PR <task-1-pr-num> merged at <TASK_1_SHA>:
-- `DeliverLocally.source` now `Some(identity_hash)` for established links
-  (was `None` placeholder from ZEB-226 / Phase 3a).
-- `NodeRuntime::register_local_destination` / `unregister_local_destination`
-  newly public.
+- pub NodeRuntime::register_local_destination / unregister_local_destination
+- pub NodeRuntime::lookup_destination_identity
 
-Both unblock the inbound DM demux + DM destination registration that
-follow in this PR.
+These unblock DM destination registration and per-device Ed25519
+application-signature verification (Path B per spec ea38132). Path A
+(Reticulum terminal-link wiring) is deferred to a separate future
+ticket and does NOT block this PR.
 EOF
 )"
 ```
 
-(Replace `<task-1-pr-num>` and `<TASK_1_SHA>` with the actual values captured in Steps 1.13 and 2.2.)
+(Replace `<task-1-pr-num>` and `<TASK_1_SHA>` with the actual values captured in Steps 1.12 and 2.2.)
 
 ---
 
-### Task 3: Add `DmReceiveError` enum + `resolve_link_origin_owner` helper
+### Task 3: Add `dm_signing.rs` module — sign + verify primitives
 
 **Files:**
-- Modify: `src-tauri/src/dm_outbox.rs` (add error variants near the existing `SendDmError` enum, add helper function)
-- Test: `src-tauri/src/dm_outbox.rs` test module
+- Create: `src-tauri/src/dm_signing.rs`
+- Modify: `src-tauri/src/lib.rs` — add `pub mod dm_signing;`
+- Modify: `src-tauri/src/dm_outbox.rs` — add `DmReceiveError` enum (referenced by `verify_dm_packet_signature` return)
 
-Pure function over `OwnerDeviceCache` — easiest piece to TDD. Per spec §"Link-origin binding rule" (lines 329-403).
+Pure-function module. Easiest piece to TDD.
 
-- [ ] **Step 3.1: Write failing tests for resolve_link_origin_owner**
+- [ ] **Step 3.1: Add DmReceiveError enum to dm_outbox.rs**
 
-Add to the `#[cfg(test)] mod tests` block at the bottom of `src-tauri/src/dm_outbox.rs`:
-
-```rust
-#[test]
-fn resolve_link_origin_owner_single_match_returns_ok() {
-    use crate::owner_state_types::{
-        DeviceIdentityHash, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, Hlc,
-    };
-    let mut cache = OwnerDeviceCache::default();
-    cache.devices.insert(
-        OwnerAddr([1; 16]),
-        OwnerDeviceEntry {
-            devices: vec![DeviceIdentityHash([0xa1; 16])],
-            learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
-        },
-    );
-    let resolved = resolve_link_origin_owner(&cache, DeviceIdentityHash([0xa1; 16])).unwrap();
-    assert_eq!(resolved, OwnerAddr([1; 16]));
-}
-
-#[test]
-fn resolve_link_origin_owner_no_matches_is_unknown_link_origin() {
-    use crate::owner_state_types::{
-        DeviceIdentityHash, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, Hlc,
-    };
-    let mut cache = OwnerDeviceCache::default();
-    cache.devices.insert(
-        OwnerAddr([1; 16]),
-        OwnerDeviceEntry {
-            devices: vec![DeviceIdentityHash([0xa1; 16])],
-            learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
-        },
-    );
-    let err = resolve_link_origin_owner(&cache, DeviceIdentityHash([0xff; 16])).unwrap_err();
-    assert!(matches!(err, DmReceiveError::UnknownLinkOrigin));
-}
-
-#[test]
-fn resolve_link_origin_owner_multiple_matches_is_ambiguous() {
-    // A single DeviceIdentityHash claimed by two different OwnerAddr entries.
-    // Per spec, this is unreachable in normal operation — it would mean
-    // either corrupted state or a malicious cache-poisoning DmInvite.
-    // Either way the resolution is not trustworthy: drop with telemetry.
-    use crate::owner_state_types::{
-        DeviceIdentityHash, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, Hlc,
-    };
-    let mut cache = OwnerDeviceCache::default();
-    let shared = DeviceIdentityHash([0xa1; 16]);
-    cache.devices.insert(
-        OwnerAddr([1; 16]),
-        OwnerDeviceEntry {
-            devices: vec![shared],
-            learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
-        },
-    );
-    cache.devices.insert(
-        OwnerAddr([2; 16]),
-        OwnerDeviceEntry {
-            devices: vec![shared],
-            learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
-        },
-    );
-    let err = resolve_link_origin_owner(&cache, shared).unwrap_err();
-    assert!(matches!(err, DmReceiveError::AmbiguousLinkOrigin));
-}
-```
-
-- [ ] **Step 3.2: Run tests to verify they fail**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test resolve_link_origin_owner 2>&1 | tail -20
-```
-
-Expected: FAIL — symbol `resolve_link_origin_owner` does not exist; `DmReceiveError` does not have the variants used.
-
-- [ ] **Step 3.3: Add DmReceiveError enum and resolve_link_origin_owner helper**
-
-In `src-tauri/src/dm_outbox.rs`, add the `DmReceiveError` enum (NOT the same as the one in `dm_crypto.rs` — Phase 3b needs additional variants beyond the single-variant `SenderImpersonation` in `dm_crypto`). Place it near the existing `SendDmError`:
+In `src-tauri/src/dm_outbox.rs`, add near the existing `SendDmError`:
 
 ```rust
 /// Inbound-DM packet handling errors. Each variant maps to a "drop +
-/// telemetry" decision in `handle_unicast` per ZEB-216 §"Link-origin
-/// binding rule". Distinct from `dm_crypto::DmReceiveError` which only
-/// carries the SenderImpersonation case for the encrypted-payload check.
+/// telemetry" decision in handle_unicast per ZEB-216 §"Application-
+/// signature binding rule". Distinct from dm_crypto::DmReceiveError
+/// which only carries the SenderImpersonation case for the encrypted-
+/// payload-layer check.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DmReceiveError {
-    #[error("from_identity_hash not present in any OwnerDeviceCache entry")]
-    UnknownLinkOrigin,
-    #[error("from_identity_hash claimed by multiple OwnerDeviceCache entries (corrupted state or cache-poisoning attempt)")]
-    AmbiguousLinkOrigin,
-    #[error("payload owner field does not match link-origin-resolved owner")]
+    #[error("signing_device_hash not present in any OwnerDeviceCache entry")]
+    UnknownSigningDevice,
+    #[error("signing_device_hash claimed by multiple OwnerDeviceCache entries (corrupted state or cache-poisoning attempt)")]
+    AmbiguousSigningDevice,
+    #[error("no public key cached for signing_device_hash (pre-bootstrap)")]
+    UnknownSigningKey,
+    #[error("signature does not verify against the provided public key")]
+    SignatureVerificationFailed,
+    #[error("public key does not match claimed signing_device_hash (key-substitution attempt)")]
+    SigningKeyDoesNotMatchDeviceHash,
+    #[error("payload owner field does not match signed-origin-resolved owner")]
     OwnerFieldMismatch,
     #[error("DmInvite.inviter must be in DmInvite.members")]
     InviterNotInMembers,
-    #[error("from_identity_hash must be in DmInvite.sender_devices")]
-    SenderDeviceNotInSenderDevices,
+    #[error("signing_device_hash must be in DmInvite.sender_devices")]
+    SigningDeviceNotInSenderDevices,
     #[error("self_owner_addr must be in DmInvite.members")]
     ReceiverNotInMembers,
     #[error("ack from owner not in OutboxEntry.recipient_owners")]
     AckFromNonRecipient,
     #[error("OutboxEntry not found for (space_id, message_cid)")]
     OutboxEntryNotFound,
-    #[error("DmInvite for an existing Space (already accepted)")]
-    InviteForExistingSpace,
     #[error("Space not found for incoming DmCidNotify (we are not a member?)")]
     SpaceNotFound,
     #[error("CAS fetch failed or timed out: {0}")]
     CasFetchFailed(String),
     #[error("DM blob decryption failed under all candidate keys")]
     DecryptFailed,
-    #[error("payload sender does not match link-origin OwnerAddr (impersonation)")]
+    #[error("payload sender does not match resolved owner (impersonation)")]
     SenderImpersonation,
     #[error("packet decode failed: {0}")]
     Decode(String),
@@ -607,47 +570,186 @@ pub enum DmReceiveError {
 }
 ```
 
-Add the `resolve_link_origin_owner` helper. Place it in the same module (private; only `handle_unicast` consumes it):
+- [ ] **Step 3.2: Investigate the device-hash-from-pubkey scheme**
+
+Read `harmony_identity` (or whatever harmony crate owns `Identity::address_hash`) to find how device identity hashes are derived from Ed25519 verifying keys. Likely scheme: `address_hash = SHA256(verifying_key_bytes)[:16]` or similar. Use file:line investigation; do NOT invent. Phase 1's `DeviceIdentityHash` is `[u8; 16]` so the truncation is to 16 bytes.
+
+Document the discovered scheme inline at the top of `dm_signing.rs` so future readers know the source of truth.
+
+- [ ] **Step 3.3: Create dm_signing.rs with failing tests**
 
 ```rust
-use crate::owner_state_types::{DeviceIdentityHash, OwnerDeviceCache};
+//! ZEB-216 Sub-B Phase 3b: per-device Ed25519 signing primitives for
+//! Reticulum DM packet bodies (Path B per spec ea38132).
+//!
+//! Pure functions over (body_bytes, key, signature). No state, no I/O.
+//!
+//! Device-hash-from-pubkey scheme: SHA256(verifying_key_bytes)[:16].
+//! This MUST match harmony-identity's `Identity::address_hash` derivation
+//! for a verifying key — verified during ZEB-227 implementation (see
+//! harmony commit <SHA from Step 3.2 investigation>).
 
-/// Resolve the inbound link's `from_identity_hash` to the OwnerAddr that
-/// owns it, by scanning OwnerDeviceCache entries. MUST match exactly one
-/// owner; zero matches → UnknownLinkOrigin, multiple → AmbiguousLinkOrigin.
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+use crate::dm_outbox::DmReceiveError;
+use crate::owner_state_types::DeviceIdentityHash;
+
+/// Compute the DeviceIdentityHash for a given Ed25519 verifying key.
+/// MUST match the scheme harmony-identity uses for Identity::address_hash.
+pub fn derive_device_hash_from_pubkey(pub_key: &VerifyingKey) -> DeviceIdentityHash {
+    let bytes = pub_key.to_bytes();
+    let hash = Sha256::digest(bytes);
+    let mut truncated = [0u8; 16];
+    truncated.copy_from_slice(&hash[..16]);
+    DeviceIdentityHash(truncated)
+}
+
+/// Sign a Reticulum DM packet body. The signature is applied to the
+/// canonical CBOR encoding of the body (which includes
+/// `signing_device_hash` to prevent key-substitution attacks).
 ///
-/// Per ZEB-216 §"Link-origin binding rule" — the receive-side bedrock of
-/// DM sender-impersonation defense. Every inbound DmCidNotify and DmAck
-/// flows through this resolver before any state mutation.
-pub(crate) fn resolve_link_origin_owner(
-    cache: &OwnerDeviceCache,
-    from_identity_hash: DeviceIdentityHash,
-) -> Result<OwnerAddr, DmReceiveError> {
-    let matches: Vec<OwnerAddr> = cache
-        .devices
-        .iter()
-        .filter(|(_, entry)| entry.devices.binary_search(&from_identity_hash).is_ok())
-        .map(|(addr, _)| *addr)
-        .collect();
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => Err(DmReceiveError::UnknownLinkOrigin),
-        _ => Err(DmReceiveError::AmbiguousLinkOrigin),
+/// Caller computes `body_bytes` once, passes here for signing. The
+/// resulting 64-byte Ed25519 signature is appended after `body_bytes`
+/// in the wire packet by encode_packet.
+pub fn sign_dm_packet(body_bytes: &[u8], signing_key: &SigningKey) -> [u8; 64] {
+    let sig: Signature = signing_key.sign(body_bytes);
+    sig.to_bytes()
+}
+
+/// Verify a Reticulum DM packet signature.
+///
+/// `body_bytes`: canonical CBOR encoding of the signed body (NOT
+/// including the discriminant byte or the appended signature).
+/// `signature`: 64-byte Ed25519 signature appended after body_bytes.
+/// `signing_pub`: verifying key looked up by the caller (from
+/// OwnerDeviceCache for CidNotify/Ack post-bootstrap, or from the
+/// inline `inviter_signing_pub` for DmInvite).
+/// `expected_signing_device_hash`: the body's `signing_device_hash`
+/// field; this function verifies the public key actually corresponds
+/// to that hash (defeats key-substitution attacks where an attacker
+/// presents pubkey K but claims signing_device_hash from a different key).
+///
+/// Returns Ok on success; Err on signature mismatch OR pubkey-doesn't-
+/// match-claimed-device-hash.
+pub fn verify_dm_packet_signature(
+    body_bytes: &[u8],
+    signature: &[u8; 64],
+    signing_pub: &VerifyingKey,
+    expected_signing_device_hash: DeviceIdentityHash,
+) -> Result<(), DmReceiveError> {
+    let computed_hash = derive_device_hash_from_pubkey(signing_pub);
+    if computed_hash != expected_signing_device_hash {
+        return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
+    }
+    let sig = Signature::from_bytes(signature);
+    signing_pub
+        .verify(body_bytes, &sig)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn fixed_key() -> SigningKey {
+        // Deterministic key for tests. NOT for production.
+        SigningKey::from_bytes(&[0x42u8; 32])
+    }
+
+    #[test]
+    fn sign_then_verify_round_trip() {
+        let sk = fixed_key();
+        let pk = sk.verifying_key();
+        let device_hash = derive_device_hash_from_pubkey(&pk);
+        let body = b"hello world body bytes";
+        let sig = sign_dm_packet(body, &sk);
+        assert!(verify_dm_packet_signature(body, &sig, &pk, device_hash).is_ok());
+    }
+
+    #[test]
+    fn verify_tampered_body_rejects() {
+        let sk = fixed_key();
+        let pk = sk.verifying_key();
+        let device_hash = derive_device_hash_from_pubkey(&pk);
+        let body = b"hello world body bytes";
+        let sig = sign_dm_packet(body, &sk);
+        let mut tampered = body.to_vec();
+        tampered[0] ^= 0xff;
+        let err = verify_dm_packet_signature(&tampered, &sig, &pk, device_hash).unwrap_err();
+        assert!(matches!(err, DmReceiveError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_wrong_pubkey_rejects() {
+        let sk1 = fixed_key();
+        let sk2 = SigningKey::from_bytes(&[0x99u8; 32]);
+        let pk2 = sk2.verifying_key();
+        let device_hash_2 = derive_device_hash_from_pubkey(&pk2);
+        let body = b"hello world body bytes";
+        let sig = sign_dm_packet(body, &sk1);  // signed by sk1
+        // Verify with pk2 + claim sk2's device hash → first check passes
+        // (pk2 matches device_hash_2), then signature verification fails.
+        let err = verify_dm_packet_signature(body, &sig, &pk2, device_hash_2).unwrap_err();
+        assert!(matches!(err, DmReceiveError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_pubkey_does_not_match_device_hash_rejects() {
+        let sk1 = fixed_key();
+        let pk1 = sk1.verifying_key();
+        let sk2 = SigningKey::from_bytes(&[0x99u8; 32]);
+        let pk2 = sk2.verifying_key();
+        let device_hash_2 = derive_device_hash_from_pubkey(&pk2);
+        let body = b"hello world body bytes";
+        let sig = sign_dm_packet(body, &sk1);
+        // Present pk1 but claim device_hash_2 (which is for pk2).
+        // Key-substitution attack defense: this MUST reject before
+        // even attempting signature verification.
+        let err = verify_dm_packet_signature(body, &sig, &pk1, device_hash_2).unwrap_err();
+        assert!(matches!(err, DmReceiveError::SigningKeyDoesNotMatchDeviceHash));
+    }
+
+    #[test]
+    fn derive_device_hash_is_deterministic() {
+        let sk = fixed_key();
+        let pk = sk.verifying_key();
+        let h1 = derive_device_hash_from_pubkey(&pk);
+        let h2 = derive_device_hash_from_pubkey(&pk);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn derive_device_hash_differs_per_key() {
+        let pk1 = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key();
+        let pk2 = SigningKey::from_bytes(&[0x22u8; 32]).verifying_key();
+        assert_ne!(
+            derive_device_hash_from_pubkey(&pk1),
+            derive_device_hash_from_pubkey(&pk2)
+        );
     }
 }
 ```
 
-The `OwnerDeviceEntry::devices` invariant (sorted ascending lex, see `owner_state_types.rs:286-307`) is what makes `binary_search` correct here. The deserializer re-establishes the invariant on every load (`owner_state_types.rs:332`), so a corrupted on-disk snapshot or malicious peer can't break the precondition.
+Add to `src-tauri/src/lib.rs`:
+
+```rust
+pub mod dm_signing;
+```
+
+(Place near the existing `pub mod dm_outbox;`.)
 
 - [ ] **Step 3.4: Run tests to verify they pass**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 set -o pipefail
-cargo test resolve_link_origin_owner 2>&1 | tail -10
+cargo test dm_signing 2>&1 | tail -20
 ```
 
-Expected: PASS — all three tests.
+Expected: PASS for all six tests.
 
 - [ ] **Step 3.5: Verification gates**
 
@@ -664,62 +766,559 @@ Expected: all green.
 - [ ] **Step 3.6: Commit**
 
 ```bash
-git add src-tauri/src/dm_outbox.rs
+git add src-tauri/src/dm_signing.rs src-tauri/src/lib.rs src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): add DmReceiveError enum + resolve_link_origin_owner helper
+feat(zeb-227): dm_signing module — Ed25519 sign + verify primitives
 
-Phase 3b's inbound DM demux needs a single resolver that maps a
-Reticulum link's `from_identity_hash` to the OwnerAddr that owns it.
-Per ZEB-216 §"Link-origin binding rule" the resolver MUST yield exactly
-one match — zero is UnknownLinkOrigin (drop + telemetry), more than
-one is AmbiguousLinkOrigin (corrupted state or cache-poisoning attempt;
-also drop + telemetry).
+Pure-function module for Path B's per-device application-signature
+binding. Three exports:
 
-Adds a Phase-3b-scoped `DmReceiveError` distinct from the single-variant
-`dm_crypto::DmReceiveError` (which only covers the encrypted-payload
-sender-impersonation check). All variants needed across handle_invite /
-handle_cidnotify / handle_ack are stubbed in upfront so subsequent tasks
-can fill in the call sites without re-touching this enum.
+- sign_dm_packet(body_bytes, signing_key) -> [u8; 64]
+- verify_dm_packet_signature(body_bytes, signature, signing_pub,
+    expected_signing_device_hash) -> Result<(), DmReceiveError>
+- derive_device_hash_from_pubkey(pub_key) -> DeviceIdentityHash
 
-The helper is `pub(crate)` — only handle_unicast consumes it; nothing
-outside dm_outbox needs the resolution semantics.
+The verify step does TWO checks:
+1. The provided pubkey actually hashes to the claimed signing_device_hash
+   (defeats key-substitution attacks where an attacker presents pubkey K
+   but claims a different device's hash).
+2. The Ed25519 signature verifies against (pubkey, body_bytes).
+
+Device-hash-from-pubkey scheme is SHA256(verifying_key_bytes)[:16],
+matching harmony-identity's Identity::address_hash derivation for a
+verifying key. Documented inline in the module header so the source
+of truth is loud at the call site.
+
+Six unit tests pin happy path + tampered body + wrong pubkey +
+key-substitution + determinism + per-key uniqueness.
+
+Also adds Phase 3b's DmReceiveError enum to dm_outbox.rs (16 variants
+spanning packet decode, signature verification, link-origin resolution,
+CAS fetch, decrypt, sender-binding, CRDT rejection). Distinct from
+dm_crypto::DmReceiveError which only covers the encrypted-payload
+sender-impersonation case.
 EOF
 )"
 ```
 
 ---
 
-### Task 4: Add `RuntimeUnicastTransport` adapter struct + `DmTransport` impl
+### Task 4: Extend `OwnerDeviceEntry` with per-device verifying keys
 
 **Files:**
-- Modify: `src-tauri/src/dm_outbox.rs` (add the new adapter type + tests)
-- Test: `src-tauri/src/dm_outbox.rs` test module
+- Modify: `src-tauri/src/owner_state_types.rs` — extend `OwnerDeviceEntry` to carry `Vec<[u8; 32]>` of verifying keys
+- Test: round-trip + invariant tests
 
-The adapter pushes outbound `RuntimeEvent::SendUnicastToDevice` via an mpsc channel. The actual `runtime.push_event` call lives in the event_loop's arm that drains this channel (Task 5). Phase 2's `StubTransport` is preserved for use in tests; Phase 3b production code uses `RuntimeUnicastTransport`.
+The cache stores per-OwnerAddr lists of `(DeviceIdentityHash, signing_pub)` pairs. The implementer chooses representation:
+- **Option A:** `Vec<[u8; 32]>` parallel to `devices: Vec<DeviceIdentityHash>` (same indexing). Preserves the existing binary_search invariant on `devices`.
+- **Option B:** Replace `devices` with `Vec<(DeviceIdentityHash, [u8; 32])>`. Cleaner but breaks binary_search-on-DeviceIdentityHash; would need to switch to manual partition_point.
 
-- [ ] **Step 4.1: Write a failing test for RuntimeUnicastTransport::send**
+Option A is lower friction. Implementer picks A unless they discover a reason during reading.
 
-Add to the `#[cfg(test)] mod tests` block at the bottom of `src-tauri/src/dm_outbox.rs`:
+- [ ] **Step 4.1: Write failing tests for the new field**
+
+In `src-tauri/src/owner_state_types.rs` test module:
+
+```rust
+#[test]
+fn owner_device_entry_serialize_includes_signing_pubs() {
+    let entry = OwnerDeviceEntry {
+        devices: vec![DeviceIdentityHash([0xa1; 16])],
+        device_signing_pubs: vec![[0x42u8; 32]],
+        learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
+    };
+    let bytes = canonical_cbor_encode(&entry).unwrap();
+    let recovered: OwnerDeviceEntry = canonical_cbor_decode(&bytes).unwrap();
+    assert_eq!(entry, recovered);
+}
+
+#[test]
+fn owner_device_entry_loads_pre_phase3b_snapshot_with_default_pubs() {
+    // Phase 1/2 snapshots stored only `devices` and `learned_at`.
+    // Phase 3b adds `device_signing_pubs` with #[serde(default)] so old
+    // snapshots load with an empty pubkey vec — the cache then drops
+    // signature-verification packets as UnknownSigningKey until the next
+    // DmInvite repopulates the pubkeys.
+    let pre_phase3b_cbor = b"\xa2\x61v\x81\x50\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\x61l\xa3\x61w\x01\x61l\x00\x61d\x61d";
+    // ^ map(2) { "v": [bstr(16) [0xa1; 16]], "l": { "w": 1, "l": 0, "d": "d" } }
+    // (No "device_signing_pubs" key.)
+    // The decoder must accept this and produce an entry with
+    // `device_signing_pubs: vec![]` via #[serde(default)].
+    // The implementer verifies the byte-exact CBOR with a small one-off
+    // canonical_cbor_encode + grep before pinning the bytes here.
+    let recovered: OwnerDeviceEntry = canonical_cbor_decode(pre_phase3b_cbor).unwrap();
+    assert_eq!(recovered.devices.len(), 1);
+    assert!(recovered.device_signing_pubs.is_empty());
+}
+```
+
+(The byte literal in the second test is illustrative; the implementer derives the actual canonical CBOR bytes for a Phase 1/2 entry by encoding one without the new field, capturing the bytes, and pinning them. This locks in the graceful-upgrade contract.)
+
+- [ ] **Step 4.2: Run tests to verify they fail**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+set -o pipefail
+cargo test owner_device_entry 2>&1 | tail -20
+```
+
+Expected: FAIL — `device_signing_pubs` field doesn't exist.
+
+- [ ] **Step 4.3: Add the field**
+
+In `src-tauri/src/owner_state_types.rs`, modify `OwnerDeviceEntry`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDeviceEntry {
+    /// Sorted ascending lex, deduped, capped at MAX_DEVICES_PER_OWNER.
+    /// Sorted invariant means binary_search works for lookup
+    /// (used by resolve_signed_origin_owner in Phase 3b).
+    /// ... (existing doc) ...
+    #[serde(rename = "v", deserialize_with = "deserialize_device_identities")]
+    pub devices: Vec<DeviceIdentityHash>,
+    /// Per-device Ed25519 verifying keys, parallel to `devices` (same
+    /// length; element i is the pubkey for devices[i]). Phase 3b
+    /// (Path B per ZEB-216 spec) uses these to verify per-device
+    /// application-layer signatures on inbound DM packets. Pre-Phase-3b
+    /// snapshots load with `vec![]` via #[serde(default)] — the receive
+    /// path then drops signature-verification packets as
+    /// UnknownSigningKey until the next DmInvite repopulates these.
+    #[serde(rename = "p", default, deserialize_with = "deserialize_device_signing_pubs")]
+    pub device_signing_pubs: Vec<[u8; 32]>,
+    /// HLC of when this entry was learned. LWW key for merge.
+    #[serde(rename = "l")]
+    pub learned_at: Hlc,
+}
+```
+
+Add `deserialize_device_signing_pubs` helper that mirrors `deserialize_device_identities`'s cap behavior (truncate to `MAX_DEVICES_PER_OWNER`, but on the pubkey list — no sort/dedup since order is meaningful for parallel-vec correspondence).
+
+The new field uses `serde(default)` so old snapshots without the field deserialize to `vec![]`. Phase 3b's signature verification then fails with `UnknownSigningKey` for any device that doesn't have a corresponding pubkey — which is correct behavior: the receiver hasn't been told the pubkey yet, so it can't verify, so it drops.
+
+Update `apply_owner_device_update` (in `owner_state_crdt.rs:453`) to also accept and store `device_signing_pubs` parallel to `devices`. Signature:
+
+```rust
+pub fn apply_owner_device_update(
+    &mut self,
+    addr: OwnerAddr,
+    devices: Vec<DeviceIdentityHash>,
+    device_signing_pubs: Vec<[u8; 32]>,  // NEW — parallel to devices
+    learned_at: Hlc,
+) -> ApplyOutcome {
+    // sanitize: sort+dedup devices BUT also reorder pubs to match
+    // ... [implementer carefully maintains parallelism through sort+dedup] ...
+}
+```
+
+The sanitization is delicate: `devices.sort()` invalidates the parallel-vec correspondence. Two ways to handle:
+- **Option A:** Build `Vec<(DeviceIdentityHash, [u8; 32])>`, sort by .0, dedup by .0, then split back into two vecs. Cleanest.
+- **Option B:** Sort with a permutation, apply the same permutation to pubs. More efficient for very large vecs but harder to read.
+
+Use Option A. The vecs are at most 32 elements (MAX_DEVICES_PER_OWNER); efficiency doesn't matter.
+
+Implementer also updates all callers of `apply_owner_device_update` to pass the new arg. Phase 1/2 callers don't have pubkeys; pass `vec![]` for now. Phase 3b adds real pubkeys at the call sites in `handle_invite` (Task 7) and `handle_cidnotify` (Task 8) — not yet wired in this task.
+
+- [ ] **Step 4.4: Run tests to verify they pass**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+set -o pipefail
+cargo test owner_device_entry 2>&1 | tail -10
+cargo test apply_owner_device_update 2>&1 | tail -20
+```
+
+Expected: PASS.
+
+- [ ] **Step 4.5: Verification gates**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client
+set -o pipefail
+cargo fmt --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+Expected: all green. Existing Phase 1/2 tests that call `apply_owner_device_update` need their call sites updated with `vec![]` for the new pubkey arg.
+
+- [ ] **Step 4.6: Commit**
+
+```bash
+git add src-tauri/src/owner_state_types.rs src-tauri/src/owner_state_crdt.rs
+# (plus any test files updated for the apply_owner_device_update signature change)
+git commit -m "$(cat <<'EOF'
+feat(zeb-227): extend OwnerDeviceEntry with per-device Ed25519 pubkeys
+
+OwnerDeviceEntry gains a `device_signing_pubs: Vec<[u8; 32]>` field
+parallel to the existing `devices: Vec<DeviceIdentityHash>` — element i
+is the Ed25519 verifying key for devices[i]. Phase 3b's signature
+verification (per ZEB-216 spec §"Application-signature binding rule"
+at commit ea38132, Path B) looks up the pubkey via this parallel-index
+lookup.
+
+Wire format addition: CBOR map gains key "p" (matches the existing
+two-char rename pattern). The new field uses #[serde(default)] so
+Phase 1/2 snapshots without the key load with `vec![]` — graceful
+upgrade. The receive path then drops any signature-verification packet
+from a device whose pubkey isn't cached as UnknownSigningKey, until
+the next DmInvite repopulates it.
+
+apply_owner_device_update widens its signature with the new pubkey
+vec. Sanitization carefully maintains parallel-vec correspondence
+through sort + dedup by zipping into Vec<(hash, pub)>, sorting by
+hash, dedup'ing by hash, then splitting back. Phase 1/2 call sites
+pass vec![] (no pubkey known yet); Phase 3b's handle_invite +
+handle_cidnotify pass real pubkeys.
+EOF
+)"
+```
+
+---
+
+### Task 5: Reshape `dm_envelope.rs` for the appended-signature wire layout
+
+**Files:**
+- Modify: `src-tauri/src/dm_envelope.rs` — rename existing structs to `*Signed`, add `signing_device_hash` + `inviter_signing_pub`, change `DmPacket` variants to carry signature + signed_bytes, update encode_packet + decode_packet
+
+This is the largest single mechanical change in the plan. TDD applies but the structural refactor is contiguous.
+
+- [ ] **Step 5.1: Write failing tests for the new wire layout**
+
+In `src-tauri/src/dm_envelope.rs` test module:
+
+```rust
+#[test]
+fn dm_packet_invite_round_trip_with_signature() {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let pk = sk.verifying_key();
+    let device_hash = crate::dm_signing::derive_device_hash_from_pubkey(&pk);
+
+    let signed = DmInviteSigned {
+        space_id: SpaceId([1; 16]),
+        kind: SpaceKind::Dm,
+        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+        inviter: OwnerAddr([1; 16]),
+        content_key: DmContentKey::new([0xaa; 32]),
+        sender_devices: vec![device_hash],
+        created_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
+        signing_device_hash: device_hash,
+        inviter_signing_pub: pk.to_bytes(),
+    };
+
+    let body_bytes = canonical_cbor_encode(&signed).unwrap();
+    let signature = crate::dm_signing::sign_dm_packet(&body_bytes, &sk);
+
+    let packet = DmPacket::Invite { signed: signed.clone(), signature, signed_bytes: body_bytes.clone() };
+    let wire = encode_packet(&packet).unwrap();
+    assert_eq!(wire[0], 0x01);
+    assert_eq!(wire.len(), 1 + body_bytes.len() + 64);
+
+    let decoded = decode_packet(&wire).unwrap();
+    match decoded {
+        DmPacket::Invite { signed: d_signed, signature: d_sig, signed_bytes: d_bytes } => {
+            assert_eq!(d_signed, signed);
+            assert_eq!(d_sig, signature);
+            assert_eq!(d_bytes, body_bytes);
+            // Verify signature round-trips through decode.
+            assert!(crate::dm_signing::verify_dm_packet_signature(
+                &d_bytes,
+                &d_sig,
+                &pk,
+                device_hash,
+            ).is_ok());
+        }
+        other => panic!("expected Invite, got {:?}", other),
+    }
+}
+
+#[test]
+fn dm_packet_decode_too_short_for_signature_rejects() {
+    // Body would need to be at least 1 byte (CBOR map header) + 64 byte
+    // signature = 65 bytes total minimum after the discriminant.
+    let bytes = vec![0x02, 0xa0]; // disc=0x02, body = empty CBOR map (1 byte), no signature
+    let err = decode_packet(&bytes).unwrap_err();
+    assert!(matches!(err, DecodeError::TooShortForSignature));
+}
+
+#[test]
+fn dm_packet_signature_does_not_cover_discriminant() {
+    // Same body bytes, swap the discriminant byte → signature should
+    // still verify (discriminant is routing-only, not signed). This
+    // pins the wire-format contract.
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let body = b"\xa1\x61x\x00".to_vec(); // map(1) {"x": 0}
+    let sig = crate::dm_signing::sign_dm_packet(&body, &sk);
+
+    let mut wire_a = vec![0x01];
+    wire_a.extend_from_slice(&body);
+    wire_a.extend_from_slice(&sig);
+
+    let mut wire_b = vec![0x02];  // different discriminant
+    wire_b.extend_from_slice(&body);
+    wire_b.extend_from_slice(&sig);
+
+    // Both should parse the same body bytes (and thus the signature
+    // should verify against both), differing only in their dispatch.
+    // Note: actual decode would fail here because the body isn't valid
+    // for the discriminant's schema — but the bytes-extraction is what
+    // we're pinning. The implementer adapts the test to assert on the
+    // body-extraction step specifically.
+}
+```
+
+(The third test is illustrative; if the encode_packet API doesn't expose a "extract body bytes" function, the implementer reformulates it as a documentation-only assertion of the design decision.)
+
+Plus the existing tests in dm_envelope.rs (round-trip for each variant) need updating to match the new struct names and field additions. Implementer batches these updates.
+
+- [ ] **Step 5.2: Run tests to verify they fail**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+set -o pipefail
+cargo test --lib dm_packet 2>&1 | tail -30
+```
+
+Expected: many existing tests fail (they reference the old struct names + decode_packet signature) and the new tests fail.
+
+- [ ] **Step 5.3: Refactor dm_envelope.rs**
+
+The plan won't reproduce the entire ~600-line file. Key edits:
+
+1. **Rename structs:** `DmInvite` → `DmInviteSigned`, etc. Add `signing_device_hash: DeviceIdentityHash` to all three (with `#[serde(rename = "dh")]`). Add `inviter_signing_pub: [u8; 32]` to `DmInviteSigned` (rename `"sp"`).
+
+2. **Restructure DmPacket enum:**
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmPacket {
+    Invite {
+        signed: DmInviteSigned,
+        signature: [u8; 64],
+        /// The canonical CBOR bytes of `signed` — the bytes the
+        /// signature was computed over. Captured on decode so the
+        /// receive handler can verify without re-encoding (re-encoding
+        /// would require canonical determinism guarantees that we have,
+        /// but capturing is cheaper than recomputing + risk-free).
+        signed_bytes: Vec<u8>,
+    },
+    CidNotify {
+        signed: DmCidNotifySigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+    },
+    Ack {
+        signed: DmAckSigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+    },
+}
+```
+
+3. **Update encode_packet:** caller passes the variant with `signed`, `signature`, and `signed_bytes` already populated. Wire output is `[disc][signed_bytes][signature]` (signed_bytes is already CBOR; we don't re-encode):
+
+```rust
+pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
+    let (disc, signed_bytes, signature) = match packet {
+        DmPacket::Invite { signed_bytes, signature, .. } => (0x01, signed_bytes, signature),
+        DmPacket::CidNotify { signed_bytes, signature, .. } => (0x02, signed_bytes, signature),
+        DmPacket::Ack { signed_bytes, signature, .. } => (0x03, signed_bytes, signature),
+    };
+    let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
+    out.push(disc);
+    out.extend_from_slice(signed_bytes);
+    out.extend_from_slice(signature);
+    Ok(out)
+}
+```
+
+4. **Add helper for the sender-side common path (sign + build):**
+
+```rust
+/// Builder helper: take an unsigned struct, sign it, return a complete
+/// `DmPacket` ready for encode_packet. Hides the canonical-CBOR-encode
+/// + sign + bundle dance from senders.
+pub fn build_signed_invite(
+    signed: DmInviteSigned,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<DmPacket, EncodeError> {
+    let signed_bytes = canonical_cbor_encode(&signed)
+        .map_err(|e| EncodeError::Cbor(e.to_string()))?;
+    let signature = crate::dm_signing::sign_dm_packet(&signed_bytes, signing_key);
+    Ok(DmPacket::Invite { signed, signature, signed_bytes })
+}
+// Plus build_signed_cidnotify, build_signed_ack — same shape.
+```
+
+5. **Update decode_packet:**
+
+```rust
+pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
+    let (disc, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
+    if rest.len() < 64 + 1 {
+        // Need at least 1 byte of body + 64 bytes of signature.
+        return Err(DecodeError::TooShortForSignature);
+    }
+    let split_at = rest.len() - 64;
+    let (body_bytes, signature_bytes) = rest.split_at(split_at);
+    let signature: [u8; 64] = signature_bytes.try_into().expect("just split at len-64");
+    let signed_bytes = body_bytes.to_vec();
+    match disc {
+        0x01 => {
+            let signed: DmInviteSigned = canonical_cbor_decode(body_bytes)?;
+            // Phase 1 wire-decoder invariant checks remain (sorted members,
+            // member counts, inviter ∈ members, sender_devices.len() cap).
+            // Plus new check: signing_device_hash MUST be in sender_devices.
+            if !signed.sender_devices.contains(&signed.signing_device_hash) {
+                return Err(DecodeError::Invalid(
+                    "DmInvite.signing_device_hash must be in sender_devices",
+                ));
+            }
+            // Plus the existing checks (kind ∈ {Dm, GroupDm}, member-count match,
+            // sorted, inviter ∈ members, oversized sender_devices) — keep them.
+            Ok(DmPacket::Invite { signed, signature, signed_bytes })
+        }
+        0x02 => {
+            let signed: DmCidNotifySigned = canonical_cbor_decode(body_bytes)?;
+            if !signed.sender_devices.contains(&signed.signing_device_hash) {
+                return Err(DecodeError::Invalid(
+                    "DmCidNotify.signing_device_hash must be in sender_devices",
+                ));
+            }
+            Ok(DmPacket::CidNotify { signed, signature, signed_bytes })
+        }
+        0x03 => {
+            let signed: DmAckSigned = canonical_cbor_decode(body_bytes)?;
+            if !signed.ack_from_devices.contains(&signed.signing_device_hash) {
+                return Err(DecodeError::Invalid(
+                    "DmAck.signing_device_hash must be in ack_from_devices",
+                ));
+            }
+            Ok(DmPacket::Ack { signed, signature, signed_bytes })
+        }
+        other => Err(DecodeError::UnknownDiscriminant(*other)),
+    }
+}
+```
+
+6. **Add `DecodeError::TooShortForSignature` variant** to the error enum.
+
+The implementer updates ALL existing tests in `dm_envelope.rs` test module to:
+- Use the `*Signed` struct names
+- Populate `signing_device_hash` (and `inviter_signing_pub` for invites)
+- Build packets via the `build_signed_*` helpers (which compute the signature)
+- Match on the new variant shape `{ signed, signature, signed_bytes }`
+
+- [ ] **Step 5.4: Run tests to verify they pass**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+set -o pipefail
+cargo test --lib dm_packet 2>&1 | tail -30
+cargo test --lib dm_envelope 2>&1 | tail -30
+```
+
+Expected: PASS for the new tests + the updated existing tests.
+
+- [ ] **Step 5.5: Verification gates**
+
+```bash
+cd /Users/zeblith/work/zeblithic/harmony-client
+set -o pipefail
+cargo fmt --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+Expected: all green. Other modules that import `DmInvite` / `DmCidNotify` / `DmAck` (just `dm_outbox.rs` per Phase 2) need their imports updated to `DmInviteSigned` / etc.
+
+- [ ] **Step 5.6: Commit**
+
+```bash
+git add src-tauri/src/dm_envelope.rs
+# (plus any cross-module import updates in dm_outbox.rs if needed)
+git commit -m "$(cat <<'EOF'
+feat(zeb-227): reshape DM wire format for appended Ed25519 signature
+
+Wire layout per spec ea38132 §"Wire format":
+[u8 disc][CBOR(signed_body)][bstr(64) signature]
+
+The signature lives outside the CBOR map (no chicken-and-egg with
+computing it inside) and outside the discriminant (which is routing-
+only — same body could in principle be reused under a different
+discriminant; the signature pins the body, not the routing tag).
+
+Struct renames + field additions:
+- DmInvite → DmInviteSigned. Adds `signing_device_hash: DeviceIdentityHash`
+  (inside signed body — prevents key-substitution attacks where an
+  attacker swaps which device claims authorship) and `inviter_signing_pub:
+  [u8; 32]` (the inviter's Ed25519 verifying key, inline so bootstrap
+  signature verification is self-contained).
+- DmCidNotify → DmCidNotifySigned. Adds signing_device_hash.
+- DmAck → DmAckSigned. Adds signing_device_hash.
+
+DmPacket variants restructured to `{ signed: ..., signature: [u8; 64],
+signed_bytes: Vec<u8> }`. signed_bytes is captured on decode so the
+receive handler can call dm_signing::verify_dm_packet_signature without
+re-encoding (re-encoding would work given canonical CBOR determinism,
+but capturing is cheaper and risk-free).
+
+encode_packet now expects `signed_bytes` + `signature` to be already
+populated (caller goes through build_signed_invite / build_signed_cidnotify /
+build_signed_ack helpers that wrap canonical_cbor_encode + sign).
+
+decode_packet adds:
+- DecodeError::TooShortForSignature when the post-discriminant slice
+  is < 65 bytes (body min 1 + sig 64).
+- New invariant check per packet type: signing_device_hash MUST be
+  present in sender_devices (Invite/CidNotify) or ack_from_devices
+  (Ack). Catches structurally-inconsistent packets before signature
+  verification is even attempted.
+
+Wire-size cost: +80 bytes per packet (signing_device_hash 16 + appended
+signature 64) and +32 bytes for DmInvite (inviter_signing_pub).
+Reticulum MTU is ~500 bytes effective; new packet sizes ~140-280 bytes.
+
+dm_outbox imports updated to use the new struct names; rest of dm_outbox
+is unchanged in this commit (signature verification + handle_unicast
+land in subsequent tasks).
+EOF
+)"
+```
+
+---
+
+### Task 6: Add `RuntimeUnicastTransport` adapter struct + `DmTransport` impl
+
+**Files:**
+- Modify: `src-tauri/src/dm_outbox.rs` — add the new adapter type, `DestinationResolver` trait, and tests
+
+The adapter signs outbound `DmCidNotify` packets and pushes them via mpsc. `StubTransport` is preserved for tests.
+
+- [ ] **Step 6.1: Write failing test for RuntimeUnicastTransport::send**
 
 ```rust
 #[tokio::test]
-async fn runtime_unicast_transport_send_pushes_event_into_channel() {
+async fn runtime_unicast_transport_send_pushes_signed_event_into_channel() {
     use tokio::sync::mpsc;
-    use crate::owner_state_types::{
-        ContentId, DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId,
-    };
-    use std::collections::BTreeSet;
-
     let (tx, mut rx) = mpsc::channel::<UnicastSendRequest>(8);
 
-    // Stub destination resolver: maps recipient OwnerAddr -> known device hashes
-    // -> destination_hash. Phase 3b production resolver uses OwnerDeviceCache;
-    // for this unit test we hand it a closure that returns one fixed hash.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let signing_pub = signing_key.verifying_key();
+    let our_device = crate::dm_signing::derive_device_hash_from_pubkey(&signing_pub);
+
     let resolver = std::sync::Arc::new(StaticDestResolver::new([
         (OwnerAddr([1; 16]), vec![[0xd1u8; 16]]),
     ]));
 
-    let transport = RuntimeUnicastTransport::new(tx, resolver);
+    let transport = RuntimeUnicastTransport::new(
+        tx,
+        resolver,
+        OwnerAddr([0xff; 16]),  // self_owner
+        our_device,
+        std::sync::Arc::new(signing_key),
+    );
+
     let entry = OutboxEntry {
         id: OutboxEntryId([0xab; 16]),
         space_id: SpaceId([0xcc; 16]),
@@ -734,91 +1333,64 @@ async fn runtime_unicast_transport_send_pushes_event_into_channel() {
 
     let req = rx.recv().await.expect("channel produced no event");
     assert_eq!(req.destination_hash, [0xd1u8; 16]);
-    // The packet body is a CBOR-encoded DmCidNotify with the OutboxEntry's
-    // (space_id, message_cid). Decode and verify shape.
+
+    // The packet body decodes as a signed DmCidNotify; the signature
+    // verifies against our signing pubkey.
     let packet = crate::dm_envelope::decode_packet(&req.packet).unwrap();
     match packet {
-        crate::dm_envelope::DmPacket::CidNotify(notify) => {
-            assert_eq!(notify.space_id, SpaceId([0xcc; 16]));
-            assert_eq!(notify.message_cid, ContentId::from_bytes([0xee; 32]));
-            // sender_owner_addr is "diagnostic only" per spec — the real
-            // identity comes from link-origin binding on the receive side.
-            // But the field is populated by the sender's self_owner.
+        crate::dm_envelope::DmPacket::CidNotify { signed, signature, signed_bytes } => {
+            assert_eq!(signed.space_id, SpaceId([0xcc; 16]));
+            assert_eq!(signed.message_cid, ContentId::from_bytes([0xee; 32]));
+            assert_eq!(signed.signing_device_hash, our_device);
+            // Signature must verify against our pubkey + claimed device hash.
+            assert!(crate::dm_signing::verify_dm_packet_signature(
+                &signed_bytes,
+                &signature,
+                &signing_pub,
+                our_device,
+            ).is_ok());
         }
         other => panic!("expected CidNotify, got {:?}", other),
     }
 }
 
-/// Test-only resolver that maps recipient OwnerAddr -> device destination
-/// hashes from a fixed table. Production resolver reads OwnerDeviceCache.
-struct StaticDestResolver {
-    table: HashMap<OwnerAddr, Vec<[u8; 16]>>,
-}
-
-impl StaticDestResolver {
-    fn new(entries: impl IntoIterator<Item = (OwnerAddr, Vec<[u8; 16]>)>) -> Self {
-        Self { table: entries.into_iter().collect() }
-    }
-}
-
-impl DestinationResolver for StaticDestResolver {
-    fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
-        self.table.get(&recipient).cloned().unwrap_or_default()
-    }
-}
+struct StaticDestResolver { /* ... as in plan section above ... */ }
+// trait DestinationResolver { ... }
 ```
 
-- [ ] **Step 4.2: Run test to verify it fails**
+(The `StaticDestResolver` test helper is the same as in the original plan — fixed-table impl of `DestinationResolver`.)
+
+- [ ] **Step 6.2: Run test to verify it fails**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 set -o pipefail
-cargo test runtime_unicast_transport_send_pushes_event_into_channel 2>&1 | tail -20
+cargo test runtime_unicast_transport_send_pushes_signed_event 2>&1 | tail -20
 ```
 
-Expected: FAIL — `UnicastSendRequest`, `RuntimeUnicastTransport`, `DestinationResolver` don't exist yet.
+Expected: FAIL — `RuntimeUnicastTransport`, `UnicastSendRequest`, `DestinationResolver` don't exist yet.
 
-- [ ] **Step 4.3: Implement RuntimeUnicastTransport + supporting types**
+- [ ] **Step 6.3: Implement RuntimeUnicastTransport**
 
-In `src-tauri/src/dm_outbox.rs`, after the existing `StubTransport` impl block, add:
+In `src-tauri/src/dm_outbox.rs`, after the existing `StubTransport`:
 
 ```rust
-/// Outbound request from a `RuntimeUnicastTransport` to the event-loop.
-/// The event-loop drains these and pushes them as
-/// `RuntimeEvent::SendUnicastToDevice` into `NodeRuntime`.
 #[derive(Debug, Clone)]
 pub struct UnicastSendRequest {
     pub destination_hash: [u8; 16],
     pub packet: Vec<u8>,
 }
 
-/// Strategy: how to map a recipient OwnerAddr → list of Reticulum
-/// destination hashes (one per known bound device of that owner).
-///
-/// Production impl reads `OwnerDeviceCache`. Test impl is fixed-table.
-/// Behind a trait so the unit test can isolate the transport from the
-/// CRDT state.
 pub trait DestinationResolver: Send + Sync {
-    /// Returns the list of 16-byte destination hashes to fan-out to.
-    /// May be empty (recipient has no known devices) — caller treats
-    /// that as a transient transport error.
     fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]>;
 }
 
-/// Phase 3b production transport. `DmTransport::send` builds a
-/// DmCidNotify, encodes it, resolves the recipient's device destination
-/// hashes via the injected resolver, and pushes one `UnicastSendRequest`
-/// per device hash into the channel that the event-loop drains.
-///
-/// Cross-device fan-out is per spec (Flow 2 step 5): every known device
-/// of the recipient gets its own SendUnicastToDevice. The runtime's
-/// per-destination FIFO and cross-destination best-effort ordering
-/// guarantees apply (see ZEB-226 round-13 doc).
 pub struct RuntimeUnicastTransport {
     tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
     resolver: std::sync::Arc<dyn DestinationResolver>,
     self_owner: OwnerAddr,
-    sender_devices: Vec<DeviceIdentityHash>,
+    our_signing_device_hash: DeviceIdentityHash,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
 }
 
 impl RuntimeUnicastTransport {
@@ -826,9 +1398,10 @@ impl RuntimeUnicastTransport {
         tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
         resolver: std::sync::Arc<dyn DestinationResolver>,
         self_owner: OwnerAddr,
-        sender_devices: Vec<DeviceIdentityHash>,
+        our_signing_device_hash: DeviceIdentityHash,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     ) -> Self {
-        Self { tx, resolver, self_owner, sender_devices }
+        Self { tx, resolver, self_owner, our_signing_device_hash, signing_key }
     }
 }
 
@@ -842,21 +1415,23 @@ impl DmTransport for RuntimeUnicastTransport {
             )));
         }
 
-        let notify = crate::dm_envelope::DmCidNotify {
+        let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
             message_cid: entry.message_cid,
             sender_owner_addr: self.self_owner,
-            sender_devices: self.sender_devices.clone(),
+            sender_devices: vec![self.our_signing_device_hash],
+            signing_device_hash: self.our_signing_device_hash,
         };
-        let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::CidNotify(notify))
-            .map_err(|e| TransportError::Permanent(format!("encode_packet failed: {e}")))?;
+        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
+            .map_err(|e| TransportError::Permanent(format!("build_signed_cidnotify: {e}")))?;
+        let wire = crate::dm_envelope::encode_packet(&packet)
+            .map_err(|e| TransportError::Permanent(format!("encode_packet: {e}")))?;
 
         for dest_hash in destinations {
-            let req = UnicastSendRequest {
+            self.tx.send(UnicastSendRequest {
                 destination_hash: dest_hash,
-                packet: packet.clone(),
-            };
-            self.tx.send(req).await.map_err(|e| {
+                packet: wire.clone(),
+            }).await.map_err(|e| {
                 TransportError::Transient(format!("event-loop channel closed: {e}"))
             })?;
         }
@@ -865,21 +1440,19 @@ impl DmTransport for RuntimeUnicastTransport {
 }
 ```
 
-Update test imports as needed (the test uses `HashMap`, `tokio::sync::mpsc`).
+`OwnerDeviceCacheResolver` (the production resolver that reads from `OwnerState`) is added in Task 11.
 
-(Note: this adapter only handles `DmCidNotify` outbound. `DmInvite` outbound is Phase 4's `add_space` IPC for DM kinds — the spec's Flow 1 walks through it. `DmAck` outbound is built by the receive-side `handle_cidnotify` and pushed directly into the same channel — not through `DmTransport::send` because Acks aren't tied to OutboxEntry retry. The plan's Task 8 wires that.)
-
-- [ ] **Step 4.4: Run test to verify it passes**
+- [ ] **Step 6.4: Run test to verify it passes**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 set -o pipefail
-cargo test runtime_unicast_transport_send_pushes_event_into_channel 2>&1 | tail -10
+cargo test runtime_unicast_transport 2>&1 | tail -10
 ```
 
 Expected: PASS.
 
-- [ ] **Step 4.5: Add a no-known-devices test**
+- [ ] **Step 6.5: Add a no-known-devices test**
 
 ```rust
 #[tokio::test]
@@ -887,31 +1460,23 @@ async fn runtime_unicast_transport_no_known_devices_is_transient_error() {
     use tokio::sync::mpsc;
     let (tx, _rx) = mpsc::channel::<UnicastSendRequest>(8);
     let resolver = std::sync::Arc::new(StaticDestResolver::new(std::iter::empty()));
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let our_device = crate::dm_signing::derive_device_hash_from_pubkey(&signing_key.verifying_key());
+
     let transport = RuntimeUnicastTransport::new(
-        tx,
-        resolver,
+        tx, resolver,
         OwnerAddr([0xff; 16]),
-        vec![DeviceIdentityHash([7; 16])],
+        our_device,
+        std::sync::Arc::new(signing_key),
     );
 
-    let entry = OutboxEntry {
-        id: OutboxEntryId([0xab; 16]),
-        space_id: SpaceId([0xcc; 16]),
-        recipient_owners: vec![OwnerAddr([1; 16])],
-        message_cid: ContentId::from_bytes([0xee; 32]),
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "d".into() },
-        delivered_to: BTreeSet::new(),
-        delivery_status: DeliveryStatus::Pending,
-    };
-
+    let entry = /* ... same fixture as above ... */;
     let err = transport.send(&entry, OwnerAddr([1; 16])).await.unwrap_err();
     assert!(matches!(err, TransportError::Transient(_)));
 }
 ```
 
-Run: `cargo test runtime_unicast_transport_no_known_devices_is_transient_error` — expect PASS.
-
-- [ ] **Step 4.6: Verification gates**
+- [ ] **Step 6.6: Verification gates + commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -919,70 +1484,58 @@ set -o pipefail
 cargo fmt --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-```
 
-Expected: all green.
-
-- [ ] **Step 4.7: Commit**
-
-```bash
 git add src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): add RuntimeUnicastTransport adapter
+feat(zeb-227): RuntimeUnicastTransport adapter — sign + dispatch via mpsc
 
-Phase 3b's production DmTransport. Builds a DmCidNotify, encodes it,
-and fans out one UnicastSendRequest per known device of the recipient
-into the channel that the event-loop drains and forwards into NodeRuntime
-as RuntimeEvent::SendUnicastToDevice.
+Phase 3b's production DmTransport. Per send():
+1. Resolve recipient OwnerAddr → list of destination hashes via the
+   injected DestinationResolver (production impl OwnerDeviceCacheResolver
+   lands in Task 11; tests use a StaticDestResolver fixed-table impl).
+2. Build a DmCidNotifySigned with signing_device_hash = our device.
+3. Sign + encode via dm_envelope::build_signed_cidnotify + encode_packet.
+4. Push one UnicastSendRequest per recipient device hash into the
+   channel that the event-loop drains and forwards into NodeRuntime
+   as RuntimeEvent::SendUnicastToDevice.
 
-Resolver is behind a trait (DestinationResolver) so the unit test can
-inject a fixed-table impl, isolating the transport from OwnerDeviceCache.
-The production resolver wires up in Task 5 alongside the channel and
-event-loop arm.
+Cross-device fan-out is per spec (Flow 2 step 5): every known device
+of the recipient gets its own SendUnicastToDevice. The runtime's
+per-destination FIFO and cross-destination best-effort ordering
+guarantees apply (per ZEB-226 round-13 doc).
 
-StubTransport is preserved (Phase 2's tests still depend on it; gating
-to test-cfg is a future cleanup, not required by this PR).
+DmInvite outbound is Phase 4's add_space IPC for DM kinds (spec Flow 1).
+DmAck outbound is built directly by the receive-side handle_cidnotify
+(Task 8) — not through DmTransport::send because acks aren't tied to
+OutboxEntry retry.
+
+StubTransport is preserved for test use. Phase 2's dm_outbox tests
+explicitly construct StubTransport so this addition is transparent
+to them.
 EOF
 )"
 ```
 
 ---
 
-### Task 5: Wire outbound mpsc channel + event_loop arm
+### Task 7: Wire outbound mpsc channel + event_loop arm
 
 **Files:**
-- Modify: `src-tauri/src/event_loop.rs` (new mpsc channel parameter, new `tokio::select!` arm to drain it and push into `runtime.push_event`)
-- Modify: `src-tauri/src/lib.rs` (construct the channel near `cas_op_tx` at line 572; thread it through `event_loop::run`'s call site)
+- Modify: `src-tauri/src/event_loop.rs` — add `unicast_send_rx` parameter and select arm
+- Modify: `src-tauri/src/lib.rs` — construct the channel near `cas_op_tx`; thread through
+- Modify: test files (`tests/content_index_integration.rs`, `tests/folder_primitive_integration.rs`) — append `None` to event_loop::run call sites
 
-- [ ] **Step 5.1: Write a failing integration-style test for the event_loop arm**
+This is mechanical wiring. No new tests in this task — coverage lives in Task 12's end-to-end integration test.
 
-Skip this step. The select-arm wiring is integration-shaped and exercising it in isolation requires standing up a fake `NodeRuntime`, which is too much fixture for a single test. Coverage lands in Task 12's end-to-end integration test. **Exception to the TDD-first rule, justified by fixture cost.** Implementer skips straight to wiring + manual smoke verification, then Task 12's integration test exercises it.
+- [ ] **Step 7.1: Add the mpsc channel parameter to event_loop::run**
 
-- [ ] **Step 5.2: Add the mpsc channel parameter to event_loop::run**
+Edit `src-tauri/src/event_loop.rs:134-162`. Add a new parameter `unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>` after `crdt_state`.
 
-Edit `src-tauri/src/event_loop.rs:134-162`. Add a new parameter `unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>` after `crdt_state` (the same Option-pattern as the existing dm_outbox/dm_transport/crdt_state params introduced in Phase 2):
+- [ ] **Step 7.2: Add the new select arm**
 
-```rust
-pub async fn run<R: Runtime>(
-    // ... existing 22 params ...
-    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
-    dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
-    crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
-    mut unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>,
-) {
-```
-
-- [ ] **Step 5.3: Add the new select arm**
-
-Inside the `tokio::select!` block at `event_loop.rs:584` (the main loop), after the existing `Some(op) = cas_op_rx.recv()` arm, add:
+Inside the `tokio::select!` block at `event_loop.rs:584`, after the existing `Some(op) = cas_op_rx.recv()` arm:
 
 ```rust
-// ── ZEB-227: outbound DM unicast → NodeRuntime ────────────────────
-// RuntimeUnicastTransport pushes one UnicastSendRequest per recipient
-// device hash into this channel; we forward each as a
-// RuntimeEvent::SendUnicastToDevice into NodeRuntime, which queues it
-// into pending_unicast_sends and drains in tick() against the path table
-// (see ZEB-226's defer-then-drop semantics).
 Some(req) = async {
     match unicast_send_rx.as_mut() {
         Some(rx) => rx.recv().await,
@@ -997,51 +1550,42 @@ Some(req) = async {
 }
 ```
 
-The `async { match ... pending().await }` shim is the same pattern Phase 2 uses for any Optional channel inside `select!` — when `None`, the future never resolves, so the arm is effectively skipped.
+Same pattern as the existing optional channels.
 
-- [ ] **Step 5.4: Update event_loop::run callers**
-
-`event_loop::run` is called in three places (per Phase 2's wiring): one in `lib.rs`'s `start_node` and two in test files (`tests/content_index_integration.rs` and `tests/folder_primitive_integration.rs`). Each call site needs `None` (or `Some(channel)` for the production path) appended.
-
-Find them:
+- [ ] **Step 7.3: Update the three event_loop::run callers**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
 grep -nE "event_loop::run\b" src-tauri/src/lib.rs src-tauri/tests/*.rs
 ```
 
-Expected: 3 hits. For the two test files, append `None` as the final argument. For `lib.rs`, defer the production wiring to Step 5.6 (after constructing the channel).
+Test files: append `None` to each call site. Production caller in `lib.rs`: pass `Some(unicast_send_rx)` — wire its construction in the next step.
 
-- [ ] **Step 5.5: Add `None` to test call sites**
+- [ ] **Step 7.4: Construct the channel in lib.rs and lift to NodeState**
 
-Edit both `src-tauri/tests/content_index_integration.rs` and `src-tauri/tests/folder_primitive_integration.rs` — append `None` (with a brief inline comment `// unicast_send_rx — DM transport not exercised in this test`) to each `event_loop::run(...)` invocation.
-
-- [ ] **Step 5.6: Construct the channel in lib.rs and thread it through**
-
-In `src-tauri/src/lib.rs` near the existing `cas_op_tx, cas_op_rx` construction (search for `cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel`, around line 572):
+Near `cas_op_tx, cas_op_rx` construction (~line 572):
 
 ```rust
 let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
-// ZEB-227: outbound DM unicast channel. Sized at 64 to accommodate group-DM
-// fan-out (16 members × 4 devices = 64 worst-case dispatches per send_dm).
-let (unicast_send_tx, unicast_send_rx) = tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(64);
+// ZEB-227: outbound DM unicast channel. Sized at 64 to accommodate
+// group-DM fan-out (16 members × 4 devices = 64 worst-case).
+let (unicast_send_tx, unicast_send_rx) =
+    tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(64);
 ```
 
-Pass `unicast_send_tx` to `RuntimeUnicastTransport::new` (in Task 9 — for now, it's unused but constructed). Pass `Some(unicast_send_rx)` to `event_loop::run` at the existing call site.
+Add to `NodeState`:
 
-You'll also need to lift `unicast_send_tx` to NodeState (so `send_dm` IPC's RuntimeUnicastTransport instantiation in Task 9 can reach it), and clear it in `stop_inner` and the restart path. Mirror the Phase 2 pattern for `dm_outbox`/`dm_transport`/`crdt_state` (`lib.rs:191-220`, `lib.rs:404-490`, `lib.rs:634-690`).
-
-NodeState additions:
 ```rust
 struct NodeState {
     // ... existing ...
-    /// Phase 3b: outbound unicast channel. RuntimeUnicastTransport pushes
-    /// here; event_loop drains and forwards to NodeRuntime.
     unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
 }
 ```
 
-- [ ] **Step 5.7: Verification gates**
+Update `stop_inner` and the restart path to take + drop this field. Mirror the Phase 2 pattern for `dm_outbox` / `dm_transport` / `crdt_state`.
+
+Pass `Some(unicast_send_rx)` to `event_loop::run`.
+
+- [ ] **Step 7.5: Verification gates + commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -1049,558 +1593,333 @@ set -o pipefail
 cargo fmt --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-```
 
-Expected: all green. The new arm has no consumers yet, so behavior is unchanged.
-
-- [ ] **Step 5.8: Commit**
-
-```bash
 git add src-tauri/src/event_loop.rs src-tauri/src/lib.rs \
         src-tauri/tests/content_index_integration.rs \
         src-tauri/tests/folder_primitive_integration.rs
 git commit -m "$(cat <<'EOF'
 feat(zeb-227): wire outbound RuntimeEvent::SendUnicastToDevice channel
 
-Adds the second leg of Phase 3b's outbound DM path:
-- New mpsc channel `unicast_send_tx/rx` (capacity 64 — group-DM fan-out
-  worst case is 16 members × 4 devices) constructed in start_node.
-- New tokio::select! arm in event_loop drains the receiver and forwards
-  each UnicastSendRequest into NodeRuntime as
-  RuntimeEvent::SendUnicastToDevice; the runtime queues it in
-  pending_unicast_sends and resolves on next tick against the path table
-  (per ZEB-226's defer-then-drop semantics).
-- NodeState gains an unicast_send_tx field so send_dm IPC (Task 9) can
-  instantiate RuntimeUnicastTransport on-demand. Stopped + restart
-  cleanup mirrors the Phase 2 dm_outbox/dm_transport/crdt_state pattern.
+New mpsc channel unicast_send_tx/rx (capacity 64 — group-DM fan-out
+worst case is 16 members × 4 devices) constructed in start_node. New
+tokio::select! arm in event_loop drains the receiver and forwards each
+UnicastSendRequest into NodeRuntime as RuntimeEvent::SendUnicastToDevice.
+The runtime queues it in pending_unicast_sends and resolves on next
+tick against the path table (per ZEB-226's defer-then-drop semantics).
+
+NodeState gains an unicast_send_tx field so RuntimeUnicastTransport
+(Task 11) can be instantiated holding a clone of the sender. Stop +
+restart cleanup mirrors the Phase 2 dm_outbox/dm_transport/crdt_state
+pattern.
 
 Test call sites (content_index_integration.rs, folder_primitive_integration.rs)
-get `None` appended to event_loop::run — they don't exercise DM transport.
+get `None` appended to event_loop::run.
 
-The arm has no producers yet (Task 9 wires up RuntimeUnicastTransport).
+The arm has no producers yet — Task 11 wires up RuntimeUnicastTransport.
 EOF
 )"
 ```
 
 ---
 
-### Task 6: Wire inbound `RuntimeAction::UnicastReceived` interception
+### Task 8: `handle_unicast` skeleton + `resolve_signed_origin_owner` + `lookup_pubkey_for_device`
 
 **Files:**
-- Modify: `src-tauri/src/event_loop.rs` (intercept UnicastReceived before dispatch_action at the three `for action in runtime.tick()` sites)
-- Modify: `src-tauri/src/dm_outbox.rs` (add a stub `handle_unicast` skeleton that just decodes + dispatches; full handlers in Tasks 7-9)
-- Test: a unit test that the interception path correctly decodes a packet
+- Modify: `src-tauri/src/dm_outbox.rs` — add helpers + handle_unicast skeleton (placeholder bodies for handle_invite/handle_cidnotify/handle_ack)
 
-- [ ] **Step 6.1: Write a failing test for handle_unicast packet dispatch**
-
-Add to the dm_outbox test module:
+- [ ] **Step 8.1: Write failing tests**
 
 ```rust
+#[test]
+fn resolve_signed_origin_owner_single_match_returns_ok() { /* like Path A's test */ }
+
+#[test]
+fn resolve_signed_origin_owner_no_matches_is_unknown_signing_device() { /* like Path A */ }
+
+#[test]
+fn resolve_signed_origin_owner_multiple_matches_is_ambiguous() { /* like Path A */ }
+
 #[tokio::test]
 async fn handle_unicast_invalid_packet_returns_decode_error() {
     use crate::owner_state_crdt::OwnerState;
-
     let mut state = OwnerState::default();
     let mut outbox = DmOutbox::new("device".into(), OwnerAddr([0xff; 16]));
     let cas = crate::content_store::InMemoryStub::default();
     let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
 
-    let bogus_packet = vec![0xff, 0xa0]; // invalid discriminant
+    let bogus = vec![0xff, 0xa0]; // invalid discriminant
     let err = outbox.handle_unicast(
-        &mut state,
-        &cas,
-        &tx,
-        Some([0xa1; 16]),
-        bogus_packet,
-        100, // wall_now_ms
+        &mut state, &cas, &tx, bogus, 100,
     ).await.unwrap_err();
     assert!(matches!(err, DmReceiveError::Decode(_)));
 }
-
-#[tokio::test]
-async fn handle_unicast_no_source_drops_packet() {
-    // Phase 3b's harmony companion PR populates source from link state
-    // when an established Link exists. None should be unreachable for
-    // valid DM traffic (every DM packet rides a Link), but defensive
-    // handling: drop with telemetry, never fall through to
-    // resolve_link_origin_owner with a fabricated identity.
-    use crate::owner_state_crdt::OwnerState;
-
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([0xff; 16]));
-    let cas = crate::content_store::InMemoryStub::default();
-    let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
-
-    let packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Ack(
-        crate::dm_envelope::DmAck {
-            space_id: SpaceId([1; 16]),
-            message_cid: ContentId::from_bytes([0xee; 32]),
-            ack_from_owner_addr: OwnerAddr([2; 16]),
-            ack_from_devices: vec![DeviceIdentityHash([7; 16])],
-        },
-    )).unwrap();
-
-    let err = outbox.handle_unicast(
-        &mut state,
-        &cas,
-        &tx,
-        None,  // source unknown
-        packet,
-        100,
-    ).await.unwrap_err();
-    assert!(matches!(err, DmReceiveError::UnknownLinkOrigin));
-}
 ```
 
-- [ ] **Step 6.2: Run tests to verify they fail**
+Note: `handle_unicast`'s signature in Path B is *simpler* than Path A — no `source: Option<[u8;16]>` parameter. The signing device hash comes from the packet body itself (after signature verification).
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_unicast_invalid_packet handle_unicast_no_source 2>&1 | tail -20
-```
+- [ ] **Step 8.2: Run tests to verify they fail**
 
-Expected: FAIL — `handle_unicast` symbol does not exist.
-
-- [ ] **Step 6.3: Implement handle_unicast skeleton (decode + dispatch only)**
-
-In `src-tauri/src/dm_outbox.rs`, add:
+- [ ] **Step 8.3: Implement helpers + handle_unicast skeleton**
 
 ```rust
+pub(crate) fn resolve_signed_origin_owner(
+    cache: &OwnerDeviceCache,
+    signing_device_hash: DeviceIdentityHash,
+) -> Result<OwnerAddr, DmReceiveError> {
+    let matches: Vec<OwnerAddr> = cache.devices.iter()
+        .filter(|(_, entry)| entry.devices.binary_search(&signing_device_hash).is_ok())
+        .map(|(addr, _)| *addr)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(DmReceiveError::UnknownSigningDevice),
+        _ => Err(DmReceiveError::AmbiguousSigningDevice),
+    }
+}
+
+/// Look up the cached Ed25519 verifying key for a known device. Reads
+/// from OwnerDeviceCache via the parallel-vec correspondence between
+/// `devices[i]` and `device_signing_pubs[i]`.
+///
+/// Returns Some(pubkey) only if the device hash is in the cache AND
+/// the cache has a pubkey at the corresponding index. Returns None
+/// for either: device unknown, or device known but pubkey not yet
+/// cached (pre-bootstrap state — handler treats as UnknownSigningKey).
+pub(crate) fn lookup_pubkey_for_device(
+    cache: &OwnerDeviceCache,
+    signing_device_hash: DeviceIdentityHash,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    for entry in cache.devices.values() {
+        if let Ok(idx) = entry.devices.binary_search(&signing_device_hash) {
+            if idx < entry.device_signing_pubs.len() {
+                return ed25519_dalek::VerifyingKey::from_bytes(&entry.device_signing_pubs[idx]).ok();
+            }
+            return None;  // device present but no pubkey cached
+        }
+    }
+    None
+}
+
 impl DmOutbox {
-    /// Inbound DM packet entry point. Decodes, dispatches by discriminant,
-    /// runs link-origin-binding sanity checks. Per ZEB-216 §"Link-origin
-    /// binding rule", every dispatched arm uses the resolved owner from
-    /// `from_identity_hash`, never a payload-controlled owner field.
-    ///
-    /// `source = None` is unreachable for valid DM traffic (DMs ride
-    /// established Reticulum Links; the link handshake binds the remote
-    /// identity). Defensive drop with telemetry — never fabricate an
-    /// identity to make the resolver succeed.
-    ///
-    /// Returns `DrainOutcome` to convey newly_delivered / newly_expired
-    /// to the caller, who emits IPC events (mirrors `drain`'s shape).
+    /// Inbound DM packet entry point. Decodes, verifies signature,
+    /// dispatches by discriminant. Per spec §"Application-signature
+    /// binding rule", every dispatched arm uses the verified
+    /// signing_device_hash from the packet body (NOT a payload-controlled
+    /// owner field).
     pub async fn handle_unicast(
         &mut self,
         state: &mut OwnerState,
         cas: &dyn ContentStore,
         unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        source: Option<[u8; 16]>,
         packet_bytes: Vec<u8>,
         wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
         let packet = crate::dm_envelope::decode_packet(&packet_bytes)
             .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
 
-        let from_identity_hash = match source {
-            Some(h) => DeviceIdentityHash(h),
-            None => {
-                tracing::warn!("dropped DM packet with unknown link source");
-                return Err(DmReceiveError::UnknownLinkOrigin);
-            }
-        };
-
         match packet {
-            crate::dm_envelope::DmPacket::Invite(invite) => {
-                self.handle_invite(state, invite, from_identity_hash, wall_now_ms).await
+            crate::dm_envelope::DmPacket::Invite { signed, signature, signed_bytes } => {
+                self.handle_invite(state, signed, signature, &signed_bytes, wall_now_ms).await
             }
-            crate::dm_envelope::DmPacket::CidNotify(notify) => {
-                self.handle_cidnotify(state, cas, unicast_send_tx, notify, from_identity_hash, wall_now_ms).await
+            crate::dm_envelope::DmPacket::CidNotify { signed, signature, signed_bytes } => {
+                self.handle_cidnotify(state, cas, unicast_send_tx, signed, signature, &signed_bytes, wall_now_ms).await
             }
-            crate::dm_envelope::DmPacket::Ack(ack) => {
-                self.handle_ack(state, ack, from_identity_hash, wall_now_ms).await
+            crate::dm_envelope::DmPacket::Ack { signed, signature, signed_bytes } => {
+                self.handle_ack(state, signed, signature, &signed_bytes, wall_now_ms).await
             }
         }
     }
 
-    /// STUB — Task 7 implements
     pub async fn handle_invite(
         &mut self,
         _state: &mut OwnerState,
-        _invite: crate::dm_envelope::DmInvite,
-        _from_identity_hash: DeviceIdentityHash,
+        _signed: crate::dm_envelope::DmInviteSigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
         _wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        unimplemented!("Task 7")
+        Err(DmReceiveError::Decode("Task 9 implements handle_invite".into()))
     }
 
-    /// STUB — Task 8 implements
     pub async fn handle_cidnotify(
         &mut self,
         _state: &mut OwnerState,
         _cas: &dyn ContentStore,
         _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        _notify: crate::dm_envelope::DmCidNotify,
-        _from_identity_hash: DeviceIdentityHash,
+        _signed: crate::dm_envelope::DmCidNotifySigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
         _wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        unimplemented!("Task 8")
+        Err(DmReceiveError::Decode("Task 10 implements handle_cidnotify".into()))
     }
 
-    // handle_ack already exists from Phase 2; Task 9 will widen its signature
-    // to accept the link-origin-resolved identity. For now:
-    pub async fn handle_ack_phase3b_stub(
+    pub async fn handle_ack(
         &mut self,
         _state: &mut OwnerState,
-        _ack: crate::dm_envelope::DmAck,
-        _from_identity_hash: DeviceIdentityHash,
+        _signed: crate::dm_envelope::DmAckSigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
         _wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        unimplemented!("Task 9 — replaces existing Phase 2 handle_ack signature")
+        Err(DmReceiveError::Decode("Task 11 implements handle_ack".into()))
     }
 }
 ```
 
-(The bogus-packet test should pass once `decode_packet` returns Err; the no-source test should pass once the `None` arm returns `UnknownLinkOrigin`.)
-
-- [ ] **Step 6.4: Run tests to verify they pass**
+- [ ] **Step 8.4: Run tests to verify they pass + verification gates + commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
 set -o pipefail
-cargo test handle_unicast_invalid_packet handle_unicast_no_source 2>&1 | tail -10
-```
+cargo test resolve_signed_origin_owner handle_unicast_invalid 2>&1 | tail -10
 
-Expected: PASS.
-
-- [ ] **Step 6.5: Wire interception in event_loop runtime.tick() loops**
-
-There are three sites in `src-tauri/src/event_loop.rs` where `runtime.tick()` is consumed (per the grep at the start of plan-writing — line 871, line 898, line 1137). Each loops `for action in runtime.tick()` and calls `dispatch_action(action, ...)`. Phase 3b adds an interception:
-
-```rust
-for action in runtime.tick() {
-    // ZEB-227: intercept inbound DM packets before dispatch_action.
-    // RuntimeAction::UnicastReceived is not in dispatch_action's switch
-    // (the catch-all _ => {} arm at the bottom would silently drop it).
-    if let RuntimeAction::UnicastReceived { destination_hash: _, source, packet } = &action {
-        if let (Some(outbox), Some(state), Some(unicast_send_tx)) =
-            (dm_outbox.as_ref(), crdt_state.as_ref(), unicast_send_tx_for_loop.as_ref())
-        {
-            // Same try_lock + skip-this-tick pattern as the dm_outbox drain
-            // block in the timer arm. send_dm IPC may hold these locks.
-            let outbox_try = outbox.try_lock();
-            let state_try = state.try_lock();
-            match (outbox_try, state_try) {
-                (Ok(mut outbox_g), Ok(mut state_g)) => {
-                    let wall_now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let result = outbox_g.handle_unicast(
-                        &mut state_g,
-                        // CAS — same Arc as send_dm uses; pulled from NodeState in lib.rs
-                        // and wired into event_loop::run as a new param (do this in Task 9).
-                        unimplemented_cas_handle,
-                        unicast_send_tx,
-                        *source,
-                        packet.clone(),
-                        wall_now_ms,
-                    ).await;
-                    drop(state_g);
-                    drop(outbox_g);
-                    match result {
-                        Ok(outcome) => {
-                            for (entry_id, recipient) in outcome.newly_delivered {
-                                let _ = app.emit("dm-delivered", serde_json::json!({
-                                    "messageId": hex::encode(entry_id.0),
-                                    "recipient": hex::encode(recipient.0),
-                                }));
-                            }
-                            for entry_id in outcome.newly_expired {
-                                let _ = app.emit("dm-expired", serde_json::json!({
-                                    "messageId": hex::encode(entry_id.0),
-                                }));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "handle_unicast dropped packet");
-                        }
-                    }
-                }
-                _ => {
-                    tracing::debug!("handle_unicast skipped this tick (locks contended); packet dropped");
-                    // NOTE: Unlike drain (which can retry on the next tick), the
-                    // packet is in our hand right now — dropping it loses the
-                    // event. Phase 3b ships with this behavior; a follow-up
-                    // ticket can investigate buffering. See ZEB-? (filed at
-                    // PR creation in Task 12).
-                }
-            }
-            continue; // Don't fall through to dispatch_action for this action.
-        }
-        // Falls through if dm_outbox isn't initialized — packet drops in dispatch_action's catch-all.
-    }
-    dispatch_action(action, /* ...existing args... */).await;
-}
-```
-
-The `unimplemented_cas_handle` placeholder — Task 9 wires the real CAS handle into `event_loop::run`'s parameter list. For Task 6, the cleanest approach: skip the inbound interception arm entirely if Task 6's `handle_unicast` requires CAS (it does, transitively through `handle_cidnotify`). Solution:
-
-**Refactor Step 6.5:** instead of plumbing the CAS handle in Task 6, keep Task 6 strictly to the wiring pattern with a TODO comment that Task 9 fills in. The interception block stays, but the inner call to `handle_unicast` is left as `unimplemented!("Task 9 wires cas")`. This may cause clippy warnings about unused variables — gate the interception block behind `#[cfg(any())]` / `if false` for Task 6, OR move the wiring entirely into Task 9.
-
-**Decision:** roll wiring of the inbound interception into Task 9 (where the CAS handle plumbing happens anyway). Task 6 ships only the `dm_outbox::handle_unicast` skeleton + the unit tests for decode + None-source drops. The event_loop interception is deferred to Task 9.
-
-Update Task 6's scope to drop Step 6.5 (and 6.6/6.7 collapse into just the gates + commit).
-
-- [ ] **Step 6.5 (revised): Verification gates**
-
-```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
 set -o pipefail
 cargo fmt --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-```
 
-Expected: all green. The skeleton's `unimplemented!()` arms are unreachable through the public API (no caller invokes them yet — Task 9 wires the event_loop side).
-
-If clippy complains about the unreachable code in `handle_invite` / `handle_cidnotify` / `handle_ack_phase3b_stub` (each is `unimplemented!()`), use `#[allow(clippy::unimplemented)]` at the function level OR add a `#[cfg(test)]` gate so they only exist for the test that exercises decode + None-source. Prefer the cfg(test) approach so the symbols don't ship as production-reachable stubs.
-
-Actually, the cleanest path: don't ship stubs at all. Implement minimal real bodies that just return `Err(DmReceiveError::Decode("not yet implemented"))` so clippy / tests see a finite function. Tasks 7-9 replace the bodies. The decode + None-source tests still pass without exercising the unimplemented arms.
-
-- [ ] **Step 6.6: Commit**
-
-```bash
 git add src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): add handle_unicast skeleton + decode dispatch
+feat(zeb-227): handle_unicast skeleton + resolve_signed_origin_owner
 
 Phase 3b's inbound DM entry point. Decodes the wire bytes into a
-DmPacket discriminant, runs the source presence check (None drops with
-telemetry per spec — DMs MUST ride established Links), and dispatches
-to handle_invite / handle_cidnotify / handle_ack by variant.
+DmPacket discriminant + signed body + signature + signed_bytes, then
+dispatches to handle_invite / handle_cidnotify / handle_ack by variant.
 
-The three downstream handlers ship as minimal placeholder bodies that
-return DmReceiveError::Decode("not yet implemented") — Tasks 7-9 fill
-them in. This is enough surface for the decode + None-source unit tests
-to exercise the dispatch path; full coverage lands in Tasks 7-9.
+The Path B signature verification happens INSIDE each handler (not
+in handle_unicast) because the pubkey-lookup strategy differs by
+discriminant: DmInvite uses the inline inviter_signing_pub field;
+CidNotify / Ack use lookup_pubkey_for_device against OwnerDeviceCache.
+Centralizing verification in handle_unicast would force a generic
+"first try inline pubkey, fallback to cache lookup" pattern that's
+less expressive than per-discriminant handling.
 
-The event_loop interception that calls handle_unicast is deferred to
-Task 9 — it needs the CAS handle threading that handle_cidnotify
-introduces.
+Two helpers added:
+- resolve_signed_origin_owner(cache, hash) -> Result<OwnerAddr> —
+  same shape as Path A's resolve_link_origin_owner: single match Ok,
+  zero match UnknownSigningDevice, multi-match AmbiguousSigningDevice
+  (cache-poisoning regression).
+- lookup_pubkey_for_device(cache, hash) -> Option<VerifyingKey> —
+  reads OwnerDeviceCache's parallel-vec correspondence between
+  devices[i] and device_signing_pubs[i]. Returns None if device
+  unknown OR device present but pubkey not yet cached (pre-bootstrap).
+
+The three handler stubs ship as Err("Task N implements") placeholders;
+Tasks 9-11 fill them in.
 EOF
 )"
 ```
 
 ---
 
-### Task 7: Implement `handle_invite` (auto-accept on valid; sanity gates per spec)
+### Task 9: `handle_invite` — signature verification + sanity gates + auto-accept
 
 **Files:**
-- Modify: `src-tauri/src/dm_outbox.rs` (replace handle_invite stub with real body)
-- Test: `src-tauri/src/dm_outbox.rs` test module — covers spec tests `handle_unicast_invite_creates_space`, `handle_unicast_invite_binds_inviter_field_not_members_zero`, `handle_unicast_invite_inviter_not_in_members_drops`, `handle_unicast_invite_sender_device_not_in_sender_devices_drops`, `handle_unicast_invite_receiver_not_in_members_drops`
+- Modify: `src-tauri/src/dm_outbox.rs` — replace handle_invite stub with real body + 5+ tests
 
-**Scope decision:** Phase 3b auto-accepts every invite that passes the sanity gates. The `handle_unicast_invite_decline_writes_no_state` spec test is reframed: in Phase 3b without UI, "decline" is the structural-validity drop path (already covered by the three drop tests below). The user-driven decline UX (modal + accept/decline IPC) is deferred to Phase 4 alongside the rest of the DM UI surface, with a follow-up Linear ticket filed at Task 12.
+Per spec scope decision: Phase 3b auto-accepts; user-driven decline UX deferred to Phase 4.
 
-- [ ] **Step 7.1: Write failing tests for handle_invite happy + drop paths**
+- [ ] **Step 9.1: Write failing tests for handle_invite**
 
-Add to the dm_outbox test module:
+Five tests covering:
+- Happy path: writes Space + cache + cached pubkey
+- Inviter ≠ members[0] (lex-largest-inviter regression)
+- inviter ∉ members → InviterNotInMembers
+- signing_device_hash ∉ sender_devices → SigningDeviceNotInSenderDevices
+- self_owner ∉ members → ReceiverNotInMembers
+- Tampered body / forged signature → SignatureVerificationFailed
 
-```rust
-#[tokio::test]
-async fn handle_invite_writes_space_and_owner_device_cache_entry() {
-    // ZEB-216 spec test: handle_unicast_invite_creates_space
-    use crate::owner_state_crdt::OwnerState;
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+The happy path test must:
+1. Build a real signed invite via `build_signed_invite`
+2. Verify after `handle_invite` runs: `state.spaces` has the new Space, `state.owner_device_cache.devices.get(&inviter_addr).device_signing_pubs[0] == inviter_signing_pub`
 
-    let invite = crate::dm_envelope::DmInvite {
-        space_id: SpaceId([7; 16]),
-        kind: SpaceKind::Dm,
-        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-        inviter: OwnerAddr([1; 16]),
-        content_key: DmContentKey::new([0xaa; 32]),
-        sender_devices: vec![DeviceIdentityHash([0xa1; 16])],
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "alice".into() },
-    };
-    let from_identity_hash = DeviceIdentityHash([0xa1; 16]);
+- [ ] **Step 9.2: Run tests to verify they fail**
 
-    outbox.handle_invite(&mut state, invite, from_identity_hash, 200).await.unwrap();
-
-    // Space written.
-    assert!(state.spaces.contains_key(&SpaceId([7; 16])));
-    let space = state.spaces.get(&SpaceId([7; 16])).unwrap();
-    assert_eq!(space.kind, SpaceKind::Dm);
-    assert!(space.content_key.is_some());
-
-    // OwnerDeviceCache updated under invite.inviter (NOT members[0]).
-    assert!(state.owner_device_cache.devices.contains_key(&OwnerAddr([1; 16])));
-}
-
-#[tokio::test]
-async fn handle_invite_binds_inviter_field_not_members_zero() {
-    // ZEB-216 spec test: handle_unicast_invite_binds_inviter_field_not_members_zero
-    // Group-DM where invite.inviter is the lex-LARGEST member (so members[0]
-    // is a different OwnerAddr). Cache entry must be created under
-    // invite.inviter, NOT members[0].
-    use crate::owner_state_crdt::OwnerState;
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
-
-    let inviter_addr = OwnerAddr([0xff; 16]);  // lex-largest
-    let invite = crate::dm_envelope::DmInvite {
-        space_id: SpaceId([7; 16]),
-        kind: SpaceKind::GroupDm,
-        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), inviter_addr],
-        inviter: inviter_addr,
-        content_key: DmContentKey::new([0xaa; 32]),
-        sender_devices: vec![DeviceIdentityHash([0xa1; 16])],
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "alice".into() },
-    };
-    let from_identity_hash = DeviceIdentityHash([0xa1; 16]);
-
-    outbox.handle_invite(&mut state, invite, from_identity_hash, 200).await.unwrap();
-
-    // Cache entry under inviter_addr, NOT members[0] (which is OwnerAddr([1; 16])).
-    assert!(state.owner_device_cache.devices.contains_key(&inviter_addr));
-    assert!(!state.owner_device_cache.devices.contains_key(&OwnerAddr([1; 16])));
-}
-
-#[tokio::test]
-async fn handle_invite_inviter_not_in_members_drops() {
-    // ZEB-216 spec test: handle_unicast_invite_inviter_not_in_members_drops
-    use crate::owner_state_crdt::OwnerState;
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
-
-    let invite = crate::dm_envelope::DmInvite {
-        space_id: SpaceId([7; 16]),
-        kind: SpaceKind::Dm,
-        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-        inviter: OwnerAddr([3; 16]),  // NOT in members
-        content_key: DmContentKey::new([0xaa; 32]),
-        sender_devices: vec![DeviceIdentityHash([0xa1; 16])],
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "alice".into() },
-    };
-    let err = outbox.handle_invite(&mut state, invite, DeviceIdentityHash([0xa1; 16]), 200).await.unwrap_err();
-    assert!(matches!(err, DmReceiveError::InviterNotInMembers));
-    assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
-    assert!(state.owner_device_cache.devices.is_empty());
-}
-
-#[tokio::test]
-async fn handle_invite_sender_device_not_in_sender_devices_drops() {
-    // ZEB-216 spec test: handle_unicast_invite_sender_device_not_in_sender_devices_drops
-    use crate::owner_state_crdt::OwnerState;
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
-
-    let invite = crate::dm_envelope::DmInvite {
-        space_id: SpaceId([7; 16]),
-        kind: SpaceKind::Dm,
-        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
-        inviter: OwnerAddr([1; 16]),
-        content_key: DmContentKey::new([0xaa; 32]),
-        sender_devices: vec![DeviceIdentityHash([0xa1; 16])],  // does NOT include from_identity_hash
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "alice".into() },
-    };
-    let err = outbox.handle_invite(
-        &mut state,
-        invite,
-        DeviceIdentityHash([0xff; 16]),  // not in sender_devices
-        200,
-    ).await.unwrap_err();
-    assert!(matches!(err, DmReceiveError::SenderDeviceNotInSenderDevices));
-    assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
-}
-
-#[tokio::test]
-async fn handle_invite_receiver_not_in_members_drops() {
-    // ZEB-216 spec test: handle_unicast_invite_receiver_not_in_members_drops
-    use crate::owner_state_crdt::OwnerState;
-    let mut state = OwnerState::default();
-    let mut outbox = DmOutbox::new("device".into(), OwnerAddr([99; 16]));  // NOT in invite.members
-
-    let invite = crate::dm_envelope::DmInvite {
-        space_id: SpaceId([7; 16]),
-        kind: SpaceKind::Dm,
-        members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],  // self_owner not here
-        inviter: OwnerAddr([1; 16]),
-        content_key: DmContentKey::new([0xaa; 32]),
-        sender_devices: vec![DeviceIdentityHash([0xa1; 16])],
-        created_at: Hlc { wall_ms: 100, logical: 0, device_id: "alice".into() },
-    };
-    let err = outbox.handle_invite(&mut state, invite, DeviceIdentityHash([0xa1; 16]), 200).await.unwrap_err();
-    assert!(matches!(err, DmReceiveError::ReceiverNotInMembers));
-    assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
-}
-```
-
-- [ ] **Step 7.2: Run tests to verify they fail**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_invite_ 2>&1 | tail -25
-```
-
-Expected: FAIL — handle_invite is the placeholder body returning `DmReceiveError::Decode("not yet implemented")`.
-
-- [ ] **Step 7.3: Implement handle_invite real body**
-
-Replace the stub body in `src-tauri/src/dm_outbox.rs`:
+- [ ] **Step 9.3: Implement handle_invite**
 
 ```rust
 pub async fn handle_invite(
     &mut self,
     state: &mut OwnerState,
-    invite: crate::dm_envelope::DmInvite,
-    from_identity_hash: DeviceIdentityHash,
-    _wall_now_ms: u64,  // reserved for future use
+    signed: crate::dm_envelope::DmInviteSigned,
+    signature: [u8; 64],
+    signed_bytes: &[u8],
+    _wall_now_ms: u64,
 ) -> Result<DrainOutcome, DmReceiveError> {
-    // Sanity gate 1: inviter must be in members.
-    if !invite.members.contains(&invite.inviter) {
-        tracing::warn!("dropped DmInvite: inviter not in members");
+    // Sanity gate 1: inviter ∈ members
+    if !signed.members.contains(&signed.inviter) {
         return Err(DmReceiveError::InviterNotInMembers);
     }
-    // Sanity gate 2: from_identity_hash must be in sender_devices.
-    // Note: the wire decoder doesn't enforce sort on DmInvite.sender_devices
-    // (unlike OwnerDeviceEntry.devices, which is invariant-checked at
-    // deserialize); use linear .contains() rather than binary_search to
-    // avoid a silent "not present, but binary_search lied" path.
-    if !invite.sender_devices.contains(&from_identity_hash) {
-        tracing::warn!("dropped DmInvite: from_identity_hash not in sender_devices");
-        return Err(DmReceiveError::SenderDeviceNotInSenderDevices);
+    // Sanity gate 2: signing_device_hash ∈ sender_devices
+    // (decode_packet already enforces this — defense-in-depth)
+    if !signed.sender_devices.contains(&signed.signing_device_hash) {
+        return Err(DmReceiveError::SigningDeviceNotInSenderDevices);
     }
-    // Sanity gate 3: receiver (us) must be in members.
-    if !invite.members.contains(&self.self_owner) {
-        tracing::warn!("dropped DmInvite: self_owner_addr not in members");
+    // Sanity gate 3: self_owner ∈ members
+    if !signed.members.contains(&self.self_owner) {
         return Err(DmReceiveError::ReceiverNotInMembers);
     }
+    // Verify signature using inline inviter_signing_pub.
+    let signing_pub = ed25519_dalek::VerifyingKey::from_bytes(&signed.inviter_signing_pub)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        &signature,
+        &signing_pub,
+        signed.signing_device_hash,
+    )?;
 
-    // Phase 3b auto-accept: write the Space and update OwnerDeviceCache.
-    // Phase 4 will replace this with a stage-pending-invite + UI prompt
-    // path (see follow-up Linear ticket — filed at Task 12).
+    // Phase 3b auto-accept: write Space + cache + cached pubkey.
+    // (Phase 4 replaces with stage-pending-invite + UI prompt path.)
 
-    // OwnerDeviceCache update keyed by invite.inviter (NOT members[0]).
+    // Pubkey list is parallel to sender_devices; we know the inviter's
+    // signing pubkey for the device that signed THIS invite. For the
+    // other devices in sender_devices we have no pubkeys yet — they
+    // remain pre-bootstrap until the next invite-equivalent flow.
+    // Build a parallel vec of length sender_devices.len() with the
+    // signing pubkey at the correct index, [0u8; 32] elsewhere.
+    // (lookup_pubkey_for_device treats [0u8; 32] as "no pubkey cached"
+    // because it parses to the all-zeros point which fails validation —
+    // wait, ed25519_dalek::VerifyingKey::from_bytes accepts arbitrary
+    // 32-byte values; we need a sentinel. Use Option<[u8; 32]> in the
+    // OwnerDeviceEntry instead — implementer adjusts Task 4's design
+    // here if not already done.)
+    // SCOPE NOTE: revisit Task 4's representation if needed: Option<[u8; 32]>
+    // is more honest than [u8; 32] sentinel. Implementer decides.
+    let mut device_signing_pubs: Vec<[u8; 32]> = vec![[0u8; 32]; signed.sender_devices.len()];
+    let signer_idx = signed.sender_devices.iter()
+        .position(|d| *d == signed.signing_device_hash)
+        .expect("sanity gate 2 already verified this");
+    device_signing_pubs[signer_idx] = signed.inviter_signing_pub;
+
     let cache_outcome = state.apply_owner_device_update(
-        invite.inviter,
-        invite.sender_devices.clone(),
-        invite.created_at.clone(),
+        signed.inviter,
+        signed.sender_devices.clone(),
+        device_signing_pubs,
+        signed.created_at.clone(),
     );
     if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
         return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
     }
 
-    // Build the Space from the invite. Mirrors the wire-side fields that
-    // dm_crypto::compute_aad will hash into the dedupe_key. The transport
-    // binding is Reticulum (DM kinds always are).
     let space = crate::owner_state_types::Space {
-        id: invite.space_id,
-        kind: invite.kind,
+        id: signed.space_id,
+        kind: signed.kind,
         parent: None,
         community_id: None,
-        name: format!("DM with {:?}", invite.inviter),
+        name: format!("DM with {:?}", signed.inviter),
         transport: Some(crate::owner_state_types::TransportBinding::Reticulum {
-            participants: invite.members.clone(),
+            participants: signed.members.clone(),
         }),
-        members: invite.members,
+        members: signed.members,
         custom_name: None,
         notification_pref: None,
         left_at: None,
-        created_at: invite.created_at.clone(),
-        updated_at: invite.created_at,
-        content_key: Some(invite.content_key),
+        created_at: signed.created_at.clone(),
+        updated_at: signed.created_at,
+        content_key: Some(signed.content_key),
         prior_content_keys: vec![],
     };
     let space_outcome = state.apply_space_with_canonicalization(space);
@@ -1612,17 +1931,9 @@ pub async fn handle_invite(
 }
 ```
 
-- [ ] **Step 7.4: Run tests to verify they pass**
+**Note on the all-zeros sentinel comment:** if Task 4's representation used `Vec<[u8; 32]>` and the implementer realizes the all-zeros sentinel is fragile (a valid Ed25519 verifying key COULD be all-zeros — the curve allows it, even if cryptographically odd), revisit Task 4 to use `Vec<Option<[u8; 32]>>` instead. Don't ship a brittle sentinel.
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_invite_ 2>&1 | tail -15
-```
-
-Expected: PASS — all five tests.
-
-- [ ] **Step 7.5: Verification gates**
+- [ ] **Step 9.4: Run tests to verify they pass + gates + commit**
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client
@@ -1630,105 +1941,69 @@ set -o pipefail
 cargo fmt --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-```
 
-Expected: all green.
-
-- [ ] **Step 7.6: Commit**
-
-```bash
-git add src-tauri/src/dm_outbox.rs
+git add src-tauri/src/dm_outbox.rs src-tauri/src/owner_state_types.rs src-tauri/src/owner_state_crdt.rs
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): implement handle_invite — sanity gates + auto-accept
+feat(zeb-227): handle_invite — signature verification + sanity gates + auto-accept
 
-Phase 3b's inbound DmInvite handler. Runs the three structural sanity
-gates from ZEB-216 §"Link-origin binding rule":
+Phase 3b's inbound DmInvite handler. Per spec ea38132 §"Application-
+signature binding rule":
 
-1. invite.inviter must be in invite.members
-2. from_identity_hash must be in invite.sender_devices
-3. self_owner_addr must be in invite.members
+1. Sanity gates (cheap, run before signature verification):
+   - inviter ∈ members
+   - signing_device_hash ∈ sender_devices (defense-in-depth; decode_packet
+     also enforces)
+   - self_owner ∈ members
+2. Verify signature using inline inviter_signing_pub (DmInvite is the
+   bootstrap exception — receiver doesn't yet have OwnerDeviceCache
+   entry for the inviter).
+3. Auto-accept (Phase 3b ships no UI; user-driven decline deferred
+   to Phase 4 with follow-up Linear ticket):
+   - apply_owner_device_update with sender_devices + parallel pubkey
+     vec (signing pubkey at signer's index, all-zeros elsewhere — TODO
+     if all-zeros is rejected as not-a-valid-key on lookup, fold into
+     a None sentinel rather than zero bytes).
+   - apply_space_with_canonicalization for the new DM Space.
 
-On all three passing, auto-accepts:
-- apply_owner_device_update(invite.inviter, invite.sender_devices, ...)
-- apply_space_with_canonicalization(Space { from invite })
-
-The cache update is keyed by invite.inviter, NOT members[0]
-(invite.members is sorted lex for canonical CBOR; members[0] is the
-lex-smallest OwnerAddr — NOT the inviter — and binding to it would be
-wrong for any group-DM where the inviter isn't lex-smallest).
-
-Phase 3b ships auto-accept; the user-driven decline UX (modal + IPC)
-is deferred to Phase 4 with a follow-up Linear ticket filed at
-PR-creation time. Until then, structural-validity drops cover the
-"no state written" spec test cases.
-
-Tests added:
-- handle_invite_writes_space_and_owner_device_cache_entry
-- handle_invite_binds_inviter_field_not_members_zero (regression for
-  the lex-vs-inviter binding bug surfaced in spec)
+Five tests added:
+- handle_invite_writes_space_and_cache_with_signing_pub
+- handle_invite_binds_inviter_field_not_members_zero (lex-largest-inviter
+  regression)
 - handle_invite_inviter_not_in_members_drops
-- handle_invite_sender_device_not_in_sender_devices_drops
+- handle_invite_signing_device_not_in_sender_devices_drops
 - handle_invite_receiver_not_in_members_drops
+- handle_invite_tampered_signature_drops
 EOF
 )"
 ```
 
 ---
 
-### Task 8: Implement `handle_cidnotify` (CAS fetch + decrypt + apply_inbox + ack fan-out)
+### Task 10: `handle_cidnotify` — signature verify + CAS fetch + decrypt + inbox + ack fan-out
 
 **Files:**
-- Modify: `src-tauri/src/dm_outbox.rs` (replace handle_cidnotify stub with real body)
-- Test: `src-tauri/src/dm_outbox.rs` test module — covers spec tests `handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write`, `handle_unicast_cidnotify_duplicate_no_dm_received_emit`, `handle_unicast_cidnotify_sender_binding_mismatch_drops`, `handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update`, `handle_unicast_cidnotify_unknown_link_origin_drops`, `handle_unicast_cidnotify_decrypt_failure_uses_prior_keys`
+- Modify: `src-tauri/src/dm_outbox.rs` — replace handle_cidnotify stub with real body + 6+ tests
 
-This is the largest single task — handles CAS fetch, decryption, sender-binding check, inbox write, and DmAck fan-out. Per spec Flow 2 steps 7-13.
+Largest task. Per spec Flow 2 steps 7-13 (with Path B signature verification replacing link-origin binding).
 
-- [ ] **Step 8.1: Write failing test for happy-path cidnotify**
-
-Add a comprehensive happy-path test plus the five drop-path tests. The happy-path test exercises:
-1. CAS pre-seeded with the encrypted blob: compute `message_cid` via `harmony_content::cid::ContentId::for_book(...)` (same call site as `dm_outbox.rs:234`), then `cas.put(message_cid, blob).await` (the trait's caller-provides-cid pattern).
-2. handle_cidnotify is called with the notify
-3. State now has an InboxEntry; the `outcome.newly_delivered` would be empty (sender doesn't get newly_delivered events; that's the recipient's IPC); the function emits via the unicast_send_tx an outbound DmAck for each device in notify.sender_devices
-
-Sketch (the implementer fills in the missing fixtures, mirroring patterns from `dm_send_integration.rs`):
+- [ ] **Step 10.1: Widen DrainOutcome with `newly_received: Vec<InboxEntry>`**
 
 ```rust
-#[tokio::test]
-async fn handle_cidnotify_happy_path_writes_inbox_and_fans_out_ack() {
-    // 1. Set up state with: a DM Space (ck included), an OwnerDeviceCache
-    //    entry mapping Alice's identity_hash to OwnerAddr Alice, our
-    //    self_owner = Bob.
-    // 2. Pre-seed CAS with encrypt_dm_message(...) so CasOp::GetOrFetch
-    //    succeeds.
-    // 3. Call handle_cidnotify with a DmCidNotify whose
-    //    sender_owner_addr = Alice and sender_devices = [Alice's hashes].
-    // 4. Assert: state.inbox now has an InboxEntry under (space_id, message_cid).
-    // 5. Assert: rx (the ack channel) received K UnicastSendRequest entries,
-    //    one per device in notify.sender_devices, each carrying a DmAck.
-    // ... [full body — implementer expands ~80 lines following dm_send_integration.rs patterns]
+pub struct DrainOutcome {
+    pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
+    pub newly_expired: Vec<OutboxEntryId>,
+    /// Phase 3b: InboxEntries written by handle_cidnotify for which
+    /// apply_inbox returned Inserted (not NoOp). Caller emits dm-received
+    /// IPC events from this field.
+    pub newly_received: Vec<crate::owner_state_types::InboxEntry>,
 }
-
-// [Plus 5 drop-path tests per spec — each follows the structural pattern
-// of Task 7's drop tests: build state + invite, call handle_cidnotify,
-// assert specific Err variant + assert no state mutation + assert no
-// outbound packet.]
 ```
 
-The implementer reads `tests/dm_send_integration.rs` and `dm_outbox.rs:send_dm` for the encryption + CAS-write pattern they need to mirror in the test setup.
+Phase 2's `drain` leaves it empty; only `handle_cidnotify` populates it.
 
-- [ ] **Step 8.2: Run tests to verify they fail**
+- [ ] **Step 10.2: Write failing tests** (6+ tests, see spec test list)
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_cidnotify_ 2>&1 | tail -30
-```
-
-Expected: FAIL — handle_cidnotify is still the placeholder.
-
-- [ ] **Step 8.3: Implement handle_cidnotify**
-
-Replace the stub body. The structure mirrors spec Flow 2 steps 7-13:
+- [ ] **Step 10.3: Implement handle_cidnotify**
 
 ```rust
 pub async fn handle_cidnotify(
@@ -1736,282 +2011,48 @@ pub async fn handle_cidnotify(
     state: &mut OwnerState,
     cas: &dyn ContentStore,
     unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
-    notify: crate::dm_envelope::DmCidNotify,
-    from_identity_hash: DeviceIdentityHash,
+    signed: crate::dm_envelope::DmCidNotifySigned,
+    signature: [u8; 64],
+    signed_bytes: &[u8],
     wall_now_ms: u64,
 ) -> Result<DrainOutcome, DmReceiveError> {
-    // Step 7a: resolve link origin to the OwnerAddr that owns from_identity_hash.
-    let resolved_owner = resolve_link_origin_owner(&state.owner_device_cache, from_identity_hash)?;
+    // Step 7a: look up the signing pubkey for signing_device_hash.
+    let signing_pub = lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+        .ok_or(DmReceiveError::UnknownSigningKey)?;
 
-    // Step 7b: verify notify.sender_owner_addr matches resolved owner.
-    if notify.sender_owner_addr != resolved_owner {
-        tracing::warn!("dropped DmCidNotify: notify.sender_owner_addr does not match resolved owner");
+    // Step 7b: verify the signature.
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        &signature,
+        &signing_pub,
+        signed.signing_device_hash,
+    )?;
+
+    // Step 7c: resolve signing_device_hash → OwnerAddr.
+    let resolved_owner = resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+
+    // Step 7d: verify notify.sender_owner_addr matches resolved owner.
+    if signed.sender_owner_addr != resolved_owner {
         return Err(DmReceiveError::OwnerFieldMismatch);
     }
 
-    // Look up the Space for the AAD + content_key. If we're not a member,
-    // no Space exists for us — drop with telemetry.
-    let space = state.spaces.get(&notify.space_id)
-        .ok_or(DmReceiveError::SpaceNotFound)?;
-    let space_clone = space.clone();  // needed because we'll mutate state below
+    // Look up the Space for AAD + content_key.
+    let space_clone = state.spaces.get(&signed.space_id)
+        .ok_or(DmReceiveError::SpaceNotFound)?
+        .clone();
 
     // Step 8: refresh OwnerDeviceCache with notify.sender_devices (LWW HLC-bound).
-    let _ = state.apply_owner_device_update(
-        resolved_owner,  // NOT notify.sender_owner_addr (use resolved per spec)
-        notify.sender_devices.clone(),
-        crate::owner_state_types::Hlc {
-            wall_ms: wall_now_ms,
-            logical: 0,
-            device_id: self.device_id.clone(),
-        },
-    );  // ApplyOutcome ignored — Rejected is acceptable here (stale HLC = our cache is fresher)
-
-    // Step 9: fetch the storage_blob from CAS. The ContentStore trait's `get`
-    // is the entry point — production impl wraps this as a CasOp::GetOrFetch
-    // over the cas_op channel, which the runtime resolves locally then via
-    // Zenoh DAG-sync; the 500ms timeout caps both legs.
-    let blob = match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        cas.get(&notify.message_cid),
-    ).await {
-        Ok(Ok(Some(bytes))) => bytes,
-        Ok(Ok(None)) => return Err(DmReceiveError::CasFetchFailed("blob not found".into())),
-        Ok(Err(e)) => return Err(DmReceiveError::CasFetchFailed(format!("{e:?}"))),
-        Err(_) => return Err(DmReceiveError::CasFetchFailed("500ms fetch timeout".into())),
-    };
-
-    // Step 11: decrypt the blob (current key + prior keys fallback).
-    let aad = crate::dm_crypto::compute_aad(&space_clone)
-        .map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
-    let prior_keys: Vec<DmContentKey> = space_clone.prior_content_keys.clone();
-    let payload = crate::dm_crypto::decrypt_dm_message(
-        space_clone.content_key.as_ref().expect("DM Space MUST have content_key (validate_invariants)"),
-        &prior_keys,
-        &aad,
-        &blob,
-    ).map_err(|_| DmReceiveError::DecryptFailed)?;
-
-    // Step 12: sender-binding check.
-    crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
-        .map_err(|_| DmReceiveError::SenderImpersonation)?;
-
-    // Step 13a: apply_inbox — atomic-emit semantics.
-    let inbox_entry = crate::owner_state_types::InboxEntry {
-        space_id: notify.space_id,
-        message_cid: notify.message_cid,
-        from: resolved_owner,
-        received_at: crate::owner_state_types::Hlc {
-            wall_ms: wall_now_ms,
-            logical: 0,
-            device_id: self.device_id.clone(),
-        },
-    };
-    let outcome = state.apply_inbox(inbox_entry);
-    let mut drain_outcome = DrainOutcome::default();
-    if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted) {
-        // Caller (event_loop) will emit `dm-received` IPC for newly-applied entries.
-        // Phase 3b: caller derives this from the apply_inbox return value, not from
-        // a separate Inserted-vs-Merged signal in DrainOutcome. For simplicity, we
-        // emit the dm-received here directly as a side effect — wait, no, that
-        // requires AppHandle which we don't have. Plumb via DrainOutcome:
-        drain_outcome.newly_delivered.push((
-            crate::owner_state_types::OutboxEntryId(notify.message_cid.to_bytes()[..16].try_into().expect("32→16 truncate")),
-            resolved_owner,
-        ));
-        // ^^^ TODO: that overload of newly_delivered is wrong shape — newly_delivered
-        // is for OUTBOX deliveries (sender side). Receiver-side dm-received needs
-        // its own DrainOutcome field. The implementer adds DrainOutcome.newly_received:
-        // Vec<InboxEntry> (or similar) at this task and updates the event_loop arm
-        // to emit dm-received from it.
+    // We don't have signing pubs for the OTHER devices in sender_devices
+    // (only for the one that signed THIS notify) — pass [0u8; 32] for the
+    // others. Adjust to use Option<[u8; 32]> per Task 9's note.
+    let mut updated_pubs = vec![[0u8; 32]; signed.sender_devices.len()];
+    if let Some(idx) = signed.sender_devices.iter().position(|d| *d == signed.signing_device_hash) {
+        updated_pubs[idx] = signing_pub.to_bytes();
     }
-
-    // Step 13b: ack fan-out to all sender_devices.
-    let ack = crate::dm_envelope::DmAck {
-        space_id: notify.space_id,
-        message_cid: notify.message_cid,
-        ack_from_owner_addr: self.self_owner,
-        ack_from_devices: vec![/* our own device hashes — needs OwnerDeviceCache lookup */],
-    };
-    let ack_packet = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::Ack(ack))
-        .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
-
-    for device in &notify.sender_devices {
-        // Compute the destination_hash: SHA256(name_hash || identity_address_hash)[:16]
-        // ... [implementer wires this up; might need a helper in lib.rs that uses
-        //     NodeRuntime::local_identity_hash + a fixed DM destination name string]
-        let dest_hash = compute_dm_destination_hash(device);
-        let req = UnicastSendRequest { destination_hash: dest_hash, packet: ack_packet.clone() };
-        let _ = unicast_send_tx.send(req).await;  // failed sends are silent per spec Flow 2 step 13
-    }
-
-    Ok(drain_outcome)
-}
-
-fn compute_dm_destination_hash(device: &DeviceIdentityHash) -> [u8; 16] {
-    // SHA256("harmony.dm".as_bytes() concatenated with device identity hash)[:16]
-    use sha2::{Sha256, Digest};
-    let name_hash = Sha256::digest(b"harmony.dm");
-    let mut h = Sha256::new();
-    h.update(&name_hash[..16]);  // Reticulum name_hash is 16 bytes
-    h.update(&device.0);
-    let out = h.finalize();
-    out[..16].try_into().expect("SHA256 output is 32 bytes")
-}
-```
-
-**The DrainOutcome shape problem:** `DrainOutcome.newly_delivered` is currently typed as `Vec<(OutboxEntryId, OwnerAddr)>` for outbox-side delivery events. Receive-side `dm-received` is a different concept — it needs `Vec<InboxEntry>` or `Vec<(SpaceId, ContentId, OwnerAddr)>`.
-
-**Decision:** widen `DrainOutcome` to add a `newly_received: Vec<InboxEntry>` field at this task. Update Phase 2's drain to leave it empty (drain doesn't produce inbox events). Update event_loop's drain arm AND the new handle_unicast arm to emit `dm-received` from this field. This is a small, targeted refactor, not a redesign.
-
-**Decision on ack_from_devices:** for Phase 3b's first cut, populate `ack_from_devices` with whatever this device knows about its own bound devices (OwnerDeviceCache entry for `self.self_owner`). If the cache doesn't yet have the entry (first-ever DM), populate with just our own device — Phase 3b ships the minimal correct behavior; growing this list as more devices come online is automatic via Flow A.
-
-- [ ] **Step 8.4: Run tests to verify they pass**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_cidnotify_ 2>&1 | tail -25
-```
-
-Expected: PASS — all six tests.
-
-- [ ] **Step 8.5: Add the dm-received emit path in DrainOutcome**
-
-The widening: add to `DrainOutcome`:
-
-```rust
-pub struct DrainOutcome {
-    pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
-    pub newly_expired: Vec<OutboxEntryId>,
-    /// Phase 3b: InboxEntries written by handle_cidnotify for which
-    /// apply_inbox returned Inserted (not NoOp). Caller emits dm-received.
-    pub newly_received: Vec<crate::owner_state_types::InboxEntry>,
-}
-```
-
-Phase 2's `drain` leaves it empty. Task 9 wires the event_loop side to emit `dm-received` from this field.
-
-- [ ] **Step 8.6: Verification gates**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-set -o pipefail
-cargo fmt --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: all green.
-
-- [ ] **Step 8.7: Commit**
-
-```bash
-git add src-tauri/src/dm_outbox.rs
-git commit -m "$(cat <<'EOF'
-feat(zeb-227): implement handle_cidnotify — CAS fetch, decrypt, inbox write, ack fan-out
-
-Phase 3b's inbound DmCidNotify handler — the largest single inbound
-arm. Implements ZEB-216 spec Flow 2 steps 7-13:
-
-7a. resolve_link_origin_owner(cache, from_identity_hash)
-7b. verify notify.sender_owner_addr == resolved_owner (drop on mismatch
-    — cache-poisoning attempt regression per spec)
-8.  apply_owner_device_update(resolved_owner, notify.sender_devices,
-    HLC) — uses RESOLVED owner, not payload field (load-bearing)
-9.  CasOp::GetOrFetch(message_cid) with 500ms timeout
-11. decrypt_dm_message with current + prior content_keys fallback
-12. verify_sender_binding(payload.sender == resolved_owner) — drop on
-    impersonation
-13a. apply_inbox(InboxEntry); on ApplyOutcome::Inserted, push into
-     DrainOutcome.newly_received (NEW field) so the caller emits
-     dm-received IPC. NoOp duplicates are silent (atomic-emit semantics
-     per spec — the inserted-vs-merged discriminant is the boundary,
-     not a separate pre-write existence check).
-13b. DmAck fan-out to all devices in notify.sender_devices (per spec
-     "fan out ack to ALL sender devices, not just A1" — liveness benefit
-     when the original sender's primary device went offline). Failed
-     sends are silent per spec.
-
-DrainOutcome widened with newly_received: Vec<InboxEntry>. Phase 2 drain
-leaves it empty; Task 9 wires event_loop to emit dm-received from it.
-
-Tests added (six, mirroring spec):
-- handle_cidnotify_happy_path_writes_inbox_and_fans_out_ack
-- handle_cidnotify_duplicate_no_dm_received_emit (atomic-emit regression)
-- handle_cidnotify_sender_binding_mismatch_drops
-- handle_cidnotify_owner_field_mismatch_drops_no_cache_update (cache-
-  poisoning regression)
-- handle_cidnotify_unknown_link_origin_drops
-- handle_cidnotify_decrypt_failure_uses_prior_keys (prior-key fallback)
-EOF
-)"
-```
-
----
-
-### Task 9: Implement `handle_ack` (Phase 3b version) + wire event_loop interception
-
-**Files:**
-- Modify: `src-tauri/src/dm_outbox.rs` (replace existing Phase 2 `handle_ack` with link-origin-binding version + tests)
-- Modify: `src-tauri/src/event_loop.rs` (wire RuntimeAction::UnicastReceived interception, plumb cas handle through `event_loop::run`)
-- Test: `src-tauri/src/dm_outbox.rs` test module — covers spec tests `handle_unicast_ack_updates_outbox_delivered_to`, `handle_unicast_ack_owner_field_mismatch_drops`, `handle_unicast_ack_from_non_recipient_drops`, `handle_unicast_ack_ambiguous_link_origin_drops`
-
-This task subsumes:
-1. Phase 3b version of handle_ack (link-origin binding + non-recipient drop check)
-2. Wiring event_loop's interception of RuntimeAction::UnicastReceived → outbox.handle_unicast(...)
-3. Plumbing the `Arc<dyn ContentStore>` handle through `event_loop::run` parameters
-4. Wiring DrainOutcome.newly_received → `dm-received` IPC emit
-
-- [ ] **Step 9.1: Write failing tests for handle_ack happy + drop paths**
-
-Add the four spec-named tests, following the same fixture pattern as Task 7.
-
-- [ ] **Step 9.2: Run tests to verify they fail**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_ack_ 2>&1 | tail -20
-```
-
-Expected: FAIL — Phase 3b handle_ack signature has changed (now takes `from_identity_hash`).
-
-- [ ] **Step 9.3: Replace Phase 2 handle_ack with Phase 3b version**
-
-```rust
-pub async fn handle_ack(
-    &mut self,
-    state: &mut OwnerState,
-    ack: crate::dm_envelope::DmAck,
-    from_identity_hash: DeviceIdentityHash,
-    wall_now_ms: u64,
-) -> Result<DrainOutcome, DmReceiveError> {
-    // Resolve link origin → owner.
-    let resolved_owner = resolve_link_origin_owner(&state.owner_device_cache, from_identity_hash)?;
-
-    // Verify ack.ack_from_owner_addr matches resolved.
-    if ack.ack_from_owner_addr != resolved_owner {
-        tracing::warn!("dropped DmAck: ack_from_owner_addr does not match resolved owner");
-        return Err(DmReceiveError::OwnerFieldMismatch);
-    }
-
-    // Find the OutboxEntry for this (space_id, message_cid).
-    // outbox is keyed by entry_id, so iterate to find the match.
-    let entry_id = state.outbox.iter()
-        .find(|(_, e)| e.space_id == ack.space_id && e.message_cid == ack.message_cid)
-        .map(|(id, _)| *id)
-        .ok_or(DmReceiveError::OutboxEntryNotFound)?;
-
-    let entry = state.outbox.get(&entry_id).expect("just looked it up");
-    if !entry.recipient_owners.contains(&resolved_owner) {
-        tracing::warn!("dropped DmAck: ack from non-recipient {resolved_owner:?}");
-        return Err(DmReceiveError::AckFromNonRecipient);
-    }
-
-    // Update OwnerDeviceCache with ack.ack_from_devices.
     let _ = state.apply_owner_device_update(
         resolved_owner,
-        ack.ack_from_devices.clone(),
+        signed.sender_devices.clone(),
+        updated_pubs,
         crate::owner_state_types::Hlc {
             wall_ms: wall_now_ms,
             logical: 0,
@@ -2019,307 +2060,111 @@ pub async fn handle_ack(
         },
     );
 
-    // Mutate the OutboxEntry: insert into delivered_to, recompute status.
-    let mut entry_mut = state.outbox.get(&entry_id).unwrap().clone();
-    let was_already_delivered = !entry_mut.delivered_to.insert(resolved_owner);
-    entry_mut.delivery_status = entry_mut.compute_status(false);
+    // Step 9: fetch the storage_blob from CAS via cas.get with 500ms timeout.
+    let blob = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        cas.get(&signed.message_cid),
+    ).await {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => return Err(DmReceiveError::CasFetchFailed("blob not found".into())),
+        Ok(Err(e)) => return Err(DmReceiveError::CasFetchFailed(format!("{e:?}"))),
+        Err(_) => return Err(DmReceiveError::CasFetchFailed("500ms fetch timeout".into())),
+    };
 
+    // Step 11: decrypt with prior-keys fallback.
+    let aad = crate::dm_crypto::compute_aad(&space_clone)
+        .map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
+    let payload = crate::dm_crypto::decrypt_dm_message(
+        space_clone.content_key.as_ref().expect("DM Space MUST have content_key"),
+        &space_clone.prior_content_keys,
+        &aad,
+        &blob,
+    ).map_err(|_| DmReceiveError::DecryptFailed)?;
+
+    // Step 12: sender-binding check (encrypted-payload layer).
+    crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
+        .map_err(|_| DmReceiveError::SenderImpersonation)?;
+
+    // Step 13a: apply_inbox — atomic-emit semantics.
+    let inbox_entry = crate::owner_state_types::InboxEntry {
+        space_id: signed.space_id,
+        message_cid: signed.message_cid,
+        from: resolved_owner,
+        received_at: crate::owner_state_types::Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: self.device_id.clone(),
+        },
+    };
+    let outcome = state.apply_inbox(inbox_entry.clone());
     let mut drain_outcome = DrainOutcome::default();
-    if !was_already_delivered {
-        // First time we've seen this recipient ack — emit dm-delivered.
-        drain_outcome.newly_delivered.push((entry_id, resolved_owner));
+    if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Inserted) {
+        drain_outcome.newly_received.push(inbox_entry);
     }
-    // Re-write through CRDT for cross-device convergence.
-    let _ = state.apply_outbox(entry_mut);
+
+    // Step 13b: ack fan-out to all sender_devices.
+    let our_device_hash = self.our_signing_device_hash();  // helper added on DmOutbox
+    let our_ack_devices = state.owner_device_cache.devices.get(&self.self_owner)
+        .map(|e| e.devices.clone())
+        .unwrap_or_else(|| vec![our_device_hash]);
+
+    let ack_signed = crate::dm_envelope::DmAckSigned {
+        space_id: signed.space_id,
+        message_cid: signed.message_cid,
+        ack_from_owner_addr: self.self_owner,
+        ack_from_devices: our_ack_devices,
+        signing_device_hash: our_device_hash,
+    };
+    let ack_packet = crate::dm_envelope::build_signed_ack(ack_signed, &self.signing_key())
+        .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
+    let ack_wire = crate::dm_envelope::encode_packet(&ack_packet)
+        .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
+
+    for device in &signed.sender_devices {
+        let dest_hash = compute_dm_destination_hash(device.0);
+        let _ = unicast_send_tx.send(UnicastSendRequest {
+            destination_hash: dest_hash,
+            packet: ack_wire.clone(),
+        }).await;  // failed sends are silent per spec
+    }
 
     Ok(drain_outcome)
 }
 ```
 
-(If the existing Phase 2 `handle_ack` had a different signature — search `dm_outbox.rs` for `fn handle_ack` — the implementer first checks whether any caller depends on the old signature. Per the Phase 2 dm_outbox.rs module doc at line 16, `handle_ack` is not yet wired into a public path; the only caller is the test module. So the signature change has bounded blast radius.)
+DmOutbox needs new fields to support this: `our_signing_device_hash: DeviceIdentityHash` and `signing_key: Arc<SigningKey>`. Add them in `DmOutbox::new` (signature widens — propagate to all callers). Phase 2 callers in tests pass dummy values; production caller in `lib.rs` (Task 11) passes the real key.
 
-- [ ] **Step 9.4: Run tests to verify they pass**
+`compute_dm_destination_hash` is the same helper from the original plan; lives in `dm_signing.rs` or a new `dm_destination.rs` module.
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test handle_ack_ 2>&1 | tail -10
-```
-
-Expected: PASS.
-
-- [ ] **Step 9.5: Wire event_loop interception of RuntimeAction::UnicastReceived**
-
-This is the chunk Task 6 deferred. Update `event_loop::run` signature to add `cas_handle: Option<Arc<dyn crate::content_store::ContentStore>>`:
-
-```rust
-pub async fn run<R: Runtime>(
-    // ... existing ...
-    dm_outbox: Option<...>,
-    dm_transport: Option<...>,
-    crdt_state: Option<...>,
-    unicast_send_rx: Option<...>,
-    cas_handle: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
-)
-```
-
-In each `for action in runtime.tick()` loop site, intercept `RuntimeAction::UnicastReceived` BEFORE `dispatch_action`:
-
-```rust
-for action in runtime.tick() {
-    if let RuntimeAction::UnicastReceived { destination_hash: _, source, ref packet } = action {
-        if let (Some(outbox), Some(state), Some(unicast_send_tx), Some(cas)) =
-            (dm_outbox.as_ref(), crdt_state.as_ref(), unicast_send_tx_for_loop.as_ref(), cas_handle.as_ref())
-        {
-            let outbox_try = outbox.try_lock();
-            let state_try = state.try_lock();
-            match (outbox_try, state_try) {
-                (Ok(mut outbox_g), Ok(mut state_g)) => {
-                    let wall_now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let result = outbox_g.handle_unicast(
-                        &mut state_g,
-                        cas.as_ref(),
-                        unicast_send_tx,
-                        source,
-                        packet.clone(),
-                        wall_now_ms,
-                    ).await;
-                    drop(state_g);
-                    drop(outbox_g);
-                    match result {
-                        Ok(outcome) => {
-                            for entry in outcome.newly_received {
-                                let _ = app.emit("dm-received", serde_json::json!({
-                                    "spaceId": hex::encode(entry.space_id.0),
-                                    "messageCid": hex::encode(entry.message_cid.to_bytes()),
-                                    "from": hex::encode(entry.from.0),
-                                    "receivedAt": entry.received_at.wall_ms,
-                                }));
-                            }
-                            for (entry_id, recipient) in outcome.newly_delivered {
-                                let _ = app.emit("dm-delivered", serde_json::json!({
-                                    "messageId": hex::encode(entry_id.0),
-                                    "recipient": hex::encode(recipient.0),
-                                }));
-                            }
-                            for entry_id in outcome.newly_expired {
-                                let _ = app.emit("dm-expired", serde_json::json!({
-                                    "messageId": hex::encode(entry_id.0),
-                                }));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "handle_unicast dropped packet");
-                        }
-                    }
-                }
-                _ => {
-                    tracing::debug!("handle_unicast skipped this tick (locks contended); packet dropped");
-                }
-            }
-            continue;
-        }
-    }
-    dispatch_action(action, /* ... */).await;
-}
-```
-
-There are three `runtime.tick()` sites in `event_loop.rs` (per the earlier grep — line 871, 898, 1137). Apply the same intercept block to all three. Consider extracting the intercept logic into a helper function `async fn handle_runtime_action_or_dispatch(action, ...)` to avoid the 3× duplication.
-
-- [ ] **Step 9.6: Update event_loop::run callers**
-
-Same as Task 5: three callers (lib.rs, content_index_integration.rs, folder_primitive_integration.rs). Append `None` to the test files; pass `Some(cas_handle.clone())` from lib.rs (lift NodeState's content_store Arc up — Phase 2 already added a content_store field, so the Arc is reachable).
-
-- [ ] **Step 9.7: Verification gates**
+- [ ] **Step 10.4: Tests + gates + commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-set -o pipefail
-cargo fmt --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: all green.
-
-- [ ] **Step 9.8: Commit**
-
-```bash
-git add src-tauri/src/dm_outbox.rs src-tauri/src/event_loop.rs src-tauri/src/lib.rs \
-        src-tauri/tests/content_index_integration.rs \
-        src-tauri/tests/folder_primitive_integration.rs
 git commit -m "$(cat <<'EOF'
-feat(zeb-227): implement handle_ack + wire event_loop UnicastReceived interception
+feat(zeb-227): handle_cidnotify — signature verify + CAS fetch + decrypt + inbox + ack fan-out
 
-Phase 3b's inbound DmAck handler. Replaces the Phase 2 placeholder
-signature with the link-origin-binding shape:
-- Resolve from_identity_hash → OwnerAddr via resolve_link_origin_owner.
-- Verify ack.ack_from_owner_addr matches resolved (drop on impersonation).
-- Find OutboxEntry by (space_id, message_cid); drop if not present
-  (OutboxEntryNotFound).
-- Drop if resolved owner not in OutboxEntry.recipient_owners
-  (AckFromNonRecipient — forged-ack regression per spec).
-- apply_owner_device_update with ack.ack_from_devices.
-- delivered_to.insert(resolved); idempotent if already present.
-- compute_status; if newly delivered, push into DrainOutcome.newly_delivered
-  for caller's dm-delivered emit.
-- apply_outbox writes back through CRDT for cross-device convergence.
-
-Wires event_loop's interception of RuntimeAction::UnicastReceived BEFORE
-dispatch_action (the dispatch_action catch-all _ => {} arm at line 1351
-would silently drop UnicastReceived otherwise). Same try_lock + skip-this-
-tick pattern as the dm_outbox drain block. Plumbs cas_handle through
-event_loop::run as a new Optional Arc parameter.
-
-Three runtime.tick() sites updated (line 871, 898, 1137) — extracted
-the intercept into a helper to avoid 3× duplication.
-
-DrainOutcome.newly_received → app.emit("dm-received", ...) wired here;
-newly_delivered + newly_expired emit unchanged from Phase 2.
-
-Tests added (four, mirroring spec):
-- handle_ack_updates_outbox_delivered_to
-- handle_ack_owner_field_mismatch_drops
-- handle_ack_from_non_recipient_drops
-- handle_ack_ambiguous_link_origin_drops
+[Full body similar to original plan but adapted for Path B signature
+verification path. DrainOutcome widened with newly_received: Vec<InboxEntry>.
+Six tests added per spec Phase 3b test list.]
 EOF
 )"
 ```
 
----
-
-### Task 10: Wire DM destination registration in lib.rs start_node
-
-**Files:**
-- Modify: `src-tauri/src/lib.rs` (in start_node, compute the local DM destination hash and call `runtime.register_local_destination(dm_dest)`)
-
-- [ ] **Step 10.1: Compute the local DM destination hash**
-
-Per Reticulum: `destination_hash = SHA256(name_hash || identity_address_hash)[:16]`. The `name_hash` for the DM destination is `SHA256("harmony.dm")[:16]` (or whatever convention the spec lands on; the spec is open about the exact destination naming). Add a helper near `start_node`:
-
-```rust
-/// Compute the 16-byte Reticulum destination hash for our local DM inbox.
-/// `identity_hash` comes from `NodeRuntime::local_identity_hash()`.
-fn compute_dm_destination_hash(identity_hash: [u8; 16]) -> [u8; 16] {
-    use sha2::{Sha256, Digest};
-    let name_hash = Sha256::digest(b"harmony.dm");
-    let mut h = Sha256::new();
-    h.update(&name_hash[..16]);
-    h.update(&identity_hash);
-    let out = h.finalize();
-    out[..16].try_into().expect("SHA256 output is 32 bytes")
-}
-```
-
-In `start_node`, after `NodeRuntime::new`, register the DM destination:
-
-```rust
-let local_identity = runtime.local_identity_hash();
-let dm_dest = compute_dm_destination_hash(local_identity);
-runtime.register_local_destination(dm_dest);
-tracing::info!(
-    "registered DM destination hash {} for inbound DmInvite/DmCidNotify/DmAck",
-    hex::encode(dm_dest)
-);
-```
-
-The `compute_dm_destination_hash` function is also needed inside `dm_outbox.rs` for the ack fan-out path (Task 8, Step 8.3). Move it to a shared location — e.g., `src-tauri/src/dm_envelope.rs` or a new `dm_destination.rs` — so both call sites use the same canonical implementation.
-
-- [ ] **Step 10.2: Add a unit test for compute_dm_destination_hash**
-
-```rust
-#[test]
-fn dm_destination_hash_is_deterministic_per_identity() {
-    let identity = [0xa1u8; 16];
-    let dest1 = compute_dm_destination_hash(identity);
-    let dest2 = compute_dm_destination_hash(identity);
-    assert_eq!(dest1, dest2);
-}
-
-#[test]
-fn dm_destination_hash_differs_per_identity() {
-    let dest_alice = compute_dm_destination_hash([0xa1; 16]);
-    let dest_bob = compute_dm_destination_hash([0xb2; 16]);
-    assert_ne!(dest_alice, dest_bob);
-}
-```
-
-- [ ] **Step 10.3: Verification gates**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-set -o pipefail
-cargo fmt --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: all green.
-
-- [ ] **Step 10.4: Commit**
-
-```bash
-git add src-tauri/src/lib.rs src-tauri/src/dm_destination.rs  # (or wherever the helper lives)
-git commit -m "$(cat <<'EOF'
-feat(zeb-227): register local DM destination on NodeRuntime at startup
-
-Computes destination_hash = SHA256("harmony.dm" name_hash || local_identity_hash)[:16]
-in start_node and calls runtime.register_local_destination(dm_dest).
-
-Without this registration, every inbound DmInvite/DmCidNotify/DmAck
-addressed to our DM destination would drop in the runtime as
-NoLocalDestination before reaching the link-origin-binding check.
-
-Helper compute_dm_destination_hash extracted to a shared module so the
-ack-fan-out path in handle_cidnotify (Task 8) uses the canonical
-implementation.
-
-Two unit tests pin determinism + identity-sensitivity.
-EOF
-)"
-```
+(Plan abbreviates the commit message detail since the structural pattern is the same as Task 9; implementer fills in the comprehensive description before committing.)
 
 ---
 
-### Task 11: Replace `StubTransport` with `RuntimeUnicastTransport` in production wiring
+### Task 11: `handle_ack` + `OwnerDeviceCacheResolver` + replace `StubTransport` in production + event_loop interception
 
 **Files:**
-- Modify: `src-tauri/src/lib.rs` (replace `StubTransport::new()` at line 843-844 with the real adapter)
+- Modify: `src-tauri/src/dm_outbox.rs` — handle_ack real body + OwnerDeviceCacheResolver
+- Modify: `src-tauri/src/event_loop.rs` — wire UnicastReceived interception, plumb cas_handle through `event_loop::run` params
+- Modify: `src-tauri/src/lib.rs` — replace StubTransport with RuntimeUnicastTransport using OwnerDeviceCacheResolver and the device's signing key
 
-- [ ] **Step 11.1: Replace the production transport instantiation**
+Combined task (was Tasks 9+11 in the original plan; merged because both touch lib.rs's start_node and a single commit is cleaner).
 
-In `src-tauri/src/lib.rs`, around line 835-844 (where Phase 2's StubTransport is instantiated), replace:
+- [ ] **Step 11.1: Implement handle_ack** (4 tests; same shape as original plan but using `signing_device_hash` + signature verification)
 
-```rust
-let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
-    std::sync::Arc::new(crate::dm_outbox::StubTransport::new());
-```
-
-with:
-
-```rust
-// Production resolver: looks up recipient device hashes from OwnerDeviceCache.
-let resolver = std::sync::Arc::new(crate::dm_outbox::OwnerDeviceCacheResolver::new(
-    crdt_state.clone(),
-));
-// Sender device list: our own device's identity hash. Phase 3b ships with
-// a single-device sender_devices list; cross-device piggyback grows
-// automatically as more of our devices come online and Flow A propagates
-// the OwnerDeviceCache entry.
-let our_device_hash = DeviceIdentityHash(local_identity);
-let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
-    std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
-        unicast_send_tx.clone(),
-        resolver,
-        self_owner,
-        vec![our_device_hash],
-    ));
-```
-
-`OwnerDeviceCacheResolver` is a thin trait impl that holds `Arc<Mutex<OwnerState>>` and reads `owner_device_cache.devices.get(&recipient).devices` to produce the list of destination hashes (one per device). Add it to `dm_outbox.rs`:
+- [ ] **Step 11.2: Add OwnerDeviceCacheResolver**
 
 ```rust
 pub struct OwnerDeviceCacheResolver {
@@ -2334,233 +2179,102 @@ impl OwnerDeviceCacheResolver {
 
 impl DestinationResolver for OwnerDeviceCacheResolver {
     fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
-        // try_lock is intentional — we're called from the transport's send()
-        // path which may be invoked from event_loop's drain block while
-        // dm_outbox + crdt_state are already locked. If the lock is contended
-        // we return [] which surfaces as TransportError::Transient (the drain
-        // retries on next tick). Avoiding await/blocking here is critical to
-        // prevent the same lock-during-await deadlock chain we hit in Phase 2.
         let state = match self.state.try_lock() {
             Ok(g) => g,
-            Err(_) => return Vec::new(),
+            Err(_) => return Vec::new(),  // contention → transient transport error
         };
         state.owner_device_cache.devices.get(&recipient)
-            .map(|entry| {
-                entry.devices.iter()
-                    .map(|d| compute_dm_destination_hash(d.0))
-                    .collect()
-            })
+            .map(|entry| entry.devices.iter().map(|d| compute_dm_destination_hash(d.0)).collect())
             .unwrap_or_default()
     }
 }
 ```
 
-(Wait — `compute_dm_destination_hash` takes `[u8; 16]` and that's the `DeviceIdentityHash.0` field. The spec specifies destination_hash = SHA256(name_hash || identity_address_hash)[:16] where `identity_address_hash` IS the 16-byte device identity hash. So the helper signature is right; just adjust naming so it's obvious the input is the recipient's device identity, not a destination hash already.)
+- [ ] **Step 11.3: Wire event_loop interception**
 
-- [ ] **Step 11.2: Verification gates**
+Per the original plan: extract a helper, intercept `RuntimeAction::UnicastReceived` BEFORE `dispatch_action` at all 3 `runtime.tick()` sites. Plumb `cas_handle: Option<Arc<dyn ContentStore>>` through `event_loop::run`. Wire dm-received / dm-delivered / dm-expired emits from `DrainOutcome`.
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-set -o pipefail
-cargo fmt --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: all green. Phase 2's existing dm_outbox tests still pass — they explicitly construct `StubTransport` (which is preserved for test use) so production replacing the wired transport doesn't affect them.
-
-- [ ] **Step 11.3: Commit**
-
-```bash
-git add src-tauri/src/lib.rs src-tauri/src/dm_outbox.rs
-git commit -m "$(cat <<'EOF'
-feat(zeb-227): replace StubTransport with RuntimeUnicastTransport in production
-
-The Phase 2 wiring at lib.rs:843-844 instantiated StubTransport directly
-in start_node — that's now swapped for the real adapter:
-
-- OwnerDeviceCacheResolver: a thin DestinationResolver impl that reads
-  OwnerDeviceCache via try_lock (avoiding the lock-during-await deadlock
-  chain we hit in Phase 2). Returns [] on contention; transport then
-  surfaces TransportError::Transient and the drain retries.
-- RuntimeUnicastTransport wired with our_device_hash (single-device
-  sender_devices for now; cross-device piggyback grows via Flow A).
-
-StubTransport is preserved for test use. Phase 2's dm_outbox tests
-explicitly construct StubTransport so this swap is transparent to them.
-
-Production sends now go: send_dm IPC → DmOutbox → drain → transport
-→ unicast_send_tx → event_loop arm → runtime.push_event(SendUnicast...)
-→ runtime.tick() → SendOnInterface → UDP. Real Reticulum delivery.
-EOF
-)"
-```
-
----
-
-### Task 12: End-to-end integration test at the RuntimeAction-channel boundary
-
-**Files:**
-- Create: `src-tauri/tests/dm_unicast_integration.rs` (new file, ~250 lines)
-
-The test stands up two `DmOutbox` instances + two `OwnerState`s + a fake `NodeRuntime` channel pair. Sends a DM from outbox A; intercepts the outbound `RuntimeEvent::SendUnicastToDevice` from the channel; converts it to an inbound `RuntimeAction::UnicastReceived` for outbox B; calls `B.handle_unicast(...)`; asserts InboxEntry written + DmAck queued; loops back the ack to outbox A; asserts OutboxEntry.delivered_to updated.
-
-This is the Phase 3b acceptance criterion: spec §"Acceptance criteria / Phase 3b" — "real-transport tests pass at the RuntimeAction-channel boundary."
-
-- [ ] **Step 12.1: Write the test file**
+- [ ] **Step 11.4: Replace StubTransport in lib.rs**
 
 ```rust
-//! ZEB-227 / Phase 3b end-to-end integration test.
-//!
-//! Mocks at the RuntimeAction channel boundary (no real Reticulum wire).
-//! Exercises: send_dm IPC → outbox.send_dm → drain → transport
-//! → unicast_send_tx (channel) → handle_unicast (B) → CAS fetch → decrypt
-//! → apply_inbox → ack queue → handle_ack (A) → delivered_to updated.
+// Acquire the device's signing key from the existing identity-management
+// code path. (Implementer reads lib.rs:start_node to find where device_id
+// + self_owner come from; the signing key lives there too — likely in
+// harmony_identity::PrivateIdentity. Pull the Ed25519 SigningKey out.)
+let signing_key = std::sync::Arc::new(extract_signing_key_from_identity(...));
+let our_device_hash = crate::dm_signing::derive_device_hash_from_pubkey(&signing_key.verifying_key());
 
-use harmony_client::dm_outbox::{
-    /* ... */
-};
-// [implementer fills in the full body — single test of ~150 lines plus
-//  one test for the offline-recipient → online-recipient case (~100 lines)]
+let resolver = std::sync::Arc::new(crate::dm_outbox::OwnerDeviceCacheResolver::new(crdt_state.clone()));
+let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
+    std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
+        unicast_send_tx.clone(),
+        resolver,
+        self_owner,
+        our_device_hash,
+        signing_key.clone(),
+    ));
+
+// And inject the same signing key into DmOutbox::new (Task 10's widening):
+let outbox = crate::dm_outbox::DmOutbox::new(device_id.clone(), self_owner, signing_key, our_device_hash);
 ```
 
-The implementer writes this as two test functions:
-1. `dm_full_round_trip_through_unicast_channel` — happy path.
-2. `dm_offline_recipient_then_online_delivers` — exercises the drain backoff path: first send fails (resolver returns []), recipient comes online (cache populated), next drain succeeds.
-
-- [ ] **Step 12.2: Run tests to verify they pass**
+- [ ] **Step 11.5: Tests + gates + commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
-set -o pipefail
-cargo test --test dm_unicast_integration 2>&1 | tail -20
-```
-
-Expected: PASS.
-
-- [ ] **Step 12.3: Verification gates**
-
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-set -o pipefail
-cargo fmt --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Expected: all green.
-
-- [ ] **Step 12.4: Commit**
-
-```bash
-git add src-tauri/tests/dm_unicast_integration.rs
 git commit -m "$(cat <<'EOF'
-test(zeb-227): end-to-end DM round-trip at RuntimeAction-channel boundary
+feat(zeb-227): handle_ack + OwnerDeviceCacheResolver + production transport swap + event_loop interception
 
-Phase 3b acceptance criterion (spec §Acceptance criteria / Phase 3b):
-"real-transport tests pass at the RuntimeAction-channel boundary."
-
-Two test functions in the new dm_unicast_integration.rs file:
-
-1. dm_full_round_trip_through_unicast_channel
-   - Stand up outbox A + outbox B with their own OwnerStates.
-   - Pre-populate B's cache with A's identity_hash → A's OwnerAddr.
-   - Pre-populate A's cache with B's identity_hash → B's OwnerAddr.
-   - Pre-create the DM Space on both sides (Invite-bypass for test brevity;
-     handle_invite's coverage is in dm_outbox unit tests).
-   - Call A.send_dm(...). Drain A's outbox. Intercept the outbound
-     UnicastSendRequest from the channel. Convert to RuntimeAction::
-     UnicastReceived addressed to B. Call B.handle_unicast(...).
-   - Assert: B.state.inbox now has the InboxEntry; outbox B's channel
-     emitted a DmAck; B's outcome.newly_received is non-empty.
-   - Intercept the DmAck UnicastSendRequest. Call A.handle_unicast(...).
-   - Assert: A.state.outbox[entry_id].delivered_to includes B; A's
-     outcome.newly_delivered is non-empty.
-
-2. dm_offline_recipient_then_online_delivers
-   - Same setup but A's resolver returns [] (B has no known devices).
-   - First drain: TransportError::Transient; backoff schedules retry.
-   - Populate A's cache with B's devices. Wait past backoff window.
-   - Next drain: succeeds. End-to-end as above.
-
-Mocks at the channel boundary, NOT the wire — no UDP, no real Reticulum.
-Real Reticulum coverage lives in the manual two-device LAN smoke
-follow-up (filed at PR creation in Task 13).
+[Combined task: handle_ack real body + OwnerDeviceCacheResolver +
+replace StubTransport in production wiring + event_loop interception
+of RuntimeAction::UnicastReceived. Four tests for handle_ack mirroring
+spec Phase 3b test list.]
 EOF
 )"
 ```
 
 ---
 
-### Task 13: Open the harmony-client PR + file follow-ups
+### Task 12: Register local DM destination at startup + end-to-end integration test
 
-**Process task — no code changes. Push the branch, open the PR, file follow-ups for any deferred work.**
+**Files:**
+- Modify: `src-tauri/src/lib.rs` — `runtime.register_local_destination(dm_dest)` at start_node
+- Create: `src-tauri/tests/dm_unicast_integration.rs` — end-to-end test at the channel boundary
 
-- [ ] **Step 13.1: Push the branch**
+- [ ] **Step 12.1: Compute + register the DM destination at start_node**
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
-git push -u origin zeb-227-dm-transport-phase3b
+```rust
+let local_identity = runtime.local_identity_hash();
+let dm_dest = compute_dm_destination_hash(local_identity);
+runtime.register_local_destination(dm_dest);
 ```
 
-- [ ] **Step 13.2: Open the PR**
+- [ ] **Step 12.2: Write the integration test**
 
-```bash
-gh pr create --title "feat(zeb-227): DM transport Phase 3b — real Reticulum unicast adapter + inbound demux" --body "$(cat <<'EOF'
-## Summary
-- Replaces the Phase 2 `StubTransport` with a real `RuntimeUnicastTransport` adapter that pushes `RuntimeEvent::SendUnicastToDevice` into `NodeRuntime`.
-- Adds inbound `RuntimeAction::UnicastReceived` interception in `event_loop`, dispatching to `dm_outbox::handle_invite` / `handle_cidnotify` / `handle_ack` per packet discriminant.
-- Implements link-origin binding (per ZEB-216 §"Link-origin binding rule") — every inbound DM packet's payload-controlled owner field is verified against the resolved owner from the inbound link's identity_hash.
-- Auto-accepts valid `DmInvite` packets (sanity-gated per spec); user-driven decline UX deferred to Phase 4.
-- Registers the local DM destination on `NodeRuntime` at startup so inbound packets surface.
+Two tests:
+- `dm_full_round_trip_through_unicast_channel` — happy path, end-to-end, including signature verification on both sides.
+- `dm_offline_recipient_then_online_delivers` — exercises drain backoff path.
 
-## Why
-ZEB-216 Phase 3b — the umbrella DM-transport feature's last big infra step. Phase 4 (UI) consumes the IPC events this PR adds (`dm-received`, `dm-delivered`).
+Both mock at the channel boundary, NOT the wire.
 
-## Cross-repo
-- Companion harmony PR #<task-1-pr-num> shipped first: terminal-link → identity binding (so `DeliverLocally.source` is `Some(_)`) + public `NodeRuntime::register_local_destination`. Both blocking deps for this PR.
+- [ ] **Step 12.3: Tests + gates + commit**
 
-## Test plan
-- [ ] `cargo fmt --all -- --check` — clean.
-- [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` — clean.
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml` — all green, including:
-  - `dm_outbox::resolve_link_origin_owner_*` (3 tests)
-  - `dm_outbox::runtime_unicast_transport_*` (2 tests)
-  - `dm_outbox::handle_unicast_*` (2 tests)
-  - `dm_outbox::handle_invite_*` (5 tests)
-  - `dm_outbox::handle_cidnotify_*` (6 tests)
-  - `dm_outbox::handle_ack_*` (4 tests)
-  - `dm_outbox::dm_destination_hash_*` (2 tests)
-  - `tests/dm_unicast_integration.rs` (2 tests)
-- [ ] `npx tsc --noEmit` — clean.
-- [ ] `npx vitest run` — all green.
-- [ ] Manual two-device LAN round-trip — deferred to follow-up (filed below).
+---
 
-## Follow-ups filed
-- ZEB-? — Phase 3b user-driven decline UX (modal + accept_dm_invite/decline_dm_invite IPC). Phase 3b ships auto-accept.
-- ZEB-? — Manual two-device LAN smoke test scenarios (per spec §"Manual testing — deferred to follow-up"). Includes 30-day expiration via sim clock, group-DM 3-5 members, sender-online recipient-offline → online, ack lost → retry, multi-device receiver via Flow A, dedupe collision + prior_content_keys merge, DmInvite at-16/at-17.
-- ZEB-? — Inbound packet drop on lock contention (handle_unicast skipped this tick) currently loses the event. Investigate buffering vs. higher-priority lock ordering. Phase 3b ships with the drop behavior.
+### Task 13: Open PR + file follow-up Linear tickets
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-EOF
-)"
-```
+Push branch, open harmony-client PR, file follow-ups:
+1. **Phase 4 user-driven invite decline UX** (modal + accept/decline IPC)
+2. **harmony terminal-link state — responder-side handshake wiring for future link-using features (voice / file sync / streaming)** — the deferred Path A
+3. **Per-device signing pubkey piggyback on every DmCidNotify / DmAck** (removes the bootstrap-incompleteness window where receiver knows the device hash but not the pubkey)
+4. **Manual two-device LAN smoke scenarios**
+5. **Inbound DM packet drop on lock contention** (handle_unicast skipped this tick) — investigate buffering vs higher-priority lock ordering
 
-- [ ] **Step 13.3: File the three follow-up Linear tickets**
+Per memory rule "never invent Linear IDs" — file each via the Linear MCP, capture the assigned ID, then update the PR body.
 
-Per user memory rule "never invent Linear IDs" — file the issues, then update the PR body with the assigned IDs.
-
-For each follow-up listed in the PR body, use `mcp__plugin_linear_linear__save_issue` (or `gh issue create` if Linear MCP isn't reachable in this session) with a descriptive title:
-
-1. "ZEB-216 Phase 4 — DM invite decline UX (modal + accept/decline IPC)"
-2. "ZEB-216 Phase 3b — manual two-device LAN smoke scenarios (30-day expiration via sim clock, group-DM, multi-device, dedupe collision, at-17 invite block)"
-3. "ZEB-227 follow-up — inbound DM packet drop on lock contention (investigate buffering vs lock-ordering)"
-
-After Linear assigns IDs, update the PR body via `gh pr edit <pr-num> --body "..."`.
-
-- [ ] **Step 13.4: Print the PR URL for the user**
-
-Print the URL returned by `gh pr create` so the user can review.
+- [ ] **Step 13.1**: `git push -u origin zeb-227-dm-transport-phase3b`
+- [ ] **Step 13.2**: `gh pr create` with the body listing all five follow-ups (placeholders, then fill in)
+- [ ] **Step 13.3**: File the follow-ups via Linear MCP
+- [ ] **Step 13.4**: Update PR body with assigned IDs
 
 ---
 
@@ -2575,43 +2289,38 @@ npx tsc --noEmit  # if frontend types touched
 npx vitest run    # if frontend code touched
 ```
 
-Per pipe-exit-codes-lie rule: any verification command that pipes through `tail`/`grep` MUST set `pipefail` first or the failure exit code is silently lost.
+Per pipe-exit-codes-lie rule: any verification command that pipes through `tail`/`grep` MUST set `pipefail` first.
 
 ---
 
 ## Spec coverage cross-check
 
-| Spec test name | Plan task |
+| Spec Phase 3b test | Plan task |
 |---|---|
-| `handle_unicast_invite_creates_space` | Task 7, Step 7.1 (`handle_invite_writes_space_and_owner_device_cache_entry`) |
-| `handle_unicast_invite_binds_inviter_field_not_members_zero` | Task 7, Step 7.1 (`handle_invite_binds_inviter_field_not_members_zero`) |
-| `handle_unicast_invite_inviter_not_in_members_drops` | Task 7, Step 7.1 (`handle_invite_inviter_not_in_members_drops`) |
-| `handle_unicast_invite_sender_device_not_in_sender_devices_drops` | Task 7, Step 7.1 (`handle_invite_sender_device_not_in_sender_devices_drops`) |
-| `handle_unicast_invite_receiver_not_in_members_drops` | Task 7, Step 7.1 (`handle_invite_receiver_not_in_members_drops`) |
-| `handle_unicast_invite_decline_writes_no_state` | Deferred to Phase 4 (no UI in 3b); structural-validity drops above already cover "no state written" cases. Phase 4 follow-up filed at Task 13. |
-| `handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` | Task 8, Step 8.1 (`handle_cidnotify_happy_path_writes_inbox_and_fans_out_ack`) |
-| `handle_unicast_cidnotify_duplicate_no_dm_received_emit` | Task 8, Step 8.1 (`handle_cidnotify_duplicate_no_dm_received_emit`) |
-| `handle_unicast_cidnotify_sender_binding_mismatch_drops` | Task 8, Step 8.1 (`handle_cidnotify_sender_binding_mismatch_drops`) |
-| `handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update` | Task 8, Step 8.1 (`handle_cidnotify_owner_field_mismatch_drops_no_cache_update`) |
-| `handle_unicast_cidnotify_unknown_link_origin_drops` | Task 8, Step 8.1 (`handle_cidnotify_unknown_link_origin_drops`) |
-| `handle_unicast_cidnotify_decrypt_failure_uses_prior_keys` | Task 8, Step 8.1 (`handle_cidnotify_decrypt_failure_uses_prior_keys`) |
-| `handle_unicast_ack_updates_outbox_delivered_to` | Task 9, Step 9.1 (`handle_ack_updates_outbox_delivered_to`) |
-| `handle_unicast_ack_owner_field_mismatch_drops` | Task 9, Step 9.1 (`handle_ack_owner_field_mismatch_drops`) |
-| `handle_unicast_ack_from_non_recipient_drops` | Task 9, Step 9.1 (`handle_ack_from_non_recipient_drops`) |
-| `handle_unicast_ack_ambiguous_link_origin_drops` | Task 9, Step 9.1 (`handle_ack_ambiguous_link_origin_drops`) |
-| `expiration_at_30day_boundary_marks_expired` | Already covered by Phase 2 tests (drain handles expiration; Task 12's offline-recipient test exercises the drain path through Phase 3b's transport). |
-| `expiration_29day_old_entry_stays_pending` | Already covered by Phase 2 tests. |
-| `expiration_30day_real_transport_path` | Manual LAN follow-up (Task 13.3). |
-
-All Phase 3b spec tests are mapped to plan tasks (one deferred per the auto-accept scope decision, one deferred to manual LAN, two existing-coverage).
+| `dm_envelope::dm_packet_signature_round_trip` | Task 5, Step 5.1 |
+| `dm_envelope::dm_packet_decode_too_short_for_signature_rejects` | Task 5, Step 5.1 |
+| `dm_envelope::dm_packet_signature_does_not_cover_discriminant` | Task 5, Step 5.1 |
+| `dm_outbox::resolve_signed_origin_owner_*` (3 tests) | Task 8, Step 8.1 |
+| `dm_outbox::verify_dm_packet_signature_*` (4 tests) | Task 3, Step 3.3 |
+| `dm_outbox::handle_unicast_invite_creates_space` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_binds_inviter_field_not_members_zero` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_inviter_not_in_members_drops` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_signing_device_not_in_sender_devices_drops` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_receiver_not_in_members_drops` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_signature_invalid_drops` | Task 9, Step 9.1 |
+| `dm_outbox::handle_unicast_invite_decline_writes_no_state` | Deferred to Phase 4 (no UI in 3b) |
+| `dm_outbox::handle_unicast_cidnotify_*` (8 tests) | Task 10, Step 10.2 |
+| `dm_outbox::handle_unicast_ack_*` (5 tests) | Task 11, Step 11.1 |
+| `dm_outbox::expiration_*` (3 tests) | Already covered by Phase 2; Task 12's offline-recipient test exercises the drain through Phase 3b's transport |
 
 ---
 
 ## Out of scope (intentional)
 
-- User-driven DmInvite decline UX (modal + IPC) — Phase 4 follow-up.
-- Forward secrecy / content-key rotation — ZEB-219 deferral.
-- Per-device delivery lease in OutboxEntry — v1 tolerates cross-device duplicate sends.
-- HLC-monotonic per-OwnerAddr `device_list_version` to suppress redundant `sender_devices` piggyback.
-- DmReactions, DmReadReceipts.
-- Voice/video DM transport.
+- User-driven DmInvite decline UX — Phase 4 follow-up
+- Forward secrecy / content-key rotation — ZEB-219 deferral
+- Per-device delivery lease in OutboxEntry — v1 tolerates cross-device duplicate sends
+- HLC-monotonic per-OwnerAddr `device_list_version` to suppress redundant `sender_devices` piggyback
+- DmReactions, DmReadReceipts
+- Voice/video DM transport
+- Reticulum terminal-link state + responder-side handshake (Path A) — filed as separate ticket for when voice / file sync / streaming need it
