@@ -39,7 +39,50 @@ pub enum TransportError {
 
 #[async_trait]
 pub trait DmTransport: Send + Sync {
-    async fn send(&self, entry: &OutboxEntry, recipient: OwnerAddr) -> Result<(), TransportError>;
+    /// Send `entry` to `recipient`'s pre-resolved `destinations`. The
+    /// caller (drain) resolves OwnerAddr → device-hash list before
+    /// invoking — see `resolve_destinations` below. Empty `destinations`
+    /// must be filtered out by the caller (drain treats empty as a
+    /// transient resolver miss and bumps backoff without calling send).
+    ///
+    /// Resolution is split out of the transport (was inside
+    /// `RuntimeUnicastTransport::send` via an injected `DestinationResolver`
+    /// in the original Phase 3b shape) because production drain holds
+    /// `OwnerState`'s mutex via `&mut OwnerState`, and the production
+    /// resolver also needed to read `OwnerState` — which deadlocked with
+    /// `try_lock` on the same Tokio mutex. Resolving inside drain reads
+    /// directly from the held `&OwnerState` reference, no locking
+    /// required.
+    async fn send(
+        &self,
+        entry: &OutboxEntry,
+        recipient: OwnerAddr,
+        destinations: Vec<[u8; 16]>,
+    ) -> Result<(), TransportError>;
+}
+
+/// Resolve `recipient` → list of 16-byte Reticulum destination hashes
+/// from `OwnerDeviceCache`. Each cached `DeviceIdentityHash` maps to its
+/// destination via `compute_dm_destination_hash` (Task 10). Empty Vec
+/// when no entry is known — drain treats that as a transient miss and
+/// bumps backoff so a future tick (after Flow A propagates the missing
+/// entry) retries.
+///
+/// Pure function: no locking, no `&mut`. Drain calls this with the
+/// `&OwnerState` it already has from its mutex guard, sidestepping the
+/// recursive-lock deadlock that lived in the original Phase 3b shape.
+pub fn resolve_destinations(cache: &OwnerDeviceCache, recipient: OwnerAddr) -> Vec<[u8; 16]> {
+    cache
+        .devices
+        .get(&recipient)
+        .map(|entry| {
+            entry
+                .devices
+                .iter()
+                .map(|d| crate::dm_signing::compute_dm_destination_hash(d.0))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// In-process transport for Phase 2 tests + the in-process Tauri integration
@@ -101,9 +144,18 @@ impl StubTransport {
 // `TransportError` is not Clone (thiserror + io-style errors rarely are).
 // `remove` instead of `get/clone` so each pre-seeded outcome fires once;
 // repeat calls without re-seeding fall through to the default Ok(()).
+//
+// Stub ignores `destinations` — its purpose is to record (entry, recipient)
+// for unit-test assertions; per-device fan-out is exercised by the
+// integration test against `RuntimeUnicastTransport`.
 #[async_trait]
 impl DmTransport for StubTransport {
-    async fn send(&self, entry: &OutboxEntry, recipient: OwnerAddr) -> Result<(), TransportError> {
+    async fn send(
+        &self,
+        entry: &OutboxEntry,
+        recipient: OwnerAddr,
+        _destinations: Vec<[u8; 16]>,
+    ) -> Result<(), TransportError> {
         let mut inner = self.inner.lock().expect("StubTransport poisoned");
         if inner.sends.len() >= Self::STUB_MAX_RECORDED_SENDS {
             inner.sends.pop_front();
@@ -127,32 +179,26 @@ pub struct UnicastSendRequest {
     pub packet: Vec<u8>,
 }
 
-/// Strategy for mapping a recipient `OwnerAddr` to the list of 16-byte
-/// destination hashes we should fan-out to. Production impl
-/// (`OwnerDeviceCacheResolver`, lands in Task 11) reads
-/// `OwnerDeviceCache`; tests use `StaticDestResolver` to isolate the
-/// transport's mechanics from CRDT state.
-///
-/// May return an empty Vec — caller treats that as a transient error
-/// (no known devices) so the outbox backoff drives a future retry once
-/// Flow A propagates the missing OwnerDeviceCache entry.
-pub trait DestinationResolver: Send + Sync {
-    fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]>;
-}
-
 /// Production `DmTransport` adapter (ZEB-227 Phase 3b). Per `send`:
 ///
-/// 1. Resolve the recipient `OwnerAddr` → list of destination hashes
-///    via the injected `DestinationResolver`.
-/// 2. Build a `DmCidNotifySigned` whose `signing_device_hash` is our
+/// 1. Build a `DmCidNotifySigned` whose `signing_device_hash` is our
 ///    device's identity hash (single-device `sender_devices` for Phase
 ///    3b — cross-device piggyback grows automatically as Flow A
 ///    propagates more entries; see spec §"Public-key storage on
 ///    OwnerDeviceCache").
-/// 3. Sign + canonical-CBOR-encode via
+/// 2. Sign + canonical-CBOR-encode via
 ///    `dm_envelope::build_signed_cidnotify` + `encode_packet`.
-/// 4. Push one `UnicastSendRequest` per destination hash into `tx`,
+/// 3. Push one `UnicastSendRequest` per destination hash into `tx`,
 ///    which the event-loop drains and forwards to `NodeRuntime`.
+///
+/// Resolution of `recipient: OwnerAddr` → `destinations: Vec<[u8; 16]>`
+/// happens UPSTREAM in `DmOutbox::drain` (which has `&OwnerState` in
+/// scope from its mutex guard). Original Phase 3b shape had the
+/// transport own a `DestinationResolver` that also wanted to lock
+/// `OwnerState` — recursive `try_lock` on the same Tokio mutex always
+/// failed → empty Vec → no DMs ever delivered. Splitting resolution out
+/// of the transport sidesteps that deadlock; see `resolve_destinations`
+/// above.
 ///
 /// `DmInvite` outbound is Phase 4's `add_space` IPC for DM kinds
 /// (spec Flow 1). `DmAck` outbound is built directly by the receive-side
@@ -160,7 +206,6 @@ pub trait DestinationResolver: Send + Sync {
 /// because acks are not tied to an `OutboxEntry` retry loop.
 pub struct RuntimeUnicastTransport {
     tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
-    resolver: Arc<dyn DestinationResolver>,
     self_owner: OwnerAddr,
     our_signing_device_hash: DeviceIdentityHash,
     signing_key: Arc<ed25519_dalek::SigningKey>,
@@ -169,14 +214,12 @@ pub struct RuntimeUnicastTransport {
 impl RuntimeUnicastTransport {
     pub fn new(
         tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        resolver: Arc<dyn DestinationResolver>,
         self_owner: OwnerAddr,
         our_signing_device_hash: DeviceIdentityHash,
         signing_key: Arc<ed25519_dalek::SigningKey>,
     ) -> Self {
         Self {
             tx,
-            resolver,
             self_owner,
             our_signing_device_hash,
             signing_key,
@@ -186,17 +229,23 @@ impl RuntimeUnicastTransport {
 
 #[async_trait]
 impl DmTransport for RuntimeUnicastTransport {
-    async fn send(&self, entry: &OutboxEntry, recipient: OwnerAddr) -> Result<(), TransportError> {
-        let destinations = self.resolver.resolve(recipient);
+    async fn send(
+        &self,
+        entry: &OutboxEntry,
+        recipient: OwnerAddr,
+        destinations: Vec<[u8; 16]>,
+    ) -> Result<(), TransportError> {
+        // Empty destinations → no known devices for this recipient.
+        // Surface as Transient so the outbox backoff drives a future
+        // retry once Flow A propagates the missing OwnerDeviceCache
+        // entry. (StubTransport ignores `destinations` and returns
+        // pre-seeded outcomes — this branch only fires for the real
+        // production transport path.)
         if destinations.is_empty() {
-            // Empty resolver result is transient: Flow A may surface the
-            // recipient's devices on the next OwnerState sync round. The
-            // outbox's exponential backoff handles the retry cadence.
             return Err(TransportError::Transient(format!(
                 "no known devices for recipient {recipient:?}"
             )));
         }
-
         let signed = crate::dm_envelope::DmCidNotifySigned {
             space_id: entry.space_id,
             message_cid: entry.message_cid,
@@ -225,54 +274,6 @@ impl DmTransport for RuntimeUnicastTransport {
                 })?;
         }
         Ok(())
-    }
-}
-
-/// Production `DestinationResolver` (ZEB-227 Phase 3b Task 11). Reads
-/// the recipient's device list from `OwnerDeviceCache` via `try_lock`
-/// to avoid the lock-during-await deadlock chain that Phase 2 hit (and
-/// fixed) for the drain block in event_loop.
-///
-/// On lock contention, returns `Vec::new()` — the transport surfaces
-/// this as `TransportError::Transient` and the drain retries on the
-/// next tick. Better to defer 250ms than to block the
-/// transport-send path on the OwnerState lock during cas_op channel
-/// processing (the original Phase 2 deadlock chain).
-///
-/// `compute_dm_destination_hash` (Task 10) maps each cached
-/// `DeviceIdentityHash` to its 16-byte Reticulum destination hash via
-/// `SHA256(SHA256("harmony.dm")[:10] || device_hash)[:16]`.
-pub struct OwnerDeviceCacheResolver {
-    state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
-}
-
-impl OwnerDeviceCacheResolver {
-    pub fn new(state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>) -> Self {
-        Self { state }
-    }
-}
-
-impl DestinationResolver for OwnerDeviceCacheResolver {
-    fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
-        let state = match self.state.try_lock() {
-            Ok(g) => g,
-            // Contention → empty Vec → TransportError::Transient → drain
-            // retries on next tick (mirrors Phase 2 dm_outbox drain
-            // pattern for lock-during-await avoidance).
-            Err(_) => return Vec::new(),
-        };
-        state
-            .owner_device_cache
-            .devices
-            .get(&recipient)
-            .map(|entry| {
-                entry
-                    .devices
-                    .iter()
-                    .map(|d| crate::dm_signing::compute_dm_destination_hash(d.0))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -562,8 +563,16 @@ impl DmOutbox {
                 if !self.is_due(entry_id, recipient, wall_now_ms) {
                     continue;
                 }
+                // Resolve destinations from the in-scope `&OwnerState`
+                // (no mutex acquisition: drain holds the state via the
+                // caller's mutex guard, no recursive lock needed).
+                // Production transport returns `TransportError::Transient`
+                // on empty (Flow A may surface the missing
+                // OwnerDeviceCache entry on the next sync round); test
+                // stubs (StubTransport) ignore `destinations` entirely.
+                let destinations = resolve_destinations(&state.owner_device_cache, recipient);
                 self.in_flight.insert((entry_id, recipient));
-                let result = transport.send(&entry_clone, recipient).await;
+                let result = transport.send(&entry_clone, recipient, destinations).await;
                 self.in_flight.remove(&(entry_id, recipient));
                 match result {
                     Ok(()) => {
@@ -1455,7 +1464,7 @@ mod tests {
         let t = StubTransport::new();
         let e = entry(1);
         let r = OwnerAddr([2u8; 16]);
-        let res = t.send(&e, r).await;
+        let res = t.send(&e, r, Vec::new()).await;
         assert!(res.is_ok(), "default outcome is Ok: {res:?}");
         assert_eq!(t.sends(), vec![(e.id, r)]);
     }
@@ -1477,7 +1486,7 @@ mod tests {
             let id = OutboxEntryId([i as u8; 16]);
             let mut e = entry(0);
             e.id = id;
-            let _ = t.send(&e, r).await;
+            let _ = t.send(&e, r, Vec::new()).await;
         }
         let recorded = t.sends();
         assert_eq!(
@@ -2066,28 +2075,6 @@ mod tests {
         );
     }
 
-    /// Test-only `DestinationResolver` impl with a fixed lookup table.
-    /// Mirrors the production `OwnerDeviceCacheResolver` (Task 11) shape
-    /// without depending on CRDT state — keeps the transport unit tests
-    /// hermetic.
-    struct StaticDestResolver {
-        table: HashMap<OwnerAddr, Vec<[u8; 16]>>,
-    }
-
-    impl StaticDestResolver {
-        fn new(entries: impl IntoIterator<Item = (OwnerAddr, Vec<[u8; 16]>)>) -> Self {
-            Self {
-                table: entries.into_iter().collect(),
-            }
-        }
-    }
-
-    impl DestinationResolver for StaticDestResolver {
-        fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
-            self.table.get(&recipient).cloned().unwrap_or_default()
-        }
-    }
-
     #[tokio::test]
     async fn runtime_unicast_transport_send_pushes_signed_event_into_channel() {
         // Synthetic identity_pub trick (per dm_signing.rs's empirical
@@ -2107,11 +2094,9 @@ mod tests {
 
         let recipient = OwnerAddr([1; 16]);
         let dest_hash = [0xd1u8; 16];
-        let resolver = std::sync::Arc::new(StaticDestResolver::new([(recipient, vec![dest_hash])]));
 
         let transport = RuntimeUnicastTransport::new(
             tx,
-            resolver,
             OwnerAddr([0xff; 16]),
             our_device,
             signing_key.clone(),
@@ -2132,7 +2117,7 @@ mod tests {
         };
 
         transport
-            .send(&entry, recipient)
+            .send(&entry, recipient, vec![dest_hash])
             .await
             .expect("send must succeed");
 
@@ -2170,25 +2155,22 @@ mod tests {
         }
     }
 
+    /// Empty `destinations` → `TransportError::Transient` so drain bumps
+    /// backoff and a future tick (after Flow A surfaces the missing
+    /// `OwnerDeviceCache` entry) retries. Replaces the original
+    /// resolver-based variant: resolution moved out of the transport,
+    /// but the empty-list contract stayed at the transport boundary so
+    /// existing drain unit tests (which exercise drain → StubTransport
+    /// without populating OwnerDeviceCache) continue to work — only
+    /// `RuntimeUnicastTransport` cares about destinations.
     #[tokio::test]
     async fn runtime_unicast_transport_no_known_devices_is_transient_error() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
-        let resolver = std::sync::Arc::new(StaticDestResolver::new(std::iter::empty::<(
-            OwnerAddr,
-            Vec<[u8; 16]>,
-        )>()));
         let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
-        // Arbitrary — resolver returns empty before the device hash is
-        // ever consulted on the send path.
         let our_device = DeviceIdentityHash([0xaa; 16]);
 
-        let transport = RuntimeUnicastTransport::new(
-            tx,
-            resolver,
-            OwnerAddr([0xff; 16]),
-            our_device,
-            signing_key,
-        );
+        let transport =
+            RuntimeUnicastTransport::new(tx, OwnerAddr([0xff; 16]), our_device, signing_key);
 
         let entry = OutboxEntry {
             id: OutboxEntryId([0xab; 16]),
@@ -2205,12 +2187,12 @@ mod tests {
         };
 
         let err = transport
-            .send(&entry, OwnerAddr([1; 16]))
+            .send(&entry, OwnerAddr([1; 16]), Vec::new())
             .await
             .unwrap_err();
         assert!(
             matches!(err, TransportError::Transient(_)),
-            "empty resolver must surface as Transient (drives backoff retry), got {err:?}"
+            "empty destinations must surface as Transient (drives backoff retry), got {err:?}"
         );
     }
 

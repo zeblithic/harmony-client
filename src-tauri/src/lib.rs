@@ -906,18 +906,15 @@ async fn start_node(
                     // Production transport: RuntimeUnicastTransport pushes
                     // signed CidNotify packets into unicast_send_tx, which
                     // event_loop::run translates into
-                    // RuntimeEvent::SendUnicastToDevice. The
-                    // OwnerDeviceCacheResolver does the OwnerAddr →
-                    // device-hash list lookup via try_lock (transient
-                    // failure on contention drives the outbox backoff).
-                    let resolver: std::sync::Arc<dyn crate::dm_outbox::DestinationResolver> =
-                        std::sync::Arc::new(crate::dm_outbox::OwnerDeviceCacheResolver::new(
-                            std::sync::Arc::clone(&crdt_state),
-                        ));
+                    // RuntimeEvent::SendUnicastToDevice. OwnerAddr →
+                    // device-hash resolution happens inside drain (which
+                    // has `&OwnerState` from the event-loop's mutex guard),
+                    // not in the transport — splitting resolution out
+                    // sidesteps the recursive-lock deadlock that broke
+                    // delivery in the original Phase 3b shape.
                     let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
                         std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
                             unicast_send_tx.clone(),
-                            resolver,
                             self_owner,
                             our_signing_device_hash,
                             signing_key_arc,
@@ -1080,8 +1077,42 @@ async fn start_node(
                     .build()
                     .expect("failed to create tokio runtime for harmony-runtime");
                 rt.block_on(async move {
-                    let (runtime, startup_actions) =
+                    let (mut runtime, startup_actions) =
                         NodeRuntime::new(config, MemoryBookStore::new());
+
+                    // ZEB-227 Path B: register our DM destination so inbound
+                    // packets to it surface as RuntimeAction::UnicastReceived.
+                    // Without this registration, every inbound DmInvite /
+                    // DmCidNotify / DmAck would drop in the runtime as
+                    // NoLocalDestination before reaching
+                    // dm_outbox::handle_unicast.
+                    //
+                    // Our DM destination hash is computed from our local
+                    // Reticulum identity hash via the same
+                    // SHA256(SHA256("harmony.dm")[:10] || identity)[:16]
+                    // scheme that DmOutbox::drain uses to resolve outbound
+                    // destinations from OwnerDeviceCache (so a peer's
+                    // outbound dest_hash for us == our registered
+                    // dest_hash for ourselves).
+                    //
+                    // Unconditional: every node has a Reticulum identity
+                    // (loaded above via identity::load_or_generate, before
+                    // owner-loading). DMs themselves only flow once the owner
+                    // identity is loaded (which gates DmOutbox /
+                    // RuntimeUnicastTransport construction above), but the
+                    // raw destination registration is harmless when no owner
+                    // is loaded — it just means inbound packets surface but
+                    // event_loop's UnicastReceived arm has no DmOutbox to
+                    // dispatch to (and logs the drop).
+                    let our_identity_hash = runtime.local_identity_hash();
+                    let our_dm_dest =
+                        crate::dm_signing::compute_dm_destination_hash(our_identity_hash);
+                    runtime.register_local_destination(our_dm_dest);
+                    tracing::info!(
+                        dm_dest = hex::encode(our_dm_dest),
+                        "registered DM destination for inbound DmInvite/DmCidNotify/DmAck"
+                    );
+
                     event_loop::run(
                         runtime,
                         startup_actions,

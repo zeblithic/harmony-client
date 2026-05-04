@@ -23,7 +23,7 @@ use crate::owner_state_types::DeviceIdentityHash;
 /// name is `"harmony.dm"` (app `"harmony"`, single aspect `"dm"`); see
 /// `harmony_reticulum::destination::DestinationName::from_name` for the
 /// canonical naming scheme. Pinned here as a constant so both the
-/// production resolver (Task 11's `OwnerDeviceCacheResolver`) and the
+/// drain-side `resolve_destinations` helper in `dm_outbox` and the
 /// ack-fan-out path in `handle_cidnotify` (Task 10) compute the same
 /// destination hash for any given device-identity hash.
 const DM_DESTINATION_FULL_NAME: &[u8] = b"harmony.dm";
@@ -42,7 +42,7 @@ const DM_DESTINATION_FULL_NAME: &[u8] = b"harmony.dm";
 /// canonical implementation via the `compute_dm_destination_hash_matches_*`
 /// equivalence test in this module — if harmony-reticulum's formula ever
 /// drifts, that test breaks loudly.
-pub(crate) fn compute_dm_destination_hash(identity_address_hash: [u8; 16]) -> [u8; 16] {
+pub fn compute_dm_destination_hash(identity_address_hash: [u8; 16]) -> [u8; 16] {
     // name_hash = SHA256("harmony.dm")[:10]
     let mut name_hasher = Sha256::new();
     name_hasher.update(DM_DESTINATION_FULL_NAME);
