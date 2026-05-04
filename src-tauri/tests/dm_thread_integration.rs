@@ -1,0 +1,214 @@
+//! Phase 4 integration test for the `read_dm_thread` IPC.
+//!
+//! Seeds a DM Space with a content_key, writes 3 self-sent messages via the
+//! existing `DmOutbox::send_dm` path (which lands a self-InboxEntry per the
+//! Phase-4 widening), then calls the pure inner function
+//! `read_dm_thread_inner` and asserts the bodies + mime_types come back in
+//! reverse-chronological order. A second test exercises pagination via the
+//! `before_hlc` cursor.
+//!
+//! These tests target the inner pure function rather than the
+//! `#[tauri::command]` shim because spinning a fully-populated `NodeState`
+//! (event-loop thread, pairing handle, follow_mgr, etc.) is an order of
+//! magnitude more setup than a Phase-4 IPC behavior test warrants. The
+//! `tauri::command` wrapper is a thin adapter — its contract is "snapshot
+//! handles under sync mutex, drop, call inner".
+
+use std::sync::Arc;
+
+use harmony_app::content_store::{ContentStore, InMemoryStub};
+use harmony_app::dm_outbox::DmOutbox;
+use harmony_app::owner_state_crdt::OwnerState;
+use harmony_app::owner_state_types::{
+    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+};
+use harmony_app::read_dm_thread_inner;
+
+fn make_dm_space(space_id: SpaceId, alice: OwnerAddr, bob: OwnerAddr) -> Space {
+    let mut members = vec![alice, bob];
+    members.sort();
+    Space {
+        id: space_id,
+        kind: SpaceKind::Dm,
+        parent: None,
+        community_id: None,
+        name: "Alice <-> Bob".into(),
+        transport: Some(TransportBinding::Reticulum {
+            participants: vec![],
+        }),
+        members,
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-device".into(),
+        },
+        updated_at: Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "alice-device".into(),
+        },
+        content_key: Some(DmContentKey::new([0xAB; 32])),
+        prior_content_keys: vec![],
+    }
+}
+
+/// Construct an `OwnerState` + `DmOutbox` + CAS triple seeded with a DM
+/// Space. Returns `(state, outbox, cas, alice_owner, space_id)`.
+async fn fixture() -> (
+    OwnerState,
+    DmOutbox,
+    Arc<dyn ContentStore>,
+    OwnerAddr,
+    SpaceId,
+) {
+    let alice = OwnerAddr([0x01; 16]);
+    let bob = OwnerAddr([0x02; 16]);
+    let mut state = OwnerState::default();
+    let space = make_dm_space(SpaceId([7u8; 16]), alice, bob);
+    let space_id = space.id;
+    state.apply_space_with_canonicalization(space);
+
+    let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+
+    // Phase 3b: DmOutbox::new takes signing_key + signing_device_hash for
+    // ack fan-out. Send-only path here doesn't exercise signing.
+    let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+    let our_device_hash = DeviceIdentityHash([0xaa; 16]);
+    let outbox = DmOutbox::new("alice-device".into(), alice, our_device_hash, signing_key);
+
+    (state, outbox, cas, alice, space_id)
+}
+
+#[tokio::test]
+async fn read_dm_thread_returns_decrypted_messages_reverse_chronological() {
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+
+    // Three sends with strictly increasing wall_ms — ensures a deterministic
+    // chronological order independent of HLC logical-tick collisions.
+    let bodies: [&[u8]; 3] = [b"hello", b"world", b"phase4"];
+    for (i, body) in bodies.iter().enumerate() {
+        outbox
+            .send_dm(
+                &mut state,
+                cas.as_ref(),
+                space_id,
+                body.to_vec(),
+                "text/plain".into(),
+                1_000_000 + (i as u64) * 1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+    }
+
+    let result = read_dm_thread_inner(&state, cas.as_ref(), space_id, 50, None, alice)
+        .await
+        .expect("read_dm_thread_inner ok");
+
+    assert_eq!(result.len(), 3, "all 3 self-InboxEntries surface");
+
+    // Reverse-chronological: newest (i=2, wall_ms 1_002_000) first.
+    assert_eq!(
+        hex::decode(&result[0].body).unwrap(),
+        b"phase4",
+        "newest first"
+    );
+    assert_eq!(hex::decode(&result[1].body).unwrap(), b"world");
+    assert_eq!(hex::decode(&result[2].body).unwrap(), b"hello");
+
+    // received_at is monotonically decreasing.
+    assert!(result[0].received_at > result[1].received_at);
+    assert!(result[1].received_at > result[2].received_at);
+
+    // sent_at on each message must match the wall_now_ms passed to send_dm
+    // (encrypted payload survives the round-trip).
+    assert_eq!(result[0].sent_at, 1_002_000);
+    assert_eq!(result[1].sent_at, 1_001_000);
+    assert_eq!(result[2].sent_at, 1_000_000);
+
+    // All three are self-sent.
+    assert!(
+        result.iter().all(|m| m.is_self_outbound),
+        "all 3 are self-outbound"
+    );
+    assert!(result.iter().all(|m| m.mime_type == "text/plain"));
+    assert!(
+        result.iter().all(|m| m.from == hex::encode(alice.0)),
+        "from == self_owner hex on all self-sent entries"
+    );
+}
+
+#[tokio::test]
+async fn read_dm_thread_paginates_via_before_hlc_cursor() {
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+
+    // Seed 5 messages at strictly increasing wall_ms.
+    for i in 0..5u64 {
+        outbox
+            .send_dm(
+                &mut state,
+                cas.as_ref(),
+                space_id,
+                format!("msg-{i}").into_bytes(),
+                "text/plain".into(),
+                1_000_000 + i * 1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+    }
+
+    // Page 1: newest 2.
+    let page1 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, None, alice)
+        .await
+        .expect("page 1 ok");
+    assert_eq!(page1.len(), 2);
+    assert_eq!(hex::decode(&page1[0].body).unwrap(), b"msg-4");
+    assert_eq!(hex::decode(&page1[1].body).unwrap(), b"msg-3");
+
+    // Page 2: cursor = oldest received_at on page 1 (msg-3's wall_ms).
+    let cursor = page1[1].received_at;
+    let page2 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
+        .await
+        .expect("page 2 ok");
+    assert_eq!(page2.len(), 2);
+    assert_eq!(hex::decode(&page2[0].body).unwrap(), b"msg-2");
+    assert_eq!(hex::decode(&page2[1].body).unwrap(), b"msg-1");
+
+    // Page 3: cursor = oldest received_at on page 2 (msg-1's wall_ms).
+    let cursor = page2[1].received_at;
+    let page3 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
+        .await
+        .expect("page 3 ok");
+    assert_eq!(page3.len(), 1, "only msg-0 left");
+    assert_eq!(hex::decode(&page3[0].body).unwrap(), b"msg-0");
+
+    // Page 4: cursor = oldest received_at on page 3 → empty.
+    let cursor = page3[0].received_at;
+    let page4 = read_dm_thread_inner(&state, cas.as_ref(), space_id, 2, Some(cursor), alice)
+        .await
+        .expect("page 4 ok");
+    assert!(page4.is_empty(), "no entries past the oldest message");
+
+    // Pagination invariant: pages 1+2+3 cover all 5 messages, no overlap, no
+    // skips. Concatenate decoded bodies and assert the full descending
+    // sequence.
+    let mut all_bodies: Vec<Vec<u8>> = Vec::new();
+    for m in page1.iter().chain(page2.iter()).chain(page3.iter()) {
+        all_bodies.push(hex::decode(&m.body).unwrap());
+    }
+    assert_eq!(
+        all_bodies,
+        vec![
+            b"msg-4".to_vec(),
+            b"msg-3".to_vec(),
+            b"msg-2".to_vec(),
+            b"msg-1".to_vec(),
+            b"msg-0".to_vec(),
+        ],
+        "pagination covers all 5 in descending order, no overlap/skips"
+    );
+}

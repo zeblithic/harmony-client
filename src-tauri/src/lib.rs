@@ -1716,6 +1716,250 @@ async fn send_dm(
     Ok(hex::encode(msg_id.0))
 }
 
+// ── ZEB-228 Phase 4: read_dm_thread (cold-start scrollback) ──────────────
+
+/// Phase 4 cold-start scrollback IPC payload — one decrypted message in a
+/// DM Space's history. Hex-encoded fields are sized for the Tauri JSON
+/// channel (Vec<u8> would round-trip through base64; hex is what every
+/// other DM-shaped payload in this codebase uses).
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DmThreadMessage {
+    /// Hex-encoded ContentId (32 bytes → 64 hex chars).
+    pub message_cid: String,
+    /// Hex-encoded sender OwnerAddr (16 bytes → 32 hex chars). For
+    /// self-sent messages, equals self_owner; for received messages,
+    /// equals the original sender's OwnerAddr.
+    pub from: String,
+    /// `MessagePayload.sent_at.wall_ms` — sender's HLC at compose time.
+    pub sent_at: u64,
+    /// `InboxEntry.received_at.wall_ms` — local HLC at apply_inbox time.
+    /// Pagination cursor: callers pass the oldest entry's value as
+    /// `before_hlc` to fetch the next page.
+    pub received_at: u64,
+    /// Hex-encoded plaintext body (decrypted from CAS storage_blob).
+    pub body: String,
+    pub mime_type: String,
+    /// True iff `from == self_owner` — UI uses this to right-align the
+    /// bubble + skip the avatar fetch for self.
+    pub is_self_outbound: bool,
+}
+
+/// Pure inner implementation of `read_dm_thread`. The `#[tauri::command]`
+/// shim snapshots NodeState handles, drops the sync mutex, and calls this.
+///
+/// Behavior matches the IPC contract:
+///   1. `space_id` MUST exist in `state.spaces`; otherwise `UnknownSpace`.
+///   2. The Space MUST have a `content_key`; otherwise `MissingContentKey`.
+///   3. InboxEntries are filtered to `space_id`, sorted by `received_at`
+///      DESCENDING (newest first), the optional `before_hlc` cursor
+///      filters out entries with `received_at.wall_ms >= cursor`, then
+///      truncated to `limit`.
+///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
+///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
+///      fallback (matches `handle_cidnotify`'s receive path so post-key-
+///      rotation scrollback works).
+///   5. Any per-entry CAS miss (`Ok(None)`) or fetch error (`Err(_)`) or
+///      decrypt failure surfaces as a single `Err` with the failing
+///      message_cid in the message — caller can retry. (Partial-result
+///      handling is a follow-up if needed; today's UI is fine with
+///      "scrollback failed, retry".)
+///
+/// The pure-function shape lets integration tests exercise the decrypt +
+/// pagination logic without standing up a tauri::State<NodeState>.
+pub async fn read_dm_thread_inner(
+    state: &crate::owner_state_crdt::OwnerState,
+    cas: &dyn crate::content_store::ContentStore,
+    space_id: crate::owner_state_types::SpaceId,
+    limit: usize,
+    before_hlc: Option<u64>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<Vec<DmThreadMessage>, String> {
+    let space = state
+        .spaces
+        .get(&space_id)
+        .ok_or_else(|| format!("UnknownSpace({space_id:?})"))?;
+    let content_key = space
+        .content_key
+        .clone()
+        .ok_or_else(|| format!("MissingContentKey({space_id:?})"))?;
+    let prior_content_keys = space.prior_content_keys.clone();
+    let aad = crate::dm_crypto::compute_aad(space).map_err(|e| format!("compute_aad: {e}"))?;
+
+    // Filter + sort (descending received_at) + cursor + truncate. All in
+    // memory; no .await crosses the borrow of `state`.
+    let mut entries: Vec<crate::owner_state_types::InboxEntry> =
+        state.inbox_entries_for_space(space_id).cloned().collect();
+    // Sort by received_at descending. Hlc has no Ord impl, so compare on
+    // the (wall_ms, logical, device_id) tuple — same lex ordering
+    // `is_strictly_newer_than` uses.
+    entries.sort_by(|a, b| {
+        let ka = (
+            b.received_at.wall_ms,
+            b.received_at.logical,
+            &b.received_at.device_id,
+        );
+        let kb = (
+            a.received_at.wall_ms,
+            a.received_at.logical,
+            &a.received_at.device_id,
+        );
+        ka.cmp(&kb)
+    });
+    if let Some(cursor) = before_hlc {
+        entries.retain(|e| e.received_at.wall_ms < cursor);
+    }
+    entries.truncate(limit);
+
+    decrypt_inbox_entries(
+        cas,
+        &content_key,
+        &prior_content_keys,
+        &aad,
+        entries,
+        self_owner,
+    )
+    .await
+}
+
+/// ZEB-228 Phase 4 — Cold-start DM scrollback IPC.
+///
+/// Returns InboxEntries for a given Space (self-sent + received), each
+/// with its decrypted body + mime_type. Reverse-chronological order by
+/// `received_at`. Paginated via `limit` + `before_hlc` cursor:
+///
+/// - `space_id_hex`: 32-character hex of a 16-byte SpaceId.
+/// - `limit`: max entries per page (UI page size, typical 50).
+/// - `before_hlc`: if `Some(wall_ms)`, return entries with
+///   `received_at.wall_ms < before_hlc`. None = newest first page.
+///
+/// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
+/// fallback (matches `handle_cidnotify`'s receive path), so scrollback
+/// after a content_key rotation still surfaces older messages encrypted
+/// under the previous key.
+///
+/// Frontend uses this on first DM-channel switch to populate the
+/// TextFeed with history. To paginate: pass the oldest entry's
+/// `received_at` as `before_hlc` for the next call.
+#[tauri::command]
+async fn read_dm_thread(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id_hex: String,
+    limit: usize,
+    before_hlc: Option<u64>,
+) -> Result<Vec<DmThreadMessage>, String> {
+    // Snapshot handles under the sync mutex; release before any .await.
+    // (Same pattern as send_dm — NodeState's sync mutex must not span
+    // .await boundaries.)
+    let (crdt_state, cas, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.content_store.clone().ok_or("content_store missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+        )
+    };
+
+    let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Two-phase: gather everything we need under the OwnerState lock
+    // (no .await), drop the lock, then run the cas.get + decrypt loop
+    // unlocked. This honors the locks-across-await rule (mirrors ZEB-241
+    // pending refactor's pattern).
+    let (entries, content_key, prior_content_keys, aad) = {
+        let state_guard = crdt_state.lock().await;
+        let space = state_guard
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| format!("UnknownSpace({space_id:?})"))?;
+        let content_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| format!("MissingContentKey({space_id:?})"))?;
+        let prior = space.prior_content_keys.clone();
+        let aad = crate::dm_crypto::compute_aad(space).map_err(|e| format!("compute_aad: {e}"))?;
+
+        let mut entries: Vec<crate::owner_state_types::InboxEntry> = state_guard
+            .inbox_entries_for_space(space_id)
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| {
+            let ka = (
+                b.received_at.wall_ms,
+                b.received_at.logical,
+                &b.received_at.device_id,
+            );
+            let kb = (
+                a.received_at.wall_ms,
+                a.received_at.logical,
+                &a.received_at.device_id,
+            );
+            ka.cmp(&kb)
+        });
+        if let Some(cursor) = before_hlc {
+            entries.retain(|e| e.received_at.wall_ms < cursor);
+        }
+        entries.truncate(limit);
+
+        (entries, content_key, prior, aad)
+    };
+
+    decrypt_inbox_entries(
+        cas.as_ref(),
+        &content_key,
+        &prior_content_keys,
+        &aad,
+        entries,
+        self_owner,
+    )
+    .await
+}
+
+/// Helper: fetch + decrypt a pre-filtered + pre-sorted slice of
+/// InboxEntries. Shared between the `tauri::command` (which gathers
+/// entries under the OwnerState lock and drops it before calling this)
+/// and `read_dm_thread_inner` (which the integration tests use without
+/// a NodeState).
+async fn decrypt_inbox_entries(
+    cas: &dyn crate::content_store::ContentStore,
+    content_key: &crate::owner_state_types::DmContentKey,
+    prior_content_keys: &[crate::owner_state_types::DmContentKey],
+    aad: &[u8],
+    entries: Vec<crate::owner_state_types::InboxEntry>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<Vec<DmThreadMessage>, String> {
+    let mut out: Vec<DmThreadMessage> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let blob = cas
+            .get(&entry.message_cid)
+            .await
+            .map_err(|e| format!("cas.get failed for {:?}: {e:?}", entry.message_cid))?
+            .ok_or_else(|| format!("blob missing for {:?}", entry.message_cid))?;
+        let payload =
+            crate::dm_crypto::decrypt_dm_message(content_key, prior_content_keys, aad, &blob)
+                .map_err(|e| format!("decrypt failed for {:?}: {e:?}", entry.message_cid))?;
+        out.push(DmThreadMessage {
+            message_cid: hex::encode(entry.message_cid.to_bytes()),
+            from: hex::encode(entry.from.0),
+            sent_at: payload.sent_at.wall_ms,
+            received_at: entry.received_at.wall_ms,
+            body: hex::encode(&payload.body),
+            mime_type: payload.mime_type,
+            is_self_outbound: entry.from == self_owner,
+        });
+    }
+    Ok(out)
+}
+
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
 ///
 /// The frontend uses this to identify self-sent messages in the Zenoh echo.
@@ -3802,6 +4046,7 @@ pub fn run() {
             publish_profile,
             send_message,
             send_dm,
+            read_dm_thread,
             get_node_addr,
             list_content,
             pin_content,
