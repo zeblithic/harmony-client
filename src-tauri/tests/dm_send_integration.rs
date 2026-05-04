@@ -9,7 +9,7 @@
 use harmony_app::dm_outbox::{DmOutbox, StubTransport};
 use harmony_app::owner_state_crdt::{ApplyOutcome, OwnerState};
 use harmony_app::owner_state_types::{
-    DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
 };
 
 #[tokio::test]
@@ -65,7 +65,13 @@ async fn send_dm_round_trip_through_dm_outbox() {
     ));
 
     let cas = harmony_app::content_store::InMemoryStub::default();
-    let mut outbox = DmOutbox::new("dev".into(), alice);
+    // Phase 3b: DmOutbox::new takes signing_key + signing_device_hash for
+    // ack fan-out in handle_cidnotify. This Phase-2 test only exercises the
+    // sender-side path (send_dm + drain + mark_ack_delivered) so the values
+    // are inert — synthetic SigningKey + arbitrary DeviceIdentityHash.
+    let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+    let our_device_hash = DeviceIdentityHash([0xaa; 16]);
+    let mut outbox = DmOutbox::new("dev".into(), alice, our_device_hash, signing_key);
     let transport = StubTransport::new();
 
     // 1. send_dm

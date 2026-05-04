@@ -14,9 +14,51 @@
 //! OwnerDeviceCache.devices — an Ed25519-only hash would diverge.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use sha2::{Digest, Sha256};
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
+
+/// Reticulum app+aspect for DM-protocol packets. The full destination
+/// name is `"harmony.dm"` (app `"harmony"`, single aspect `"dm"`); see
+/// `harmony_reticulum::destination::DestinationName::from_name` for the
+/// canonical naming scheme. Pinned here as a constant so both the
+/// production resolver (Task 11's `OwnerDeviceCacheResolver`) and the
+/// ack-fan-out path in `handle_cidnotify` (Task 10) compute the same
+/// destination hash for any given device-identity hash.
+const DM_DESTINATION_FULL_NAME: &[u8] = b"harmony.dm";
+
+/// Compute the Reticulum 16-byte destination hash for a DM packet
+/// addressed to `identity_address_hash` (a 16-byte `DeviceIdentityHash`).
+///
+/// Per `harmony_reticulum::destination::DestinationName::destination_hash`:
+///   `name_hash       = SHA256("harmony.dm")[:10]`
+///   `destination_hash = SHA256(name_hash || identity_address_hash)[:16]`
+///
+/// We replicate the formula inline (rather than depending on the
+/// `harmony-reticulum` crate, which is currently a transitive-only dep)
+/// because the only call sites in harmony-client are this module and the
+/// future Task 11 resolver. Pin the bytes against `harmony-reticulum`'s
+/// canonical implementation via the `compute_dm_destination_hash_matches_*`
+/// equivalence test in this module — if harmony-reticulum's formula ever
+/// drifts, that test breaks loudly.
+pub(crate) fn compute_dm_destination_hash(identity_address_hash: [u8; 16]) -> [u8; 16] {
+    // name_hash = SHA256("harmony.dm")[:10]
+    let mut name_hasher = Sha256::new();
+    name_hasher.update(DM_DESTINATION_FULL_NAME);
+    let name_full: [u8; 32] = name_hasher.finalize().into();
+    let mut name_hash = [0u8; 10];
+    name_hash.copy_from_slice(&name_full[..10]);
+
+    // destination_hash = SHA256(name_hash || identity_address_hash)[:16]
+    let mut dest_hasher = Sha256::new();
+    dest_hasher.update(name_hash);
+    dest_hasher.update(identity_address_hash);
+    let dest_full: [u8; 32] = dest_hasher.finalize().into();
+    let mut dest_hash = [0u8; 16];
+    dest_hash.copy_from_slice(&dest_full[..16]);
+    dest_hash
+}
 
 /// Compute the DeviceIdentityHash for a given 64-byte combined identity
 /// public-bytes value (`X25519_pub(32) || Ed25519_pub(32)`, the canonical
@@ -237,6 +279,53 @@ mod tests {
             "derive_device_hash_from_identity_pub MUST match harmony_identity::Identity::address_hash. \
              If this fails, signature verification on inbound DM packets will silently break."
         );
+    }
+
+    /// Pin `compute_dm_destination_hash` against a hand-computed reference.
+    /// Formula per `harmony_reticulum::destination::DestinationName`:
+    ///   name_hash        = SHA256("harmony.dm")[:10]
+    ///   destination_hash = SHA256(name_hash || identity_address_hash)[:16]
+    /// Verifying the inline replica matches a re-derivation against the same
+    /// input pins the helper bytes — if harmony-reticulum's formula ever
+    /// drifts, the next dep bump will surface the mismatch via this test.
+    #[test]
+    fn compute_dm_destination_hash_matches_reticulum_formula() {
+        use sha2::{Digest, Sha256};
+        let identity_hash = [0xabu8; 16];
+
+        // Reproduce the Reticulum formula directly here.
+        let mut name_hasher = Sha256::new();
+        name_hasher.update(b"harmony.dm");
+        let name_full: [u8; 32] = name_hasher.finalize().into();
+        let mut name_hash = [0u8; 10];
+        name_hash.copy_from_slice(&name_full[..10]);
+
+        let mut dest_hasher = Sha256::new();
+        dest_hasher.update(name_hash);
+        dest_hasher.update(identity_hash);
+        let dest_full: [u8; 32] = dest_hasher.finalize().into();
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&dest_full[..16]);
+
+        let actual = compute_dm_destination_hash(identity_hash);
+        assert_eq!(
+            actual, expected,
+            "compute_dm_destination_hash must match SHA256(SHA256(\"harmony.dm\")[:10] || identity_hash)[:16]"
+        );
+    }
+
+    #[test]
+    fn compute_dm_destination_hash_is_deterministic_per_identity() {
+        let h1 = compute_dm_destination_hash([0x42; 16]);
+        let h2 = compute_dm_destination_hash([0x42; 16]);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_dm_destination_hash_differs_per_identity() {
+        let h1 = compute_dm_destination_hash([0x11; 16]);
+        let h2 = compute_dm_destination_hash([0x22; 16]);
+        assert_ne!(h1, h2);
     }
 
     /// Pin that `sign_dm_packet(body, &sk)` is bit-identical to

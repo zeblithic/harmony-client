@@ -868,8 +868,25 @@ async fn start_node(
                     // with the SyncEngine; the StubTransport is the in-process
                     // Phase 2 stand-in (Phase 3b replaces with a real
                     // RuntimeAction::SendUnicastToDevice adapter).
+                    //
+                    // ZEB-227 Phase 3b Task 10: DmOutbox::new now takes a
+                    // signing key + signing_device_hash for the DmAck fan-out
+                    // path in handle_cidnotify. Wire `loaded.device_signing_key`
+                    // and `our_addr_bytes` here as a stopgap — Task 11 swaps
+                    // both to the proper Reticulum-identity signing key once
+                    // the production transport replaces StubTransport. The
+                    // current StubTransport doesn't exercise these fields, so
+                    // any compile-time-correct values suffice for now.
+                    let signing_key_arc = std::sync::Arc::new(loaded.device_signing_key.clone());
+                    let our_signing_device_hash =
+                        crate::owner_state_types::DeviceIdentityHash(our_addr_bytes);
                     let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outbox::DmOutbox::new(device_id.clone(), self_owner),
+                        crate::dm_outbox::DmOutbox::new(
+                            device_id.clone(),
+                            self_owner,
+                            our_signing_device_hash,
+                            signing_key_arc,
+                        ),
                     ));
                     let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
                         std::sync::Arc::new(crate::dm_outbox::StubTransport::new());

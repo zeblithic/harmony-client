@@ -249,6 +249,15 @@ pub struct DrainOutcome {
     pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
     /// Entries that transitioned to Expired this tick.
     pub newly_expired: Vec<OutboxEntryId>,
+    /// Phase 3b: InboxEntries written by `handle_cidnotify` for which
+    /// `apply_inbox` returned `ApplyOutcome::Inserted` (NOT `Merged`/NoOp).
+    /// The caller emits `dm-received` IPC events from this field. Per spec
+    /// §"Idempotency and drain semantics", the inserted-vs-already-present
+    /// discriminant from `apply_inbox` is the atomic-emit boundary;
+    /// duplicate notifies hitting the same `(space_id, message_cid)` key
+    /// don't re-emit. `drain` (sender-side) leaves this empty; only
+    /// `handle_cidnotify` (receiver-side) populates it.
+    pub newly_received: Vec<crate::owner_state_types::InboxEntry>,
 }
 
 /// Per-process DM-outbox state. One instance per running node, shared between
@@ -261,15 +270,33 @@ pub struct DrainOutcome {
 pub struct DmOutbox {
     pub(crate) device_id: String,
     pub(crate) self_owner: OwnerAddr,
+    /// Phase 3b: our device-Identity hash, used as the
+    /// `signing_device_hash` in outbound DmAck packets fanned out by
+    /// `handle_cidnotify`. Mirrors `RuntimeUnicastTransport`'s field of
+    /// the same name; both are populated from the same identity-management
+    /// site in production (Task 11 wires `lib.rs::start_node`).
+    pub(crate) our_signing_device_hash: DeviceIdentityHash,
+    /// Phase 3b: our device's Ed25519 signing key, used to sign outbound
+    /// DmAck packets in `handle_cidnotify`. Held via `Arc` so the outbox
+    /// can outlive any single owning context — `RuntimeUnicastTransport`
+    /// holds it the same way.
+    pub(crate) signing_key: Arc<ed25519_dalek::SigningKey>,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
 }
 
 impl DmOutbox {
-    pub fn new(device_id: String, self_owner: OwnerAddr) -> Self {
+    pub fn new(
+        device_id: String,
+        self_owner: OwnerAddr,
+        our_signing_device_hash: DeviceIdentityHash,
+        signing_key: Arc<ed25519_dalek::SigningKey>,
+    ) -> Self {
         Self {
             device_id,
             self_owner,
+            our_signing_device_hash,
+            signing_key,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
         }
@@ -797,21 +824,216 @@ impl DmOutbox {
         Ok(DrainOutcome::default())
     }
 
-    /// STUB — Task 10 implements.
+    /// Inbound `DmCidNotify` handler — Phase 3b receive path.
+    ///
+    /// Per ZEB-216 spec §"Wire format" Flow 2 steps 7-13:
+    ///   7a. Look up signing pubkey via `lookup_pubkey_for_device`. None →
+    ///       `UnknownSigningKey` (pre-bootstrap state — drop, telemetry).
+    ///       Verify signature via `dm_signing::verify_dm_packet_signature`
+    ///       (key-substitution defense + Ed25519 verify).
+    ///   7b. `resolve_signed_origin_owner(cache, signing_device_hash)` →
+    ///       `resolved_owner` (UnknownSigningDevice / AmbiguousSigningDevice
+    ///       drop on degenerate cache states).
+    ///   7c. `signed.sender_owner_addr ?= resolved_owner` — drop
+    ///       `OwnerFieldMismatch` on cache-poisoning.
+    ///   8.  `apply_owner_device_update` with notify.sender_devices and
+    ///       a parallel pubs vec (Some at the signer's index, None
+    ///       elsewhere). LWW HLC uses our local wall clock — this is OUR
+    ///       record of when WE learned about these devices, not the
+    ///       sender's HLC. Rejected outcome ignored (our cache may be
+    ///       fresher than what just arrived).
+    ///   9.  Look up Space (SpaceNotFound drops if we're not a member).
+    ///       `cas.get(message_cid)` with 500ms tokio::time::timeout. Three
+    ///       drop paths: blob not found, fetch error, timeout — all
+    ///       surface as `CasFetchFailed`.
+    ///   11. `decrypt_dm_message` with prior-keys fallback (current key
+    ///       first, then each prior).
+    ///   12. `verify_sender_binding(payload, resolved_owner)` —
+    ///       encrypted-payload-layer check that the body's sender field
+    ///       matches the wire-layer cryptographically-authenticated source.
+    ///   13a. `apply_inbox` + atomic-emit: only `Inserted` (NOT NoOp /
+    ///        Merged) populates `DrainOutcome.newly_received`. Duplicate
+    ///        notifies stay silent per spec §"Idempotency and drain
+    ///        semantics".
+    ///   13b. DmAck fan-out: build_signed_ack with our signing key + our
+    ///        signing_device_hash; encode_packet; one
+    ///        `UnicastSendRequest` per device in signed.sender_devices.
+    ///        Failed sends are silent per spec (no retry on the ack
+    ///        itself).
+    ///
+    /// Sanity gates run BEFORE expensive operations (signature verify,
+    /// CAS fetch, decrypt). Cheaper checks first.
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_cidnotify(
         &mut self,
-        _state: &mut OwnerState,
-        _cas: &dyn ContentStore,
-        _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        _signed: crate::dm_envelope::DmCidNotifySigned,
-        _signature: [u8; 64],
-        _signed_bytes: &[u8],
-        _wall_now_ms: u64,
+        state: &mut OwnerState,
+        cas: &dyn ContentStore,
+        unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        signed: crate::dm_envelope::DmCidNotifySigned,
+        signature: [u8; 64],
+        signed_bytes: &[u8],
+        wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        Err(DmReceiveError::Decode(
-            "Task 10 implements handle_cidnotify".into(),
-        ))
+        // Step 7a: look up signing pubkey + verify signature.
+        let identity_pub =
+            lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+                .ok_or(DmReceiveError::UnknownSigningKey)?;
+        crate::dm_signing::verify_dm_packet_signature(
+            signed_bytes,
+            &signature,
+            &identity_pub,
+            signed.signing_device_hash,
+        )?;
+
+        // Step 7b: resolve signing_device_hash → OwnerAddr.
+        let resolved_owner =
+            resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+
+        // Step 7c: verify notify.sender_owner_addr matches the resolved
+        // owner. Drops cache-poisoning attempts where a peer claims a
+        // sender_owner_addr that doesn't agree with the cryptographically-
+        // authenticated source.
+        if signed.sender_owner_addr != resolved_owner {
+            return Err(DmReceiveError::OwnerFieldMismatch);
+        }
+
+        // Look up Space for AAD + content_key. SpaceNotFound is the
+        // "we are not a member" / "stale notify after we left" drop path.
+        let space = state
+            .spaces
+            .get(&signed.space_id)
+            .ok_or(DmReceiveError::SpaceNotFound)?
+            .clone();
+
+        // Step 8: refresh OwnerDeviceCache with notify.sender_devices.
+        // Pubs vec: Some(identity_pub) at the signer's index (we just
+        // verified that hash → pub binding), None at every other index
+        // (Path B post-bootstrap — non-signer devices remain pubs-less
+        // until the next signed packet from each surfaces them).
+        // HLC uses our local wall clock + device_id (this is OUR record
+        // of when WE learned, NOT the sender's HLC).
+        let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
+        if let Some(idx) = signed
+            .sender_devices
+            .iter()
+            .position(|d| *d == signed.signing_device_hash)
+        {
+            updated_pubs[idx] = Some(identity_pub);
+        }
+        // Ignore the apply outcome — Rejected (StaleHlc) is acceptable
+        // here, our cache may already be fresher than what just arrived.
+        let _ = state.apply_owner_device_update(
+            resolved_owner,
+            signed.sender_devices.clone(),
+            updated_pubs,
+            Hlc {
+                wall_ms: wall_now_ms,
+                logical: 0,
+                device_id: self.device_id.clone(),
+            },
+        );
+
+        // Step 9: fetch storage_blob from CAS with 500ms timeout. The
+        // timeout matters in production where cas.get goes through the
+        // cas_op channel and may wait on Zenoh DAG-sync; tests using
+        // InMemoryStub return immediately so the timeout is never hit.
+        let blob = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cas.get(&signed.message_cid),
+        )
+        .await
+        {
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => return Err(DmReceiveError::CasFetchFailed("blob not found".into())),
+            Ok(Err(e)) => return Err(DmReceiveError::CasFetchFailed(format!("{e:?}"))),
+            Err(_) => return Err(DmReceiveError::CasFetchFailed("500ms fetch timeout".into())),
+        };
+
+        // Step 11: decrypt with prior-keys fallback.
+        // `space.content_key` is non-None for any DM/group-DM Space that
+        // passed `validate_invariants` — the invariant check in
+        // `apply_space_with_canonicalization` (which wrote this Space into
+        // state) rejects DM/group-DM Spaces with content_key=None.
+        let aad = crate::dm_crypto::compute_aad(&space)
+            .map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
+        let payload = crate::dm_crypto::decrypt_dm_message(
+            space
+                .content_key
+                .as_ref()
+                .expect("DM Space MUST have content_key per validate_invariants"),
+            &space.prior_content_keys,
+            &aad,
+            &blob,
+        )
+        .map_err(|_| DmReceiveError::DecryptFailed)?;
+
+        // Step 12: sender-binding check (encrypted-payload layer).
+        // Wire-layer says the signer's owner is `resolved_owner`; the
+        // encrypted body's `sender` field MUST agree.
+        crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
+            .map_err(|_| DmReceiveError::SenderImpersonation)?;
+
+        // Step 13a: apply_inbox — atomic-emit semantics.
+        // Only `Inserted` (NOT `Merged` — composite-key collision via a
+        // duplicate notify) populates newly_received. Caller emits
+        // dm-received IPC ONLY for Inserted entries.
+        let inbox_entry = crate::owner_state_types::InboxEntry {
+            space_id: signed.space_id,
+            message_cid: signed.message_cid,
+            from: resolved_owner,
+            received_at: Hlc {
+                wall_ms: wall_now_ms,
+                logical: 0,
+                device_id: self.device_id.clone(),
+            },
+        };
+        let outcome = state.apply_inbox(inbox_entry.clone());
+        let mut drain_outcome = DrainOutcome::default();
+        if matches!(outcome, ApplyOutcome::Inserted) {
+            drain_outcome.newly_received.push(inbox_entry);
+        }
+
+        // Step 13b: DmAck fan-out to all sender_devices.
+        // Build the ack signed by US (our signing key, our device hash).
+        // ack_from_devices = our currently-known devices for self_owner
+        // from OwnerDeviceCache, falling back to just us if no entry yet
+        // (pre-Flow-A-bootstrap). signing_device_hash MUST be in
+        // ack_from_devices (envelope invariant) — fall back to a
+        // single-element vec to satisfy that.
+        let our_ack_devices = state
+            .owner_device_cache
+            .devices
+            .get(&self.self_owner)
+            .map(|e| e.devices.clone())
+            .filter(|devs| devs.contains(&self.our_signing_device_hash))
+            .unwrap_or_else(|| vec![self.our_signing_device_hash]);
+        let ack_signed = crate::dm_envelope::DmAckSigned {
+            space_id: signed.space_id,
+            message_cid: signed.message_cid,
+            ack_from_owner_addr: self.self_owner,
+            ack_from_devices: our_ack_devices,
+            signing_device_hash: self.our_signing_device_hash,
+        };
+        let ack_packet = crate::dm_envelope::build_signed_ack(ack_signed, &self.signing_key)
+            .map_err(|e| DmReceiveError::Decode(format!("build_signed_ack: {e}")))?;
+        let ack_wire = crate::dm_envelope::encode_packet(&ack_packet)
+            .map_err(|e| DmReceiveError::Decode(format!("encode_packet ack: {e}")))?;
+
+        // Compute one dest_hash per sender device + push UnicastSendRequest.
+        // dest_hash = SHA256(name_hash("harmony.dm") || identity_address_hash)[:16]
+        // — same convention the future Task 11 production resolver uses.
+        // Failed sends are silent per spec — no retry on the ack itself.
+        for device in &signed.sender_devices {
+            let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+            let _ = unicast_send_tx
+                .send(UnicastSendRequest {
+                    destination_hash: dest_hash,
+                    packet: ack_wire.clone(),
+                })
+                .await;
+        }
+
+        Ok(drain_outcome)
     }
 
     /// STUB — Task 11 implements (the Phase 3b version replaces the Phase 2
@@ -942,9 +1164,8 @@ fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
 /// `deserialize_device_identities` on every load — see
 /// `owner_state_types.rs:286-307`).
 // Task 9 (handle_invite) does NOT call this — invites carry the inviter
-// inline so resolution is unnecessary. Tasks 10 (handle_cidnotify) and 11
-// (handle_ack) will be the first consumers.
-#[allow(dead_code)] // Wired in by Tasks 10/11 (handle_cidnotify/handle_ack).
+// inline so resolution is unnecessary. Task 10 (handle_cidnotify) is the
+// first consumer; Task 11 (handle_ack) will be the second.
 pub(crate) fn resolve_signed_origin_owner(
     cache: &OwnerDeviceCache,
     signing_device_hash: DeviceIdentityHash,
@@ -978,7 +1199,6 @@ pub(crate) fn resolve_signed_origin_owner(
 /// (not just Ed25519) so `verify_dm_packet_signature` can re-derive the
 /// `signing_device_hash` and confirm the cached pub actually maps to the
 /// hash the body claims (key-substitution defense).
-#[allow(dead_code)] // Wired in by Tasks 10/11 (handle_cidnotify/handle_ack).
 pub(crate) fn lookup_pubkey_for_device(
     cache: &OwnerDeviceCache,
     signing_device_hash: DeviceIdentityHash,
@@ -1001,6 +1221,24 @@ mod tests {
     use super::*;
     use crate::content_store::InMemoryStub;
     use crate::owner_state_types::{ContentId, DmContentKey, Space, TransportBinding};
+
+    /// Test-only helper: build a `DmOutbox` with synthetic signing key +
+    /// device hash that don't actually verify against each other. Most
+    /// tests in this module are sender-side / state-machine-only paths that
+    /// never invoke handle_cidnotify (which is the only consumer of the new
+    /// signing fields), so synthetic values suffice. Tests that DO verify
+    /// signature bytes (the handle_invite suite, the handle_cidnotify suite
+    /// added in Phase 3b Task 10) construct keys + hashes from
+    /// `harmony_identity::PrivateIdentity::from_seed` directly.
+    fn make_outbox_synthetic(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+        DmOutbox::new(
+            device_id.into(),
+            self_owner,
+            DeviceIdentityHash([0xaa; 16]),
+            signing_key,
+        )
+    }
 
     fn entry(id: u8) -> OutboxEntry {
         OutboxEntry {
@@ -1115,7 +1353,7 @@ mod tests {
 
     #[test]
     fn dm_outbox_constructs_with_empty_state() {
-        let o = DmOutbox::new("dev".into(), OwnerAddr([0xaa; 16]));
+        let o = make_outbox_synthetic("dev", OwnerAddr([0xaa; 16]));
         assert_eq!(o.device_id, "dev");
         assert_eq!(o.self_owner, OwnerAddr([0xaa; 16]));
         assert!(o.in_flight.is_empty());
@@ -1132,7 +1370,7 @@ mod tests {
         install_space(&mut state, sp);
 
         let cas = InMemoryStub::default();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let msg_id = o
             .send_dm(
                 &mut state,
@@ -1170,7 +1408,7 @@ mod tests {
         install_space(&mut state, sp);
 
         let cas = InMemoryStub::default();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let err = o
             .send_dm(
                 &mut state,
@@ -1190,7 +1428,7 @@ mod tests {
     async fn send_dm_unknown_space_rejects() {
         let mut state = OwnerState::default();
         let cas = InMemoryStub::default();
-        let mut o = DmOutbox::new("dev".into(), OwnerAddr([0x01; 16]));
+        let mut o = make_outbox_synthetic("dev", OwnerAddr([0x01; 16]));
         let err = o
             .send_dm(
                 &mut state,
@@ -1238,7 +1476,7 @@ mod tests {
         let entry_id = entry.id;
         install_outbox_entry(&mut state, entry);
 
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let inserted = o.mark_ack_delivered(&mut state, entry_id, bob);
 
         assert!(inserted, "first ack inserts");
@@ -1256,7 +1494,7 @@ mod tests {
         let entry_id = entry.id;
         install_outbox_entry(&mut state, entry);
 
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let first = o.mark_ack_delivered(&mut state, entry_id, bob);
         let second = o.mark_ack_delivered(&mut state, entry_id, bob);
 
@@ -1335,7 +1573,7 @@ mod tests {
     #[tokio::test]
     async fn handle_unicast_invalid_packet_returns_decode_error() {
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([0xff; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([0xff; 16]));
         let cas = InMemoryStub::default();
         let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
 
@@ -1382,7 +1620,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let outcome = o.drain(&mut state, &transport, 2_000).await;
 
         assert!(
@@ -1417,7 +1655,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let _ = o.drain(&mut state, &transport, 2_000).await;
 
         // Only dave is outstanding.
@@ -1443,7 +1681,7 @@ mod tests {
             Err(TransportError::Transient("net down".into())),
         );
 
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let _ = o.drain(&mut state, &transport, 10_000).await;
         assert_eq!(
             transport.sends(),
@@ -1478,7 +1716,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         // wall_now = created + 30 days + 1s
         let wall_now = 1_000 + EXPIRATION_MS + 1_000;
         let outcome = o.drain(&mut state, &transport, wall_now).await;
@@ -1503,7 +1741,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let outcome = o.drain(&mut state, &transport, 2_000).await;
 
         assert!(outcome.newly_delivered.is_empty());
@@ -1528,7 +1766,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let _ = o.drain(&mut state, &transport, 2_000).await;
 
         let sends = transport.sends();
@@ -1558,7 +1796,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
 
         let _ = o.drain(&mut state, &transport, 0).await;
         assert_eq!(transport.sends().len(), 1, "first attempt fires at t=0");
@@ -1596,7 +1834,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
 
         let _ = o.drain(&mut state, &transport, 2_000).await;
         assert_eq!(transport.sends().len(), 1);
@@ -1656,7 +1894,7 @@ mod tests {
         state.spaces.insert(space_id, sp);
 
         let cas = InMemoryStub::default();
-        let mut o = DmOutbox::new("dev".into(), alice);
+        let mut o = make_outbox_synthetic("dev", alice);
         let err = o
             .send_dm(
                 &mut state,
@@ -1828,7 +2066,7 @@ mod tests {
         use crate::owner_state_crdt::OwnerState;
 
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
 
         // Build a real signed DmInvite via PrivateIdentity::from_seed.
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
@@ -1886,7 +2124,7 @@ mod tests {
         // binding rule".
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -1929,7 +2167,7 @@ mod tests {
     async fn handle_invite_inviter_not_in_members_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -1967,7 +2205,7 @@ mod tests {
     async fn handle_invite_signing_device_not_in_sender_devices_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -2020,7 +2258,7 @@ mod tests {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
         // self_owner NOT in invite.members.
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([99; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([99; 16]));
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -2057,7 +2295,7 @@ mod tests {
     async fn handle_invite_tampered_signature_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -2094,5 +2332,646 @@ mod tests {
             err
         );
         assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
+    }
+
+    // ── Phase 3b Task 10: handle_cidnotify tests ────────────────────────
+
+    /// Build the standard receive-side fixture: a self-owner Bob (the
+    /// `outbox`'s self_owner), a peer Alice with a known signing identity
+    /// pre-seeded into Bob's
+    /// `OwnerDeviceCache.devices[alice].device_identity_pubs`, a DM Space
+    /// shared between them, and an InMemoryStub CAS pre-seeded with an
+    /// encrypted MessagePayload addressed `from = alice`.
+    ///
+    /// Async because `cas.put` is on the `ContentStore` async trait — the
+    /// in-memory impl never actually yields, but the interface forces an
+    /// `await`.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_cidnotify_fixture(
+        space_id: SpaceId,
+        space_kind: SpaceKind,
+        alice: OwnerAddr,
+        alice_seed: u8,
+        bob: OwnerAddr,
+        message_body: &[u8],
+        content_key: DmContentKey,
+    ) -> (
+        OwnerState,
+        InMemoryStub,
+        crate::dm_envelope::DmCidNotifySigned,
+        [u8; 64],
+        Vec<u8>,
+        DeviceIdentityHash,
+        [u8; 64], // alice's full identity_pub (used by some tests)
+        ContentId,
+    ) {
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[alice_seed; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+
+        // Pre-seed Bob's view of Alice in OwnerDeviceCache (post-bootstrap).
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        // Build + install the shared DM Space (Bob is also a member).
+        let mut sorted = [alice, bob];
+        sorted.sort();
+        let space = Space {
+            id: space_id,
+            kind: space_kind,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: sorted.to_vec(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+        };
+        let outcome = state.apply_space_with_canonicalization(space.clone());
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "fixture install failed: {outcome:?}"
+        );
+
+        // Encrypt MessagePayload under content_key + space's AAD.
+        let payload = crate::dm_envelope::MessagePayload {
+            body: message_body.to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice, // sender-binding correct
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+
+        // Compute message_cid + write to CAS.
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cas = InMemoryStub::default();
+        cas.put(message_cid, blob).await.unwrap();
+
+        // Build + sign the DmCidNotify packet.
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        (
+            state,
+            cas,
+            signed,
+            signature,
+            signed_bytes,
+            alice_device_hash,
+            alice_identity_pub,
+            message_cid,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key,
+            )
+            .await;
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let outcome = outbox
+            .handle_cidnotify(
+                &mut state,
+                &cas,
+                &tx,
+                signed.clone(),
+                signature,
+                &signed_bytes,
+                500,
+            )
+            .await
+            .expect("happy path returns Ok");
+
+        // InboxEntry written.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry must be installed"
+        );
+        let entry = state.inbox.get(&inbox_key).unwrap();
+        assert_eq!(entry.from, alice);
+
+        // newly_received populated for the Inserted outcome.
+        assert_eq!(outcome.newly_received.len(), 1);
+        assert_eq!(outcome.newly_received[0].from, alice);
+        assert_eq!(outcome.newly_received[0].space_id, space_id);
+
+        // One UnicastSendRequest emitted per sender device (one device
+        // here, so exactly one).
+        let req = rx.try_recv().expect("ack must have been pushed");
+        assert!(!req.packet.is_empty(), "ack packet bytes must be non-empty");
+        assert!(rx.try_recv().is_err(), "exactly one ack expected");
+        // Ack packet decodes as DmAck with our signing_device_hash.
+        let ack = crate::dm_envelope::decode_packet(&req.packet).unwrap();
+        match ack {
+            crate::dm_envelope::DmPacket::Ack { signed: ack, .. } => {
+                assert_eq!(ack.space_id, space_id);
+                assert_eq!(ack.message_cid, message_cid);
+                assert_eq!(ack.ack_from_owner_addr, bob);
+            }
+            other => panic!("expected DmAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_duplicate_no_dm_received_emit() {
+        // Atomic-emit semantics: a duplicate notify (same composite key)
+        // MUST NOT re-emit dm-received. apply_inbox returns NoOp/Merged
+        // on the second call → newly_received stays empty. (The first
+        // call's full-ack-fan-out behavior is exercised by the happy-path
+        // test above; this test only checks the second-call
+        // empty-newly_received contract.)
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, _mcid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key,
+            )
+            .await;
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        // First call — happy path, newly_received populated.
+        let first = outbox
+            .handle_cidnotify(
+                &mut state,
+                &cas,
+                &tx,
+                signed.clone(),
+                signature,
+                &signed_bytes,
+                500,
+            )
+            .await
+            .expect("first call ok");
+        assert_eq!(
+            first.newly_received.len(),
+            1,
+            "first call must populate newly_received"
+        );
+        // Drain the ack the first call emitted so we can check the second
+        // call's emit count cleanly.
+        let _ = rx.try_recv();
+
+        // Second call — same packet bytes; apply_inbox returns Merged
+        // (composite key already exists), newly_received stays empty.
+        let second = outbox
+            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 600)
+            .await
+            .expect("second call ok (re-applies idempotently)");
+        assert!(
+            second.newly_received.is_empty(),
+            "duplicate notify MUST NOT re-emit dm-received (atomic-emit semantics)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_sender_binding_mismatch_drops() {
+        // Set MessagePayload.sender to a DIFFERENT owner than the wire-
+        // layer-resolved owner (alice). The signature still verifies
+        // (signing_device_hash → alice's identity), the cache update
+        // succeeds, but verify_sender_binding rejects with
+        // SenderImpersonation. No InboxEntry, no ack.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+
+        // Use the standard fixture but swap the encrypted payload's
+        // `sender` field for a different OwnerAddr. We re-do the fixture
+        // construction inline so we control the payload.sender mutation.
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        let mut sorted = [alice, bob];
+        sorted.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: sorted.to_vec(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+        };
+        state.apply_space_with_canonicalization(space.clone());
+
+        // Encrypt with payload.sender = an attacker (NOT alice).
+        let attacker = OwnerAddr([0xff; 16]);
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"forged".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: attacker,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "attacker-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cas = InMemoryStub::default();
+        cas.put(message_cid, blob).await.unwrap();
+
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let err = outbox
+            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::SenderImpersonation),
+            "expected SenderImpersonation, got {err:?}"
+        );
+        // No InboxEntry written.
+        assert!(state.inbox.is_empty());
+        // No ack emitted.
+        assert!(rx.try_recv().is_err(), "ack MUST NOT fire on impersonation");
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update() {
+        // signed.sender_owner_addr ≠ resolved_owner. The signature
+        // verifies, but Step 7c fails. Cache-poisoning regression:
+        // apply_owner_device_update MUST NOT be called.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (mut state, cas, mut signed, _signature, _signed_bytes, _adev, _apub, _mcid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key,
+            )
+            .await;
+
+        // Swap sender_owner_addr to an attacker. Re-sign the modified
+        // body so signature verification still passes — Step 7c is the
+        // explicit defense, NOT a downstream signature failure.
+        let attacker = OwnerAddr([0xff; 16]);
+        signed.sender_owner_addr = attacker;
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let new_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let new_signature = private_alice.sign(&new_signed_bytes);
+
+        // Snapshot the cache state for alice to confirm Step 8 didn't fire.
+        let alice_cache_before = state
+            .owner_device_cache
+            .devices
+            .get(&alice)
+            .cloned()
+            .expect("fixture pre-seeded alice");
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let err = outbox
+            .handle_cidnotify(
+                &mut state,
+                &cas,
+                &tx,
+                signed,
+                new_signature,
+                &new_signed_bytes,
+                500,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::OwnerFieldMismatch),
+            "expected OwnerFieldMismatch, got {err:?}"
+        );
+        // No InboxEntry, no ack.
+        assert!(state.inbox.is_empty());
+        assert!(rx.try_recv().is_err());
+        // Cache for alice unchanged (NOT updated by Step 8 — Step 7c
+        // returned BEFORE Step 8).
+        let alice_cache_after = state.owner_device_cache.devices.get(&alice).unwrap();
+        assert_eq!(
+            alice_cache_after, &alice_cache_before,
+            "cache MUST NOT be touched on OwnerFieldMismatch (cache-poisoning regression)"
+        );
+        // Attacker MUST NOT have been inserted into the cache.
+        assert!(
+            !state.owner_device_cache.devices.contains_key(&attacker),
+            "attacker OwnerAddr MUST NOT be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_unknown_signing_key_drops() {
+        // signing_device_hash IS known in the cache, but the
+        // device_identity_pubs[idx] entry is None (pre-bootstrap state —
+        // we know-the-hash-but-not-the-pub). lookup_pubkey_for_device
+        // returns None → UnknownSigningKey drop.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+
+        // Pre-seed cache with the device hash but None for the pub.
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![None], // pre-bootstrap: hash known, pub not yet learned
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        // Install a Space (so SpaceNotFound isn't the failure mode).
+        let mut sorted = [alice, bob];
+        sorted.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: sorted.to_vec(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(DmContentKey::new([0xab; 32])),
+            prior_content_keys: vec![],
+        };
+        state.apply_space_with_canonicalization(space);
+
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid: ContentId::from_bytes([0xee; 32]),
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let cas = InMemoryStub::default();
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let err = outbox
+            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::UnknownSigningKey),
+            "expected UnknownSigningKey, got {err:?}"
+        );
+        // No InboxEntry, no ack — we never got past Step 7a.
+        assert!(state.inbox.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_cidnotify_decrypt_failure_uses_prior_keys() {
+        // Space has prior_content_keys=[K1] and current key=K2. The blob
+        // is encrypted under K1. decrypt_dm_message tries current first
+        // (fails), then K1 (succeeds). InboxEntry written.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let k1 = DmContentKey::new([0x11; 32]);
+        let k2 = DmContentKey::new([0x22; 32]);
+
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        let mut sorted = [alice, bob];
+        sorted.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Alice".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: sorted.to_vec(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(k2.clone()),        // current = K2
+            prior_content_keys: vec![k1.clone()], // prior contains K1
+        };
+        state.apply_space_with_canonicalization(space.clone());
+
+        // Encrypt under K1 (the OLD key) — decrypt MUST fall back.
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"recovered".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&k1, &aad, &payload).unwrap();
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cas = InMemoryStub::default();
+        cas.put(message_cid, blob).await.unwrap();
+
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let outcome = outbox
+            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
+            .await
+            .expect("prior-key fallback must succeed");
+
+        assert_eq!(outcome.newly_received.len(), 1);
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(state.inbox.contains_key(&inbox_key));
     }
 }
