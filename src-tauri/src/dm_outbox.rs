@@ -458,15 +458,37 @@ impl DmOutbox {
             space_id,
             recipient_owners: recipients,
             message_cid,
-            created_at: sent_at,
+            created_at: sent_at.clone(),
             delivered_to: BTreeSet::new(),
             delivery_status: DeliveryStatus::Pending,
         };
         match state.apply_outbox(entry) {
-            ApplyOutcome::Inserted => Ok(entry_id),
-            ApplyOutcome::Merged { .. } => {
-                // Should not happen — fresh ULID can't collide with any existing entry.
+            ApplyOutcome::Inserted | ApplyOutcome::Merged { .. } => {
+                // Phase 4: Self-InboxEntry write for self-history persistence.
+                //
+                // InboxEntry semantics widen here from "received from someone
+                // else" to "exists in this Space's history (sender OR
+                // recipient)". A paired device receiving the same DmCidNotify
+                // writes its own InboxEntry on receipt; this self-write on
+                // the sending device matches what the paired device will
+                // write, so the InboxEntry table converges naturally without
+                // special-casing.
+                let self_inbox_entry = crate::owner_state_types::InboxEntry {
+                    space_id,
+                    message_cid,
+                    from: self.self_owner,
+                    received_at: sent_at.clone(),
+                };
+                let _ = state.apply_inbox(self_inbox_entry);
+                // Outcome ignored: Inserted is the happy path; Merged{old_id:
+                // None} fires if a paired device's CidNotify already wrote
+                // this CID first (cross-device race), which is fine — same
+                // payload, idempotent.
                 Ok(entry_id)
+                // Note: ApplyOutcome::Merged would also reach here. It "should
+                // not happen" because a fresh ULID can't collide with any
+                // existing entry, but we treat it the same as Inserted for
+                // safety.
             }
             ApplyOutcome::Rejected(r) => Err(SendDmError::CrdtRejected(r)),
         }
@@ -1470,7 +1492,7 @@ pub(crate) fn lookup_pubkey_for_device(
 mod tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{ContentId, DmContentKey, Space, TransportBinding};
+    use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space, TransportBinding};
 
     /// Test-only helper: build a `DmOutbox` with synthetic signing key +
     /// device hash that don't actually verify against each other. Most
@@ -1639,6 +1661,51 @@ mod tests {
         assert_eq!(stored.recipient_owners, vec![bob], "Alice excluded");
         assert!(stored.delivered_to.is_empty());
         assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn send_dm_writes_self_inbox_entry_alongside_outbox_entry() {
+        // Phase 4 self-history persistence: send_dm must write a self-InboxEntry
+        // alongside the OutboxEntry, so self-sent messages survive past
+        // OutboxEntry's lifetime (Complete entries can be GC'd; InboxEntry is
+        // the durable scrollback record).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let _msg_id = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"hello".to_vec(),
+                "text/plain".into(),
+                1_000_000,
+                None,
+            )
+            .await
+            .expect("send_dm must succeed");
+
+        // Self-InboxEntry exists at (space_id, message_cid) with from = self_owner.
+        let self_inbox: Vec<&InboxEntry> = state
+            .inbox
+            .values()
+            .filter(|e| e.space_id == space_id && e.from == o.self_owner)
+            .collect();
+        assert_eq!(
+            self_inbox.len(),
+            1,
+            "send_dm must write exactly one self-InboxEntry"
+        );
+        assert_eq!(
+            self_inbox[0].from, o.self_owner,
+            "self-InboxEntry from = self_owner"
+        );
     }
 
     #[tokio::test]

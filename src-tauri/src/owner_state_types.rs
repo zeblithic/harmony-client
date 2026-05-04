@@ -1676,6 +1676,24 @@ impl Ord for InboxKey {
     }
 }
 
+/// A persistent record that a DM message exists in this Space's history
+/// (sender OR recipient).
+///
+/// Originally InboxEntry meant "a message received from someone else";
+/// Phase 4 widens the semantics so that `dm_outbox::send_dm` writes a
+/// self-InboxEntry on every send, alongside the OutboxEntry. The motive:
+/// OutboxEntry is delivery-state-tracking (Pending/Partial/Complete/Expired)
+/// and Complete entries can be GC'd, but InboxEntry is the durable
+/// scrollback record. Without a self-InboxEntry, self-sent messages would
+/// vanish from the Space's history once the OutboxEntry is collected.
+///
+/// `from` distinguishes sender vs. receiver: `from == self_owner` for
+/// self-sent messages, `from == sender_owner` for received messages.
+///
+/// Cross-device convergence: a paired device receiving the same
+/// DmCidNotify writes its own InboxEntry on receipt with the same
+/// `(space_id, message_cid)` key, so the table converges across the
+/// originating + paired-receiving devices without special-casing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxEntry {
     #[serde(rename = "sp")]
