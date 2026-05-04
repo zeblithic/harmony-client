@@ -151,14 +151,23 @@
         members: args.members,
       })) as string;
       dmCreateDialogOpen = false;
-      // Give NavService a tick to apply the nav-updated event before we
-      // try to switch to the new node. The backend emits nav-updated as
-      // part of apply_space, but it travels through Tauri's IPC bridge
-      // asynchronously so a microtask isn't enough.
-      setTimeout(() => {
-        const newNode = navService.nodes.find((n) => n.id === spaceId);
-        if (newNode) handleNodeClick(newNode.id);
-      }, 50);
+      // Fix B from PR #81 review: there's no Rust-side `nav-updated`
+      // emit yet, so waiting on the IPC event meant the new DM never
+      // appeared in the nav tree. Synthesize the NavNode directly via
+      // navService — same logic the (still-wired) listener uses, so a
+      // future backend emit won't double-insert (the duplicate-added
+      // path preserves UI state via Fix G).
+      navService.addOrUpdateDmSpace({
+        action: 'added',
+        spaceId,
+        kind: args.kind,
+        name: args.name,
+        members: args.members,
+        parentId: null,
+      });
+      // Switch synchronously — the node is in navService.nodes now, no
+      // need for the old setTimeout delay.
+      handleNodeClick(spaceId);
     } catch (e) {
       // Phase 4 v1: log to console. The dialog's client-side recipient cap
       // catches the most common failure (16+ members); other failures
@@ -855,27 +864,42 @@
       const optimisticId = crypto.randomUUID();
       const optimistic: Message = {
         id: optimisticId,
-        sender: {
-          address: messageService.ownAddress ?? 'self',
-          displayName: 'You',
-        },
+        // Fix D from PR #81 review: self-sender uses the 'self' sentinel
+        // (matches the channel-publish convention). Using the real
+        // ownAddress here confused downstream classification (e.g.
+        // knownPeers derivation, isSelf computation in TextFeed).
+        sender: { address: 'self', displayName: 'You' },
         text,
         timestamp: Date.now(),
         media: [],
         priority,
         channel: activeChannel,
+        // Fix A from PR #81 review: top-level DMs have activeHub=''; the
+        // feed filter compares Message.hub against activeHub — without
+        // hub:'' here, the optimistic bubble fails the filter and never
+        // renders in the active feed.
+        hub: '',
         deliveryState: 'sending',
       };
       messageService.pushOptimistic(optimistic);
 
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const messageId = (await invoke('send_dm', {
+        // Fix C from PR #81 review: send_dm now returns
+        // { messageId, messageCid } (post-b58a15b). messageCid is the
+        // stable id (matches the dm-received echo / scrollback fetch);
+        // messageId is the OutboxEntryId used only for lifecycle
+        // correlation in dm-delivered / dm-expired / dm-deleted.
+        const result = (await invoke('send_dm', {
           spaceId: activeChannel,
           content: Array.from(new TextEncoder().encode(text)),
           mimeType: 'text/plain',
-        })) as string;
-        messageService.replaceOptimisticId(optimisticId, messageId);
+        })) as { messageId: string; messageCid: string };
+        messageService.replaceOptimisticId(
+          optimisticId,
+          result.messageCid,
+          result.messageId,
+        );
       } catch (e) {
         messageService.markFailed(optimisticId, String(e));
         console.error('DM send failed:', e);
@@ -1185,7 +1209,11 @@
 
 {#if dmCreateDialogOpen}
   <!-- ZEB-228 Phase 4: DM creation modal. Overlay-click and Esc dismiss;
-       inner content stops propagation so dialog clicks don't dismiss. -->
+       inner content stops click propagation so dialog clicks don't
+       dismiss. Fix H from PR #81 review: keydown propagation is NOT
+       stopped — the overlay's `onkeydown={Escape}` needs to receive
+       events whose target is inside .modal-content (e.g. when focus is
+       in the search input). Stopping keydown blocked Esc-to-dismiss. -->
   <div
     class="modal-overlay"
     role="presentation"
@@ -1197,7 +1225,6 @@
       role="dialog"
       aria-modal="true"
       onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
     >
       <DmCreateDialog
         profiles={navService.profiles}

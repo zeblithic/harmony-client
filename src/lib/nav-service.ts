@@ -99,69 +99,102 @@ export class NavService {
     this.unlisteners.push(unlistenProfile);
 
     const unlistenNav = await adapter.listen('nav-updated', (event) => {
-      const payload = event.payload as NavUpdatedPayload;
-      const { action, spaceId, kind, name, members, parentId } = payload;
-      // Phase 4 only handles DM/GroupDm Spaces — channel/community/folder
-      // events are reserved for other phases.
-      if (kind !== 'dm' && kind !== 'group-dm') return;
-
-      if (action === 'removed') {
-        const before = this.nodes.length;
-        this.nodes = this.nodes.filter((n) => n.id !== spaceId);
-        if (this.nodes.length !== before) this.onChange?.();
-        return;
-      }
-
-      const navType: NavNodeType = kind === 'dm' ? 'dm' : 'group-chat';
-      // For 1:1 DMs we can attach a Peer if we already know the profile.
-      // GroupDms (members.length > 1) get no peer — they have a member list.
-      const peerAddress = members && members.length === 1 ? members[0] : undefined;
-      const peerProfile = peerAddress ? this.profiles.get(peerAddress) : undefined;
-      const peer = peerAddress
-        ? {
-            address: peerAddress,
-            displayName: peerProfile?.displayName ?? name,
-            avatarUrl: peerProfile?.avatarUrl,
-          }
-        : undefined;
-      const newNode: NavNode = {
-        id: spaceId,
-        type: navType,
-        name,
-        parentId: parentId ?? null,
-        expanded: false,
-        unreadCount: 0,
-        unreadLevel: 'none',
-        peer,
-      };
-
-      if (action === 'added') {
-        // Avoid duplicate inserts if the same spaceId is already present
-        // (e.g. backend re-emits on reconnect / cold-start replay).
-        if (this.nodes.some((n) => n.id === spaceId)) {
-          this.nodes = this.nodes.map((n) => (n.id === spaceId ? newNode : n));
-        } else {
-          this.nodes = [...this.nodes, newNode];
-        }
-      } else if (action === 'modified') {
-        // Patch in-place — preserve existing parentId/expanded/unread state
-        // so user-applied folder placement and read state aren't clobbered
-        // by a name change.
-        let found = false;
-        this.nodes = this.nodes.map((n) => {
-          if (n.id !== spaceId) return n;
-          found = true;
-          return { ...n, name, peer };
-        });
-        if (!found) {
-          // Modified for an unknown spaceId — treat as added to stay
-          // self-healing on missed `added` events.
-          this.nodes = [...this.nodes, newNode];
-        }
-      }
-      this.onChange?.();
+      this.addOrUpdateDmSpace(event.payload as NavUpdatedPayload);
     });
     this.unlisteners.push(unlistenNav);
+  }
+
+  /**
+   * Phase 4 (ZEB-228) — apply a `nav-updated`-shaped payload to the
+   * NavNode tree. Extracted from the `nav-updated` listener so the
+   * frontend `add_space` IPC path (App.svelte:handleDmCreate) can
+   * synthesize the same NavNode without depending on a backend emit
+   * (no `nav-updated` emit exists on the Rust side yet — Fix B from
+   * PR #81 review).
+   */
+  addOrUpdateDmSpace(payload: NavUpdatedPayload): void {
+    const { action, spaceId, kind, name, members, parentId } = payload;
+    // Phase 4 only handles DM/GroupDm Spaces — channel/community/folder
+    // events are reserved for other phases.
+    if (kind !== 'dm' && kind !== 'group-dm') return;
+
+    if (action === 'removed') {
+      const before = this.nodes.length;
+      this.nodes = this.nodes.filter((n) => n.id !== spaceId);
+      if (this.nodes.length !== before) this.onChange?.();
+      return;
+    }
+
+    const navType: NavNodeType = kind === 'dm' ? 'dm' : 'group-chat';
+    // Fix F from PR #81 review: backend's `add_space` puts BOTH self
+    // and peer in `members` (sorted, deduped). For 1:1 DMs the peer is
+    // whichever member isn't us. Fall back to members[0] in the
+    // pre-bootstrap case where ownAddress isn't set yet, and to
+    // members.length===1 (legacy / test-only shape) for safety. Group
+    // DMs (kind='group-dm') never get a single-peer attachment.
+    let peerAddress: string | undefined;
+    if (kind === 'dm' && members && members.length > 0) {
+      if (this.ownAddress) {
+        peerAddress = members.find((a) => a !== this.ownAddress) ?? members[0];
+      } else {
+        peerAddress = members[0];
+      }
+    }
+    const peerProfile = peerAddress ? this.profiles.get(peerAddress) : undefined;
+    const peer = peerAddress
+      ? {
+          address: peerAddress,
+          displayName: peerProfile?.displayName ?? name,
+          avatarUrl: peerProfile?.avatarUrl,
+        }
+      : undefined;
+    const newNode: NavNode = {
+      id: spaceId,
+      type: navType,
+      name,
+      parentId: parentId ?? null,
+      expanded: false,
+      unreadCount: 0,
+      unreadLevel: 'none',
+      peer,
+    };
+
+    if (action === 'added') {
+      // Fix G from PR #81 review: a duplicate `added` (reconnect /
+      // cold-start replay) must not wipe user-applied UI state. Preserve
+      // parentId (folder placement), expanded, and unread counters from
+      // the existing node — only the network-derived fields (name, type,
+      // peer) get refreshed.
+      const existing = this.nodes.find((n) => n.id === spaceId);
+      if (existing) {
+        const merged: NavNode = {
+          ...newNode,
+          parentId: existing.parentId,
+          expanded: existing.expanded,
+          unreadCount: existing.unreadCount,
+          unreadLevel: existing.unreadLevel,
+        };
+        this.nodes = this.nodes.map((n) => (n.id === spaceId ? merged : n));
+      } else {
+        this.nodes = [...this.nodes, newNode];
+      }
+    } else if (action === 'modified') {
+      // Patch in-place — preserve existing parentId/expanded/unread state
+      // so user-applied folder placement and read state aren't clobbered
+      // by a name change.
+      let found = false;
+      this.nodes = this.nodes.map((n) => {
+        if (n.id !== spaceId) return n;
+        found = true;
+        return { ...n, name, peer };
+      });
+      if (!found) {
+        // Modified for an unknown spaceId — treat as added to stay
+        // self-healing on missed `added` events.
+        this.nodes = [...this.nodes, newNode];
+      }
+    }
+    this.onChange?.();
   }
 
   /** Look up a peer's status text by address. */

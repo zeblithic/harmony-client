@@ -123,6 +123,11 @@ export class MessageService {
         media: [],
         priority: 'standard',
         channel: payload.spaceId,
+        // App.svelte's feed filter checks `m.hub === activeHub`. Top-level
+        // DMs live with activeHub='' (findNearestFolder returns null).
+        // Without `hub:''` here the filter compares '' === undefined and
+        // DM messages never render. (Fix A from PR #81 review.)
+        hub: '',
       };
       this.messages = [...this.messages, msg];
       this.onChange?.();
@@ -154,14 +159,23 @@ export class MessageService {
     this.unlisteners.push(unlistenDmExpired);
 
     const unlistenDmDeleted = await adapter.listen('dm-deleted', (event) => {
-      const { spaceId, messageCid } = event.payload as {
+      const { spaceId, messageCid, messageId } = event.payload as {
         messageId?: string;
         spaceId: string;
         messageCid: string;
       };
       const before = this.messages.length;
+      // Fix C from PR #81 review: match either id (messageCid for
+      // scrollback / post-replaceOptimisticId shapes) or messageId (the
+      // pre-swap optimistic placeholder still keyed by OutboxEntryId).
+      // Either alone leaves orphaned bubbles in one of the two paths.
       this.messages = this.messages.filter(
-        (m) => !(m.channel === spaceId && m.id === messageCid),
+        (m) =>
+          !(
+            m.channel === spaceId &&
+            (m.id === messageCid ||
+              (messageId !== undefined && m.messageId === messageId))
+          ),
       );
       if (this.messages.length !== before) {
         // Drop from seenIds so a re-arrival of the same CID (e.g. peer
@@ -232,17 +246,31 @@ export class MessageService {
     this.onChange?.();
   }
 
-  replaceOptimisticId(optimisticId: string, realMessageId: string): void {
+  /**
+   * Phase 4 (ZEB-228) — swap an optimistic placeholder's id for the real
+   * `messageCid` (content-addressed; stable across optimistic /
+   * dm-received / scrollback / dm-deleted) AND attach `messageId` (the
+   * OutboxEntryId, used solely for lifecycle correlation in
+   * dm-delivered / dm-expired / dm-deleted).
+   *
+   * Fix C from PR #81 review: previously this took just `realMessageId`
+   * and used the OutboxEntryId as `id`, which broke dedup against the
+   * incoming `dm-received` echo (which uses `messageCid`).
+   */
+  replaceOptimisticId(
+    optimisticId: string,
+    messageCid: string,
+    messageId: string,
+  ): void {
     this.messages = this.messages.map((m) =>
       m.id === optimisticId
-        ? { ...m, id: realMessageId, messageId: realMessageId }
+        ? { ...m, id: messageCid, messageId }
         : m,
     );
-    // Update seenIds: the optimistic id is gone, the real one takes its
-    // place. Keeping the optimistic id in seenIds would silently dedupe a
-    // future (very unlikely) collision; better to release it.
+    // Update seenIds: drop the optimistic id, add the messageCid so the
+    // dm-received echo is deduped.
     this.seenIds.delete(optimisticId);
-    this.seenIds.add(realMessageId);
+    this.seenIds.add(messageCid);
     this.onChange?.();
   }
 
@@ -283,6 +311,10 @@ export class MessageService {
       body: string;
       mimeType: string;
       isSelfOutbound: boolean;
+      /** Backend (post-b58a15b) ships per-entry delivery state for self-
+       *  outbound messages: 'sending' | 'delivered' | 'expired' | 'failed'.
+       *  Undefined for received entries. (Fix E from PR #81 review.) */
+      deliveryState?: 'sending' | 'delivered' | 'expired' | 'failed';
     };
     const results = await this.adapter.invoke('read_dm_thread', {
       spaceId,
@@ -308,12 +340,16 @@ export class MessageService {
           media: [],
           priority: 'standard',
           channel: spaceId,
+          // Fix A from PR #81 review: top-level DMs use activeHub='' in
+          // App.svelte's feed filter — Messages need hub:'' to match.
+          hub: '',
         };
         if (r.isSelfOutbound) {
-          // Self-sent historical message: it's in our inbox, so peer
-          // ack already happened. No messageId — lifecycle correlation
-          // only matters for in-flight sends, not retrospective ones.
-          msg.deliveryState = 'delivered';
+          // Fix E from PR #81 review: consume backend's per-entry
+          // deliveryState (was hardcoded 'delivered'; now reflects
+          // outbox.delivery_status, e.g. 'sending' for entries not yet
+          // ack'd at restart time, 'expired' for the 30-day TTL run-out).
+          msg.deliveryState = r.deliveryState ?? undefined;
         }
         return msg;
       })

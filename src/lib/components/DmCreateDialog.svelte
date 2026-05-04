@@ -62,6 +62,7 @@
   <input
     type="text"
     placeholder="Search contacts…"
+    aria-label="Search contacts"
     bind:value={searchQuery}
     class="search-input"
   />

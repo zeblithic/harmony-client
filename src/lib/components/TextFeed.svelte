@@ -156,7 +156,7 @@
             {trustVersion}
             allMessages={messages}
             {onScrollToMessage}
-            isSelf={ownAddress !== '' && item.message.sender.address === ownAddress}
+            isSelf={item.message.sender.address === 'self' || (ownAddress !== '' && item.message.sender.address === ownAddress)}
             onDelete={onMessageDelete}
           />
           {#if threadMeta.has(item.message.id)}
