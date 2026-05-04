@@ -501,6 +501,39 @@ impl<'de> Deserialize<'de> for OwnerDeviceEntry {
                     }
                 }
                 merged.truncate(MAX_DEVICES_PER_OWNER);
+
+                // Defense-in-depth: every cached `Some(identity_pub)` MUST
+                // derive (via SHA256(pub)[:16] —
+                // `derive_device_hash_from_identity_pub`) to its paired
+                // `DeviceIdentityHash`. A poisoned snapshot or malicious
+                // peer's `OwnerState` blob could otherwise pair a hash
+                // with a non-matching pub, silently breaking every
+                // signature verify in `resolve_signed_origin_owner`.
+                // Reject at deserialize time so the bad state never enters
+                // the in-memory cache. Mirrors the parallel check in
+                // `apply_owner_device_update`.
+                for (d, p) in merged.iter() {
+                    if let Some(pub_bytes) = p {
+                        match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
+                            Some(derived) if derived == *d => {}
+                            Some(derived) => {
+                                return Err(A::Error::custom(format!(
+                                    "OwnerDeviceEntry has identity pub for device {:?} \
+                                     that derives to a different device hash {:?}",
+                                    d, derived
+                                )));
+                            }
+                            None => {
+                                return Err(A::Error::custom(format!(
+                                    "OwnerDeviceEntry has structurally-invalid identity pub \
+                                     for device {:?}",
+                                    d
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) =
                     merged.into_iter().unzip();
 
@@ -2621,6 +2654,20 @@ mod owner_device_entry_deserialize_tests {
         }
     }
 
+    /// Build a real (DeviceIdentityHash, [u8; 64]) pair from a seed where
+    /// the hash IS `derive_device_hash_from_identity_pub(&pub)`. Required
+    /// for any test that exercises a path now gated by the
+    /// pub-derives-to-hash invariant added in this commit — placeholder
+    /// pubs (e.g., `[0x42u8; 64]`) would now be rejected as
+    /// `D::Error::custom(...)` and mask the test's intent.
+    fn matching_device_pair(seed_byte: u8) -> (DeviceIdentityHash, [u8; 64]) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[seed_byte; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+        (device_hash, identity_pub)
+    }
+
     #[test]
     fn deserialize_rejects_oversized_devices() {
         // A wire input with > MAX_DEVICES_PER_OWNER (32) device hashes
@@ -2699,9 +2746,13 @@ mod owner_device_entry_deserialize_tests {
 
     #[test]
     fn owner_device_entry_serialize_includes_identity_pubs() {
+        // Use a real matching (hash, pub) pair so the new
+        // pub-derives-to-hash invariant in struct-level Deserialize
+        // doesn't reject the round-trip.
+        let (h1, p1) = matching_device_pair(0xa1);
         let entry = OwnerDeviceEntry {
-            devices: vec![DeviceIdentityHash([0xa1; 16])],
-            device_identity_pubs: vec![Some([0x42u8; 64])],
+            devices: vec![h1],
+            device_identity_pubs: vec![Some(p1)],
             learned_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -2718,12 +2769,20 @@ mod owner_device_entry_deserialize_tests {
     fn owner_device_entry_serialize_handles_unknown_pubs() {
         // Mid-bootstrap state: device hash is known but pub isn't yet
         // cached. The Option::None entries must round-trip cleanly.
+        // The Some(pub) entry uses a real derive-matching pair so the
+        // new pub-derives-to-hash invariant doesn't fire.
+        let (h1, p1) = matching_device_pair(0xa1);
+        let (h2, _) = matching_device_pair(0xa2);
+        // Pre-sort so the post-deserialize sorted order is unambiguous
+        // (the deserialize impl re-sorts; the serialize side does not).
+        let (devices, pubs) = if h1 < h2 {
+            (vec![h1, h2], vec![Some(p1), None])
+        } else {
+            (vec![h2, h1], vec![None, Some(p1)])
+        };
         let entry = OwnerDeviceEntry {
-            devices: vec![
-                DeviceIdentityHash([0xa1; 16]),
-                DeviceIdentityHash([0xa2; 16]),
-            ],
-            device_identity_pubs: vec![Some([0x42u8; 64]), None],
+            devices: devices.clone(),
+            device_identity_pubs: pubs.clone(),
             learned_at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -2734,8 +2793,9 @@ mod owner_device_entry_deserialize_tests {
         let recovered: OwnerDeviceEntry =
             crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
         assert_eq!(entry, recovered);
-        assert_eq!(recovered.device_identity_pubs[0], Some([0x42u8; 64]));
-        assert_eq!(recovered.device_identity_pubs[1], None);
+        // The Some(pub) entry survives round-trip; the None entry stays None.
+        assert!(recovered.device_identity_pubs.contains(&Some(p1)));
+        assert!(recovered.device_identity_pubs.contains(&None));
     }
 
     #[test]
@@ -2820,20 +2880,28 @@ mod owner_device_entry_deserialize_tests {
         // with re-ordered devices paired with the WRONG pubs.
         //
         // Wire shape (deliberately non-canonical):
-        //   devices = [d2, d1]  (descending — would be sorted to [d1, d2])
-        //   pubs    = [P2, P1]  (parallel to wire devices)
+        //   devices = [d_high, d_low]  (descending — would be sorted to [d_low, d_high])
+        //   pubs    = [P_high, P_low]  (parallel to wire devices)
         //
         // Under the fix, devices and pubs are zipped, sorted by hash,
         // then re-split — pubs follow devices through the sort and the
-        // result is [d1, d2] paired with [P1, P2].
-        let d1 = DeviceIdentityHash([0x11; 16]);
-        let d2 = DeviceIdentityHash([0x22; 16]);
-        let p1 = [0xaa; 64];
-        let p2 = [0xbb; 64];
+        // result is [d_low, d_high] paired with [P_low, P_high].
+        //
+        // Each (hash, pub) is a real derive-matching pair so the
+        // pub-derives-to-hash invariant doesn't fire. We then
+        // disambiguate which is "low" vs "high" by lex order on the
+        // derived hashes.
+        let (h_a, p_a) = matching_device_pair(0xa1);
+        let (h_b, p_b) = matching_device_pair(0xa2);
+        let (low_h, low_p, high_h, high_p) = if h_a < h_b {
+            (h_a, p_a, h_b, p_b)
+        } else {
+            (h_b, p_b, h_a, p_a)
+        };
 
         let raw = RawOwnerDeviceEntryWithPubs {
-            v: vec![d2, d1], // descending on the wire
-            p: vec![Some(p2), Some(p1)],
+            v: vec![high_h, low_h], // descending on the wire
+            p: vec![Some(high_p), Some(low_p)],
             l: hlc(7),
         };
         let mut bytes = Vec::new();
@@ -2841,10 +2909,14 @@ mod owner_device_entry_deserialize_tests {
 
         let entry: OwnerDeviceEntry = ciborium::from_reader(&bytes[..]).expect("decode entry");
 
-        assert_eq!(entry.devices, vec![d1, d2], "devices sorted ascending");
+        assert_eq!(
+            entry.devices,
+            vec![low_h, high_h],
+            "devices sorted ascending"
+        );
         assert_eq!(
             entry.device_identity_pubs,
-            vec![Some(p1), Some(p2)],
+            vec![Some(low_p), Some(high_p)],
             "pubs MUST follow devices through the sort \
              (parallel-vec correspondence preserved)"
         );
@@ -2918,8 +2990,9 @@ mod owner_device_entry_deserialize_tests {
         // pub = Some(P) — the merge rule prefers Some over None
         // regardless of order. The pre-fix `dedup_by_key` would have
         // kept the FIRST entry and dropped the Some.
-        let d = DeviceIdentityHash([0x11; 16]);
-        let p = [0xaa; 64];
+        // Real (hash, pub) pair so the new pub-derives-to-hash invariant
+        // doesn't fire.
+        let (d, p) = matching_device_pair(0xa1);
 
         let raw = RawOwnerDeviceEntryWithPubs {
             v: vec![d, d],
@@ -2935,6 +3008,42 @@ mod owner_device_entry_deserialize_tests {
             entry.device_identity_pubs,
             vec![Some(p)],
             "merge MUST prefer Some over None"
+        );
+    }
+
+    #[test]
+    fn owner_device_entry_deserialize_rejects_pub_with_mismatched_hash() {
+        // Defense-in-depth (mirror of `apply_owner_device_update`'s
+        // pub-derives-to-hash check): a snapshot or remote-replica blob
+        // that pairs a `Some(identity_pub)` with a `DeviceIdentityHash`
+        // that the pub does NOT derive to is malformed/poisoned.
+        // Loading it would silently break every later signature verify
+        // in `resolve_signed_origin_owner` — reject at deserialize time.
+        //
+        // Use a STRUCTURALLY-VALID pub (derived from a real
+        // PrivateIdentity) paired with a hash that does NOT derive from
+        // it — isolates the derives-to-different-hash branch.
+        let (real_hash, real_pub) = matching_device_pair(0xa1);
+        let mismatched_hash = DeviceIdentityHash([0x42; 16]);
+        assert_ne!(
+            real_hash, mismatched_hash,
+            "test fixture must keep mismatched_hash distinct from the derived hash"
+        );
+
+        let raw = RawOwnerDeviceEntryWithPubs {
+            v: vec![mismatched_hash],
+            p: vec![Some(real_pub)],
+            l: hlc(7),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&raw, &mut bytes).expect("encode raw");
+
+        let err = ciborium::from_reader::<OwnerDeviceEntry, _>(&bytes[..])
+            .expect_err("decode must reject pub that does not derive to its paired hash");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity pub") && msg.contains("device hash"),
+            "expected error mentioning identity pub deriving to a different device hash, got: {msg}"
         );
     }
 }

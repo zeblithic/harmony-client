@@ -20,7 +20,9 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
+use crate::owner_state_crypto::{
+    canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload,
+};
 use crate::owner_state_types::{
     deserialize_vec_from_bstr, serialize_vec_as_bstr, ContentId, DeviceIdentityHash, DmContentKey,
     Hlc, OwnerAddr, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER,
@@ -341,6 +343,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
     let packet = match disc {
         0x01 => {
             let signed: DmInviteSigned = decode_body(body_bytes)?;
+            ensure_canonical_body(&signed, body_bytes)?;
             // Phase 1 invariant: invites only flow over the DM transport
             // (Reticulum-unicast Dm/GroupDm). A non-DM kind on the wire is
             // either a malicious cross-protocol confusion attempt or a
@@ -405,6 +408,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
         }
         0x02 => {
             let signed: DmCidNotifySigned = decode_body(body_bytes)?;
+            ensure_canonical_body(&signed, body_bytes)?;
             if signed.sender_devices.len() > MAX_DEVICES_PER_OWNER {
                 return Err(DecodeError::Invalid(
                     "DmCidNotify.sender_devices exceeds MAX_DEVICES_PER_OWNER",
@@ -423,6 +427,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
         }
         0x03 => {
             let signed: DmAckSigned = decode_body(body_bytes)?;
+            ensure_canonical_body(&signed, body_bytes)?;
             if signed.ack_from_devices.len() > MAX_DEVICES_PER_OWNER {
                 return Err(DecodeError::Invalid(
                     "DmAck.ack_from_devices exceeds MAX_DEVICES_PER_OWNER",
@@ -469,6 +474,31 @@ fn decode_body<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
         });
     }
     Ok(value)
+}
+
+/// Re-encode `signed` via the same canonical CBOR encoder that
+/// `encode_packet` uses, and reject if the result differs from
+/// `body_bytes`. This is the round-trip invariant that pairs with
+/// `encode_packet`'s re-encode-from-`signed` guard (commit 6efc81f):
+/// the send path now always produces canonical bytes, and a future
+/// relay/cache-and-replay path would re-encode on send — so any
+/// non-canonical body accepted here would break signature verification
+/// downstream. Reject non-canonical bodies at the wire boundary.
+///
+/// Catches: reordered map keys, indefinite-length encodings, oversized
+/// integer/length prefixes, anything else where decode → canonical-
+/// re-encode is not byte-identical to the original.
+fn ensure_canonical_body<T: CanonicalPayload>(
+    signed: &T,
+    body_bytes: &[u8],
+) -> Result<(), DecodeError> {
+    let canonical = canonical_cbor_encode(signed).map_err(|e| DecodeError::Cbor(e.to_string()))?;
+    if canonical != body_bytes {
+        return Err(DecodeError::Invalid(
+            "DM packet body must use canonical CBOR",
+        ));
+    }
+    Ok(())
 }
 
 /// Helper: serialize `[u8; 64]` as CBOR bstr (major type 2). Mirrors
@@ -1212,5 +1242,85 @@ mod tests {
             }
             other => panic!("expected Invite, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn decode_packet_rejects_non_canonical_cbor_body() {
+        // Defense-in-depth pair to encode_packet's re-encode-from-`signed`
+        // invariant (commit 6efc81f). decode_packet must reject any body
+        // that is not the canonical encoding of the typed `signed` value
+        // — otherwise decode → encode is no longer byte-identical, which
+        // would break signature verification on any future relay /
+        // cache-and-replay path.
+        //
+        // Strategy: take a canonical CidNotify body, swap the leading
+        // definite-length map header (0xa5 — major type 5 << 5 | count 5)
+        // for an indefinite-length map header (0xbf) and append a CBOR
+        // break byte (0xff). Both encodings decode to the same
+        // DmCidNotifySigned via ciborium, but only the definite-length
+        // form is canonical. The decoder must therefore reject the
+        // indefinite-length variant.
+        let device_hash = DeviceIdentityHash([0x42; 16]);
+        let signed = sample_cidnotify_with_hash(device_hash);
+        let canonical = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        // Sanity: confirm the canonical leading byte is the 5-element
+        // definite-length map header. If this ever changes (e.g., the
+        // struct gains/loses a field) the test will surface it loudly
+        // rather than silently testing the wrong byte.
+        assert_eq!(
+            canonical[0], 0xa5,
+            "expected definite-length map(5) header 0xa5 at start of canonical CidNotify body, got 0x{:02x}",
+            canonical[0]
+        );
+
+        // Build the non-canonical variant: 0xbf + entries + 0xff.
+        let mut non_canonical = Vec::with_capacity(canonical.len() + 1);
+        non_canonical.push(0xbf);
+        non_canonical.extend_from_slice(&canonical[1..]);
+        non_canonical.push(0xff);
+
+        // Sanity: the non-canonical body still ciborium-decodes to the
+        // same value (otherwise we'd just be testing decode_body's
+        // CBOR-error path, not the canonical-body check).
+        let round_trip: DmCidNotifySigned =
+            ciborium::from_reader(non_canonical.as_slice()).unwrap();
+        assert_eq!(round_trip, signed);
+
+        // Assemble a wire packet: [disc=0x02][non_canonical_body][sig].
+        // Signature can be all zeros — the canonical-body check fires
+        // before signature verification ever runs.
+        let mut wire = Vec::with_capacity(1 + non_canonical.len() + 64);
+        wire.push(0x02);
+        wire.extend_from_slice(&non_canonical);
+        wire.extend_from_slice(&[0u8; 64]);
+
+        let err = decode_packet(&wire).unwrap_err();
+        match err {
+            DecodeError::Invalid(msg) => {
+                assert!(
+                    msg.contains("canonical"),
+                    "expected error mentioning canonical CBOR, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected DecodeError::Invalid('...canonical...'), got {:?}",
+                other
+            ),
+        }
+
+        // Sanity: the canonical version of the same body is accepted
+        // (proves the test is isolating the canonical-body check, not
+        // some other invariant).
+        let mut canonical_wire = Vec::with_capacity(1 + canonical.len() + 64);
+        canonical_wire.push(0x02);
+        canonical_wire.extend_from_slice(&canonical);
+        canonical_wire.extend_from_slice(&[0u8; 64]);
+        // We expect the decode to succeed structurally (signature is
+        // not validated by decode_packet — that happens in the receive
+        // handler).
+        let _decoded = decode_packet(&canonical_wire).expect(
+            "canonical-body wire packet must decode (canonical-body check is the only \
+             new gate in this test)",
+        );
     }
 }

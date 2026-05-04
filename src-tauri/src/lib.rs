@@ -894,11 +894,20 @@ async fn start_node(
                     // bit-identical to the one PrivateIdentity::sign uses
                     // internally (verified by sign_dm_packet_matches_private_identity_sign
                     // in dm_signing.rs).
-                    let ed25519_seed: [u8; 32] = reticulum_identity_bytes
-                        .as_ref()
-                        .expect("reticulum_identity_bytes populated above")[32..64]
-                        .try_into()
-                        .expect("64 - 32 == 32");
+                    // Wrap in Zeroizing — the signing seed must be scrubbed
+                    // when this scope ends, mirroring how
+                    // reticulum_identity_bytes is held above (line 772).
+                    // Without this the 32-byte stack copy would persist in
+                    // freed stack memory until overwritten.
+                    let ed25519_seed = zeroize::Zeroizing::new(
+                        <[u8; 32]>::try_from(
+                            &reticulum_identity_bytes
+                                .as_ref()
+                                .expect("reticulum_identity_bytes populated above")
+                                [32..64],
+                        )
+                        .expect("64 - 32 == 32"),
+                    );
                     let signing_key_arc =
                         std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
                     let our_signing_device_hash =

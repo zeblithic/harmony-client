@@ -519,6 +519,39 @@ impl OwnerState {
             }
         }
         merged.truncate(MAX_DEVICES_PER_OWNER);
+
+        // Defense-in-depth: every cached `Some(identity_pub)` MUST derive
+        // (via `derive_device_hash_from_identity_pub` = SHA256(pub)[:16])
+        // to its paired `DeviceIdentityHash`. A malformed/poisoned cache
+        // entry where the pair is mismatched would silently fail every
+        // later signature verify in `resolve_signed_origin_owner`,
+        // converting "this device's signature didn't match" into a
+        // confusing dead-letter; rejecting here surfaces the bug at
+        // apply time. `derive_device_hash_from_identity_pub` returns
+        // `None` for a structurally-invalid pub (malformed X25519 /
+        // Ed25519 split) — also reject as InvariantFail.
+        for (d, p) in merged.iter() {
+            if let Some(pub_bytes) = p {
+                match crate::dm_signing::derive_device_hash_from_identity_pub(pub_bytes) {
+                    Some(derived) if derived == *d => {}
+                    Some(derived) => {
+                        return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                            "owner_device_entry for {:?} has identity pub for device {:?} \
+                             that derives to a different device hash {:?}",
+                            addr, d, derived
+                        )));
+                    }
+                    None => {
+                        return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                            "owner_device_entry for {:?} has structurally-invalid identity pub \
+                             for device {:?}",
+                            addr, d
+                        )));
+                    }
+                }
+            }
+        }
+
         let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) = merged.into_iter().unzip();
 
         // LWW guard.
@@ -1983,6 +2016,20 @@ mod owner_device_cache_tests {
         }
     }
 
+    /// Build a real (DeviceIdentityHash, [u8; 64]) pair from a seed where
+    /// the hash IS `derive_device_hash_from_identity_pub(&pub)`. Required
+    /// for any test that exercises a path now gated by the
+    /// pub-derives-to-hash invariant added in this commit — placeholder
+    /// pubs (e.g., `[0x42u8; 64]`) would now be rejected as InvariantFail
+    /// and mask the test's intent.
+    fn matching_device_pair(seed_byte: u8) -> (DeviceIdentityHash, [u8; 64]) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[seed_byte; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+        (device_hash, identity_pub)
+    }
+
     #[test]
     fn lww_newer_replaces() {
         let mut c = OwnerDeviceCache::default();
@@ -2125,11 +2172,17 @@ mod owner_device_cache_tests {
     fn apply_owner_device_update_stores_identity_pubs_parallel_to_devices() {
         let mut state = OwnerState::default();
         let owner = OwnerAddr([1; 16]);
-        let devices = vec![
-            DeviceIdentityHash([0xa1; 16]),
-            DeviceIdentityHash([0xa2; 16]),
-        ];
-        let pubs = vec![Some([0x42u8; 64]), Some([0x43u8; 64])];
+        // Use real matching (hash, pub) pairs — placeholder pubs would
+        // now be rejected by the pub-derives-to-hash invariant.
+        let (h1, p1) = matching_device_pair(0xa1);
+        let (h2, p2) = matching_device_pair(0xa2);
+        // Pre-sort so the input is already canonical (the sort/merge
+        // path is exercised by `apply_owner_device_update_sort_dedup_keeps_pubs_aligned`).
+        let (devices, pubs) = if h1 < h2 {
+            (vec![h1, h2], vec![Some(p1), Some(p2)])
+        } else {
+            (vec![h2, h1], vec![Some(p2), Some(p1)])
+        };
         let learned_at = Hlc {
             wall_ms: 100,
             logical: 0,
@@ -2155,21 +2208,24 @@ mod owner_device_cache_tests {
         // — the merge rule accepts equal Somes (the "two replicas
         // converged on the same pub" case). Conflicting Somes are
         // covered by `apply_owner_device_update_rejects_conflicting_some_pubs`.
+        //
+        // Each (hash, pub) is a real derive-matching pair so the
+        // pub-derives-to-hash invariant doesn't fire.
         let mut state = OwnerState::default();
         let owner = OwnerAddr([1; 16]);
-        // Unsorted + duplicate input.
-        let devices = vec![
-            DeviceIdentityHash([0xa3; 16]), // index 0 → pub 0
-            DeviceIdentityHash([0xa1; 16]), // index 1 → pub 1
-            DeviceIdentityHash([0xa2; 16]), // index 2 → pub 2
-            DeviceIdentityHash([0xa1; 16]), // index 3 → pub 3 (DUPLICATE — merge collapses)
-        ];
-        let pubs = vec![
-            Some([0x33u8; 64]), // for [0xa3; 16]
-            Some([0x11u8; 64]), // for [0xa1; 16] (first occurrence)
-            Some([0x22u8; 64]), // for [0xa2; 16]
-            Some([0x11u8; 64]), // for [0xa1; 16] (duplicate, MATCHING — merge accepts)
-        ];
+        let (h_a, p_a) = matching_device_pair(0xa1);
+        let (h_b, p_b) = matching_device_pair(0xa2);
+        let (h_c, p_c) = matching_device_pair(0xa3);
+        // Compute the post-sort/dedup expected order from the real hashes
+        // (we don't know the lex order of derived hashes a priori).
+        let mut expected: Vec<(DeviceIdentityHash, [u8; 64])> =
+            vec![(h_a, p_a), (h_b, p_b), (h_c, p_c)];
+        expected.sort_by_key(|(h, _)| *h);
+
+        // Unsorted + duplicate input (h_a appears twice with the same
+        // matching pub — merge accepts equal Somes).
+        let devices = vec![h_c, h_a, h_b, h_a];
+        let pubs = vec![Some(p_c), Some(p_a), Some(p_b), Some(p_a)];
         let learned_at = Hlc {
             wall_ms: 100,
             logical: 0,
@@ -2180,19 +2236,11 @@ mod owner_device_cache_tests {
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
 
         // Sorted ascending by hash, merged to 3 unique devices.
-        assert_eq!(
-            entry.devices,
-            vec![
-                DeviceIdentityHash([0xa1; 16]),
-                DeviceIdentityHash([0xa2; 16]),
-                DeviceIdentityHash([0xa3; 16]),
-            ]
-        );
-        // Parallel pubs must match the (sorted) hash order.
+        let expected_devices: Vec<DeviceIdentityHash> = expected.iter().map(|(h, _)| *h).collect();
+        let expected_pubs: Vec<Option<[u8; 64]>> = expected.iter().map(|(_, p)| Some(*p)).collect();
+        assert_eq!(entry.devices, expected_devices);
         assert_eq!(entry.device_identity_pubs.len(), 3);
-        assert_eq!(entry.device_identity_pubs[0], Some([0x11u8; 64])); // for [0xa1; 16]
-        assert_eq!(entry.device_identity_pubs[1], Some([0x22u8; 64])); // for [0xa2; 16]
-        assert_eq!(entry.device_identity_pubs[2], Some([0x33u8; 64])); // for [0xa3; 16]
+        assert_eq!(entry.device_identity_pubs, expected_pubs);
     }
 
     #[test]
@@ -2203,8 +2251,9 @@ mod owner_device_cache_tests {
         // preferring Some over None regardless of order.
         let mut state = OwnerState::default();
         let owner = OwnerAddr([1; 16]);
-        let d1 = DeviceIdentityHash([0xa1; 16]);
-        let p = [0x42u8; 64];
+        // Real matching (hash, pub) pair so the pub-derives-to-hash
+        // invariant doesn't fire — placeholder pubs would now reject.
+        let (d1, p) = matching_device_pair(0xa1);
         let learned_at = Hlc {
             wall_ms: 100,
             logical: 0,
@@ -2231,8 +2280,7 @@ mod owner_device_cache_tests {
         // canonical form is.
         let mut state = OwnerState::default();
         let owner = OwnerAddr([1; 16]);
-        let d1 = DeviceIdentityHash([0xa1; 16]);
-        let p = [0x42u8; 64];
+        let (d1, p) = matching_device_pair(0xa1);
         let learned_at = Hlc {
             wall_ms: 100,
             logical: 0,
@@ -2281,6 +2329,85 @@ mod owner_device_cache_tests {
         }
         // No partial state inserted.
         assert!(!state.owner_device_cache.devices.contains_key(&owner));
+    }
+
+    #[test]
+    fn apply_owner_device_update_rejects_pub_with_mismatched_hash() {
+        // Defense-in-depth: a `Some(identity_pub)` MUST derive (via
+        // SHA256(pub)[:16] = `derive_device_hash_from_identity_pub`) to
+        // its paired `DeviceIdentityHash`. A malformed/poisoned cache
+        // entry where the pair is mismatched would silently fail every
+        // later signature verify in `resolve_signed_origin_owner`,
+        // converting "this device's signature didn't match" into a
+        // confusing dead-letter. Reject at apply time so the bad state
+        // never enters the cache.
+        // Use a STRUCTURALLY-VALID pub (derived from a real
+        // PrivateIdentity) paired with a hash that does NOT derive from
+        // it — this isolates the derives-to-different-hash branch
+        // (vs. the structurally-invalid-pub branch, which would fire on
+        // arbitrary garbage like `[0x99; 64]`).
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let (real_hash, real_pub) = matching_device_pair(0xa1);
+        let mismatched_hash = DeviceIdentityHash([0x42; 16]);
+        // Sanity: confirm the test fixture really IS a mismatch.
+        assert_ne!(
+            real_hash, mismatched_hash,
+            "test fixture must keep mismatched_hash distinct from the derived hash"
+        );
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome = state.apply_owner_device_update(
+            owner,
+            vec![mismatched_hash],
+            vec![Some(real_pub)],
+            learned_at,
+        );
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("identity pub") && msg.contains("device hash"),
+                    "expected message about identity pub deriving to a different device hash, got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(InvariantFail), got {:?}", other),
+        }
+        // No partial state inserted.
+        assert!(!state.owner_device_cache.devices.contains_key(&owner));
+    }
+
+    #[test]
+    fn apply_owner_device_update_accepts_pub_with_matching_hash() {
+        // Sanity counterpart to
+        // `apply_owner_device_update_rejects_pub_with_mismatched_hash`:
+        // a real (hash, pub) pair derived from a `PrivateIdentity` must
+        // pass the new derive check and insert successfully.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let (device_hash, identity_pub) = matching_device_pair(0x42);
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome = state.apply_owner_device_update(
+            owner,
+            vec![device_hash],
+            vec![Some(identity_pub)],
+            learned_at,
+        );
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "expected Inserted with a real matching (hash, pub) pair, got {outcome:?}"
+        );
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.devices, vec![device_hash]);
+        assert_eq!(entry.device_identity_pubs, vec![Some(identity_pub)]);
     }
 
     // Helper that lets the test pass without naming the public method twice.
