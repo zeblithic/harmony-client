@@ -585,14 +585,22 @@ async fn start_node(
     // GetOrFetch uses a second-mpsc-hop re-entry pattern that briefly
     // doubles the queue depth. See spec §"Risks: cas_op_tx capacity".
     let (cas_op_tx, cas_op_rx) = tokio::sync::mpsc::channel::<crate::content_store::CasOp>(8);
-    // ZEB-227 Path B: outbound DM unicast channel. Sized at 64 to accommodate
-    // group-DM fan-out (16 members × 4 devices = 64 worst-case dispatches per
-    // send_dm). Sender clone is lifted onto NodeState so Task 11 can reach it
-    // when instantiating RuntimeUnicastTransport; receiver is consumed by
-    // event_loop::run's new select! arm (forwards each request as
+    // ZEB-227 Path B: outbound DM unicast channel. Sized at 256 to absorb
+    // realistic group-DM fan-out spikes: a single send_dm to a group can
+    // emit up to 16 members × 4 devices = 64 UnicastSendRequests, and
+    // overlapping batches from concurrent send_dm + handle_cidnotify ack
+    // fan-out can stack on top. 256 is "doubled-and-then-some" of that
+    // single-send bound — production try_send call sites
+    // (RuntimeUnicastTransport::send + handle_cidnotify ack fan-out)
+    // surface Transient on full so back-pressure NEVER causes deadlock
+    // even if the cap is exceeded; the larger cap just keeps that
+    // recovery path off the hot path. Sender clone is lifted onto
+    // NodeState so Task 11 can reach it when instantiating
+    // RuntimeUnicastTransport; receiver is consumed by event_loop::run's
+    // new select! arm (forwards each request as
     // RuntimeEvent::SendUnicastToDevice into NodeRuntime).
     let (unicast_send_tx, unicast_send_rx) =
-        tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(64);
+        tokio::sync::mpsc::channel::<crate::dm_outbox::UnicastSendRequest>(256);
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);

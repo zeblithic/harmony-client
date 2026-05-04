@@ -263,14 +263,24 @@ impl DmTransport for RuntimeUnicastTransport {
             .map_err(|e| TransportError::Permanent(format!("encode_packet: {e}")))?;
 
         for destination_hash in destinations {
+            // Use try_send (not send().await) because this transport runs
+            // inside the event-loop task that ALSO drains
+            // `unicast_send_rx`. .await on a full channel would deadlock
+            // the event loop on itself. Transient errors flow back into
+            // DmOutbox::drain's per-recipient backoff, which retries on
+            // the next tick once the channel has drained.
             self.tx
-                .send(UnicastSendRequest {
+                .try_send(UnicastSendRequest {
                     destination_hash,
                     packet: wire.clone(),
                 })
-                .await
-                .map_err(|e| {
-                    TransportError::Transient(format!("event-loop channel closed: {e}"))
+                .map_err(|e| match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        TransportError::Transient("unicast channel full".to_string())
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        TransportError::Transient(format!("event-loop channel closed: {e}"))
+                    }
                 })?;
         }
         Ok(())
@@ -1080,14 +1090,24 @@ impl DmOutbox {
         // dest_hash = SHA256(name_hash("harmony.dm") || identity_address_hash)[:16]
         // — same convention the future Task 11 production resolver uses.
         // Failed sends are silent per spec — no retry on the ack itself.
+        //
+        // Use try_send (not send().await) because handle_cidnotify is invoked
+        // from the same event-loop task that drains unicast_send_rx. .await
+        // on a full channel would deadlock the event loop on itself. On
+        // channel pressure we drop+warn; the sender's drain backoff
+        // retransmits the underlying CidNotify, which produces a fresh ack
+        // opportunity on the next inbound tick.
         for device in &signed.sender_devices {
             let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-            let _ = unicast_send_tx
-                .send(UnicastSendRequest {
-                    destination_hash: dest_hash,
-                    packet: ack_wire.clone(),
-                })
-                .await;
+            if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
+                destination_hash: dest_hash,
+                packet: ack_wire.clone(),
+            }) {
+                tracing::warn!(
+                    error = ?e,
+                    "ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
+                );
+            }
         }
 
         Ok(drain_outcome)
@@ -3356,5 +3376,104 @@ mod tests {
             matches!(err, DmReceiveError::OutboxEntryNotFound),
             "expected OutboxEntryNotFound, got {err:?}"
         );
+    }
+
+    // ── ZEB-227 PR #80 review fix: try_send pressure regressions ─────────
+
+    #[tokio::test]
+    async fn runtime_unicast_transport_send_returns_transient_when_channel_full() {
+        // RuntimeUnicastTransport::send must NOT .await on a full channel
+        // (deadlocks the event loop on itself). Verify it returns
+        // Transient — drain's per-recipient backoff drives the retry.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(1);
+        // Pre-fill the channel so the first try_send inside `send` hits
+        // TrySendError::Full.
+        tx.try_send(UnicastSendRequest {
+            destination_hash: [0u8; 16],
+            packet: vec![],
+        })
+        .expect("pre-fill must succeed on a fresh channel");
+
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+        let transport = RuntimeUnicastTransport::new(
+            tx,
+            OwnerAddr([0x01; 16]),
+            DeviceIdentityHash([0xaa; 16]),
+            signing_key,
+        );
+        let entry = entry(7);
+        // Non-empty destinations so we get past the empty-destinations
+        // Transient short-circuit and exercise the channel-full path.
+        let res = transport
+            .send(&entry, OwnerAddr([0x02; 16]), vec![[0xbb; 16]])
+            .await;
+        match res {
+            Err(TransportError::Transient(msg)) => {
+                assert!(
+                    msg.contains("unicast channel full"),
+                    "expected 'unicast channel full' Transient, got: {msg}"
+                );
+            }
+            other => panic!("expected Transient on full channel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_ack_fanout_silent_on_channel_full() {
+        // Ack fan-out on a saturated channel must not propagate as a
+        // DmReceiveError; the CidNotify body still applies (InboxEntry
+        // written, newly_received populated). Sender's drain backoff
+        // retransmits the CidNotify, which reopens the ack window.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key,
+            )
+            .await;
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        // Capacity 1, prefilled, so the ack-fan-out try_send hits Full.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(1);
+        tx.try_send(UnicastSendRequest {
+            destination_hash: [0u8; 16],
+            packet: vec![0xde, 0xad],
+        })
+        .expect("pre-fill must succeed on a fresh channel");
+
+        let outcome = outbox
+            .handle_cidnotify(
+                &mut state,
+                &cas,
+                &tx,
+                signed.clone(),
+                signature,
+                &signed_bytes,
+                500,
+            )
+            .await
+            .expect("CidNotify body must still apply even when ack channel is full");
+
+        // InboxEntry was installed.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry must still be installed despite dropped ack"
+        );
+        // newly_received populated for the Inserted outcome — ack drop
+        // does NOT suppress dm-received emission.
+        assert_eq!(outcome.newly_received.len(), 1);
+        assert_eq!(outcome.newly_received[0].from, alice);
     }
 }

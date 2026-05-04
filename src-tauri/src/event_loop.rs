@@ -597,6 +597,26 @@ pub async fn run<R: Runtime>(
     let mut voice_subs: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
+    // ZEB-227 PR #80 review fix: retry buffer for RuntimeActions whose
+    // dispatch transiently failed because dm_outbox/crdt_state locks were
+    // contended by an in-flight IPC handler. Today only
+    // `RuntimeAction::UnicastReceived` requeues here — dropping that
+    // packet on contention previously converted ordinary lock pressure
+    // into delivery failures with no caller-visible recovery (Reticulum
+    // is best-effort, so the upstream sender's CidNotify retransmit
+    // takes ~retransmit_interval to drive a redelivery).
+    //
+    // Capacity 32 caps the very-degraded fan-out (e.g. event-loop
+    // wedged behind a long-running IPC) so we don't unbounded-buffer.
+    // On full we drop+warn, which is no worse than the prior behavior.
+    // Each loop iteration drains AT MOST ONE queued action before
+    // entering the select! again; this keeps other arms (timer, UDP,
+    // shutdown) responsive even under a steady stream of contended
+    // packets.
+    let mut runtime_action_retry: std::collections::VecDeque<RuntimeAction> =
+        std::collections::VecDeque::with_capacity(32);
+    const RUNTIME_ACTION_RETRY_CAP: usize = 32;
+
     tracing::info!("event loop running");
 
     loop {
@@ -895,6 +915,7 @@ pub async fn run<R: Runtime>(
                             &broadcast_addr, &app, &closing, &own_zid,
                             dm_outbox.as_ref(), crdt_state.as_ref(),
                             cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                            &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                         ).await;
                     }
                     let _ = req.reply.send(Ok(()));
@@ -924,6 +945,7 @@ pub async fn run<R: Runtime>(
                                 &broadcast_addr, &app, &closing, &own_zid,
                                 dm_outbox.as_ref(), crdt_state.as_ref(),
                                 cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                                &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                             ).await;
                         }
                         // We do NOT inspect tick() actions for a "rejected"
@@ -1197,9 +1219,37 @@ pub async fn run<R: Runtime>(
                     crdt_state.as_ref(),
                     cas_handle.as_ref(),
                     unicast_send_tx.as_ref(),
+                    &mut runtime_action_retry,
+                    RUNTIME_ACTION_RETRY_CAP,
                 )
                 .await;
             }
+        }
+
+        // ZEB-227 PR #80 review fix: drain at most one queued
+        // RuntimeAction per loop iteration. Processing one-at-a-time
+        // means a steady stream of contended packets can't starve other
+        // select! arms (timer, UDP, shutdown). When locks are still
+        // contended on retry, `handle_runtime_action_or_dispatch`
+        // re-pushes onto the buffer; we'll try again next iteration.
+        if let Some(retry_action) = runtime_action_retry.pop_front() {
+            handle_runtime_action_or_dispatch(
+                retry_action,
+                &session,
+                &zenoh_tx,
+                &udp,
+                &broadcast_addr,
+                &app,
+                &closing,
+                &own_zid,
+                dm_outbox.as_ref(),
+                crdt_state.as_ref(),
+                cas_handle.as_ref(),
+                unicast_send_tx.as_ref(),
+                &mut runtime_action_retry,
+                RUNTIME_ACTION_RETRY_CAP,
+            )
+            .await;
         }
     }
 
@@ -1221,12 +1271,23 @@ pub async fn run<R: Runtime>(
 /// drop `UnicastReceived` — extracted here so all three `runtime.tick()`
 /// loops route consistently without duplicating the interception block.
 ///
-/// Lock acquisition uses `try_lock`: contention skips THIS tick and
-/// drops the packet. Mirrors the Phase 2 `dm_outbox` drain pattern in
-/// the timer arm — `.lock().await` here would re-introduce the deadlock
-/// chain (send_dm IPC + cas_op processing both contend on dm_outbox +
-/// crdt_state). Follow-up at PR-creation time investigates buffering vs
-/// higher-priority lock ordering; Phase 3b ships with drop-on-contention.
+/// Lock acquisition uses `try_lock`: contention requeues the action via
+/// `retry_buffer` so the next loop iteration retries once locks are free,
+/// instead of dropping the packet. `.lock().await` here would re-introduce
+/// the deadlock chain (send_dm IPC + cas_op processing both contend on
+/// dm_outbox + crdt_state). The retry buffer keeps inbound DMs reliable
+/// without the deadlock risk of awaiting on a contended lock.
+///
+/// `retry_buffer` is bounded: when full, the action is dropped+warned
+/// (very-degraded case; means event-loop is wedged behind a long IPC and
+/// >32 packets have queued — Reticulum CidNotify retransmit will redrive).
+///
+/// NOTE: a focused unit test for the requeue behavior is deferred — the
+/// `handle_runtime_action_or_dispatch` helper requires an `AppHandle`,
+/// `zenoh::Session`, `UdpSocket`, and several other handles to call,
+/// which the existing event_loop test modules don't currently scaffold.
+/// The fix-up is verified via type-checking of the requeue branch + the
+/// dm_outbox-side tests for the channel-pressure path.
 #[allow(clippy::too_many_arguments)]
 async fn handle_runtime_action_or_dispatch<R: Runtime>(
     action: RuntimeAction,
@@ -1241,13 +1302,10 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
     crdt_state: Option<&std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
     cas_handle: Option<&std::sync::Arc<dyn crate::content_store::ContentStore>>,
     unicast_send_tx: Option<&mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    retry_buffer: &mut std::collections::VecDeque<RuntimeAction>,
+    retry_buffer_cap: usize,
 ) {
-    if let RuntimeAction::UnicastReceived {
-        destination_hash: _,
-        source: _,
-        ref packet,
-    } = action
-    {
+    if matches!(action, RuntimeAction::UnicastReceived { .. }) {
         if let (Some(outbox), Some(state), Some(cas), Some(tx)) =
             (dm_outbox, crdt_state, cas_handle, unicast_send_tx)
         {
@@ -1255,12 +1313,19 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
             let state_try = state.try_lock();
             match (outbox_try, state_try) {
                 (Ok(mut outbox_g), Ok(mut state_g)) => {
+                    // Extract packet bytes from the action without cloning when
+                    // possible. We re-bind to take ownership inside the match
+                    // arm via destructuring of `action` itself.
+                    let packet = match &action {
+                        RuntimeAction::UnicastReceived { packet, .. } => packet.clone(),
+                        _ => unreachable!("matched UnicastReceived above"),
+                    };
                     let wall_now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let result = outbox_g
-                        .handle_unicast(&mut state_g, cas.as_ref(), tx, packet.clone(), wall_now_ms)
+                        .handle_unicast(&mut state_g, cas.as_ref(), tx, packet, wall_now_ms)
                         .await;
                     // Drop locks before IPC emits.
                     drop(state_g);
@@ -1302,9 +1367,21 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
                     }
                 }
                 _ => {
-                    tracing::debug!(
-                        "handle_unicast skipped this tick (locks contended); packet dropped"
-                    );
+                    // Locks contended — requeue this action so the next
+                    // loop iteration retries once locks free up. Bounded:
+                    // drop+warn when the retry buffer is full.
+                    if retry_buffer.len() >= retry_buffer_cap {
+                        tracing::warn!(
+                            cap = retry_buffer_cap,
+                            "UnicastReceived retry buffer full; dropping packet \
+                             (event loop appears wedged behind contended IPC)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "handle_unicast deferred this tick (locks contended); requeued"
+                        );
+                        retry_buffer.push_back(action);
+                    }
                 }
             }
             return;
