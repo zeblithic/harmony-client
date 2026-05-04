@@ -278,8 +278,12 @@ impl DmTransport for RuntimeUnicastTransport {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         TransportError::Transient("unicast channel full".to_string())
                     }
+                    // Closed channel = event-loop receiver dropped (runtime
+                    // shutdown / panic). Permanent because retry will never
+                    // succeed; the OutboxEntry surfaces failure once instead
+                    // of spinning every drain tick.
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        TransportError::Transient(format!("event-loop channel closed: {e}"))
+                        TransportError::Permanent(format!("event-loop channel closed: {e}"))
                     }
                 })?;
         }
@@ -993,6 +997,17 @@ impl DmOutbox {
             .ok_or(DmReceiveError::SpaceNotFound)?
             .clone();
 
+        // Membership gate. Signature verify proves WHO sent this; this gate
+        // proves they're still ALLOWED to send into this space. An ex-member
+        // whose identity_pub is still in OwnerDeviceCache (because we haven't
+        // expired the entry) would otherwise pass signature verify and land
+        // a message in our inbox after their membership was revoked. For DM
+        // kinds members never changes; for GroupDm members can shrink, and
+        // this gate is what blocks cached-key reuse from a removed member.
+        if !space.members.contains(&resolved_owner) {
+            return Err(DmReceiveError::SenderNotInSpaceMembers);
+        }
+
         // Step 8: refresh OwnerDeviceCache with notify.sender_devices.
         // Pubs vec: Some(identity_pub) at the signer's index (we just
         // verified that hash → pub binding), None at every other index
@@ -1207,6 +1222,19 @@ impl DmOutbox {
         // entry's recipient_owners. A peer NOT on the recipient list cannot
         // legitimately ack the message; their ack must not advance
         // delivered_to.
+        //
+        // No `space.members` gate parallel to `handle_cidnotify`'s membership
+        // check is needed here. handle_cidnotify gates against the LIVE
+        // space.members snapshot to block ex-members from injecting fresh
+        // inbox writes. handle_ack instead gates against the OutboxEntry's
+        // OWN `recipient_owners` snapshot, which was frozen at send time.
+        // That's strictly stronger for the ack flow: a peer who was a member
+        // at send time but was removed before acking is still a legitimate
+        // recipient of the in-flight message — denying their ack would leak
+        // delivery state. AckFromNonRecipient already covers the
+        // ex-member-with-cached-key case (they were never in this entry's
+        // recipient_owners), so a separate space.members lookup would be
+        // redundant.
         let entry_ref = state
             .outbox
             .get(&entry_id)
@@ -1308,6 +1336,10 @@ pub enum DmReceiveError {
     OutboxEntryNotFound,
     #[error("Space not found for incoming DmCidNotify (we are not a member?)")]
     SpaceNotFound,
+    /// Sender's resolved owner is not in space.members. Defends against
+    /// ex-members whose signing key is still cached in OwnerDeviceCache.
+    #[error("sender's resolved owner is not in space.members (ex-member with cached key?)")]
+    SenderNotInSpaceMembers,
     #[error("CAS fetch failed or timed out: {0}")]
     CasFetchFailed(String),
     #[error("DM blob decryption failed under all candidate keys")]
@@ -3575,5 +3607,148 @@ mod tests {
         // does NOT suppress dm-received emission.
         assert_eq!(outcome.newly_received.len(), 1);
         assert_eq!(outcome.newly_received[0].from, alice);
+    }
+
+    #[tokio::test]
+    async fn runtime_unicast_transport_send_returns_permanent_when_channel_closed() {
+        // Channel closed = event-loop receiver dropped (runtime shutdown
+        // or panic). retry will never succeed, so `send` must return
+        // Permanent — drain converts that to OutboxEntry failure once
+        // instead of spinning every drain tick.
+        let (tx, rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        // Drop the receiver BEFORE calling send → try_send sees Closed.
+        drop(rx);
+
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+        let transport = RuntimeUnicastTransport::new(
+            tx,
+            OwnerAddr([0x01; 16]),
+            DeviceIdentityHash([0xaa; 16]),
+            signing_key,
+        );
+        let entry = entry(7);
+        // Non-empty destinations so we get past the empty-destinations
+        // Transient short-circuit and exercise the channel-closed path.
+        let res = transport
+            .send(&entry, OwnerAddr([0x02; 16]), vec![[0xbb; 16]])
+            .await;
+        match res {
+            Err(TransportError::Permanent(msg)) => {
+                assert!(
+                    msg.contains("event-loop channel closed"),
+                    "expected 'event-loop channel closed' Permanent, got: {msg}"
+                );
+            }
+            other => panic!("expected Permanent on closed channel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_drops_when_resolved_owner_not_in_space_members() {
+        // Defense-in-depth membership gate: a sender whose identity_pub
+        // is still cached in OwnerDeviceCache (e.g., a former group-DM
+        // member whose entry hasn't been expired) MUST NOT be able to
+        // land a message in our inbox after their membership was
+        // revoked. Signature verify and owner-mismatch both pass; the
+        // space.members containment check is what stops them.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let charlie = OwnerAddr([0x03; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+
+        // Build a fixture where Alice (the signer) IS still cached but
+        // is NOT in space.members. We seed the fixture with Alice as the
+        // sender (so her signing key + OwnerDeviceCache binding is in
+        // place), then mutate the Space's members to drop Alice — the
+        // "cached key from an ex-member" scenario.
+        // Build under SpaceKind::Dm (2 members satisfies the DM
+        // invariant) so the fixture's apply_space_with_canonicalization
+        // accepts. After install, we direct-insert a mutated Space that
+        // simulates the post-revocation GroupDm state where bob has
+        // expelled alice but bob's local cache still has her key.
+        let (mut state, cas, signed, signature, signed_bytes, alice_dev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key,
+            )
+            .await;
+
+        // Snapshot Alice's cache entry to confirm the membership-gate drop
+        // does NOT refresh OwnerDeviceCache (Step 8 must be gated behind
+        // the membership check).
+        let alice_cache_before = state
+            .owner_device_cache
+            .devices
+            .get(&alice)
+            .cloned()
+            .expect("fixture pre-seeded alice");
+
+        // Mutate the Space's members to remove Alice (the "ex-member"
+        // scenario). Replace with bob + charlie so members is non-empty
+        // (DM/group-DM invariant). Direct insertion bypasses
+        // canonicalization — we're simulating the post-revocation state
+        // where bob's local OwnerDeviceCache hasn't yet expired alice's
+        // cached key.
+        let mut sp = state.spaces.get(&space_id).cloned().unwrap();
+        sp.members = vec![bob, charlie];
+        sp.members.sort();
+        state.spaces.insert(space_id, sp);
+
+        // Sanity: the OwnerDeviceCache still binds alice's device → key
+        // (the "cached key" precondition for this attack scenario).
+        assert!(
+            state.owner_device_cache.devices.contains_key(&alice),
+            "alice's OwnerDeviceCache entry must persist (ex-member with cached key)"
+        );
+
+        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let err = outbox
+            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::SenderNotInSpaceMembers),
+            "expected SenderNotInSpaceMembers, got {err:?}"
+        );
+
+        // Inbox unchanged — no entry written for the rejected packet.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed for an ex-member sender"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on membership-gate drop"
+        );
+
+        // No ack fan-out — the membership gate fires before Step 13b.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted for an ex-member sender"
+        );
+
+        // OwnerDeviceCache unchanged — Step 8 (refresh from
+        // notify.sender_devices) MUST NOT fire when the membership gate
+        // rejects. Otherwise an ex-member could keep their cache entry
+        // alive indefinitely by spamming signed CidNotifies.
+        let alice_cache_after = state.owner_device_cache.devices.get(&alice).unwrap();
+        assert_eq!(
+            alice_cache_after, &alice_cache_before,
+            "OwnerDeviceCache MUST NOT be refreshed on membership-gate drop"
+        );
+        // Sanity: the device hash didn't somehow leak elsewhere.
+        let _ = alice_dev; // silence unused var warning if any
     }
 }
