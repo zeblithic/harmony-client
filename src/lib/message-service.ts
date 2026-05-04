@@ -17,6 +17,27 @@ export interface ChannelMessageEvent {
 }
 
 /**
+ * Decode a lowercase hex string into a UTF-8 text body. The Rust event
+ * loop hex-encodes DM body bytes (`hex::encode(&rm.body)`) before
+ * shipping them over IPC; this is the inverse. Tolerates an empty body
+ * (returns `''`); returns `''` on a malformed (odd-length / non-hex)
+ * payload rather than throwing, since a DM with un-decodable body is
+ * still better-rendered as an empty text bubble than a hard crash.
+ */
+function hexToUtf8(hex: string): string {
+  if (hex.length === 0) return '';
+  const pairs = hex.match(/.{2}/g);
+  if (!pairs || pairs.length * 2 !== hex.length) return '';
+  const bytes = new Uint8Array(pairs.length);
+  for (let i = 0; i < pairs.length; i++) {
+    const n = parseInt(pairs[i], 16);
+    if (Number.isNaN(n)) return '';
+    bytes[i] = n;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/**
  * Manages real-time channel messaging over Zenoh pub/sub.
  *
  * When connected, messages flow via Tauri IPC events (`message-received`).
@@ -59,6 +80,93 @@ export class MessageService {
       },
     );
     this.unlisteners.push(unlisten);
+
+    // ── Phase 4 (ZEB-228) — DM lifecycle subscriptions ──────────────
+    //
+    // The DM transport uses a separate IPC channel from channel pub/sub.
+    // `dm-received` carries hex-encoded body bytes (UTF-8 text payloads
+    // for now). The lifecycle events (`dm-delivered`/`dm-expired`/
+    // `dm-deleted`) correlate to a self-Message via `messageId` (hex
+    // OutboxEntryId set on send). `channel` on a DM Message is the
+    // SpaceId hex, matching `NavNode.id` from Task 8.
+
+    const unlistenDmRx = await adapter.listen('dm-received', (event) => {
+      const payload = event.payload as {
+        spaceId: string;
+        messageCid: string;
+        from: string;
+        sentAt: number;
+        receivedAt: number;
+        body: string;
+        mimeType: string;
+      };
+      // Dedupe across reconnect/cold-start replay (messageCid is content-addressed).
+      if (this.seenIds.has(payload.messageCid)) return;
+      this.seenIds.add(payload.messageCid);
+
+      const text = hexToUtf8(payload.body);
+      const sender = (this.ownAddress && payload.from === this.ownAddress)
+        ? { address: 'self', displayName: 'You' }
+        : {
+            address: payload.from,
+            displayName: payload.from.slice(0, 8),
+          };
+      const msg: Message = {
+        id: payload.messageCid,
+        sender,
+        text,
+        timestamp: payload.sentAt,
+        media: [],
+        priority: 'standard',
+        channel: payload.spaceId,
+      };
+      this.messages = [...this.messages, msg];
+      this.onChange?.();
+    });
+    this.unlisteners.push(unlistenDmRx);
+
+    const unlistenDmDelivered = await adapter.listen('dm-delivered', (event) => {
+      const { messageId } = event.payload as { messageId: string; recipient: string };
+      let changed = false;
+      this.messages = this.messages.map((m) => {
+        if (m.messageId !== messageId) return m;
+        changed = true;
+        return { ...m, deliveryState: 'delivered' as const };
+      });
+      if (changed) this.onChange?.();
+    });
+    this.unlisteners.push(unlistenDmDelivered);
+
+    const unlistenDmExpired = await adapter.listen('dm-expired', (event) => {
+      const { messageId } = event.payload as { messageId: string };
+      let changed = false;
+      this.messages = this.messages.map((m) => {
+        if (m.messageId !== messageId) return m;
+        changed = true;
+        return { ...m, deliveryState: 'expired' as const };
+      });
+      if (changed) this.onChange?.();
+    });
+    this.unlisteners.push(unlistenDmExpired);
+
+    const unlistenDmDeleted = await adapter.listen('dm-deleted', (event) => {
+      const { spaceId, messageCid } = event.payload as {
+        messageId?: string;
+        spaceId: string;
+        messageCid: string;
+      };
+      const before = this.messages.length;
+      this.messages = this.messages.filter(
+        (m) => !(m.channel === spaceId && m.id === messageCid),
+      );
+      if (this.messages.length !== before) {
+        // Drop from seenIds so a re-arrival of the same CID (e.g. peer
+        // resends after we manually deleted a stuck entry) isn't deduped.
+        this.seenIds.delete(messageCid);
+        this.onChange?.();
+      }
+    });
+    this.unlisteners.push(unlistenDmDeleted);
   }
 
   /** Send a channel message via Tauri command. */
