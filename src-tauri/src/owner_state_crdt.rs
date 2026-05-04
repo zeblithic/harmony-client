@@ -318,6 +318,27 @@ impl OwnerState {
         }
     }
 
+    /// Iterator over InboxEntries belonging to a given Space, in
+    /// BTreeMap natural order (`(space_id, message_cid)` lex).
+    ///
+    /// For UI scrollback, callers typically collect + sort by
+    /// `received_at` descending. The natural BTreeMap order is by
+    /// message_cid which IS NOT chronological — `received_at` is
+    /// the chronological key.
+    pub fn inbox_entries_for_space(&self, space_id: SpaceId) -> impl Iterator<Item = &InboxEntry> {
+        self.inbox.values().filter(move |e| e.space_id == space_id)
+    }
+
+    /// Remove an InboxEntry by (space_id, message_cid). Returns the
+    /// removed entry on hit, None on miss. Idempotent: second call
+    /// with the same key returns None.
+    ///
+    /// Phase 4: used by `delete_outbox_entry` IPC to clear a stuck/
+    /// expired self-Message from the user's history.
+    pub fn delete_inbox_entry(&mut self, key: InboxKey) -> Option<InboxEntry> {
+        self.inbox.remove(&key)
+    }
+
     /// `apply_space` followed by atomic rewrite of all dependent records
     /// (OutboxEntry/InboxEntry/ReadMarker `space_id`) when the merge
     /// collapses two SpaceIds into one. This is the public entry point
@@ -1507,6 +1528,77 @@ mod apply_inbox_tests {
         s.apply_inbox(entry(1, 2, 3, 100));
         s.apply_inbox(entry(99, 2, 3, 100));
         assert_eq!(s.inbox.len(), 2);
+    }
+
+    #[test]
+    fn inbox_entries_for_space_returns_only_matching_space() {
+        let mut state = OwnerState::default();
+        let space_a = SpaceId([0x01; 16]);
+        let space_b = SpaceId([0x02; 16]);
+        let owner = OwnerAddr([0xff; 16]);
+
+        state.apply_inbox(InboxEntry {
+            space_id: space_a,
+            message_cid: ContentId::from_bytes([0x10; 32]),
+            from: owner,
+            received_at: hlc(2),
+        });
+        state.apply_inbox(InboxEntry {
+            space_id: space_a,
+            message_cid: ContentId::from_bytes([0x11; 32]),
+            from: owner,
+            received_at: hlc(1),
+        });
+        state.apply_inbox(InboxEntry {
+            space_id: space_b,
+            message_cid: ContentId::from_bytes([0x20; 32]),
+            from: owner,
+            received_at: hlc(99),
+        });
+
+        let entries: Vec<&InboxEntry> = state.inbox_entries_for_space(space_a).collect();
+        assert_eq!(entries.len(), 2, "only space_a entries");
+        assert!(entries.iter().all(|e| e.space_id == space_a));
+    }
+
+    #[test]
+    fn delete_inbox_entry_removes_only_matching_key() {
+        let mut state = OwnerState::default();
+        let space_a = SpaceId([0x01; 16]);
+        let cid_x = ContentId::from_bytes([0xaa; 32]);
+        let cid_y = ContentId::from_bytes([0xbb; 32]);
+
+        state.apply_inbox(InboxEntry {
+            space_id: space_a,
+            message_cid: cid_x,
+            from: OwnerAddr([1; 16]),
+            received_at: hlc(1),
+        });
+        state.apply_inbox(InboxEntry {
+            space_id: space_a,
+            message_cid: cid_y,
+            from: OwnerAddr([1; 16]),
+            received_at: hlc(2),
+        });
+        assert_eq!(state.inbox.len(), 2);
+
+        let removed = state.delete_inbox_entry(InboxKey {
+            space_id: space_a,
+            message_cid: cid_x,
+        });
+        assert!(removed.is_some(), "must return the removed entry");
+        assert_eq!(removed.unwrap().message_cid, cid_x);
+        assert_eq!(state.inbox.len(), 1, "exactly one entry deleted");
+        assert!(
+            state.inbox.values().any(|e| e.message_cid == cid_y),
+            "the other entry survives"
+        );
+
+        let removed_again = state.delete_inbox_entry(InboxKey {
+            space_id: space_a,
+            message_cid: cid_x,
+        });
+        assert!(removed_again.is_none(), "second delete returns None");
     }
 }
 
