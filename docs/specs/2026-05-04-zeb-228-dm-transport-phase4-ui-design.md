@@ -64,7 +64,7 @@ Phase 4 is therefore predominantly a wiring exercise: route DM-shaped data throu
 │ ────────────── │  │ ─────────          │  │ ────────────────       │
 │ Per-channel    │  │ NavNodes by type   │  │ Member picker          │
 │ message buffer │  │ {channel, dm,      │  │ at-16 inline hint      │
-│ + IPC subs:    │  │  group-chat,       │  │ at-17 hard block       │
+│ + IPC subs:    │  │  group-chat,       │  │ at-16 hard block       │
 │  - dm-received │  │  folder}           │  │ → calls add_space IPC  │
 │  - dm-delivered│  │ + IPC subs:        │  └────────────────────────┘
 │  - dm-expired  │  │  - nav-updated     │
@@ -276,7 +276,7 @@ Use the existing ConfirmDialog component (per user's DRY preference) unless the 
 ### Flow A: Create a DM
 
 1. User clicks "+ New DM" → `DmCreateDialog` opens.
-2. User searches/selects Bob → counter shows "1 of 16."
+2. User searches/selects Bob → counter shows "1 of 15 recipients."
 3. User clicks "Start DM" → frontend invokes `add_space(kind: 'dm', name: 'DM with Bob', members: [Alice, Bob])`.
 4. Backend generates content_key, builds Space CRDT, applies locally, fans out DmInviteSigned to Bob's known devices.
 5. Backend returns SpaceId.

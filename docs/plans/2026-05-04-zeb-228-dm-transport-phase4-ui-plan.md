@@ -2090,7 +2090,7 @@ testing reveals it's wrong."
 - [ ] **Step 1: Run all gates from a clean state.**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+cd "$(git rev-parse --show-toplevel)"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -2176,7 +2176,7 @@ Mark ZEB-228 as In Progress (if not already) and link the PR via `links` field o
 ## Verification gates (run at every commit)
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+cd "$(git rev-parse --show-toplevel)"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
