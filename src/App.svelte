@@ -30,7 +30,7 @@
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
+  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -678,6 +678,15 @@
     if (switched) {
       openThreadId = null;
     }
+    // Phase 4 (ZEB-228) — fetch decrypted DM scrollback on switch so
+    // cold-start (no live dm-received yet) renders history. Per-channel
+    // pagination cursor in MessageService prevents repeat fetches of
+    // the same page on rapid switches; no-op when offline / pre-adapter.
+    if (node.type === 'dm' || node.type === 'group-chat') {
+      messageService.loadDmThread(node.id).catch((e) => {
+        console.error('loadDmThread failed:', e);
+      });
+    }
   }
 
   // Filter to messages in the active channel (mock messages without
@@ -759,6 +768,46 @@
   }
 
   async function handleSend(text: string, priority: MessagePriority) {
+    // Phase 4 (ZEB-228) — DM/GroupDm channels route through the
+    // send_dm IPC instead of the channel publish path. Optimistic UI:
+    // a placeholder Message is pushed in 'sending' state immediately;
+    // on success the placeholder's id is swapped for the real
+    // OutboxEntryId returned by send_dm so dm-delivered / dm-expired
+    // can correlate via `messageId`. On failure the placeholder is
+    // marked 'failed' (kept visible — losing the bubble would hide
+    // the user's intent).
+    if (activeChannelType === 'dm' || activeChannelType === 'group-chat') {
+      const optimisticId = crypto.randomUUID();
+      const optimistic: Message = {
+        id: optimisticId,
+        sender: {
+          address: messageService.ownAddress ?? 'self',
+          displayName: 'You',
+        },
+        text,
+        timestamp: Date.now(),
+        media: [],
+        priority,
+        channel: activeChannel,
+        deliveryState: 'sending',
+      };
+      messageService.pushOptimistic(optimistic);
+
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const messageId = (await invoke('send_dm', {
+          spaceId: activeChannel,
+          content: Array.from(new TextEncoder().encode(text)),
+          mimeType: 'text/plain',
+        })) as string;
+        messageService.replaceOptimisticId(optimisticId, messageId);
+      } catch (e) {
+        messageService.markFailed(optimisticId, String(e));
+        console.error('DM send failed:', e);
+      }
+      return;
+    }
+
     try {
       await messageService.send(text, priority, activeChannel, activeHub);
     } catch (err) {

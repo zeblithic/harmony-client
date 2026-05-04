@@ -215,6 +215,45 @@ export class MessageService {
   }
 
   /**
+   * Phase 4 (ZEB-228) — DM optimistic-UI helpers.
+   *
+   * The DM send-path (App.svelte) pushes a placeholder Message into the
+   * buffer immediately so the user sees their text without waiting for
+   * the IPC round-trip. Once `send_dm` returns, the placeholder's id is
+   * swapped for the real OutboxEntryId so subsequent dm-delivered /
+   * dm-expired / dm-deleted IPCs correlate via `messageId`. On send
+   * failure the placeholder is marked `deliveryState: 'failed'` rather
+   * than removed — keeping a visible record lets the user see what went
+   * out (and eventually retry; retry UX is a follow-up).
+   */
+  pushOptimistic(msg: Message): void {
+    this.messages = [...this.messages, msg];
+    this.seenIds.add(msg.id);
+    this.onChange?.();
+  }
+
+  replaceOptimisticId(optimisticId: string, realMessageId: string): void {
+    this.messages = this.messages.map((m) =>
+      m.id === optimisticId
+        ? { ...m, id: realMessageId, messageId: realMessageId }
+        : m,
+    );
+    // Update seenIds: the optimistic id is gone, the real one takes its
+    // place. Keeping the optimistic id in seenIds would silently dedupe a
+    // future (very unlikely) collision; better to release it.
+    this.seenIds.delete(optimisticId);
+    this.seenIds.add(realMessageId);
+    this.onChange?.();
+  }
+
+  markFailed(optimisticId: string, _error: string): void {
+    this.messages = this.messages.map((m) =>
+      m.id === optimisticId ? { ...m, deliveryState: 'failed' as const } : m,
+    );
+    this.onChange?.();
+  }
+
+  /**
    * Phase 4 (ZEB-228) — Cold-start scrollback. Fetches decrypted DM
    * history for `spaceId` via the `read_dm_thread` IPC and merges the
    * results into the per-channel buffer in oldest-first display order.
