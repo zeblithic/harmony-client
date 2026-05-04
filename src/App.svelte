@@ -19,6 +19,7 @@
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
+  import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
@@ -165,6 +166,45 @@
       // only in the dev console. Toast UX is a polish follow-up.
       console.error('add_space failed:', e);
     }
+  }
+
+  // ── Inline manual delete on stuck/expired DMs (ZEB-228 Phase 4 Task 14) ─
+  // TextMessage surfaces an inline ⓧ when a self-Message has been stuck in
+  // 'sending' for >60s, or has reached terminal 'expired'/'failed' state.
+  // The click drops here through TextFeed.onMessageDelete; we open a
+  // ConfirmDialog with state-appropriate copy. Confirm dispatches the
+  // delete_outbox_entry IPC; the backend's `dm-deleted` event arrives
+  // and MessageService prunes the message from the per-channel buffer.
+  let pendingDeleteMessageId: string | null = $state(null);
+  let pendingDeleteState: string | null = $state(null);
+
+  function requestDeleteMessage(messageId: string) {
+    const msg = messageService.messages.find((m) => m.messageId === messageId);
+    pendingDeleteMessageId = messageId;
+    pendingDeleteState = msg?.deliveryState ?? null;
+  }
+
+  async function confirmDeleteMessage() {
+    if (!pendingDeleteMessageId) return;
+    const id = pendingDeleteMessageId;
+    pendingDeleteMessageId = null;
+    pendingDeleteState = null;
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('delete_outbox_entry', { messageId: id });
+      // The `dm-deleted` IPC event will land via MessageService's
+      // subscription (Task 5) and prune the message from the buffer.
+    } catch (e) {
+      // Production rejections are strings; tests may surface Error objects.
+      // Per `feedback_tauri_error_extraction`: always normalize.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('delete_outbox_entry failed:', msg);
+    }
+  }
+
+  function cancelDeleteMessage() {
+    pendingDeleteMessageId = null;
+    pendingDeleteState = null;
   }
 
   /** Detect video MIME type from magic bytes. */
@@ -940,6 +980,8 @@
       onThreadSend={handleThreadSend}
       onScrollToMessage={scrollToMessage}
       {pinnedThreadIds}
+      onMessageDelete={requestDeleteMessage}
+      ownAddress={messageService.ownAddress ?? ''}
     />
   {/snippet}
   {#snippet mediaFeed()}
@@ -1164,6 +1206,23 @@
       />
     </div>
   </div>
+{/if}
+
+{#if pendingDeleteMessageId}
+  <!-- ZEB-228 Phase 4 Task 14: confirmation for inline delete on stuck/
+       expired DM messages. Copy switches by lifecycle state — expired
+       implies the 30-day TTL ran out, anything else implies the recipient
+       hasn't seen it yet. -->
+  <ConfirmDialog
+    title="Delete message?"
+    message={pendingDeleteState === 'expired'
+      ? "Delete this expired message? It's been undeliverable for 30 days."
+      : "Delete this message? It hasn't been delivered yet. Recipients who haven't received it won't see it."}
+    confirmLabel="Delete"
+    destructive={true}
+    onConfirm={confirmDeleteMessage}
+    onCancel={cancelDeleteMessage}
+  />
 {/if}
 
 <style>

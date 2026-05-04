@@ -29,6 +29,8 @@
     onThreadSend,
     onScrollToMessage,
     pinnedThreadIds = new Set(),
+    onMessageDelete,
+    ownAddress = '',
   }: {
     messages: Message[];
     collapsed?: boolean;
@@ -48,6 +50,14 @@
     onThreadSend?: (text: string, priority: MessagePriority) => void;
     onScrollToMessage?: (messageId: string) => void;
     pinnedThreadIds?: Set<string>;
+    /** ZEB-228 Phase 4 Task 14: invoked when the user clicks the
+     *  inline ⓧ on a stuck/expired self-Message. Parent shows the
+     *  ConfirmDialog and dispatches `delete_outbox_entry`. */
+    onMessageDelete?: (messageId: string) => void;
+    /** ZEB-228 Phase 4 Task 14: local user's address; used to compute
+     *  `isSelf` for each rendered TextMessage so the delete button is
+     *  only shown on outgoing messages. */
+    ownAddress?: string;
   } = $props();
 
   let visibleThreadIds = $state(new Set<string>());
@@ -146,6 +156,8 @@
             {trustVersion}
             allMessages={messages}
             {onScrollToMessage}
+            isSelf={ownAddress !== '' && item.message.sender.address === ownAddress}
+            onDelete={onMessageDelete}
           />
           {#if threadMeta.has(item.message.id)}
             {@const meta = threadMeta.get(item.message.id)!}
