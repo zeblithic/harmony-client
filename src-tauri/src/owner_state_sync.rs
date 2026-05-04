@@ -577,7 +577,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // would only see entries learned locally), breaking DM unicast
     // addressing convergence across bound devices.
     for (addr, entry) in owner_device_cache.devices {
-        local.apply_owner_device_update(addr, entry.devices, entry.learned_at);
+        local.apply_owner_device_update(
+            addr,
+            entry.devices,
+            entry.device_identity_pubs,
+            entry.learned_at,
+        );
     }
 }
 
@@ -1669,7 +1674,7 @@ mod integration_tests {
         // A learns a per-OwnerAddr device list.
         {
             let mut a = dev.a_state.lock().await;
-            a.apply_owner_device_update(owner, devices.clone(), learned.clone());
+            a.apply_owner_device_update(owner, devices.clone(), vec![], learned.clone());
         }
         dev.a_engine.notify_dirty();
         tokio::time::sleep(Duration::from_millis(400)).await;

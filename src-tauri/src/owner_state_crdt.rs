@@ -454,15 +454,34 @@ impl OwnerState {
         &mut self,
         addr: OwnerAddr,
         devices: Vec<DeviceIdentityHash>,
+        device_identity_pubs: Vec<Option<[u8; 64]>>,
         learned_at: Hlc,
     ) -> ApplyOutcome {
-        // Sanitize first so the equal-HLC payload check below can compare
-        // semantically-equal lists (the on-the-wire vec might be unsorted /
-        // duplicated / oversized; the stored vec is always normalized).
-        let mut sanitized = devices;
-        sanitized.sort();
-        sanitized.dedup();
-        sanitized.truncate(MAX_DEVICES_PER_OWNER);
+        // Sanitize: the on-the-wire vec might be unsorted / duplicated /
+        // oversized. Sort+dedup `devices` while maintaining the parallel-
+        // vec correspondence with `device_identity_pubs`.
+        //
+        // Pad/truncate device_identity_pubs to match devices.len() FIRST so
+        // the zip is well-formed even if the caller passed a mismatched-
+        // length pubs vec (Phase 1/2 callers pass `vec![]`; defensive
+        // sanitization is cheap).
+        let mut pubs = device_identity_pubs;
+        pubs.resize(devices.len(), None);
+
+        // Zip into Vec<(DeviceIdentityHash, Option<[u8; 64]>)>, sort by
+        // .0, dedup by .0, then split back into two vecs. This is the
+        // one correct way to preserve parallel-vec correspondence
+        // through sort+dedup — naively sorting `devices` and
+        // `device_identity_pubs` independently would shuffle pubs out of
+        // alignment, silently breaking signature lookups in
+        // `resolve_signed_origin_owner`.
+        let mut zipped: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
+            devices.into_iter().zip(pubs).collect();
+        zipped.sort_by_key(|(d, _)| *d);
+        zipped.dedup_by_key(|(d, _)| *d);
+        zipped.truncate(MAX_DEVICES_PER_OWNER);
+        let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) = zipped.into_iter().unzip();
+
         // LWW guard.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
             if existing.learned_at.is_strictly_newer_than(&learned_at) {
@@ -472,15 +491,18 @@ impl OwnerState {
                 });
             }
             if existing.learned_at == learned_at {
-                // Equal HLC — only idempotent if the payload matches. Two
-                // replicas concurrently issuing different `devices` under the
-                // same HLC would otherwise diverge silently.
-                if existing.devices == sanitized {
+                // Equal HLC — only idempotent if the payload (devices AND
+                // pubs) matches. Two replicas concurrently issuing
+                // different payloads under the same HLC would otherwise
+                // diverge silently.
+                if existing.devices == sanitized_devices
+                    && existing.device_identity_pubs == sanitized_pubs
+                {
                     return ApplyOutcome::Merged { old_id: None };
                 }
                 return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                     "owner_device_entry for {:?} diverges at identical learned_at \
-                     (concurrent updates with same HLC but different devices)",
+                     (concurrent updates with same HLC but different devices or pubs)",
                     addr
                 )));
             }
@@ -489,7 +511,8 @@ impl OwnerState {
         self.owner_device_cache.devices.insert(
             addr,
             OwnerDeviceEntry {
-                devices: sanitized,
+                devices: sanitized_devices,
+                device_identity_pubs: sanitized_pubs,
                 learned_at,
             },
         );
@@ -2059,6 +2082,78 @@ mod owner_device_cache_tests {
         assert!(stored.binary_search(&target).is_ok());
     }
 
+    #[test]
+    fn apply_owner_device_update_stores_identity_pubs_parallel_to_devices() {
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let devices = vec![
+            DeviceIdentityHash([0xa1; 16]),
+            DeviceIdentityHash([0xa2; 16]),
+        ];
+        let pubs = vec![Some([0x42u8; 64]), Some([0x43u8; 64])];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome =
+            state.apply_owner_device_update(owner, devices.clone(), pubs.clone(), learned_at);
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
+
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.devices, devices);
+        assert_eq!(entry.device_identity_pubs, pubs);
+    }
+
+    #[test]
+    fn apply_owner_device_update_sort_dedup_keeps_pubs_aligned() {
+        // Sanitization MUST maintain parallel-vec correspondence: when
+        // sort+dedup reorders or drops `devices` entries, the matching
+        // entries in `device_identity_pubs` must follow.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        // Unsorted + duplicate input.
+        let devices = vec![
+            DeviceIdentityHash([0xa3; 16]), // index 0 → pub 0
+            DeviceIdentityHash([0xa1; 16]), // index 1 → pub 1
+            DeviceIdentityHash([0xa2; 16]), // index 2 → pub 2
+            DeviceIdentityHash([0xa1; 16]), // index 3 → pub 3 (DUPLICATE — dedup keeps one)
+        ];
+        let pubs = vec![
+            Some([0x33u8; 64]), // for [0xa3; 16]
+            Some([0x11u8; 64]), // for [0xa1; 16] (first occurrence)
+            Some([0x22u8; 64]), // for [0xa2; 16]
+            Some([0x99u8; 64]), // for [0xa1; 16] (duplicate — should be dropped along with its device)
+        ];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        state.apply_owner_device_update(owner, devices, pubs, learned_at);
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+
+        // Sorted ascending by hash, deduped to 3 unique devices.
+        assert_eq!(
+            entry.devices,
+            vec![
+                DeviceIdentityHash([0xa1; 16]),
+                DeviceIdentityHash([0xa2; 16]),
+                DeviceIdentityHash([0xa3; 16]),
+            ]
+        );
+        // Parallel pubs must match the (sorted) hash order.
+        // Note: which of the two duplicate-hash pubs survives is an
+        // implementation choice (Vec::dedup_by drops the SECOND); both
+        // are semantically valid since they're for the same device hash.
+        assert_eq!(entry.device_identity_pubs.len(), 3);
+        assert_eq!(entry.device_identity_pubs[0], Some([0x11u8; 64])); // for [0xa1; 16]
+        assert_eq!(entry.device_identity_pubs[1], Some([0x22u8; 64])); // for [0xa2; 16]
+        assert_eq!(entry.device_identity_pubs[2], Some([0x33u8; 64])); // for [0xa3; 16]
+    }
+
     // Helper that lets the test pass without naming the public method twice.
     // If apply_owner_device_update is a method on OwnerState rather than a
     // free function, adapt: the helper either calls a free function in
@@ -2073,7 +2168,10 @@ mod owner_device_cache_tests {
             owner_device_cache: std::mem::take(cache),
             ..Default::default()
         };
-        let outcome = state.apply_owner_device_update(addr, devices, learned_at);
+        // Phase 1/2 helper: pass empty pubs vec (apply resizes to
+        // None-padded internally). Phase 3b's parallel-vec semantics are
+        // exercised by the dedicated tests in this same module.
+        let outcome = state.apply_owner_device_update(addr, devices, vec![], learned_at);
         *cache = state.owner_device_cache;
         outcome
     }

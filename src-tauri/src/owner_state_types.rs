@@ -301,6 +301,36 @@ pub struct OwnerDeviceEntry {
     /// concern.
     #[serde(rename = "v", deserialize_with = "deserialize_device_identities")]
     pub devices: Vec<DeviceIdentityHash>,
+
+    /// Per-device combined identity public-bytes (`X25519_pub(32) ||
+    /// Ed25519_pub(32)`, the canonical
+    /// `harmony_identity::Identity::to_public_bytes()` layout). Parallel
+    /// to `devices` — element i is the identity_pub for `devices[i]`
+    /// when present, or `None` when this device is known-by-hash but its
+    /// pub hasn't been propagated yet (the bootstrap-incompleteness case
+    /// from Path B per ZEB-216 spec §"Public-key storage on
+    /// OwnerDeviceCache"). Caller treats `None` as `UnknownSigningKey` —
+    /// signature verification cannot proceed without the cached pub.
+    ///
+    /// 64 bytes (not 32): `signing_device_hash = SHA256(X25519 ||
+    /// Ed25519)[:16]` per `harmony_identity::Identity::address_hash`.
+    /// Storing only the Ed25519 half would yield an Ed25519-only hash
+    /// that diverges from `DeviceIdentityHash` values stored in
+    /// `devices`, silently breaking every cache lookup in
+    /// `resolve_signed_origin_owner`.
+    ///
+    /// Pre-Phase-3b snapshots load with `vec![]` via `#[serde(default)]`
+    /// — graceful upgrade. The receive path then drops signature-
+    /// verification packets from those devices as `UnknownSigningKey`
+    /// until the next invite-equivalent flow repopulates the pubs.
+    #[serde(
+        rename = "p",
+        default,
+        serialize_with = "serialize_device_identity_pubs",
+        deserialize_with = "deserialize_device_identity_pubs"
+    )]
+    pub device_identity_pubs: Vec<Option<[u8; 64]>>,
+
     /// HLC of when this entry was learned. LWW key for merge.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
@@ -384,6 +414,180 @@ where
             out.sort();
             out.dedup();
             out.truncate(MAX_DEVICES_PER_OWNER);
+            Ok(out)
+        }
+    }
+
+    d.deserialize_seq(CapVisitor)
+}
+
+/// Serialize `Vec<Option<[u8; 64]>>` for
+/// `OwnerDeviceEntry::device_identity_pubs`. Each element is encoded as
+/// either CBOR null (for `None` — known-by-hash, pub not yet cached) or
+/// a CBOR bstr(64) (for `Some(pub_bytes)`). The 64-byte bstr form is
+/// significantly more compact than the default `[u8; 64]` Serialize impl
+/// (which emits a 64-element CBOR array, two bytes per element after
+/// 0x17) and matches the bstr-everywhere convention used elsewhere in
+/// this module (see `serialize_bytes_as_bstr`).
+///
+/// We need an explicit `serialize_with` here because serde's blanket
+/// `Serialize` impl on `[T; N]` only covers `N <= 32` (or per-version
+/// const-generic limits), so the derive-generated serialization for the
+/// outer struct can't see `[u8; 64]: Serialize`. Custom helper sidesteps
+/// the derive entirely by walking the vec and emitting each element via
+/// `serialize_bytes`.
+fn serialize_device_identity_pubs<S>(v: &[Option<[u8; 64]>], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeSeq;
+
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for opt in v {
+        // Wrap in a tiny newtype that overrides Serialize to emit
+        // bstr(64) for Some / null for None. SerializeSeq::serialize_element
+        // requires `T: Serialize`, so we can't pass the bare slice.
+        struct BstrOpt<'a>(&'a Option<[u8; 64]>);
+        impl serde::Serialize for BstrOpt<'_> {
+            fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                match self.0 {
+                    Some(bytes) => s.serialize_bytes(bytes),
+                    None => s.serialize_none(),
+                }
+            }
+        }
+        seq.serialize_element(&BstrOpt(opt))?;
+    }
+    seq.end()
+}
+
+/// Deserialize `Vec<Option<[u8; 64]>>` for
+/// `OwnerDeviceEntry::device_identity_pubs`. Mirrors
+/// `deserialize_device_identities`'s cap behavior: rejects up-front via
+/// `size_hint` when possible, pre-allocates `min(cap, hint)`, refuses
+/// the (cap+1)-th element. Does NOT sort or dedup — order is meaningful
+/// (parallel-indexed to `OwnerDeviceEntry.devices`, so reordering would
+/// silently break the device→pub correspondence that
+/// `dm_signing::verify_dm_packet_signature` relies on).
+///
+/// Each element is decoded as either CBOR null (→ `None`) or CBOR
+/// bstr(64) (→ `Some([u8; 64])`). Length is enforced strictly: a bstr
+/// of any length other than 64 is rejected.
+fn deserialize_device_identity_pubs<'de, D>(d: D) -> Result<Vec<Option<[u8; 64]>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    /// One element: CBOR null (→ None) or bstr(64) (→ Some).
+    struct OptPubVisitor;
+
+    impl<'de> Visitor<'de> for OptPubVisitor {
+        type Value = Option<[u8; 64]>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "CBOR null or a 64-byte CBOR byte string")
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            // serde's deserialize_option fans out to visit_some when the
+            // wire value is non-null; delegate to a fresh bytes-visitor.
+            d.deserialize_bytes(BytesVisitor).map(Some)
+        }
+        // ciborium drives Option-shaped deserialization through the
+        // outer Visitor when the value is bytes (not via Option's
+        // visit_some path). Accept bstr directly here.
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            BytesVisitor.visit_bytes(value).map(Some)
+        }
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            BytesVisitor.visit_byte_buf(v).map(Some)
+        }
+    }
+
+    struct BytesVisitor;
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = [u8; 64];
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a 64-byte CBOR byte string")
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<[u8; 64], E> {
+            if value.len() != 64 {
+                return Err(E::custom(format!(
+                    "device identity pub must be 64 bytes, got {}",
+                    value.len()
+                )));
+            }
+            let mut out = [0u8; 64];
+            out.copy_from_slice(value);
+            Ok(out)
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<[u8; 64], E> {
+            self.visit_bytes(&v)
+        }
+    }
+
+    /// Wrapper newtype so we can dispatch the custom OptPubVisitor per
+    /// element without going through serde's default Option deserialize
+    /// (which would call deserialize_bytes on a non-existent
+    /// `[u8; 64]: Deserialize` for serde versions where that fails).
+    struct OptPub(Option<[u8; 64]>);
+    impl<'de> Deserialize<'de> for OptPub {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            d.deserialize_any(OptPubVisitor).map(OptPub)
+        }
+    }
+
+    struct CapVisitor;
+
+    impl<'de> Visitor<'de> for CapVisitor {
+        type Value = Vec<Option<[u8; 64]>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "an array of at most {} optional 64-byte identity pubs",
+                MAX_DEVICES_PER_OWNER
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(n) = seq.size_hint() {
+                if n > MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_identity_pubs array length {} exceeds MAX_DEVICES_PER_OWNER ({})",
+                        n, MAX_DEVICES_PER_OWNER
+                    )));
+                }
+            }
+            let initial_cap = seq
+                .size_hint()
+                .unwrap_or(MAX_DEVICES_PER_OWNER)
+                .min(MAX_DEVICES_PER_OWNER);
+            let mut out: Vec<Option<[u8; 64]>> = Vec::with_capacity(initial_cap);
+            while let Some(item) = seq.next_element::<OptPub>()? {
+                if out.len() >= MAX_DEVICES_PER_OWNER {
+                    return Err(A::Error::custom(format!(
+                        "device_identity_pubs array exceeds MAX_DEVICES_PER_OWNER ({}); \
+                         legitimate peers always send canonical (capped) form",
+                        MAX_DEVICES_PER_OWNER
+                    )));
+                }
+                out.push(item.0);
+            }
             Ok(out)
         }
     }
@@ -2294,5 +2498,91 @@ mod owner_device_entry_deserialize_tests {
         assert_eq!(entry.devices[0], DeviceIdentityHash([0; 16]));
         // learned_at preserved from the wire.
         assert_eq!(entry.learned_at, hlc(7));
+    }
+
+    #[test]
+    fn owner_device_entry_serialize_includes_identity_pubs() {
+        let entry = OwnerDeviceEntry {
+            devices: vec![DeviceIdentityHash([0xa1; 16])],
+            device_identity_pubs: vec![Some([0x42u8; 64])],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(entry, recovered);
+    }
+
+    #[test]
+    fn owner_device_entry_serialize_handles_unknown_pubs() {
+        // Mid-bootstrap state: device hash is known but pub isn't yet
+        // cached. The Option::None entries must round-trip cleanly.
+        let entry = OwnerDeviceEntry {
+            devices: vec![
+                DeviceIdentityHash([0xa1; 16]),
+                DeviceIdentityHash([0xa2; 16]),
+            ],
+            device_identity_pubs: vec![Some([0x42u8; 64]), None],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&entry).unwrap();
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(entry, recovered);
+        assert_eq!(recovered.device_identity_pubs[0], Some([0x42u8; 64]));
+        assert_eq!(recovered.device_identity_pubs[1], None);
+    }
+
+    #[test]
+    fn owner_device_entry_loads_pre_phase3b_snapshot_with_default_empty_pubs() {
+        // Phase 1/2 snapshots stored only `devices` and `learned_at`.
+        // Phase 3b adds `device_identity_pubs` with #[serde(default)] so
+        // old snapshots load with `vec![]` — Path B's signature
+        // verification then drops packets from those devices as
+        // UnknownSigningKey (handler-side semantic; this test only
+        // verifies the deserializer-side contract).
+        //
+        // Construction: build the OLD shape via a stripped-down struct
+        // that mirrors Phase 1/2's OwnerDeviceEntry, encode it, then
+        // decode under the NEW OwnerDeviceEntry definition. This is
+        // more robust than pinning hand-crafted CBOR bytes (which would
+        // lock in serde's current encoding choices and become brittle).
+        #[derive(serde::Serialize)]
+        struct OldOwnerDeviceEntry {
+            #[serde(rename = "v")]
+            devices: Vec<DeviceIdentityHash>,
+            #[serde(rename = "l")]
+            learned_at: Hlc,
+        }
+        let old = OldOwnerDeviceEntry {
+            devices: vec![DeviceIdentityHash([0xa1; 16])],
+            learned_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        // OldOwnerDeviceEntry is local to this test (cannot impl the
+        // sealed CanonicalPayload trait), so encode via ciborium
+        // directly. Decode goes through the sealed canonical decoder
+        // since OwnerDeviceEntry IS a registered canonical type.
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).expect("encode old shape");
+        let recovered: OwnerDeviceEntry =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(recovered.devices, vec![DeviceIdentityHash([0xa1; 16])]);
+        assert!(
+            recovered.device_identity_pubs.is_empty(),
+            "Phase 1/2 snapshot must load with empty device_identity_pubs (graceful upgrade)"
+        );
+        assert_eq!(recovered.learned_at.wall_ms, 1);
     }
 }

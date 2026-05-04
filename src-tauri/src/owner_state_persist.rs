@@ -480,6 +480,7 @@ mod tests {
         state.apply_owner_device_update(
             OwnerAddr([2; 16]),
             vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([8; 16])],
+            vec![],
             hlc(1),
         );
 
