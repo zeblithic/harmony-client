@@ -163,13 +163,14 @@ pub struct DmAckSigned {
 /// Each variant carries:
 /// - `signed`: the typed body the signature covers.
 /// - `signature`: the 64-byte Ed25519 signature appended after the body.
-/// - `signed_bytes`: the canonical CBOR encoding of `signed`. On the
-///   send path this is what `encode_packet` writes between the
-///   discriminant and the signature; on the receive path it's captured
-///   by `decode_packet` so the receive handler can call
-///   `dm_signing::verify_dm_packet_signature` without re-encoding (re-
-///   encoding would work given canonical-CBOR determinism, but
-///   capturing is cheaper and risk-free).
+/// - `signed_bytes`: the canonical CBOR encoding of `signed` captured by
+///   `decode_packet` on the receive path so the receive handler can call
+///   `dm_signing::verify_dm_packet_signature` without re-encoding (the
+///   captured bytes are exactly what the signature covers, so even if
+///   the encoder were to drift this is the bit-exact verification input).
+///   On the send path `encode_packet` re-encodes from `signed` rather
+///   than trusting this field — see `encode_packet`'s invariant-guard
+///   doc comment for rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DmPacket {
     Invite {
@@ -193,6 +194,13 @@ pub enum DmPacket {
 pub enum EncodeError {
     #[error("CBOR encode failed: {0}")]
     Cbor(String),
+    /// Re-encoding `signed` to canonical CBOR failed inside `encode_packet`.
+    /// The build_signed_* helpers already round-tripped this value through
+    /// the same encoder, so this should be unreachable in practice — surface
+    /// as a clear distinct variant so a regression here doesn't mask as a
+    /// generic Cbor encode failure.
+    #[error("re-encode signed body failed: {0}")]
+    ReSerialize(String),
 }
 
 /// Errors produced by [`decode_packet`].
@@ -220,37 +228,50 @@ pub enum DecodeError {
 }
 
 /// Encode a fully-built DmPacket to the wire layout
-/// `[disc][signed_bytes][signature]`. Caller is responsible for having
-/// computed `signed_bytes` (canonical CBOR of `signed`) and `signature`
-/// (Ed25519 over `signed_bytes`) — usually via the `build_signed_*`
-/// helpers below.
+/// `[disc][signed_bytes][signature]`.
 ///
-/// Note: `signed_bytes` is written verbatim — we do NOT re-encode
-/// `signed` here. Re-encoding would normally be safe given canonical-CBOR
-/// determinism, but the capture-once-write-once contract removes any
-/// risk of an encoder change drifting the on-wire bytes away from what
-/// the signature actually covers.
+/// **Invariant guard.** Re-encode the body from `signed` (rather than
+/// trusting the cached `signed_bytes` field) before concatenating with
+/// the signature. This eliminates the inconsistent-state class where a
+/// caller could hold `signed = A` but `signed_bytes` for some prior
+/// `B` — a re-encode here means whatever ships on the wire matches
+/// `signed` by construction. The cost is one extra CBOR encoding per
+/// send, which is cheap (signed bodies are ≤ ~200 bytes serialized).
+///
+/// `signature` is still written verbatim — recomputing it here would
+/// require the signing key, and the build_signed_* helpers already
+/// signed `signed_bytes` (which equals the freshly-re-encoded bytes by
+/// canonical-CBOR determinism, asserted in the build_signed_* tests).
 pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
-    let (disc, signed_bytes, signature): (u8, &[u8], &[u8; 64]) = match packet {
+    let (disc, signed_bytes, signature): (u8, Vec<u8>, &[u8; 64]) = match packet {
         DmPacket::Invite {
-            signed_bytes,
+            signed, signature, ..
+        } => (
+            0x01,
+            crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
             signature,
-            ..
-        } => (0x01, signed_bytes.as_slice(), signature),
+        ),
         DmPacket::CidNotify {
-            signed_bytes,
+            signed, signature, ..
+        } => (
+            0x02,
+            crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
             signature,
-            ..
-        } => (0x02, signed_bytes.as_slice(), signature),
+        ),
         DmPacket::Ack {
-            signed_bytes,
+            signed, signature, ..
+        } => (
+            0x03,
+            crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?,
             signature,
-            ..
-        } => (0x03, signed_bytes.as_slice(), signature),
+        ),
     };
     let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
     out.push(disc);
-    out.extend_from_slice(signed_bytes);
+    out.extend_from_slice(&signed_bytes);
     out.extend_from_slice(signature);
     Ok(out)
 }
@@ -1082,6 +1103,67 @@ mod tests {
             "expected Invalid error mentioning signing_device_hash and sender_devices, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn encode_packet_re_encodes_from_signed_not_signed_bytes() {
+        // Invariant guard: `encode_packet` must re-encode the body from
+        // `signed` and IGNORE the cached `signed_bytes` field. If a caller
+        // ever ends up with `signed = A` but `signed_bytes` corresponds
+        // to some other body B (e.g., from in-place mutation after a
+        // `build_signed_*` helper), the wire output must still match
+        // `signed = A`. This test simulates that inconsistent state by
+        // building a packet via `build_signed_cidnotify` and then
+        // overwriting `signed_bytes` with garbage, then verifying the
+        // wire output decodes back to the ORIGINAL `signed`.
+        let (private, _, device_hash) = make_test_identity(0x77);
+        // Mirror the signing-key extraction from build_signed_invite_produces_verifiable_packet.
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(None, &[0x77u8; 32]);
+        let mut ed_arr = [0u8; 32];
+        hk.expand(b"harmony-identity-ed25519-v1", &mut ed_arr)
+            .expect("HKDF length 32 within SHA-256 limit");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_arr);
+
+        let original_signed = sample_cidnotify_with_hash(device_hash);
+        let packet = build_signed_cidnotify(original_signed.clone(), &signing_key).unwrap();
+
+        // Corrupt the cached signed_bytes — this is the inconsistent
+        // state we're guarding against. Use bytes that would never
+        // CBOR-decode to a valid DmCidNotifySigned (a leading 0xff
+        // is not a legal CBOR major type).
+        let corrupted_packet = match packet {
+            DmPacket::CidNotify {
+                signed, signature, ..
+            } => DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes: vec![0xff, 0xff, 0xff, 0xff, 0xff],
+            },
+            other => panic!("expected CidNotify, got {:?}", other),
+        };
+
+        // Encode the corrupted packet — this MUST re-encode from `signed`
+        // and produce a wire-decodable result, NOT propagate the corrupted
+        // bytes.
+        let wire = encode_packet(&corrupted_packet).unwrap();
+        assert_eq!(wire[0], 0x02);
+
+        // Decode and confirm we recovered the ORIGINAL signed body, not
+        // the corrupted bytes (which would fail to decode).
+        let decoded = decode_packet(&wire).unwrap();
+        match decoded {
+            DmPacket::CidNotify { signed, .. } => {
+                let _ = private; // silence unused warning if path changes
+                assert_eq!(
+                    signed, original_signed,
+                    "decoded signed must match the ORIGINAL signed, proving encode_packet \
+                     re-encoded from `signed` and ignored the corrupted signed_bytes"
+                );
+            }
+            other => panic!("expected CidNotify after decode, got {:?}", other),
+        }
     }
 
     #[test]

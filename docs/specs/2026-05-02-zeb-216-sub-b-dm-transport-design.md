@@ -278,7 +278,7 @@ This is what's ChaCha20-Poly1305-encrypted into the storage_blob written to CAS.
 
 Reticulum unicast carries one of three packet types. Wire layout per packet:
 
-```
+```text
 [u8 discriminant][CBOR-encoded signed body][signature: bstr(64)]
 ```
 
@@ -371,7 +371,7 @@ pub struct DmAckSigned {
 
 ### Public-key storage on OwnerDeviceCache
 
-To verify signatures from devices already in the cache (every post-bootstrap DmCidNotify and DmAck), the cache must store each device's full identity pubkeys (64 bytes: `X25519_pub || Ed25519_pub`) alongside its identity hash. Phase 1 stored only `Vec<DeviceIdentityHash>`; Phase 3b extends `OwnerDeviceEntry` to store `Vec<[u8; 64]>` parallel to the existing `Vec<DeviceIdentityHash>` (parallel-vec representation preserves the existing binary-search invariant on `devices`; element i in `device_identity_pubs` is the 64-byte identity-pub for `devices[i]`).
+To verify signatures from devices already in the cache (every post-bootstrap DmCidNotify and DmAck), the cache must store each device's full identity pubkeys (64 bytes: `X25519_pub || Ed25519_pub`) alongside its identity hash. Phase 1 stored only `Vec<DeviceIdentityHash>`; Phase 3b extends `OwnerDeviceEntry` to store `Vec<Option<[u8; 64]>>` parallel to the existing `Vec<DeviceIdentityHash>`. Element i is the 64-byte identity pub for `devices[i]` when present, or `None` when this device is known-by-hash but its pub hasn't been propagated yet (the bootstrap-incompleteness case from Path B). The receiver treats `None` as `UnknownSigningKey` — signature verification cannot proceed without the cached pub, and the packet drops as `UnknownSigningKey`. Pre-Phase-3b snapshots load with all-None pubs (padded by the struct-level Deserialize), graceful upgrade.
 
 64 bytes (not 32): `signing_device_hash` MUST equal `Identity::address_hash` = `SHA256(X25519 || Ed25519)[:16]` (see `harmony_identity::Identity::from_public_bytes` at `~/work/zeblithic/harmony/crates/harmony-identity/src/identity.rs:79`). Reproducing this hash from a cached pubkey requires both keys; storing only the Ed25519 half would yield an Ed25519-only hash that diverges from `DeviceIdentityHash` values stored in `devices`, silently breaking every cache lookup in `resolve_signed_origin_owner`. Signature verification still uses only the Ed25519 half (bytes `[32..64]` of the 64-byte combined pub) — the X25519 half is carried for correct hash reproduction, not for signature operations.
 

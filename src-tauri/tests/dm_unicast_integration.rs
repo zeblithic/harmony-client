@@ -259,11 +259,14 @@ async fn dm_full_round_trip_through_unicast_channel() {
 
     // ── Intercept Alice's outbound CidNotify. The destination_hash MUST
     //    equal `compute_dm_destination_hash(bob_device.0)` — same scheme
-    //    Bob's lib.rs::start_node uses for register_local_destination. ──
-    let alice_to_bob = alice_unicast_rx
-        .recv()
-        .await
-        .expect("Alice's drain must produce a UnicastSendRequest");
+    //    Bob's lib.rs::start_node uses for register_local_destination.
+    //    Wrap recv in a 5s timeout so a regression that fails to deliver
+    //    surfaces as a fast-fail panic instead of hanging CI. ──
+    let alice_to_bob =
+        tokio::time::timeout(std::time::Duration::from_secs(5), alice_unicast_rx.recv())
+            .await
+            .expect("Alice's outbound UnicastSendRequest did not arrive within 5s")
+            .expect("alice_unicast_rx closed before Alice's drain produced a UnicastSendRequest");
     assert_eq!(
         alice_to_bob.destination_hash,
         dm_signing::compute_dm_destination_hash(bob_device.0),
@@ -305,10 +308,11 @@ async fn dm_full_round_trip_through_unicast_channel() {
 
     // ── Bob's ack got pushed onto bob_unicast_tx (one ack per device in
     //    `signed.sender_devices` — single device for Alice). ──
-    let bob_to_alice = bob_unicast_rx
-        .recv()
-        .await
-        .expect("Bob must have queued an ack to Alice");
+    let bob_to_alice =
+        tokio::time::timeout(std::time::Duration::from_secs(5), bob_unicast_rx.recv())
+            .await
+            .expect("Bob's ack did not arrive within 5s — DM did not deliver back to Alice")
+            .expect("bob_unicast_rx closed before Bob queued an ack to Alice");
     assert_eq!(
         bob_to_alice.destination_hash,
         dm_signing::compute_dm_destination_hash(alice_device.0),
@@ -553,11 +557,15 @@ async fn dm_offline_recipient_then_online_delivers() {
     }
 
     // ── End-to-end as Test 1 from here: intercept → Bob.handle_unicast →
-    //    intercept ack → Alice.handle_unicast → delivered_to. ──
-    let alice_to_bob = alice_unicast_rx
-        .recv()
-        .await
-        .expect("second drain (post-cache-populate) must produce UnicastSendRequest");
+    //    intercept ack → Alice.handle_unicast → delivered_to. Wrap each
+    //    recv in 5s timeout so CI fails fast on regression. ──
+    let alice_to_bob = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        alice_unicast_rx.recv(),
+    )
+    .await
+    .expect("second drain produced no UnicastSendRequest within 5s — backoff/cache-populate path regressed")
+    .expect("alice_unicast_rx closed before second drain emitted a UnicastSendRequest");
     assert_eq!(
         alice_to_bob.destination_hash,
         dm_signing::compute_dm_destination_hash(bob_device.0)
@@ -579,7 +587,11 @@ async fn dm_offline_recipient_then_online_delivers() {
     };
     assert_eq!(bob_outcome.newly_received.len(), 1);
 
-    let bob_to_alice = bob_unicast_rx.recv().await.expect("Bob must queue an ack");
+    let bob_to_alice =
+        tokio::time::timeout(std::time::Duration::from_secs(5), bob_unicast_rx.recv())
+            .await
+            .expect("Bob's ack did not arrive within 5s in the offline-then-online path")
+            .expect("bob_unicast_rx closed before Bob queued an ack");
     assert_eq!(
         bob_to_alice.destination_hash,
         dm_signing::compute_dm_destination_hash(alice_device.0)

@@ -1670,11 +1670,16 @@ mod integration_tests {
             device_id: "device-a".into(),
         };
         let devices = vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([9; 16])];
+        // Seed parallel `device_identity_pubs` with two distinct Somes
+        // so the sync path actually carries pubs across the wire — an
+        // empty-pubs seed would make this test go green even if the
+        // CRDT-merge path silently dropped device_identity_pubs.
+        let pubs = vec![Some([0xCDu8; 64]), Some([0xEFu8; 64])];
 
         // A learns a per-OwnerAddr device list.
         {
             let mut a = dev.a_state.lock().await;
-            a.apply_owner_device_update(owner, devices.clone(), vec![], learned.clone());
+            a.apply_owner_device_update(owner, devices.clone(), pubs.clone(), learned.clone());
         }
         dev.a_engine.notify_dirty();
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1689,6 +1694,11 @@ mod integration_tests {
         assert_eq!(
             b_entry.devices, devices,
             "B's replicated devices vec must match A's"
+        );
+        assert_eq!(
+            b_entry.device_identity_pubs, pubs,
+            "B's replicated device_identity_pubs must match A's — pins that the CRDT merge \
+             path does not silently drop the parallel pubs vec"
         );
         assert_eq!(
             b_entry.learned_at, learned,

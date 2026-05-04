@@ -476,11 +476,15 @@ mod tests {
         };
         state.apply_space_with_canonicalization(dm_space);
 
-        // Insert OwnerDeviceCache entries.
+        // Insert OwnerDeviceCache entries. Seed a non-empty
+        // `device_identity_pubs` parallel vec — Some + None mix exercises
+        // both branches of the bstr-or-null encoder. Without this seed
+        // the test goes green even if persist drops the parallel vec
+        // entirely (regression-of-omission).
         state.apply_owner_device_update(
             OwnerAddr([2; 16]),
             vec![DeviceIdentityHash([7; 16]), DeviceIdentityHash([8; 16])],
-            vec![],
+            vec![Some([0xAB; 64]), None],
             hlc(1),
         );
 
@@ -530,6 +534,14 @@ mod tests {
             cache_entry.devices[1],
             DeviceIdentityHash([8; 16]),
             "second device hash",
+        );
+        // Pin parallel-vec round-trip: persist must preserve the Some/None
+        // shape exactly. Without this assertion the test would go green
+        // even if persist dropped device_identity_pubs entirely.
+        assert_eq!(
+            cache_entry.device_identity_pubs,
+            vec![Some([0xAB; 64]), None],
+            "device_identity_pubs parallel vec must persist with Some + None preserved",
         );
     }
 
