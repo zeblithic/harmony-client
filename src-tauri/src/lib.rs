@@ -221,6 +221,15 @@ pub struct NodeState {
     /// `RuntimeEvent::SendUnicastToDevice`. Cleared on stop_node so a
     /// restart's transport doesn't carry a stale sender.
     unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    /// ZEB-228 Phase 4: 64-byte combined `identity_pub` for our local
+    /// device (X25519_pub(32) || Ed25519_pub(32) per
+    /// `harmony_identity::Identity::to_public_bytes()`). Captured in
+    /// `start_node` before the in-memory `PrivateIdentity` is dropped, so
+    /// `add_space` can ship it as the bootstrap pubkey on outbound
+    /// `DmInvite` packets without re-deriving from the private bytes.
+    /// Cleared on stop_node so a stale pub never leaks into a new
+    /// identity's invites.
+    dm_identity_pub_64: Option<[u8; 64]>,
 }
 
 impl NodeState {
@@ -264,6 +273,7 @@ impl Default for NodeState {
             dm_self_owner: None,
             content_store: None,
             unicast_send_tx: None,
+            dm_identity_pub_64: None,
         }
     }
 }
@@ -444,7 +454,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (
+        let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
             guard.publish_tx.take(),
@@ -471,7 +481,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_self_owner.take(),
             guard.content_store.take(),
             guard.unicast_send_tx.take(),
-        )
+        );
+        // ZEB-228 Phase 4: clear our cached identity_pub so a restart
+        // can't accidentally ship the prior identity's pub on a new
+        // identity's invites. `[u8; 64]` is Copy, so just `take()` and
+        // discard — no extra cleanup needed beyond the assignment.
+        let _ = guard.dm_identity_pub_64.take();
+        tup
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
@@ -704,6 +720,10 @@ async fn start_node(
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
+        // ZEB-228 Phase 4: clear our cached identity_pub so a restart
+        // can't ship the prior identity's pub on the new identity's
+        // outbound DmInvites. Mirrors stop_inner's cleanup.
+        let _ = guard.dm_identity_pub_64.take();
         tup
     };
 
@@ -768,6 +788,15 @@ async fn start_node(
         let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
         let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
         drop(pq);
+
+        // ZEB-228 Phase 4: capture our 64-byte combined identity_pub
+        // (X25519_pub(32) || Ed25519_pub(32) per
+        // `harmony_identity::Identity::to_public_bytes()`) BEFORE the
+        // ed25519 PrivateIdentity is dropped below. add_space ships this
+        // as the bootstrap pubkey on outbound DmInvite packets so the
+        // recipient can verify the signature without a prior
+        // OwnerDeviceCache entry for us.
+        let identity_pub_64: [u8; 64] = ed25519.public_identity().to_public_bytes();
 
         let reticulum_identity_bytes = Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
         drop(ed25519);
@@ -1209,6 +1238,11 @@ async fn start_node(
                 // event_loop above; the sender remains unused-by-production
                 // until Task 11 wires it to the real transport.
                 guard.unicast_send_tx = Some(unicast_send_tx.clone());
+                // ZEB-228 Phase 4: store our 64-byte combined identity_pub
+                // so add_space can ship it as the bootstrap pubkey on
+                // outbound DmInvite packets. Captured above before the
+                // ed25519 PrivateIdentity was dropped.
+                guard.dm_identity_pub_64 = Some(identity_pub_64);
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -2028,6 +2062,404 @@ async fn delete_outbox_entry(
     }
 
     Ok(())
+}
+
+// ── ZEB-228 Phase 4: add_space (DM/GroupDm creation) ─────────────────────
+
+/// Pure inner implementation of `add_space`'s DM/GroupDm dispatch. The
+/// `#[tauri::command]` shim snapshots NodeState handles, drops the sync
+/// mutex, calls this, then forwards each `UnicastSendRequest` into the
+/// outbound unicast channel.
+///
+/// Behavior:
+///   1. Validate kind ∈ {Dm, GroupDm} and the recipient list:
+///      - Dm: exactly 1 recipient (total members = 2).
+///      - GroupDm: 2-15 recipients (total members = 3-16).
+///      - No self in recipients.
+///      - No duplicate recipients.
+///   2. Generate a fresh content_key (32 random bytes via OsRng, wrapped
+///      in `Zeroizing` while in scope).
+///   3. Build a Space CRDT entry with sorted self+recipient members,
+///      Reticulum transport (empty participants — populated lazily as
+///      announces flow), `created_at`/`updated_at` from a fresh HLC.
+///   4. Apply locally via `apply_space_with_canonicalization`.
+///   5. Build a signed `DmInvite` packet and emit one
+///      `UnicastSendRequest` per device in each recipient's
+///      `OwnerDeviceCache` entry. Best-effort: a recipient with no
+///      cached devices yields zero outbound packets — Phase 3b's
+///      handle_invite-on-first-send_dm path still recovers because the
+///      sender's outbox loop will fan out the missing invite when the
+///      first message ships.
+///
+/// Returns the new SpaceId and the list of `UnicastSendRequest`s the
+/// caller must push into `unicast_send_tx`.
+///
+/// The pure-function shape lets integration tests exercise the
+/// validation + Space-construction + invite-build logic without
+/// standing up a tauri::State<NodeState>.
+#[allow(clippy::too_many_arguments)]
+pub fn add_space_dm_inner(
+    state: &mut crate::owner_state_crdt::OwnerState,
+    signing_key: &ed25519_dalek::SigningKey,
+    inviter_identity_pub: &[u8; 64],
+    self_owner: crate::owner_state_types::OwnerAddr,
+    our_signing_device_hash: crate::owner_state_types::DeviceIdentityHash,
+    device_id: &str,
+    kind: crate::owner_state_types::SpaceKind,
+    name: String,
+    recipients: Vec<crate::owner_state_types::OwnerAddr>,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<
+    (
+        crate::owner_state_types::SpaceId,
+        Vec<crate::dm_outbox::UnicastSendRequest>,
+    ),
+    String,
+> {
+    use crate::owner_state_types::{
+        DmContentKey, OwnerAddr, ReticulumDest, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    // ── 1. Validate kind + recipients. ───────────────────────────────
+    if !matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Err(format!(
+            "add_space_dm_inner only handles Dm/GroupDm; got {kind:?}"
+        ));
+    }
+    if recipients.contains(&self_owner) {
+        return Err("self must not be in recipients (backend adds self automatically)".to_string());
+    }
+    // Defense in depth — frontend already blocks but enforce here too.
+    let total_members = 1 + recipients.len();
+    if total_members > 16 {
+        return Err(format!(
+            "DM/GroupDm cap is 16 members; got {total_members} (use a community for larger groups)"
+        ));
+    }
+    match kind {
+        SpaceKind::Dm => {
+            if recipients.len() != 1 {
+                return Err(format!(
+                    "Dm kind requires exactly 1 recipient; got {} (use GroupDm for 2-15)",
+                    recipients.len()
+                ));
+            }
+        }
+        SpaceKind::GroupDm => {
+            if !(2..=15).contains(&recipients.len()) {
+                return Err(format!(
+                    "GroupDm requires 2-15 recipients; got {}",
+                    recipients.len()
+                ));
+            }
+        }
+        _ => unreachable!("kind already restricted to Dm or GroupDm above"),
+    }
+
+    // ── 2. Build sorted+deduped member list (self + recipients). ─────
+    let mut all_members: Vec<OwnerAddr> = std::iter::once(self_owner)
+        .chain(recipients.iter().copied())
+        .collect();
+    all_members.sort();
+    all_members.dedup();
+    if all_members.len() != total_members {
+        return Err("duplicate recipient(s) in input".to_string());
+    }
+
+    // ── 3. Generate fresh content_key. Bytes live in `Zeroizing` for
+    //       the duration of this scope; `DmContentKey::new` copies the
+    //       bytes into its own (also-zeroize-on-drop) wrapper. ───────
+    let content_key = {
+        use rand::RngCore;
+        use zeroize::Zeroizing;
+        let mut k = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(k.as_mut());
+        DmContentKey::new(*k)
+    };
+
+    // ── 4. Mint HLCs for created_at / updated_at. Both stamped from
+    //       the same `next_hlc` so a peer comparing them by lex-order
+    //       sees them as equal (the typical case for fresh creation).
+    //       The IPC shim's caller is responsible for keeping the HLC
+    //       tracker monotone post-mint; this inner function doesn't
+    //       touch the tracker. ───────────────────────────────────────
+    let creation_hlc = next_hlc(prev_hlc, wall_now_ms, device_id);
+
+    // ── 5. Build the Space CRDT entry. ───────────────────────────────
+    let space_id = SpaceId(rand::random());
+    let space = Space {
+        id: space_id,
+        kind,
+        parent: None,
+        community_id: None,
+        name,
+        members: all_members.clone(),
+        // DM kinds always Reticulum; participants populated lazily as
+        // announces propagate (Phase 3b currently leaves it empty —
+        // resolution happens via OwnerDeviceCache, not the Space's
+        // transport binding).
+        transport: Some(TransportBinding::Reticulum {
+            participants: Vec::<ReticulumDest>::new(),
+        }),
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: creation_hlc.clone(),
+        updated_at: creation_hlc.clone(),
+        content_key: Some(content_key.clone()),
+        prior_content_keys: vec![],
+    };
+
+    // Validate invariants up front — catches programmer error before we
+    // mutate state. apply_space_with_canonicalization itself does NOT
+    // validate (it's the receive path's job, and incoming entries from
+    // remote replicas are guarded by their own decode-time checks).
+    space
+        .validate_invariants()
+        .map_err(|e| format!("Space invariants violated: {}", e.0))?;
+
+    // ── 6. Apply locally. ────────────────────────────────────────────
+    state.apply_space_with_canonicalization(space);
+
+    // ── 7. Build + sign the DmInvite. Our own devices come from
+    //       OwnerDeviceCache (populated by Flow A); fall back to just
+    //       our_signing_device_hash if no entry yet (pre-bootstrap). ──
+    let our_devices: Vec<crate::owner_state_types::DeviceIdentityHash> = state
+        .owner_device_cache
+        .devices
+        .get(&self_owner)
+        .map(|e| e.devices.clone())
+        .unwrap_or_else(|| vec![our_signing_device_hash]);
+    // Defense in depth — sender_devices MUST contain signing_device_hash
+    // (Phase 3b invariant; validated wire-side by decode_packet).
+    let sender_devices = if our_devices.contains(&our_signing_device_hash) {
+        our_devices
+    } else {
+        let mut combined = our_devices;
+        combined.push(our_signing_device_hash);
+        combined.sort();
+        combined.dedup();
+        combined
+    };
+
+    let signed_invite = crate::dm_envelope::DmInviteSigned {
+        space_id,
+        kind,
+        members: all_members,
+        inviter: self_owner,
+        inviter_identity_pub: *inviter_identity_pub,
+        content_key,
+        sender_devices,
+        signing_device_hash: our_signing_device_hash,
+        created_at: creation_hlc,
+    };
+    let invite_packet = crate::dm_envelope::build_signed_invite(signed_invite, signing_key)
+        .map_err(|e| format!("build_signed_invite: {e}"))?;
+    let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
+        .map_err(|e| format!("encode_packet: {e}"))?;
+
+    // ── 8. One UnicastSendRequest per non-self recipient device. ─────
+    // Note: we hold a borrow of `state.owner_device_cache` here, which
+    // is fine because the `apply_space_with_canonicalization` write
+    // above already returned.
+    let mut sends: Vec<crate::dm_outbox::UnicastSendRequest> = Vec::new();
+    for r in &recipients {
+        let entry = match state.owner_device_cache.devices.get(r) {
+            Some(e) => e,
+            None => continue, // recipient unknown — outbox loop on first send_dm recovers
+        };
+        for device in &entry.devices {
+            let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+            sends.push(crate::dm_outbox::UnicastSendRequest {
+                destination_hash: dest_hash,
+                packet: invite_wire.clone(),
+            });
+        }
+    }
+
+    Ok((space_id, sends))
+}
+
+/// Helper mirroring `dm_outbox::next_hlc` for callers in this module.
+/// Inlined here to avoid widening `dm_outbox::next_hlc` from `fn` (file-
+/// private) to `pub(crate)` for one consumer; if a third caller emerges,
+/// promote it.
+fn next_hlc(
+    prev: Option<&crate::owner_state_types::Hlc>,
+    wall_now_ms: u64,
+    device_id: &str,
+) -> crate::owner_state_types::Hlc {
+    let (logical, base_wall) = match prev {
+        Some(p) if p.wall_ms == wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) if p.wall_ms > wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) => (0, p.wall_ms),
+        None => (0, 0),
+    };
+    let effective_wall = std::cmp::max(wall_now_ms, base_wall);
+    crate::owner_state_types::Hlc {
+        wall_ms: effective_wall,
+        logical,
+        device_id: device_id.to_string(),
+    }
+}
+
+/// ZEB-228 Phase 4 — Create a new Space.
+///
+/// For DM/GroupDm kinds: generates a fresh content_key, builds the
+/// Space CRDT entry with members (self + recipients), applies it
+/// locally, and dispatches a signed DmInvite to each recipient's
+/// known devices via the unicast channel. Returns the new SpaceId
+/// (hex-encoded).
+///
+/// Validation:
+///   - DM kind = exactly 1 recipient (total members = 2).
+///   - GroupDm kind = 2-15 recipients (total members = 3-16).
+///   - Total members ≤ 16 (defense in depth — frontend also blocks).
+///   - No self in recipients (caller passes recipients only; backend
+///     adds self automatically).
+///   - No duplicate recipients.
+///
+/// Other kinds (Folder, Channel, Community, PublicChannel) are not
+/// yet implemented in this IPC and return Err — they have their own
+/// dedicated flows (e.g., `create_folder`).
+///
+/// Frontend's DmCreateDialog calls this; the dispatched DmInvite
+/// flows through Phase 3b's `handle_invite` on each recipient's
+/// device, which auto-accepts and writes the Space + cache entry.
+#[tauri::command]
+async fn add_space(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    kind: String,
+    name: String,
+    members: Option<Vec<String>>,
+) -> Result<String, String> {
+    use crate::owner_state_types::{OwnerAddr, SpaceKind};
+
+    // Parse the kind string. Accept the same wire codes the SpaceKind
+    // serde-rename uses ("d", "g") AND the human-friendly forms the
+    // frontend will probably send ("dm", "group-dm").
+    let parsed_kind = match kind.as_str() {
+        "d" | "dm" | "Dm" => SpaceKind::Dm,
+        "g" | "group-dm" | "groupdm" | "GroupDm" => SpaceKind::GroupDm,
+        // Other kinds are not implemented in this IPC yet (Phase 4
+        // ships DM/GroupDm only). Surface as a clear Err so a future
+        // frontend that tries to call add_space for, e.g., a folder
+        // gets a useful diagnostic rather than silent acceptance.
+        other => {
+            return Err(format!(
+                "add_space: unsupported kind '{other}' (Phase 4 ships Dm/GroupDm only)"
+            ));
+        }
+    };
+
+    // Decode each recipient OwnerAddr from hex.
+    let recipients: Vec<OwnerAddr> = members
+        .unwrap_or_default()
+        .iter()
+        .map(|hex_addr| {
+            let bytes = hex::decode(hex_addr)
+                .map_err(|e| format!("recipient '{hex_addr}' hex decode: {e}"))?;
+            let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                format!(
+                    "recipient '{hex_addr}' must be 16 bytes, got {}",
+                    bytes.len()
+                )
+            })?;
+            Ok(OwnerAddr(arr))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Snapshot all handles under the sync mutex; release before any
+    // .await. (Same pattern as send_dm — NodeState's sync mutex must
+    // not span .await boundaries.)
+    let (
+        dm_outbox,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        unicast_send_tx,
+        identity_pub_64,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.unicast_send_tx.clone().ok_or("unicast_send_tx missing")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Lock order mirrors send_dm: dm_outbox → crdt_state → hlc_tracker.
+    // We borrow signing_key + our_signing_device_hash from DmOutbox so
+    // we don't double-store identity-derived material on NodeState.
+    let (space_id, sends, new_hlc) = {
+        let outbox_g = dm_outbox.lock().await;
+        let mut state_g = crdt_state.lock().await;
+        let mut tracker_g = hlc_tracker.lock().await;
+        let prev_hlc = tracker_g.get(&device_id).cloned();
+
+        let signing_key = outbox_g.signing_key.as_ref();
+        let our_signing_device_hash = outbox_g.our_signing_device_hash;
+
+        let result = add_space_dm_inner(
+            &mut state_g,
+            signing_key,
+            &identity_pub_64,
+            self_owner,
+            our_signing_device_hash,
+            &device_id,
+            parsed_kind,
+            name,
+            recipients,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?;
+
+        // Fetch the HLC stamped on the just-applied Space — single
+        // source of truth (mirrors send_dm's pattern of reading back
+        // from state after apply, so any future change to next_hlc's
+        // logic stays in lockstep).
+        let stamped = state_g
+            .spaces
+            .get(&result.0)
+            .map(|s| s.created_at.clone())
+            .ok_or_else(|| {
+                "add_space: just-applied Space not in state (apply rejected?)".to_string()
+            })?;
+        tracker_g.insert(device_id.clone(), stamped.clone());
+
+        (result.0, result.1, stamped)
+    };
+    let _ = new_hlc; // borrowed only to pin the tracker update timing
+
+    // Dispatch invites. Best-effort try_send — a full channel surfaces
+    // as a dropped invite, recovered by the outbox loop's first send_dm
+    // into this Space (which builds + ships its own DmInvite).
+    for req in sends {
+        if let Err(e) = unicast_send_tx.try_send(req) {
+            tracing::warn!(
+                error = %e,
+                "add_space: dropped DmInvite dispatch (channel full); outbox retry on first send_dm will recover"
+            );
+        }
+    }
+
+    Ok(hex::encode(space_id.0))
 }
 
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
@@ -4118,6 +4550,7 @@ pub fn run() {
             send_dm,
             read_dm_thread,
             delete_outbox_entry,
+            add_space,
             get_node_addr,
             list_content,
             pin_content,
