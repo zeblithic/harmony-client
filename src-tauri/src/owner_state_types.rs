@@ -1697,6 +1697,25 @@ impl InboxEntry {
     }
 }
 
+/// A received DM message bundle — Phase 4 IPC payload carrier.
+///
+/// `handle_cidnotify` (receive path) decrypts the message, then emits this
+/// struct via `DrainOutcome.newly_received`. The event_loop tick consumes
+/// the vec and emits one `dm-received` IPC event per element with body +
+/// mime_type + sent_at fields the frontend needs to render the message.
+///
+/// This widens the previous `Vec<InboxEntry>` carrier so the decrypted
+/// body doesn't have to be re-fetched + re-decrypted on the IPC emit
+/// path. The fields are not persisted — only InboxEntry persists; body
+/// lives in CAS keyed by message_cid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedMessage {
+    pub inbox_entry: InboxEntry,
+    pub body: Vec<u8>,
+    pub mime_type: String,
+    pub sent_at: Hlc,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadMarker {
     #[serde(rename = "sp")]

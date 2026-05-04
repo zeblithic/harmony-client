@@ -1332,14 +1332,17 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
                     drop(outbox_g);
                     match result {
                         Ok(outcome) => {
-                            for entry in outcome.newly_received {
+                            for rm in outcome.newly_received {
                                 let _ = app.emit(
                                     "dm-received",
                                     serde_json::json!({
-                                        "spaceId": hex::encode(entry.space_id.0),
-                                        "messageCid": hex::encode(entry.message_cid.to_bytes()),
-                                        "from": hex::encode(entry.from.0),
-                                        "receivedAt": entry.received_at.wall_ms,
+                                        "spaceId": hex::encode(rm.inbox_entry.space_id.0),
+                                        "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
+                                        "from": hex::encode(rm.inbox_entry.from.0),
+                                        "receivedAt": rm.inbox_entry.received_at.wall_ms,
+                                        "sentAt": rm.sent_at.wall_ms,
+                                        "body": hex::encode(&rm.body),
+                                        "mimeType": rm.mime_type,
                                     }),
                                 );
                             }

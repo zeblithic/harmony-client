@@ -312,15 +312,22 @@ pub struct DrainOutcome {
     pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
     /// Entries that transitioned to Expired this tick.
     pub newly_expired: Vec<OutboxEntryId>,
-    /// Phase 3b: InboxEntries written by `handle_cidnotify` for which
-    /// `apply_inbox` returned `ApplyOutcome::Inserted` (NOT `Merged`/NoOp).
-    /// The caller emits `dm-received` IPC events from this field. Per spec
-    /// §"Idempotency and drain semantics", the inserted-vs-already-present
-    /// discriminant from `apply_inbox` is the atomic-emit boundary;
-    /// duplicate notifies hitting the same `(space_id, message_cid)` key
-    /// don't re-emit. `drain` (sender-side) leaves this empty; only
-    /// `handle_cidnotify` (receiver-side) populates it.
-    pub newly_received: Vec<crate::owner_state_types::InboxEntry>,
+    /// Phase 4: ReceivedMessage bundles written by `handle_cidnotify` for
+    /// which `apply_inbox` returned `ApplyOutcome::Inserted` (NOT
+    /// `Merged`/NoOp). The caller emits `dm-received` IPC events from this
+    /// field. Per spec §"Idempotency and drain semantics", the
+    /// inserted-vs-already-present discriminant from `apply_inbox` is the
+    /// atomic-emit boundary; duplicate notifies hitting the same
+    /// `(space_id, message_cid)` key don't re-emit. `drain` (sender-side)
+    /// leaves this empty; only `handle_cidnotify` (receiver-side)
+    /// populates it.
+    ///
+    /// Each element wraps the InboxEntry alongside the decrypted body,
+    /// mime_type, and sender's HLC `sent_at` — Phase 3b only carried the
+    /// InboxEntry pointer, forcing the IPC emit path to re-fetch + re-
+    /// decrypt to render the message. Phase 4 widens the carrier so the
+    /// already-decrypted MessagePayload fields ride along.
+    pub newly_received: Vec<crate::owner_state_types::ReceivedMessage>,
 }
 
 /// Per-process DM-outbox state. One instance per running node, shared between
@@ -1093,7 +1100,14 @@ impl DmOutbox {
         let outcome = state.apply_inbox(inbox_entry.clone());
         let mut drain_outcome = DrainOutcome::default();
         if matches!(outcome, ApplyOutcome::Inserted) {
-            drain_outcome.newly_received.push(inbox_entry);
+            drain_outcome
+                .newly_received
+                .push(crate::owner_state_types::ReceivedMessage {
+                    inbox_entry,
+                    body: payload.body.clone(),
+                    mime_type: payload.mime_type.clone(),
+                    sent_at: payload.sent_at.clone(),
+                });
         }
 
         // Step 13b: DmAck fan-out to all sender_devices.
@@ -2802,8 +2816,8 @@ mod tests {
 
         // newly_received populated for the Inserted outcome.
         assert_eq!(outcome.newly_received.len(), 1);
-        assert_eq!(outcome.newly_received[0].from, alice);
-        assert_eq!(outcome.newly_received[0].space_id, space_id);
+        assert_eq!(outcome.newly_received[0].inbox_entry.from, alice);
+        assert_eq!(outcome.newly_received[0].inbox_entry.space_id, space_id);
 
         // One UnicastSendRequest emitted per sender device (one device
         // here, so exactly one).
@@ -3606,7 +3620,7 @@ mod tests {
         // newly_received populated for the Inserted outcome — ack drop
         // does NOT suppress dm-received emission.
         assert_eq!(outcome.newly_received.len(), 1);
-        assert_eq!(outcome.newly_received[0].from, alice);
+        assert_eq!(outcome.newly_received[0].inbox_entry.from, alice);
     }
 
     #[tokio::test]
