@@ -279,10 +279,10 @@ This is what's ChaCha20-Poly1305-encrypted into the storage_blob written to CAS.
 Reticulum unicast carries one of three packet types. Wire layout per packet:
 
 ```text
-[u8 discriminant][CBOR-encoded signed body][signature: bstr(64)]
+[u8 discriminant][CBOR-encoded signed body][signature: 64 raw bytes]
 ```
 
-The discriminant byte is excluded from the signed bytes (the signature covers the CBOR body only — discriminant is just a routing tag). The signature is a separate 64-byte CBOR `bstr` appended after the body, NOT a field inside the CBOR map (so the signed body has no chicken-and-egg with computing the signature). This mirrors ZEB-219's per-message version-byte pattern and lets future packet types add new discriminants without bumping a top-level CBOR schema.
+The discriminant byte is excluded from the signed bytes (the signature covers the CBOR body only — discriminant is just a routing tag). The signature is appended as 64 raw Ed25519 signature bytes after the CBOR body, NOT inside the CBOR map (so the signed body has no chicken-and-egg with computing the signature). The decode side splits the trailing 64 bytes off the wire packet directly — no CBOR header, no `bstr` framing on the signature tail. This mirrors ZEB-219's per-message version-byte pattern and lets future packet types add new discriminants without bumping a top-level CBOR schema.
 
 | Disc | Type | Direction | Purpose |
 |---|---|---|---|
@@ -292,7 +292,7 @@ The discriminant byte is excluded from the signed bytes (the signature covers th
 
 ```rust
 /// Signed payload (the CBOR-encoded bytes that the signature covers).
-/// Wire packet = [0x01][CBOR(DmInviteSigned)][bstr(64) signature].
+/// Wire packet = [0x01][CBOR(DmInviteSigned)][64 raw signature bytes].
 pub struct DmInviteSigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "kn")] pub kind: SpaceKind,            // dm or group-dm
@@ -335,7 +335,7 @@ pub struct DmInviteSigned {
 }
 
 /// Signed payload for DmCidNotify.
-/// Wire packet = [0x02][CBOR(DmCidNotifySigned)][bstr(64) signature].
+/// Wire packet = [0x02][CBOR(DmCidNotifySigned)][64 raw signature bytes].
 pub struct DmCidNotifySigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
@@ -354,7 +354,7 @@ pub struct DmCidNotifySigned {
 }
 
 /// Signed payload for DmAck.
-/// Wire packet = [0x03][CBOR(DmAckSigned)][bstr(64) signature].
+/// Wire packet = [0x03][CBOR(DmAckSigned)][64 raw signature bytes].
 pub struct DmAckSigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
@@ -379,7 +379,14 @@ The signing pubkey for each device propagates via:
 - `DmInvite.inviter_identity_pub` → cached on accept (one device's identity pub per invite).
 - `DmCidNotify.signing_device_hash` + the in-packet signature verifies against an identity pub the receiver looks up — if the receiver has the device hash without its identity pub, the lookup fails and the packet drops as `UnknownSigningKey`. This is the bootstrap-incompleteness case; in v1 it's acceptable (the receiver eventually learns the pubs via a fresh DmInvite or a follow-up announce that has the identity material in the announce table — see `NodeRuntime::lookup_destination_identity` at PR #268).
 
-For Phase 3b shipped scope: the receiver caches the inviter's identity pub on DmInvite accept; subsequent CidNotify/Ack from the inviter's already-cached devices verify against that cached pub. CidNotify/Ack from a NEW device of an already-known owner (not in the inviter's original `sender_devices`) drops as `UnknownSigningKey` until the next DmInvite-equivalent flow re-publishes the device's pub. Filed as a Phase 3b follow-up: per-device-pubkey piggyback on every packet (~64 bytes per device extra wire cost, removes the bootstrap-incompleteness window).
+For Phase 3b shipped scope: the receiver caches the inviter's identity pub on DmInvite accept; subsequent CidNotify/Ack from the inviter's already-cached devices verify against that cached pub. CidNotify/Ack from a NEW device of an already-known owner (not in the inviter's original `sender_devices`) drops as `UnknownSigningDevice` until the next DmInvite-equivalent flow propagates the device's hash and pub. Filed as a Phase 3b follow-up: per-device-pubkey piggyback on every packet (~64 bytes per device extra wire cost, removes the bootstrap-incompleteness window).
+
+Note the two-error split (matches `DmReceiveError` in `dm_outbox.rs`):
+
+- `UnknownSigningDevice` — the `signing_device_hash` is not in `OwnerDeviceCache.devices` for ANY owner. Owner resolution itself fails (`resolve_signed_origin_owner` returns zero matches) before any pub lookup runs. The sender is using a device we've never heard of; this is the case for a NEW device of an already-known owner that the receiver hasn't yet learned via an invite-equivalent flow.
+- `UnknownSigningKey` — the `signing_device_hash` IS in `OwnerDeviceCache.devices`, owner resolution succeeds, but the parallel-vec pub slot is `None`. The receiver knows the device exists but doesn't have its identity pub yet (bootstrap-incompleteness from Path B: known-by-hash, pub-not-yet-propagated). Signature verification cannot proceed without the cached pub.
+
+A new device of an already-known owner falls under the first error class (hash not in cache at all), not the second.
 
 ### Application-signature binding rule (load-bearing, applies to all three packets)
 

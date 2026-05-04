@@ -889,7 +889,7 @@ impl DmOutbox {
             kind: signed.kind,
             parent: None,
             community_id: None,
-            name: format!("DM with {:?}", signed.inviter),
+            name: format!("DM with {}", hex::encode(signed.inviter.0)),
             // `participants` is a `Vec<ReticulumDest>` of opaque transport
             // identifiers; we don't have those for the inviter's owners
             // here (only their `OwnerAddr`s — the receiver-side code path
