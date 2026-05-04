@@ -40,8 +40,8 @@ Same as ZEB-219 plus transport-layer concerns:
 - **OwnerDeviceCache poisoning via spoofed payload owner**: blocked by the application-signature binding rule — every cache mutation uses the owner resolved from the cryptographically-verified `signing_device_hash`, never a payload-controlled `sender_owner_addr` field. Mismatched packets are dropped with telemetry.
 - **Forged DmAck inflating `delivered_to`**: blocked by (a) application-signature binding (ack signed by an authenticated device → resolved owner via OwnerDeviceCache) AND (b) recipient-membership check (resolved owner must be in `OutboxEntry.recipient_owners`).
 - **Stale device list**: piggyback refresh on every DM envelope keeps recipient's `OwnerDeviceCache` fresh; cache LWW on `learned_at` HLC
-- **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot resolve the signing device's public key via cache lookup. Two layers of bootstrap trust: (1) `DmInvite` carries `inviter_signing_pub: [u8; 32]` inline (the inviter's device-Identity Ed25519 verifying key) so signature verification is self-contained; (2) UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated, anchoring the `(owner_addr, device_identity_hash, signing_pub)` triple in user-mediated trust from the out-of-band channel (invite link, QR, library directory listing). Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
-- **Application-signature forgery**: blocked by per-device Ed25519 signing of the canonical CBOR encoding of every Reticulum DM packet body (incl. `signing_device_hash` to prevent key-substitution). Receiver looks up the public key for `signing_device_hash` (via OwnerDeviceCache for post-bootstrap packets, via inline `inviter_signing_pub` for DmInvite), verifies the signature, and uses the verified `signing_device_hash` as `from_identity_hash` for downstream rules. Verification failure → drop with telemetry.
+- **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot resolve the signing device's public key via cache lookup. Two layers of bootstrap trust: (1) `DmInvite` carries `inviter_identity_pub: [u8; 64]` inline (the inviter's full device-Identity public bytes — `X25519_pub(32) || Ed25519_pub(32)` per `harmony_identity::Identity::to_public_bytes`) so signature verification + device-hash reconstruction are both self-contained; (2) UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated, anchoring the `(owner_addr, device_identity_hash, identity_pub)` triple in user-mediated trust from the out-of-band channel (invite link, QR, library directory listing). Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
+- **Application-signature forgery**: blocked by per-device Ed25519 signing of the canonical CBOR encoding of every Reticulum DM packet body (incl. `signing_device_hash` to prevent key-substitution). Receiver looks up the identity pub for `signing_device_hash` (via OwnerDeviceCache for post-bootstrap packets, via inline `inviter_identity_pub` for DmInvite), verifies the signature, and uses the verified `signing_device_hash` as `from_identity_hash` for downstream rules. Verification failure → drop with telemetry.
 
 ### DmInvite rejection / decline semantics (v1)
 
@@ -312,12 +312,26 @@ pub struct DmInviteSigned {
     /// signature. MUST be in `sender_devices`. Inside the signed body
     /// (preventing key-substitution attacks).
     #[serde(rename = "dh")] pub signing_device_hash: DeviceIdentityHash,
-    /// Inviter's device-Identity Ed25519 verifying key (32 bytes).
+    /// Inviter's full device-Identity public bytes (64 bytes:
+    /// `X25519_pub(32) || Ed25519_pub(32)`, the canonical
+    /// `harmony_identity::Identity::to_public_bytes()` layout).
     /// Bootstrap-only on DmInvite: the receiver doesn't yet have an
     /// OwnerDeviceCache entry for the inviter, so cannot resolve the
-    /// signing public key by lookup. The inviter ships its key inline.
-    /// User-mediated UI acceptance anchors trust per the threat model.
-    #[serde(rename = "sp")] pub inviter_signing_pub: [u8; 32],
+    /// signing public key by lookup. The inviter ships its full identity
+    /// pubs inline. The receiver derives `signing_device_hash` by calling
+    /// `harmony_identity::Identity::from_public_bytes(&inviter_identity_pub)
+    /// .address_hash`; signature verification uses the second 32-byte half
+    /// (Ed25519 verifying key). User-mediated UI acceptance anchors trust
+    /// per the threat model.
+    ///
+    /// Why 64 bytes (full identity) and not 32 bytes (Ed25519 only):
+    /// harmony's `address_hash = SHA256(X25519 || Ed25519)[:16]`, so
+    /// reproducing the `signing_device_hash` value (which MUST equal
+    /// the same hash stored in `OwnerDeviceCache.devices` — see
+    /// `resolve_signed_origin_owner` for the lookup) requires both keys.
+    /// A naive Ed25519-only hash would diverge from existing
+    /// DeviceIdentityHash values and silently break cache lookups.
+    #[serde(rename = "sp")] pub inviter_identity_pub: [u8; 64],
 }
 
 /// Signed payload for DmCidNotify.
@@ -333,7 +347,7 @@ pub struct DmCidNotifySigned {
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
     /// The DeviceIdentityHash of the device that produced the appended
     /// signature. Receiver looks up this device's Ed25519 public key in
-    /// OwnerDeviceCache (or in the bootstrap `inviter_signing_pub` if
+    /// OwnerDeviceCache (or in the bootstrap `inviter_identity_pub` if
     /// this is the first inbound from a not-yet-cached owner — typically
     /// only DmInvite hits that path). Inside the signed body.
     #[serde(rename = "dh")] pub signing_device_hash: DeviceIdentityHash,
@@ -357,11 +371,15 @@ pub struct DmAckSigned {
 
 ### Public-key storage on OwnerDeviceCache
 
-To verify signatures from devices already in the cache (every post-bootstrap DmCidNotify and DmAck), the cache must store each device's Ed25519 verifying key alongside its identity hash. Phase 1 stored only `Vec<DeviceIdentityHash>`; Phase 3b extends `OwnerDeviceEntry` to store `Vec<(DeviceIdentityHash, [u8; 32])>` (or split into two parallel sorted vecs to preserve the existing binary-search invariant — exact representation is an implementation detail). The signing pubkey for each device propagates via:
-- `DmInvite.inviter_signing_pub` → cached on accept (one device's key per invite).
-- `DmCidNotify.signing_device_hash` + the in-packet signature verifies against a key the receiver looks up — but if the receiver has the device hash without its pubkey, the lookup fails and the packet drops as `UnknownSigningKey`. This is the bootstrap-incompleteness case; in v1 it's acceptable (the receiver eventually learns the pubkey via a fresh DmInvite or a follow-up announce). Future: piggyback `signing_pub` per device in `sender_devices` to make every packet self-contained.
+To verify signatures from devices already in the cache (every post-bootstrap DmCidNotify and DmAck), the cache must store each device's full identity pubkeys (64 bytes: `X25519_pub || Ed25519_pub`) alongside its identity hash. Phase 1 stored only `Vec<DeviceIdentityHash>`; Phase 3b extends `OwnerDeviceEntry` to store `Vec<[u8; 64]>` parallel to the existing `Vec<DeviceIdentityHash>` (parallel-vec representation preserves the existing binary-search invariant on `devices`; element i in `device_identity_pubs` is the 64-byte identity-pub for `devices[i]`).
 
-For Phase 3b shipped scope: the receiver caches the inviter's pubkey on DmInvite accept; subsequent CidNotify/Ack from the inviter's already-cached devices verify against that cached pubkey. CidNotify/Ack from a NEW device of an already-known owner (not in the inviter's original `sender_devices`) drops as `UnknownSigningKey` until the next DmInvite-equivalent flow re-publishes the device's pubkey. Filed as a Phase 3b follow-up: per-device-pubkey piggyback on every packet (small wire cost, removes the bootstrap-incompleteness window).
+64 bytes (not 32): `signing_device_hash` MUST equal `Identity::address_hash` = `SHA256(X25519 || Ed25519)[:16]` (see `harmony_identity::Identity::from_public_bytes` at `~/work/zeblithic/harmony/crates/harmony-identity/src/identity.rs:79`). Reproducing this hash from a cached pubkey requires both keys; storing only the Ed25519 half would yield an Ed25519-only hash that diverges from `DeviceIdentityHash` values stored in `devices`, silently breaking every cache lookup in `resolve_signed_origin_owner`. Signature verification still uses only the Ed25519 half (bytes `[32..64]` of the 64-byte combined pub) — the X25519 half is carried for correct hash reproduction, not for signature operations.
+
+The signing pubkey for each device propagates via:
+- `DmInvite.inviter_identity_pub` → cached on accept (one device's identity pub per invite).
+- `DmCidNotify.signing_device_hash` + the in-packet signature verifies against an identity pub the receiver looks up — if the receiver has the device hash without its identity pub, the lookup fails and the packet drops as `UnknownSigningKey`. This is the bootstrap-incompleteness case; in v1 it's acceptable (the receiver eventually learns the pubs via a fresh DmInvite or a follow-up announce that has the identity material in the announce table — see `NodeRuntime::lookup_destination_identity` at PR #268).
+
+For Phase 3b shipped scope: the receiver caches the inviter's identity pub on DmInvite accept; subsequent CidNotify/Ack from the inviter's already-cached devices verify against that cached pub. CidNotify/Ack from a NEW device of an already-known owner (not in the inviter's original `sender_devices`) drops as `UnknownSigningKey` until the next DmInvite-equivalent flow re-publishes the device's pub. Filed as a Phase 3b follow-up: per-device-pubkey piggyback on every packet (~64 bytes per device extra wire cost, removes the bootstrap-incompleteness window).
 
 ### Application-signature binding rule (load-bearing, applies to all three packets)
 
@@ -369,7 +387,7 @@ Both DmCidNotify and DmAck carry payload-controlled owner fields (`sender_owner_
 
 **Why not Reticulum link-layer binding.** The original spec assumed Reticulum link-layer ECDH would provide the authenticated source identity (i.e., `RuntimeAction::UnicastReceived.source: Option<[u8; 16]>` would be `Some(remote_link_identity_hash)`). Investigation during ZEB-227 implementation revealed that harmony's `Node` does not currently track terminal-link state at endpoint destinations — `Link::respond` is unwired, no `terminal_links` map exists, and inbound DM packets are sent as raw Type1 Data packets via `path_table` routing, NOT over established Reticulum links. Wiring the responder-side handshake is a multi-PR feature in its own right (terminal-link state machine, handshake completion, link expiration, plus a corresponding initiator-side link cache + runtime API redesign for "establish-then-send" semantics). Path B — application-layer Ed25519 signatures on every Reticulum DM packet body — is consistent with the current "raw bytes via path_table" architecture, requires a single small harmony-side companion PR (just expose the existing announce-table identity material), and is in fact stronger than link-layer binding for DM-specific authentication (the signature is over the application payload, not just a link envelope, so a compromised link doesn't let an attacker forge DM signatures). Reticulum link state may still be wired in a future ticket if voice / file sync / streaming features need it; that work doesn't block ZEB-216.
 
-**The mechanism.** Every Reticulum DM packet body carries a `signing_device_hash` field inside the signed CBOR body and an Ed25519 signature appended after the body. The signature is computed over the canonical CBOR encoding of the body (which includes `signing_device_hash`, preventing key-substitution attacks where an attacker swaps which device claims authorship). Receiver verifies the signature using the public key for `signing_device_hash`, looked up via OwnerDeviceCache (post-bootstrap) or via the inline `inviter_signing_pub` field on DmInvite (bootstrap exception). On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream state mutations use the OwnerAddr resolved from this hash via OwnerDeviceCache, never a payload-controlled `sender_owner_addr` field.
+**The mechanism.** Every Reticulum DM packet body carries a `signing_device_hash` field inside the signed CBOR body and an Ed25519 signature appended after the body. The signature is computed over the canonical CBOR encoding of the body (which includes `signing_device_hash`, preventing key-substitution attacks where an attacker swaps which device claims authorship). Receiver verifies the signature using the 64-byte combined identity pub for `signing_device_hash`, looked up via OwnerDeviceCache (post-bootstrap) or via the inline `inviter_identity_pub` field on DmInvite (bootstrap exception). On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream state mutations use the OwnerAddr resolved from this hash via OwnerDeviceCache, never a payload-controlled `sender_owner_addr` field.
 
 The receive-side rule (Phase 3b):
 
@@ -400,29 +418,45 @@ fn resolve_signed_origin_owner(
     }
 }
 
-/// Verify a Reticulum DM packet's signature, returning the verified
-/// signing_device_hash on success.
+/// Verify a Reticulum DM packet's signature.
 ///
 /// `body_bytes` is the canonical CBOR encoding of the signed body (NOT
 /// including the discriminant byte or the appended signature). `signature`
-/// is the 64-byte Ed25519 signature. `signing_pub` is the verifying key
-/// looked up by the caller (from OwnerDeviceCache for CidNotify/Ack, or
-/// from the inline `inviter_signing_pub` for DmInvite).
+/// is the 64-byte Ed25519 signature. `identity_pub` is the 64-byte
+/// combined identity public-bytes (`X25519_pub(32) || Ed25519_pub(32)`)
+/// looked up by the caller (from OwnerDeviceCache.device_identity_pubs
+/// for CidNotify/Ack, or from the inline `inviter_identity_pub` for
+/// DmInvite).
 ///
-/// Returns Err if the signature does not verify, or if the verifying key
-/// does not match the body's `signing_device_hash` (computed by hashing
-/// the public key per the same scheme as Reticulum's identity_address_hash).
+/// The check is two-step:
+/// 1. The provided `identity_pub` MUST hash to the body's
+///    `signing_device_hash` per harmony-identity's address_hash scheme.
+///    This defeats key-substitution attacks where an attacker presents
+///    pubkey K but claims a different device's hash.
+/// 2. The Ed25519 signature MUST verify against the second 32-byte half
+///    of `identity_pub` (the Ed25519 verifying key) and `body_bytes`.
+///
+/// Returns Err on either failure mode.
 fn verify_dm_packet_signature(
     body_bytes: &[u8],
     signature: &[u8; 64],
-    signing_pub: &VerifyingKey,
+    identity_pub: &[u8; 64],
     expected_signing_device_hash: DeviceIdentityHash,
 ) -> Result<(), DmReceiveError> {
-    let computed_device_hash = derive_device_hash_from_pubkey(signing_pub);
-    if computed_device_hash != expected_signing_device_hash {
+    // Step 1: reconstruct Identity → check address_hash matches.
+    // (Single source of truth: harmony_identity::Identity::from_public_bytes.)
+    let identity = harmony_identity::Identity::from_public_bytes(identity_pub)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    if identity.address_hash != expected_signing_device_hash.0 {
         return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
     }
-    signing_pub.verify(body_bytes, signature)
+    // Step 2: extract Ed25519 verifying key + verify signature.
+    let ed25519_pub_bytes: [u8; 32] = identity_pub[32..64]
+        .try_into().expect("64 - 32 == 32");
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&ed25519_pub_bytes)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    verifying_key.verify(body_bytes, &sig)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     Ok(())
 }
@@ -443,7 +477,7 @@ if matches!(packet, DmPacket::Ack(_)) && !outbox_entry.recipient_owners.contains
 // use `resolved_owner`, never the payload field.
 ```
 
-DmInvite is the bootstrap case: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `lookup_pubkey_for_device` would return None. The DmInvite carries the inviter's Ed25519 verifying key inline in `inviter_signing_pub`; signature verification uses that field directly. The Invite teaches the cache the `(invite.inviter, invite.sender_devices)` mapping AND the `(signing_device_hash, inviter_signing_pub)` pubkey association after the user accepts. Sanity gates that MUST run BEFORE signature verification (they catch malformed structure cheaper than the AEAD operation):
+DmInvite is the bootstrap case: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `lookup_pubkey_for_device` would return None. The DmInvite carries the inviter's full identity pubs inline in `inviter_identity_pub` (64 bytes); signature verification uses that field directly. The Invite teaches the cache the `(invite.inviter, invite.sender_devices)` mapping AND the `(signing_device_hash, inviter_identity_pub)` pubkey association after the user accepts. Sanity gates that MUST run BEFORE signature verification (they catch malformed structure cheaper than the AEAD operation):
 
 ```rust
 // 1. inviter must be one of the Space members.
@@ -462,7 +496,7 @@ if !invite.members.contains(&self_owner_addr) {
 verify_dm_packet_signature(
     &body_bytes,
     &signature,
-    &VerifyingKey::from_bytes(&invite.inviter_signing_pub)?,
+    &invite.inviter_identity_pub,  // 64-byte combined identity pubs; verify_dm_packet_signature splits + uses the Ed25519 half
     invite.signing_device_hash,
 )?;
 // 5. UI prompt: "Invite from {invite.inviter} to {invite.kind}, accept?"
@@ -474,7 +508,7 @@ verify_dm_packet_signature(
 //      );
 //      cache_signing_pubkey(
 //          invite.signing_device_hash,
-//          invite.inviter_signing_pub,
+//          invite.inviter_identity_pub,
 //      );
 //      apply_space(Space {
 //          content_key: Some(invite.content_key.clone()),
@@ -484,7 +518,7 @@ verify_dm_packet_signature(
 
 Note that `invite.members` is sorted ascending (matching `Space::members` invariants for canonical CBOR determinism), so `invite.members[0]` is the lex-smallest OwnerAddr — **NOT** the inviter. Always use `invite.inviter` for owner-binding decisions. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's already-cached devices are validated through application-signature binding using the cached pubkey.
 
-Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Wire-size cost of the signature scheme: +80 bytes per packet (16 for `signing_device_hash` + 64 for the appended signature) and an additional +32 bytes for DmInvite (`inviter_signing_pub`). Current packet sizes ~60-200 bytes; new sizes ~140-280 bytes — well within the MTU.
+Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Wire-size cost of the signature scheme: +80 bytes per packet (16 for `signing_device_hash` + 64 for the appended signature) and an additional +64 bytes for DmInvite (`inviter_identity_pub` — full identity pubs, not just Ed25519 verifying key, because `signing_device_hash = SHA256(X25519 || Ed25519)[:16]` requires both halves). Current packet sizes ~60-200 bytes; new sizes ~140-310 bytes — well within the MTU.
 
 Decode pseudocode:
 

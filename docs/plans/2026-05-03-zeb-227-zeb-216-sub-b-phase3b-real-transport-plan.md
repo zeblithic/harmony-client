@@ -4,7 +4,7 @@
 
 **Goal:** Replace the Phase 2 `StubTransport` with a real harmony-runtime adapter (raw Type1 Data via `path_table`, NOT Reticulum links) and add inbound `UnicastReceived` demux (`DmInvite` / `DmCidNotify` / `DmAck`) with **per-device Ed25519 signature binding on every packet body** so DMs work end-to-end with full sender-impersonation defense.
 
-**Architecture (Path B):** The original spec assumed Reticulum link-layer ECDH would provide authenticated source identity. Investigation revealed harmony's `Node` has no terminal-link state at endpoint destinations — `Link::respond` is unwired. Wiring it would be a multi-PR feature in its own right. **Path B** instead authenticates sender identity at the application layer: every Reticulum DM packet body carries a `signing_device_hash` field and an appended Ed25519 signature. Sender signs with their device-Identity Ed25519 key. Receiver verifies against the public key looked up via OwnerDeviceCache (post-bootstrap) or inline `inviter_signing_pub` (DmInvite bootstrap). On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream checks use the OwnerAddr resolved from this hash. See `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md` §"Application-signature binding rule" (commit `ea38132`).
+**Architecture (Path B):** The original spec assumed Reticulum link-layer ECDH would provide authenticated source identity. Investigation revealed harmony's `Node` has no terminal-link state at endpoint destinations — `Link::respond` is unwired. Wiring it would be a multi-PR feature in its own right. **Path B** instead authenticates sender identity at the application layer: every Reticulum DM packet body carries a `signing_device_hash` field and an appended Ed25519 signature. Sender signs with their device-Identity Ed25519 key. Receiver verifies against the **64-byte combined identity pubs** (`X25519_pub || Ed25519_pub`, `harmony_identity::Identity::to_public_bytes()` layout) looked up via OwnerDeviceCache (post-bootstrap) or inline `inviter_identity_pub` (DmInvite bootstrap). The 64-byte form is required because `signing_device_hash = SHA256(X25519 || Ed25519)[:16]` per `harmony_identity::Identity::address_hash` — an Ed25519-only hash would diverge from `DeviceIdentityHash` values stored elsewhere in `OwnerDeviceCache.devices` and silently break cache lookups. On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream checks use the OwnerAddr resolved from this hash. See `docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md` §"Application-signature binding rule" (the spec on the current branch).
 
 **Tech Stack:** Rust (`tokio`, `async-trait`, `chacha20poly1305`, `ed25519-dalek`, `ciborium`, `tracing`), Tauri 2 IPC, harmony-runtime + harmony-content (cross-repo deps), Reticulum unicast plane B (via harmony-runtime's existing `RuntimeAction::SendUnicastToDevice` / `RuntimeAction::UnicastReceived` per ZEB-226 Phase 3a).
 
@@ -33,10 +33,10 @@ Total harmony delta: ~60-90 lines + tests. Single squash-merge PR.
 | File | Action | Estimated lines |
 |---|---|---|
 | `src-tauri/Cargo.toml` | Modify: bump `harmony-runtime` and `harmony-content` git revs to the harmony companion-PR merge SHA. Confirm `ed25519-dalek` is in deps (it likely already is via `harmony-identity` or `harmony-crypto` workspace re-export; verify and add direct dep if needed). | +4 modified |
-| `src-tauri/src/owner_state_types.rs` | Modify: extend `OwnerDeviceEntry` to store per-device Ed25519 verifying keys alongside identity hashes. Two parallel sorted vecs (preserves binary-search invariant) OR a single `Vec<(DeviceIdentityHash, [u8; 32])>` — pick the lower-friction option after reading the existing struct. Add `serde(default)` so persisted Phase 1/2 OwnerDeviceCache snapshots load with empty pubkey vec (graceful upgrade). | +~50 |
-| `src-tauri/src/dm_envelope.rs` | Modify: rename `DmInvite`/`DmCidNotify`/`DmAck` to `DmInviteSigned`/`DmCidNotifySigned`/`DmAckSigned` (the wire CBOR body); add `signing_device_hash` field to all three; add `inviter_signing_pub: [u8; 32]` to DmInviteSigned. Replace single-struct `DmPacket` variants with `{ signed: ..., signature: [u8; 64], signed_bytes: Vec<u8> }` (the receive handler needs the bytes the signature covers without re-encoding). Update `encode_packet` to canonical-CBOR-encode the body, append the 64-byte signature, prepend the discriminant. Update `decode_packet` to split `[disc][body][sig:64]` and capture `signed_bytes`. Add `DecodeError::TooShortForSignature`. | +~150 |
+| `src-tauri/src/owner_state_types.rs` | Modify: extend `OwnerDeviceEntry` to store per-device **64-byte combined identity pubs** alongside identity hashes (parallel-vec representation, `Vec<[u8; 64]>` parallel to `Vec<DeviceIdentityHash>`, preserves the binary-search invariant on `devices`). 64 bytes (not 32) because `signing_device_hash = SHA256(X25519 \|\| Ed25519)[:16]` — see harmony commit `c53e525` `crates/harmony-identity/src/identity.rs:79` for the canonical scheme. Add `serde(default)` so persisted Phase 1/2 OwnerDeviceCache snapshots load with empty pubkey vec (graceful upgrade). | +~50 |
+| `src-tauri/src/dm_envelope.rs` | Modify: rename `DmInvite`/`DmCidNotify`/`DmAck` to `DmInviteSigned`/`DmCidNotifySigned`/`DmAckSigned` (the wire CBOR body); add `signing_device_hash` field to all three; add `inviter_identity_pub: [u8; 64]` to DmInviteSigned. Replace single-struct `DmPacket` variants with `{ signed: ..., signature: [u8; 64], signed_bytes: Vec<u8> }` (the receive handler needs the bytes the signature covers without re-encoding). Update `encode_packet` to canonical-CBOR-encode the body, append the 64-byte signature, prepend the discriminant. Update `decode_packet` to split `[disc][body][sig:64]` and capture `signed_bytes`. Add `DecodeError::TooShortForSignature`. | +~150 |
 | `src-tauri/src/dm_crypto.rs` | Modify: parameter rename `link_origin` → `resolved_owner` on `verify_sender_binding` (semantics unchanged; only the parameter name and doc comment). | +~5 modified |
-| `src-tauri/src/dm_signing.rs` | Create: pure-function module with `sign_dm_packet(body_bytes: &[u8], signing_key: &SigningKey) -> [u8; 64]` and `verify_dm_packet_signature(body_bytes: &[u8], signature: &[u8; 64], signing_pub: &VerifyingKey, expected_signing_device_hash: DeviceIdentityHash) -> Result<(), DmReceiveError>`. Plus `derive_device_hash_from_pubkey(pub: &VerifyingKey) -> DeviceIdentityHash` matching whatever scheme `harmony-identity` already uses for device hashes (read it; do not invent). Pure functions, no state, no I/O. | +~120 (new file) |
+| `src-tauri/src/dm_signing.rs` | Create: pure-function module with `sign_dm_packet(body_bytes: &[u8], signing_key: &SigningKey) -> [u8; 64]` and `verify_dm_packet_signature(body_bytes: &[u8], signature: &[u8; 64], identity_pub: &[u8; 64], expected_signing_device_hash: DeviceIdentityHash) -> Result<(), DmReceiveError>`. Plus `derive_device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> DeviceIdentityHash` that delegates to `harmony_identity::Identity::from_public_bytes(identity_pub).address_hash` (single source of truth — never re-derive the formula). Pure functions, no state, no I/O. | +~120 (new file) |
 | `src-tauri/src/dm_outbox.rs` | Modify: add `DmReceiveError` enum (Phase 3b-scoped; distinct from `dm_crypto::DmReceiveError`). Add `resolve_signed_origin_owner` helper. Add `lookup_pubkey_for_device` helper (reads OwnerDeviceCache). Add `handle_unicast` dispatcher that decodes + verifies signature + dispatches by discriminant. Add `handle_invite`, `handle_cidnotify`, `handle_ack`. Add `RuntimeUnicastTransport` adapter struct + `DmTransport` impl. Trim `StubTransport` documentation to note it's test-cfg surface (still needed by Phase 2 tests). | ~1129 → ~2000 |
 | `src-tauri/src/event_loop.rs` | Modify: add an mpsc channel for outbound `RuntimeEvent::SendUnicastToDevice` requests (`unicast_send_rx` parameter on `event_loop::run`). Add a `RuntimeAction::UnicastReceived` interception block in each `for action in runtime.tick()` loop site, before `dispatch_action`. Pass through `cas_handle`, `dm_outbox`, `crdt_state`, `app` to the new handler. | +~120 |
 | `src-tauri/src/lib.rs` | Modify: replace `StubTransport::new()` at line 843-844 with `RuntimeUnicastTransport::new(...)`. Construct `unicast_send_tx/rx` mpsc channel near `cas_op_tx` (line 572). Compute the local DM destination hash at start_node and call `runtime.register_local_destination(dm_dest)` once at startup. Wire NodeState fields for `unicast_send_tx`. Pull the device-Identity SigningKey from existing identity-management code (likely `harmony_identity` integration site near where `device_id` and `self_owner` come from) and inject into `RuntimeUnicastTransport`. | +~80 |
@@ -272,7 +272,7 @@ Add to the same `impl<B: BookStore> NodeRuntime<B>` block:
 /// which is the same scheme harmony-identity already uses.
 ///
 /// Note: for first-contact DmInvite, harmony-client carries the
-/// inviter's signing pubkey inline (`inviter_signing_pub`) so this
+/// inviter's signing pubkey inline (`inviter_identity_pub`) so this
 /// lookup is unnecessary at bootstrap. Subsequent DmCidNotify / DmAck
 /// from the inviter's already-cached devices use this lookup against
 /// pubkeys harmony-client cached locally on DmInvite accept — NOT
@@ -580,29 +580,41 @@ Document the discovered scheme inline at the top of `dm_signing.rs` so future re
 
 ```rust
 //! ZEB-216 Sub-B Phase 3b: per-device Ed25519 signing primitives for
-//! Reticulum DM packet bodies (Path B per spec ea38132).
+//! Reticulum DM packet bodies (Path B per spec — see
+//! docs/specs/2026-05-02-zeb-216-sub-b-dm-transport-design.md
+//! §"Application-signature binding rule").
 //!
 //! Pure functions over (body_bytes, key, signature). No state, no I/O.
 //!
-//! Device-hash-from-pubkey scheme: SHA256(verifying_key_bytes)[:16].
-//! This MUST match harmony-identity's `Identity::address_hash` derivation
-//! for a verifying key — verified during ZEB-227 implementation (see
-//! harmony commit <SHA from Step 3.2 investigation>).
+//! Device-hash-from-pubkey scheme: delegates to
+//! `harmony_identity::Identity::from_public_bytes(identity_pub).address_hash`,
+//! which is `SHA256(X25519_pub(32) || Ed25519_pub(32))[:16]` per
+//! `~/work/zeblithic/harmony/crates/harmony-identity/src/identity.rs:58-76`
+//! (commit c53e525). The 64-byte combined-pubs input is what makes the
+//! computed hash match `DeviceIdentityHash` values stored in
+//! OwnerDeviceCache.devices — an Ed25519-only hash would diverge.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
 
-/// Compute the DeviceIdentityHash for a given Ed25519 verifying key.
-/// MUST match the scheme harmony-identity uses for Identity::address_hash.
-pub fn derive_device_hash_from_pubkey(pub_key: &VerifyingKey) -> DeviceIdentityHash {
-    let bytes = pub_key.to_bytes();
-    let hash = Sha256::digest(bytes);
-    let mut truncated = [0u8; 16];
-    truncated.copy_from_slice(&hash[..16]);
-    DeviceIdentityHash(truncated)
+/// Compute the DeviceIdentityHash for a given 64-byte combined identity
+/// public-bytes value (`X25519_pub(32) || Ed25519_pub(32)`, the canonical
+/// `harmony_identity::Identity::to_public_bytes()` layout).
+///
+/// Single source of truth: delegates to
+/// `harmony_identity::Identity::from_public_bytes(identity_pub).address_hash`.
+/// Never re-derive the hash formula here — if harmony changes its scheme,
+/// we want to follow automatically rather than silently diverge.
+///
+/// Returns `None` if the bytes are malformed (invalid X25519 or Ed25519
+/// point encoding). Caller treats `None` as a verification-failure case.
+pub fn derive_device_hash_from_identity_pub(
+    identity_pub: &[u8; 64],
+) -> Option<DeviceIdentityHash> {
+    let identity = harmony_identity::Identity::from_public_bytes(identity_pub).ok()?;
+    Some(DeviceIdentityHash(identity.address_hash))
 }
 
 /// Sign a Reticulum DM packet body. The signature is applied to the
@@ -622,28 +634,39 @@ pub fn sign_dm_packet(body_bytes: &[u8], signing_key: &SigningKey) -> [u8; 64] {
 /// `body_bytes`: canonical CBOR encoding of the signed body (NOT
 /// including the discriminant byte or the appended signature).
 /// `signature`: 64-byte Ed25519 signature appended after body_bytes.
-/// `signing_pub`: verifying key looked up by the caller (from
-/// OwnerDeviceCache for CidNotify/Ack post-bootstrap, or from the
-/// inline `inviter_signing_pub` for DmInvite).
+/// `identity_pub`: 64-byte combined identity pubs (X25519_pub(32) ||
+/// Ed25519_pub(32)) looked up by the caller (from OwnerDeviceCache's
+/// device_identity_pubs parallel-vec for CidNotify/Ack post-bootstrap,
+/// or from the inline `inviter_identity_pub` for DmInvite).
 /// `expected_signing_device_hash`: the body's `signing_device_hash`
-/// field; this function verifies the public key actually corresponds
-/// to that hash (defeats key-substitution attacks where an attacker
-/// presents pubkey K but claims signing_device_hash from a different key).
+/// field. This function checks two things:
+///   1. The provided identity_pub actually hashes to expected_signing_device_hash
+///      (defeats key-substitution attacks).
+///   2. The Ed25519 signature verifies against bytes [32..64] of identity_pub
+///      and body_bytes.
 ///
-/// Returns Ok on success; Err on signature mismatch OR pubkey-doesn't-
-/// match-claimed-device-hash.
+/// Returns Ok on success; Err on either failure mode.
 pub fn verify_dm_packet_signature(
     body_bytes: &[u8],
     signature: &[u8; 64],
-    signing_pub: &VerifyingKey,
+    identity_pub: &[u8; 64],
     expected_signing_device_hash: DeviceIdentityHash,
 ) -> Result<(), DmReceiveError> {
-    let computed_hash = derive_device_hash_from_pubkey(signing_pub);
+    // Step 1: derive the device hash from the identity_pub and check it
+    // matches what the body claims.
+    let computed_hash = derive_device_hash_from_identity_pub(identity_pub)
+        .ok_or(DmReceiveError::SignatureVerificationFailed)?;
     if computed_hash != expected_signing_device_hash {
         return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
     }
+    // Step 2: extract Ed25519 verifying key from second half + verify signature.
+    let ed25519_pub_bytes: [u8; 32] = identity_pub[32..64]
+        .try_into()
+        .expect("64 - 32 == 32");
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&ed25519_pub_bytes)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     let sig = Signature::from_bytes(signature);
-    signing_pub
+    verifying_key
         .verify(body_bytes, &sig)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     Ok(())
@@ -654,80 +677,114 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
-    fn fixed_key() -> SigningKey {
-        // Deterministic key for tests. NOT for production.
-        SigningKey::from_bytes(&[0x42u8; 32])
+    /// Construct a deterministic 64-byte identity_pub for tests.
+    /// Uses harmony_identity::PrivateIdentity::from_seed (the canonical
+    /// path) so the resulting identity_pub byte layout matches production
+    /// exactly. Returns (signing_key, identity_pub_bytes, expected_device_hash).
+    fn make_test_identity(seed_byte: u8) -> (SigningKey, [u8; 64], DeviceIdentityHash) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        // Extract the SigningKey for signing tests. PrivateIdentity stores the
+        // Ed25519 SigningKey internally; expose via whatever public path
+        // exists (signing_key()? to_signing_bytes()? — implementer reads the
+        // PrivateIdentity API to find the right accessor).
+        let signing_key = private.signing_key().clone();  // ADAPT to actual API
+
+        (signing_key, identity_pub, device_hash)
     }
 
     #[test]
     fn sign_then_verify_round_trip() {
-        let sk = fixed_key();
-        let pk = sk.verifying_key();
-        let device_hash = derive_device_hash_from_pubkey(&pk);
+        let (sk, identity_pub, device_hash) = make_test_identity(0x42);
         let body = b"hello world body bytes";
         let sig = sign_dm_packet(body, &sk);
-        assert!(verify_dm_packet_signature(body, &sig, &pk, device_hash).is_ok());
+        assert!(verify_dm_packet_signature(body, &sig, &identity_pub, device_hash).is_ok());
     }
 
     #[test]
     fn verify_tampered_body_rejects() {
-        let sk = fixed_key();
-        let pk = sk.verifying_key();
-        let device_hash = derive_device_hash_from_pubkey(&pk);
+        let (sk, identity_pub, device_hash) = make_test_identity(0x42);
         let body = b"hello world body bytes";
         let sig = sign_dm_packet(body, &sk);
         let mut tampered = body.to_vec();
         tampered[0] ^= 0xff;
-        let err = verify_dm_packet_signature(&tampered, &sig, &pk, device_hash).unwrap_err();
+        let err = verify_dm_packet_signature(&tampered, &sig, &identity_pub, device_hash).unwrap_err();
         assert!(matches!(err, DmReceiveError::SignatureVerificationFailed));
     }
 
     #[test]
-    fn verify_wrong_pubkey_rejects() {
-        let sk1 = fixed_key();
-        let sk2 = SigningKey::from_bytes(&[0x99u8; 32]);
-        let pk2 = sk2.verifying_key();
-        let device_hash_2 = derive_device_hash_from_pubkey(&pk2);
+    fn verify_wrong_signing_key_rejects() {
+        let (sk1, _, _) = make_test_identity(0x42);
+        let (_, identity_pub_2, device_hash_2) = make_test_identity(0x99);
         let body = b"hello world body bytes";
         let sig = sign_dm_packet(body, &sk1);  // signed by sk1
-        // Verify with pk2 + claim sk2's device hash → first check passes
-        // (pk2 matches device_hash_2), then signature verification fails.
-        let err = verify_dm_packet_signature(body, &sig, &pk2, device_hash_2).unwrap_err();
+        // Verify with identity_pub_2 + claim its device hash → first
+        // check passes (identity_pub_2 hashes to device_hash_2), then
+        // signature verification fails (sk1's signature doesn't verify
+        // under identity_pub_2's Ed25519 half).
+        let err = verify_dm_packet_signature(body, &sig, &identity_pub_2, device_hash_2).unwrap_err();
         assert!(matches!(err, DmReceiveError::SignatureVerificationFailed));
     }
 
     #[test]
     fn verify_pubkey_does_not_match_device_hash_rejects() {
-        let sk1 = fixed_key();
-        let pk1 = sk1.verifying_key();
-        let sk2 = SigningKey::from_bytes(&[0x99u8; 32]);
-        let pk2 = sk2.verifying_key();
-        let device_hash_2 = derive_device_hash_from_pubkey(&pk2);
+        let (sk1, identity_pub_1, _) = make_test_identity(0x42);
+        let (_, _, device_hash_2) = make_test_identity(0x99);
         let body = b"hello world body bytes";
         let sig = sign_dm_packet(body, &sk1);
-        // Present pk1 but claim device_hash_2 (which is for pk2).
-        // Key-substitution attack defense: this MUST reject before
-        // even attempting signature verification.
-        let err = verify_dm_packet_signature(body, &sig, &pk1, device_hash_2).unwrap_err();
+        // Present identity_pub_1 but claim device_hash_2 (which is for
+        // a different identity). Key-substitution attack defense: this
+        // MUST reject before even attempting signature verification.
+        let err = verify_dm_packet_signature(body, &sig, &identity_pub_1, device_hash_2).unwrap_err();
         assert!(matches!(err, DmReceiveError::SigningKeyDoesNotMatchDeviceHash));
     }
 
     #[test]
     fn derive_device_hash_is_deterministic() {
-        let sk = fixed_key();
-        let pk = sk.verifying_key();
-        let h1 = derive_device_hash_from_pubkey(&pk);
-        let h2 = derive_device_hash_from_pubkey(&pk);
+        let (_, identity_pub, _) = make_test_identity(0x42);
+        let h1 = derive_device_hash_from_identity_pub(&identity_pub).unwrap();
+        let h2 = derive_device_hash_from_identity_pub(&identity_pub).unwrap();
         assert_eq!(h1, h2);
     }
 
     #[test]
-    fn derive_device_hash_differs_per_key() {
-        let pk1 = SigningKey::from_bytes(&[0x11u8; 32]).verifying_key();
-        let pk2 = SigningKey::from_bytes(&[0x22u8; 32]).verifying_key();
+    fn derive_device_hash_differs_per_identity() {
+        let (_, ip1, _) = make_test_identity(0x11);
+        let (_, ip2, _) = make_test_identity(0x22);
         assert_ne!(
-            derive_device_hash_from_pubkey(&pk1),
-            derive_device_hash_from_pubkey(&pk2)
+            derive_device_hash_from_identity_pub(&ip1).unwrap(),
+            derive_device_hash_from_identity_pub(&ip2).unwrap()
+        );
+    }
+
+    /// CRITICAL equivalence test: derive_device_hash_from_identity_pub
+    /// MUST agree with harmony_identity::PrivateIdentity::public_identity().address_hash
+    /// for the same identity. If this ever fails, signature verification on
+    /// inbound DM packets will silently break (the device_hash claimed by a
+    /// peer's signing_device_hash field won't match the hash derived from
+    /// their cached identity_pub, so SigningKeyDoesNotMatchDeviceHash fires
+    /// even for legitimate packets).
+    ///
+    /// Direct delegation to Identity::from_public_bytes makes this near-
+    /// trivially true, but the test pins it explicitly so a future refactor
+    /// (e.g., re-implementing the hash formula here for "performance") can't
+    /// regress the equivalence silently.
+    #[test]
+    fn derive_device_hash_equals_harmony_identity_address_hash() {
+        let seed = [0xabu8; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let our_hash = derive_device_hash_from_identity_pub(&identity_pub).unwrap();
+        assert_eq!(
+            our_hash.0,
+            public.address_hash,
+            "derive_device_hash_from_identity_pub MUST match harmony_identity::Identity::address_hash. \
+             If this fails, signature verification on inbound DM packets will silently break."
         );
     }
 }
@@ -806,12 +863,12 @@ EOF
 ### Task 4: Extend `OwnerDeviceEntry` with per-device verifying keys
 
 **Files:**
-- Modify: `src-tauri/src/owner_state_types.rs` — extend `OwnerDeviceEntry` to carry `Vec<[u8; 32]>` of verifying keys
+- Modify: `src-tauri/src/owner_state_types.rs` — extend `OwnerDeviceEntry` to carry `Vec<[u8; 64]>` of full identity pubs (X25519 || Ed25519)
 - Test: round-trip + invariant tests
 
 The cache stores per-OwnerAddr lists of `(DeviceIdentityHash, signing_pub)` pairs. The implementer chooses representation:
-- **Option A:** `Vec<[u8; 32]>` parallel to `devices: Vec<DeviceIdentityHash>` (same indexing). Preserves the existing binary_search invariant on `devices`.
-- **Option B:** Replace `devices` with `Vec<(DeviceIdentityHash, [u8; 32])>`. Cleaner but breaks binary_search-on-DeviceIdentityHash; would need to switch to manual partition_point.
+- **Option A:** `Vec<[u8; 64]>` parallel to `devices: Vec<DeviceIdentityHash>` (same indexing). Preserves the existing binary_search invariant on `devices`.
+- **Option B:** Replace `devices` with `Vec<(DeviceIdentityHash, [u8; 64])>`. Cleaner but breaks binary_search-on-DeviceIdentityHash; would need to switch to manual partition_point.
 
 Option A is lower friction. Implementer picks A unless they discover a reason during reading.
 
@@ -824,7 +881,7 @@ In `src-tauri/src/owner_state_types.rs` test module:
 fn owner_device_entry_serialize_includes_signing_pubs() {
     let entry = OwnerDeviceEntry {
         devices: vec![DeviceIdentityHash([0xa1; 16])],
-        device_signing_pubs: vec![[0x42u8; 32]],
+        device_identity_pubs: vec![[0x42u8; 32]],
         learned_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
     };
     let bytes = canonical_cbor_encode(&entry).unwrap();
@@ -835,20 +892,20 @@ fn owner_device_entry_serialize_includes_signing_pubs() {
 #[test]
 fn owner_device_entry_loads_pre_phase3b_snapshot_with_default_pubs() {
     // Phase 1/2 snapshots stored only `devices` and `learned_at`.
-    // Phase 3b adds `device_signing_pubs` with #[serde(default)] so old
+    // Phase 3b adds `device_identity_pubs` with #[serde(default)] so old
     // snapshots load with an empty pubkey vec — the cache then drops
     // signature-verification packets as UnknownSigningKey until the next
     // DmInvite repopulates the pubkeys.
     let pre_phase3b_cbor = b"\xa2\x61v\x81\x50\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\xa1\x61l\xa3\x61w\x01\x61l\x00\x61d\x61d";
     // ^ map(2) { "v": [bstr(16) [0xa1; 16]], "l": { "w": 1, "l": 0, "d": "d" } }
-    // (No "device_signing_pubs" key.)
+    // (No "device_identity_pubs" key.)
     // The decoder must accept this and produce an entry with
-    // `device_signing_pubs: vec![]` via #[serde(default)].
+    // `device_identity_pubs: vec![]` via #[serde(default)].
     // The implementer verifies the byte-exact CBOR with a small one-off
     // canonical_cbor_encode + grep before pinning the bytes here.
     let recovered: OwnerDeviceEntry = canonical_cbor_decode(pre_phase3b_cbor).unwrap();
     assert_eq!(recovered.devices.len(), 1);
-    assert!(recovered.device_signing_pubs.is_empty());
+    assert!(recovered.device_identity_pubs.is_empty());
 }
 ```
 
@@ -862,7 +919,7 @@ set -o pipefail
 cargo test owner_device_entry 2>&1 | tail -20
 ```
 
-Expected: FAIL — `device_signing_pubs` field doesn't exist.
+Expected: FAIL — `device_identity_pubs` field doesn't exist.
 
 - [ ] **Step 4.3: Add the field**
 
@@ -884,26 +941,26 @@ pub struct OwnerDeviceEntry {
     /// snapshots load with `vec![]` via #[serde(default)] — the receive
     /// path then drops signature-verification packets as
     /// UnknownSigningKey until the next DmInvite repopulates these.
-    #[serde(rename = "p", default, deserialize_with = "deserialize_device_signing_pubs")]
-    pub device_signing_pubs: Vec<[u8; 32]>,
+    #[serde(rename = "p", default, deserialize_with = "deserialize_device_identity_pubs")]
+    pub device_identity_pubs: Vec<[u8; 64]>,
     /// HLC of when this entry was learned. LWW key for merge.
     #[serde(rename = "l")]
     pub learned_at: Hlc,
 }
 ```
 
-Add `deserialize_device_signing_pubs` helper that mirrors `deserialize_device_identities`'s cap behavior (truncate to `MAX_DEVICES_PER_OWNER`, but on the pubkey list — no sort/dedup since order is meaningful for parallel-vec correspondence).
+Add `deserialize_device_identity_pubs` helper that mirrors `deserialize_device_identities`'s cap behavior (truncate to `MAX_DEVICES_PER_OWNER`, but on the pubkey list — no sort/dedup since order is meaningful for parallel-vec correspondence).
 
 The new field uses `serde(default)` so old snapshots without the field deserialize to `vec![]`. Phase 3b's signature verification then fails with `UnknownSigningKey` for any device that doesn't have a corresponding pubkey — which is correct behavior: the receiver hasn't been told the pubkey yet, so it can't verify, so it drops.
 
-Update `apply_owner_device_update` (in `owner_state_crdt.rs:453`) to also accept and store `device_signing_pubs` parallel to `devices`. Signature:
+Update `apply_owner_device_update` (in `owner_state_crdt.rs:453`) to also accept and store `device_identity_pubs` parallel to `devices`. Signature:
 
 ```rust
 pub fn apply_owner_device_update(
     &mut self,
     addr: OwnerAddr,
     devices: Vec<DeviceIdentityHash>,
-    device_signing_pubs: Vec<[u8; 32]>,  // NEW — parallel to devices
+    device_identity_pubs: Vec<[u8; 64]>,  // NEW — parallel to devices
     learned_at: Hlc,
 ) -> ApplyOutcome {
     // sanitize: sort+dedup devices BUT also reorder pubs to match
@@ -912,7 +969,7 @@ pub fn apply_owner_device_update(
 ```
 
 The sanitization is delicate: `devices.sort()` invalidates the parallel-vec correspondence. Two ways to handle:
-- **Option A:** Build `Vec<(DeviceIdentityHash, [u8; 32])>`, sort by .0, dedup by .0, then split back into two vecs. Cleanest.
+- **Option A:** Build `Vec<(DeviceIdentityHash, [u8; 64])>`, sort by .0, dedup by .0, then split back into two vecs. Cleanest.
 - **Option B:** Sort with a permutation, apply the same permutation to pubs. More efficient for very large vecs but harder to read.
 
 Use Option A. The vecs are at most 32 elements (MAX_DEVICES_PER_OWNER); efficiency doesn't matter.
@@ -950,7 +1007,7 @@ git add src-tauri/src/owner_state_types.rs src-tauri/src/owner_state_crdt.rs
 git commit -m "$(cat <<'EOF'
 feat(zeb-227): extend OwnerDeviceEntry with per-device Ed25519 pubkeys
 
-OwnerDeviceEntry gains a `device_signing_pubs: Vec<[u8; 32]>` field
+OwnerDeviceEntry gains a `device_identity_pubs: Vec<[u8; 64]>` field
 parallel to the existing `devices: Vec<DeviceIdentityHash>` — element i
 is the Ed25519 verifying key for devices[i]. Phase 3b's signature
 verification (per ZEB-216 spec §"Application-signature binding rule"
@@ -979,7 +1036,7 @@ EOF
 ### Task 5: Reshape `dm_envelope.rs` for the appended-signature wire layout
 
 **Files:**
-- Modify: `src-tauri/src/dm_envelope.rs` — rename existing structs to `*Signed`, add `signing_device_hash` + `inviter_signing_pub`, change `DmPacket` variants to carry signature + signed_bytes, update encode_packet + decode_packet
+- Modify: `src-tauri/src/dm_envelope.rs` — rename existing structs to `*Signed`, add `signing_device_hash` + `inviter_identity_pub`, change `DmPacket` variants to carry signature + signed_bytes, update encode_packet + decode_packet
 
 This is the largest single mechanical change in the plan. TDD applies but the structural refactor is contiguous.
 
@@ -1003,7 +1060,7 @@ fn dm_packet_invite_round_trip_with_signature() {
         sender_devices: vec![device_hash],
         created_at: Hlc { wall_ms: 1, logical: 0, device_id: "d".into() },
         signing_device_hash: device_hash,
-        inviter_signing_pub: pk.to_bytes(),
+        inviter_identity_pub: pk.to_bytes(),
     };
 
     let body_bytes = canonical_cbor_encode(&signed).unwrap();
@@ -1085,7 +1142,7 @@ Expected: many existing tests fail (they reference the old struct names + decode
 
 The plan won't reproduce the entire ~600-line file. Key edits:
 
-1. **Rename structs:** `DmInvite` → `DmInviteSigned`, etc. Add `signing_device_hash: DeviceIdentityHash` to all three (with `#[serde(rename = "dh")]`). Add `inviter_signing_pub: [u8; 32]` to `DmInviteSigned` (rename `"sp"`).
+1. **Rename structs:** `DmInvite` → `DmInviteSigned`, etc. Add `signing_device_hash: DeviceIdentityHash` to all three (with `#[serde(rename = "dh")]`). Add `inviter_identity_pub: [u8; 64]` to `DmInviteSigned` (rename `"sp"`) — 64 bytes covers X25519+Ed25519 per harmony_identity::Identity::to_public_bytes layout.
 
 2. **Restructure DmPacket enum:**
 
@@ -1205,7 +1262,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
 
 The implementer updates ALL existing tests in `dm_envelope.rs` test module to:
 - Use the `*Signed` struct names
-- Populate `signing_device_hash` (and `inviter_signing_pub` for invites)
+- Populate `signing_device_hash` (and `inviter_identity_pub` for invites)
 - Build packets via the `build_signed_*` helpers (which compute the signature)
 - Match on the new variant shape `{ signed, signature, signed_bytes }`
 
@@ -1251,7 +1308,7 @@ discriminant; the signature pins the body, not the routing tag).
 Struct renames + field additions:
 - DmInvite → DmInviteSigned. Adds `signing_device_hash: DeviceIdentityHash`
   (inside signed body — prevents key-substitution attacks where an
-  attacker swaps which device claims authorship) and `inviter_signing_pub:
+  attacker swaps which device claims authorship) and `inviter_identity_pub:
   [u8; 32]` (the inviter's Ed25519 verifying key, inline so bootstrap
   signature verification is self-contained).
 - DmCidNotify → DmCidNotifySigned. Adds signing_device_hash.
@@ -1276,7 +1333,7 @@ decode_packet adds:
   verification is even attempted.
 
 Wire-size cost: +80 bytes per packet (signing_device_hash 16 + appended
-signature 64) and +32 bytes for DmInvite (inviter_signing_pub).
+signature 64) and +32 bytes for DmInvite (inviter_identity_pub).
 Reticulum MTU is ~500 bytes effective; new packet sizes ~140-280 bytes.
 
 dm_outbox imports updated to use the new struct names; rest of dm_outbox
@@ -1677,24 +1734,31 @@ pub(crate) fn resolve_signed_origin_owner(
     }
 }
 
-/// Look up the cached Ed25519 verifying key for a known device. Reads
-/// from OwnerDeviceCache via the parallel-vec correspondence between
-/// `devices[i]` and `device_signing_pubs[i]`.
+/// Look up the cached 64-byte combined identity pubs for a known device.
+/// Reads from OwnerDeviceCache via the parallel-vec correspondence between
+/// `devices[i]` and `device_identity_pubs[i]`.
 ///
-/// Returns Some(pubkey) only if the device hash is in the cache AND
-/// the cache has a pubkey at the corresponding index. Returns None
-/// for either: device unknown, or device known but pubkey not yet
+/// Returns Some(identity_pub_bytes) only if the device hash is in the
+/// cache AND the cache has a pub at the corresponding index. Returns
+/// None for either: device unknown, or device known but pub not yet
 /// cached (pre-bootstrap state — handler treats as UnknownSigningKey).
+///
+/// Returns the full 64-byte combined pub (X25519 || Ed25519); the caller
+/// passes this to dm_signing::verify_dm_packet_signature, which splits
+/// out the Ed25519 half internally. We must return the full 64 bytes
+/// (not just Ed25519) so verify_dm_packet_signature can re-derive the
+/// signing_device_hash and confirm the cached pub actually maps to the
+/// hash the body claims (key-substitution defense).
 pub(crate) fn lookup_pubkey_for_device(
     cache: &OwnerDeviceCache,
     signing_device_hash: DeviceIdentityHash,
-) -> Option<ed25519_dalek::VerifyingKey> {
+) -> Option<[u8; 64]> {
     for entry in cache.devices.values() {
         if let Ok(idx) = entry.devices.binary_search(&signing_device_hash) {
-            if idx < entry.device_signing_pubs.len() {
-                return ed25519_dalek::VerifyingKey::from_bytes(&entry.device_signing_pubs[idx]).ok();
+            if idx < entry.device_identity_pubs.len() {
+                return Some(entry.device_identity_pubs[idx]);
             }
-            return None;  // device present but no pubkey cached
+            return None;  // device present but no pub cached
         }
     }
     None
@@ -1790,7 +1854,7 @@ dispatches to handle_invite / handle_cidnotify / handle_ack by variant.
 
 The Path B signature verification happens INSIDE each handler (not
 in handle_unicast) because the pubkey-lookup strategy differs by
-discriminant: DmInvite uses the inline inviter_signing_pub field;
+discriminant: DmInvite uses the inline inviter_identity_pub field;
 CidNotify / Ack use lookup_pubkey_for_device against OwnerDeviceCache.
 Centralizing verification in handle_unicast would force a generic
 "first try inline pubkey, fallback to cache lookup" pattern that's
@@ -1803,7 +1867,7 @@ Two helpers added:
   (cache-poisoning regression).
 - lookup_pubkey_for_device(cache, hash) -> Option<VerifyingKey> —
   reads OwnerDeviceCache's parallel-vec correspondence between
-  devices[i] and device_signing_pubs[i]. Returns None if device
+  devices[i] and device_identity_pubs[i]. Returns None if device
   unknown OR device present but pubkey not yet cached (pre-bootstrap).
 
 The three handler stubs ship as Err("Task N implements") placeholders;
@@ -1833,7 +1897,7 @@ Five tests covering:
 
 The happy path test must:
 1. Build a real signed invite via `build_signed_invite`
-2. Verify after `handle_invite` runs: `state.spaces` has the new Space, `state.owner_device_cache.devices.get(&inviter_addr).device_signing_pubs[0] == inviter_signing_pub`
+2. Verify after `handle_invite` runs: `state.spaces` has the new Space, `state.owner_device_cache.devices.get(&inviter_addr).device_identity_pubs[0] == inviter_identity_pub`
 
 - [ ] **Step 9.2: Run tests to verify they fail**
 
@@ -1861,43 +1925,41 @@ pub async fn handle_invite(
     if !signed.members.contains(&self.self_owner) {
         return Err(DmReceiveError::ReceiverNotInMembers);
     }
-    // Verify signature using inline inviter_signing_pub.
-    let signing_pub = ed25519_dalek::VerifyingKey::from_bytes(&signed.inviter_signing_pub)
-        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    // Verify signature using inline inviter_identity_pub (64-byte combined
+    // identity pubs; verify_dm_packet_signature splits + uses Ed25519 half).
     crate::dm_signing::verify_dm_packet_signature(
         signed_bytes,
         &signature,
-        &signing_pub,
+        &signed.inviter_identity_pub,
         signed.signing_device_hash,
     )?;
 
-    // Phase 3b auto-accept: write Space + cache + cached pubkey.
+    // Phase 3b auto-accept: write Space + cache + cached identity pub.
     // (Phase 4 replaces with stage-pending-invite + UI prompt path.)
 
-    // Pubkey list is parallel to sender_devices; we know the inviter's
-    // signing pubkey for the device that signed THIS invite. For the
-    // other devices in sender_devices we have no pubkeys yet — they
-    // remain pre-bootstrap until the next invite-equivalent flow.
-    // Build a parallel vec of length sender_devices.len() with the
-    // signing pubkey at the correct index, [0u8; 32] elsewhere.
-    // (lookup_pubkey_for_device treats [0u8; 32] as "no pubkey cached"
-    // because it parses to the all-zeros point which fails validation —
-    // wait, ed25519_dalek::VerifyingKey::from_bytes accepts arbitrary
-    // 32-byte values; we need a sentinel. Use Option<[u8; 32]> in the
-    // OwnerDeviceEntry instead — implementer adjusts Task 4's design
-    // here if not already done.)
-    // SCOPE NOTE: revisit Task 4's representation if needed: Option<[u8; 32]>
-    // is more honest than [u8; 32] sentinel. Implementer decides.
-    let mut device_signing_pubs: Vec<[u8; 32]> = vec![[0u8; 32]; signed.sender_devices.len()];
+    // device_identity_pubs is parallel to sender_devices. We only know the
+    // inviter's identity_pub for the device that signed THIS invite; for
+    // the other devices in sender_devices we have no pubs yet (they remain
+    // pre-bootstrap until the next invite-equivalent flow). The
+    // OwnerDeviceEntry shape uses Option<[u8; 64]> so the "no pub cached"
+    // case is represented unambiguously (no all-zeros sentinel that could
+    // collide with a legitimate-but-unusual identity).
+    //
+    // Task 4 SCOPE NOTE: implementer chooses Vec<Option<[u8; 64]>> in
+    // OwnerDeviceEntry to make this representation honest. If they instead
+    // chose Vec<[u8; 64]> with all-zeros sentinel, they MUST add a clear
+    // sentinel-vs-real check in lookup_pubkey_for_device. The Option form
+    // is preferred — see Task 4's implementation guidance.
+    let mut device_identity_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
     let signer_idx = signed.sender_devices.iter()
         .position(|d| *d == signed.signing_device_hash)
         .expect("sanity gate 2 already verified this");
-    device_signing_pubs[signer_idx] = signed.inviter_signing_pub;
+    device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
 
     let cache_outcome = state.apply_owner_device_update(
         signed.inviter,
         signed.sender_devices.clone(),
-        device_signing_pubs,
+        device_identity_pubs,
         signed.created_at.clone(),
     );
     if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
@@ -1954,7 +2016,7 @@ signature binding rule":
    - signing_device_hash ∈ sender_devices (defense-in-depth; decode_packet
      also enforces)
    - self_owner ∈ members
-2. Verify signature using inline inviter_signing_pub (DmInvite is the
+2. Verify signature using inline inviter_identity_pub (DmInvite is the
    bootstrap exception — receiver doesn't yet have OwnerDeviceCache
    entry for the inviter).
 3. Auto-accept (Phase 3b ships no UI; user-driven decline deferred
