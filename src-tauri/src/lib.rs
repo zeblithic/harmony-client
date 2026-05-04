@@ -1960,6 +1960,76 @@ async fn decrypt_inbox_entries(
     Ok(out)
 }
 
+// ── ZEB-228 Phase 4: delete_outbox_entry (manual delete) ─────────────────
+
+/// Phase 4 — Delete a stuck or expired DM message (manual delete).
+///
+/// Wraps `DmOutbox::delete_dm_outbox_entry`. Removes BOTH the
+/// OutboxEntry and the corresponding self-InboxEntry keyed by
+/// `(space_id, message_cid)`, and clears in-flight + backoff caches.
+/// On success with a non-default outcome, emits a `dm-deleted` IPC
+/// event so the frontend MessageService can prune the message from
+/// its local cache.
+///
+/// Idempotent: a missing `message_id` returns `Ok(())` without
+/// emitting any event.
+///
+/// `message_id` is the 32-character hex of a 16-byte OutboxEntryId.
+#[tauri::command]
+async fn delete_outbox_entry(
+    app: tauri::AppHandle,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    message_id: String,
+) -> Result<(), String> {
+    // Snapshot handles under the sync mutex; release before any .await.
+    // Same pattern as send_dm — NodeState's sync mutex must not span
+    // .await boundaries.
+    let (dm_outbox, crdt_state) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
+        )
+    };
+
+    // Decode message_id from hex → OutboxEntryId.
+    let id_bytes = hex::decode(&message_id).map_err(|e| format!("message_id hex: {e}"))?;
+    let id_arr: [u8; 16] = id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("message_id must be 16 bytes, got {}", id_bytes.len()))?;
+    let outbox_entry_id = crate::owner_state_types::OutboxEntryId(id_arr);
+
+    // Lock order: dm_outbox → crdt_state. Mirrors send_dm to avoid
+    // deadlock against any concurrent send/drain.
+    let outcome = {
+        let mut outbox_g = dm_outbox.lock().await;
+        let mut state_g = crdt_state.lock().await;
+        outbox_g
+            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id)
+            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
+    };
+
+    // Locks dropped (block scope ended). Emit IPC event only if
+    // something actually changed (idempotent missing-id is no-op).
+    if let (Some(space_id), Some(message_cid)) = (outcome.space_id, outcome.message_cid) {
+        let _ = app.emit(
+            "dm-deleted",
+            serde_json::json!({
+                "messageId": message_id,
+                "spaceId": hex::encode(space_id.0),
+                "messageCid": hex::encode(message_cid.to_bytes()),
+            }),
+        );
+    }
+
+    Ok(())
+}
+
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
 ///
 /// The frontend uses this to identify self-sent messages in the Zenoh echo.
@@ -4047,6 +4117,7 @@ pub fn run() {
             send_message,
             send_dm,
             read_dm_thread,
+            delete_outbox_entry,
             get_node_addr,
             list_content,
             pin_content,

@@ -330,6 +330,33 @@ pub struct DrainOutcome {
     pub newly_received: Vec<crate::owner_state_types::ReceivedMessage>,
 }
 
+/// Phase 4 — outcome of `DmOutbox::delete_dm_outbox_entry`.
+///
+/// The IPC layer reads this to decide which `dm-deleted` IPC event to
+/// emit. All fields are `Option` so a no-op delete (idempotent missing-
+/// id call) returns `Default::default()` and the caller knows to emit
+/// nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeleteDmOutboxOutcome {
+    pub deleted_outbox_id: Option<OutboxEntryId>,
+    pub deleted_inbox_key: Option<crate::owner_state_types::InboxKey>,
+    pub space_id: Option<SpaceId>,
+    pub message_cid: Option<crate::owner_state_types::ContentId>,
+}
+
+/// Phase 4 — error type for `DmOutbox::delete_dm_outbox_entry`.
+///
+/// Currently no failure modes (BTreeMap removal is infallible, and a
+/// missing entry is the idempotent success case). Kept as an enum
+/// purely for forward-extensibility — adding a variant later (e.g.,
+/// "cannot delete a Complete entry") is a non-breaking change in
+/// signature, whereas widening `Result<T, !>` to `Result<T, E>` would
+/// be a breaking change for every caller. Suppress the empty-enum
+/// lint accordingly.
+#[allow(clippy::empty_enums)]
+#[derive(Debug, thiserror::Error)]
+pub enum DeleteDmError {}
+
 /// Per-process DM-outbox state. One instance per running node, shared between
 /// the IPC handler (writes via `send_dm`) and the event-loop drain tick.
 ///
@@ -543,6 +570,51 @@ impl DmOutbox {
             self.backoff.remove(&(entry_id, recipient));
         }
         inserted
+    }
+
+    /// Phase 4 — Manual delete of a stuck or expired self-OutboxEntry.
+    ///
+    /// Removes BOTH the OutboxEntry and the corresponding self-InboxEntry
+    /// keyed by `(space_id, message_cid)`. User intent on manual delete
+    /// is "make this message go away," so removing both is the expected
+    /// UX. The IPC layer reads the returned `DeleteDmOutboxOutcome` to
+    /// decide which `dm-deleted` event to emit.
+    ///
+    /// Also clears any in-flight + backoff cache entries for the deleted
+    /// message so a stale entry can't resurface from a future drain tick.
+    ///
+    /// Idempotent: returns `Default::default()` (all None) if the
+    /// OutboxEntry doesn't exist (e.g., already deleted, or the caller
+    /// raced a Complete → GC).
+    pub fn delete_dm_outbox_entry(
+        &mut self,
+        state: &mut OwnerState,
+        message_id: OutboxEntryId,
+    ) -> Result<DeleteDmOutboxOutcome, DeleteDmError> {
+        let outbox_entry = match state.outbox.remove(&message_id) {
+            Some(e) => e,
+            None => return Ok(DeleteDmOutboxOutcome::default()),
+        };
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id: outbox_entry.space_id,
+            message_cid: outbox_entry.message_cid,
+        };
+        // Self-InboxEntry may legitimately be absent (e.g., a paired
+        // device's CidNotify could have raced ahead and the InboxEntry
+        // could have been GC'd). Either way, idempotent removal.
+        let _removed_inbox = state.delete_inbox_entry(inbox_key);
+
+        // Clear in-flight + backoff caches across all recipients of this
+        // message so a stale entry can't resurface on a future drain.
+        self.in_flight.retain(|(eid, _)| *eid != message_id);
+        self.backoff.retain(|(eid, _), _| *eid != message_id);
+
+        Ok(DeleteDmOutboxOutcome {
+            deleted_outbox_id: Some(message_id),
+            deleted_inbox_key: Some(inbox_key),
+            space_id: Some(outbox_entry.space_id),
+            message_cid: Some(outbox_entry.message_cid),
+        })
     }
 
     /// Single drain pass. Walks every Pending/Partial entry; per outstanding
@@ -3831,5 +3903,116 @@ mod tests {
         );
         // Sanity: the device hash didn't somehow leak elsewhere.
         let _ = alice_dev; // silence unused var warning if any
+    }
+
+    // ── Phase 4: delete_dm_outbox_entry (manual delete) ─────────────────
+    //
+    // Removes the OutboxEntry + the corresponding self-InboxEntry keyed
+    // by `(space_id, message_cid)`, plus clears in_flight/backoff caches
+    // so a stuck entry can't resurface.
+
+    #[tokio::test]
+    async fn delete_dm_outbox_entry_removes_outbox_and_self_inbox() {
+        // Arrange: build a DM Space, send a DM (which writes both
+        // OutboxEntry and self-InboxEntry), pre-populate in_flight +
+        // backoff entries for that message to verify they're cleared.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let msg_id = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"hello".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+
+        // Pre-condition: both records exist.
+        let message_cid = state
+            .outbox
+            .get(&msg_id)
+            .expect("outbox entry exists")
+            .message_cid;
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "self-InboxEntry must exist before delete"
+        );
+
+        // Pre-populate in_flight + backoff so we can verify they're cleared.
+        o.in_flight.insert((msg_id, bob));
+        o.backoff.insert(
+            (msg_id, bob),
+            AttemptState {
+                last_attempt_wall_ms: 1_000,
+                failure_count: 1,
+            },
+        );
+
+        // Act.
+        let outcome = o
+            .delete_dm_outbox_entry(&mut state, msg_id)
+            .expect("delete_dm_outbox_entry ok");
+
+        // Assert: OutboxEntry gone.
+        assert!(
+            !state.outbox.contains_key(&msg_id),
+            "OutboxEntry must be removed"
+        );
+        // Self-InboxEntry gone.
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "self-InboxEntry must be removed"
+        );
+        // in_flight + backoff cleared for this message_id (across all
+        // recipients, not just bob).
+        assert!(
+            !o.in_flight.iter().any(|(eid, _)| *eid == msg_id),
+            "in_flight must be cleared for deleted message_id"
+        );
+        assert!(
+            !o.backoff.keys().any(|(eid, _)| *eid == msg_id),
+            "backoff must be cleared for deleted message_id"
+        );
+
+        // Outcome carries the IPC payload data.
+        assert_eq!(outcome.deleted_outbox_id, Some(msg_id));
+        assert_eq!(outcome.deleted_inbox_key, Some(inbox_key));
+        assert_eq!(outcome.space_id, Some(space_id));
+        assert_eq!(outcome.message_cid, Some(message_cid));
+    }
+
+    #[tokio::test]
+    async fn delete_dm_outbox_entry_idempotent_on_missing() {
+        // Arrange: empty state, no OutboxEntry exists.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let mut o = make_outbox_synthetic("dev", alice);
+        let fake_id = OutboxEntryId([0xff; 16]);
+
+        // Act.
+        let outcome = o
+            .delete_dm_outbox_entry(&mut state, fake_id)
+            .expect("idempotent: no error on missing");
+
+        // Assert: all-None outcome, no error.
+        assert_eq!(outcome.deleted_outbox_id, None);
+        assert_eq!(outcome.deleted_inbox_key, None);
+        assert_eq!(outcome.space_id, None);
+        assert_eq!(outcome.message_cid, None);
     }
 }
