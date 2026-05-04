@@ -1530,10 +1530,19 @@ async fn send_dm(
     // be detached from the live NodeState — the new node won't see this
     // entry. Surface as Err so the caller can retry against the live node.
     //
-    // Residual TOCTOU: a stop+restart between this post-check and the IPC
-    // return still produces apparent success with an orphaned entry. That
-    // window is sub-microsecond and Phase 2 acceptable (no UI flow
-    // concurrently triggers stop+send).
+    // KNOWN RACE (ZEB-234, deferred to pre-Phase-4): the mutation already
+    // happened when this check runs. If stop_inner's SyncEngine::shutdown()
+    // flushes the cloned crdt_state between apply_outbox and this post-check,
+    // the entry is persisted + broadcast even though we report Err. A retry
+    // against the new node mints a second OutboxEntry → recipient sees a
+    // duplicate DM. The proper fix is a shutdown fence (in-flight permit
+    // shared between send_dm and stop_inner). Phase 2 ships with this race
+    // unaddressed because no UI flow concurrently triggers stop+send;
+    // ZEB-234 lands the fence before Phase 4 frontend does.
+    //
+    // Residual TOCTOU within this code: a stop+restart between this post-
+    // check and the IPC return still produces apparent success with an
+    // orphaned entry. Same fix (ZEB-234) closes this window too.
     {
         let g = state_lock
             .lock()
