@@ -1443,7 +1443,22 @@ async fn send_dm(
 ) -> Result<String, String> {
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
-    let (dm_outbox, _dm_transport, crdt_state, hlc_tracker, device_id, _self_owner, cas) = {
+    //
+    // We also capture `generation` paired-atomically with the Arcs. If
+    // stop_inner detaches the Arcs (sets to None) and start_node bumps the
+    // generation while the work below is in flight, the Arcs we hold are
+    // orphaned: they'll write into a `crdt_state` the new node never reads
+    // from. The post-check at the bottom catches that and surfaces Err.
+    let (
+        dm_outbox,
+        _dm_transport,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        _self_owner,
+        cas,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -1457,6 +1472,7 @@ async fn send_dm(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
+            g.generation,
         )
     };
 
@@ -1492,23 +1508,45 @@ async fn send_dm(
         .await
         .map_err(|e| format!("send_dm: {e}"))?;
 
-    // Update the HLC tracker with the same stamp DmOutbox::send_dm minted.
-    // Mirror dm_outbox::next_hlc: clock-regression case carries prev.wall_ms
-    // forward and bumps logical; same-wall case bumps logical; new-wall case
-    // resets logical to 0 and uses wall_now_ms.
-    let next = match prev_hlc.as_ref() {
-        Some(p) if p.wall_ms >= wall_now_ms => crate::owner_state_types::Hlc {
-            wall_ms: p.wall_ms,
-            logical: p.logical.saturating_add(1),
-            device_id: device_id.clone(),
-        },
-        _ => crate::owner_state_types::Hlc {
-            wall_ms: wall_now_ms,
-            logical: 0,
-            device_id: device_id.clone(),
-        },
-    };
-    tracker_g.insert(device_id, next);
+    // Read the HLC that DmOutbox::send_dm actually minted from the
+    // just-inserted OutboxEntry. Single source of truth: if next_hlc's logic
+    // ever changes (Phase 3b's planned ±20% jitter, etc.), the tracker stays
+    // in lockstep automatically — the prior manual re-derivation here would
+    // silently desync.
+    let next_hlc = state_g
+        .outbox
+        .get(&msg_id)
+        .map(|e| e.created_at.clone())
+        .ok_or("send_dm minted entry not in outbox (apply_outbox rejected?)")?;
+    tracker_g.insert(device_id, next_hlc);
+
+    // Drop the per-handle locks before re-acquiring NodeState's sync mutex.
+    drop(tracker_g);
+    drop(state_g);
+    drop(outbox_g);
+
+    // Post-check: the work above mutated crdt_state via the cloned Arcs. If
+    // a stop+restart fired during the .await chain, our crdt_state may now
+    // be detached from the live NodeState — the new node won't see this
+    // entry. Surface as Err so the caller can retry against the live node.
+    //
+    // Residual TOCTOU: a stop+restart between this post-check and the IPC
+    // return still produces apparent success with an orphaned entry. That
+    // window is sub-microsecond and Phase 2 acceptable (no UI flow
+    // concurrently triggers stop+send).
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during send_dm (was {}, now {}); \
+                 entry was written to a detached crdt_state and won't be \
+                 drained — retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+    }
 
     Ok(hex::encode(msg_id.0))
 }

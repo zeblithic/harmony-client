@@ -23,7 +23,7 @@ use crate::owner_state_types::{
     DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId, SpaceKind,
 };
 use async_trait::async_trait;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 pub type MessageId = OutboxEntryId;
@@ -52,12 +52,21 @@ pub struct StubTransport {
 
 #[derive(Default)]
 struct StubInner {
-    sends: Vec<(OutboxEntryId, OwnerAddr)>,
+    /// Bounded ring buffer of recorded sends. `StubTransport` is wired into
+    /// `start_node` as the production Phase 2 transport, so a long-lived node
+    /// would otherwise accumulate one entry per send call forever. Capped at
+    /// `STUB_MAX_RECORDED_SENDS` (~32KB worst case at 32B/entry × 1024); on
+    /// overflow the oldest entry is `pop_front`ed before `push_back`. No test
+    /// asserts a `sends` count above ~10, so the cap is non-disruptive.
+    sends: VecDeque<(OutboxEntryId, OwnerAddr)>,
     /// Pre-seeded outcomes; if absent, default = Ok(()).
     outcomes: HashMap<(OutboxEntryId, OwnerAddr), Result<(), TransportError>>,
 }
 
 impl StubTransport {
+    /// FIFO cap on `StubInner::sends` to keep the production stub bounded.
+    const STUB_MAX_RECORDED_SENDS: usize = 1024;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -76,13 +85,15 @@ impl StubTransport {
             .insert((entry_id, recipient), outcome);
     }
 
-    /// Snapshot all recorded sends (in call order).
+    /// Snapshot all recorded sends (in call order, oldest first).
     pub fn sends(&self) -> Vec<(OutboxEntryId, OwnerAddr)> {
         self.inner
             .lock()
             .expect("StubTransport poisoned")
             .sends
-            .clone()
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -93,7 +104,10 @@ impl StubTransport {
 impl DmTransport for StubTransport {
     async fn send(&self, entry: &OutboxEntry, recipient: OwnerAddr) -> Result<(), TransportError> {
         let mut inner = self.inner.lock().expect("StubTransport poisoned");
-        inner.sends.push((entry.id, recipient));
+        if inner.sends.len() >= Self::STUB_MAX_RECORDED_SENDS {
+            inner.sends.pop_front();
+        }
+        inner.sends.push_back((entry.id, recipient));
         inner
             .outcomes
             .remove(&(entry.id, recipient))
@@ -595,6 +609,26 @@ mod tests {
         let res = t.send(&e, r).await;
         assert!(res.is_ok(), "default outcome is Ok: {res:?}");
         assert_eq!(t.sends(), vec![(e.id, r)]);
+    }
+
+    #[tokio::test]
+    async fn stub_transport_caps_recorded_sends_at_max() {
+        // StubTransport is wired into start_node as the production Phase 2
+        // transport. Without the FIFO cap on `sends`, a long-lived node would
+        // accumulate one entry per send call forever (~32 bytes each). Verify
+        // the bound holds: push 2000, expect exactly STUB_MAX_RECORDED_SENDS
+        // retained, oldest evicted (FIFO).
+        let t = StubTransport::new();
+        let e = entry(1);
+        let r = OwnerAddr([2u8; 16]);
+        for _ in 0..2000 {
+            let _ = t.send(&e, r).await;
+        }
+        assert_eq!(
+            t.sends().len(),
+            StubTransport::STUB_MAX_RECORDED_SENDS,
+            "ring buffer must cap at STUB_MAX_RECORDED_SENDS"
+        );
     }
 
     #[test]
