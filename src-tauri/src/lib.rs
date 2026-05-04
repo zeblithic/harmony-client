@@ -13,6 +13,7 @@ pub mod content_store;
 pub mod dm_crypto;
 pub mod dm_envelope;
 pub mod dm_outbox;
+pub mod dm_signing;
 pub mod event_loop;
 pub mod folders;
 mod follows;

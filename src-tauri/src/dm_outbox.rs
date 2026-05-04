@@ -510,6 +510,51 @@ pub enum SendDmError {
     Encode(String),
 }
 
+/// Inbound-DM packet handling errors. Each variant maps to a "drop +
+/// telemetry" decision in handle_unicast per ZEB-216 §"Application-
+/// signature binding rule". Distinct from dm_crypto::DmReceiveError
+/// which only carries the SenderImpersonation case for the encrypted-
+/// payload-layer check.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DmReceiveError {
+    #[error("signing_device_hash not present in any OwnerDeviceCache entry")]
+    UnknownSigningDevice,
+    #[error("signing_device_hash claimed by multiple OwnerDeviceCache entries (corrupted state or cache-poisoning attempt)")]
+    AmbiguousSigningDevice,
+    #[error("no public key cached for signing_device_hash (pre-bootstrap)")]
+    UnknownSigningKey,
+    #[error("signature does not verify against the provided public key")]
+    SignatureVerificationFailed,
+    #[error("public key does not match claimed signing_device_hash (key-substitution attempt)")]
+    SigningKeyDoesNotMatchDeviceHash,
+    #[error("payload owner field does not match signed-origin-resolved owner")]
+    OwnerFieldMismatch,
+    #[error("DmInvite.inviter must be in DmInvite.members")]
+    InviterNotInMembers,
+    #[error("signing_device_hash must be in DmInvite.sender_devices")]
+    SigningDeviceNotInSenderDevices,
+    #[error("self_owner_addr must be in DmInvite.members")]
+    ReceiverNotInMembers,
+    #[error("ack from owner not in OutboxEntry.recipient_owners")]
+    AckFromNonRecipient,
+    #[error("OutboxEntry not found for (space_id, message_cid)")]
+    OutboxEntryNotFound,
+    #[error("Space not found for incoming DmCidNotify (we are not a member?)")]
+    SpaceNotFound,
+    #[error("CAS fetch failed or timed out: {0}")]
+    CasFetchFailed(String),
+    #[error("DM blob decryption failed under all candidate keys")]
+    DecryptFailed,
+    #[error("payload sender does not match resolved owner (impersonation)")]
+    SenderImpersonation,
+    #[error("packet decode failed: {0}")]
+    Decode(String),
+    #[error("AAD compute failed: {0}")]
+    AadCompute(String),
+    #[error("CRDT rejected the apply (invariant violation): {0}")]
+    CrdtRejected(String),
+}
+
 fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerAddr> {
     let mut set: BTreeSet<OwnerAddr> = members.iter().copied().collect();
     set.remove(self_addr);
