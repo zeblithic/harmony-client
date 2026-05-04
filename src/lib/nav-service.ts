@@ -1,7 +1,24 @@
 import type { TauriAdapter, ProfilePayload } from './zenoh-service';
-import type { NavNode, Profile } from './types';
+import type { NavNode, NavNodeType, Profile } from './types';
 import type { AvatarResolver } from './avatar-resolver';
 import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
+
+/**
+ * Phase 4 (ZEB-228) — wire shape of the `nav-updated` IPC event.
+ *
+ * Emitted by the backend when a Space CRDT entry is added, modified,
+ * or removed. Phase 4 only acts on `dm` and `group-dm` kinds; channel,
+ * community, and folder kinds are reserved for later phases and
+ * silently ignored here.
+ */
+export interface NavUpdatedPayload {
+  action: 'added' | 'removed' | 'modified';
+  spaceId: string;
+  kind: 'dm' | 'group-dm' | 'channel' | 'community' | 'folder';
+  name: string;
+  members?: string[];
+  parentId?: string | null;
+}
 
 /**
  * Manages navigation tree state and peer profile lookups.
@@ -80,6 +97,71 @@ export class NavService {
       },
     );
     this.unlisteners.push(unlistenProfile);
+
+    const unlistenNav = await adapter.listen('nav-updated', (event) => {
+      const payload = event.payload as NavUpdatedPayload;
+      const { action, spaceId, kind, name, members, parentId } = payload;
+      // Phase 4 only handles DM/GroupDm Spaces — channel/community/folder
+      // events are reserved for other phases.
+      if (kind !== 'dm' && kind !== 'group-dm') return;
+
+      if (action === 'removed') {
+        const before = this.nodes.length;
+        this.nodes = this.nodes.filter((n) => n.id !== spaceId);
+        if (this.nodes.length !== before) this.onChange?.();
+        return;
+      }
+
+      const navType: NavNodeType = kind === 'dm' ? 'dm' : 'group-chat';
+      // For 1:1 DMs we can attach a Peer if we already know the profile.
+      // GroupDms (members.length > 1) get no peer — they have a member list.
+      const peerAddress = members && members.length === 1 ? members[0] : undefined;
+      const peerProfile = peerAddress ? this.profiles.get(peerAddress) : undefined;
+      const peer = peerAddress
+        ? {
+            address: peerAddress,
+            displayName: peerProfile?.displayName ?? name,
+            avatarUrl: peerProfile?.avatarUrl,
+          }
+        : undefined;
+      const newNode: NavNode = {
+        id: spaceId,
+        type: navType,
+        name,
+        parentId: parentId ?? null,
+        expanded: false,
+        unreadCount: 0,
+        unreadLevel: 'none',
+        peer,
+      };
+
+      if (action === 'added') {
+        // Avoid duplicate inserts if the same spaceId is already present
+        // (e.g. backend re-emits on reconnect / cold-start replay).
+        if (this.nodes.some((n) => n.id === spaceId)) {
+          this.nodes = this.nodes.map((n) => (n.id === spaceId ? newNode : n));
+        } else {
+          this.nodes = [...this.nodes, newNode];
+        }
+      } else if (action === 'modified') {
+        // Patch in-place — preserve existing parentId/expanded/unread state
+        // so user-applied folder placement and read state aren't clobbered
+        // by a name change.
+        let found = false;
+        this.nodes = this.nodes.map((n) => {
+          if (n.id !== spaceId) return n;
+          found = true;
+          return { ...n, name, peer };
+        });
+        if (!found) {
+          // Modified for an unknown spaceId — treat as added to stay
+          // self-healing on missed `added` events.
+          this.nodes = [...this.nodes, newNode];
+        }
+      }
+      this.onChange?.();
+    });
+    this.unlisteners.push(unlistenNav);
   }
 
   /** Look up a peer's status text by address. */
