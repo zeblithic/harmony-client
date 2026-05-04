@@ -12,6 +12,7 @@ pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
 pub mod dm_envelope;
+pub mod dm_outbox;
 pub mod event_loop;
 pub mod folders;
 mod follows;
@@ -185,6 +186,34 @@ pub struct NodeState {
     /// owner identity (master_seed) is available. Shutdown is called
     /// explicitly in `stop_inner` before the event-loop thread is joined.
     sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
+    /// start_node alongside the SyncEngine; shared with the IPC handler
+    /// (send_dm) and the event-loop drain tick.
+    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    /// Phase 2: in-process StubTransport. Phase 3b replaces with a real
+    /// adapter that pushes RuntimeAction::SendUnicastToDevice.
+    dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
+    /// CRDT state Mutex (already constructed for SyncEngine; we hold a
+    /// clone so the IPC handler can lock it independently of SyncEngine).
+    /// Stored as Option because identity-restore can null out everything.
+    crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    /// HLC tracker (mirror of SyncEngine's tracker; the dm_outbox handler
+    /// reads/writes the local device's entry to keep send_dm's HLCs
+    /// monotone with state-root publishes).
+    hlc_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    /// Local device_id string + self OwnerAddr — captured at start_node
+    /// time, snapshot for IPC handlers that mint OutboxEntry / HLC stamps.
+    dm_device_id: Option<String>,
+    dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
+    /// ContentStore handle — same `Arc` SyncEngine was constructed with.
+    /// Lifted onto NodeState so send_dm can write blobs through the same
+    /// store SyncEngine uses for state-root publishes (RuntimeContentStore
+    /// in production, InMemoryStub in some tests).
+    content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
 }
 
 impl NodeState {
@@ -220,6 +249,13 @@ impl Default for NodeState {
             node_addr: String::new(),
             pairing_handle: None,
             sync_engine: None,
+            dm_outbox: None,
+            dm_transport: None,
+            crdt_state: None,
+            hlc_tracker: None,
+            dm_device_id: None,
+            dm_self_owner: None,
+            content_store: None,
         }
     }
 }
@@ -381,6 +417,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _mail_sync,
         pairing_handle,
         sync_engine,
+        dm_outbox,
+        dm_transport,
+        crdt_state,
+        hlc_tracker,
+        dm_device_id,
+        dm_self_owner,
+        content_store,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -411,6 +454,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.mail_sync.take(),
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
+            guard.dm_outbox.take(),
+            guard.dm_transport.take(),
+            guard.crdt_state.take(),
+            guard.hlc_tracker.take(),
+            guard.dm_device_id.take(),
+            guard.dm_self_owner.take(),
+            guard.content_store.take(),
         )
     };
 
@@ -428,6 +478,21 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     drop(follow_tx);
     drop(voice_tx);
     drop(voice_channel_tx);
+    // ZEB-225 Sub-B Phase 2: drop DM outbox handles after the channel
+    // drops. send_dm IPC and the event-loop drain tick both clone these
+    // Arcs into local scope before await, so dropping our Arc here just
+    // releases our reference; any in-flight IPC keeps its own clone
+    // alive for the duration of its critical section.
+    drop(dm_outbox);
+    drop(dm_transport);
+    drop(crdt_state);
+    drop(hlc_tracker);
+    drop(dm_device_id);
+    // OwnerAddr is Copy → use `let _` instead of drop() to satisfy
+    // clippy::dropping_copy_types (the binding goes out of scope here
+    // either way; the explicit binding is just for documentation).
+    let _ = dm_self_owner;
+    drop(content_store);
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -566,6 +631,13 @@ async fn start_node(
         old_voice_channel,
         old_pairing_handle,
         old_sync_engine,
+        old_dm_outbox,
+        old_dm_transport,
+        old_crdt_state,
+        old_hlc_tracker,
+        old_dm_device_id,
+        old_dm_self_owner,
+        old_content_store,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         let tup = (
@@ -580,6 +652,18 @@ async fn start_node(
             guard.voice_channel_tx.take(),
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
+            // ZEB-225 Sub-B Phase 2: take + drop the per-identity DM
+            // handles so a restart doesn't carry stale Arc<DmOutbox> /
+            // Arc<DmTransport> / Arc<OwnerState> / Arc<HlcTracker> /
+            // Arc<dyn ContentStore> against the prior identity into the
+            // new generation. Mirrors stop_inner's cleanup.
+            guard.dm_outbox.take(),
+            guard.dm_transport.take(),
+            guard.crdt_state.take(),
+            guard.hlc_tracker.take(),
+            guard.dm_device_id.take(),
+            guard.dm_self_owner.take(),
+            guard.content_store.take(),
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
@@ -599,6 +683,18 @@ async fn start_node(
     drop(old_follow);
     drop(old_voice);
     drop(old_voice_channel);
+    // ZEB-225 Sub-B Phase 2: drop the previous identity's DM handles so
+    // the new SyncEngine/DmOutbox built below sees no stale Arc clones
+    // outside the new NodeState. Same drop-order rationale as stop_inner.
+    drop(old_dm_outbox);
+    drop(old_dm_transport);
+    drop(old_crdt_state);
+    drop(old_hlc_tracker);
+    drop(old_dm_device_id);
+    // OwnerAddr is Copy → use `let _` instead of drop() to satisfy
+    // clippy::dropping_copy_types.
+    let _ = old_dm_self_owner;
+    drop(old_content_store);
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping
@@ -668,6 +764,32 @@ async fn start_node(
         )?;
 
         let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
+        // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
+        // depends on (device_id, self_owner, crdt_state, tracker,
+        // content_store) out of the `if let Some(seed)` block so the
+        // outer NodeState assignment can reach them. send_dm IPC clones
+        // these from NodeState; without lifting, they'd be unreachable
+        // outside the SyncEngine constructor.
+        let mut device_id_for_state: Option<String> = None;
+        let mut self_owner_for_state: Option<crate::owner_state_types::OwnerAddr> = None;
+        let mut crdt_state_for_state: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+        > = None;
+        let mut tracker_for_state: Option<
+            std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                >,
+            >,
+        > = None;
+        let mut content_store_for_state: Option<
+            std::sync::Arc<dyn crate::content_store::ContentStore>,
+        > = None;
+        let mut dm_outbox_arc: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+        > = None;
+        let mut dm_transport_arc: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>> = None;
+
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
                 if let Some(seed) = loaded.master_seed.as_ref() {
@@ -708,12 +830,25 @@ async fn start_node(
                     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
+                    let self_owner = crate::owner_state_types::OwnerAddr(loaded.state.owner_id);
+
+                    // ZEB-225 Sub-B Phase 2: construct DmOutbox + StubTransport
+                    // alongside SyncEngine. Both share device_id + self_owner
+                    // with the SyncEngine; the StubTransport is the in-process
+                    // Phase 2 stand-in (Phase 3b replaces with a real
+                    // RuntimeAction::SendUnicastToDevice adapter).
+                    let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::dm_outbox::DmOutbox::new(device_id.clone(), self_owner),
+                    ));
+                    let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
+                        std::sync::Arc::new(crate::dm_outbox::StubTransport::new());
+
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
                         std::sync::Arc::clone(&kt),
-                        device_id,
+                        device_id.clone(),
                         std::sync::Arc::clone(&crdt_state),
                         std::sync::Arc::clone(&tracker),
-                        content_store,
+                        std::sync::Arc::clone(&content_store),
                         out_tx,
                         in_rx,
                         crate::owner_state_sync::PersistPaths {
@@ -734,6 +869,16 @@ async fn start_node(
                         outbound_rx: out_rx,
                         inbound_tx: in_tx,
                     });
+
+                    // Lift the per-identity handles out for NodeState
+                    // assignment below.
+                    device_id_for_state = Some(device_id);
+                    self_owner_for_state = Some(self_owner);
+                    crdt_state_for_state = Some(crdt_state);
+                    tracker_for_state = Some(tracker);
+                    content_store_for_state = Some(content_store);
+                    dm_outbox_arc = Some(outbox);
+                    dm_transport_arc = Some(transport);
 
                     Some(engine)
                 } else {
@@ -818,6 +963,9 @@ async fn start_node(
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let cas_op_tx_for_loop = cas_op_tx.clone();
         let sync_handles_for_loop = sync_handles_opt;
+        let dm_outbox_for_loop = dm_outbox_arc.clone();
+        let dm_transport_for_loop = dm_transport_arc.clone();
+        let crdt_state_for_loop = crdt_state_for_state.clone();
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -870,6 +1018,9 @@ async fn start_node(
                         fetch_completion_rx,
                         Some(pairing_in_tx),
                         sync_handles_for_loop,
+                        dm_outbox_for_loop,
+                        dm_transport_for_loop,
+                        crdt_state_for_loop,
                     )
                     .await;
                 });
@@ -903,6 +1054,15 @@ async fn start_node(
                 guard.mail_sync = Some(mail_sync);
                 guard.node_addr = node_addr_for_state;
                 guard.sync_engine = sync_engine_arc.clone();
+                // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
+                // handles on NodeState for send_dm IPC + (T7) drain tick.
+                guard.dm_outbox = dm_outbox_arc.clone();
+                guard.dm_transport = dm_transport_arc.clone();
+                guard.crdt_state = crdt_state_for_state.clone();
+                guard.hlc_tracker = tracker_for_state.clone();
+                guard.dm_device_id = device_id_for_state.clone();
+                guard.dm_self_owner = self_owner_for_state;
+                guard.content_store = content_store_for_state.clone();
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -1261,6 +1421,153 @@ async fn send_message(
     reply_rx
         .await
         .map_err(|_| "event loop dropped publish request".to_string())?
+}
+
+/// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
+///
+/// Snapshots the DmOutbox/CRDT/HLC/ContentStore handles under the NodeState
+/// sync mutex, releases it (before any `.await`), then orchestrates the
+/// send: encrypt+CAS+apply_outbox via `DmOutbox::send_dm`, then bump the
+/// HLC tracker so the next state-root publish stamps monotonically.
+///
+/// Lock order (mirror in event_loop drain): dm_outbox → crdt_state → hlc_tracker.
+///
+/// `space_id_hex` is the 32-character hex of a 16-byte SpaceId.
+/// Returns the hex-encoded MessageId (== OutboxEntryId) on success.
+#[tauri::command]
+async fn send_dm(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id_hex: String,
+    content: Vec<u8>,
+    mime_type: String,
+) -> Result<String, String> {
+    // Snapshot all handles under the sync mutex; release it before any await.
+    // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
+    //
+    // We also capture `generation` paired-atomically with the Arcs. If
+    // stop_inner detaches the Arcs (sets to None) and start_node bumps the
+    // generation while the work below is in flight, the Arcs we hold are
+    // orphaned: they'll write into a `crdt_state` the new node never reads
+    // from. The post-check at the bottom catches that and surfaces Err.
+    let (
+        dm_outbox,
+        _dm_transport,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        _self_owner,
+        cas,
+        snapshot_generation,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.dm_transport.clone().ok_or("dm_transport missing")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.content_store.clone().ok_or("content_store missing")?,
+            g.generation,
+        )
+    };
+
+    let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id_typed = crate::owner_state_types::SpaceId(space_arr);
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Lock order: dm_outbox → crdt_state → hlc_tracker.
+    // Mirror this order in event_loop drain (T7) to avoid deadlock.
+    let mut outbox_g = dm_outbox.lock().await;
+    let mut state_g = crdt_state.lock().await;
+    let mut tracker_g = hlc_tracker.lock().await;
+    let prev_hlc = tracker_g.get(&device_id).cloned();
+
+    let msg_id = outbox_g
+        .send_dm(
+            &mut state_g,
+            cas.as_ref(),
+            space_id_typed,
+            content,
+            mime_type,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("send_dm: {e}"))?;
+
+    // Read the HLC that DmOutbox::send_dm actually minted from the
+    // just-inserted OutboxEntry. Single source of truth: if next_hlc's logic
+    // ever changes (Phase 3b's planned ±20% jitter, etc.), the tracker stays
+    // in lockstep automatically — the prior manual re-derivation here would
+    // silently desync.
+    let next_hlc = state_g
+        .outbox
+        .get(&msg_id)
+        .map(|e| e.created_at.clone())
+        .ok_or("send_dm minted entry not in outbox (apply_outbox rejected?)")?;
+    tracker_g.insert(device_id, next_hlc);
+
+    // Drop the per-handle locks before re-acquiring NodeState's sync mutex.
+    drop(tracker_g);
+    drop(state_g);
+    drop(outbox_g);
+
+    // Post-check: the work above mutated crdt_state via the cloned Arcs. If
+    // a stop+restart fired during the .await chain, our crdt_state may now
+    // be detached from the live NodeState — the new node won't see this
+    // entry. Surface as Err so the caller can retry against the live node.
+    //
+    // KNOWN RACE (ZEB-234, deferred to pre-Phase-4): the mutation already
+    // happened when this check runs. If stop_inner's SyncEngine::shutdown()
+    // flushes the cloned crdt_state between apply_outbox and this post-check,
+    // the entry is persisted + broadcast even though we report Err. A retry
+    // against the new node mints a second OutboxEntry → recipient sees a
+    // duplicate DM. The proper fix is a shutdown fence (in-flight permit
+    // shared between send_dm and stop_inner). Phase 2 ships with this race
+    // unaddressed because no UI flow concurrently triggers stop+send;
+    // ZEB-234 lands the fence before Phase 4 frontend does.
+    //
+    // Residual TOCTOU within this code: a stop+restart between this post-
+    // check and the IPC return still produces apparent success with an
+    // orphaned entry. Same fix (ZEB-234) closes this window too.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during send_dm (was {}, now {}); \
+                 entry was written to a detached crdt_state and won't be \
+                 drained — retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        // stop_inner clears DM handles (dm_outbox, crdt_state, etc → None)
+        // WITHOUT bumping `generation`. So a stop_node alone (no subsequent
+        // start) leaves generation unchanged but handles None. The
+        // generation-only check above misses that case; verify the handles
+        // are still present too.
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during send_dm; entry was written to a \
+                 detached crdt_state and won't be drained"
+                .to_string());
+        }
+    }
+
+    Ok(hex::encode(msg_id.0))
 }
 
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
@@ -3348,6 +3655,7 @@ pub fn run() {
             disconnect_zenoh,
             publish_profile,
             send_message,
+            send_dm,
             get_node_addr,
             list_content,
             pin_content,
