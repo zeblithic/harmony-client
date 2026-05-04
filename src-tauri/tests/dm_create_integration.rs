@@ -104,7 +104,7 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         "alice",
     );
 
-    let (space_id, sends) = add_space_dm_inner(
+    let (space_id, sends, was_merge) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -118,6 +118,7 @@ async fn add_space_dm_kind_generates_content_key_and_dispatches_invite() {
         None,
     )
     .expect("add_space_dm_inner must succeed");
+    assert!(!was_merge, "first creation must not be a merge");
 
     // Space is in CRDT.
     let space = state.spaces.get(&space_id).expect("space inserted");
@@ -180,7 +181,7 @@ async fn add_space_group_dm_with_15_recipients_succeeds() {
     // total members, exactly at the cap.
     let recipients: Vec<OwnerAddr> = (0..15u8).map(|i| OwnerAddr([0x10 + i; 16])).collect();
 
-    let (space_id, _sends) = add_space_dm_inner(
+    let (space_id, _sends, _was_merge) = add_space_dm_inner(
         &mut state,
         &alice_signing_key,
         &alice_identity_pub,
@@ -299,6 +300,117 @@ async fn add_space_dm_kind_rejects_self_in_recipients() {
         err.contains("duplicate") || err.contains("self") || err.contains("recipient"),
         "error mentions self/duplicate: {err}"
     );
+}
+
+#[tokio::test]
+async fn add_space_dm_kind_idempotent_on_duplicate_creation() {
+    // Phase 4 / PR #81 review fix: creating the same DM twice (same
+    // sorted members) must dedupe via apply_space_with_canonicalization.
+    // The second call must:
+    //   - return the SAME canonical SpaceId as the first (the existing
+    //     Space's id, not a fresh one — so the outer command's
+    //     state.spaces.get(&canonical_id) succeeds);
+    //   - signal `was_merge=true`;
+    //   - dispatch ZERO additional DmInvites (the existing Space was
+    //     already invited at original creation; re-firing here would
+    //     just produce duplicate invite handling on the recipient).
+    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key) = make_party(0xa1);
+    let (bob_owner, bob_device, bob_identity_pub, _bob_signing_key) = make_party(0xb2);
+
+    let mut state = OwnerState::default();
+    cache_party(
+        &mut state,
+        alice_owner,
+        alice_device,
+        alice_identity_pub,
+        100,
+        "alice",
+    );
+    cache_party(
+        &mut state,
+        bob_owner,
+        bob_device,
+        bob_identity_pub,
+        100,
+        "alice",
+    );
+
+    // First create — Inserted.
+    let (first_id, first_sends, first_merge) = add_space_dm_inner(
+        &mut state,
+        &alice_signing_key,
+        &alice_identity_pub,
+        alice_owner,
+        alice_device,
+        "alice-device",
+        SpaceKind::Dm,
+        "DM with Bob".into(),
+        vec![bob_owner],
+        500,
+        None,
+    )
+    .expect("first create must succeed");
+    assert!(!first_merge, "first create must not be a merge");
+    assert_eq!(
+        first_sends.len(),
+        1,
+        "first create dispatches one invite to Bob"
+    );
+
+    // Second create with the same members (different name to prove
+    // dedupe is on members, not name). Must merge into a single
+    // canonical SpaceId and skip dispatch. The winner is
+    // lex-min(first_id, second_minted_id) per ULID tie-break — the
+    // load-bearing assertion is "second_id IS the live entry in
+    // state.spaces", not "second_id == first_id" (which only holds
+    // when the second mint loses the tie-break).
+    let (second_id, second_sends, second_merge) = add_space_dm_inner(
+        &mut state,
+        &alice_signing_key,
+        &alice_identity_pub,
+        alice_owner,
+        alice_device,
+        "alice-device",
+        SpaceKind::Dm,
+        "DM with Bob (again)".into(),
+        vec![bob_owner],
+        600, // later wall_ms — irrelevant; dedupe is by sorted members
+        None,
+    )
+    .expect("second create must succeed (dedupe path)");
+    assert!(second_merge, "second create must be a merge (dedupe)");
+    assert!(
+        state.spaces.contains_key(&second_id),
+        "second create returns a canonical SpaceId that's live in state.spaces \
+         (NOT a stale loser id whose entry was dropped by the dedupe merge)"
+    );
+    assert!(
+        second_sends.is_empty(),
+        "second create must NOT re-dispatch DmInvite (existing was already invited)"
+    );
+
+    // Post-condition: state.spaces has exactly one DM Space for this
+    // member set (no orphan loser entry from the merge). The winner
+    // is whichever of (first_id, second-minted-id) is lex-smaller —
+    // both calls converge on the same canonical id.
+    let dm_spaces: Vec<_> = state
+        .spaces
+        .values()
+        .filter(|s| matches!(s.kind, SpaceKind::Dm))
+        .collect();
+    assert_eq!(dm_spaces.len(), 1, "dedupe collapsed to a single DM Space");
+    assert_eq!(
+        dm_spaces[0].id, second_id,
+        "the live DM Space's id is the canonical id returned by the second call"
+    );
+    // Either the first or the second call's returned id won the
+    // tie-break; the loser's id should NOT be in state.spaces.
+    if first_id != second_id {
+        assert!(
+            !state.spaces.contains_key(&first_id),
+            "the loser id (first_id) was dropped during dedupe merge"
+        );
+    }
 }
 
 #[tokio::test]

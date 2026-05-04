@@ -346,16 +346,23 @@ pub struct DeleteDmOutboxOutcome {
 
 /// Phase 4 — error type for `DmOutbox::delete_dm_outbox_entry`.
 ///
-/// Currently no failure modes (BTreeMap removal is infallible, and a
-/// missing entry is the idempotent success case). Kept as an enum
-/// purely for forward-extensibility — adding a variant later (e.g.,
-/// "cannot delete a Complete entry") is a non-breaking change in
-/// signature, whereas widening `Result<T, !>` to `Result<T, E>` would
-/// be a breaking change for every caller. Suppress the empty-enum
-/// lint accordingly.
-#[allow(clippy::empty_enums)]
+/// `AlreadyDelivered`: the targeted OutboxEntry is `DeliveryStatus::Complete`,
+/// meaning every recipient already acknowledged. Manual-delete must NOT remove
+/// delivered self-history — the user's UX expectation for "delete" of a
+/// stuck/expired message does not extend to wiping messages that successfully
+/// shipped (and that may already be replicated to a paired device). The IPC
+/// layer surfaces this as an Err so the caller can distinguish "we erased a
+/// stuck/expired thing" from "this message already made it; refusing to erase
+/// delivered history."
+///
+/// Missing entries remain the idempotent success case (returns
+/// `Ok(DeleteDmOutboxOutcome::default())`) — a stale UI/IPC retry must not
+/// be elevated to an error.
 #[derive(Debug, thiserror::Error)]
-pub enum DeleteDmError {}
+pub enum DeleteDmError {
+    #[error("message {0:?} is already complete (all recipients acked); refusing to erase delivered self-history")]
+    AlreadyDelivered(OutboxEntryId),
+}
 
 /// Per-process DM-outbox state. One instance per running node, shared between
 /// the IPC handler (writes via `send_dm`) and the event-loop drain tick.
@@ -400,8 +407,14 @@ impl DmOutbox {
     }
 
     /// Encrypt `content` under `Space.content_key`, write the storage blob to
-    /// CAS, mint a fresh OutboxEntry, install it. Returns the new MessageId.
-    /// Drain (next tick) attempts delivery; this call returns immediately.
+    /// CAS, mint a fresh OutboxEntry, install it. Returns the new
+    /// `(MessageId, ContentId)` — MessageId is the OutboxEntryId for
+    /// lifecycle correlation; ContentId is the message_cid the IPC layer
+    /// surfaces to the frontend so it can stably key by content identifier
+    /// across optimistic / dm-received / read_dm_thread paths (a
+    /// MessageId-only return would force the caller to re-look-up the
+    /// entry to recover the cid). Drain (next tick) attempts delivery;
+    /// this call returns immediately.
     ///
     /// `wall_now_ms` and `prev_hlc` are passed in (not derived) so tests can
     /// drive deterministic HLCs and so the IPC handler can keep the per-device
@@ -416,7 +429,7 @@ impl DmOutbox {
         mime_type: String,
         wall_now_ms: u64,
         prev_hlc: Option<&Hlc>,
-    ) -> Result<MessageId, SendDmError> {
+    ) -> Result<(MessageId, crate::owner_state_types::ContentId), SendDmError> {
         // 1. Look up Space, check kind + content_key.
         let space = state
             .spaces
@@ -511,7 +524,7 @@ impl DmOutbox {
                 // None} fires if a paired device's CidNotify already wrote
                 // this CID first (cross-device race), which is fine — same
                 // payload, idempotent.
-                Ok(entry_id)
+                Ok((entry_id, message_cid))
                 // Note: ApplyOutcome::Merged would also reach here. It "should
                 // not happen" because a fresh ULID can't collide with any
                 // existing entry, but we treat it the same as Inserted for
@@ -591,10 +604,23 @@ impl DmOutbox {
         state: &mut OwnerState,
         message_id: OutboxEntryId,
     ) -> Result<DeleteDmOutboxOutcome, DeleteDmError> {
-        let outbox_entry = match state.outbox.remove(&message_id) {
-            Some(e) => e,
+        // Peek before removing so a Complete entry doesn't get unconditionally
+        // wiped. Idempotent miss → Ok(default()); Complete hit → Err so the
+        // caller can distinguish "refusing to erase delivered history" from
+        // "the entry was already deleted/never existed."
+        match state.outbox.get(&message_id) {
             None => return Ok(DeleteDmOutboxOutcome::default()),
-        };
+            Some(e) if matches!(e.delivery_status, DeliveryStatus::Complete) => {
+                return Err(DeleteDmError::AlreadyDelivered(message_id));
+            }
+            Some(_) => {}
+        }
+        // SAFETY: the get() above proved the entry exists with non-Complete
+        // status. No await between, so no concurrent mutator can race.
+        let outbox_entry = state
+            .outbox
+            .remove(&message_id)
+            .expect("entry existed in get() above; no await between");
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id: outbox_entry.space_id,
             message_cid: outbox_entry.message_cid,
@@ -1715,7 +1741,7 @@ mod tests {
 
         let cas = InMemoryStub::default();
         let mut o = make_outbox_synthetic("dev", alice);
-        let msg_id = o
+        let (msg_id, _msg_cid) = o
             .send_dm(
                 &mut state,
                 &cas,
@@ -1750,7 +1776,7 @@ mod tests {
 
         let cas = InMemoryStub::default();
         let mut o = make_outbox_synthetic("dev", alice);
-        let _msg_id = o
+        let (_msg_id, _msg_cid) = o
             .send_dm(
                 &mut state,
                 &cas,
@@ -3925,7 +3951,7 @@ mod tests {
 
         let cas = InMemoryStub::default();
         let mut o = make_outbox_synthetic("dev", alice);
-        let msg_id = o
+        let (msg_id, _msg_cid) = o
             .send_dm(
                 &mut state,
                 &cas,
@@ -4014,5 +4040,69 @@ mod tests {
         assert_eq!(outcome.deleted_inbox_key, None);
         assert_eq!(outcome.space_id, None);
         assert_eq!(outcome.message_cid, None);
+    }
+
+    #[tokio::test]
+    async fn delete_dm_outbox_entry_rejects_completed() {
+        // Arrange: send a DM, then mark the OutboxEntry Complete (every
+        // recipient acked). delete_dm_outbox_entry must refuse — manual
+        // delete is for stuck/expired entries, not delivered self-history.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let sp = make_dm_space(7, vec![alice, bob]);
+        let space_id = sp.id;
+        install_space(&mut state, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = make_outbox_synthetic("dev", alice);
+        let (msg_id, _msg_cid) = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"shipped".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+
+        // Force the entry to Complete: insert bob in delivered_to and
+        // recompute status. (mark_ack_delivered would do the same thing
+        // but with a forged ack path; we mutate directly to keep the
+        // test focused on the delete behavior.)
+        {
+            let entry = state.outbox.get_mut(&msg_id).expect("entry exists");
+            entry.delivered_to.insert(bob);
+            entry.delivery_status = entry.compute_status(false);
+            assert!(matches!(entry.delivery_status, DeliveryStatus::Complete));
+        }
+        // Pre-condition: self-InboxEntry exists.
+        let message_cid = state.outbox.get(&msg_id).unwrap().message_cid;
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(state.inbox.contains_key(&inbox_key));
+
+        // Act: must err.
+        let err = o
+            .delete_dm_outbox_entry(&mut state, msg_id)
+            .expect_err("Complete entries must not be deletable");
+        match err {
+            DeleteDmError::AlreadyDelivered(id) => assert_eq!(id, msg_id),
+        }
+
+        // Post-condition: nothing was removed.
+        assert!(
+            state.outbox.contains_key(&msg_id),
+            "Complete entry must remain"
+        );
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "self-InboxEntry must remain — delivered history is preserved"
+        );
     }
 }

@@ -75,7 +75,7 @@ async fn send_dm_round_trip_through_dm_outbox() {
     let transport = StubTransport::new();
 
     // 1. send_dm
-    let msg_id = outbox
+    let (msg_id, _msg_cid) = outbox
         .send_dm(
             &mut state,
             &cas,

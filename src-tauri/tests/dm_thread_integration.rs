@@ -20,7 +20,8 @@ use harmony_app::content_store::{ContentStore, InMemoryStub};
 use harmony_app::dm_outbox::DmOutbox;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{
-    DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding,
+    DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind,
+    TransportBinding,
 };
 use harmony_app::read_dm_thread_inner;
 
@@ -139,6 +140,16 @@ async fn read_dm_thread_returns_decrypted_messages_reverse_chronological() {
         result.iter().all(|m| m.from == hex::encode(alice.0)),
         "from == self_owner hex on all self-sent entries"
     );
+
+    // ── delivery_state check ──
+    // All three were freshly sent without acks, so the outbox status
+    // is `Pending` for each → delivery_state = "sending".
+    assert!(
+        result
+            .iter()
+            .all(|m| m.delivery_state.as_deref() == Some("sending")),
+        "self-entries with Pending outbox status surface as delivery_state='sending'"
+    );
 }
 
 #[tokio::test]
@@ -211,4 +222,91 @@ async fn read_dm_thread_paginates_via_before_hlc_cursor() {
         ],
         "pagination covers all 5 in descending order, no overlap/skips"
     );
+}
+
+#[tokio::test]
+async fn read_dm_thread_self_message_delivery_state_reflects_outbox_status() {
+    // Phase 4 / PR #81 review fix: read_dm_thread must populate
+    // DmThreadMessage.delivery_state for self entries by joining
+    // against the outbox status. A stuck-sending self-message must
+    // surface as "sending" — pre-fix, the frontend hardcoded
+    // "delivered" on every self-InboxEntry and stuck/expired
+    // messages were silently misrepresented in scrollback.
+    //
+    // Strategy: send 4 messages, then mutate their outbox entries
+    // to land in each of the four observable states (Pending,
+    // Partial, Complete, Expired). Plus delete the outbox entry
+    // entirely on a 5th (simulating post-Complete GC) and assert
+    // that the InboxEntry-only path also surfaces "delivered".
+    let (mut state, mut outbox, cas, alice, space_id) = fixture().await;
+    let bob = OwnerAddr([0x02; 16]);
+    // The third recipient lets us realize a Partial state: 1-of-2
+    // acked. The DM Space we created in fixture() has only alice+bob
+    // as members, so we directly mutate the outbox entry's
+    // recipient list to add a synthetic peer for the Partial test.
+    let charlie = OwnerAddr([0x03; 16]);
+
+    let mut msg_ids = Vec::with_capacity(5);
+    for i in 0..5u64 {
+        let (msg_id, _msg_cid) = outbox
+            .send_dm(
+                &mut state,
+                cas.as_ref(),
+                space_id,
+                format!("msg-{i}").into_bytes(),
+                "text/plain".into(),
+                1_000_000 + i * 1_000,
+                None,
+            )
+            .await
+            .expect("send_dm ok");
+        msg_ids.push(msg_id);
+    }
+
+    // msg-0: leave Pending (default post-send_dm).
+    // msg-1: Partial — bump recipient list to {bob, charlie}, ack bob.
+    {
+        let e = state.outbox.get_mut(&msg_ids[1]).unwrap();
+        e.recipient_owners = vec![bob, charlie];
+        e.recipient_owners.sort();
+        e.delivered_to.insert(bob);
+        e.delivery_status = e.compute_status(false);
+        assert!(matches!(e.delivery_status, DeliveryStatus::Partial));
+    }
+    // msg-2: Complete — ack bob (the only recipient).
+    {
+        let e = state.outbox.get_mut(&msg_ids[2]).unwrap();
+        e.delivered_to.insert(bob);
+        e.delivery_status = e.compute_status(false);
+        assert!(matches!(e.delivery_status, DeliveryStatus::Complete));
+    }
+    // msg-3: Expired — flip status directly (mirrors what drain's
+    // wall-clock sweep does after EXPIRATION_MS elapses).
+    {
+        let e = state.outbox.get_mut(&msg_ids[3]).unwrap();
+        e.delivery_status = DeliveryStatus::Expired;
+    }
+    // msg-4: simulate post-Complete GC — remove the OutboxEntry
+    // entirely. The InboxEntry remains; the helper's missing-outbox
+    // fallback should produce "delivered" (the entry was Complete
+    // before being collected; GC is the only realistic reason for
+    // a self-InboxEntry without a matching outbox entry).
+    state.outbox.remove(&msg_ids[4]);
+
+    // Read back. Newest-first ordering means msg-4, msg-3, msg-2, msg-1, msg-0.
+    let result = read_dm_thread_inner(&state, cas.as_ref(), space_id, 50, None, alice)
+        .await
+        .expect("read_dm_thread_inner ok");
+    assert_eq!(result.len(), 5);
+
+    // msg-4 (outbox GC'd → "delivered"), msg-3 (Expired), msg-2 (Complete),
+    // msg-1 (Partial), msg-0 (Pending).
+    assert_eq!(result[0].delivery_state.as_deref(), Some("delivered"));
+    assert_eq!(result[1].delivery_state.as_deref(), Some("expired"));
+    assert_eq!(result[2].delivery_state.as_deref(), Some("delivered"));
+    assert_eq!(result[3].delivery_state.as_deref(), Some("sending"));
+    assert_eq!(result[4].delivery_state.as_deref(), Some("sending"));
+
+    // Sanity: every entry IS self-outbound (we sent all five).
+    assert!(result.iter().all(|m| m.is_self_outbound));
 }

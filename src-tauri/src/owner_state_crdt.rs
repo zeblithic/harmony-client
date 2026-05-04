@@ -325,8 +325,21 @@ impl OwnerState {
     /// `received_at` descending. The natural BTreeMap order is by
     /// message_cid which IS NOT chronological — `received_at` is
     /// the chronological key.
+    ///
+    /// Implementation: BTreeMap range scoped by SpaceId. `InboxKey` orders
+    /// by `(space_id, message_cid)` so all entries for `space_id` form a
+    /// contiguous run in the map. We start the range at the all-zero
+    /// `message_cid` and `take_while` `key.space_id == space_id` to bound
+    /// the scan to O(matching) rather than O(total inbox entries).
     pub fn inbox_entries_for_space(&self, space_id: SpaceId) -> impl Iterator<Item = &InboxEntry> {
-        self.inbox.values().filter(move |e| e.space_id == space_id)
+        let start = InboxKey {
+            space_id,
+            message_cid: crate::owner_state_types::ContentId::from_bytes([0u8; 32]),
+        };
+        self.inbox
+            .range(start..)
+            .take_while(move |(k, _)| k.space_id == space_id)
+            .map(|(_, e)| e)
     }
 
     /// Remove an InboxEntry by (space_id, message_cid). Returns the
@@ -1559,6 +1572,49 @@ mod apply_inbox_tests {
         let entries: Vec<&InboxEntry> = state.inbox_entries_for_space(space_a).collect();
         assert_eq!(entries.len(), 2, "only space_a entries");
         assert!(entries.iter().all(|e| e.space_id == space_a));
+    }
+
+    #[test]
+    fn inbox_entries_for_space_skips_unrelated_at_scale() {
+        // Regression for the BTreeMap::range optimization: with 200
+        // unrelated entries across other SpaceIds, the helper must still
+        // return only the matching-Space entries. This guards against a
+        // future refactor that accidentally widens the range bounds or
+        // forgets the take_while terminator.
+        let mut state = OwnerState::default();
+        let target = SpaceId([0x77; 16]);
+        let owner = OwnerAddr([0xff; 16]);
+
+        // Seed 200 entries across other spaces (SpaceIds [0x00..=0x76]
+        // and [0x78..=0xff], straddling target on both sides of the
+        // range bound to exercise the take_while terminator).
+        for sp_byte in 0u8..=255u8 {
+            if sp_byte == 0x77 {
+                continue;
+            }
+            state.apply_inbox(InboxEntry {
+                space_id: SpaceId([sp_byte; 16]),
+                message_cid: ContentId::from_bytes([0x42; 32]),
+                from: owner,
+                received_at: hlc(sp_byte as u64),
+            });
+        }
+        // Three entries in target with distinct message_cids.
+        for cid_byte in 0u8..3u8 {
+            state.apply_inbox(InboxEntry {
+                space_id: target,
+                message_cid: ContentId::from_bytes([cid_byte; 32]),
+                from: owner,
+                received_at: hlc(1_000 + cid_byte as u64),
+            });
+        }
+
+        let entries: Vec<&InboxEntry> = state.inbox_entries_for_space(target).collect();
+        assert_eq!(entries.len(), 3, "exactly the 3 target-space entries");
+        assert!(
+            entries.iter().all(|e| e.space_id == target),
+            "no unrelated SpaceId leaks through"
+        );
     }
 
     #[test]

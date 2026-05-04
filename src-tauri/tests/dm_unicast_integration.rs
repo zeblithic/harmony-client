@@ -231,7 +231,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
     let _msg_id = {
         let mut alice_g = alice_state.lock().await;
         let mut alice_outbox_g = alice_outbox.lock().await;
-        alice_outbox_g
+        let (msg_id, _msg_cid) = alice_outbox_g
             .send_dm(
                 &mut alice_g,
                 cas.as_ref(),
@@ -242,7 +242,8 @@ async fn dm_full_round_trip_through_unicast_channel() {
                 None,
             )
             .await
-            .expect("send_dm ok")
+            .expect("send_dm ok");
+        msg_id
     };
 
     // ── Drain Alice's outbox: drain resolves Bob's destinations from
