@@ -6,13 +6,16 @@
 //! and §"Application-signature binding rule".
 //!
 //! Phase 3b wire layout per Reticulum unicast packet:
-//! `[u8 discriminant][CBOR(signed_body)][bstr(64) signature]`
+//! `[u8 discriminant][CBOR(signed_body)][64 raw signature bytes]`
 //!
-//! The discriminant is routing-only (excluded from the signed bytes),
-//! the signature lives outside the CBOR map (avoids a chicken-and-egg
-//! computing it inside), and `signed_bytes` is captured on decode so the
-//! receive handler can call `dm_signing::verify_dm_packet_signature`
-//! without re-encoding.
+//! The discriminant is routing-only (excluded from the signed bytes).
+//! The signature is 64 raw Ed25519 bytes appended to the wire (NOT a
+//! CBOR bstr — `encode_packet` uses `extend_from_slice(signature)`,
+//! `decode_packet` uses `split_at(len - 64)`, no CBOR header involved).
+//! Keeping it outside the CBOR map avoids the chicken-and-egg of
+//! computing the signature over a body that contains it, and
+//! `signed_bytes` is captured on decode so the receive handler can call
+//! `dm_signing::verify_dm_packet_signature` without re-encoding.
 //!
 //! All wire types use two-character serde renames so each struct's keys
 //! are the same encoded length at a single nesting level — the same-length-
@@ -159,8 +162,10 @@ pub struct DmAckSigned {
 }
 
 /// Discriminated union of Reticulum DM packets. Wire layout per packet:
-/// `[u8 discriminant][CBOR(signed_body)][bstr(64) signature]` with
-/// discriminants 0x01=Invite, 0x02=CidNotify, 0x03=Ack.
+/// `[u8 discriminant][CBOR(signed_body)][64 raw signature bytes]` with
+/// discriminants 0x01=Invite, 0x02=CidNotify, 0x03=Ack. The signature
+/// tail is 64 raw bytes (NOT a CBOR bstr — encode appends via
+/// `extend_from_slice`, decode splits via `split_at(len - 64)`).
 ///
 /// Each variant carries:
 /// - `signed`: the typed body the signature covers.
