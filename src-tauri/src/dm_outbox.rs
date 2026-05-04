@@ -785,6 +785,12 @@ impl DmOutbox {
     ///        identity pub for the device that signed THIS invite, but
     ///        has no pubs for the inviter's other devices yet — they
     ///        remain pre-bootstrap until the next invite-equivalent flow.
+    ///        The LWW HLC for this update is built from OUR local
+    ///        `wall_now_ms` + `self.device_id`, NOT `signed.created_at`
+    ///        (the inviter's claim) — using the remote HLC would let
+    ///        an attacker forge a far-future timestamp on a single
+    ///        malicious invite and pin the cache, rejecting all future
+    ///        legitimate updates from the same owner as `StaleHlc`.
     ///      - `apply_space_with_canonicalization` for the new DM Space,
     ///        mirroring what `dm_outbox::send_dm` builds on the outbound
     ///        side (Reticulum transport binding, Phase 1 invariants for
@@ -800,7 +806,7 @@ impl DmOutbox {
         signed: crate::dm_envelope::DmInviteSigned,
         signature: [u8; 64],
         signed_bytes: &[u8],
-        _wall_now_ms: u64,
+        wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
         // Sanity gate 1: inviter ∈ members.
         if !signed.members.contains(&signed.inviter) {
@@ -844,11 +850,26 @@ impl DmOutbox {
             .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
         device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
 
+        // SECURITY: the OwnerDeviceCache LWW HLC must record when WE
+        // learned about these devices, NOT the timestamp the inviter
+        // claims they sent the invite. Using `signed.created_at` here
+        // would let an attacker forge a far-future HLC (e.g.,
+        // wall_ms = u64::MAX / 2) on a single malicious invite,
+        // pinning the local cache and rejecting every legitimate
+        // future update from the same owner as `StaleHlc` — a
+        // denial-of-updates attack. Mirror the pattern that
+        // `handle_cidnotify` step 8 already uses (local wall clock
+        // + our device_id).
+        let learned_at = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: self.device_id.clone(),
+        };
         let cache_outcome = state.apply_owner_device_update(
             signed.inviter,
             signed.sender_devices.clone(),
             device_identity_pubs,
-            signed.created_at.clone(),
+            learned_at,
         );
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
             return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
@@ -1342,8 +1363,9 @@ fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
 /// — drop + telemetry.
 ///
 /// Uses `binary_search` on `OwnerDeviceEntry::devices`, which is sorted-
-/// ascending-lex per its existing invariant (re-established by
-/// `deserialize_device_identities` on every load — see
+/// ascending-lex per its existing invariant (re-established by the
+/// struct-level `Deserialize` impl on `OwnerDeviceEntry` on every load —
+/// jointly with the parallel `device_identity_pubs` vec — see
 /// `owner_state_types.rs:286-307`).
 // Task 9 (handle_invite) does NOT call this — invites carry the inviter
 // inline so resolution is unnecessary. Task 10 (handle_cidnotify) is the
@@ -2268,6 +2290,84 @@ mod tests {
         assert_eq!(entry.devices, vec![device_hash]);
         // Cached pub is at index 0 (the only device, also the signer).
         assert_eq!(entry.device_identity_pubs[0], Some(identity_pub));
+    }
+
+    #[tokio::test]
+    async fn handle_invite_uses_local_wall_now_ms_for_cache_lww_not_remote_created_at() {
+        // SECURITY regression: handle_invite previously fed
+        // `signed.created_at` (attacker-controlled remote HLC) into
+        // `apply_owner_device_update` as the LWW timestamp. A forged
+        // far-future HLC (e.g., wall_ms = u64::MAX / 2) on a single
+        // malicious invite would pin the local cache and reject every
+        // legitimate future update from the same owner as `StaleHlc`
+        // — a denial-of-updates attack.
+        //
+        // The fix uses our local `wall_now_ms` + `self.device_id` to
+        // build the LWW HLC (mirroring `handle_cidnotify` step 8). The
+        // assertion: after handle_invite, the cache entry's
+        // `learned_at.wall_ms` MUST be `wall_now_ms`, NOT the remote
+        // far-future value.
+        use crate::owner_state_crdt::OwnerState;
+
+        let mut state = OwnerState::default();
+        let mut outbox = make_outbox_synthetic("local-dev", OwnerAddr([2; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        // Forged far-future HLC — under the bug, this would be written
+        // into the cache and lock out legitimate updates.
+        let attacker_hlc = Hlc {
+            wall_ms: u64::MAX / 2,
+            logical: 0,
+            device_id: "attacker".into(),
+        };
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: attacker_hlc.clone(),
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        let local_wall_now_ms: u64 = 12345;
+        outbox
+            .handle_invite(
+                &mut state,
+                signed,
+                signature,
+                &body_bytes,
+                local_wall_now_ms,
+            )
+            .await
+            .unwrap();
+
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&OwnerAddr([1; 16]))
+            .expect("cache entry must exist after handle_invite");
+        assert_eq!(
+            entry.learned_at.wall_ms, local_wall_now_ms,
+            "cache LWW HLC MUST use local wall_now_ms, NOT attacker-controlled created_at"
+        );
+        assert_ne!(
+            entry.learned_at.wall_ms, attacker_hlc.wall_ms,
+            "cache LWW HLC MUST NOT echo the remote far-future timestamp"
+        );
+        assert_eq!(
+            entry.learned_at.device_id, "local-dev",
+            "cache LWW HLC device_id MUST be OUR device_id"
+        );
     }
 
     #[tokio::test]

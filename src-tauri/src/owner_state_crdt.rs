@@ -469,18 +469,57 @@ impl OwnerState {
         pubs.resize(devices.len(), None);
 
         // Zip into Vec<(DeviceIdentityHash, Option<[u8; 64]>)>, sort by
-        // .0, dedup by .0, then split back into two vecs. This is the
-        // one correct way to preserve parallel-vec correspondence
-        // through sort+dedup — naively sorting `devices` and
-        // `device_identity_pubs` independently would shuffle pubs out of
-        // alignment, silently breaking signature lookups in
+        // .0, then walk-and-merge consecutive entries with the same hash.
+        // This is the one correct way to preserve parallel-vec
+        // correspondence through sort+dedup — naively sorting `devices`
+        // and `device_identity_pubs` independently would shuffle pubs out
+        // of alignment, silently breaking signature lookups in
         // `resolve_signed_origin_owner`.
+        //
+        // Merge rule for duplicate-hash entries (same `DeviceIdentityHash`
+        // appearing more than once in the zipped vec):
+        //   - both `None` → `None`.
+        //   - exactly one `Some(pub)` → keep the `Some` (the other side
+        //     was just "known by hash, pub not yet propagated"; merging
+        //     LOSES information if we kept `None` — `dedup_by_key` did
+        //     exactly this and dropped a Some when it followed a None).
+        //   - both `Some(pub)` and equal → keep one.
+        //   - both `Some(pub)` and DIFFERENT → reject as invariant fail.
+        //     A peer claiming two different identity pubs for the same
+        //     `DeviceIdentityHash` is either malicious or a bug in their
+        //     bootstrap path; either way, silently picking one would leak
+        //     a TOCTOU into signature verification.
         let mut zipped: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
             devices.into_iter().zip(pubs).collect();
         zipped.sort_by_key(|(d, _)| *d);
-        zipped.dedup_by_key(|(d, _)| *d);
-        zipped.truncate(MAX_DEVICES_PER_OWNER);
-        let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) = zipped.into_iter().unzip();
+
+        let mut merged: Vec<(DeviceIdentityHash, Option<[u8; 64]>)> =
+            Vec::with_capacity(zipped.len());
+        for (d, p) in zipped {
+            match merged.last_mut() {
+                Some((prev_d, prev_p)) if *prev_d == d => {
+                    // Merge into the existing entry per the rules above.
+                    match (*prev_p, p) {
+                        (None, None) => {}
+                        (None, Some(_)) => *prev_p = p,
+                        (Some(_), None) => {}
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(_), Some(_)) => {
+                            return ApplyOutcome::Rejected(RejectionReason::InvariantFail(
+                                format!(
+                                    "owner_device_entry for {:?} has conflicting identity pubs \
+                                     for device {:?}",
+                                    addr, d
+                                ),
+                            ));
+                        }
+                    }
+                }
+                _ => merged.push((d, p)),
+            }
+        }
+        merged.truncate(MAX_DEVICES_PER_OWNER);
+        let (sanitized_devices, sanitized_pubs): (Vec<_>, Vec<_>) = merged.into_iter().unzip();
 
         // LWW guard.
         if let Some(existing) = self.owner_device_cache.devices.get(&addr) {
@@ -2109,8 +2148,13 @@ mod owner_device_cache_tests {
     #[test]
     fn apply_owner_device_update_sort_dedup_keeps_pubs_aligned() {
         // Sanitization MUST maintain parallel-vec correspondence: when
-        // sort+dedup reorders or drops `devices` entries, the matching
+        // sort+merge reorders or collapses `devices` entries, the matching
         // entries in `device_identity_pubs` must follow.
+        //
+        // For the duplicate-hash entry below we pass MATCHING Some pubs
+        // — the merge rule accepts equal Somes (the "two replicas
+        // converged on the same pub" case). Conflicting Somes are
+        // covered by `apply_owner_device_update_rejects_conflicting_some_pubs`.
         let mut state = OwnerState::default();
         let owner = OwnerAddr([1; 16]);
         // Unsorted + duplicate input.
@@ -2118,13 +2162,13 @@ mod owner_device_cache_tests {
             DeviceIdentityHash([0xa3; 16]), // index 0 → pub 0
             DeviceIdentityHash([0xa1; 16]), // index 1 → pub 1
             DeviceIdentityHash([0xa2; 16]), // index 2 → pub 2
-            DeviceIdentityHash([0xa1; 16]), // index 3 → pub 3 (DUPLICATE — dedup keeps one)
+            DeviceIdentityHash([0xa1; 16]), // index 3 → pub 3 (DUPLICATE — merge collapses)
         ];
         let pubs = vec![
             Some([0x33u8; 64]), // for [0xa3; 16]
             Some([0x11u8; 64]), // for [0xa1; 16] (first occurrence)
             Some([0x22u8; 64]), // for [0xa2; 16]
-            Some([0x99u8; 64]), // for [0xa1; 16] (duplicate — should be dropped along with its device)
+            Some([0x11u8; 64]), // for [0xa1; 16] (duplicate, MATCHING — merge accepts)
         ];
         let learned_at = Hlc {
             wall_ms: 100,
@@ -2135,7 +2179,7 @@ mod owner_device_cache_tests {
         state.apply_owner_device_update(owner, devices, pubs, learned_at);
         let entry = state.owner_device_cache.devices.get(&owner).unwrap();
 
-        // Sorted ascending by hash, deduped to 3 unique devices.
+        // Sorted ascending by hash, merged to 3 unique devices.
         assert_eq!(
             entry.devices,
             vec![
@@ -2145,13 +2189,98 @@ mod owner_device_cache_tests {
             ]
         );
         // Parallel pubs must match the (sorted) hash order.
-        // Note: which of the two duplicate-hash pubs survives is an
-        // implementation choice (Vec::dedup_by drops the SECOND); both
-        // are semantically valid since they're for the same device hash.
         assert_eq!(entry.device_identity_pubs.len(), 3);
         assert_eq!(entry.device_identity_pubs[0], Some([0x11u8; 64])); // for [0xa1; 16]
         assert_eq!(entry.device_identity_pubs[1], Some([0x22u8; 64])); // for [0xa2; 16]
         assert_eq!(entry.device_identity_pubs[2], Some([0x33u8; 64])); // for [0xa3; 16]
+    }
+
+    #[test]
+    fn apply_owner_device_update_merges_some_over_none_on_duplicate() {
+        // Pre-fix bug: `dedup_by_key` kept the FIRST occurrence of a
+        // duplicate hash, so [d1, d1] paired with [None, Some(P)]
+        // dropped the Some. The fix walks-and-merges duplicates,
+        // preferring Some over None regardless of order.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let d1 = DeviceIdentityHash([0xa1; 16]);
+        let p = [0x42u8; 64];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome =
+            state.apply_owner_device_update(owner, vec![d1, d1], vec![None, Some(p)], learned_at);
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.devices, vec![d1]);
+        assert_eq!(
+            entry.device_identity_pubs[0],
+            Some(p),
+            "merge MUST prefer Some over None (regardless of order)"
+        );
+    }
+
+    #[test]
+    fn apply_owner_device_update_merges_some_over_none_reverse_order() {
+        // Reverse-order variant: pubs = [Some(P), None] still preserves
+        // Some after merge. Order independence matters because wire-
+        // order is not constrained by callers; only the post-merge
+        // canonical form is.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let d1 = DeviceIdentityHash([0xa1; 16]);
+        let p = [0x42u8; 64];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome =
+            state.apply_owner_device_update(owner, vec![d1, d1], vec![Some(p), None], learned_at);
+        assert!(matches!(outcome, ApplyOutcome::Inserted));
+        let entry = state.owner_device_cache.devices.get(&owner).unwrap();
+        assert_eq!(entry.devices, vec![d1]);
+        assert_eq!(entry.device_identity_pubs[0], Some(p));
+    }
+
+    #[test]
+    fn apply_owner_device_update_rejects_conflicting_some_pubs() {
+        // Two Some(pub) values on the same DeviceIdentityHash that
+        // disagree is a real invariant violation — silently picking
+        // one would leak a TOCTOU into signature verification. Reject
+        // as InvariantFail.
+        let mut state = OwnerState::default();
+        let owner = OwnerAddr([1; 16]);
+        let d1 = DeviceIdentityHash([0xa1; 16]);
+        let p_a = [0x11u8; 64];
+        let p_b = [0x22u8; 64];
+        let learned_at = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+
+        let outcome = state.apply_owner_device_update(
+            owner,
+            vec![d1, d1],
+            vec![Some(p_a), Some(p_b)],
+            learned_at,
+        );
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("conflicting identity pubs"),
+                    "expected message mentioning conflicting identity pubs, got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(InvariantFail), got {:?}", other),
+        }
+        // No partial state inserted.
+        assert!(!state.owner_device_cache.devices.contains_key(&owner));
     }
 
     // Helper that lets the test pass without naming the public method twice.
