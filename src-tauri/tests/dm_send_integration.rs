@@ -1,6 +1,6 @@
 //! Phase 2 end-to-end test: invoke `send_dm` via the Tauri test harness,
 //! observe OutboxEntry installed in OwnerState, and (via direct
-//! handle_ack) walk it to Complete.
+//! mark_ack_delivered) walk it to Complete.
 //!
 //! This test does NOT cover the real frontend or real Reticulum transport.
 //! It validates that the IPC plumbing (Tauri command registration, NodeState
@@ -89,7 +89,7 @@ async fn send_dm_round_trip_through_dm_outbox() {
     assert_eq!(transport.sends().len(), 1, "drain attempted one send");
 
     // 3. simulate ack arrival
-    assert!(outbox.handle_ack(&mut state, msg_id, bob));
+    assert!(outbox.mark_ack_delivered(&mut state, msg_id, bob));
 
     // 4. assert Complete
     let stored = state.outbox.get(&msg_id).expect("entry still present");

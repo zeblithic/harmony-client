@@ -20,8 +20,8 @@ use crate::dm_crypto::{compute_aad, encrypt_dm_message, DmEncryptError};
 use crate::dm_envelope::MessagePayload;
 use crate::owner_state_crdt::{ApplyOutcome, OwnerState, RejectionReason};
 use crate::owner_state_types::{
-    DeliveryStatus, DeviceIdentityHash, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId,
-    SpaceKind,
+    DeliveryStatus, DeviceIdentityHash, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr,
+    OwnerDeviceCache, SpaceId, SpaceKind,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -385,7 +385,13 @@ impl DmOutbox {
     ///   - recipient not in entry.recipient_owners (forged ack)
     ///
     /// Both mismatches log at warn level; neither mutates state.
-    pub fn handle_ack(
+    ///
+    /// Phase 3b note: this is the post-verification delivery-marking
+    /// primitive that Task 11's `handle_ack` (the inbound DM packet
+    /// dispatcher) calls AFTER signature verification + signed-origin
+    /// resolution. Phase 2 callers (drain integration tests) drive it
+    /// directly because Phase 2 had no signature layer to verify against.
+    pub fn mark_ack_delivered(
         &mut self,
         state: &mut OwnerState,
         entry_id: OutboxEntryId,
@@ -405,7 +411,7 @@ impl DmOutbox {
         }
         let inserted = entry.delivered_to.insert(recipient);
         if inserted {
-            // Re-derive status. is_expired=false because handle_ack is the
+            // Re-derive status. is_expired=false because this is the
             // happy-path mutation; expiration is owned by drain's wall-clock
             // sweep. If drain has already marked Expired, compute_status
             // will preserve Expired only when (a) is_expired is passed true
@@ -601,6 +607,115 @@ impl DmOutbox {
     pub(crate) fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }
+
+    /// Inbound DM packet entry point. Decodes, dispatches by discriminant.
+    ///
+    /// The signature verification happens INSIDE each per-discriminant
+    /// handler (handle_invite uses inline pubkey from invite body;
+    /// handle_cidnotify and handle_ack use `lookup_pubkey_for_device`
+    /// against `OwnerDeviceCache`). Centralizing verification in
+    /// `handle_unicast` would force a generic "first try inline, fallback
+    /// to cache" pattern that's less expressive than per-discriminant
+    /// handling.
+    ///
+    /// Per spec §"Application-signature binding rule", every dispatched
+    /// arm uses the verified `signing_device_hash` from the packet body
+    /// (NOT a payload-controlled owner field) for downstream state
+    /// mutations.
+    pub async fn handle_unicast(
+        &mut self,
+        state: &mut OwnerState,
+        cas: &dyn ContentStore,
+        unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        packet_bytes: Vec<u8>,
+        wall_now_ms: u64,
+    ) -> Result<DrainOutcome, DmReceiveError> {
+        let packet = crate::dm_envelope::decode_packet(&packet_bytes)
+            .map_err(|e| DmReceiveError::Decode(e.to_string()))?;
+
+        match packet {
+            crate::dm_envelope::DmPacket::Invite {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                self.handle_invite(state, signed, signature, &signed_bytes, wall_now_ms)
+                    .await
+            }
+            crate::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                self.handle_cidnotify(
+                    state,
+                    cas,
+                    unicast_send_tx,
+                    signed,
+                    signature,
+                    &signed_bytes,
+                    wall_now_ms,
+                )
+                .await
+            }
+            crate::dm_envelope::DmPacket::Ack {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                self.handle_ack(state, signed, signature, &signed_bytes, wall_now_ms)
+                    .await
+            }
+        }
+    }
+
+    /// STUB — Task 9 implements.
+    pub async fn handle_invite(
+        &mut self,
+        _state: &mut OwnerState,
+        _signed: crate::dm_envelope::DmInviteSigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
+        _wall_now_ms: u64,
+    ) -> Result<DrainOutcome, DmReceiveError> {
+        Err(DmReceiveError::Decode(
+            "Task 9 implements handle_invite".into(),
+        ))
+    }
+
+    /// STUB — Task 10 implements.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_cidnotify(
+        &mut self,
+        _state: &mut OwnerState,
+        _cas: &dyn ContentStore,
+        _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        _signed: crate::dm_envelope::DmCidNotifySigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
+        _wall_now_ms: u64,
+    ) -> Result<DrainOutcome, DmReceiveError> {
+        Err(DmReceiveError::Decode(
+            "Task 10 implements handle_cidnotify".into(),
+        ))
+    }
+
+    /// STUB — Task 11 implements (the Phase 3b version replaces the Phase 2
+    /// `mark_ack_delivered` primitive's role as the public ack entry point;
+    /// `mark_ack_delivered` is retained as the post-verification delivery-
+    /// marking helper that this method will call internally).
+    pub async fn handle_ack(
+        &mut self,
+        _state: &mut OwnerState,
+        _signed: crate::dm_envelope::DmAckSigned,
+        _signature: [u8; 64],
+        _signed_bytes: &[u8],
+        _wall_now_ms: u64,
+    ) -> Result<DrainOutcome, DmReceiveError> {
+        Err(DmReceiveError::Decode(
+            "Task 11 implements handle_ack".into(),
+        ))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -694,6 +809,74 @@ fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
         logical,
         device_id: device_id.to_string(),
     }
+}
+
+/// Resolve a verified signing device → owner. MUST match exactly one OwnerAddr.
+///
+/// Pre-condition: the caller has already verified the signature against
+/// the public key for `signing_device_hash`. This function only does the
+/// device-hash → OwnerAddr lookup, not signature verification.
+///
+/// Returns Err on zero matches (UnknownSigningDevice) or multiple matches
+/// (AmbiguousSigningDevice). Multi-match is reachable via corrupted state
+/// or a malicious cache-poisoning DmInvite that claimed an existing device
+/// hash for a different owner; either way the resolution is not trustworthy
+/// — drop + telemetry.
+///
+/// Uses `binary_search` on `OwnerDeviceEntry::devices`, which is sorted-
+/// ascending-lex per its existing invariant (re-established by
+/// `deserialize_device_identities` on every load — see
+/// `owner_state_types.rs:286-307`).
+#[allow(dead_code)] // Wired in by Tasks 9/10/11 (handle_invite/cidnotify/ack).
+pub(crate) fn resolve_signed_origin_owner(
+    cache: &OwnerDeviceCache,
+    signing_device_hash: DeviceIdentityHash,
+) -> Result<OwnerAddr, DmReceiveError> {
+    let matches: Vec<OwnerAddr> = cache
+        .devices
+        .iter()
+        .filter(|(_, entry)| entry.devices.binary_search(&signing_device_hash).is_ok())
+        .map(|(addr, _)| *addr)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(DmReceiveError::UnknownSigningDevice),
+        _ => Err(DmReceiveError::AmbiguousSigningDevice),
+    }
+}
+
+/// Look up the cached 64-byte combined identity pubs for a known device.
+/// Reads from `OwnerDeviceCache` via the parallel-vec correspondence
+/// between `devices[i]` and `device_identity_pubs[i]` (Task 4).
+///
+/// Returns `Some(identity_pub_bytes)` only if the device hash is in the
+/// cache AND the cache has a `Some(pub)` at the corresponding index.
+/// Returns `None` for any of: device unknown, or device known but
+/// `device_identity_pubs[i] == None` (pre-bootstrap state — handler
+/// treats as `UnknownSigningKey`).
+///
+/// Returns the full 64-byte combined pub (X25519 || Ed25519); the caller
+/// passes this to `dm_signing::verify_dm_packet_signature`, which splits
+/// out the Ed25519 half internally. We must return the full 64 bytes
+/// (not just Ed25519) so `verify_dm_packet_signature` can re-derive the
+/// `signing_device_hash` and confirm the cached pub actually maps to the
+/// hash the body claims (key-substitution defense).
+#[allow(dead_code)] // Wired in by Tasks 10/11 (handle_cidnotify/handle_ack).
+pub(crate) fn lookup_pubkey_for_device(
+    cache: &OwnerDeviceCache,
+    signing_device_hash: DeviceIdentityHash,
+) -> Option<[u8; 64]> {
+    for entry in cache.devices.values() {
+        if let Ok(idx) = entry.devices.binary_search(&signing_device_hash) {
+            if idx < entry.device_identity_pubs.len() {
+                // device_identity_pubs[idx] is Option<[u8; 64]>;
+                // Some → return; None → fall through, no pub cached.
+                return entry.device_identity_pubs[idx];
+            }
+            return None; // device present but pubs vec shorter than expected
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -930,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_ack_updates_delivered_to() {
+    fn mark_ack_delivered_updates_delivered_to() {
         let mut state = OwnerState::default();
         let alice = OwnerAddr([0xaa; 16]);
         let bob = OwnerAddr([0xbb; 16]);
@@ -939,7 +1122,7 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let mut o = DmOutbox::new("dev".into(), alice);
-        let inserted = o.handle_ack(&mut state, entry_id, bob);
+        let inserted = o.mark_ack_delivered(&mut state, entry_id, bob);
 
         assert!(inserted, "first ack inserts");
         let stored = state.outbox.get(&entry_id).unwrap();
@@ -948,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_ack_duplicate_is_idempotent() {
+    fn mark_ack_delivered_duplicate_is_idempotent() {
         let mut state = OwnerState::default();
         let alice = OwnerAddr([0xaa; 16]);
         let bob = OwnerAddr([0xbb; 16]);
@@ -957,14 +1140,103 @@ mod tests {
         install_outbox_entry(&mut state, entry);
 
         let mut o = DmOutbox::new("dev".into(), alice);
-        let first = o.handle_ack(&mut state, entry_id, bob);
-        let second = o.handle_ack(&mut state, entry_id, bob);
+        let first = o.mark_ack_delivered(&mut state, entry_id, bob);
+        let second = o.mark_ack_delivered(&mut state, entry_id, bob);
 
         assert!(first);
         assert!(!second, "duplicate ack returns false");
         let stored = state.outbox.get(&entry_id).unwrap();
         assert_eq!(stored.delivered_to.len(), 1);
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[test]
+    fn resolve_signed_origin_owner_single_match_returns_owner() {
+        use crate::owner_state_types::{OwnerDeviceCache, OwnerDeviceEntry};
+        let mut cache = OwnerDeviceCache::default();
+        cache.devices.insert(
+            OwnerAddr([1; 16]),
+            OwnerDeviceEntry {
+                devices: vec![DeviceIdentityHash([0xa1; 16])],
+                device_identity_pubs: vec![Some([0x11; 64])],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            },
+        );
+        let owner = resolve_signed_origin_owner(&cache, DeviceIdentityHash([0xa1; 16])).unwrap();
+        assert_eq!(owner, OwnerAddr([1; 16]));
+    }
+
+    #[test]
+    fn resolve_signed_origin_owner_no_matches_returns_unknown() {
+        use crate::owner_state_types::OwnerDeviceCache;
+        let cache = OwnerDeviceCache::default();
+        let err = resolve_signed_origin_owner(&cache, DeviceIdentityHash([0xff; 16])).unwrap_err();
+        assert!(matches!(err, DmReceiveError::UnknownSigningDevice));
+    }
+
+    #[test]
+    fn resolve_signed_origin_owner_multi_match_returns_ambiguous() {
+        // Two OwnerAddr entries claiming the same DeviceIdentityHash.
+        // Reachable only via corrupted state or a malicious DmInvite that
+        // asserted an existing device hash for a different owner.
+        // Resolution untrustworthy — drop with telemetry.
+        use crate::owner_state_types::{OwnerDeviceCache, OwnerDeviceEntry};
+        let mut cache = OwnerDeviceCache::default();
+        let shared = DeviceIdentityHash([0xa1; 16]);
+        cache.devices.insert(
+            OwnerAddr([1; 16]),
+            OwnerDeviceEntry {
+                devices: vec![shared],
+                device_identity_pubs: vec![Some([0x11; 64])],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            },
+        );
+        cache.devices.insert(
+            OwnerAddr([2; 16]),
+            OwnerDeviceEntry {
+                devices: vec![shared], // same hash claimed by a different owner
+                device_identity_pubs: vec![Some([0x22; 64])],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            },
+        );
+        let err = resolve_signed_origin_owner(&cache, shared).unwrap_err();
+        assert!(matches!(err, DmReceiveError::AmbiguousSigningDevice));
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_invalid_packet_returns_decode_error() {
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([0xff; 16]));
+        let cas = InMemoryStub::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        // Unknown discriminant 0xff with enough trailing bytes to clear the
+        // TooShortForSignature gate (1 body byte + 64 signature bytes). The
+        // TooShortForSignature gate has its own dm_envelope test; this test
+        // exercises the unknown-discriminant drop path.
+        let mut padded = vec![0xff_u8]; // unknown discriminant
+        padded.extend(std::iter::repeat_n(0_u8, 65)); // 1 byte body + 64 byte sig
+
+        let err = outbox
+            .handle_unicast(&mut state, &cas, &tx, padded, 100)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::Decode(_)),
+            "expected Decode error from unknown discriminant, got {err:?}"
+        );
     }
 
     fn entry_with_age(id: u8, recipients: Vec<OwnerAddr>, created_wall_ms: u64) -> OutboxEntry {
@@ -1005,8 +1277,9 @@ mod tests {
         assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
 
         // Now simulate the ack arriving (Phase 3b will route this from
-        // handle_unicast's DmAck arm; Phase 2 callers do it directly).
-        let inserted = o.handle_ack(&mut state, entry_id, bob);
+        // handle_unicast's DmAck arm via mark_ack_delivered; Phase 2 callers
+        // do it directly).
+        let inserted = o.mark_ack_delivered(&mut state, entry_id, bob);
         assert!(inserted);
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
