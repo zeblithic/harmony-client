@@ -228,6 +228,54 @@ impl DmTransport for RuntimeUnicastTransport {
     }
 }
 
+/// Production `DestinationResolver` (ZEB-227 Phase 3b Task 11). Reads
+/// the recipient's device list from `OwnerDeviceCache` via `try_lock`
+/// to avoid the lock-during-await deadlock chain that Phase 2 hit (and
+/// fixed) for the drain block in event_loop.
+///
+/// On lock contention, returns `Vec::new()` — the transport surfaces
+/// this as `TransportError::Transient` and the drain retries on the
+/// next tick. Better to defer 250ms than to block the
+/// transport-send path on the OwnerState lock during cas_op channel
+/// processing (the original Phase 2 deadlock chain).
+///
+/// `compute_dm_destination_hash` (Task 10) maps each cached
+/// `DeviceIdentityHash` to its 16-byte Reticulum destination hash via
+/// `SHA256(SHA256("harmony.dm")[:10] || device_hash)[:16]`.
+pub struct OwnerDeviceCacheResolver {
+    state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+}
+
+impl OwnerDeviceCacheResolver {
+    pub fn new(state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl DestinationResolver for OwnerDeviceCacheResolver {
+    fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
+        let state = match self.state.try_lock() {
+            Ok(g) => g,
+            // Contention → empty Vec → TransportError::Transient → drain
+            // retries on next tick (mirrors Phase 2 dm_outbox drain
+            // pattern for lock-during-await avoidance).
+            Err(_) => return Vec::new(),
+        };
+        state
+            .owner_device_cache
+            .devices
+            .get(&recipient)
+            .map(|entry| {
+                entry
+                    .devices
+                    .iter()
+                    .map(|d| crate::dm_signing::compute_dm_destination_hash(d.0))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
     last_attempt_wall_ms: u64,
@@ -1036,21 +1084,126 @@ impl DmOutbox {
         Ok(drain_outcome)
     }
 
-    /// STUB — Task 11 implements (the Phase 3b version replaces the Phase 2
-    /// `mark_ack_delivered` primitive's role as the public ack entry point;
-    /// `mark_ack_delivered` is retained as the post-verification delivery-
-    /// marking helper that this method will call internally).
+    /// Inbound `DmAck` handler — Phase 3b receive path for the sender side.
+    ///
+    /// Per ZEB-216 spec §"Application-signature binding rule" + Flow 3:
+    ///   1. Look up signing pubkey via `lookup_pubkey_for_device`. None →
+    ///      `UnknownSigningKey` (pre-bootstrap state — drop, telemetry).
+    ///      Verify signature via `dm_signing::verify_dm_packet_signature`
+    ///      (key-substitution defense + Ed25519 verify).
+    ///   2. `resolve_signed_origin_owner(cache, signing_device_hash)` →
+    ///      `resolved_owner` (UnknownSigningDevice / AmbiguousSigningDevice
+    ///      drop on degenerate cache states).
+    ///   3. `signed.ack_from_owner_addr ?= resolved_owner` — drop
+    ///      `OwnerFieldMismatch` on cache-poisoning.
+    ///   4. Look up the OutboxEntry by `(space_id, message_cid)`. Missing →
+    ///      `OutboxEntryNotFound` (stale ack from before app restart, or
+    ///      ack for an entry already swept).
+    ///   5. Verify `resolved_owner ∈ entry.recipient_owners` —
+    ///      `AckFromNonRecipient` (forged-ack regression).
+    ///   6. Refresh OwnerDeviceCache with `signed.ack_from_devices` and
+    ///      our newly-verified pubkey for the signer at the matching index.
+    ///      Rejected outcome ignored — our cache may be fresher.
+    ///   7. Call `mark_ack_delivered` to mutate `delivered_to`, recompute
+    ///      `delivery_status`, and clear in-flight/backoff. Push into
+    ///      `DrainOutcome.newly_delivered` if newly delivered (caller
+    ///      emits `dm-delivered` IPC). `mark_ack_delivered` already calls
+    ///      the CRDT `apply_outbox` path indirectly via direct mutation
+    ///      with status recomputation — no separate apply needed.
     pub async fn handle_ack(
         &mut self,
-        _state: &mut OwnerState,
-        _signed: crate::dm_envelope::DmAckSigned,
-        _signature: [u8; 64],
-        _signed_bytes: &[u8],
-        _wall_now_ms: u64,
+        state: &mut OwnerState,
+        signed: crate::dm_envelope::DmAckSigned,
+        signature: [u8; 64],
+        signed_bytes: &[u8],
+        wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        Err(DmReceiveError::Decode(
-            "Task 11 implements handle_ack".into(),
-        ))
+        // Step 1: look up signing pubkey + verify signature.
+        let identity_pub =
+            lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+                .ok_or(DmReceiveError::UnknownSigningKey)?;
+        crate::dm_signing::verify_dm_packet_signature(
+            signed_bytes,
+            &signature,
+            &identity_pub,
+            signed.signing_device_hash,
+        )?;
+
+        // Step 2: resolve signing_device_hash → OwnerAddr.
+        let resolved_owner =
+            resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+
+        // Step 3: verify ack_from_owner_addr matches the resolved owner.
+        // Drops cache-poisoning attempts where a peer claims an
+        // ack_from_owner_addr that doesn't agree with the cryptographically-
+        // authenticated source.
+        if signed.ack_from_owner_addr != resolved_owner {
+            return Err(DmReceiveError::OwnerFieldMismatch);
+        }
+
+        // Step 4: find the OutboxEntry by (space_id, message_cid). The
+        // outbox is keyed by OutboxEntryId (a fresh ULID minted at send
+        // time), so we iterate to locate the match. Missing entry =
+        // stale ack from before app restart, or ack for an entry already
+        // swept — drop with telemetry.
+        let entry_id = state
+            .outbox
+            .iter()
+            .find(|(_, e)| e.space_id == signed.space_id && e.message_cid == signed.message_cid)
+            .map(|(id, _)| *id)
+            .ok_or(DmReceiveError::OutboxEntryNotFound)?;
+
+        // Step 5: forged-ack defense — resolved_owner MUST be in the
+        // entry's recipient_owners. A peer NOT on the recipient list cannot
+        // legitimately ack the message; their ack must not advance
+        // delivered_to.
+        let entry_ref = state
+            .outbox
+            .get(&entry_id)
+            .expect("entry_id was just looked up from state.outbox");
+        if !entry_ref.recipient_owners.contains(&resolved_owner) {
+            return Err(DmReceiveError::AckFromNonRecipient);
+        }
+
+        // Step 6: refresh OwnerDeviceCache with ack.ack_from_devices.
+        // Pubs vec: Some(identity_pub) at the signer's index, None at
+        // every other index (Path B post-bootstrap — non-signer devices
+        // remain pubs-less until the next signed packet from each
+        // surfaces them). HLC uses our local wall clock + device_id.
+        let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.ack_from_devices.len()];
+        if let Some(idx) = signed
+            .ack_from_devices
+            .iter()
+            .position(|d| *d == signed.signing_device_hash)
+        {
+            updated_pubs[idx] = Some(identity_pub);
+        }
+        // Ignore the apply outcome — Rejected (StaleHlc) is acceptable
+        // here, our cache may already be fresher than what just arrived.
+        let _ = state.apply_owner_device_update(
+            resolved_owner,
+            signed.ack_from_devices.clone(),
+            updated_pubs,
+            Hlc {
+                wall_ms: wall_now_ms,
+                logical: 0,
+                device_id: self.device_id.clone(),
+            },
+        );
+
+        // Step 7: mutate delivered_to + recompute delivery_status via
+        // mark_ack_delivered (Phase 2's primitive — handles the
+        // delivered_to insert, status recompute (Expired-sticky), and
+        // in_flight/backoff cleanup). Returns true iff this was newly
+        // delivered (not a duplicate). Caller emits dm-delivered IPC for
+        // the entries in newly_delivered.
+        let mut drain_outcome = DrainOutcome::default();
+        if self.mark_ack_delivered(state, entry_id, resolved_owner) {
+            drain_outcome
+                .newly_delivered
+                .push((entry_id, resolved_owner));
+        }
+        Ok(drain_outcome)
     }
 }
 
@@ -2973,5 +3126,253 @@ mod tests {
             message_cid,
         };
         assert!(state.inbox.contains_key(&inbox_key));
+    }
+
+    // ── Phase 3b Task 11: handle_ack tests ──────────────────────────────
+
+    /// Build the standard sender-side ack-receive fixture: self-owner Alice
+    /// (the outbox's self_owner) has previously sent a DM to Bob and the
+    /// OutboxEntry is still Pending. Bob's signing identity is pre-seeded
+    /// into Alice's `OwnerDeviceCache.devices[bob].device_identity_pubs`.
+    /// Returns (state, signed_ack, signature, signed_bytes, outbox_entry_id).
+    #[allow(clippy::type_complexity)]
+    fn build_handle_ack_fixture(
+        alice: OwnerAddr,
+        bob: OwnerAddr,
+        space_id: SpaceId,
+        message_cid: ContentId,
+    ) -> (
+        OwnerState,
+        crate::dm_envelope::DmAckSigned,
+        [u8; 64],
+        Vec<u8>,
+        OutboxEntryId,
+    ) {
+        let mut state = OwnerState::default();
+        let private_bob = harmony_identity::PrivateIdentity::from_seed(&[0x77; 32]);
+        let bob_pub_id = private_bob.public_identity();
+        let bob_identity_pub = bob_pub_id.to_public_bytes();
+        let bob_device_hash = DeviceIdentityHash(bob_pub_id.address_hash);
+
+        // Pre-seed Alice's view of Bob in OwnerDeviceCache (post-bootstrap).
+        state.apply_owner_device_update(
+            bob,
+            vec![bob_device_hash],
+            vec![Some(bob_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            },
+        );
+
+        // Install Alice's pending OutboxEntry — destined to bob.
+        let entry_id = OutboxEntryId([0x77; 16]);
+        let entry = OutboxEntry {
+            id: entry_id,
+            space_id,
+            recipient_owners: vec![bob],
+            message_cid,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+        match state.apply_outbox(entry) {
+            ApplyOutcome::Inserted => {}
+            other => panic!("fixture install failed: {other:?}"),
+        }
+        let _ = alice; // self_owner is used by callers via outbox, not state
+
+        // Build + sign the DmAck packet.
+        let signed = crate::dm_envelope::DmAckSigned {
+            space_id,
+            message_cid,
+            ack_from_owner_addr: bob,
+            ack_from_devices: vec![bob_device_hash],
+            signing_device_hash: bob_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_bob.sign(&signed_bytes);
+
+        (state, signed, signature, signed_bytes, entry_id)
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_ack_updates_outbox_delivered_to() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, signed, signature, signed_bytes, entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let outcome = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .await
+            .expect("happy path returns Ok");
+
+        assert_eq!(
+            outcome.newly_delivered,
+            vec![(entry_id, bob)],
+            "newly_delivered must contain (entry_id, bob) on first ack"
+        );
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.contains(&bob));
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_ack_owner_field_mismatch_drops() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, mut signed, _sig, _bytes, _entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        // Swap ack_from_owner_addr to an attacker. Re-sign with bob's key
+        // so Step 1 (signature verify) passes — Step 3 is the explicit
+        // defense, NOT a downstream signature failure.
+        let attacker = OwnerAddr([0xff; 16]);
+        signed.ack_from_owner_addr = attacker;
+        let private_bob = harmony_identity::PrivateIdentity::from_seed(&[0x77; 32]);
+        let new_signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let new_signature = private_bob.sign(&new_signed_bytes);
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, new_signature, &new_signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::OwnerFieldMismatch),
+            "expected OwnerFieldMismatch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_ack_from_non_recipient_drops() {
+        // resolved_owner is in OwnerDeviceCache but NOT in the
+        // OutboxEntry's recipient_owners list — forged ack from a peer
+        // who wasn't on the recipient list. MUST NOT advance delivered_to.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let mallory = OwnerAddr([0x03; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+
+        // Build the standard fixture (entry's recipient_owners = [bob]).
+        let (mut state, _signed_bob, _sig_bob, _bytes_bob, entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        // Now seed Mallory's identity into the cache too (cache-known but
+        // NOT a legitimate recipient of this OutboxEntry).
+        let private_mallory = harmony_identity::PrivateIdentity::from_seed(&[0x33; 32]);
+        let mallory_pub_id = private_mallory.public_identity();
+        let mallory_identity_pub = mallory_pub_id.to_public_bytes();
+        let mallory_device_hash = DeviceIdentityHash(mallory_pub_id.address_hash);
+        state.apply_owner_device_update(
+            mallory,
+            vec![mallory_device_hash],
+            vec![Some(mallory_identity_pub)],
+            Hlc {
+                wall_ms: 60,
+                logical: 0,
+                device_id: "mallory-dev".into(),
+            },
+        );
+
+        // Mallory crafts an ack and signs it with her own key.
+        let signed = crate::dm_envelope::DmAckSigned {
+            space_id,
+            message_cid,
+            ack_from_owner_addr: mallory,
+            ack_from_devices: vec![mallory_device_hash],
+            signing_device_hash: mallory_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_mallory.sign(&signed_bytes);
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::AckFromNonRecipient),
+            "expected AckFromNonRecipient, got {err:?}"
+        );
+        // delivered_to must still be empty.
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.is_empty());
+        assert!(matches!(stored.delivery_status, DeliveryStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_ack_signature_invalid_drops() {
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let message_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, signed, mut signature, signed_bytes, entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, message_cid);
+
+        // Flip a bit in the signature.
+        signature[0] ^= 0xff;
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::SignatureVerificationFailed),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+        // No mutation to delivered_to.
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(stored.delivered_to.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_unicast_ack_outbox_entry_not_found_drops() {
+        // DmAck for (space_id, message_cid) we never sent — no matching
+        // OutboxEntry. Drop with OutboxEntryNotFound.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let real_cid = ContentId::from_bytes([0xee; 32]);
+        let (mut state, _signed, _sig, _bytes, _entry_id) =
+            build_handle_ack_fixture(alice, bob, space_id, real_cid);
+
+        // Build a DmAck for a DIFFERENT message_cid (one we never sent).
+        let unknown_cid = ContentId::from_bytes([0x99; 32]);
+        let private_bob = harmony_identity::PrivateIdentity::from_seed(&[0x77; 32]);
+        let bob_pub_id = private_bob.public_identity();
+        let bob_device_hash = DeviceIdentityHash(bob_pub_id.address_hash);
+        let signed = crate::dm_envelope::DmAckSigned {
+            space_id,
+            message_cid: unknown_cid,
+            ack_from_owner_addr: bob,
+            ack_from_devices: vec![bob_device_hash],
+            signing_device_hash: bob_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_bob.sign(&signed_bytes);
+
+        let mut outbox = make_outbox_synthetic("alice-dev", alice);
+        let err = outbox
+            .handle_ack(&mut state, signed, signature, &signed_bytes, 500)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::OutboxEntryNotFound),
+            "expected OutboxEntryNotFound, got {err:?}"
+        );
     }
 }

@@ -863,21 +863,36 @@ async fn start_node(
 
                     let self_owner = crate::owner_state_types::OwnerAddr(loaded.state.owner_id);
 
-                    // ZEB-225 Sub-B Phase 2: construct DmOutbox + StubTransport
+                    // ZEB-225 Sub-B Phase 2: construct DmOutbox + transport
                     // alongside SyncEngine. Both share device_id + self_owner
-                    // with the SyncEngine; the StubTransport is the in-process
-                    // Phase 2 stand-in (Phase 3b replaces with a real
-                    // RuntimeAction::SendUnicastToDevice adapter).
+                    // with the SyncEngine.
                     //
-                    // ZEB-227 Phase 3b Task 10: DmOutbox::new now takes a
-                    // signing key + signing_device_hash for the DmAck fan-out
-                    // path in handle_cidnotify. Wire `loaded.device_signing_key`
-                    // and `our_addr_bytes` here as a stopgap — Task 11 swaps
-                    // both to the proper Reticulum-identity signing key once
-                    // the production transport replaces StubTransport. The
-                    // current StubTransport doesn't exercise these fields, so
-                    // any compile-time-correct values suffice for now.
-                    let signing_key_arc = std::sync::Arc::new(loaded.device_signing_key.clone());
+                    // ZEB-227 Phase 3b Task 11: DmOutbox + RuntimeUnicastTransport
+                    // both consume the SAME (signing_key, signing_device_hash)
+                    // pair sourced from the Reticulum identity loaded above.
+                    // The Reticulum identity's `address_hash` IS the
+                    // DeviceIdentityHash that peers cache in OwnerDeviceCache —
+                    // signing with any other key would produce signatures that
+                    // fail verification at the receiver's
+                    // `verify_dm_packet_signature` (key-substitution defense:
+                    // Step 1 derives the device hash from the identity_pub
+                    // and rejects if it doesn't match the wire-claimed hash).
+                    //
+                    // SigningKey extraction: `ed25519.to_private_bytes()`
+                    // returns `[32B X25519_secret][32B Ed25519_secret]` per
+                    // harmony_identity::PrivateIdentity::to_private_bytes
+                    // (identity.rs:308). The Ed25519 secret half occupies
+                    // bytes 32..64 and constructs an ed25519_dalek::SigningKey
+                    // bit-identical to the one PrivateIdentity::sign uses
+                    // internally (verified by sign_dm_packet_matches_private_identity_sign
+                    // in dm_signing.rs).
+                    let ed25519_seed: [u8; 32] = reticulum_identity_bytes
+                        .as_ref()
+                        .expect("reticulum_identity_bytes populated above")[32..64]
+                        .try_into()
+                        .expect("64 - 32 == 32");
+                    let signing_key_arc =
+                        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed25519_seed));
                     let our_signing_device_hash =
                         crate::owner_state_types::DeviceIdentityHash(our_addr_bytes);
                     let outbox = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -885,11 +900,28 @@ async fn start_node(
                             device_id.clone(),
                             self_owner,
                             our_signing_device_hash,
-                            signing_key_arc,
+                            signing_key_arc.clone(),
                         ),
                     ));
+                    // Production transport: RuntimeUnicastTransport pushes
+                    // signed CidNotify packets into unicast_send_tx, which
+                    // event_loop::run translates into
+                    // RuntimeEvent::SendUnicastToDevice. The
+                    // OwnerDeviceCacheResolver does the OwnerAddr →
+                    // device-hash list lookup via try_lock (transient
+                    // failure on contention drives the outbox backoff).
+                    let resolver: std::sync::Arc<dyn crate::dm_outbox::DestinationResolver> =
+                        std::sync::Arc::new(crate::dm_outbox::OwnerDeviceCacheResolver::new(
+                            std::sync::Arc::clone(&crdt_state),
+                        ));
                     let transport: std::sync::Arc<dyn crate::dm_outbox::DmTransport> =
-                        std::sync::Arc::new(crate::dm_outbox::StubTransport::new());
+                        std::sync::Arc::new(crate::dm_outbox::RuntimeUnicastTransport::new(
+                            unicast_send_tx.clone(),
+                            resolver,
+                            self_owner,
+                            our_signing_device_hash,
+                            signing_key_arc,
+                        ));
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
                         std::sync::Arc::clone(&kt),
@@ -1014,6 +1046,15 @@ async fn start_node(
         let dm_outbox_for_loop = dm_outbox_arc.clone();
         let dm_transport_for_loop = dm_transport_arc.clone();
         let crdt_state_for_loop = crdt_state_for_state.clone();
+        // ZEB-227 Path B Task 11: extra handles for the
+        // RuntimeAction::UnicastReceived interception block in event_loop.
+        // cas_handle: handle_cidnotify does a 500ms-timeout cas.get; reuse
+        //   the same RuntimeContentStore the SyncEngine consumes.
+        // unicast_send_tx_for_loop: handle_cidnotify pushes DmAck fan-out
+        //   into the same channel the production transport uses for
+        //   outbound CidNotify. Same channel, both directions push.
+        let cas_handle_for_loop = content_store_for_state.clone();
+        let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -1070,6 +1111,8 @@ async fn start_node(
                         dm_transport_for_loop,
                         crdt_state_for_loop,
                         Some(unicast_send_rx),
+                        cas_handle_for_loop,
+                        unicast_send_tx_for_loop,
                     )
                     .await;
                 });

@@ -143,6 +143,8 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None, // dm_transport — DM outbox not exercised in this test
                     None, // crdt_state — DM outbox not exercised in this test
                     None, // unicast_send_rx — DM transport not exercised in this test
+                    None, // cas_handle — DM transport not exercised in this test
+                    None, // unicast_send_tx — DM transport not exercised in this test
                 )
                 .await;
             });
@@ -389,6 +391,8 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None, // dm_transport — DM outbox not exercised in this test
                     None, // crdt_state — DM outbox not exercised in this test
                     None, // unicast_send_rx — DM transport not exercised in this test
+                    None, // cas_handle — DM transport not exercised in this test
+                    None, // unicast_send_tx — DM transport not exercised in this test
                 )
                 .await;
             });
@@ -713,6 +717,8 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None, // dm_transport — DM outbox not exercised in this test
                     None, // crdt_state — DM outbox not exercised in this test
                     None, // unicast_send_rx — DM transport not exercised in this test
+                    None, // cas_handle — DM transport not exercised in this test
+                    None, // unicast_send_tx — DM transport not exercised in this test
                 )
                 .await;
             });
