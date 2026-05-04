@@ -20,11 +20,12 @@ use crate::dm_crypto::{compute_aad, encrypt_dm_message, DmEncryptError};
 use crate::dm_envelope::MessagePayload;
 use crate::owner_state_crdt::{ApplyOutcome, OwnerState, RejectionReason};
 use crate::owner_state_types::{
-    DeliveryStatus, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId, SpaceKind,
+    DeliveryStatus, DeviceIdentityHash, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr, SpaceId,
+    SpaceKind,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub type MessageId = OutboxEntryId;
 
@@ -112,6 +113,118 @@ impl DmTransport for StubTransport {
             .outcomes
             .remove(&(entry.id, recipient))
             .unwrap_or(Ok(()))
+    }
+}
+
+/// Payload pushed by `RuntimeUnicastTransport` into the event-loop's
+/// outbound channel. Task 7 wires the receiver into `event_loop` which
+/// translates each request into `RuntimeEvent::SendUnicastToDevice` for
+/// `NodeRuntime`. Per-destination FIFO + cross-destination best-effort
+/// ordering inherits from ZEB-226's runtime.
+#[derive(Debug, Clone)]
+pub struct UnicastSendRequest {
+    pub destination_hash: [u8; 16],
+    pub packet: Vec<u8>,
+}
+
+/// Strategy for mapping a recipient `OwnerAddr` to the list of 16-byte
+/// destination hashes we should fan-out to. Production impl
+/// (`OwnerDeviceCacheResolver`, lands in Task 11) reads
+/// `OwnerDeviceCache`; tests use `StaticDestResolver` to isolate the
+/// transport's mechanics from CRDT state.
+///
+/// May return an empty Vec — caller treats that as a transient error
+/// (no known devices) so the outbox backoff drives a future retry once
+/// Flow A propagates the missing OwnerDeviceCache entry.
+pub trait DestinationResolver: Send + Sync {
+    fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]>;
+}
+
+/// Production `DmTransport` adapter (ZEB-227 Phase 3b). Per `send`:
+///
+/// 1. Resolve the recipient `OwnerAddr` → list of destination hashes
+///    via the injected `DestinationResolver`.
+/// 2. Build a `DmCidNotifySigned` whose `signing_device_hash` is our
+///    device's identity hash (single-device `sender_devices` for Phase
+///    3b — cross-device piggyback grows automatically as Flow A
+///    propagates more entries; see spec §"Public-key storage on
+///    OwnerDeviceCache").
+/// 3. Sign + canonical-CBOR-encode via
+///    `dm_envelope::build_signed_cidnotify` + `encode_packet`.
+/// 4. Push one `UnicastSendRequest` per destination hash into `tx`,
+///    which the event-loop drains and forwards to `NodeRuntime`.
+///
+/// `DmInvite` outbound is Phase 4's `add_space` IPC for DM kinds
+/// (spec Flow 1). `DmAck` outbound is built directly by the receive-side
+/// `handle_cidnotify` (Task 10) — it bypasses `DmTransport::send`
+/// because acks are not tied to an `OutboxEntry` retry loop.
+pub struct RuntimeUnicastTransport {
+    tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+    resolver: Arc<dyn DestinationResolver>,
+    self_owner: OwnerAddr,
+    our_signing_device_hash: DeviceIdentityHash,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+}
+
+impl RuntimeUnicastTransport {
+    pub fn new(
+        tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        resolver: Arc<dyn DestinationResolver>,
+        self_owner: OwnerAddr,
+        our_signing_device_hash: DeviceIdentityHash,
+        signing_key: Arc<ed25519_dalek::SigningKey>,
+    ) -> Self {
+        Self {
+            tx,
+            resolver,
+            self_owner,
+            our_signing_device_hash,
+            signing_key,
+        }
+    }
+}
+
+#[async_trait]
+impl DmTransport for RuntimeUnicastTransport {
+    async fn send(&self, entry: &OutboxEntry, recipient: OwnerAddr) -> Result<(), TransportError> {
+        let destinations = self.resolver.resolve(recipient);
+        if destinations.is_empty() {
+            // Empty resolver result is transient: Flow A may surface the
+            // recipient's devices on the next OwnerState sync round. The
+            // outbox's exponential backoff handles the retry cadence.
+            return Err(TransportError::Transient(format!(
+                "no known devices for recipient {recipient:?}"
+            )));
+        }
+
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id: entry.space_id,
+            message_cid: entry.message_cid,
+            sender_owner_addr: self.self_owner,
+            // Phase 3b: single-device sender_devices (just the signer).
+            // Cross-device piggyback (sender lists ALL bound devices) is
+            // a documented follow-up — see spec §"Public-key storage on
+            // OwnerDeviceCache".
+            sender_devices: vec![self.our_signing_device_hash],
+            signing_device_hash: self.our_signing_device_hash,
+        };
+        let packet = crate::dm_envelope::build_signed_cidnotify(signed, &self.signing_key)
+            .map_err(|e| TransportError::Permanent(format!("build_signed_cidnotify: {e}")))?;
+        let wire = crate::dm_envelope::encode_packet(&packet)
+            .map_err(|e| TransportError::Permanent(format!("encode_packet: {e}")))?;
+
+        for destination_hash in destinations {
+            self.tx
+                .send(UnicastSendRequest {
+                    destination_hash,
+                    packet: wire.clone(),
+                })
+                .await
+                .map_err(|e| {
+                    TransportError::Transient(format!("event-loop channel closed: {e}"))
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -1169,6 +1282,154 @@ mod tests {
         assert!(
             matches!(err, SendDmError::NoRecipients(id) if id == space_id),
             "expected NoRecipients, got {err:?}"
+        );
+    }
+
+    /// Test-only `DestinationResolver` impl with a fixed lookup table.
+    /// Mirrors the production `OwnerDeviceCacheResolver` (Task 11) shape
+    /// without depending on CRDT state — keeps the transport unit tests
+    /// hermetic.
+    struct StaticDestResolver {
+        table: HashMap<OwnerAddr, Vec<[u8; 16]>>,
+    }
+
+    impl StaticDestResolver {
+        fn new(entries: impl IntoIterator<Item = (OwnerAddr, Vec<[u8; 16]>)>) -> Self {
+            Self {
+                table: entries.into_iter().collect(),
+            }
+        }
+    }
+
+    impl DestinationResolver for StaticDestResolver {
+        fn resolve(&self, recipient: OwnerAddr) -> Vec<[u8; 16]> {
+            self.table.get(&recipient).cloned().unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_unicast_transport_send_pushes_signed_event_into_channel() {
+        // Synthetic identity_pub trick (per dm_signing.rs's empirical
+        // finding that ed25519-dalek doesn't strict-check point membership
+        // at construction): all-zero X25519 half + real Ed25519 half.
+        // The address_hash for this synthetic input matches what
+        // verify_dm_packet_signature will compute, so the
+        // SigningKeyDoesNotMatchDeviceHash check passes; the Ed25519
+        // signature still verifies under the real verifying key.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+        let signing_pub = signing_key.verifying_key();
+        let mut identity_pub = [0u8; 64];
+        identity_pub[32..].copy_from_slice(signing_pub.as_bytes());
+        let our_device = crate::dm_signing::derive_device_hash_from_identity_pub(&identity_pub)
+            .expect("synthetic identity_pub should be valid");
+
+        let recipient = OwnerAddr([1; 16]);
+        let dest_hash = [0xd1u8; 16];
+        let resolver = std::sync::Arc::new(StaticDestResolver::new([(recipient, vec![dest_hash])]));
+
+        let transport = RuntimeUnicastTransport::new(
+            tx,
+            resolver,
+            OwnerAddr([0xff; 16]),
+            our_device,
+            signing_key.clone(),
+        );
+
+        let entry = OutboxEntry {
+            id: OutboxEntryId([0xab; 16]),
+            space_id: SpaceId([0xcc; 16]),
+            recipient_owners: vec![recipient],
+            message_cid: ContentId::from_bytes([0xee; 32]),
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+
+        transport
+            .send(&entry, recipient)
+            .await
+            .expect("send must succeed");
+
+        let req = rx.recv().await.expect("channel produced no event");
+        assert_eq!(req.destination_hash, dest_hash);
+
+        // Decode wire packet → confirm shape + signature verifies.
+        let packet = crate::dm_envelope::decode_packet(&req.packet).unwrap();
+        match packet {
+            crate::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => {
+                assert_eq!(signed.space_id, SpaceId([0xcc; 16]));
+                assert_eq!(signed.message_cid, ContentId::from_bytes([0xee; 32]));
+                assert_eq!(signed.sender_owner_addr, OwnerAddr([0xff; 16]));
+                assert_eq!(signed.signing_device_hash, our_device);
+                assert_eq!(
+                    signed.sender_devices,
+                    vec![our_device],
+                    "Phase 3b ships single-device sender_devices"
+                );
+                // Signature must verify against our identity_pub +
+                // claimed device hash.
+                assert!(crate::dm_signing::verify_dm_packet_signature(
+                    &signed_bytes,
+                    &signature,
+                    &identity_pub,
+                    our_device,
+                )
+                .is_ok());
+            }
+            other => panic!("expected CidNotify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_unicast_transport_no_known_devices_is_transient_error() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let resolver = std::sync::Arc::new(StaticDestResolver::new(std::iter::empty::<(
+            OwnerAddr,
+            Vec<[u8; 16]>,
+        )>()));
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+        // Arbitrary — resolver returns empty before the device hash is
+        // ever consulted on the send path.
+        let our_device = DeviceIdentityHash([0xaa; 16]);
+
+        let transport = RuntimeUnicastTransport::new(
+            tx,
+            resolver,
+            OwnerAddr([0xff; 16]),
+            our_device,
+            signing_key,
+        );
+
+        let entry = OutboxEntry {
+            id: OutboxEntryId([0xab; 16]),
+            space_id: SpaceId([0xcc; 16]),
+            recipient_owners: vec![OwnerAddr([1; 16])],
+            message_cid: ContentId::from_bytes([0xee; 32]),
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            delivered_to: BTreeSet::new(),
+            delivery_status: DeliveryStatus::Pending,
+        };
+
+        let err = transport
+            .send(&entry, OwnerAddr([1; 16]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TransportError::Transient(_)),
+            "empty resolver must surface as Transient (drives backoff retry), got {err:?}"
         );
     }
 }
