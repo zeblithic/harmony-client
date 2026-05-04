@@ -423,6 +423,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         hlc_tracker,
         dm_device_id,
         dm_self_owner,
+        content_store,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -459,6 +460,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.hlc_tracker.take(),
             guard.dm_device_id.take(),
             guard.dm_self_owner.take(),
+            guard.content_store.take(),
         )
     };
 
@@ -490,6 +492,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // clippy::dropping_copy_types (the binding goes out of scope here
     // either way; the explicit binding is just for documentation).
     let _ = dm_self_owner;
+    drop(content_store);
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -628,6 +631,13 @@ async fn start_node(
         old_voice_channel,
         old_pairing_handle,
         old_sync_engine,
+        old_dm_outbox,
+        old_dm_transport,
+        old_crdt_state,
+        old_hlc_tracker,
+        old_dm_device_id,
+        old_dm_self_owner,
+        old_content_store,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
         let tup = (
@@ -642,6 +652,18 @@ async fn start_node(
             guard.voice_channel_tx.take(),
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
+            // ZEB-225 Sub-B Phase 2: take + drop the per-identity DM
+            // handles so a restart doesn't carry stale Arc<DmOutbox> /
+            // Arc<DmTransport> / Arc<OwnerState> / Arc<HlcTracker> /
+            // Arc<dyn ContentStore> against the prior identity into the
+            // new generation. Mirrors stop_inner's cleanup.
+            guard.dm_outbox.take(),
+            guard.dm_transport.take(),
+            guard.crdt_state.take(),
+            guard.hlc_tracker.take(),
+            guard.dm_device_id.take(),
+            guard.dm_self_owner.take(),
+            guard.content_store.take(),
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
@@ -661,6 +683,18 @@ async fn start_node(
     drop(old_follow);
     drop(old_voice);
     drop(old_voice_channel);
+    // ZEB-225 Sub-B Phase 2: drop the previous identity's DM handles so
+    // the new SyncEngine/DmOutbox built below sees no stale Arc clones
+    // outside the new NodeState. Same drop-order rationale as stop_inner.
+    drop(old_dm_outbox);
+    drop(old_dm_transport);
+    drop(old_crdt_state);
+    drop(old_hlc_tracker);
+    drop(old_dm_device_id);
+    // OwnerAddr is Copy → use `let _` instead of drop() to satisfy
+    // clippy::dropping_copy_types.
+    let _ = old_dm_self_owner;
+    drop(old_content_store);
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping

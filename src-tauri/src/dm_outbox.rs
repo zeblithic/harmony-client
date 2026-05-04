@@ -190,6 +190,14 @@ impl DmOutbox {
 
         // 2. Derive recipient_owners — exclude self, dedup, sort.
         let recipients = derive_recipients(&space.members, &self.self_owner);
+        // Reject self-only DMs up front. Without this we'd mint an
+        // OutboxEntry with `recipient_owners: vec![]`, which drain() never
+        // sends to anyone AND which the expiration sweep would mark
+        // Complete (vacuous all-acked truth) instead of Expired — so the
+        // entry sits forever doing nothing.
+        if recipients.is_empty() {
+            return Err(SendDmError::NoRecipients(space_id));
+        }
 
         // 3. Build MessagePayload + HLC stamp.
         let sent_at = next_hlc(prev_hlc, wall_now_ms, &self.device_id);
@@ -345,13 +353,25 @@ impl DmOutbox {
                 self.in_flight.remove(&(entry_id, recipient));
                 match result {
                     Ok(()) => {
-                        // Real ack lives in the future. Clear backoff so a
-                        // subsequent retry (if no ack arrives) starts at base.
-                        // Phase 3b can refine to keep backoff escalating until
-                        // the ack lands; Phase 2's stub-or-test pattern means
-                        // an Ok send is always followed by either a manual
-                        // handle_ack or an explicit Err re-seed.
-                        self.backoff.remove(&(entry_id, recipient));
+                        // Throttle post-Ok retries until the ack arrives.
+                        // Without this, `is_due` returns true on the very next
+                        // 250ms tick (no backoff entry → first attempt),
+                        // producing tick-rate retry until handle_ack fires —
+                        // ~4 sends/sec/recipient against the production
+                        // StubTransport (which always returns Ok and has an
+                        // unbounded sends Vec). Treat "sent but ack pending"
+                        // as failure_count=1 so the existing exponential
+                        // backoff applies (5s base × 2^(n-1), 5min cap).
+                        // First post-Ok retry waits 5s; if still no ack the
+                        // next waits 10s, etc. The 30-day expiration sweep
+                        // is the eventual terminator.
+                        self.backoff.insert(
+                            (entry_id, recipient),
+                            AttemptState {
+                                last_attempt_wall_ms: wall_now_ms,
+                                failure_count: 1,
+                            },
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(?entry_id, ?recipient, error = %e, "transport.send failed; bumping backoff");
@@ -390,11 +410,38 @@ impl DmOutbox {
                 }
             }
         }
-        // 4. Cleanup backoff/in_flight for expired entries.
-        for id in &expired {
-            self.backoff.retain(|(e, _), _| e != id);
-            self.in_flight.retain(|(e, _)| e != id);
-        }
+        // 4. Cleanup backoff/in_flight for entries no longer Pending/Partial.
+        // Covers expired (just marked above), Complete via local handle_ack
+        // (already cleaned in handle_ack but defensive double-cleanup is
+        // cheap), AND Complete via CRDT merge (a peer device's ack
+        // replicated through owner-state sync — handle_ack never fires for
+        // that path so the previous narrow expired-only sweep leaked
+        // forever). Entries whose underlying OutboxEntry is gone
+        // (shouldn't happen in Phase 2; defensive) are also cleaned.
+        self.backoff.retain(|(entry_id, _), _| {
+            state
+                .outbox
+                .get(entry_id)
+                .map(|e| {
+                    matches!(
+                        e.delivery_status,
+                        DeliveryStatus::Pending | DeliveryStatus::Partial
+                    )
+                })
+                .unwrap_or(false)
+        });
+        self.in_flight.retain(|(entry_id, _)| {
+            state
+                .outbox
+                .get(entry_id)
+                .map(|e| {
+                    matches!(
+                        e.delivery_status,
+                        DeliveryStatus::Pending | DeliveryStatus::Partial
+                    )
+                })
+                .unwrap_or(false)
+        });
         outcome.newly_expired = expired;
         outcome
     }
@@ -411,6 +458,16 @@ impl DmOutbox {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn backoff_len(&self) -> usize {
+        self.backoff.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -421,6 +478,8 @@ pub enum SendDmError {
     InvalidSpaceKind(SpaceId, &'static str),
     #[error("space {0:?} has no content_key (DM/group-dm invariant violated)")]
     MissingContentKey(SpaceId),
+    #[error("space {0:?} has no remote recipients (members contains only self)")]
+    NoRecipients(SpaceId),
     #[error("encryption failed: {0}")]
     Encrypt(#[from] DmEncryptError),
     #[error("CAS write failed: {0}")]
@@ -869,5 +928,138 @@ mod tests {
         );
         assert_eq!(unique.len(), 2, "exactly one send per recipient");
         let _ = entry_id;
+    }
+
+    #[tokio::test]
+    async fn drain_throttles_post_ok_send_until_backoff_elapses() {
+        // Fix A regression: the prior `Ok(()) => self.backoff.remove(...)`
+        // branch let `is_due` return true on the very next 250ms tick,
+        // producing tick-rate retry until handle_ack arrived. Verify the
+        // post-Ok throttle: install entry, drain at t=0 (1 send), drain
+        // 1s later (no new send — under 5s base), drain 6s later (one
+        // more send — past 5s base).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 0);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+
+        let _ = o.drain(&mut state, &transport, 0).await;
+        assert_eq!(transport.sends().len(), 1, "first attempt fires at t=0");
+
+        let _ = o.drain(&mut state, &transport, 1_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            1,
+            "second attempt at t=1s skipped — under 5s base backoff"
+        );
+
+        let _ = o.drain(&mut state, &transport, 6_000).await;
+        assert_eq!(
+            transport.sends().len(),
+            2,
+            "third attempt at t=6s fires — past 5s base backoff"
+        );
+        let _ = entry_id;
+    }
+
+    #[tokio::test]
+    async fn drain_cleans_backoff_for_complete_via_crdt_merge() {
+        // Fix C regression: an entry can transition Pending → Complete
+        // via CRDT replication (another device acks, owner-state sync
+        // merges the OutboxEntry with delivered_to populated). In that
+        // path handle_ack is never called locally, so the prior
+        // expired-only cleanup leaked the (entry, recipient) backoff
+        // and in_flight entries forever. Verify the broader sweep cleans
+        // them after a CRDT-merge completion.
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let transport = StubTransport::new();
+        let mut o = DmOutbox::new("dev".into(), alice);
+
+        let _ = o.drain(&mut state, &transport, 2_000).await;
+        assert_eq!(transport.sends().len(), 1);
+        assert_eq!(
+            o.backoff_len(),
+            1,
+            "post-Ok throttle inserted backoff entry (Fix A)"
+        );
+
+        // Simulate a peer device's ack replicating through CRDT merge:
+        // mutate delivered_to + delivery_status directly (NOT via
+        // handle_ack — that path already cleans up).
+        {
+            let stored = state.outbox.get_mut(&entry_id).unwrap();
+            stored.delivered_to.insert(bob);
+            stored.delivery_status = DeliveryStatus::Complete;
+        }
+
+        let _ = o.drain(&mut state, &transport, 10_000).await;
+        assert_eq!(
+            o.backoff_len(),
+            0,
+            "drain cleaned backoff for Complete-via-CRDT entry"
+        );
+        assert_eq!(
+            o.in_flight_len(),
+            0,
+            "drain cleaned in_flight for Complete-via-CRDT entry"
+        );
+        assert_eq!(
+            transport.sends().len(),
+            1,
+            "no further sends — entry is Complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_self_only_dm_rejects() {
+        // Fix D regression: a Space whose members reduces (via
+        // `derive_recipients`'s self-exclusion) to an empty list would
+        // have minted an OutboxEntry with `recipient_owners: []`, which
+        // drain never sent and the expiration sweep would mark Complete
+        // via vacuous all-acked truth (`all(|r| ...)` over empty set).
+        //
+        // The DM invariant in `Space::canonical_invariants` forbids
+        // single-member spaces, so we bypass canonicalization by
+        // inserting directly into `state.spaces`. This mirrors the
+        // shape of a Space that's been corrupted or where `self_owner`
+        // is the only remaining valid member (defensive fallback).
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
+        let mut sp = make_dm_space(7, vec![alice, OwnerAddr([0x02; 16])]);
+        // Mutate to single-member after construction; insert directly to
+        // skip apply_space_with_canonicalization's invariant check.
+        sp.members = vec![alice];
+        let space_id = sp.id;
+        state.spaces.insert(space_id, sp);
+
+        let cas = InMemoryStub::default();
+        let mut o = DmOutbox::new("dev".into(), alice);
+        let err = o
+            .send_dm(
+                &mut state,
+                &cas,
+                space_id,
+                b"x".to_vec(),
+                "text/plain".into(),
+                1_000,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendDmError::NoRecipients(id) if id == space_id),
+            "expected NoRecipients, got {err:?}"
+        );
     }
 }
