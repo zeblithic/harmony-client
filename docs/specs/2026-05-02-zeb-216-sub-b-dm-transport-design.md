@@ -34,13 +34,14 @@ Out of scope (deferred):
 
 Same as ZEB-219 plus transport-layer concerns:
 - **CAS observer**: encrypted blobs only; no plaintext leak even with full CID inventory
-- **Reticulum link observer**: link-layer ECDH between device identities encrypts wire payloads; observer sees identity_hash → identity_hash + length, not contents
-- **Sender impersonation across owners**: receive-time `verify_sender_binding` check blocks impersonation by comparing `MessagePayload.sender` against the link-origin OwnerAddr resolved from `from_identity_hash`
+- **Wire observer**: harmony-client sends DM packets as raw Reticulum Type1 Data packets (no Reticulum link establishment — see §"Application-signature binding rule" for why). Observer sees `(destination_hash, packet_bytes)` — destination_hash leaks who is being addressed, packet_bytes are CBOR-encoded DM metadata + signature (not encrypted at the wire layer; the *message body* is end-to-end encrypted in CAS via `content_key`). DM body confidentiality comes from the CAS-layer ChaCha20-Poly1305 encryption, not from a transport link.
+- **Sender impersonation across owners**: receive-time `verify_sender_binding` check (encrypted-payload-layer) blocks impersonation by comparing `MessagePayload.sender` against the OwnerAddr resolved from the verified `signing_device_hash` in the Reticulum packet body.
 - **Sender impersonation across own devices**: per-owner CRDT replication boundary makes this structurally impossible — only the owner's own bound devices can write to their owner-state
-- **OwnerDeviceCache poisoning via spoofed payload owner**: blocked by the link-origin binding rule — every cache mutation uses the owner resolved from `from_identity_hash`, never the payload-controlled owner field. Mismatched packets are dropped with telemetry.
-- **Forged DmAck inflating `delivered_to`**: blocked by (a) link-origin binding (ack owner = link origin owner) AND (b) recipient-membership check (resolved owner must be in `OutboxEntry.recipient_owners`).
+- **OwnerDeviceCache poisoning via spoofed payload owner**: blocked by the application-signature binding rule — every cache mutation uses the owner resolved from the cryptographically-verified `signing_device_hash`, never a payload-controlled `sender_owner_addr` field. Mismatched packets are dropped with telemetry.
+- **Forged DmAck inflating `delivered_to`**: blocked by (a) application-signature binding (ack signed by an authenticated device → resolved owner via OwnerDeviceCache) AND (b) recipient-membership check (resolved owner must be in `OutboxEntry.recipient_owners`).
 - **Stale device list**: piggyback refresh on every DM envelope keeps recipient's `OwnerDeviceCache` fresh; cache LWW on `learned_at` HLC
-- **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot run link-origin binding. Trust comes from the out-of-band channel by which the inviter's `(owner_addr, device_identity_hash)` was shared (invite link, QR, library directory listing). UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated. Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
+- **Bootstrap trust on first DmInvite**: receiver has no prior `OwnerDeviceCache` entry for the inviter, so cannot resolve the signing device's public key via cache lookup. Two layers of bootstrap trust: (1) `DmInvite` carries `inviter_signing_pub: [u8; 32]` inline (the inviter's device-Identity Ed25519 verifying key) so signature verification is self-contained; (2) UI MUST surface "Invite from <owner_addr>" with affirmative user acceptance before the cache is updated, anchoring the `(owner_addr, device_identity_hash, signing_pub)` triple in user-mediated trust from the out-of-band channel (invite link, QR, library directory listing). Owner-key signature on DmInvite (UCAN-rooted via ZEB-173 device delegation) is stronger and a deferred future improvement.
+- **Application-signature forgery**: blocked by per-device Ed25519 signing of the canonical CBOR encoding of every Reticulum DM packet body (incl. `signing_device_hash` to prevent key-substitution). Receiver looks up the public key for `signing_device_hash` (via OwnerDeviceCache for post-bootstrap packets, via inline `inviter_signing_pub` for DmInvite), verifies the signature, and uses the verified `signing_device_hash` as `from_identity_hash` for downstream rules. Verification failure → drop with telemetry.
 
 ### DmInvite rejection / decline semantics (v1)
 
@@ -55,7 +56,7 @@ If the receiver has already accepted a previous DmInvite from the same OwnerAddr
 Out of scope:
 - Master-seed compromise of any participant (ZEB-173 fresh-identity flow)
 - Forward secrecy on past messages (ZEB-219 v1 trade-off)
-- Forensic deniability (recipients can prove "Alice sent this" by retaining ciphertext + Alice's link-layer signature)
+- Forensic deniability (recipients can prove "Alice sent this" by retaining ciphertext + Alice's per-device Ed25519 signature on the corresponding DmCidNotify)
 
 ## Phase decomposition
 
@@ -66,7 +67,7 @@ Five-PR rollout. Each PR ships independently green; Phase 3a is a cross-repo com
 | 1 | harmony-client | DM encryption primitives in code: Space struct fields, validate_invariants, dedupe-merge for prior_content_keys, `dm_crypto.rs`, `dm_envelope.rs` types + canonical CBOR | ZEB-219 contract is implemented and tested; no transport, no IPC |
 | 2 | harmony-client | `dm_outbox.rs` skeleton with stub transport; `send_dm` IPC writes encrypted blob to CAS + creates OutboxEntry; drain state machine with backoff + 30-day expiration | DM send works end-to-end against an in-memory transport mock |
 | 3a | harmony-runtime | `RuntimeAction::SendUnicastToDevice { device_identity_hash, payload }` + `RuntimeEvent::UnicastReceived { from_identity_hash, payload }`. Resolves identity_hash → existing tunnel (or initiates) | Companion PR merged + tagged in upstream; harmony-client `[patch]` removed |
-| 3b | harmony-client | Replace stub transport with real harmony-runtime addressed-pipe; wire `UnicastReceived` to inbound demux (CasOp::GetOrFetch + decrypt + sender-binding + InboxEntry); DmAck handling | DMs work end-to-end through real Reticulum transport (still mocked at the RuntimeAction-channel boundary in tests) |
+| 3b | harmony-client (+ harmony companion) | Replace stub transport with real harmony-runtime addressed-pipe (raw Type1 Data via `path_table`, NOT Reticulum links — see §"Application-signature binding rule"); wire `UnicastReceived` to inbound demux (CasOp::Get + decrypt + sender-binding + InboxEntry); per-device Ed25519 signature on every DM packet body; DmAck handling. Companion harmony PR exposes `pub NodeRuntime::register_local_destination` + `lookup_destination_identity` accessors. | DMs work end-to-end through real Reticulum unicast (still mocked at the RuntimeAction-channel boundary in tests) |
 | 4 | harmony-client + frontend | NavService DM/group-DM rendering; DmComposer/DmMessageList/DmCreateDialog Svelte components; `dm-received`/`dm-delivered` IPC event subscriptions; at-17 conversion UX | DMs work in the GUI; manual two-device LAN smoke deferred to follow-up Linear ticket |
 
 ## Architecture
@@ -275,16 +276,24 @@ This is what's ChaCha20-Poly1305-encrypted into the storage_blob written to CAS.
 
 ## Wire format
 
-Reticulum unicast carries one of three packet types. Wire layout: `[u8 discriminant][CBOR-encoded body]`. This mirrors ZEB-219's per-message version-byte pattern (consistent style across the same feature) and lets future packet types add new discriminants without bumping a top-level CBOR schema.
+Reticulum unicast carries one of three packet types. Wire layout per packet:
+
+```
+[u8 discriminant][CBOR-encoded signed body][signature: bstr(64)]
+```
+
+The discriminant byte is excluded from the signed bytes (the signature covers the CBOR body only — discriminant is just a routing tag). The signature is a separate 64-byte CBOR `bstr` appended after the body, NOT a field inside the CBOR map (so the signed body has no chicken-and-egg with computing the signature). This mirrors ZEB-219's per-message version-byte pattern and lets future packet types add new discriminants without bumping a top-level CBOR schema.
 
 | Disc | Type | Direction | Purpose |
 |---|---|---|---|
-| `0x01` | `DmInvite` | inviter → invitee | Space creation: members, content_key, sender's bound-device list |
+| `0x01` | `DmInvite` | inviter → invitee | Space creation: members, content_key, sender's bound-device list, inviter's signing pubkey for bootstrap verification |
 | `0x02` | `DmCidNotify` | sender → recipient devices | New message exists in CAS at this CID; piggybacks sender's current device list |
 | `0x03` | `DmAck` | recipient → sender devices | Receipt confirmation for `(space_id, message_cid)`; piggybacks recipient's current device list |
 
 ```rust
-pub struct DmInvite {
+/// Signed payload (the CBOR-encoded bytes that the signature covers).
+/// Wire packet = [0x01][CBOR(DmInviteSigned)][bstr(64) signature].
+pub struct DmInviteSigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "kn")] pub kind: SpaceKind,            // dm or group-dm
     /// Members of the Space — sorted ascending lex (matches Space::members
@@ -292,71 +301,137 @@ pub struct DmInvite {
     /// CANNOT be used to identify the inviter — `members[0]` is the
     /// lex-smallest OwnerAddr, not the sender.
     #[serde(rename = "me")] pub members: Vec<OwnerAddr>,
-    /// Inviter's OwnerAddr — the sender of this DmInvite. Bootstrap-trusted
-    /// at first contact (cache has no entry yet, so link-origin binding
-    /// can't run). Receiver MUST verify `inviter ∈ members` and
-    /// `sender_devices.contains(from_identity_hash)` as sanity gates,
-    /// then prompt the user before applying any state mutations.
+    /// Inviter's OwnerAddr — the sender of this DmInvite. Receiver MUST
+    /// verify `inviter ∈ members` and `sender_devices.contains(signing_device_hash)`
+    /// as sanity gates, then prompt the user before applying any state mutations.
     #[serde(rename = "iv")] pub inviter: OwnerAddr,
     #[serde(rename = "ck")] pub content_key: DmContentKey,  // bstr(32) on wire, zeroized in memory
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
     #[serde(rename = "ca")] pub created_at: Hlc,
+    /// The DeviceIdentityHash of the device that produced the appended
+    /// signature. MUST be in `sender_devices`. Inside the signed body
+    /// (preventing key-substitution attacks).
+    #[serde(rename = "dh")] pub signing_device_hash: DeviceIdentityHash,
+    /// Inviter's device-Identity Ed25519 verifying key (32 bytes).
+    /// Bootstrap-only on DmInvite: the receiver doesn't yet have an
+    /// OwnerDeviceCache entry for the inviter, so cannot resolve the
+    /// signing public key by lookup. The inviter ships its key inline.
+    /// User-mediated UI acceptance anchors trust per the threat model.
+    #[serde(rename = "sp")] pub inviter_signing_pub: [u8; 32],
 }
 
-pub struct DmCidNotify {
+/// Signed payload for DmCidNotify.
+/// Wire packet = [0x02][CBOR(DmCidNotifySigned)][bstr(64) signature].
+pub struct DmCidNotifySigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
     /// Diagnostic only — receiver MUST verify this matches the owner
-    /// resolved from the inbound `from_identity_hash` via OwnerDeviceCache,
-    /// and drop the packet on mismatch. Authoritative sender identity
-    /// comes from the link origin, not this field.
+    /// resolved from `signing_device_hash` via OwnerDeviceCache, and
+    /// drop the packet on mismatch. Authoritative sender identity comes
+    /// from the verified signature → signing_device_hash → cache lookup.
     #[serde(rename = "so")] pub sender_owner_addr: OwnerAddr,
     #[serde(rename = "sd")] pub sender_devices: Vec<DeviceIdentityHash>,
+    /// The DeviceIdentityHash of the device that produced the appended
+    /// signature. Receiver looks up this device's Ed25519 public key in
+    /// OwnerDeviceCache (or in the bootstrap `inviter_signing_pub` if
+    /// this is the first inbound from a not-yet-cached owner — typically
+    /// only DmInvite hits that path). Inside the signed body.
+    #[serde(rename = "dh")] pub signing_device_hash: DeviceIdentityHash,
 }
 
-pub struct DmAck {
+/// Signed payload for DmAck.
+/// Wire packet = [0x03][CBOR(DmAckSigned)][bstr(64) signature].
+pub struct DmAckSigned {
     #[serde(rename = "si")] pub space_id: SpaceId,
     #[serde(rename = "mc")] pub message_cid: ContentId,
     /// Diagnostic only — receiver MUST verify this matches the owner
-    /// resolved from the inbound `from_identity_hash`, AND that the
-    /// resolved owner is listed in the OutboxEntry's `recipient_owners`.
-    /// Drop the packet on either mismatch.
+    /// resolved from `signing_device_hash`, AND that the resolved owner
+    /// is listed in the OutboxEntry's `recipient_owners`. Drop on
+    /// either mismatch.
     #[serde(rename = "ao")] pub ack_from_owner_addr: OwnerAddr,
     #[serde(rename = "ad")] pub ack_from_devices: Vec<DeviceIdentityHash>,
+    /// As above for DmCidNotify.
+    #[serde(rename = "dh")] pub signing_device_hash: DeviceIdentityHash,
 }
 ```
 
-### Link-origin binding rule (load-bearing, applies to DmCidNotify and DmAck)
+### Public-key storage on OwnerDeviceCache
 
-Both DmCidNotify and DmAck carry payload-controlled owner fields (`sender_owner_addr` / `ack_from_owner_addr`). Without binding to the Reticulum link origin, an attacker on identity_hash *X* could forge a DmCidNotify claiming `sender_owner_addr = Alice` and overwrite Alice's `OwnerDeviceCache` entry with the attacker's devices, or forge a DmAck marking the attacker as a "delivered" recipient on someone else's OutboxEntry.
+To verify signatures from devices already in the cache (every post-bootstrap DmCidNotify and DmAck), the cache must store each device's Ed25519 verifying key alongside its identity hash. Phase 1 stored only `Vec<DeviceIdentityHash>`; Phase 3b extends `OwnerDeviceEntry` to store `Vec<(DeviceIdentityHash, [u8; 32])>` (or split into two parallel sorted vecs to preserve the existing binary-search invariant — exact representation is an implementation detail). The signing pubkey for each device propagates via:
+- `DmInvite.inviter_signing_pub` → cached on accept (one device's key per invite).
+- `DmCidNotify.signing_device_hash` + the in-packet signature verifies against a key the receiver looks up — but if the receiver has the device hash without its pubkey, the lookup fails and the packet drops as `UnknownSigningKey`. This is the bootstrap-incompleteness case; in v1 it's acceptable (the receiver eventually learns the pubkey via a fresh DmInvite or a follow-up announce). Future: piggyback `signing_pub` per device in `sender_devices` to make every packet self-contained.
+
+For Phase 3b shipped scope: the receiver caches the inviter's pubkey on DmInvite accept; subsequent CidNotify/Ack from the inviter's already-cached devices verify against that cached pubkey. CidNotify/Ack from a NEW device of an already-known owner (not in the inviter's original `sender_devices`) drops as `UnknownSigningKey` until the next DmInvite-equivalent flow re-publishes the device's pubkey. Filed as a Phase 3b follow-up: per-device-pubkey piggyback on every packet (small wire cost, removes the bootstrap-incompleteness window).
+
+### Application-signature binding rule (load-bearing, applies to all three packets)
+
+Both DmCidNotify and DmAck carry payload-controlled owner fields (`sender_owner_addr` / `ack_from_owner_addr`). Without an authenticated source, an attacker on the network could forge a DmCidNotify claiming `sender_owner_addr = Alice` and overwrite Alice's `OwnerDeviceCache` entry with the attacker's devices, or forge a DmAck marking the attacker as a "delivered" recipient on someone else's OutboxEntry.
+
+**Why not Reticulum link-layer binding.** The original spec assumed Reticulum link-layer ECDH would provide the authenticated source identity (i.e., `RuntimeAction::UnicastReceived.source: Option<[u8; 16]>` would be `Some(remote_link_identity_hash)`). Investigation during ZEB-227 implementation revealed that harmony's `Node` does not currently track terminal-link state at endpoint destinations — `Link::respond` is unwired, no `terminal_links` map exists, and inbound DM packets are sent as raw Type1 Data packets via `path_table` routing, NOT over established Reticulum links. Wiring the responder-side handshake is a multi-PR feature in its own right (terminal-link state machine, handshake completion, link expiration, plus a corresponding initiator-side link cache + runtime API redesign for "establish-then-send" semantics). Path B — application-layer Ed25519 signatures on every Reticulum DM packet body — is consistent with the current "raw bytes via path_table" architecture, requires a single small harmony-side companion PR (just expose the existing announce-table identity material), and is in fact stronger than link-layer binding for DM-specific authentication (the signature is over the application payload, not just a link envelope, so a compromised link doesn't let an attacker forge DM signatures). Reticulum link state may still be wired in a future ticket if voice / file sync / streaming features need it; that work doesn't block ZEB-216.
+
+**The mechanism.** Every Reticulum DM packet body carries a `signing_device_hash` field inside the signed CBOR body and an Ed25519 signature appended after the body. The signature is computed over the canonical CBOR encoding of the body (which includes `signing_device_hash`, preventing key-substitution attacks where an attacker swaps which device claims authorship). Receiver verifies the signature using the public key for `signing_device_hash`, looked up via OwnerDeviceCache (post-bootstrap) or via the inline `inviter_signing_pub` field on DmInvite (bootstrap exception). On verification success, `signing_device_hash` IS the authenticated `from_identity_hash`; downstream state mutations use the OwnerAddr resolved from this hash via OwnerDeviceCache, never a payload-controlled `sender_owner_addr` field.
 
 The receive-side rule (Phase 3b):
 
 ```rust
-/// Resolve link-origin device → owner. MUST match exactly one OwnerAddr.
+/// Resolve a verified signing device → owner. MUST match exactly one OwnerAddr.
 ///
-/// Returns Err on zero matches (UnknownLinkOrigin) or multiple matches
-/// (AmbiguousLinkOrigin). Multi-match is reachable via corrupted state
+/// Returns Err on zero matches (UnknownSigningDevice) or multiple matches
+/// (AmbiguousSigningDevice). Multi-match is reachable via corrupted state
 /// or a malicious cache-poisoning DmInvite that claimed an existing
 /// device hash for a different owner; either way the resolution is not
 /// trustworthy — drop + telemetry.
-fn resolve_link_origin_owner(
+///
+/// Pre-condition: signature has already been verified against the public
+/// key for `signing_device_hash`. This function only does the
+/// device-hash → OwnerAddr lookup, not signature verification.
+fn resolve_signed_origin_owner(
     cache: &OwnerDeviceCache,
-    from_identity_hash: DeviceIdentityHash,
+    signing_device_hash: DeviceIdentityHash,
 ) -> Result<OwnerAddr, DmReceiveError> {
     let matches: Vec<OwnerAddr> = cache.devices.iter()
-        .filter(|(_, entry)| entry.devices.binary_search(&from_identity_hash).is_ok())
+        .filter(|(_, entry)| entry.devices.binary_search(&signing_device_hash).is_ok())
         .map(|(addr, _)| *addr)
         .collect();
     match matches.len() {
         1 => Ok(matches[0]),
-        0 => Err(DmReceiveError::UnknownLinkOrigin),
-        _ => Err(DmReceiveError::AmbiguousLinkOrigin),
+        0 => Err(DmReceiveError::UnknownSigningDevice),
+        _ => Err(DmReceiveError::AmbiguousSigningDevice),
     }
 }
 
-// For DmCidNotify and DmAck:
-let resolved_owner = resolve_link_origin_owner(cache, from_identity_hash)?;  // drop + telemetry on Err
+/// Verify a Reticulum DM packet's signature, returning the verified
+/// signing_device_hash on success.
+///
+/// `body_bytes` is the canonical CBOR encoding of the signed body (NOT
+/// including the discriminant byte or the appended signature). `signature`
+/// is the 64-byte Ed25519 signature. `signing_pub` is the verifying key
+/// looked up by the caller (from OwnerDeviceCache for CidNotify/Ack, or
+/// from the inline `inviter_signing_pub` for DmInvite).
+///
+/// Returns Err if the signature does not verify, or if the verifying key
+/// does not match the body's `signing_device_hash` (computed by hashing
+/// the public key per the same scheme as Reticulum's identity_address_hash).
+fn verify_dm_packet_signature(
+    body_bytes: &[u8],
+    signature: &[u8; 64],
+    signing_pub: &VerifyingKey,
+    expected_signing_device_hash: DeviceIdentityHash,
+) -> Result<(), DmReceiveError> {
+    let computed_device_hash = derive_device_hash_from_pubkey(signing_pub);
+    if computed_device_hash != expected_signing_device_hash {
+        return Err(DmReceiveError::SigningKeyDoesNotMatchDeviceHash);
+    }
+    signing_pub.verify(body_bytes, signature)
+        .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
+    Ok(())
+}
+
+// For DmCidNotify and DmAck (post-bootstrap):
+let signing_pub = lookup_pubkey_for_device(&state, packet.signing_device_hash)
+    .ok_or(DmReceiveError::UnknownSigningKey)?;
+verify_dm_packet_signature(&body_bytes, &signature, &signing_pub, packet.signing_device_hash)?;
+let resolved_owner = resolve_signed_origin_owner(cache, packet.signing_device_hash)?;
 if payload_owner_field != resolved_owner {
     return Err(DmReceiveError::OwnerFieldMismatch);  // drop + telemetry
 }
@@ -368,31 +443,38 @@ if matches!(packet, DmPacket::Ack(_)) && !outbox_entry.recipient_owners.contains
 // use `resolved_owner`, never the payload field.
 ```
 
-DmInvite is the bootstrap exception: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `resolve_link_origin_owner` returns `Err(UnknownLinkOrigin)`. The Invite teaches the cache the `(invite.inviter, invite.sender_devices)` mapping after the user accepts. Sanity gates that MUST run before the user prompt:
+DmInvite is the bootstrap case: at first contact the receiver doesn't yet have the inviter in `OwnerDeviceCache`, so `lookup_pubkey_for_device` would return None. The DmInvite carries the inviter's Ed25519 verifying key inline in `inviter_signing_pub`; signature verification uses that field directly. The Invite teaches the cache the `(invite.inviter, invite.sender_devices)` mapping AND the `(signing_device_hash, inviter_signing_pub)` pubkey association after the user accepts. Sanity gates that MUST run BEFORE signature verification (they catch malformed structure cheaper than the AEAD operation):
 
 ```rust
-// 1. inviter must be one of the Space members (otherwise the invite is
-//    structurally inconsistent — a non-member can't invite themselves).
+// 1. inviter must be one of the Space members.
 if !invite.members.contains(&invite.inviter) {
     return Err(DmReceiveError::InviterNotInMembers);  // drop + telemetry
 }
-// 2. sender_devices must include the device that actually sent the packet
-//    (the inviter is claiming "these are my devices" — that list MUST
-//    include the device transmitting the claim).
-if invite.sender_devices.binary_search(&from_identity_hash).is_err() {
-    return Err(DmReceiveError::SenderDeviceNotInSenderDevices);  // drop + telemetry
+// 2. signing_device_hash must be in invite.sender_devices.
+if !invite.sender_devices.contains(&invite.signing_device_hash) {
+    return Err(DmReceiveError::SigningDeviceNotInSenderDevices);  // drop + telemetry
 }
-// 3. Receiver's own OwnerAddr must be in members (otherwise this invite
-//    isn't for us — likely a misroute or a probe).
+// 3. Receiver's own OwnerAddr must be in members.
 if !invite.members.contains(&self_owner_addr) {
     return Err(DmReceiveError::ReceiverNotInMembers);  // drop + telemetry
 }
-// 4. UI prompt: "Invite from {invite.inviter} to {invite.kind}, accept?"
+// 4. Verify signature using inline pubkey.
+verify_dm_packet_signature(
+    &body_bytes,
+    &signature,
+    &VerifyingKey::from_bytes(&invite.inviter_signing_pub)?,
+    invite.signing_device_hash,
+)?;
+// 5. UI prompt: "Invite from {invite.inviter} to {invite.kind}, accept?"
 //    On accept:
 //      apply_owner_device_update(
 //          invite.inviter,                  // NOT members[0]
 //          invite.sender_devices.clone(),
 //          invite.created_at,
+//      );
+//      cache_signing_pubkey(
+//          invite.signing_device_hash,
+//          invite.inviter_signing_pub,
 //      );
 //      apply_space(Space {
 //          content_key: Some(invite.content_key.clone()),
@@ -400,21 +482,39 @@ if !invite.members.contains(&self_owner_addr) {
 //      });
 ```
 
-Note that `invite.members` is sorted ascending (matching `Space::members` invariants for canonical CBOR determinism), so `invite.members[0]` is the lex-smallest OwnerAddr — **NOT** the inviter. Always use `invite.inviter` for owner-binding decisions. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's devices are validated through link-origin binding.
+Note that `invite.members` is sorted ascending (matching `Space::members` invariants for canonical CBOR determinism), so `invite.members[0]` is the lex-smallest OwnerAddr — **NOT** the inviter. Always use `invite.inviter` for owner-binding decisions. Bootstrap trust comes from the out-of-band channel (invite link / QR / library directory) — see Threat model. After Invite acceptance, all subsequent DmCidNotify / DmAck from that owner's already-cached devices are validated through application-signature binding using the cached pubkey.
 
-Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Decode pseudocode:
+Field renames keep CBOR small on Reticulum's MTU-constrained link (~500 bytes effective payload on LoRa interfaces). Wire-size cost of the signature scheme: +80 bytes per packet (16 for `signing_device_hash` + 64 for the appended signature) and an additional +32 bytes for DmInvite (`inviter_signing_pub`). Current packet sizes ~60-200 bytes; new sizes ~140-280 bytes — well within the MTU.
+
+Decode pseudocode:
 
 ```rust
 pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
-    let (disc, body) = bytes.split_first().ok_or(DecodeError::Empty)?;
+    let (disc, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
+    // Signature is the last 64 bytes; body is everything between.
+    if rest.len() < 64 + 1 { return Err(DecodeError::TooShortForSignature); }
+    let split_at = rest.len() - 64;
+    let (body_bytes, signature_bytes) = rest.split_at(split_at);
+    let signature: [u8; 64] = signature_bytes.try_into().expect("just split at len-64");
     match disc {
-        0x01 => Ok(DmPacket::Invite(from_reader(body)?)),
-        0x02 => Ok(DmPacket::CidNotify(from_reader(body)?)),
-        0x03 => Ok(DmPacket::Ack(from_reader(body)?)),
+        0x01 => {
+            let signed: DmInviteSigned = canonical_cbor_decode(body_bytes)?;
+            Ok(DmPacket::Invite { signed, signature, signed_bytes: body_bytes.to_vec() })
+        }
+        0x02 => {
+            let signed: DmCidNotifySigned = canonical_cbor_decode(body_bytes)?;
+            Ok(DmPacket::CidNotify { signed, signature, signed_bytes: body_bytes.to_vec() })
+        }
+        0x03 => {
+            let signed: DmAckSigned = canonical_cbor_decode(body_bytes)?;
+            Ok(DmPacket::Ack { signed, signature, signed_bytes: body_bytes.to_vec() })
+        }
         other => Err(DecodeError::UnknownDiscriminant(*other)),
     }
 }
 ```
+
+The decoded `DmPacket` variants carry the `signed_bytes` alongside the parsed struct so the receive handler can pass them to `verify_dm_packet_signature` without re-encoding.
 
 ## Encryption helpers (Phase 1)
 
@@ -469,9 +569,13 @@ pub fn decrypt_dm_message(
 
 pub fn verify_sender_binding(
     payload: &MessagePayload,
-    link_origin: OwnerAddr,
+    resolved_owner: OwnerAddr,
 ) -> Result<(), DmReceiveError> {
-    if payload.sender != link_origin {
+    // `resolved_owner` is derived from the verified `signing_device_hash`
+    // of the Reticulum DM packet body via OwnerDeviceCache. This is the
+    // CAS-encrypted-payload layer's check that the body's claimed sender
+    // matches the cryptographically-authenticated wire-layer source.
+    if payload.sender != resolved_owner {
         return Err(DmReceiveError::SenderImpersonation);
     }
     Ok(())
@@ -905,7 +1009,7 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - **Cross-device drain duplication tolerated.** Two of sender's devices may both run drain on the same OutboxEntry. Cost: marginal extra Reticulum traffic. Recipient's `apply_inbox` is idempotent (composite key `(space_id, message_cid)`), and sender's `apply_outbox` merges `delivered_to` via union — no corruption. Future optimization: HLC-based delivery lease.
 - **DmAck idempotent.** Same `(space_id, message_cid, ack_from_owner_addr)` arriving twice — `delivered_to.insert(addr)` is set-semantics; second ack is a no-op.
 - **Inbound DmCidNotify idempotent (atomic-emit semantics).** If recipient receives the same notify twice (e.g., sender's two drain devices both sent), `apply_inbox` upserts on `(space_id, message_cid)` — single InboxEntry exists. `apply_inbox` returns `ApplyOutcome::Applied` for the first call (new entry written) and `ApplyOutcome::NoOp` for the duplicate. The `dm-received` IPC event MUST be emitted **only when `apply_inbox` returns `Applied`** — the inserted-vs-already-present discriminant is the atomic boundary, not a separate pre-write existence check (which would race between concurrent handlers on the same device).
-- **Reticulum link encryption is not authentication of OwnerAddr.** The link-layer ECDH proves "this packet came from a device holding the private key for `from_identity_hash`," but `from_identity_hash` is a *device* identifier. The receive-time `verify_sender_binding` check is what binds the encrypted-payload `sender` field to the link-origin OwnerAddr. Sender impersonation across owners requires both subverting Reticulum link-layer crypto AND owning the encryption content_key — not separately defensible.
+- **Application-signature binding authenticates `from_identity_hash`, not OwnerAddr directly.** Per-device Ed25519 signatures on every DM packet body prove "this packet was authored by the device holding the private key for `signing_device_hash`," but `signing_device_hash` is a *device* identifier. The receive-time `verify_sender_binding` check (CAS-encrypted-payload layer) binds `MessagePayload.sender` to the OwnerAddr resolved from the verified `signing_device_hash` via OwnerDeviceCache. Sender impersonation across owners requires both forging an Ed25519 signature against an unknown private key (computationally infeasible) AND owning the per-Space `content_key` (only held by Space members) — not separately defensible.
 
 ## 30-day expiration mechanism
 
@@ -924,7 +1028,7 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `dm_crypto::length_gate_short_blob_rejects` — storage_blob.len() < 29 → TruncatedBlob (no panic)
 - `dm_crypto::tampered_ciphertext_rejects` — flip a bit → AeadFailureAllKeys
 - `dm_crypto::prior_content_keys_fallback_succeeds` — encrypt under K₁; decrypt with content_key=K₂ + prior=[K₁] → success
-- `dm_crypto::sender_binding_mismatch_rejects` — payload.sender ≠ link_origin → SenderImpersonation
+- `dm_crypto::sender_binding_mismatch_rejects` — payload.sender ≠ resolved_owner → SenderImpersonation
 - `dm_envelope::dm_packet_discriminant_round_trip` — encode each variant, decode, equal
 - `dm_envelope::dm_packet_unknown_discriminant_rejects` — `[0xFF, ...]` → Err(UnknownDiscriminant)
 - `owner_state_types::dm_content_key_serializes_as_bstr_32` — single key encodes as `0x58 0x20 || <32 bytes>` (34 bytes total), NOT as CBOR array-of-u8 (~63 bytes for random data)
@@ -941,9 +1045,7 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `owner_state_crdt::owner_device_cache_lww_apply` — newer learned_at replaces; older is no-op
 - `owner_state_crdt::owner_device_cache_apply_dedupes_devices` — input `[d1, d2, d1]` results in stored `[d1, d2]` (sorted, deduped)
 - `owner_state_crdt::owner_device_cache_apply_caps_at_max` — input of 100 devices results in stored Vec of length 32, comprising the lex-smallest 32 entries
-- `dm_outbox::resolve_link_origin_owner_one_match_returns_owner`
-- `dm_outbox::resolve_link_origin_owner_zero_matches_returns_unknown`
-- `dm_outbox::resolve_link_origin_owner_multi_match_returns_ambiguous` — same DeviceIdentityHash present under two OwnerAddr entries → AmbiguousLinkOrigin (regression for cache-poisoning attack via duplicate-claim)
+- (Phase 3b — see Phase 3b tests section below — `resolve_signed_origin_owner_*` tests live there. Phase 1 dm_outbox tests cover the send_dm orchestrator only; the receive-side resolver was originally listed here in error and is moved to Phase 3b.)
 - `dm_outbox::send_dm_recipient_owners_excludes_sender_dedup_sort` — group-DM with members [Alice, Bob, Carol, Carol] produces OutboxEntry.recipient_owners = [Bob, Carol] (sorted, deduped, sender excluded)
 - `owner_state_persist::full_roundtrip_with_dm_state` — DM Space + OwnerDeviceCache entries persist + reload identically
 
@@ -968,25 +1070,39 @@ The **silent-leaver / wrong-addr / 30-day-offline** cases are deliberately indis
 - `runtime::send_unicast_initiates_tunnel_if_absent`
 - `runtime::unicast_received_demuxed_from_tunnel_packet`
 
-### Phase 3b — real Reticulum delivery + 30-day expiration
+### Phase 3b — real Reticulum delivery + 30-day expiration + application-signature binding
 
 - All Phase 2 stub-transport tests re-run with real harmony-runtime transport (mocked at the RuntimeAction-channel boundary, not over the wire)
-- `dm_outbox::handle_unicast_invite_creates_space` — inject UnicastReceived(disc=0x01, ...) → new Space + OwnerDeviceCache update keyed by `invite.inviter` (NOT members[0])
-- `dm_outbox::handle_unicast_invite_binds_inviter_field_not_members_zero` — group-DM where `invite.inviter` is lex-LARGEST member → cache entry created under `invite.inviter`, not `invite.members[0]`. Subsequent DmCidNotify from inviter's identity_hash resolves correctly via link-origin binding (regression for the members[0]-vs-inviter bug)
+- `dm_envelope::dm_packet_signature_round_trip` — sign + encode + decode + verify a DmCidNotify via the new appended-signature wire layout
+- `dm_envelope::dm_packet_decode_too_short_for_signature_rejects` — body shorter than the 64-byte signature → DecodeError::TooShortForSignature
+- `dm_envelope::dm_packet_signature_does_not_cover_discriminant` — same body bytes, different discriminant byte → signature still verifies (discriminant is routing-only, not signed)
+- `dm_outbox::resolve_signed_origin_owner_one_match_returns_owner`
+- `dm_outbox::resolve_signed_origin_owner_zero_matches_returns_unknown` (`UnknownSigningDevice`)
+- `dm_outbox::resolve_signed_origin_owner_multi_match_returns_ambiguous` (`AmbiguousSigningDevice` — same DeviceIdentityHash present under two OwnerAddr entries; regression for cache-poisoning attack via duplicate-claim)
+- `dm_outbox::verify_dm_packet_signature_happy_path` — correct body + correct pubkey + correct device hash → Ok
+- `dm_outbox::verify_dm_packet_signature_tampered_body_rejects` — flipped bit in body → `SignatureVerificationFailed`
+- `dm_outbox::verify_dm_packet_signature_wrong_pubkey_rejects` — body signed by key A, verifying with key B → `SignatureVerificationFailed`
+- `dm_outbox::verify_dm_packet_signature_pubkey_does_not_match_device_hash_rejects` — pubkey hash ≠ claimed `signing_device_hash` → `SigningKeyDoesNotMatchDeviceHash` (defeats key-substitution)
+- `dm_outbox::handle_unicast_invite_creates_space` — inject inbound DmInvite (with valid inline pubkey + signature) → new Space + OwnerDeviceCache update keyed by `invite.inviter` (NOT members[0]) + cached signing pubkey for `signing_device_hash`
+- `dm_outbox::handle_unicast_invite_binds_inviter_field_not_members_zero` — group-DM where `invite.inviter` is lex-LARGEST member → cache entry created under `invite.inviter`, not `invite.members[0]`. Subsequent DmCidNotify from inviter's signing devices verify correctly via the cached pubkey (regression for the members[0]-vs-inviter bug)
 - `dm_outbox::handle_unicast_invite_inviter_not_in_members_drops` — invite.inviter ∉ invite.members → InviterNotInMembers, drop, no state mutation
-- `dm_outbox::handle_unicast_invite_sender_device_not_in_sender_devices_drops` — from_identity_hash ∉ invite.sender_devices → SenderDeviceNotInSenderDevices, drop
+- `dm_outbox::handle_unicast_invite_signing_device_not_in_sender_devices_drops` — `signing_device_hash` ∉ invite.sender_devices → SigningDeviceNotInSenderDevices, drop
 - `dm_outbox::handle_unicast_invite_receiver_not_in_members_drops` — self_owner_addr ∉ invite.members → ReceiverNotInMembers, drop (likely misroute or probe)
-- `dm_outbox::handle_unicast_invite_decline_writes_no_state` — UI declines → no Space written, no cache update, no IPC emitted, no notification to inviter
-- `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, ...) + mock CasOp::GetOrFetch → InboxEntry written, dm-received emitted, DmAck fan-out queued to all sender_devices
+- `dm_outbox::handle_unicast_invite_signature_invalid_drops` — DmInvite with valid structure but tampered body / forged signature → SignatureVerificationFailed, drop
+- `dm_outbox::handle_unicast_invite_decline_writes_no_state` — UI declines → no Space written, no cache update, no IPC emitted, no notification to inviter (deferred to Phase 4 — see plan)
+- `dm_outbox::handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write` — inject (disc=0x02, valid signature, inviter previously cached) + mock cas.get → InboxEntry written, dm-received emitted, DmAck fan-out queued to all sender_devices
 - `dm_outbox::handle_unicast_cidnotify_duplicate_no_dm_received_emit` — second receive of same notify → apply_inbox returns NoOp → no second dm-received IPC event (atomic-emit regression)
-- `dm_outbox::handle_unicast_cidnotify_sender_binding_mismatch_drops` — `MessagePayload.sender` ≠ link_origin → no InboxEntry, no ack, telemetry logged
-- `dm_outbox::handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update` — `notify.sender_owner_addr` ≠ resolved owner from `from_identity_hash` → no `apply_owner_device_update`, no InboxEntry, no ack, telemetry logged (cache-poisoning regression)
-- `dm_outbox::handle_unicast_cidnotify_unknown_link_origin_drops` — `from_identity_hash` not in any OwnerDeviceCache entry → drop with `UnknownLinkOrigin` telemetry
+- `dm_outbox::handle_unicast_cidnotify_sender_binding_mismatch_drops` — `MessagePayload.sender` ≠ resolved_owner → no InboxEntry, no ack, telemetry logged (CAS-encrypted-payload-layer check)
+- `dm_outbox::handle_unicast_cidnotify_owner_field_mismatch_drops_no_cache_update` — `notify.sender_owner_addr` ≠ resolved owner from verified `signing_device_hash` → no `apply_owner_device_update`, no InboxEntry, no ack, telemetry logged (cache-poisoning regression)
+- `dm_outbox::handle_unicast_cidnotify_unknown_signing_device_drops` — `signing_device_hash` not in any OwnerDeviceCache entry → drop with `UnknownSigningDevice` telemetry
+- `dm_outbox::handle_unicast_cidnotify_unknown_signing_key_drops` — `signing_device_hash` known to cache but no pubkey cached for it (incomplete bootstrap) → drop with `UnknownSigningKey` telemetry
+- `dm_outbox::handle_unicast_cidnotify_signature_invalid_drops` — packet body tampered → SignatureVerificationFailed, drop, no state mutation
 - `dm_outbox::handle_unicast_cidnotify_decrypt_failure_uses_prior_keys` — primary content_key fails, prior_content_keys[0] succeeds → InboxEntry written
-- `dm_outbox::handle_unicast_ack_updates_outbox_delivered_to` — inject (disc=0x03, ...) → OutboxEntry update, dm-delivered emitted
+- `dm_outbox::handle_unicast_ack_updates_outbox_delivered_to` — inject (disc=0x03, valid signature) → OutboxEntry update, dm-delivered emitted
 - `dm_outbox::handle_unicast_ack_owner_field_mismatch_drops` — `ack.ack_from_owner_addr` ≠ resolved owner → no delivered_to mutation, telemetry logged
 - `dm_outbox::handle_unicast_ack_from_non_recipient_drops` — resolved owner not in `OutboxEntry.recipient_owners` → no delivered_to mutation, telemetry logged (forged-ack regression)
-- `dm_outbox::handle_unicast_ack_ambiguous_link_origin_drops` — same DeviceIdentityHash claimed by two OwnerAddr entries → AmbiguousLinkOrigin → no mutation
+- `dm_outbox::handle_unicast_ack_ambiguous_signing_device_drops` — same DeviceIdentityHash claimed by two OwnerAddr entries → AmbiguousSigningDevice → no mutation
+- `dm_outbox::handle_unicast_ack_signature_invalid_drops` — DmAck with valid structure but forged signature → SignatureVerificationFailed, drop
 - `dm_outbox::expiration_at_30day_boundary_marks_expired` — entry with `created_at = now - 30.days()` (exactly at the boundary) → status transitions to `'expired'` on this drain tick (verifies `>=` not `>` semantics)
 - `dm_outbox::expiration_29day_old_entry_stays_pending` — entry with `created_at = now - 29.days()` → status remains `'pending'` (boundary regression)
 - `dm_outbox::expiration_30day_real_transport_path`
