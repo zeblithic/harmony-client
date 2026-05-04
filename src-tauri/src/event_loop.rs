@@ -156,6 +156,9 @@ pub async fn run<R: Runtime>(
     mut fetch_completion_rx: mpsc::Receiver<[u8; 32]>,
     pairing_in_tx: Option<mpsc::Sender<crate::pairing::types::PairingWireMessage>>,
     mut sync_handles: Option<SyncEngineHandles>,
+    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    dm_transport: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>>,
+    crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -609,6 +612,36 @@ pub async fn run<R: Runtime>(
                     .as_secs();
                 runtime.push_event(RuntimeEvent::TimerTick { now, unix_now });
                 should_tick = true;
+
+                // ZEB-225 Sub-B Phase 2: drive the dm_outbox drain on every
+                // tick. Skipped when no owner identity is loaded.
+                if let (Some(outbox), Some(transport), Some(state)) =
+                    (dm_outbox.as_ref(), dm_transport.as_ref(), crdt_state.as_ref())
+                {
+                    let wall_now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mut outbox_g = outbox.lock().await;
+                    let mut state_g = state.lock().await;
+                    let outcome = outbox_g.drain(&mut state_g, transport.as_ref(), wall_now_ms).await;
+                    // Drop locks before emitting IPC events.
+                    drop(state_g);
+                    drop(outbox_g);
+                    for (entry_id, recipient) in outcome.newly_delivered {
+                        let payload = serde_json::json!({
+                            "messageId": hex::encode(entry_id.0),
+                            "recipient": hex::encode(recipient.0),
+                        });
+                        let _ = app.emit("dm-delivered", payload);
+                    }
+                    for entry_id in outcome.newly_expired {
+                        let payload = serde_json::json!({
+                            "messageId": hex::encode(entry_id.0),
+                        });
+                        let _ = app.emit("dm-expired", payload);
+                    }
+                }
 
                 // Refresh direct peer set every 20 timer ticks (~5 seconds).
                 // Driven by timer only (not Zenoh events) to avoid excessive

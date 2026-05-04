@@ -248,6 +248,9 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     fetch_completion_rx,
                     None, // pairing_in_tx — pairing not exercised in this test
                     None, // sync_handles — SyncEngine not exercised in this test
+                    None, // dm_outbox — DM outbox not exercised in this test
+                    None, // dm_transport — DM outbox not exercised in this test
+                    None, // crdt_state — DM outbox not exercised in this test
                 )
                 .await;
             });

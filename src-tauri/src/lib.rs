@@ -929,6 +929,9 @@ async fn start_node(
         let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
         let cas_op_tx_for_loop = cas_op_tx.clone();
         let sync_handles_for_loop = sync_handles_opt;
+        let dm_outbox_for_loop = dm_outbox_arc.clone();
+        let dm_transport_for_loop = dm_transport_arc.clone();
+        let crdt_state_for_loop = crdt_state_for_state.clone();
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -981,6 +984,9 @@ async fn start_node(
                         fetch_completion_rx,
                         Some(pairing_in_tx),
                         sync_handles_for_loop,
+                        dm_outbox_for_loop,
+                        dm_transport_for_loop,
+                        crdt_state_for_loop,
                     )
                     .await;
                 });
