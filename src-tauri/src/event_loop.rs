@@ -618,28 +618,51 @@ pub async fn run<R: Runtime>(
                 if let (Some(outbox), Some(transport), Some(state)) =
                     (dm_outbox.as_ref(), dm_transport.as_ref(), crdt_state.as_ref())
                 {
-                    let wall_now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let mut outbox_g = outbox.lock().await;
-                    let mut state_g = state.lock().await;
-                    let outcome = outbox_g.drain(&mut state_g, transport.as_ref(), wall_now_ms).await;
-                    // Drop locks before emitting IPC events.
-                    drop(state_g);
-                    drop(outbox_g);
-                    for (entry_id, recipient) in outcome.newly_delivered {
-                        let payload = serde_json::json!({
-                            "messageId": hex::encode(entry_id.0),
-                            "recipient": hex::encode(recipient.0),
-                        });
-                        let _ = app.emit("dm-delivered", payload);
-                    }
-                    for entry_id in outcome.newly_expired {
-                        let payload = serde_json::json!({
-                            "messageId": hex::encode(entry_id.0),
-                        });
-                        let _ = app.emit("dm-expired", payload);
+                    // ZEB-225 Phase 2 deadlock fix: drain MUST NOT block on
+                    // these locks. send_dm IPC holds the same locks across
+                    // its cas.put().await, which routes a CasOp through
+                    // cas_op_tx and awaits the event-loop's reply. If we
+                    // .await on lock acquisition here, the event_loop stalls
+                    // on the timer arm and never reaches cas_op_rx → deadlock.
+                    // try_lock + skip-this-tick is safe: the entry is just
+                    // delayed 250ms to the next tick when locks are likely free.
+                    let outbox_try = outbox.try_lock();
+                    let state_try = state.try_lock();
+                    match (outbox_try, state_try) {
+                        (Ok(mut outbox_g), Ok(mut state_g)) => {
+                            let wall_now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let outcome = outbox_g
+                                .drain(&mut state_g, transport.as_ref(), wall_now_ms)
+                                .await;
+                            // Drop locks before emitting IPC events.
+                            drop(state_g);
+                            drop(outbox_g);
+                            for (entry_id, recipient) in outcome.newly_delivered {
+                                let payload = serde_json::json!({
+                                    "messageId": hex::encode(entry_id.0),
+                                    "recipient": hex::encode(recipient.0),
+                                });
+                                let _ = app.emit("dm-delivered", payload);
+                            }
+                            for entry_id in outcome.newly_expired {
+                                let payload = serde_json::json!({
+                                    "messageId": hex::encode(entry_id.0),
+                                });
+                                let _ = app.emit("dm-expired", payload);
+                            }
+                        }
+                        _ => {
+                            // Another caller (send_dm IPC most likely) holds
+                            // dm_outbox or crdt_state. Skip this tick — entry
+                            // will be drained on the next tick when locks are
+                            // free. Keeps event_loop responsive to other arms.
+                            tracing::debug!(
+                                "dm_outbox drain skipped this tick (locks contended)"
+                            );
+                        }
                     }
                 }
 

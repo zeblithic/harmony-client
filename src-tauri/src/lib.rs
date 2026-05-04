@@ -1546,6 +1546,16 @@ async fn send_dm(
                 snapshot_generation, g.generation
             ));
         }
+        // stop_inner clears DM handles (dm_outbox, crdt_state, etc → None)
+        // WITHOUT bumping `generation`. So a stop_node alone (no subsequent
+        // start) leaves generation unchanged but handles None. The
+        // generation-only check above misses that case; verify the handles
+        // are still present too.
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during send_dm; entry was written to a \
+                 detached crdt_state and won't be drained"
+                .to_string());
+        }
     }
 
     Ok(hex::encode(msg_id.0))
