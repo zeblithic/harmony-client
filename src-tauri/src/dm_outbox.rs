@@ -669,18 +669,132 @@ impl DmOutbox {
         }
     }
 
-    /// STUB — Task 9 implements.
+    /// Inbound `DmInvite` handler — Phase 3b auto-accept.
+    ///
+    /// Per ZEB-216 spec §"Application-signature binding rule":
+    ///   1. Three sanity gates (cheap, run before signature verification):
+    ///      - inviter ∈ members
+    ///      - signing_device_hash ∈ sender_devices (defense-in-depth;
+    ///        decode_packet also enforces this — the gate here catches
+    ///        future regressions if decode's invariant is ever loosened)
+    ///      - self_owner ∈ members
+    ///   2. Verify signature using inline `inviter_identity_pub` (the
+    ///      64-byte combined identity pubs — DmInvite is the bootstrap
+    ///      exception, the receiver does not yet have an OwnerDeviceCache
+    ///      entry for the inviter so the signing pub ships inline).
+    ///   3. Auto-accept (Phase 3b ships no UI; user-driven decline UX is
+    ///      deferred to Phase 4 with a follow-up Linear ticket filed at
+    ///      PR-creation time per the Phase 3b spec):
+    ///      - `apply_owner_device_update` with a parallel pubs vec that
+    ///        has `Some(inviter_identity_pub)` at the signer's index and
+    ///        `None` everywhere else. The receiver knows the inviter's
+    ///        identity pub for the device that signed THIS invite, but
+    ///        has no pubs for the inviter's other devices yet — they
+    ///        remain pre-bootstrap until the next invite-equivalent flow.
+    ///      - `apply_space_with_canonicalization` for the new DM Space,
+    ///        mirroring what `dm_outbox::send_dm` builds on the outbound
+    ///        side (Reticulum transport binding, Phase 1 invariants for
+    ///        `content_key` etc. — `validate_invariants` runs inside
+    ///        `apply_space_with_canonicalization`, so the Space MUST
+    ///        satisfy the DM-kind invariants).
+    ///   4. Return `DrainOutcome::default()` — no IPC events from the
+    ///      bare invite (`dm-received` events are tied to incoming
+    ///      messages, not invites).
     pub async fn handle_invite(
         &mut self,
-        _state: &mut OwnerState,
-        _signed: crate::dm_envelope::DmInviteSigned,
-        _signature: [u8; 64],
-        _signed_bytes: &[u8],
+        state: &mut OwnerState,
+        signed: crate::dm_envelope::DmInviteSigned,
+        signature: [u8; 64],
+        signed_bytes: &[u8],
         _wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
-        Err(DmReceiveError::Decode(
-            "Task 9 implements handle_invite".into(),
-        ))
+        // Sanity gate 1: inviter ∈ members.
+        if !signed.members.contains(&signed.inviter) {
+            return Err(DmReceiveError::InviterNotInMembers);
+        }
+        // Sanity gate 2: signing_device_hash ∈ sender_devices.
+        // (decode_packet already enforces this — defense-in-depth here.)
+        if !signed.sender_devices.contains(&signed.signing_device_hash) {
+            return Err(DmReceiveError::SigningDeviceNotInSenderDevices);
+        }
+        // Sanity gate 3: self_owner ∈ members.
+        if !signed.members.contains(&self.self_owner) {
+            return Err(DmReceiveError::ReceiverNotInMembers);
+        }
+        // Verify signature using inline inviter_identity_pub (64-byte combined
+        // identity pubs — verify_dm_packet_signature splits + uses Ed25519
+        // half for the actual signature verification, X25519 half participates
+        // only in the device-hash recomputation that defeats key-substitution).
+        crate::dm_signing::verify_dm_packet_signature(
+            signed_bytes,
+            &signature,
+            &signed.inviter_identity_pub,
+            signed.signing_device_hash,
+        )?;
+
+        // Phase 3b auto-accept: write Space + cache + cached identity pub.
+        // (Phase 4 will replace this with a stage-pending-invite + UI prompt
+        // path; follow-up ticket filed at PR-creation time per spec.)
+
+        // Build a parallel pubs vec: Some(inviter_identity_pub) at the signer's
+        // index, None everywhere else. The receiver knows the inviter's
+        // identity pub for the device that signed THIS invite, but has no pubs
+        // for the inviter's other devices yet — they remain pre-bootstrap
+        // until the next invite-equivalent flow.
+        let mut device_identity_pubs: Vec<Option<[u8; 64]>> =
+            vec![None; signed.sender_devices.len()];
+        let signer_idx = signed
+            .sender_devices
+            .iter()
+            .position(|d| *d == signed.signing_device_hash)
+            .expect("sanity gate 2 already verified signing_device_hash ∈ sender_devices");
+        device_identity_pubs[signer_idx] = Some(signed.inviter_identity_pub);
+
+        let cache_outcome = state.apply_owner_device_update(
+            signed.inviter,
+            signed.sender_devices.clone(),
+            device_identity_pubs,
+            signed.created_at.clone(),
+        );
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = cache_outcome {
+            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+        }
+
+        // Build the Space from the invite. Mirror what add_space's DM/group-DM
+        // handling will produce (Phase 4 will produce these on the SEND side
+        // as outbound invites; here we mirror the same shape on the RECEIVE
+        // side as inbound invite acceptance). Transport binding is Reticulum
+        // (DM kinds always are).
+        let space = crate::owner_state_types::Space {
+            id: signed.space_id,
+            kind: signed.kind,
+            parent: None,
+            community_id: None,
+            name: format!("DM with {:?}", signed.inviter),
+            // `participants` is a `Vec<ReticulumDest>` of opaque transport
+            // identifiers; we don't have those for the inviter's owners
+            // here (only their `OwnerAddr`s — the receiver-side code path
+            // resolves OwnerAddr → DeviceIdentityHash via OwnerDeviceCache
+            // at send time, not from `Space.transport.participants`). Leave
+            // empty; matches the existing test fixture pattern.
+            transport: Some(crate::owner_state_types::TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: signed.members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: signed.created_at.clone(),
+            updated_at: signed.created_at,
+            content_key: Some(signed.content_key),
+            prior_content_keys: vec![],
+        };
+        let space_outcome = state.apply_space_with_canonicalization(space);
+        if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = space_outcome {
+            return Err(DmReceiveError::CrdtRejected(format!("{:?}", reason)));
+        }
+
+        Ok(DrainOutcome::default())
     }
 
     /// STUB — Task 10 implements.
@@ -827,7 +941,10 @@ fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
 /// ascending-lex per its existing invariant (re-established by
 /// `deserialize_device_identities` on every load — see
 /// `owner_state_types.rs:286-307`).
-#[allow(dead_code)] // Wired in by Tasks 9/10/11 (handle_invite/cidnotify/ack).
+// Task 9 (handle_invite) does NOT call this — invites carry the inviter
+// inline so resolution is unnecessary. Tasks 10 (handle_cidnotify) and 11
+// (handle_ack) will be the first consumers.
+#[allow(dead_code)] // Wired in by Tasks 10/11 (handle_cidnotify/handle_ack).
 pub(crate) fn resolve_signed_origin_owner(
     cache: &OwnerDeviceCache,
     signing_device_hash: DeviceIdentityHash,
@@ -1704,5 +1821,278 @@ mod tests {
             matches!(err, TransportError::Transient(_)),
             "empty resolver must surface as Transient (drives backoff retry), got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_invite_writes_space_and_cache_with_signing_pub() {
+        use crate::owner_state_crdt::OwnerState;
+
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+
+        // Build a real signed DmInvite via PrivateIdentity::from_seed.
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        outbox
+            .handle_invite(&mut state, signed.clone(), signature, &body_bytes, 200)
+            .await
+            .unwrap();
+
+        // Space written.
+        assert!(state.spaces.contains_key(&SpaceId([7; 16])));
+        let space = state.spaces.get(&SpaceId([7; 16])).unwrap();
+        assert_eq!(space.kind, SpaceKind::Dm);
+        assert!(space.content_key.is_some());
+
+        // OwnerDeviceCache updated under invite.inviter.
+        let entry = state
+            .owner_device_cache
+            .devices
+            .get(&OwnerAddr([1; 16]))
+            .unwrap();
+        assert_eq!(entry.devices, vec![device_hash]);
+        // Cached pub is at index 0 (the only device, also the signer).
+        assert_eq!(entry.device_identity_pubs[0], Some(identity_pub));
+    }
+
+    #[tokio::test]
+    async fn handle_invite_binds_inviter_field_not_members_zero() {
+        // Group-DM where invite.inviter is the lex-LARGEST member (so
+        // members[0] is a different OwnerAddr). Cache entry must be created
+        // under invite.inviter, NOT members[0]. Regression for the lex-vs-
+        // inviter binding bug surfaced in spec §"Application-signature
+        // binding rule".
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let inviter_addr = OwnerAddr([0xff; 16]); // lex-largest
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::GroupDm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), inviter_addr], // sorted ascending
+            inviter: inviter_addr,
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        outbox
+            .handle_invite(&mut state, signed, signature, &body_bytes, 200)
+            .await
+            .unwrap();
+
+        // Cache entry under inviter_addr, NOT members[0].
+        assert!(state.owner_device_cache.devices.contains_key(&inviter_addr));
+        assert!(!state
+            .owner_device_cache
+            .devices
+            .contains_key(&OwnerAddr([1; 16])));
+    }
+
+    #[tokio::test]
+    async fn handle_invite_inviter_not_in_members_drops() {
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            inviter: OwnerAddr([3; 16]), // NOT in members
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        let err = outbox
+            .handle_invite(&mut state, signed, signature, &body_bytes, 200)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DmReceiveError::InviterNotInMembers));
+        assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
+        assert!(state.owner_device_cache.devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_invite_signing_device_not_in_sender_devices_drops() {
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        // Construct an invite where signing_device_hash is NOT in
+        // sender_devices. The sanity gate must reject before signature
+        // verification even runs.
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![DeviceIdentityHash([0xab; 16])], // does NOT include device_hash
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+
+        // NOTE: decode_packet would reject this packet as
+        // DecodeError::Invalid (the same invariant). Because we're calling
+        // handle_invite directly with a hand-constructed DmInviteSigned
+        // that bypasses decode, this test exercises the defense-in-depth
+        // gate inside handle_invite. In production the packet would never
+        // reach handle_invite — it'd drop at decode_packet — but the gate
+        // catches future regressions if decode_packet's invariant is ever
+        // loosened.
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        let err = outbox
+            .handle_invite(&mut state, signed, signature, &body_bytes, 200)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DmReceiveError::SigningDeviceNotInSenderDevices
+        ));
+        assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
+    }
+
+    #[tokio::test]
+    async fn handle_invite_receiver_not_in_members_drops() {
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+        // self_owner NOT in invite.members.
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([99; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])], // self_owner not here
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private.sign(&body_bytes);
+
+        let err = outbox
+            .handle_invite(&mut state, signed, signature, &body_bytes, 200)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DmReceiveError::ReceiverNotInMembers));
+        assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
+    }
+
+    #[tokio::test]
+    async fn handle_invite_tampered_signature_drops() {
+        use crate::owner_state_crdt::OwnerState;
+        let mut state = OwnerState::default();
+        let mut outbox = DmOutbox::new("device".into(), OwnerAddr([2; 16]));
+
+        let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let device_hash = DeviceIdentityHash(public.address_hash);
+
+        let signed = crate::dm_envelope::DmInviteSigned {
+            space_id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            inviter: OwnerAddr([1; 16]),
+            content_key: DmContentKey::new([0xaa; 32]),
+            sender_devices: vec![device_hash],
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice".into(),
+            },
+            signing_device_hash: device_hash,
+            inviter_identity_pub: identity_pub,
+        };
+        let body_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let mut signature = private.sign(&body_bytes);
+        // Flip a bit in the signature.
+        signature[0] ^= 0xff;
+
+        let err = outbox
+            .handle_invite(&mut state, signed, signature, &body_bytes, 200)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DmReceiveError::SignatureVerificationFailed),
+            "expected SignatureVerificationFailed, got {:?}",
+            err
+        );
+        assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
     }
 }
