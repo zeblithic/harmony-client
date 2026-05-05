@@ -170,6 +170,22 @@ pub struct EventPayload {
 impl CanonicalPayloadSealed for EventPayload {}
 impl CanonicalPayload for EventPayload {}
 
+/// Extract the unsigned payload from a SignedMembershipEvent — the
+/// exact bytes the actor sig and (when present) the countersig cover.
+/// Centralised so signing/verifying paths can't drift in field order
+/// or coverage if EventPayload gains fields in later phases.
+impl From<&SignedMembershipEvent> for EventPayload {
+    fn from(event: &SignedMembershipEvent) -> Self {
+        EventPayload {
+            id: event.id,
+            community_id: event.community_id,
+            kind: event.kind.clone(),
+            actor: event.actor,
+            at: event.at.clone(),
+        }
+    }
+}
+
 /// Sign an unsigned event payload with the actor's ed25519 key.
 /// Returns a SignedMembershipEvent ready for canonical encoding +
 /// publication. The countersig field is None — invite-only Joins
@@ -397,14 +413,7 @@ pub fn verify_signature(
     if identity.address_hash != event.actor.0 {
         return Err(VerifyError::ActorPubkeyMismatch);
     }
-    let payload = EventPayload {
-        id: event.id,
-        community_id: event.community_id,
-        kind: event.kind.clone(),
-        actor: event.actor,
-        at: event.at.clone(),
-    };
-    let bytes = canonical_cbor_encode(&payload)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
     let sig = Signature::from_bytes(&event.sig);
     identity
         .verifying_key
@@ -425,14 +434,7 @@ pub fn attach_countersig(
     signer: OwnerAddr,
     signer_key: &SigningKey,
 ) -> Result<SignedMembershipEvent, CryptoError> {
-    let payload = EventPayload {
-        id: event.id,
-        community_id: event.community_id,
-        kind: event.kind.clone(),
-        actor: event.actor,
-        at: event.at.clone(),
-    };
-    let bytes = canonical_cbor_encode(&payload)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
     let sig = signer_key.sign(&bytes).to_bytes();
     let mut out = event.clone();
     out.countersig = Some(CounterSignature { signer, sig });
@@ -446,14 +448,7 @@ pub fn attach_countersig_with_identity(
     event: &SignedMembershipEvent,
     private: &harmony_identity::PrivateIdentity,
 ) -> Result<SignedMembershipEvent, CryptoError> {
-    let payload = EventPayload {
-        id: event.id,
-        community_id: event.community_id,
-        kind: event.kind.clone(),
-        actor: event.actor,
-        at: event.at.clone(),
-    };
-    let bytes = canonical_cbor_encode(&payload)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
     let sig = private.sign(&bytes);
     let mut out = event.clone();
     out.countersig = Some(CounterSignature {
@@ -494,14 +489,7 @@ pub fn verify_countersig(
     if identity.address_hash != cs.signer.0 {
         return Err(VerifyError::CounterSignerPubkeyMismatch);
     }
-    let payload = EventPayload {
-        id: event.id,
-        community_id: event.community_id,
-        kind: event.kind.clone(),
-        actor: event.actor,
-        at: event.at.clone(),
-    };
-    let bytes = canonical_cbor_encode(&payload)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
     let sig = Signature::from_bytes(&cs.sig);
     identity
         .verifying_key
