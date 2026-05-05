@@ -546,6 +546,49 @@ fn materialize_leave_marks_actor_left_with_left_at() {
 }
 
 #[test]
+fn materialize_kick_against_unknown_target_does_not_fabricate_phantom() {
+    // verify_event already rejects KickTargetNotMember, but the
+    // materialize Kick handler must also be defensive — corrupted
+    // logs or unverified replays should not fabricate a phantom
+    // MemberState with status=Banned and joined_at=kick_time for an
+    // address that never joined. Mirrors the Join/Leave defense-in-
+    // depth guards above.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let stranger = OwnerAddr([0xEEu8; 16]);
+
+    let bad_kick = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Kick {
+                target: stranger,
+                reason: None,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let m = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            bad_kick,
+        ],
+        admin,
+    );
+    assert!(
+        !m.members.contains_key(&stranger),
+        "stranger must NOT appear in members — Kick must not fabricate phantom records"
+    );
+}
+
+#[test]
 fn materialize_kick_marks_target_banned() {
     let admin = OwnerAddr([100u8; 16]);
     let bob = OwnerAddr([2u8; 16]);

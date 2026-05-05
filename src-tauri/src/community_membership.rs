@@ -722,13 +722,18 @@ pub fn materialize(
                 }
             }
             MembershipEventKind::Kick { target, .. } => {
-                let s = m.members.entry(*target).or_insert(MemberState {
-                    status: MemberStatus::Banned,
-                    joined_at: event.at.clone(),
-                    left_at: Some(event.at.clone()),
-                });
-                s.status = MemberStatus::Banned;
-                s.left_at = Some(event.at.clone());
+                // verify_event rejects KickTargetNotMember at the input
+                // layer; only modify an existing entry here. Falling
+                // back to entry().or_insert(...) would fabricate a
+                // phantom MemberState with status=Banned and
+                // joined_at=kick_time for an unknown target — exactly
+                // the hazard the verify-time check guards against, but
+                // a corrupted log or unverified replay could otherwise
+                // surface it. Symmetric with Join/Leave defense-in-depth.
+                if let Some(s) = m.members.get_mut(target) {
+                    s.status = MemberStatus::Banned;
+                    s.left_at = Some(event.at.clone());
+                }
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
