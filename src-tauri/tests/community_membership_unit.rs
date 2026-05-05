@@ -1266,8 +1266,7 @@ fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     // Spurious countersig from someone else.
-    let event =
-        attach_countersig_with_identity(&event, &someone_priv).expect("countersig");
+    let event = attach_countersig_with_identity(&event, &someone_priv).expect("countersig");
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
