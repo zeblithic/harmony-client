@@ -1431,6 +1431,86 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
 // rejection path.
 
 #[test]
+fn verify_event_rejects_invite_targeting_banned_member() {
+    // materialize() correctly no-ops Invite when the target is Banned
+    // (Banned-sticky), but verify_event was returning Ok(()) for this
+    // case — leaving the Phase-4 IPC caller to incorrectly assume the
+    // invite took effect. Reject at verify time so the caller surfaces
+    // a clear error and the UI can prompt admin to unban first.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+
+    // alice joined, then admin kicked her.
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            {
+                let payload = EventPayload {
+                    id: [2u8; 16],
+                    community_id: SpaceId([3u8; 16]),
+                    kind: MembershipEventKind::Join,
+                    actor: alice,
+                    at: Hlc {
+                        wall_ms: 200,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                };
+                sign_event_with_identity(&payload, &alice_priv).expect("sign")
+            },
+            {
+                let payload = EventPayload {
+                    id: [3u8; 16],
+                    community_id: SpaceId([3u8; 16]),
+                    kind: MembershipEventKind::Kick {
+                        target: alice,
+                        reason: None,
+                    },
+                    actor: admin,
+                    at: Hlc {
+                        wall_ms: 300,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                };
+                sign_event_with_identity(&payload, &admin_priv).expect("sign")
+            },
+        ],
+        admin,
+    );
+    assert_eq!(
+        prior_state.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Banned),
+        "test setup: alice must be Banned"
+    );
+
+    // Admin tries to invite the banned alice.
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Invite { target: alice },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::InviteTargetBanned);
+}
+
+#[test]
 fn verify_event_rejects_invite_from_non_joined_actor() {
     // Under v1 POWER_THRESHOLDS.invite = 0, the power check alone
     // accepts anyone — so a non-member can otherwise emit a valid

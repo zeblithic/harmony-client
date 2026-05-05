@@ -280,6 +280,12 @@ pub enum VerifyError {
     /// misleading state and a "phantom member" entry. Banning a
     /// recently-Left member is still allowed (Left ∈ members).
     KickTargetNotMember,
+    /// Invite targeted a currently-Banned member. materialize() no-ops
+    /// this case (Banned-sticky), so verify_event returning Ok would
+    /// leave the caller incorrectly assuming the invite took effect.
+    /// Reject so the IPC layer surfaces a clear "unban first" error to
+    /// the UI rather than silently dropping the invite.
+    InviteTargetBanned,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -352,6 +358,13 @@ impl std::fmt::Display for VerifyError {
                 write!(
                     f,
                     "kick target has no member record in this community"
+                )
+            }
+            VerifyError::InviteTargetBanned => {
+                write!(
+                    f,
+                    "invite target is currently Banned (admin must unban first; \
+                     not yet implemented in v1)"
                 )
             }
             VerifyError::PowerLevelOutOfRange => {
@@ -971,9 +984,18 @@ pub fn verify_event(
             // above (invite-only) or unconditionally allowed (open).
             // Leave is always allowed for the actor themselves.
         }
-        MembershipEventKind::Invite { .. } => {
+        MembershipEventKind::Invite { target } => {
             if actor_power < POWER_THRESHOLDS.invite {
                 return Err(VerifyError::ActorPowerInsufficient);
+            }
+            // Inviting a Banned target is a no-op in materialize
+            // (Banned-sticky). Returning Ok here would leave the IPC
+            // caller incorrectly reporting "invite sent". Reject so
+            // the UI can surface a clear "unban first" error.
+            if let Some(target_state) = prior_state.members.get(target) {
+                if target_state.status == MemberStatus::Banned {
+                    return Err(VerifyError::InviteTargetBanned);
+                }
             }
         }
         MembershipEventKind::Kick { target, .. } => {
