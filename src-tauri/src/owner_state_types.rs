@@ -2833,12 +2833,25 @@ mod space_tests {
         let decoded: Space = canonical_cbor_decode(&encoded).expect("decode");
 
         assert_eq!(decoded.kind, SpaceKind::Community);
+        // Compare raw bytes (not MembershipKey directly) so the failure
+        // message shows actual hex on mismatch — MembershipKey's Debug
+        // impl redacts the bytes, which would render assert_eq! useless
+        // on failure.
         assert_eq!(
             decoded.membership_key.as_ref().map(|k| *k.as_bytes()),
             Some(*key.as_bytes())
         );
         assert_eq!(decoded.admin_addr, Some(admin));
         assert_eq!(decoded.is_invite_only, Some(true));
+
+        // Activated by Task 3 once SpaceKind::Community gets enforced
+        // invariants. Currently a no-op; the call here means Task 3 can
+        // land without needing to revisit this test, AND any future
+        // regression in round-trip that breaks invariant fields will be
+        // caught here.
+        decoded
+            .validate_invariants()
+            .expect("community Space must pass validate_invariants after round-trip");
     }
 
     #[test]
