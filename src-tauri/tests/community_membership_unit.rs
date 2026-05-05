@@ -863,6 +863,89 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
 // rejection path.
 
 #[test]
+fn verify_event_rejects_join_replay_after_kick() {
+    // After a kicked actor's status materializes to Banned, a replayed
+    // (or fresh) Join from that actor must be rejected — otherwise
+    // materialize() would silently overwrite Banned back to Joined,
+    // making Kick effectively cosmetic.
+    //
+    // Kick = effective ban until an explicit unban flow exists
+    // (deferred to a follow-up).
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    // alice joined, then was kicked by admin.
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            {
+                let payload = EventPayload {
+                    id: [2u8; 16],
+                    community_id: SpaceId([3u8; 16]),
+                    kind: MembershipEventKind::Join,
+                    actor: alice,
+                    at: Hlc {
+                        wall_ms: 200,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                };
+                sign_event(&payload, &alice_key).expect("sign")
+            },
+            {
+                let payload = EventPayload {
+                    id: [3u8; 16],
+                    community_id: SpaceId([3u8; 16]),
+                    kind: MembershipEventKind::Kick {
+                        target: alice,
+                        reason: Some("spam".into()),
+                    },
+                    actor: admin,
+                    at: Hlc {
+                        wall_ms: 300,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                };
+                sign_event(&payload, &admin_key).expect("sign")
+            },
+        ],
+        admin,
+    );
+    assert_eq!(
+        prior_state.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Banned),
+        "test setup: alice must be Banned in prior_state"
+    );
+
+    // Alice (or someone with her key) re-publishes a Join.
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::BannedActorJoin);
+}
+
+#[test]
 fn verify_event_rejects_setpower_when_level_exceeds_max() {
     // POWER_THRESHOLDS.max = 100. An admin (power 100) authorized to
     // SetPower must NOT be able to assign 200/255/etc. — the cap is

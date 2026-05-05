@@ -212,6 +212,10 @@ pub enum VerifyError {
     /// that would create a member admin can no longer kick (admin's own
     /// power is bounded by max).
     PowerLevelOutOfRange,
+    /// Join from an actor whose prior state is MemberStatus::Banned.
+    /// Kick = effective ban until a dedicated unban flow exists, so a
+    /// replayed Join must not silently overwrite the Banned status.
+    BannedActorJoin,
     EncodeError(String),
 }
 
@@ -232,6 +236,9 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::PowerLevelOutOfRange => {
                 write!(f, "SetPower level exceeds POWER_THRESHOLDS.max")
+            }
+            VerifyError::BannedActorJoin => {
+                write!(f, "Join rejected: actor's prior status is Banned")
             }
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
@@ -523,7 +530,20 @@ pub fn verify_event(
     // 1. Actor's signature must verify.
     verify_signature(event, ctx.actor_pubkey)?;
 
-    // 2. For invite-only Joins, countersig is required + valid + the
+    // 2. Banned-status guard: a Banned actor's Join must be rejected
+    //    BEFORE materialize() would silently overwrite the Banned
+    //    status. Applies in both open and invite-only communities —
+    //    Kick is the operative ban primitive in v1, and re-joining
+    //    after Kick requires a dedicated unban flow (deferred).
+    if matches!(event.kind, MembershipEventKind::Join) {
+        if let Some(state) = prior_state.members.get(&event.actor) {
+            if state.status == MemberStatus::Banned {
+                return Err(VerifyError::BannedActorJoin);
+            }
+        }
+    }
+
+    // 3. For invite-only Joins, countersig is required + valid + the
     //    signer must have sufficient power at the prior state's snapshot.
     //
     // Note: under v1's hardcoded POWER_THRESHOLDS.invite = 0, the
@@ -552,7 +572,7 @@ pub fn verify_event(
         }
     }
 
-    // 3. Per-kind power rules.
+    // 4. Per-kind power rules.
     let actor_power = prior_state
         .power_levels
         .get(&event.actor)
