@@ -571,6 +571,116 @@ fn materialize_kick_marks_target_banned() {
 }
 
 #[test]
+fn materialize_redundant_join_does_not_overwrite_joined_at() {
+    // A member who is already Joined re-sending a Join event must NOT
+    // reset their joined_at to the new event timestamp. Without this
+    // guard, any actor could push their own join date forward by
+    // re-signing a Join — there's no privilege gate that prevents it,
+    // so anyone could falsify "I've been here since the start".
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let alice_join_t200 = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &alice_key).expect("sign")
+    };
+    let alice_redundant_join_t900 = {
+        let payload = EventPayload {
+            id: [3u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &alice_key).expect("sign")
+    };
+
+    let m = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            alice_join_t200,
+            alice_redundant_join_t900,
+        ],
+        admin,
+    );
+    let s = m.members.get(&alice).expect("alice present");
+    assert_eq!(s.status, MemberStatus::Joined);
+    assert_eq!(
+        s.joined_at.wall_ms, 200,
+        "joined_at must pin to first Join — redundant re-Join is a no-op"
+    );
+}
+
+#[test]
+fn materialize_redundant_invite_does_not_overwrite_joined_at() {
+    // Symmetric to redundant Join: re-inviting an already-Invited
+    // target must not reset their joined_at. Otherwise an admin could
+    // backdate (or push forward) a pending invitation timestamp.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let invite_t200 = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Invite { target: bob },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+    let redundant_invite_t900 = {
+        let payload = EventPayload {
+            id: [3u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Invite { target: bob },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let m = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            invite_t200,
+            redundant_invite_t900,
+        ],
+        admin,
+    );
+    let s = m.members.get(&bob).expect("bob present");
+    assert_eq!(s.status, MemberStatus::Invited);
+    assert_eq!(
+        s.joined_at.wall_ms, 200,
+        "joined_at must pin to first Invite — redundant re-Invite is a no-op"
+    );
+}
+
+#[test]
 fn materialize_invite_refreshes_left_member_to_invited() {
     // Re-inviting a former member (status = Left) should transition
     // them to Invited so the UI can show "alice has been re-invited".

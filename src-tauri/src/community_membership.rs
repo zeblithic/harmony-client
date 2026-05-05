@@ -638,18 +638,25 @@ pub fn materialize(
     for event in sorted {
         match &event.kind {
             MembershipEventKind::Join => {
-                // Banned is sticky: a Join from a Banned actor must NOT
-                // transition status back to Joined. verify_event also
-                // rejects this case (BannedActorJoin); the materializer
-                // guard is defense-in-depth — handles bad events that
-                // slip past verification (corrupted on-disk log, replay
-                // from before the Ban arrived). Symmetric with the
-                // Leave handler below.
-                let already_banned = matches!(
-                    m.members.get(&event.actor),
-                    Some(s) if s.status == MemberStatus::Banned
-                );
-                if !already_banned {
+                // Per-prior-status transition table:
+                //   - never seen → set Joined / joined_at = event.at
+                //   - Invited → set Joined / joined_at = event.at (acceptance)
+                //   - Left → set Joined / joined_at = event.at (rejoin)
+                //   - Joined → no-op (idempotent — preserves original
+                //     joined_at; otherwise any actor could push their
+                //     own join date forward by replaying Join, with
+                //     no privilege gate to prevent it)
+                //   - Banned → no-op (Banned-sticky; verify_event
+                //     also rejects BannedActorJoin, this is
+                //     defense-in-depth for events that slip past
+                //     verification — corrupted log, replay from
+                //     before the Ban arrived)
+                let prior_status = m.members.get(&event.actor).map(|s| s.status);
+                let should_refresh = match prior_status {
+                    None | Some(MemberStatus::Invited) | Some(MemberStatus::Left) => true,
+                    Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
+                };
+                if should_refresh {
                     m.members.insert(
                         event.actor,
                         MemberState {
@@ -683,21 +690,25 @@ pub fn materialize(
             MembershipEventKind::Invite { target } => {
                 // Per-prior-status transition table:
                 //   - never seen → set Invited / joined_at = event.at
-                //   - Invited → refresh joined_at (re-invite arrived later)
-                //   - Joined → no-op (already past the "invited" stage)
+                //   - Invited → no-op (idempotent — preserves original
+                //     invite timestamp; otherwise admin could shift
+                //     pending invitation joined_at forward or backward)
                 //   - Left → refresh to Invited (legitimate re-invite of
                 //     a former member; UI shows "alice has been re-invited")
-                //   - Banned → no-op (Banned is sticky; re-Invite must
-                //     not silently un-ban)
+                //   - Joined → no-op (already past the "invited" stage)
+                //   - Banned → no-op (Banned-sticky; verify_event also
+                //     rejects InviteTargetBanned, defense-in-depth here)
                 //
                 // Refresh = replace MemberState entirely (status=Invited,
-                // joined_at=event.at, left_at=None) so a re-invited entry
-                // looks like a fresh invitation rather than carrying stale
-                // left_at from the prior departure.
+                // joined_at=event.at, left_at=None) so a re-invited Left
+                // entry looks like a fresh invitation rather than
+                // carrying stale left_at from the prior departure.
                 let prior_status = m.members.get(target).map(|s| s.status);
                 let should_refresh = match prior_status {
-                    None | Some(MemberStatus::Invited) | Some(MemberStatus::Left) => true,
-                    Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
+                    None | Some(MemberStatus::Left) => true,
+                    Some(MemberStatus::Invited)
+                    | Some(MemberStatus::Joined)
+                    | Some(MemberStatus::Banned) => false,
                 };
                 if should_refresh {
                     m.members.insert(
