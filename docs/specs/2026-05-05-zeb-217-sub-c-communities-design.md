@@ -16,7 +16,7 @@ Per the polycentric governance principle (project memory, locked in during ZEB-2
 
 ## Architecture
 
-```
+```text
                  OWNER STATE                         COMMUNITY STATE
                  (per owner, single-writer)          (per community, multi-writer)
                  ─────────────────                   ─────────────────────
@@ -39,6 +39,8 @@ Per the polycentric governance principle (project memory, locked in during ZEB-2
              Path B app-sig binding;                      │
              mirrors DmInvite from ZEB-227)               │
 ```
+
+> **Topic shorthand:** the diagram uses `{addr}` / `{id}` and the unversioned `state-root` suffix purely for visual alignment. The full wire form (matching shipped owner-state sync at `src-tauri/src/event_loop.rs`) is `harmony/owner/{addr_hex}/state-root-v1` and `harmony/community/{id_hex}/state-root-v1` — lowercase hex of the 16-byte OwnerAddr / SpaceId, plus the explicit `-v1` version suffix so a future wire-format break can ship a parallel `-v2` topic without breaking old clients. Every later prose reference uses the full form.
 
 **Key architectural decisions:**
 
@@ -131,7 +133,7 @@ SpaceKind::Community => {
 
 ### `CommunityState` CRDT (in `community_state_crdt.rs`)
 
-Per-community Prolly Tree. Replicated via `harmony/community/{id}/state-root` topic.
+Per-community CRDT (encrypted-CBOR-blob via CAS DAG-sync; "Prolly Tree" is aspirational shorthand for the layered Merkle structure ZEB-215 originally targeted, but as-shipped owner-state sync uses a single encrypted blob per state-root publish — Phase 2 mirrors that). Replicated via `harmony/community/{id_hex}/state-root-v1` topic.
 
 ```rust
 pub struct CommunityState {
@@ -310,7 +312,7 @@ pub fn verify_event(
 
 ### Topic & encryption
 
-- **Topic:** `harmony/community/{id}/state-root` (Zenoh). Mirrors `harmony/owner/{addr}/state-root`.
+- **Topic:** `harmony/community/{id_hex}/state-root-v1` (Zenoh). Mirrors `harmony/owner/{addr_hex}/state-root-v1` from shipped ZEB-215 owner-state sync. `id_hex` is the lowercase hex of the 16-byte `SpaceId`. The `-v1` suffix is intentional — a future wire-format break can ship a parallel `-v2` topic so old clients stay safely silent rather than mis-parsing.
 - **Wire payload:** Encrypted Prolly Tree root CID, published whenever a member appends a verified event.
 - **Encryption:** ChaCha20-Poly1305 (same primitive as DM content + owner-state). Key = the community's `MembershipKey` (32 bytes), distributed via the invite payload. Topic is observable to anyone with `community_id`, but the payload is opaque without the key.
 
@@ -320,7 +322,7 @@ When `community_state_sync.rs` starts, it scans `owner_state.spaces` for any `Sp
 
 ### Append flow (member publishes a new event)
 
-```
+```text
 1. Frontend → IPC (e.g., kick_from_community)
 2. community_membership::sign_event_with_identity builds + signs
    the SignedMembershipEvent
@@ -329,7 +331,7 @@ When `community_state_sync.rs` starts, it scans `owner_state.spaces` for any `Sp
      verify_event(&event, &prior, &VerifyContext { ... })?
 4. Prolly Tree insert → new root CID
 5. Encrypt root CID + new block(s) with MembershipKey
-6. Publish encrypted root CID to harmony/community/{id}/state-root
+6. Publish encrypted root CID to harmony/community/{id_hex}/state-root-v1
 7. Other members subscribe → receive root → decrypt → DAG-sync missing
    blocks via existing CAS/DAG-sync (ZEB-215 Phase 3b machinery)
 8. Each subscriber re-runs verify_event with the SAME prior-state helper
@@ -343,9 +345,9 @@ When `community_state_sync.rs` starts, it scans `owner_state.spaces` for any `Sp
 
 When you redeem an invite link and become a member:
 
-```
+```text
 1. Decode invite link → community_id, MembershipKey, (optional) inviter
-2. Subscribe to harmony/community/{id}/state-root
+2. Subscribe to harmony/community/{id_hex}/state-root-v1
 3. First message received contains current root CID (encrypted)
 4. Decrypt with MembershipKey → DAG-sync the entire Prolly Tree from
    any peer member (CAS fetch — same machinery as ZEB-215 Phase 3b)
@@ -419,7 +421,7 @@ Base64url (no `+`/`/`/`=` padding) makes it copy-paste-safe across messengers th
 
 ### Open community redemption (no Reticulum needed)
 
-```
+```text
 1. User clicks harmony://invite/... in browser → harmony-client opens
 2. Deep-link handler emits IPC event invite-link-received with payload
 3. Frontend shows confirm dialog: "Join {community_name}, created by {admin_addr_short}?"
@@ -441,7 +443,7 @@ Base64url (no `+`/`/`/`=` padding) makes it copy-paste-safe across messengers th
 
 ### Invite-only redemption (Reticulum counter-sig hop)
 
-```
+```text
 1-3. Same as open — preview + confirm
 4. User confirms → IPC redeem_invite(payload)
 5. Rust:
@@ -655,7 +657,7 @@ If any verification fails at points 1 or 2, the event is rejected and **not** re
 
 ### Privacy properties (v1)
 
-- **Member list private to joined members.** `harmony/community/{id}/state-root` topic is observable but encrypted with `MembershipKey`. Non-members see only "this community is active."
+- **Member list private to joined members.** `harmony/community/{id_hex}/state-root-v1` topic is observable but encrypted with `MembershipKey`. Non-members see only "this community is active."
 - **No backward secrecy on membership change.** Per "Encryption-key rotation on membership change", ex-members keep `MembershipKey` and can decrypt future events. Closing this is [ZEB-249](https://linear.app/zeblith/issue/ZEB-249/).
 - **No forward secrecy on key compromise.** ChaCha20-Poly1305 with a long-lived `MembershipKey` — same as DM ContentKey precedent. Both are bound by the device's encryption-at-rest story (ZEB-211).
 - **Profile-membership broadcast is opt-in.** `ProfileMembershipBroadcast` (already in spec) is per-community; default is private.
@@ -684,7 +686,7 @@ If any verification fails at points 1 or 2, the event is rejected and **not** re
 ### Test data + fixtures
 
 - Reuse the existing `make_test_owner` helper from DM transport tests
-- New `make_test_community` helper: builds + signs creator-admin-100 SetPower event + initial Join, returns ready-to-use `CommunityState` for fast fixture setup
+- New `make_test_community` helper: returns a `CommunityState` containing the creator's signed `Join` event as the first (and only mandatory) entry; the creator's power-100 admin authority comes from the bootstrap rule (`admin_addr` initializes `power_levels[admin_addr] = 100` BEFORE replay — see "Materialization rules"), so NO separate creator-admin-100 `SetPower` event is needed or correct here. A `SetPower` issued before the actor's `Join` would fail `verify_event` with `ActorNotJoined`. Optional variants (`make_test_community_with_member`, etc.) append additional `Join` events for non-creator members and any `SetPower` events strictly AFTER each member's `Join`, preserving the verify/model invariants.
 - Wire-format fixtures (CBOR golden files) for: `SignedMembershipEvent` × 5 kinds, `CommunityInvitePayload`, `InviteToken`, `CounterSignature` — pinning these prevents accidental wire breakage across phases (mirrors `wire_format_fixture.rs` we already use)
 
 ### Coverage gates
@@ -765,7 +767,7 @@ All deltas are documented in the Materialization rules / Verification / Data mod
 
 ### Phase 4 — Invite-only flow (Reticulum CommunityInvite + counter-sig)
 
-**Goal:** Invite-only flavor using the Reticulum unicast + DmInvite Path B pattern from ZEB-227. Reuses `dm_outbox` queue when no member is online to counter-sign.
+**Goal:** Invite-only flavor using the Reticulum unicast + DmInvite Path B pattern from ZEB-227. Uses the existing `dm_outbox` immediate-attempt unicast path (`UnicastSendRequest` mpsc into `event_loop`) for online counter-signers; if no member with `power ≥ invite_threshold` is reachable at redemption time, `redeem_invite` returns `Err` per the v1 contract documented above. v1 does NOT extend `dm_outbox` with a persistent queue or a "pending Join event" model — the persistent offline-counter-signer UX is deferred to [ZEB-254](https://linear.app/zeblith/issue/ZEB-254/) so Sub-C v1 stays focused on the bootstrap loop.
 
 **Files:**
 - Modified: `src-tauri/src/community_invite.rs` — Reticulum send/receive paths (mirrors `dm_envelope.rs`); imports `UnicastSendRequest` from `dm_outbox.rs` without modifying it
