@@ -17,9 +17,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::community_membership::{EventId, SignedMembershipEvent};
+use crate::community_membership::{
+    materialize, prior_state_at_event, verify_event, EventId, MaterializedMembership,
+    SignedMembershipEvent, VerifyContext, VerifyError,
+};
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
-use crate::owner_state_types::SpaceId;
+use crate::owner_state_types::{OwnerAddr, SpaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityState {
@@ -48,3 +51,66 @@ impl CommunityState {
 
 impl CanonicalPayloadSealed for CommunityState {}
 impl CanonicalPayload for CommunityState {}
+
+/// Outcome of inserting one event into `CommunityState`.
+///
+/// Distinguishes the three meaningful states so callers (sync layer,
+/// IPC layer, tests) can react appropriately:
+/// - Inserted: event was new, verified, and now lives in the log
+/// - AlreadyKnown: an event with this id was already in the log; the
+///   sync layer should treat this as a no-op (NOT an error — DAG-sync
+///   delivers duplicates by design)
+/// - Rejected: verification failed; the wrapped VerifyError says why
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    AlreadyKnown,
+    Rejected(VerifyError),
+}
+
+impl CommunityState {
+    /// Insert a `SignedMembershipEvent` after running `verify_event`
+    /// against the current materialized state. The state used for
+    /// authorization is computed via `prior_state_at_event` so the
+    /// `event_sort_key` comparator is shared with `materialize` and
+    /// no caller can drift.
+    ///
+    /// Idempotent on duplicate EventIds — DAG-sync delivers the same
+    /// event multiple times by design (e.g., when a peer re-publishes
+    /// a state-root that includes events we already have). Returning
+    /// `AlreadyKnown` rather than `Inserted` lets callers skip the
+    /// cache-invalidation work.
+    pub fn insert_event(
+        &mut self,
+        event: SignedMembershipEvent,
+        ctx: &VerifyContext,
+    ) -> InsertOutcome {
+        if self.events.contains_key(&event.id) {
+            return InsertOutcome::AlreadyKnown;
+        }
+
+        // Build prior_state from the current event log. Note that we
+        // pass the candidate event so prior_state_at_event filters
+        // strictly less-than, not less-than-or-equal — without this
+        // the candidate would self-authorize against its own future
+        // state if it had already been inserted.
+        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+        let prior = prior_state_at_event(&log, &event, ctx.admin_addr);
+
+        if let Err(e) = verify_event(&event, &prior, ctx) {
+            return InsertOutcome::Rejected(e);
+        }
+
+        self.events.insert(event.id, event);
+        InsertOutcome::Inserted
+    }
+
+    /// Materialize the current event log. Pure; no caching at this
+    /// layer — callers that want a cached view should hold the
+    /// `materialized()` result and invalidate on every successful
+    /// `insert_event`. Task 3 adds the cache.
+    pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
+        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+        materialize(&log, admin_addr)
+    }
+}
