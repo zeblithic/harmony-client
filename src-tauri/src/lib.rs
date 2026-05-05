@@ -1642,13 +1642,21 @@ pub struct SendDmResult {
 /// `space_id_hex` is the 32-character hex of a 16-byte SpaceId.
 /// Returns `{ messageId, messageCid }` on success — see `SendDmResult`
 /// for why both are surfaced.
+// PR #81 round 4: param renamed from `space_id_hex` → `space_id`.
+// Tauri 2's default JS→Rust convention auto-converts camelCase keys
+// to snake_case (so JS `spaceId` resolves to Rust `space_id`). The
+// previous `space_id_hex` name didn't match anything the frontend
+// could send (would have required JS `spaceIdHex`), so the IPC was
+// silently broken. The variable is still hex-encoded on the wire —
+// the doc comment + downstream `hex::decode` make that clear.
 #[tauri::command]
 async fn send_dm(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
-    space_id_hex: String,
+    space_id: String,
     content: Vec<u8>,
     mime_type: String,
 ) -> Result<SendDmResult, String> {
+    let space_id_hex = space_id;
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
     //
@@ -1964,13 +1972,15 @@ pub async fn read_dm_thread_inner(
 /// Frontend uses this on first DM-channel switch to populate the
 /// TextFeed with history. To paginate: pass the oldest entry's
 /// `received_at` as `before_hlc` for the next call.
+// Param rename per PR #81 round 4 — see send_dm above for rationale.
 #[tauri::command]
 async fn read_dm_thread(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
-    space_id_hex: String,
+    space_id: String,
     limit: usize,
     before_hlc: Option<u64>,
 ) -> Result<Vec<DmThreadMessage>, String> {
+    let space_id_hex = space_id;
     // Snapshot handles under the sync mutex; release before any .await.
     // (Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.)
@@ -2065,14 +2075,44 @@ async fn decrypt_inbox_entries(
 ) -> Result<Vec<DmThreadMessage>, String> {
     let mut out: Vec<DmThreadMessage> = Vec::with_capacity(entries.len());
     for entry in entries {
-        let blob = cas
-            .get(&entry.message_cid)
-            .await
-            .map_err(|e| format!("cas.get failed for {:?}: {e:?}", entry.message_cid))?
-            .ok_or_else(|| format!("blob missing for {:?}", entry.message_cid))?;
+        // PR #81 round 4 (Greptile P2): per-entry skip-on-error instead
+        // of aborting the whole page. A single corrupted CAS blob or a
+        // missing one (e.g. mid-sync state) shouldn't black-hole the
+        // user's entire scrollback. Log the failure + continue; the UI
+        // sees N-1 messages instead of zero. Future polish: surface a
+        // placeholder "decrypt failed" Message stub so the user knows
+        // something exists at that slot. Out of Phase 4 scope.
+        let blob = match cas.get(&entry.message_cid).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                tracing::warn!(
+                    message_cid = ?entry.message_cid,
+                    "read_dm_thread: blob missing in CAS — skipping entry"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    message_cid = ?entry.message_cid,
+                    error = ?e,
+                    "read_dm_thread: cas.get failed — skipping entry"
+                );
+                continue;
+            }
+        };
         let payload =
-            crate::dm_crypto::decrypt_dm_message(content_key, prior_content_keys, aad, &blob)
-                .map_err(|e| format!("decrypt failed for {:?}: {e:?}", entry.message_cid))?;
+            match crate::dm_crypto::decrypt_dm_message(content_key, prior_content_keys, aad, &blob)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        message_cid = ?entry.message_cid,
+                        error = ?e,
+                        "read_dm_thread: decrypt failed — skipping entry"
+                    );
+                    continue;
+                }
+            };
         let is_self_outbound = entry.from == self_owner;
         // Self entries: join against outbox by (space_id, message_cid).
         // Outbox is keyed by OutboxEntryId so we walk values; Phase 4

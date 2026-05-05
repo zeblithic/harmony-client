@@ -90,7 +90,15 @@
       </button>
     {/each}
     {#if filteredProfiles.length === 0}
-      <p class="empty">No contacts match "{searchQuery}"</p>
+      <p class="empty">
+        {#if searchQuery === '' && profiles.size === 0}
+          No contacts yet — they'll appear here as your peers come online.
+        {:else if searchQuery === ''}
+          No more contacts available.
+        {:else}
+          No contacts match "{searchQuery}".
+        {/if}
+      </p>
     {/if}
   </div>
 

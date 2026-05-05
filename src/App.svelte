@@ -775,10 +775,24 @@
 
   // Filter to messages in the active channel (mock messages without
   // channel/hub pass through so pre-existing seed data still shows).
+  //
+  // PR #81 round 4 (Greptile P1): for DM/group-chat channels, skip the
+  // hub equality check entirely. DM Messages always carry `hub: ''`,
+  // but `activeHub` is computed via `findNearestFolder(node.id)` —
+  // which returns the folder's id when a DM is dragged into a folder.
+  // The folder placement is a NavService UI-state concept, not a DM
+  // message-routing key; channels live in hubs, DMs do not. Without
+  // this special-case the moment a user organizes a DM into a folder
+  // every message in that DM disappears from the feed.
   let channelMessages = $derived(
-    allMessages.filter(m =>
-      !m.channel || (m.channel === activeChannel && m.hub === activeHub)
-    )
+    allMessages.filter(m => {
+      if (!m.channel) return true; // mock seed pass-through
+      if (m.channel !== activeChannel) return false;
+      if (activeChannelType === 'dm' || activeChannelType === 'group-chat') {
+        return true; // DMs ignore hub — folder placement is UI-only
+      }
+      return m.hub === activeHub;
+    })
   );
 
   // Thread derivations — scoped to the active channel so thread

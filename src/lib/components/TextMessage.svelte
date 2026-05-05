@@ -25,13 +25,19 @@
 
   // ZEB-228 Phase 4: re-evaluate `canDelete` every 5s so the button
   // appears once a "sending" message crosses the 60s stuck threshold
-  // without requiring any external nudge. The interval is cheap (one
-  // setState every 5s while the component is mounted) and only matters
-  // for self-Messages whose deliveryState is 'sending'; for terminal
-  // states (expired/failed/delivered) the value never changes after
-  // mount.
+  // without requiring any external nudge.
+  //
+  // PR #81 round 4 (Greptile P2 + ZEB-242): only schedule the timer
+  // when this Message could actually transition states — that's
+  // self-Messages currently in 'sending'. Received messages, terminal
+  // self-Messages (delivered/expired/failed), and self-Messages
+  // without a messageId never need the tick. In a long DM thread
+  // with 50+ scrollback entries, this drops O(N) idle timers to 0.
   let now = $state(Date.now());
   $effect(() => {
+    if (!isSelf) return;
+    if (message.messageId === undefined) return;
+    if (message.deliveryState !== 'sending') return;
     const interval = setInterval(() => { now = Date.now(); }, 5_000);
     return () => clearInterval(interval);
   });

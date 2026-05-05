@@ -1943,10 +1943,10 @@ git add -A
 git commit -m "feat(zeb-228): + New DM button at nav sidebar bottom + DmCreateDialog wiring
 
 Click the button → modal opens. Submit → invokes add_space IPC,
-closes modal, switches active channel to the new SpaceId after
-a 50ms tick (gives NavService time to handle the nav-updated
-event from the apply_space result). Esc + overlay-click dismiss
-the modal."
+inserts the NavNode synchronously via navService.addOrUpdateDmSpace
+(no setTimeout — the backend doesn't emit nav-updated for DM
+creation in Phase 4), closes modal, switches active channel to
+the new SpaceId. Esc + overlay-click dismiss the modal."
 ```
 
 ---
