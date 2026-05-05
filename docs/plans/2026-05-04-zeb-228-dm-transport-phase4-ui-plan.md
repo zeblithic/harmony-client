@@ -93,10 +93,13 @@ pub struct ReceivedMessage {
 - [ ] **Step 2: Update `DrainOutcome` in `dm_outbox.rs`.**
 
 Find `DrainOutcome` (around line 292). Change:
+
 ```rust
 pub newly_received: Vec<crate::owner_state_types::InboxEntry>,
 ```
+
 to:
+
 ```rust
 pub newly_received: Vec<crate::owner_state_types::ReceivedMessage>,
 ```
@@ -106,6 +109,7 @@ Update the doc comment to mention body+mime_type+sent_at.
 - [ ] **Step 3: Update `handle_cidnotify` to populate `ReceivedMessage`.**
 
 Find the `apply_inbox` block in `handle_cidnotify` (around line 1085-1095). After:
+
 ```rust
 let outcome = state.apply_inbox(inbox_entry.clone());
 let mut drain_outcome = DrainOutcome::default();
@@ -115,6 +119,7 @@ if matches!(outcome, ApplyOutcome::Inserted) {
 ```
 
 Replace the `.push(inbox_entry)` with:
+
 ```rust
 drain_outcome.newly_received.push(crate::owner_state_types::ReceivedMessage {
     inbox_entry,
@@ -129,6 +134,7 @@ drain_outcome.newly_received.push(crate::owner_state_types::ReceivedMessage {
 - [ ] **Step 4: Update event_loop emit.**
 
 Find the `dm-received` emit at `event_loop.rs:1335-1344`. Replace:
+
 ```rust
 for entry in outcome.newly_received {
     let _ = app.emit(
@@ -142,7 +148,9 @@ for entry in outcome.newly_received {
     );
 }
 ```
+
 with:
+
 ```rust
 for rm in outcome.newly_received {
     let _ = app.emit(
@@ -1500,15 +1508,26 @@ it('loadDmThread fetches read_dm_thread IPC and populates messages reverse-chron
 
 ```typescript
 private dmThreadCursors: Map<string, number> = new Map();
+// First-visit guard: App.svelte calls loadDmThread on every channel
+// switch — without this, each switch would advance the cursor and
+// prepend progressively older history pages the user didn't ask for
+// (Cursor PR #81 round 2 finding). Future scroll-to-top backfill
+// should call a separate `loadOlderPage(spaceId)` that bypasses
+// the guard.
+private loadedDmSpaces: Set<string> = new Set();
 
 async loadDmThread(spaceId: string, pageSize: number = 50): Promise<void> {
   if (!this.adapter) return;
+  if (this.loadedDmSpaces.has(spaceId)) return;
   const cursor = this.dmThreadCursors.get(spaceId);
   const results: DmThreadMessage[] = await this.adapter.invoke('read_dm_thread', {
     spaceId,
     limit: pageSize,
     beforeHlc: cursor,
   });
+  // Mark loaded BEFORE the early-return so empty-page (start-of-thread
+  // cold case) also short-circuits future calls.
+  this.loadedDmSpaces.add(spaceId);
   if (results.length === 0) return;
 
   const newMessages: Message[] = results.map((r) => ({

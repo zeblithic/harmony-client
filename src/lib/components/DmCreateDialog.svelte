@@ -56,7 +56,7 @@
   }
 </script>
 
-<div class="dm-create-dialog" role="dialog" aria-labelledby="dm-create-title">
+<div class="dm-create-dialog" role="dialog" aria-modal="true" aria-labelledby="dm-create-title">
   <h2 id="dm-create-title">New direct message</h2>
 
   <input

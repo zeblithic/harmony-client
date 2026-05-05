@@ -1869,19 +1869,23 @@ fn filter_sort_paginate_inbox(
     let mut entries = entries;
     // Sort by received_at descending. Hlc has no Ord impl, so compare on
     // the (wall_ms, logical, device_id) tuple — same lex ordering
-    // `is_strictly_newer_than` uses.
+    // `is_strictly_newer_than` uses. Newest-first ordering means we
+    // call `b.cmp(&a)` (the inversion of natural ascending order) — the
+    // tuple keys below are NAMED for the element they describe so a
+    // future "fix" to align names with assignments doesn't silently
+    // flip the sort direction (Cursor PR #81 round 4 review).
     entries.sort_by(|a, b| {
-        let ka = (
-            b.received_at.wall_ms,
-            b.received_at.logical,
-            &b.received_at.device_id,
-        );
-        let kb = (
+        let key_a = (
             a.received_at.wall_ms,
             a.received_at.logical,
             &a.received_at.device_id,
         );
-        ka.cmp(&kb)
+        let key_b = (
+            b.received_at.wall_ms,
+            b.received_at.logical,
+            &b.received_at.device_id,
+        );
+        key_b.cmp(&key_a) // descending: larger keys first
     });
     if let Some(cursor) = before_hlc {
         entries.retain(|e| e.received_at.wall_ms < cursor);
