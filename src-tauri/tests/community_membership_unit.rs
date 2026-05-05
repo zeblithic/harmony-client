@@ -1142,7 +1142,7 @@ fn verify_event_rejects_kick_on_target_who_never_joined() {
         admin,
     );
     assert!(
-        prior_state.members.get(&stranger).is_none(),
+        !prior_state.members.contains_key(&stranger),
         "test setup: stranger must not be in prior state"
     );
 
