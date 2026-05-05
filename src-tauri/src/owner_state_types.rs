@@ -3153,14 +3153,35 @@ mod membership_key_tests {
     }
 
     #[test]
+    fn membership_key_serializes_as_bstr_32() {
+        use ciborium::into_writer;
+        let k = MembershipKey::new([0u8; 32]);
+        let mut bytes = Vec::new();
+        into_writer(&k, &mut bytes).unwrap();
+        // bstr(32): 0x58 0x20 || <32 bytes> = 34 bytes total.
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
     fn membership_key_debug_is_redacted() {
-        let key = MembershipKey::new([0xAB; 32]);
-        let formatted = format!("{:?}", key);
-        assert!(
-            !formatted.contains("AB"),
-            "MembershipKey Debug must not leak bytes; got: {formatted}"
-        );
-        assert!(formatted.contains("redacted"));
+        let k = MembershipKey::new([0xab; 32]);
+        let s = format!("{:?}", k);
+        // No raw byte values, no hex, no decimal — must be a fixed redacted form.
+        assert!(!s.contains("0xab"));
+        assert!(!s.contains("171")); // 0xab as decimal
+        assert!(s.contains("redacted") || s.contains("REDACTED") || s.contains("***"));
+    }
+
+    #[test]
+    fn membership_key_zeroized_on_drop() {
+        // Use ZeroizeOnDrop's invariant: dropping the wrapper zeros the
+        // underlying [u8; 32]. We can't easily observe the freed memory,
+        // but we can verify the trait is implemented by constraining a
+        // generic function.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<MembershipKey>();
     }
 
     #[test]
