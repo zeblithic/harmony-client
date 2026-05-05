@@ -207,6 +207,11 @@ pub enum VerifyError {
     CounterSigPowerInsufficient,
     ActorPowerInsufficient,
     KickTargetPowerNotLower,
+    /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
+    /// authorized actor cannot grant a power higher than the cap, since
+    /// that would create a member admin can no longer kick (admin's own
+    /// power is bounded by max).
+    PowerLevelOutOfRange,
     EncodeError(String),
 }
 
@@ -224,6 +229,9 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::KickTargetPowerNotLower => {
                 write!(f, "kick requires actor.power > target.power")
+            }
+            VerifyError::PowerLevelOutOfRange => {
+                write!(f, "SetPower level exceeds POWER_THRESHOLDS.max")
             }
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
@@ -570,9 +578,12 @@ pub fn verify_event(
                 return Err(VerifyError::KickTargetPowerNotLower);
             }
         }
-        MembershipEventKind::SetPower { .. } => {
+        MembershipEventKind::SetPower { level, .. } => {
             if actor_power < POWER_THRESHOLDS.set_power {
                 return Err(VerifyError::ActorPowerInsufficient);
+            }
+            if *level > POWER_THRESHOLDS.max {
+                return Err(VerifyError::PowerLevelOutOfRange);
             }
         }
     }

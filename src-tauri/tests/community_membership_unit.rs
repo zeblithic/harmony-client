@@ -863,6 +863,92 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
 // rejection path.
 
 #[test]
+fn verify_event_rejects_setpower_when_level_exceeds_max() {
+    // POWER_THRESHOLDS.max = 100. An admin (power 100) authorized to
+    // SetPower must NOT be able to assign 200/255/etc. — the cap is
+    // structural to the moderation model (no member can hold a power
+    // higher than admin can revoke).
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, bob, 200),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::SetPower {
+            target: bob,
+            level: 200, // > POWER_THRESHOLDS.max (100)
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &admin_key).expect("sign");
+
+    let admin_pubkey = admin_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &admin_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::PowerLevelOutOfRange);
+}
+
+#[test]
+fn verify_event_accepts_setpower_at_max_boundary() {
+    // Boundary check: level == POWER_THRESHOLDS.max (100) is allowed.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, bob, 200),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::SetPower {
+            target: bob,
+            level: POWER_THRESHOLDS.max, // exactly 100
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &admin_key).expect("sign");
+
+    let admin_pubkey = admin_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &admin_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    verify_event(&event, &prior_state, &ctx).expect("must accept level == max");
+}
+
+#[test]
 fn verify_event_rejects_when_actor_signature_invalid() {
     let admin = OwnerAddr([100u8; 16]);
     let alice = OwnerAddr([1u8; 16]);
