@@ -161,7 +161,7 @@ Create `src-tauri/src/community_state_crdt.rs`:
 //! `ev` for events) are 2 chars.
 
 use crate::community_membership::{EventId, SignedMembershipEvent};
-use crate::owner_state_crypto::{CanonicalPayload, CanonicalPayloadSealed};
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::SpaceId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1079,7 +1079,7 @@ Note the placeholder `REPLACE_AFTER_FIRST_GENERATION` — the first run will fai
 Append to `src-tauri/src/community_state_sync.rs`:
 
 ```rust
-use crate::owner_state_crypto::{CanonicalPayload, CanonicalPayloadSealed};
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
