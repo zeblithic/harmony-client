@@ -863,6 +863,207 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
 // rejection path.
 
 #[test]
+fn verify_event_rejects_invite_from_non_joined_actor() {
+    // Under v1 POWER_THRESHOLDS.invite = 0, the power check alone
+    // accepts anyone — so a non-member can otherwise emit a valid
+    // Invite. Membership must be the operative gate.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    // Only admin has joined; alice has NOT.
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Invite { target: bob },
+        actor: alice, // non-member!
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::ActorNotJoined);
+}
+
+#[test]
+fn verify_event_rejects_kick_from_non_joined_actor() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    // Alice has high power (somehow assigned), but never Joined.
+    // She must still be rejected from kicking — power without
+    // membership is meaningless.
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, bob, 200),
+            make_signed(
+                3,
+                MembershipEventKind::SetPower {
+                    target: alice,
+                    level: 100,
+                },
+                admin,
+                300,
+            ),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Kick {
+            target: bob,
+            reason: None,
+        },
+        actor: alice, // non-member!
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::ActorNotJoined);
+}
+
+#[test]
+fn verify_event_rejects_setpower_from_non_joined_actor() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, bob, 200),
+            make_signed(
+                3,
+                MembershipEventKind::SetPower {
+                    target: alice,
+                    level: 100,
+                },
+                admin,
+                300,
+            ),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::SetPower {
+            target: bob,
+            level: 50,
+        },
+        actor: alice, // non-member!
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::ActorNotJoined);
+}
+
+#[test]
+fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
+    // Even if the countersig is cryptographically valid, the
+    // countersigner must be a current Joined member — otherwise an
+    // attacker who somehow obtained an invite token from a non-member
+    // could vouch for arbitrary joiners.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let outsider = OwnerAddr([99u8; 16]);
+    let outsider_key = SigningKey::from_bytes(&[99u8; 32]);
+
+    // Only admin Joined; outsider exists in power_levels (e.g., from a
+    // pre-departure SetPower) but has never Joined.
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(
+                2,
+                MembershipEventKind::SetPower {
+                    target: outsider,
+                    level: 50,
+                },
+                admin,
+                200,
+            ),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = attach_countersig(&event, outsider, &outsider_key).expect("countersign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let outsider_pubkey = outsider_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: true,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: Some(&outsider_pubkey),
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::CounterSignerNotJoined);
+}
+
+#[test]
 fn verify_event_rejects_join_replay_after_kick() {
     // After a kicked actor's status materializes to Banned, a replayed
     // (or fresh) Join from that actor must be rejected — otherwise

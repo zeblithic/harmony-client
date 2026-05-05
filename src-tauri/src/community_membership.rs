@@ -216,6 +216,16 @@ pub enum VerifyError {
     /// Kick = effective ban until a dedicated unban flow exists, so a
     /// replayed Join must not silently overwrite the Banned status.
     BannedActorJoin,
+    /// Invite/Kick/SetPower issued by an actor who is not currently a
+    /// Joined member of the community. Power levels alone are not
+    /// sufficient — a non-member with high assigned power (e.g., a
+    /// former member after Leave or Kick, or an address that received
+    /// SetPower but never Joined) cannot wield community moderation.
+    ActorNotJoined,
+    /// Counter-signature on an invite-only Join is from an OwnerAddr
+    /// that is not currently a Joined member. Mirrors ActorNotJoined
+    /// for the countersigner side.
+    CounterSignerNotJoined,
     EncodeError(String),
 }
 
@@ -239,6 +249,18 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::BannedActorJoin => {
                 write!(f, "Join rejected: actor's prior status is Banned")
+            }
+            VerifyError::ActorNotJoined => {
+                write!(
+                    f,
+                    "actor is not currently a Joined member of this community"
+                )
+            }
+            VerifyError::CounterSignerNotJoined => {
+                write!(
+                    f,
+                    "countersig signer is not currently a Joined member of this community"
+                )
             }
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
@@ -543,8 +565,8 @@ pub fn verify_event(
         }
     }
 
-    // 3. For invite-only Joins, countersig is required + valid + the
-    //    signer must have sufficient power at the prior state's snapshot.
+    // 3. For invite-only Joins, countersig is required + valid +
+    //    countersigner is a Joined member with sufficient power.
     //
     // Note: under v1's hardcoded POWER_THRESHOLDS.invite = 0, the
     // power check below is unreachable (any owner addr defaults to
@@ -552,6 +574,11 @@ pub fn verify_event(
     // customization (ZEB-251) will make it firable when invite_threshold
     // > 0. Keeping the rule structurally in place now means ZEB-251
     // doesn't need to revisit verify_event.
+    //
+    // The Joined-membership check on the countersigner is the security-
+    // critical gate in v1: without it, any non-member with a valid
+    // countersig key (e.g., a former member who was Kicked but whose
+    // power_levels entry persists) could vouch for new joiners.
     if matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only {
         let cs = event
             .countersig
@@ -561,6 +588,10 @@ pub fn verify_event(
             .countersigner_pubkey
             .ok_or(VerifyError::CounterSigRequired)?;
         verify_countersig(event, cs_pubkey)?;
+
+        if !is_joined_member(prior_state, &cs.signer) {
+            return Err(VerifyError::CounterSignerNotJoined);
+        }
 
         let signer_power = prior_state
             .power_levels
@@ -572,7 +603,27 @@ pub fn verify_event(
         }
     }
 
-    // 4. Per-kind power rules.
+    // 4. Joined-membership check for moderation actions. Power-level
+    //    gating alone is insufficient — power without membership is
+    //    meaningless, and a former member's stale power_levels entry
+    //    must not let them moderate after departure.
+    match &event.kind {
+        MembershipEventKind::Join | MembershipEventKind::Leave => {
+            // Join is gated above (Banned guard + invite-only countersig).
+            // Leave is always allowed for the actor themselves; the
+            // materializer no-ops if they were never Joined, so a
+            // non-member's Leave is silently ignored downstream.
+        }
+        MembershipEventKind::Invite { .. }
+        | MembershipEventKind::Kick { .. }
+        | MembershipEventKind::SetPower { .. } => {
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ActorNotJoined);
+            }
+        }
+    }
+
+    // 5. Per-kind power rules.
     let actor_power = prior_state
         .power_levels
         .get(&event.actor)
@@ -609,6 +660,17 @@ pub fn verify_event(
     }
 
     Ok(())
+}
+
+/// True iff `addr` is currently a Joined member in `state`. Pure
+/// helper — no logging, no allocation. Used by verify_event to gate
+/// moderation actions and counter-signing on active membership.
+fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
+    state
+        .members
+        .get(addr)
+        .map(|s| s.status == MemberStatus::Joined)
+        .unwrap_or(false)
 }
 
 /// Per-community power thresholds. v1 hardcoded; per-community
