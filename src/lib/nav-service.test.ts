@@ -1,0 +1,349 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { NavService } from './nav-service';
+import type { TauriAdapter } from './zenoh-service';
+
+function createMockAdapter() {
+  const listeners: Record<string, Array<(event: { payload: unknown }) => void>> = {};
+  const adapter: TauriAdapter = {
+    invoke: vi.fn().mockResolvedValue(undefined),
+    listen: vi.fn().mockImplementation(async (event: string, handler: (event: { payload: unknown }) => void) => {
+      if (!listeners[event]) listeners[event] = [];
+      listeners[event].push(handler);
+      return () => {
+        listeners[event] = listeners[event].filter((h) => h !== handler);
+      };
+    }),
+  };
+  function emit(event: string, payload: unknown) {
+    for (const handler of listeners[event] ?? []) {
+      handler({ payload });
+    }
+  }
+  return { adapter, emit, listeners };
+}
+
+describe('NavService DM handling', () => {
+  let nav: NavService;
+  let mock: ReturnType<typeof createMockAdapter>;
+
+  beforeEach(async () => {
+    nav = new NavService();
+    mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+  });
+
+  afterEach(() => {
+    nav.destroy();
+  });
+
+  it('inserts a top-level NavNode for a new DM Space via nav-updated', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'aabbccdd00112233',
+      kind: 'dm',
+      name: 'DM with Bob',
+      members: ['bob-hex-address'],
+      parentId: null,
+    });
+
+    expect(nav.nodes).toContainEqual(expect.objectContaining({
+      id: 'aabbccdd00112233',
+      type: 'dm',
+      name: 'DM with Bob',
+      parentId: null,
+    }));
+  });
+
+  it('inserts a group-chat NavNode for a new GroupDm Space (kind=group-dm → type=group-chat)', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'eeff001122334455',
+      kind: 'group-dm',
+      name: 'Project Cabal',
+      members: ['bob-hex', 'carol-hex', 'dave-hex'],
+      parentId: null,
+    });
+
+    expect(nav.nodes).toContainEqual(expect.objectContaining({
+      id: 'eeff001122334455',
+      type: 'group-chat',
+      name: 'Project Cabal',
+      parentId: null,
+    }));
+  });
+
+  it('removes a NavNode on nav-updated action=removed', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'doomed-space',
+      kind: 'dm',
+      name: 'DM with Eve',
+      members: ['eve-hex'],
+      parentId: null,
+    });
+    expect(nav.nodes.some((n) => n.id === 'doomed-space')).toBe(true);
+
+    mock.emit('nav-updated', {
+      action: 'removed',
+      spaceId: 'doomed-space',
+      kind: 'dm',
+      name: '',
+    });
+
+    expect(nav.nodes.some((n) => n.id === 'doomed-space')).toBe(false);
+  });
+
+  it('updates an existing NavNode in place on nav-updated action=modified', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'rename-space',
+      kind: 'dm',
+      name: 'DM with Bob',
+      members: ['bob-hex'],
+      parentId: null,
+    });
+
+    mock.emit('nav-updated', {
+      action: 'modified',
+      spaceId: 'rename-space',
+      kind: 'dm',
+      name: 'Bob (renamed)',
+      members: ['bob-hex'],
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'rename-space');
+    expect(node).toBeDefined();
+    expect(node!.name).toBe('Bob (renamed)');
+  });
+
+  it('ignores nav-updated for non-DM kinds (channel/community/folder)', () => {
+    const before = nav.nodes.length;
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'channel-space',
+      kind: 'channel',
+      name: '#general',
+      parentId: null,
+    });
+    expect(nav.nodes.length).toBe(before);
+    expect(nav.nodes.some((n) => n.id === 'channel-space')).toBe(false);
+  });
+
+  it('replaces an existing node on duplicate added (no double-insert)', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'dup-space',
+      kind: 'dm',
+      name: 'First',
+      members: ['x-hex'],
+      parentId: null,
+    });
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'dup-space',
+      kind: 'dm',
+      name: 'Second',
+      members: ['x-hex'],
+      parentId: null,
+    });
+
+    const matches = nav.nodes.filter((n) => n.id === 'dup-space');
+    expect(matches).toHaveLength(1);
+    expect(matches[0].name).toBe('Second');
+  });
+
+  it('fires onChange when a DM nav-updated lands', () => {
+    const onChange = vi.fn();
+    nav.onChange = onChange;
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'change-space',
+      kind: 'dm',
+      name: 'DM with Bob',
+      members: ['bob-hex'],
+      parentId: null,
+    });
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it('attaches peer info for DM with a single member if profile is known', () => {
+    nav.profiles.set('known-peer-hex', {
+      address: 'known-peer-hex',
+      displayName: 'Known Peer',
+    });
+
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'peer-space',
+      kind: 'dm',
+      name: 'DM with Known Peer',
+      members: ['known-peer-hex'],
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'peer-space');
+    expect(node?.peer).toEqual({
+      address: 'known-peer-hex',
+      displayName: 'Known Peer',
+    });
+  });
+
+  it('Fix F: peer = non-self member from a 2-member DM payload', () => {
+    // Backend's add_space puts BOTH self and peer in `members` (sorted,
+    // deduped). The frontend used to only attach a peer when
+    // members.length === 1, which never matched the actual payload — so
+    // 1:1 DMs never got a Profile attachment.
+    nav.ownAddress = 'self-hex';
+    nav.profiles.set('peer-hex', {
+      address: 'peer-hex',
+      displayName: 'Real Peer',
+    });
+
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'two-member-dm',
+      kind: 'dm',
+      name: 'DM with Real Peer',
+      members: ['peer-hex', 'self-hex'],
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'two-member-dm');
+    expect(node?.peer?.address).toBe('peer-hex');
+    expect(node?.peer?.displayName).toBe('Real Peer');
+  });
+
+  it('Fix F: falls back to members[0] when ownAddress not yet set', () => {
+    nav.ownAddress = null;
+
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'pre-bootstrap-dm',
+      kind: 'dm',
+      name: 'Pending DM',
+      members: ['some-hex', 'other-hex'],
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'pre-bootstrap-dm');
+    // Either member is a defensible choice in the pre-bootstrap window.
+    // We pick members[0] for determinism; a later profile-update will
+    // refresh the peer attachment if needed.
+    expect(node?.peer?.address).toBe('some-hex');
+  });
+
+  it('Fix F: group-dm attaches no peer regardless of member count', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'group-space',
+      kind: 'group-dm',
+      name: 'Group',
+      members: ['a-hex', 'b-hex', 'c-hex'],
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'group-space');
+    expect(node?.peer).toBeUndefined();
+  });
+
+  it('Fix G: duplicate added preserves parentId/expanded/unread state', () => {
+    // First insert.
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'persistent-dm',
+      kind: 'dm',
+      name: 'DM with Bob',
+      members: ['bob-hex'],
+      parentId: null,
+    });
+
+    // User folders it under 'family' and reads up some unread state.
+    nav.nodes = nav.nodes.map((n) =>
+      n.id === 'persistent-dm'
+        ? {
+            ...n,
+            parentId: 'family-folder',
+            expanded: true,
+            unreadCount: 5,
+            unreadLevel: 'standard',
+          }
+        : n,
+    );
+
+    // Reconnect / cold-start replay re-emits the same `added`.
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'persistent-dm',
+      kind: 'dm',
+      name: 'DM with Bob',
+      members: ['bob-hex'],
+      parentId: null, // backend has no concept of user-applied folder placement
+    });
+
+    const node = nav.nodes.find((n) => n.id === 'persistent-dm');
+    expect(node?.parentId).toBe('family-folder');
+    expect(node?.expanded).toBe(true);
+    expect(node?.unreadCount).toBe(5);
+    expect(node?.unreadLevel).toBe('standard');
+  });
+});
+
+describe('NavService addOrUpdateDmSpace (direct call)', () => {
+  // Fix B from PR #81 review: there's no Rust-side `nav-updated` emit
+  // yet, so App.svelte's handleDmCreate calls addOrUpdateDmSpace
+  // directly after add_space returns. The behavior must match the
+  // listener's path (since a future backend emit could double-fire).
+  let nav: NavService;
+
+  beforeEach(() => {
+    nav = new NavService();
+    nav.nodes = [];
+  });
+
+  afterEach(() => {
+    nav.destroy();
+  });
+
+  it('synthesizes a NavNode without an IPC emit', () => {
+    nav.addOrUpdateDmSpace({
+      action: 'added',
+      spaceId: 'direct-space',
+      kind: 'dm',
+      name: 'DM with Carol',
+      members: ['carol-hex'],
+      parentId: null,
+    });
+
+    expect(nav.nodes).toHaveLength(1);
+    expect(nav.nodes[0]).toEqual(expect.objectContaining({
+      id: 'direct-space',
+      type: 'dm',
+      name: 'DM with Carol',
+    }));
+  });
+
+  it('fires onChange for direct-call additions', () => {
+    nav.onChange = vi.fn();
+    nav.addOrUpdateDmSpace({
+      action: 'added',
+      spaceId: 'direct-space',
+      kind: 'dm',
+      name: 'DM with Dan',
+      members: ['dan-hex'],
+      parentId: null,
+    });
+    expect(nav.onChange).toHaveBeenCalled();
+  });
+
+  it('ignores non-DM kinds when called directly', () => {
+    nav.addOrUpdateDmSpace({
+      action: 'added',
+      spaceId: 'channel-id',
+      kind: 'channel',
+      name: '#general',
+      parentId: null,
+    });
+    expect(nav.nodes).toHaveLength(0);
+  });
+});

@@ -4,7 +4,7 @@
   import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
-  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage }: {
+  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete }: {
     message: Message;
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
@@ -13,7 +13,44 @@
     trustVersion?: number;
     allMessages?: Message[];
     onScrollToMessage?: (messageId: string) => void;
+    /** ZEB-228 Phase 4: true when the message was sent by the local
+     *  user; gates whether the inline delete button is rendered. */
+    isSelf?: boolean;
+    /** ZEB-228 Phase 4: invoked with the OutboxEntryId (hex) when the
+     *  user clicks the inline ⓧ on a stuck/expired self-Message. The
+     *  parent is responsible for the ConfirmDialog + delete_outbox_entry
+     *  IPC call; this component only surfaces the request. */
+    onDelete?: (messageId: string) => void;
   } = $props();
+
+  // ZEB-228 Phase 4: re-evaluate `canDelete` every 5s so the button
+  // appears once a "sending" message crosses the 60s stuck threshold
+  // without requiring any external nudge.
+  //
+  // PR #81 round 4 (Greptile P2 + ZEB-242): only schedule the timer
+  // when this Message could actually transition states — that's
+  // self-Messages currently in 'sending'. Received messages, terminal
+  // self-Messages (delivered/expired/failed), and self-Messages
+  // without a messageId never need the tick. In a long DM thread
+  // with 50+ scrollback entries, this drops O(N) idle timers to 0.
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!isSelf) return;
+    if (message.messageId === undefined) return;
+    if (message.deliveryState !== 'sending') return;
+    const interval = setInterval(() => { now = Date.now(); }, 5_000);
+    return () => clearInterval(interval);
+  });
+
+  let canDelete = $derived(
+    isSelf
+    && message.messageId !== undefined
+    && (
+      message.deliveryState === 'expired'
+      || message.deliveryState === 'failed'
+      || (message.deliveryState === 'sending' && now - message.timestamp > 60_000)
+    )
+  );
 
   let timeStr = $derived(
     new Date(message.timestamp).toLocaleTimeString([], {
@@ -52,6 +89,16 @@
     <div class="message-header">
       <span class="sender-name">{message.sender.displayName}</span>
       <span class="timestamp">{timeStr}</span>
+      {#if canDelete}
+        <button
+          type="button"
+          class="delete-btn"
+          aria-label="Delete this message"
+          onclick={() => { if (message.messageId) onDelete?.(message.messageId); }}
+        >
+          &#9447;
+        </button>
+      {/if}
     </div>
     {#if parentMessage}
       <button
@@ -153,6 +200,26 @@
   .timestamp {
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .delete-btn {
+    background: transparent;
+    border: none;
+    padding: 0 4px;
+    margin-left: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .delete-btn:hover {
+    color: #d83c3e;
+  }
+
+  .delete-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
 
   .message-text {

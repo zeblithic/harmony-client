@@ -227,21 +227,23 @@ async fn dm_full_round_trip_through_unicast_channel() {
     // ── Send a DM from Alice → Bob. ──
     let body = b"hello bob".to_vec();
     let mime_type = "text/plain".to_string();
+    let send_wall_ms: u64 = 200;
     let _msg_id = {
         let mut alice_g = alice_state.lock().await;
         let mut alice_outbox_g = alice_outbox.lock().await;
-        alice_outbox_g
+        let (msg_id, _msg_cid) = alice_outbox_g
             .send_dm(
                 &mut alice_g,
                 cas.as_ref(),
                 space_id,
                 body.clone(),
-                mime_type,
-                200,
+                mime_type.clone(),
+                send_wall_ms,
                 None,
             )
             .await
-            .expect("send_dm ok")
+            .expect("send_dm ok");
+        msg_id
     };
 
     // ── Drain Alice's outbox: drain resolves Bob's destinations from
@@ -294,7 +296,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
         1,
         "Bob's apply_inbox should have inserted one entry (CidNotify happy path)"
     );
-    let received_cid = bob_outcome.newly_received[0].message_cid;
+    let received_cid = bob_outcome.newly_received[0].inbox_entry.message_cid;
     {
         let bob_g = bob_state.lock().await;
         assert!(
@@ -305,6 +307,28 @@ async fn dm_full_round_trip_through_unicast_channel() {
             "Bob's inbox must contain the freshly-applied entry"
         );
     }
+
+    // Phase 4: ReceivedMessage carries the decrypted body + mime_type +
+    // sender's HLC sent_at. The IPC emit threads these into the
+    // dm-received payload — assert they survive the encrypt → decrypt
+    // round-trip intact and aren't shuffled / dropped.
+    let received = &bob_outcome.newly_received[0];
+    assert_eq!(
+        received.body, body,
+        "decrypted body must match Alice's plaintext"
+    );
+    assert_eq!(
+        received.mime_type, mime_type,
+        "mime_type must match Alice's send_dm input"
+    );
+    assert_eq!(
+        received.sent_at.wall_ms, send_wall_ms,
+        "sent_at.wall_ms must match the wall_now_ms Alice's send_dm stamped"
+    );
+    assert_eq!(
+        received.sent_at.device_id, "alice-device",
+        "sent_at.device_id must be Alice's signing device (sender's HLC)"
+    );
 
     // ── Bob's ack got pushed onto bob_unicast_tx (one ack per device in
     //    `signed.sender_devices` — single device for Alice). ──

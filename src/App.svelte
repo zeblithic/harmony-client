@@ -18,6 +18,8 @@
   import MailCompose from './lib/components/MailCompose.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
+  import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
+  import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
@@ -30,7 +32,7 @@
   import { VineService } from './lib/vine-service';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
-  import type { AppMode, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
+  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -130,6 +132,88 @@
     vineService.toggleLike(vine).catch((err) => {
       console.error('Toggle like failed', err);
     });
+  }
+
+  // ── DM creation modal (ZEB-228 Phase 4 Task 13) ─────────────────────
+  // The "+ New DM" button at the bottom of the nav sidebar opens this
+  // modal. Submit invokes `add_space` (DM/GroupDm wire codes), which
+  // dispatches DmInvites; the backend's apply_space + nav-updated emit
+  // will trigger NavService to insert the new NavNode. We switch to it
+  // after a short tick so NavService has time to receive the event.
+  let dmCreateDialogOpen = $state(false);
+
+  async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const spaceId = (await invoke('add_space', {
+        kind: args.kind, // backend accepts the wire codes "dm" / "group-dm"
+        name: args.name,
+        members: args.members,
+      })) as string;
+      dmCreateDialogOpen = false;
+      // Fix B from PR #81 review: there's no Rust-side `nav-updated`
+      // emit yet, so waiting on the IPC event meant the new DM never
+      // appeared in the nav tree. Synthesize the NavNode directly via
+      // navService — same logic the (still-wired) listener uses, so a
+      // future backend emit won't double-insert (the duplicate-added
+      // path preserves UI state via Fix G).
+      navService.addOrUpdateDmSpace({
+        action: 'added',
+        spaceId,
+        kind: args.kind,
+        name: args.name,
+        members: args.members,
+        parentId: null,
+      });
+      // Switch synchronously — the node is in navService.nodes now, no
+      // need for the old setTimeout delay.
+      handleNodeClick(spaceId);
+    } catch (e) {
+      // Phase 4 v1: log to console. The dialog's client-side recipient cap
+      // catches the most common failure (16+ members); other failures
+      // (backend not ready, decoding errors) are rare and currently shown
+      // only in the dev console. Toast UX is a polish follow-up.
+      console.error('add_space failed:', e);
+    }
+  }
+
+  // ── Inline manual delete on stuck/expired DMs (ZEB-228 Phase 4 Task 14) ─
+  // TextMessage surfaces an inline ⓧ when a self-Message has been stuck in
+  // 'sending' for >60s, or has reached terminal 'expired'/'failed' state.
+  // The click drops here through TextFeed.onMessageDelete; we open a
+  // ConfirmDialog with state-appropriate copy. Confirm dispatches the
+  // delete_outbox_entry IPC; the backend's `dm-deleted` event arrives
+  // and MessageService prunes the message from the per-channel buffer.
+  let pendingDeleteMessageId: string | null = $state(null);
+  let pendingDeleteState: string | null = $state(null);
+
+  function requestDeleteMessage(messageId: string) {
+    const msg = messageService.messages.find((m) => m.messageId === messageId);
+    pendingDeleteMessageId = messageId;
+    pendingDeleteState = msg?.deliveryState ?? null;
+  }
+
+  async function confirmDeleteMessage() {
+    if (!pendingDeleteMessageId) return;
+    const id = pendingDeleteMessageId;
+    pendingDeleteMessageId = null;
+    pendingDeleteState = null;
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('delete_outbox_entry', { messageId: id });
+      // The `dm-deleted` IPC event will land via MessageService's
+      // subscription (Task 5) and prune the message from the buffer.
+    } catch (e) {
+      // Production rejections are strings; tests may surface Error objects.
+      // Per `feedback_tauri_error_extraction`: always normalize.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('delete_outbox_entry failed:', msg);
+    }
+  }
+
+  function cancelDeleteMessage() {
+    pendingDeleteMessageId = null;
+    pendingDeleteState = null;
   }
 
   /** Detect video MIME type from magic bytes. */
@@ -678,14 +762,37 @@
     if (switched) {
       openThreadId = null;
     }
+    // Phase 4 (ZEB-228) — fetch decrypted DM scrollback on switch so
+    // cold-start (no live dm-received yet) renders history. Per-channel
+    // pagination cursor in MessageService prevents repeat fetches of
+    // the same page on rapid switches; no-op when offline / pre-adapter.
+    if (node.type === 'dm' || node.type === 'group-chat') {
+      messageService.loadDmThread(node.id).catch((e) => {
+        console.error('loadDmThread failed:', e);
+      });
+    }
   }
 
   // Filter to messages in the active channel (mock messages without
   // channel/hub pass through so pre-existing seed data still shows).
+  //
+  // PR #81 round 4 (Greptile P1): for DM/group-chat channels, skip the
+  // hub equality check entirely. DM Messages always carry `hub: ''`,
+  // but `activeHub` is computed via `findNearestFolder(node.id)` —
+  // which returns the folder's id when a DM is dragged into a folder.
+  // The folder placement is a NavService UI-state concept, not a DM
+  // message-routing key; channels live in hubs, DMs do not. Without
+  // this special-case the moment a user organizes a DM into a folder
+  // every message in that DM disappears from the feed.
   let channelMessages = $derived(
-    allMessages.filter(m =>
-      !m.channel || (m.channel === activeChannel && m.hub === activeHub)
-    )
+    allMessages.filter(m => {
+      if (!m.channel) return true; // mock seed pass-through
+      if (m.channel !== activeChannel) return false;
+      if (activeChannelType === 'dm' || activeChannelType === 'group-chat') {
+        return true; // DMs ignore hub — folder placement is UI-only
+      }
+      return m.hub === activeHub;
+    })
   );
 
   // Thread derivations — scoped to the active channel so thread
@@ -759,6 +866,61 @@
   }
 
   async function handleSend(text: string, priority: MessagePriority) {
+    // Phase 4 (ZEB-228) — DM/GroupDm channels route through the
+    // send_dm IPC instead of the channel publish path. Optimistic UI:
+    // a placeholder Message is pushed in 'sending' state immediately;
+    // on success the placeholder's id is swapped for the real
+    // OutboxEntryId returned by send_dm so dm-delivered / dm-expired
+    // can correlate via `messageId`. On failure the placeholder is
+    // marked 'failed' (kept visible — losing the bubble would hide
+    // the user's intent).
+    if (activeChannelType === 'dm' || activeChannelType === 'group-chat') {
+      const optimisticId = crypto.randomUUID();
+      const optimistic: Message = {
+        id: optimisticId,
+        // Fix D from PR #81 review: self-sender uses the 'self' sentinel
+        // (matches the channel-publish convention). Using the real
+        // ownAddress here confused downstream classification (e.g.
+        // knownPeers derivation, isSelf computation in TextFeed).
+        sender: { address: 'self', displayName: 'You' },
+        text,
+        timestamp: Date.now(),
+        media: [],
+        priority,
+        channel: activeChannel,
+        // Fix A from PR #81 review: top-level DMs have activeHub=''; the
+        // feed filter compares Message.hub against activeHub — without
+        // hub:'' here, the optimistic bubble fails the filter and never
+        // renders in the active feed.
+        hub: '',
+        deliveryState: 'sending',
+      };
+      messageService.pushOptimistic(optimistic);
+
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        // Fix C from PR #81 review: send_dm now returns
+        // { messageId, messageCid } (post-b58a15b). messageCid is the
+        // stable id (matches the dm-received echo / scrollback fetch);
+        // messageId is the OutboxEntryId used only for lifecycle
+        // correlation in dm-delivered / dm-expired / dm-deleted.
+        const result = (await invoke('send_dm', {
+          spaceId: activeChannel,
+          content: Array.from(new TextEncoder().encode(text)),
+          mimeType: 'text/plain',
+        })) as { messageId: string; messageCid: string };
+        messageService.replaceOptimisticId(
+          optimisticId,
+          result.messageCid,
+          result.messageId,
+        );
+      } catch (e) {
+        messageService.markFailed(optimisticId, String(e));
+        console.error('DM send failed:', e);
+      }
+      return;
+    }
+
     try {
       await messageService.send(text, priority, activeChannel, activeHub);
     } catch (err) {
@@ -806,23 +968,35 @@
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
   {#snippet nav()}
-    <NavPanel
-      nodes={navNodes}
-      {collapsed}
-      activeNodeId={activeChannel}
-      onNodeClick={handleNodeClick}
-      onSettingsClick={() => { showSettings = !showSettings; }}
-      profileLookup={(addr) => navService.profileLookup(addr)}
-      onModeChange={switchMode}
-      {appMode}
-      contentItems={allFileContents}
-      storageBuddies={fileBuddies}
-      {fileSection}
-      {currentFolderCid}
-      onFolderSelect={handleNavigateFolder}
-      filters={fileFilters}
-      onFilterChange={(filters) => { fileFilters = filters; }}
-    />
+    <div class="nav-with-dm-create">
+      <NavPanel
+        nodes={navNodes}
+        {collapsed}
+        activeNodeId={activeChannel}
+        onNodeClick={handleNodeClick}
+        onSettingsClick={() => { showSettings = !showSettings; }}
+        profileLookup={(addr) => navService.profileLookup(addr)}
+        onModeChange={switchMode}
+        {appMode}
+        contentItems={allFileContents}
+        storageBuddies={fileBuddies}
+        {fileSection}
+        {currentFolderCid}
+        onFolderSelect={handleNavigateFolder}
+        filters={fileFilters}
+        onFilterChange={(filters) => { fileFilters = filters; }}
+      />
+      {#if !collapsed && appMode === 'messages'}
+        <button
+          type="button"
+          class="new-dm-button"
+          onclick={() => { dmCreateDialogOpen = true; }}
+          title="New direct message"
+        >
+          <span aria-hidden="true">+</span> New DM
+        </button>
+      {/if}
+    </div>
   {/snippet}
   {#snippet textFeed()}
     <TextFeed
@@ -844,6 +1018,8 @@
       onThreadSend={handleThreadSend}
       onScrollToMessage={scrollToMessage}
       {pinnedThreadIds}
+      onMessageDelete={requestDeleteMessage}
+      ownAddress={messageService.ownAddress ?? ''}
     />
   {/snippet}
   {#snippet mediaFeed()}
@@ -1045,6 +1221,51 @@
   />
 {/if}
 
+{#if dmCreateDialogOpen}
+  <!-- ZEB-228 Phase 4: DM creation modal. Overlay-click and Esc dismiss;
+       inner content stops click propagation so dialog clicks don't
+       dismiss. Fix H from PR #81 review: keydown propagation is NOT
+       stopped — the overlay's `onkeydown={Escape}` needs to receive
+       events whose target is inside .modal-content (e.g. when focus is
+       in the search input). Stopping keydown blocked Esc-to-dismiss. -->
+  <div
+    class="modal-overlay"
+    role="presentation"
+    onclick={() => { dmCreateDialogOpen = false; }}
+    onkeydown={(e) => { if (e.key === 'Escape') dmCreateDialogOpen = false; }}
+  >
+    <div
+      class="modal-content"
+      role="dialog"
+      aria-modal="true"
+      onclick={(e) => e.stopPropagation()}
+    >
+      <DmCreateDialog
+        profiles={navService.profiles}
+        onSubmit={handleDmCreate}
+        onCancel={() => { dmCreateDialogOpen = false; }}
+      />
+    </div>
+  </div>
+{/if}
+
+{#if pendingDeleteMessageId}
+  <!-- ZEB-228 Phase 4 Task 14: confirmation for inline delete on stuck/
+       expired DM messages. Copy switches by lifecycle state — expired
+       implies the 30-day TTL ran out, anything else implies the recipient
+       hasn't seen it yet. -->
+  <ConfirmDialog
+    title="Delete message?"
+    message={pendingDeleteState === 'expired'
+      ? "Delete this expired message? It's been undeliverable for 30 days."
+      : "Delete this message? It hasn't been delivered yet. Recipients who haven't received it won't see it."}
+    confirmLabel="Delete"
+    destructive={true}
+    onConfirm={confirmDeleteMessage}
+    onCancel={cancelDeleteMessage}
+  />
+{/if}
+
 <style>
   :global(.text-message) {
     transition: background 0.3s ease;
@@ -1060,5 +1281,52 @@
     justify-content: center;
     height: 100%;
     color: var(--text-muted, #949ba4);
+  }
+
+  /* ── DM creation: nav sidebar wrapper + button + modal ────────────── */
+  /* Wraps NavPanel + the "+ New DM" button in a flex column so the
+     button sits at the bottom of the nav sidebar without scrolling
+     out of view. NavPanel's outer .nav-panel is height:100% — we
+     override with flex:1 + min-height:0 so it shares space with the
+     button instead of forcing a vertical overflow. */
+  .nav-with-dm-create {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+  :global(.nav-with-dm-create > .nav-panel) {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+  }
+  .new-dm-button {
+    flex-shrink: 0;
+    width: 100%;
+    padding: 8px 12px;
+    background: rgba(120, 140, 200, 0.15);
+    color: var(--text-primary, #e8eaed);
+    border: none;
+    border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+    cursor: pointer;
+    font-size: 13px;
+    text-align: center;
+  }
+  .new-dm-button:hover {
+    background: rgba(120, 140, 200, 0.3);
+  }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal-content {
+    background: var(--bg-secondary, #222);
+    border-radius: 8px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   }
 </style>

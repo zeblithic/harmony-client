@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import TextMessage from '../TextMessage.svelte';
 import { TrustService } from '../../trust-service';
@@ -116,5 +116,126 @@ describe('TextMessage', () => {
       props: { message: mockMessage, trustService: trustedService() },
     });
     expect(screen.queryByText(/↩/)).toBeNull();
+  });
+});
+
+// ZEB-228 Phase 4 Task 14 — inline manual delete on stuck/expired DM messages.
+// Self-Messages whose lifecycle has stalled (expired/failed/sending>60s) get an
+// inline ⓧ button. The button is only meaningful for self-sent DM messages that
+// already have a `messageId` (the OutboxEntryId used to correlate the
+// `delete_outbox_entry` IPC).
+describe('TextMessage delete button (ZEB-228 Phase 4)', () => {
+  const baseSelfMessage: Message = {
+    id: 'self-1',
+    sender: { address: 'self', displayName: 'You' },
+    text: 'hello',
+    timestamp: Date.now(),
+    media: [],
+    priority: 'standard',
+    messageId: 'mid1',
+  };
+
+  it('shows delete button for self-Message in expired state', () => {
+    render(TextMessage, {
+      props: {
+        message: { ...baseSelfMessage, deliveryState: 'expired' },
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeTruthy();
+  });
+
+  it('shows delete button for self-Message in failed state', () => {
+    render(TextMessage, {
+      props: {
+        message: { ...baseSelfMessage, deliveryState: 'failed' },
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeTruthy();
+  });
+
+  it('shows delete button for self-Message stuck in sending > 60s', () => {
+    render(TextMessage, {
+      props: {
+        message: {
+          ...baseSelfMessage,
+          deliveryState: 'sending',
+          timestamp: Date.now() - 70_000,
+        },
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeTruthy();
+  });
+
+  it('hides delete button for self-Message in sending state under 60s', () => {
+    render(TextMessage, {
+      props: {
+        message: {
+          ...baseSelfMessage,
+          deliveryState: 'sending',
+          timestamp: Date.now() - 5_000,
+        },
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeNull();
+  });
+
+  it('hides delete button for received messages', () => {
+    render(TextMessage, {
+      props: {
+        message: { ...baseSelfMessage, deliveryState: 'expired' },
+        isSelf: false,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeNull();
+  });
+
+  it('hides delete button for delivered self-Message', () => {
+    render(TextMessage, {
+      props: {
+        message: { ...baseSelfMessage, deliveryState: 'delivered' },
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeNull();
+  });
+
+  it('hides delete button when messageId is undefined', () => {
+    const noIdMsg: Message = {
+      ...baseSelfMessage,
+      deliveryState: 'expired',
+    };
+    delete noIdMsg.messageId;
+    render(TextMessage, {
+      props: {
+        message: noIdMsg,
+        isSelf: true,
+        onDelete: vi.fn(),
+      },
+    });
+    expect(screen.queryByLabelText(/delete this message/i)).toBeNull();
+  });
+
+  it('calls onDelete with messageId when clicked', async () => {
+    const onDelete = vi.fn();
+    render(TextMessage, {
+      props: {
+        message: { ...baseSelfMessage, deliveryState: 'expired' },
+        isSelf: true,
+        onDelete,
+      },
+    });
+    const btn = screen.getByLabelText(/delete this message/i);
+    await fireEvent.click(btn);
+    expect(onDelete).toHaveBeenCalledWith('mid1');
   });
 });

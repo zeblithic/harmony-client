@@ -1,7 +1,24 @@
 import type { TauriAdapter, ProfilePayload } from './zenoh-service';
-import type { NavNode, Profile } from './types';
+import type { NavNode, NavNodeType, Profile } from './types';
 import type { AvatarResolver } from './avatar-resolver';
 import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
+
+/**
+ * Phase 4 (ZEB-228) — wire shape of the `nav-updated` IPC event.
+ *
+ * Emitted by the backend when a Space CRDT entry is added, modified,
+ * or removed. Phase 4 only acts on `dm` and `group-dm` kinds; channel,
+ * community, and folder kinds are reserved for later phases and
+ * silently ignored here.
+ */
+export interface NavUpdatedPayload {
+  action: 'added' | 'removed' | 'modified';
+  spaceId: string;
+  kind: 'dm' | 'group-dm' | 'channel' | 'community' | 'folder';
+  name: string;
+  members?: string[];
+  parentId?: string | null;
+}
 
 /**
  * Manages navigation tree state and peer profile lookups.
@@ -80,6 +97,112 @@ export class NavService {
       },
     );
     this.unlisteners.push(unlistenProfile);
+
+    const unlistenNav = await adapter.listen('nav-updated', (event) => {
+      this.addOrUpdateDmSpace(event.payload as NavUpdatedPayload);
+    });
+    this.unlisteners.push(unlistenNav);
+  }
+
+  /**
+   * Phase 4 (ZEB-228) — apply a `nav-updated`-shaped payload to the
+   * NavNode tree. Extracted from the `nav-updated` listener so the
+   * frontend `add_space` IPC path (App.svelte:handleDmCreate) can
+   * synthesize the same NavNode without depending on a backend emit
+   * (no `nav-updated` emit exists on the Rust side yet — Fix B from
+   * PR #81 review).
+   */
+  addOrUpdateDmSpace(payload: NavUpdatedPayload): void {
+    const { action, spaceId, kind, name, members, parentId } = payload;
+    // Phase 4 only handles DM/GroupDm Spaces — channel/community/folder
+    // events are reserved for other phases.
+    if (kind !== 'dm' && kind !== 'group-dm') return;
+
+    if (action === 'removed') {
+      const before = this.nodes.length;
+      this.nodes = this.nodes.filter((n) => n.id !== spaceId);
+      if (this.nodes.length !== before) this.onChange?.();
+      return;
+    }
+
+    const navType: NavNodeType = kind === 'dm' ? 'dm' : 'group-chat';
+    // Fix F from PR #81 review: backend's `add_space` puts BOTH self
+    // and peer in `members` (sorted, deduped). For 1:1 DMs the peer is
+    // whichever member isn't us. Fall back to members[0] in the
+    // pre-bootstrap case where ownAddress isn't set yet, and to
+    // members.length===1 (legacy / test-only shape) for safety. Group
+    // DMs (kind='group-dm') never get a single-peer attachment.
+    let peerAddress: string | undefined;
+    if (kind === 'dm' && members && members.length > 0) {
+      if (this.ownAddress) {
+        peerAddress = members.find((a) => a !== this.ownAddress) ?? members[0];
+      } else {
+        peerAddress = members[0];
+      }
+    }
+    const peerProfile = peerAddress ? this.profiles.get(peerAddress) : undefined;
+    const peer = peerAddress
+      ? {
+          address: peerAddress,
+          displayName: peerProfile?.displayName ?? name,
+          avatarUrl: peerProfile?.avatarUrl,
+        }
+      : undefined;
+    const newNode: NavNode = {
+      id: spaceId,
+      type: navType,
+      name,
+      parentId: parentId ?? null,
+      expanded: false,
+      unreadCount: 0,
+      unreadLevel: 'none',
+      peer,
+    };
+
+    if (action === 'added') {
+      // Fix G from PR #81 review: a duplicate `added` (reconnect /
+      // cold-start replay) must not wipe user-applied UI state. Preserve
+      // parentId (folder placement), expanded, and unread counters from
+      // the existing node. Round 3: also preserve the cached peer when
+      // the replayed payload omits members (mirrors what the modified
+      // path already does — without this, a name-only re-emit would
+      // drop displayName/avatarUrl back to undefined).
+      const existing = this.nodes.find((n) => n.id === spaceId);
+      if (existing) {
+        const peerWasDerivedFromPayload = members !== undefined;
+        const merged: NavNode = {
+          ...newNode,
+          parentId: existing.parentId,
+          expanded: existing.expanded,
+          unreadCount: existing.unreadCount,
+          unreadLevel: existing.unreadLevel,
+          peer: peerWasDerivedFromPayload ? newNode.peer : existing.peer,
+        };
+        this.nodes = this.nodes.map((n) => (n.id === spaceId ? merged : n));
+      } else {
+        this.nodes = [...this.nodes, newNode];
+      }
+    } else if (action === 'modified') {
+      // Patch in-place — preserve existing parentId/expanded/unread state
+      // so user-applied folder placement and read state aren't clobbered
+      // by a name change. Also preserve cached `peer` when the modified
+      // payload omits `members` (name-only update); only overwrite peer
+      // when the new payload actually carried member info we could
+      // derive a fresh peer from.
+      const peerWasDerivedFromPayload = members !== undefined;
+      let found = false;
+      this.nodes = this.nodes.map((n) => {
+        if (n.id !== spaceId) return n;
+        found = true;
+        return { ...n, name, peer: peerWasDerivedFromPayload ? peer : n.peer };
+      });
+      if (!found) {
+        // Modified for an unknown spaceId — treat as added to stay
+        // self-healing on missed `added` events.
+        this.nodes = [...this.nodes, newNode];
+      }
+    }
+    this.onChange?.();
   }
 
   /** Look up a peer's status text by address. */

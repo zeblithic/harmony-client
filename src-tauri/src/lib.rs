@@ -221,6 +221,15 @@ pub struct NodeState {
     /// `RuntimeEvent::SendUnicastToDevice`. Cleared on stop_node so a
     /// restart's transport doesn't carry a stale sender.
     unicast_send_tx: Option<tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    /// ZEB-228 Phase 4: 64-byte combined `identity_pub` for our local
+    /// device (X25519_pub(32) || Ed25519_pub(32) per
+    /// `harmony_identity::Identity::to_public_bytes()`). Captured in
+    /// `start_node` before the in-memory `PrivateIdentity` is dropped, so
+    /// `add_space` can ship it as the bootstrap pubkey on outbound
+    /// `DmInvite` packets without re-deriving from the private bytes.
+    /// Cleared on stop_node so a stale pub never leaks into a new
+    /// identity's invites.
+    dm_identity_pub_64: Option<[u8; 64]>,
 }
 
 impl NodeState {
@@ -264,6 +273,7 @@ impl Default for NodeState {
             dm_self_owner: None,
             content_store: None,
             unicast_send_tx: None,
+            dm_identity_pub_64: None,
         }
     }
 }
@@ -444,7 +454,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             }
         }
         guard.node_addr.clear();
-        (
+        let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
             guard.publish_tx.take(),
@@ -471,7 +481,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_self_owner.take(),
             guard.content_store.take(),
             guard.unicast_send_tx.take(),
-        )
+        );
+        // ZEB-228 Phase 4: clear our cached identity_pub so a restart
+        // can't accidentally ship the prior identity's pub on a new
+        // identity's invites. `[u8; 64]` is Copy, so just `take()` and
+        // discard — no extra cleanup needed beyond the assignment.
+        let _ = guard.dm_identity_pub_64.take();
+        tup
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
@@ -704,6 +720,10 @@ async fn start_node(
         let _old_followed_set = guard.followed_set.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
+        // ZEB-228 Phase 4: clear our cached identity_pub so a restart
+        // can't ship the prior identity's pub on the new identity's
+        // outbound DmInvites. Mirrors stop_inner's cleanup.
+        let _ = guard.dm_identity_pub_64.take();
         tup
     };
 
@@ -768,6 +788,15 @@ async fn start_node(
         let local_dsa_pubkey = pq_pub.verifying_key.as_bytes();
         let local_kem_pubkey = pq_pub.encryption_key.as_bytes();
         drop(pq);
+
+        // ZEB-228 Phase 4: capture our 64-byte combined identity_pub
+        // (X25519_pub(32) || Ed25519_pub(32) per
+        // `harmony_identity::Identity::to_public_bytes()`) BEFORE the
+        // ed25519 PrivateIdentity is dropped below. add_space ships this
+        // as the bootstrap pubkey on outbound DmInvite packets so the
+        // recipient can verify the signature without a prior
+        // OwnerDeviceCache entry for us.
+        let identity_pub_64: [u8; 64] = ed25519.public_identity().to_public_bytes();
 
         let reticulum_identity_bytes = Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
         drop(ed25519);
@@ -1209,6 +1238,11 @@ async fn start_node(
                 // event_loop above; the sender remains unused-by-production
                 // until Task 11 wires it to the real transport.
                 guard.unicast_send_tx = Some(unicast_send_tx.clone());
+                // ZEB-228 Phase 4: store our 64-byte combined identity_pub
+                // so add_space can ship it as the bootstrap pubkey on
+                // outbound DmInvite packets. Captured above before the
+                // ed25519 PrivateIdentity was dropped.
+                guard.dm_identity_pub_64 = Some(identity_pub_64);
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -1569,6 +1603,33 @@ async fn send_message(
         .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
+/// IPC payload for `send_dm` — both ids the frontend needs to thread the
+/// optimistic / `dm-received` / `read_dm_thread` paths together.
+///
+/// Why both ids:
+///   - `messageCid` is the content hash. `dm-received` events and
+///     `read_dm_thread` results both key on this; the frontend uses it as
+///     the stable identity that survives "optimistic local message"
+///     becoming "self-echo from the receive path" without a duplicate.
+///   - `messageId` (OutboxEntryId) is the lifecycle handle. `dm-delivered`,
+///     `dm-expired`, `dm-deleted`, and `delete_outbox_entry` all key on
+///     this — it's the OutboxEntry primary key.
+///
+/// Returning only one would force the caller to either re-fetch the other
+/// (TOCTOU window) or live with a 3-way dedupe failure between the
+/// optimistic-local path, the dm-received path, and the cold-start
+/// scrollback path. PR #81 review surfaced exactly that bug.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SendDmResult {
+    /// Hex-encoded OutboxEntryId (16 bytes → 32 hex chars). Use for
+    /// lifecycle correlation (dm-delivered / dm-expired / delete).
+    pub message_id: String,
+    /// Hex-encoded ContentId (32 bytes → 64 hex chars). Use as the
+    /// stable cross-path message identity for dedupe.
+    pub message_cid: String,
+}
+
 /// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
 ///
 /// Snapshots the DmOutbox/CRDT/HLC/ContentStore handles under the NodeState
@@ -1579,14 +1640,23 @@ async fn send_message(
 /// Lock order (mirror in event_loop drain): dm_outbox → crdt_state → hlc_tracker.
 ///
 /// `space_id_hex` is the 32-character hex of a 16-byte SpaceId.
-/// Returns the hex-encoded MessageId (== OutboxEntryId) on success.
+/// Returns `{ messageId, messageCid }` on success — see `SendDmResult`
+/// for why both are surfaced.
+// PR #81 round 4: param renamed from `space_id_hex` → `space_id`.
+// Tauri 2's default JS→Rust convention auto-converts camelCase keys
+// to snake_case (so JS `spaceId` resolves to Rust `space_id`). The
+// previous `space_id_hex` name didn't match anything the frontend
+// could send (would have required JS `spaceIdHex`), so the IPC was
+// silently broken. The variable is still hex-encoded on the wire —
+// the doc comment + downstream `hex::decode` make that clear.
 #[tauri::command]
 async fn send_dm(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
-    space_id_hex: String,
+    space_id: String,
     content: Vec<u8>,
     mime_type: String,
-) -> Result<String, String> {
+) -> Result<SendDmResult, String> {
+    let space_id_hex = space_id;
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
     //
@@ -1641,7 +1711,7 @@ async fn send_dm(
     let mut tracker_g = hlc_tracker.lock().await;
     let prev_hlc = tracker_g.get(&device_id).cloned();
 
-    let msg_id = outbox_g
+    let (msg_id, msg_cid) = outbox_g
         .send_dm(
             &mut state_g,
             cas.as_ref(),
@@ -1713,7 +1783,1032 @@ async fn send_dm(
         }
     }
 
-    Ok(hex::encode(msg_id.0))
+    Ok(SendDmResult {
+        message_id: hex::encode(msg_id.0),
+        message_cid: hex::encode(msg_cid.to_bytes()),
+    })
+}
+
+// ── ZEB-228 Phase 4: read_dm_thread (cold-start scrollback) ──────────────
+
+/// Phase 4 cold-start scrollback IPC payload — one decrypted message in a
+/// DM Space's history. Hex-encoded fields are sized for the Tauri JSON
+/// channel (Vec<u8> would round-trip through base64; hex is what every
+/// other DM-shaped payload in this codebase uses).
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DmThreadMessage {
+    /// Hex-encoded ContentId (32 bytes → 64 hex chars).
+    pub message_cid: String,
+    /// Hex-encoded sender OwnerAddr (16 bytes → 32 hex chars). For
+    /// self-sent messages, equals self_owner; for received messages,
+    /// equals the original sender's OwnerAddr.
+    pub from: String,
+    /// `MessagePayload.sent_at.wall_ms` — sender's HLC at compose time.
+    pub sent_at: u64,
+    /// `InboxEntry.received_at.wall_ms` — local HLC at apply_inbox time.
+    /// Pagination cursor: callers pass the oldest entry's value as
+    /// `before_hlc` to fetch the next page.
+    pub received_at: u64,
+    /// Hex-encoded plaintext body (decrypted from CAS storage_blob).
+    pub body: String,
+    pub mime_type: String,
+    /// True iff `from == self_owner` — UI uses this to right-align the
+    /// bubble + skip the avatar fetch for self.
+    pub is_self_outbound: bool,
+    /// For self-entries (`is_self_outbound == true`): the outbox-derived
+    /// delivery state — `"sending" | "delivered" | "expired" | "failed"`.
+    ///
+    /// `"sending"` = OutboxEntry exists with `Pending` or `Partial` status.
+    /// `"expired"` = OutboxEntry exists with `Expired` status.
+    /// `"delivered"` = OutboxEntry exists with `Complete` status, OR the
+    ///                 OutboxEntry is gone (post-Complete GC, which means
+    ///                 it WAS delivered before being collected).
+    /// `None` = received entry (`is_self_outbound == false`); receivers
+    ///          don't track outbox state.
+    ///
+    /// `read_dm_thread` joins inbox→outbox by `(space_id, message_cid)`
+    /// per call. Without this field a stuck-sending self-message would
+    /// render as "delivered" in scrollback even while still in the
+    /// outbox awaiting delivery — Qodo flagged that on PR #81 review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<String>,
+    /// For self-entries: hex-encoded `OutboxEntryId` (16 bytes → 32 hex
+    /// chars), populated only when the OutboxEntry is still present in
+    /// `state.outbox`. The frontend's `TextMessage.canDelete` requires
+    /// `messageId !== undefined` to expose the inline ⓧ button — without
+    /// this field, scrollback-loaded self-messages stuck in `'sending'`
+    /// or `'expired'` couldn't be deleted after a cold restart (Cursor
+    /// Bugbot flagged this on PR #81 review).
+    ///
+    /// `None` for: received entries (no outbox row), or self-entries
+    /// whose OutboxEntry was already GC'd post-Complete (in which case
+    /// `delivery_state == "delivered"` and there's nothing to delete).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+/// Pure helper: sort InboxEntries by `received_at` descending, drop entries
+/// at or past the `before_hlc` cursor, then truncate to `limit`.
+///
+/// Extracted so `read_dm_thread` (the IPC) and `read_dm_thread_inner` (the
+/// integration-test entry point) share one implementation. Pre-extraction,
+/// each had its own copy of the sort+filter+truncate body — production
+/// hit the IPC's copy while tests only ever hit the inner's, so a quiet
+/// divergence (e.g., flipping the cursor comparison inclusivity) would
+/// never be caught.
+///
+/// Lock-free + pure: takes owned entries by value so the caller can
+/// gather them under whatever lock and drop the lock before invoking
+/// this. Returns the truncated, sorted, cursor-filtered vec.
+fn filter_sort_paginate_inbox(
+    entries: Vec<crate::owner_state_types::InboxEntry>,
+    before_hlc: Option<u64>,
+    limit: usize,
+) -> Vec<crate::owner_state_types::InboxEntry> {
+    let mut entries = entries;
+    // Sort by received_at descending. Hlc has no Ord impl, so compare on
+    // the (wall_ms, logical, device_id) tuple — same lex ordering
+    // `is_strictly_newer_than` uses. Newest-first ordering means we
+    // call `b.cmp(&a)` (the inversion of natural ascending order) — the
+    // tuple keys below are NAMED for the element they describe so a
+    // future "fix" to align names with assignments doesn't silently
+    // flip the sort direction (Cursor PR #81 round 4 review).
+    entries.sort_by(|a, b| {
+        let key_a = (
+            a.received_at.wall_ms,
+            a.received_at.logical,
+            &a.received_at.device_id,
+        );
+        let key_b = (
+            b.received_at.wall_ms,
+            b.received_at.logical,
+            &b.received_at.device_id,
+        );
+        key_b.cmp(&key_a) // descending: larger keys first
+    });
+    if let Some(cursor) = before_hlc {
+        entries.retain(|e| e.received_at.wall_ms < cursor);
+    }
+    entries.truncate(limit);
+    entries
+}
+
+/// Pure inner implementation of `read_dm_thread`. The `#[tauri::command]`
+/// shim snapshots NodeState handles, drops the sync mutex, and calls this.
+///
+/// Behavior matches the IPC contract:
+///   1. `space_id` MUST exist in `state.spaces`; otherwise `UnknownSpace`.
+///   2. The Space MUST have a `content_key`; otherwise `MissingContentKey`.
+///   3. InboxEntries are filtered to `space_id`, sorted by `received_at`
+///      DESCENDING (newest first), the optional `before_hlc` cursor
+///      filters out entries with `received_at.wall_ms >= cursor`, then
+///      truncated to `limit`.
+///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
+///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
+///      fallback (matches `handle_cidnotify`'s receive path so post-key-
+///      rotation scrollback works).
+///   5. Any per-entry CAS miss (`Ok(None)`) or fetch error (`Err(_)`) or
+///      decrypt failure surfaces as a single `Err` with the failing
+///      message_cid in the message — caller can retry. (Partial-result
+///      handling is a follow-up if needed; today's UI is fine with
+///      "scrollback failed, retry".)
+///
+/// The pure-function shape lets integration tests exercise the decrypt +
+/// pagination logic without standing up a tauri::State<NodeState>.
+pub async fn read_dm_thread_inner(
+    state: &crate::owner_state_crdt::OwnerState,
+    cas: &dyn crate::content_store::ContentStore,
+    space_id: crate::owner_state_types::SpaceId,
+    limit: usize,
+    before_hlc: Option<u64>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<Vec<DmThreadMessage>, String> {
+    let space = state
+        .spaces
+        .get(&space_id)
+        .ok_or_else(|| format!("UnknownSpace({space_id:?})"))?;
+    let content_key = space
+        .content_key
+        .clone()
+        .ok_or_else(|| format!("MissingContentKey({space_id:?})"))?;
+    let prior_content_keys = space.prior_content_keys.clone();
+    let aad = crate::dm_crypto::compute_aad(space).map_err(|e| format!("compute_aad: {e}"))?;
+
+    // Gather + filter+sort+paginate via the shared helper. All in
+    // memory; no .await crosses the borrow of `state`.
+    let raw: Vec<crate::owner_state_types::InboxEntry> =
+        state.inbox_entries_for_space(space_id).cloned().collect();
+    let entries = filter_sort_paginate_inbox(raw, before_hlc, limit);
+    // Snapshot the outbox so decrypt_inbox_entries can populate per-entry
+    // delivery_state without re-locking. Cheap (Phase 4 scale: tens of
+    // entries max).
+    let outbox_snapshot = state.outbox.clone();
+
+    decrypt_inbox_entries(
+        cas,
+        &content_key,
+        &prior_content_keys,
+        &aad,
+        entries,
+        self_owner,
+        &outbox_snapshot,
+    )
+    .await
+}
+
+/// ZEB-228 Phase 4 — Cold-start DM scrollback IPC.
+///
+/// Returns InboxEntries for a given Space (self-sent + received), each
+/// with its decrypted body + mime_type. Reverse-chronological order by
+/// `received_at`. Paginated via `limit` + `before_hlc` cursor:
+///
+/// - `space_id_hex`: 32-character hex of a 16-byte SpaceId.
+/// - `limit`: max entries per page (UI page size, typical 50).
+/// - `before_hlc`: if `Some(wall_ms)`, return entries with
+///   `received_at.wall_ms < before_hlc`. None = newest first page.
+///
+/// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
+/// fallback (matches `handle_cidnotify`'s receive path), so scrollback
+/// after a content_key rotation still surfaces older messages encrypted
+/// under the previous key.
+///
+/// Frontend uses this on first DM-channel switch to populate the
+/// TextFeed with history. To paginate: pass the oldest entry's
+/// `received_at` as `before_hlc` for the next call.
+// Param rename per PR #81 round 4 — see send_dm above for rationale.
+#[tauri::command]
+async fn read_dm_thread(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id: String,
+    limit: usize,
+    before_hlc: Option<u64>,
+) -> Result<Vec<DmThreadMessage>, String> {
+    let space_id_hex = space_id;
+    // Snapshot handles under the sync mutex; release before any .await.
+    // (Same pattern as send_dm — NodeState's sync mutex must not span
+    // .await boundaries.)
+    let (crdt_state, cas, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.content_store.clone().ok_or("content_store missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+        )
+    };
+
+    let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Two-phase: gather everything we need under the OwnerState lock
+    // (no .await), drop the lock, then run the cas.get + decrypt loop
+    // unlocked. This honors the locks-across-await rule (mirrors ZEB-241
+    // pending refactor's pattern).
+    //
+    // Filter+sort+paginate runs through the shared
+    // `filter_sort_paginate_inbox` helper so production exercises the
+    // exact code path the integration tests exercise via
+    // `read_dm_thread_inner` — no silent divergence between the two.
+    let (entries, content_key, prior_content_keys, aad, outbox_snapshot) = {
+        let state_guard = crdt_state.lock().await;
+        let space = state_guard
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| format!("UnknownSpace({space_id:?})"))?;
+        let content_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| format!("MissingContentKey({space_id:?})"))?;
+        let prior = space.prior_content_keys.clone();
+        let aad = crate::dm_crypto::compute_aad(space).map_err(|e| format!("compute_aad: {e}"))?;
+
+        let raw: Vec<crate::owner_state_types::InboxEntry> = state_guard
+            .inbox_entries_for_space(space_id)
+            .cloned()
+            .collect();
+        let entries = filter_sort_paginate_inbox(raw, before_hlc, limit);
+        // Snapshot the outbox so the decrypt loop can populate
+        // per-entry delivery_state without re-locking. Cheap (Phase 4
+        // scale: tens of entries max).
+        let outbox_snapshot = state_guard.outbox.clone();
+
+        (entries, content_key, prior, aad, outbox_snapshot)
+    };
+
+    decrypt_inbox_entries(
+        cas.as_ref(),
+        &content_key,
+        &prior_content_keys,
+        &aad,
+        entries,
+        self_owner,
+        &outbox_snapshot,
+    )
+    .await
+}
+
+/// Helper: fetch + decrypt a pre-filtered + pre-sorted slice of
+/// InboxEntries. Shared between the `tauri::command` (which gathers
+/// entries under the OwnerState lock and drops it before calling this)
+/// and `read_dm_thread_inner` (which the integration tests use without
+/// a NodeState).
+///
+/// `outbox_snapshot` is a pre-cloned view of `state.outbox` so the
+/// delivery-state join can run without re-acquiring the OwnerState lock.
+/// Cheap at Phase 4 scale (tens of entries); if outbox grows we'd swap
+/// for a `(space_id, message_cid) → status` index built once per call.
+async fn decrypt_inbox_entries(
+    cas: &dyn crate::content_store::ContentStore,
+    content_key: &crate::owner_state_types::DmContentKey,
+    prior_content_keys: &[crate::owner_state_types::DmContentKey],
+    aad: &[u8],
+    entries: Vec<crate::owner_state_types::InboxEntry>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    outbox_snapshot: &std::collections::BTreeMap<
+        crate::owner_state_types::OutboxEntryId,
+        crate::owner_state_types::OutboxEntry,
+    >,
+) -> Result<Vec<DmThreadMessage>, String> {
+    let mut out: Vec<DmThreadMessage> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // PR #81 round 4 (Greptile P2): per-entry skip-on-error instead
+        // of aborting the whole page. A single corrupted CAS blob or a
+        // missing one (e.g. mid-sync state) shouldn't black-hole the
+        // user's entire scrollback. Log the failure + continue; the UI
+        // sees N-1 messages instead of zero. Future polish: surface a
+        // placeholder "decrypt failed" Message stub so the user knows
+        // something exists at that slot. Out of Phase 4 scope.
+        let blob = match cas.get(&entry.message_cid).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                tracing::warn!(
+                    message_cid = ?entry.message_cid,
+                    "read_dm_thread: blob missing in CAS — skipping entry"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    message_cid = ?entry.message_cid,
+                    error = ?e,
+                    "read_dm_thread: cas.get failed — skipping entry"
+                );
+                continue;
+            }
+        };
+        let payload =
+            match crate::dm_crypto::decrypt_dm_message(content_key, prior_content_keys, aad, &blob)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        message_cid = ?entry.message_cid,
+                        error = ?e,
+                        "read_dm_thread: decrypt failed — skipping entry"
+                    );
+                    continue;
+                }
+            };
+        let is_self_outbound = entry.from == self_owner;
+        // Self entries: join against outbox by (space_id, message_cid).
+        // Outbox is keyed by OutboxEntryId so we walk values; Phase 4
+        // scale makes the linear scan acceptable.
+        //
+        // Missing outbox entry on a self-message → "delivered" (the
+        // OutboxEntry was GC'd post-Complete, meaning it definitely
+        // WAS delivered before collection). This is the same fallback
+        // the frontend's loadDmThread used to apply unconditionally;
+        // we narrow it here so Pending/Partial/Expired surface
+        // accurately.
+        // For self entries, capture BOTH the OutboxEntryId (so the
+        // frontend can correlate dm-delivered/expired/deleted IPC events
+        // and gate the delete button) AND the delivery_status (so
+        // scrollback reflects current outbox state, not a hardcoded
+        // 'delivered'). One linear scan over the snapshot serves both.
+        let (delivery_state, message_id) = if is_self_outbound {
+            let hit = outbox_snapshot.iter().find_map(|(id, e)| {
+                if e.space_id == entry.space_id && e.message_cid == entry.message_cid {
+                    Some((*id, e.delivery_status))
+                } else {
+                    None
+                }
+            });
+            let state = match hit.map(|(_, s)| s) {
+                Some(crate::owner_state_types::DeliveryStatus::Pending)
+                | Some(crate::owner_state_types::DeliveryStatus::Partial) => "sending",
+                Some(crate::owner_state_types::DeliveryStatus::Expired) => "expired",
+                Some(crate::owner_state_types::DeliveryStatus::Complete) | None => "delivered",
+            };
+            (
+                Some(state.to_string()),
+                hit.map(|(id, _)| hex::encode(id.0)),
+            )
+        } else {
+            (None, None)
+        };
+        out.push(DmThreadMessage {
+            message_cid: hex::encode(entry.message_cid.to_bytes()),
+            from: hex::encode(entry.from.0),
+            sent_at: payload.sent_at.wall_ms,
+            received_at: entry.received_at.wall_ms,
+            body: hex::encode(&payload.body),
+            mime_type: payload.mime_type,
+            is_self_outbound,
+            delivery_state,
+            message_id,
+        });
+    }
+    Ok(out)
+}
+
+// ── ZEB-228 Phase 4: delete_outbox_entry (manual delete) ─────────────────
+
+/// Phase 4 — Delete a stuck or expired DM message (manual delete).
+///
+/// Wraps `DmOutbox::delete_dm_outbox_entry`. Removes BOTH the
+/// OutboxEntry and the corresponding self-InboxEntry keyed by
+/// `(space_id, message_cid)`, and clears in-flight + backoff caches.
+/// On success with a non-default outcome, emits a `dm-deleted` IPC
+/// event so the frontend MessageService can prune the message from
+/// its local cache.
+///
+/// Idempotent: a missing `message_id` returns `Ok(())` without
+/// emitting any event.
+///
+/// `message_id` is the 32-character hex of a 16-byte OutboxEntryId.
+#[tauri::command]
+async fn delete_outbox_entry(
+    app: tauri::AppHandle,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    message_id: String,
+) -> Result<(), String> {
+    // Snapshot handles under the sync mutex; release before any .await.
+    // Same pattern as send_dm — NodeState's sync mutex must not span
+    // .await boundaries.
+    //
+    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
+    // with the Arcs so the post-stop check below can detect a
+    // stop+restart racing through this command. See send_dm for the
+    // full rationale on why both `generation` and handle-attachment
+    // need to be re-verified.
+    let (dm_outbox, crdt_state, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.generation,
+        )
+    };
+
+    // Decode message_id from hex → OutboxEntryId.
+    let id_bytes = hex::decode(&message_id).map_err(|e| format!("message_id hex: {e}"))?;
+    let id_arr: [u8; 16] = id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("message_id must be 16 bytes, got {}", id_bytes.len()))?;
+    let outbox_entry_id = crate::owner_state_types::OutboxEntryId(id_arr);
+
+    // Lock order: dm_outbox → crdt_state. Mirrors send_dm to avoid
+    // deadlock against any concurrent send/drain.
+    let outcome = {
+        let mut outbox_g = dm_outbox.lock().await;
+        let mut state_g = crdt_state.lock().await;
+        outbox_g
+            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id)
+            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
+    };
+
+    // Locks dropped (block scope ended).
+    //
+    // ZEB-245 (PR #81 round 6): post-stop check before emitting
+    // dm-deleted. If a stop+restart fired during the .await chain
+    // above, our cloned `crdt_state` Arc is now detached from the
+    // live NodeState — the deletion landed in an orphan that won't
+    // be persisted. Emitting dm-deleted in that case would prune the
+    // message from the UI even though it'll reappear on next start.
+    // Surface as Err instead so the caller (App.svelte's deleteDm)
+    // can re-show the message + retry against the live node.
+    //
+    // Mirrors send_dm's fence (lib.rs ~1762): same residual TOCTOU
+    // applies — a stop_inner that flushes the cloned crdt_state
+    // between mutate and post-check still persists the deletion, so
+    // ZEB-234's shutdown fence is the real fix. This guard closes the
+    // common case (stop_node alone, no flush) which is the only
+    // detach path Phase 4 UI can actually trigger.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during delete_outbox_entry (was {}, now {}); \
+                 deletion was applied to a detached crdt_state and won't be persisted — \
+                 retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during delete_outbox_entry; deletion was \
+                applied to a detached crdt_state and won't be persisted"
+                .to_string());
+        }
+    }
+
+    // Emit IPC event only if something actually changed (idempotent
+    // missing-id is no-op).
+    if let (Some(space_id), Some(message_cid)) = (outcome.space_id, outcome.message_cid) {
+        let _ = app.emit(
+            "dm-deleted",
+            serde_json::json!({
+                "messageId": message_id,
+                "spaceId": hex::encode(space_id.0),
+                "messageCid": hex::encode(message_cid.to_bytes()),
+            }),
+        );
+    }
+
+    Ok(())
+}
+
+// ── ZEB-228 Phase 4: add_space (DM/GroupDm creation) ─────────────────────
+
+/// Pure inner implementation of `add_space`'s DM/GroupDm dispatch. The
+/// `#[tauri::command]` shim snapshots NodeState handles, drops the sync
+/// mutex, calls this, then forwards each `UnicastSendRequest` into the
+/// outbound unicast channel.
+///
+/// Behavior:
+///   1. Validate kind ∈ {Dm, GroupDm} and the recipient list:
+///      - Dm: exactly 1 recipient (total members = 2).
+///      - GroupDm: 2-15 recipients (total members = 3-16).
+///      - No self in recipients.
+///      - No duplicate recipients.
+///   2. Generate a fresh content_key (32 random bytes via OsRng, wrapped
+///      in `Zeroizing` while in scope).
+///   3. Build a Space CRDT entry with sorted self+recipient members,
+///      Reticulum transport (empty participants — populated lazily as
+///      announces flow), `created_at`/`updated_at` from a fresh HLC.
+///   4. Apply locally via `apply_space_with_canonicalization`.
+///   5. Build a signed `DmInvite` packet and emit one
+///      `UnicastSendRequest` per device in each recipient's
+///      `OwnerDeviceCache` entry. Best-effort: a recipient with no
+///      cached devices yields zero outbound packets — Phase 3b's
+///      handle_invite-on-first-send_dm path still recovers because the
+///      sender's outbox loop will fan out the missing invite when the
+///      first message ships.
+///
+/// Returns `(canonical_space_id, send_requests, was_merge)`:
+///   - `canonical_space_id` is the SpaceId after CRDT canonicalization.
+///     If `apply_space_with_canonicalization` merged the freshly-minted
+///     Space into an existing one with the same dedupe key (sorted
+///     members), this is the EXISTING Space's id, not the minted one
+///     that just got dropped — the outer command's `state.spaces.get(&id)`
+///     readback would otherwise miss a real winner.
+///   - `send_requests` is the list of DmInvite UnicastSendRequests.
+///     Empty when `was_merge == true` because the existing Space's
+///     invites were already sent at original creation time; sending
+///     duplicates here would just generate redundant network traffic
+///     and (for the recipient) noisy duplicate-invite handling.
+///   - `was_merge` lets the caller skip the dispatch loop without
+///     re-checking the sends vec emptiness for the duplicate-create
+///     case (a fresh Space with zero recipients in OwnerDeviceCache
+///     also produces an empty sends list — those two empties have
+///     different semantics).
+///
+/// The pure-function shape lets integration tests exercise the
+/// validation + Space-construction + invite-build logic without
+/// standing up a tauri::State<NodeState>.
+#[allow(clippy::too_many_arguments)]
+pub fn add_space_dm_inner(
+    state: &mut crate::owner_state_crdt::OwnerState,
+    signing_key: &ed25519_dalek::SigningKey,
+    inviter_identity_pub: &[u8; 64],
+    self_owner: crate::owner_state_types::OwnerAddr,
+    our_signing_device_hash: crate::owner_state_types::DeviceIdentityHash,
+    device_id: &str,
+    kind: crate::owner_state_types::SpaceKind,
+    name: String,
+    recipients: Vec<crate::owner_state_types::OwnerAddr>,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<
+    (
+        crate::owner_state_types::SpaceId,
+        Vec<crate::dm_outbox::UnicastSendRequest>,
+        bool,
+    ),
+    String,
+> {
+    use crate::owner_state_types::{
+        DmContentKey, OwnerAddr, ReticulumDest, Space, SpaceId, SpaceKind, TransportBinding,
+    };
+
+    // ── 1. Validate kind + recipients. ───────────────────────────────
+    if !matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Err(format!(
+            "add_space_dm_inner only handles Dm/GroupDm; got {kind:?}"
+        ));
+    }
+    if recipients.contains(&self_owner) {
+        return Err("self must not be in recipients (backend adds self automatically)".to_string());
+    }
+    // Defense in depth — frontend already blocks but enforce here too.
+    let total_members = 1 + recipients.len();
+    if total_members > 16 {
+        return Err(format!(
+            "DM/GroupDm cap is 16 members; got {total_members} (use a community for larger groups)"
+        ));
+    }
+    match kind {
+        SpaceKind::Dm => {
+            if recipients.len() != 1 {
+                return Err(format!(
+                    "Dm kind requires exactly 1 recipient; got {} (use GroupDm for 2-15)",
+                    recipients.len()
+                ));
+            }
+        }
+        SpaceKind::GroupDm => {
+            if !(2..=15).contains(&recipients.len()) {
+                return Err(format!(
+                    "GroupDm requires 2-15 recipients; got {}",
+                    recipients.len()
+                ));
+            }
+        }
+        _ => unreachable!("kind already restricted to Dm or GroupDm above"),
+    }
+
+    // ── 2. Build sorted+deduped member list (self + recipients). ─────
+    let mut all_members: Vec<OwnerAddr> = std::iter::once(self_owner)
+        .chain(recipients.iter().copied())
+        .collect();
+    all_members.sort();
+    all_members.dedup();
+    if all_members.len() != total_members {
+        return Err("duplicate recipient(s) in input".to_string());
+    }
+
+    // ── 3. Generate fresh content_key. Bytes live in `Zeroizing` for
+    //       the duration of this scope; `DmContentKey::new` copies the
+    //       bytes into its own (also-zeroize-on-drop) wrapper. ───────
+    let content_key = {
+        use rand::RngCore;
+        use zeroize::Zeroizing;
+        let mut k = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(k.as_mut());
+        DmContentKey::new(*k)
+    };
+
+    // ── 4. Mint HLCs for created_at / updated_at. Both stamped from
+    //       the same `next_hlc` so a peer comparing them by lex-order
+    //       sees them as equal (the typical case for fresh creation).
+    //       The IPC shim's caller is responsible for keeping the HLC
+    //       tracker monotone post-mint; this inner function doesn't
+    //       touch the tracker. ───────────────────────────────────────
+    let creation_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+
+    // ── 5. Build the Space CRDT entry. ───────────────────────────────
+    let space_id = SpaceId(rand::random());
+    let space = Space {
+        id: space_id,
+        kind,
+        parent: None,
+        community_id: None,
+        name,
+        members: all_members.clone(),
+        // DM kinds always Reticulum; participants populated lazily as
+        // announces propagate (Phase 3b currently leaves it empty —
+        // resolution happens via OwnerDeviceCache, not the Space's
+        // transport binding).
+        transport: Some(TransportBinding::Reticulum {
+            participants: Vec::<ReticulumDest>::new(),
+        }),
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: creation_hlc.clone(),
+        updated_at: creation_hlc.clone(),
+        content_key: Some(content_key.clone()),
+        prior_content_keys: vec![],
+    };
+
+    // Validate invariants up front — catches programmer error before we
+    // mutate state. apply_space_with_canonicalization itself does NOT
+    // validate (it's the receive path's job, and incoming entries from
+    // remote replicas are guarded by their own decode-time checks).
+    space
+        .validate_invariants()
+        .map_err(|e| format!("Space invariants violated: {}", e.0))?;
+
+    // ── 6. Apply locally. apply_space_with_canonicalization returns
+    //       an ApplyOutcome; we MUST check it to learn whether a dedupe
+    //       merge collapsed our minted Space into an existing one (same
+    //       sorted members). The earlier shape ignored the outcome and
+    //       returned `space_id` unconditionally — when the merge
+    //       dropped our minted id (we lost the ULID tie-break), the
+    //       outer command's `state.spaces.get(&result.0)` readback
+    //       missed the live entry entirely. Qodo flagged this on PR #81.
+    // ───────────────────────────────────────────────────────────────
+    use crate::owner_state_crdt::ApplyOutcome;
+    let outcome = state.apply_space_with_canonicalization(space);
+    let (canonical_space_id, was_merge) = match outcome {
+        ApplyOutcome::Inserted => (space_id, false),
+        ApplyOutcome::Merged { old_id: None } => {
+            // Same-SpaceId update path. Our minted id collided with an
+            // existing entry on the same id — practically impossible
+            // for a fresh `rand::random()` SpaceId (16 bytes of
+            // randomness collision). Treat as Inserted-equivalent for
+            // the canonical id, but skip dispatch: the existing entry
+            // already had its invites sent at original creation.
+            (space_id, true)
+        }
+        ApplyOutcome::Merged {
+            old_id: Some(loser),
+        } => {
+            // Cross-id dedupe merge: lex-MIN ULID wins. Our minted id
+            // may be the winner OR the loser. The winner is the unique
+            // entry now in `state.spaces` matching our dedupe key
+            // (sorted members + kind). Walk and find it.
+            //
+            // Skip dispatch in this case: the existing Space's invites
+            // were already sent at original creation, and re-firing
+            // here would just generate redundant network traffic +
+            // noisy duplicate-invite handling on the recipient side.
+            let canonical = state
+                .spaces
+                .iter()
+                .find(|(_, s)| s.kind == kind && s.members == all_members)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    format!(
+                        "add_space_dm_inner: post-merge canonical winner not found \
+                         (loser={loser:?}, members={all_members:?})"
+                    )
+                })?;
+            (canonical, true)
+        }
+        ApplyOutcome::Rejected(reason) => {
+            return Err(format!(
+                "add_space_dm_inner: apply_space_with_canonicalization rejected: {reason}"
+            ));
+        }
+    };
+
+    // Short-circuit on merge: nothing to dispatch (existing Space
+    // already invited everyone at original creation). Returning
+    // `was_merge=true` lets the outer command skip the dispatch loop
+    // on a more strongly typed signal than "sends is empty" (which
+    // would conflate the merge case with the legitimate "no recipient
+    // devices known yet" case).
+    if was_merge {
+        return Ok((canonical_space_id, Vec::new(), true));
+    }
+
+    // ── 7. Build + sign the DmInvite. Our own devices come from
+    //       OwnerDeviceCache (populated by Flow A); fall back to just
+    //       our_signing_device_hash if no entry yet (pre-bootstrap). ──
+    let our_devices: Vec<crate::owner_state_types::DeviceIdentityHash> = state
+        .owner_device_cache
+        .devices
+        .get(&self_owner)
+        .map(|e| e.devices.clone())
+        .unwrap_or_else(|| vec![our_signing_device_hash]);
+    // Defense in depth — sender_devices MUST contain signing_device_hash
+    // (Phase 3b invariant; validated wire-side by decode_packet).
+    let sender_devices = if our_devices.contains(&our_signing_device_hash) {
+        our_devices
+    } else {
+        let mut combined = our_devices;
+        combined.push(our_signing_device_hash);
+        combined.sort();
+        combined.dedup();
+        combined
+    };
+
+    let signed_invite = crate::dm_envelope::DmInviteSigned {
+        space_id: canonical_space_id,
+        kind,
+        members: all_members,
+        inviter: self_owner,
+        inviter_identity_pub: *inviter_identity_pub,
+        content_key,
+        sender_devices,
+        signing_device_hash: our_signing_device_hash,
+        created_at: creation_hlc,
+    };
+    let invite_packet = crate::dm_envelope::build_signed_invite(signed_invite, signing_key)
+        .map_err(|e| format!("build_signed_invite: {e}"))?;
+    let invite_wire = crate::dm_envelope::encode_packet(&invite_packet)
+        .map_err(|e| format!("encode_packet: {e}"))?;
+
+    // ── 8. One UnicastSendRequest per non-self recipient device. ─────
+    // Note: we hold a borrow of `state.owner_device_cache` here, which
+    // is fine because the `apply_space_with_canonicalization` write
+    // above already returned.
+    let mut sends: Vec<crate::dm_outbox::UnicastSendRequest> = Vec::new();
+    for r in &recipients {
+        let entry = match state.owner_device_cache.devices.get(r) {
+            Some(e) => e,
+            None => continue, // recipient unknown — outbox loop on first send_dm recovers
+        };
+        for device in &entry.devices {
+            let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+            sends.push(crate::dm_outbox::UnicastSendRequest {
+                destination_hash: dest_hash,
+                packet: invite_wire.clone(),
+            });
+        }
+    }
+
+    Ok((canonical_space_id, sends, false))
+}
+
+/// ZEB-228 Phase 4 — Create a new Space.
+///
+/// For DM/GroupDm kinds: generates a fresh content_key, builds the
+/// Space CRDT entry with members (self + recipients), applies it
+/// locally, and dispatches a signed DmInvite to each recipient's
+/// known devices via the unicast channel. Returns the new SpaceId
+/// (hex-encoded).
+///
+/// Validation:
+///   - DM kind = exactly 1 recipient (total members = 2).
+///   - GroupDm kind = 2-15 recipients (total members = 3-16).
+///   - Total members ≤ 16 (defense in depth — frontend also blocks).
+///   - No self in recipients (caller passes recipients only; backend
+///     adds self automatically).
+///   - No duplicate recipients.
+///
+/// Other kinds (Folder, Channel, Community, PublicChannel) are not
+/// yet implemented in this IPC and return Err — they have their own
+/// dedicated flows (e.g., `create_folder`).
+///
+/// Frontend's DmCreateDialog calls this; the dispatched DmInvite
+/// flows through Phase 3b's `handle_invite` on each recipient's
+/// device, which auto-accepts and writes the Space + cache entry.
+#[tauri::command]
+async fn add_space(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    kind: String,
+    name: String,
+    members: Option<Vec<String>>,
+) -> Result<String, String> {
+    use crate::owner_state_types::{OwnerAddr, SpaceKind};
+
+    // Parse the kind string. Accept the same wire codes the SpaceKind
+    // serde-rename uses ("d", "g") AND the human-friendly forms the
+    // frontend will probably send ("dm", "group-dm").
+    let parsed_kind = match kind.as_str() {
+        "d" | "dm" | "Dm" => SpaceKind::Dm,
+        "g" | "group-dm" | "groupdm" | "GroupDm" => SpaceKind::GroupDm,
+        // Other kinds are not implemented in this IPC yet (Phase 4
+        // ships DM/GroupDm only). Surface as a clear Err so a future
+        // frontend that tries to call add_space for, e.g., a folder
+        // gets a useful diagnostic rather than silent acceptance.
+        other => {
+            return Err(format!(
+                "add_space: unsupported kind '{other}' (Phase 4 ships Dm/GroupDm only)"
+            ));
+        }
+    };
+
+    // Decode each recipient OwnerAddr from hex.
+    let recipients: Vec<OwnerAddr> = members
+        .unwrap_or_default()
+        .iter()
+        .map(|hex_addr| {
+            let bytes = hex::decode(hex_addr)
+                .map_err(|e| format!("recipient '{hex_addr}' hex decode: {e}"))?;
+            let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                format!(
+                    "recipient '{hex_addr}' must be 16 bytes, got {}",
+                    bytes.len()
+                )
+            })?;
+            Ok(OwnerAddr(arr))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Snapshot all handles under the sync mutex; release before any
+    // .await. (Same pattern as send_dm — NodeState's sync mutex must
+    // not span .await boundaries.)
+    //
+    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
+    // with the Arcs so the post-stop check below can detect a
+    // stop+restart racing through this command — see send_dm for the
+    // full rationale on why both `generation` and handle-attachment
+    // need to be re-verified.
+    let (
+        dm_outbox,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        unicast_send_tx,
+        identity_pub_64,
+        snapshot_generation,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_outbox
+                .clone()
+                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.unicast_send_tx.clone().ok_or("unicast_send_tx missing")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Lock order mirrors send_dm: dm_outbox → crdt_state → hlc_tracker.
+    // We borrow signing_key + our_signing_device_hash from DmOutbox so
+    // we don't double-store identity-derived material on NodeState.
+    //
+    // `was_merge` from the inner function tells us whether
+    // apply_space_with_canonicalization collapsed our minted Space into
+    // an existing one with the same dedupe key. In that case `space_id`
+    // is the EXISTING (canonical winner) id — guaranteed live in
+    // state.spaces — and `sends` is empty (the existing Space was
+    // already invited at original creation).
+    let (space_id, sends, was_merge, new_hlc) = {
+        let outbox_g = dm_outbox.lock().await;
+        let mut state_g = crdt_state.lock().await;
+        let mut tracker_g = hlc_tracker.lock().await;
+        let prev_hlc = tracker_g.get(&device_id).cloned();
+
+        let signing_key = outbox_g.signing_key.as_ref();
+        let our_signing_device_hash = outbox_g.our_signing_device_hash;
+
+        let (canonical_id, sends, was_merge) = add_space_dm_inner(
+            &mut state_g,
+            signing_key,
+            &identity_pub_64,
+            self_owner,
+            our_signing_device_hash,
+            &device_id,
+            parsed_kind,
+            name,
+            recipients,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?;
+
+        // Fetch the HLC stamped on the canonical Space — single source
+        // of truth. The inner function guarantees `canonical_id` is
+        // present in `state.spaces` post-apply (Inserted, same-id
+        // Merged, or cross-id Merged: in all three the canonical id
+        // is the live entry); the get() below should never fail.
+        let stamped = state_g
+            .spaces
+            .get(&canonical_id)
+            .map(|s| s.created_at.clone())
+            .ok_or_else(|| {
+                "add_space: canonical Space not in state \
+                 (apply_space_with_canonicalization invariants broken?)"
+                    .to_string()
+            })?;
+        // HLC monotonicity: a dedupe-merge can land on an EXISTING Space
+        // whose `created_at` is OLDER than our local tracker's prev_hlc
+        // (the existing Space was created before our most recent HLC-
+        // stamping operation). Writing `stamped` to the tracker in that
+        // case would regress the cursor below prev_hlc, breaking the
+        // monotonicity next_hlc relies on. Only update the tracker when
+        // `stamped` strictly advances from prev_hlc; otherwise leave the
+        // tracker as-is. (CodeRabbit flagged this on PR #81 review.)
+        let should_advance_tracker = match prev_hlc.as_ref() {
+            None => true,
+            Some(prev) => stamped.is_strictly_newer_than(prev),
+        };
+        if should_advance_tracker {
+            tracker_g.insert(device_id.clone(), stamped.clone());
+        }
+
+        (canonical_id, sends, was_merge, stamped)
+    };
+    let _ = new_hlc; // borrowed only to pin the tracker update timing
+
+    // ZEB-245 (PR #81 round 6): post-stop check BEFORE dispatching
+    // invites. If a stop+restart fired during the .await chain above,
+    // our cloned `crdt_state` Arc is now detached from the live
+    // NodeState — the Space landed in an orphan that won't be
+    // persisted, but if we still dispatched invites the recipients
+    // would auto-accept and ship messages to a Space the sender lost
+    // on restart (cross-device divergence). Suppressing the dispatch
+    // when we detect detachment closes the worst-case asymmetry.
+    //
+    // Mirrors send_dm's fence (lib.rs ~1762) and delete_outbox_entry's
+    // fence below: same residual TOCTOU applies — a stop_inner that
+    // flushes the cloned crdt_state between mutate and post-check
+    // still persists the Space + invites, so ZEB-234's shutdown fence
+    // is the real fix. This guard closes the common case (stop_node
+    // alone, no flush) which is the only detach path Phase 4 UI can
+    // actually trigger.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during add_space (was {}, now {}); \
+                 Space was created in a detached crdt_state and won't be persisted — \
+                 invites suppressed; retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during add_space; Space was created in a \
+                detached crdt_state and won't be persisted — invites suppressed"
+                .to_string());
+        }
+    }
+
+    // Dispatch invites only when our minted Space actually became the
+    // live entry (or extended one with same id). When `was_merge==true`
+    // the existing Space's invites were already dispatched at original
+    // creation; firing them again here would just generate redundant
+    // network traffic + noisy duplicate-invite handling on the
+    // recipient side. `sends` is also empty in that case (defense in
+    // depth — the inner function guarantees this), but the explicit
+    // flag check makes the semantics unambiguous.
+    if !was_merge {
+        // Best-effort try_send — a full channel surfaces as a dropped
+        // invite, recovered by the outbox loop's first send_dm into
+        // this Space (which builds + ships its own DmInvite).
+        for req in sends {
+            if let Err(e) = unicast_send_tx.try_send(req) {
+                tracing::warn!(
+                    error = %e,
+                    "add_space: dropped DmInvite dispatch (channel full); outbox retry on first send_dm will recover"
+                );
+            }
+        }
+    }
+
+    Ok(hex::encode(space_id.0))
 }
 
 /// Return the hex-encoded node address (derived from the Ed25519 identity).
@@ -3802,6 +4897,9 @@ pub fn run() {
             publish_profile,
             send_message,
             send_dm,
+            read_dm_thread,
+            delete_outbox_entry,
+            add_space,
             get_node_addr,
             list_content,
             pin_content,

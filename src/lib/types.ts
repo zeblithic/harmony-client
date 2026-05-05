@@ -66,6 +66,20 @@ export interface Message {
   channel?: string;
   /** Community/hub this message belongs to (e.g. "harmony-dev"). */
   hub?: string;
+  /**
+   * Phase 4 (ZEB-228) — DM lifecycle delivery state. Undefined for
+   * non-self / received messages. Self-sent messages start in 'sending',
+   * transition to 'delivered' on dm-delivered IPC, 'expired' on
+   * dm-expired, 'failed' on send_dm error.
+   */
+  deliveryState?: 'sending' | 'delivered' | 'expired' | 'failed';
+  /**
+   * Phase 4 (ZEB-228) — hex OutboxEntryId, used to correlate
+   * dm-delivered / dm-expired / dm-deleted IPC events to the right
+   * Message in the per-channel buffer. Set on self-Messages after
+   * send_dm returns; absent on received messages.
+   */
+  messageId?: string;
 }
 
 export type ThreadDisplayMode = 'panel' | 'inline' | 'muted';
