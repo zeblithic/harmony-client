@@ -359,6 +359,7 @@ fn power_thresholds_struct_constructible() {
 }
 
 use harmony_app::community_membership::materialize;
+use harmony_app::community_membership::{verify_event, VerifyContext};
 
 fn make_signed(
     id: u8,
@@ -555,4 +556,288 @@ fn materialize_replays_in_hlc_order_not_input_order() {
         m.members.get(&bob).map(|s| s.status),
         Some(MemberStatus::Banned)
     );
+}
+
+#[test]
+fn verify_event_accepts_valid_join_in_open_community() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    // Pre-existing materialized state: admin has joined.
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    // Alice signs her join event.
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    verify_event(&event, &prior_state, &ctx).expect("must accept");
+}
+
+#[test]
+fn verify_event_rejects_invite_only_join_without_countersig() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let prior_state = materialize(&[], admin);
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: true,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::CounterSigRequired);
+}
+
+#[test]
+fn verify_event_accepts_invite_only_join_with_valid_countersig() {
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = attach_countersig(&event, admin, &admin_key).expect("countersign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let admin_pubkey = admin_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: true,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: Some(&admin_pubkey),
+    };
+
+    verify_event(&event, &prior_state, &ctx).expect("must accept");
+}
+
+#[test]
+fn verify_event_rejects_kick_when_actor_power_below_threshold() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, alice, 200),
+            make_signed(3, MembershipEventKind::Join, bob, 300),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Kick {
+            target: bob,
+            reason: None,
+        },
+        actor: alice,
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::ActorPowerInsufficient);
+}
+
+#[test]
+fn verify_event_rejects_kick_when_target_power_equals_actor() {
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let admin2 = OwnerAddr([99u8; 16]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, admin2, 200),
+            make_signed(
+                3,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+                admin,
+                300,
+            ),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Kick {
+            target: admin2,
+            reason: None,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &admin_key).expect("sign");
+
+    let admin_pubkey = admin_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &admin_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::KickTargetPowerNotLower);
+}
+
+#[test]
+fn verify_event_rejects_setpower_when_actor_power_insufficient() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            make_signed(2, MembershipEventKind::Join, alice, 200),
+        ],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::SetPower {
+            target: bob,
+            level: 50,
+        },
+        actor: alice,
+        at: Hlc {
+            wall_ms: 300,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let alice_pubkey = alice_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &alice_pubkey,
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::ActorPowerInsufficient);
+}
+
+// Note: VerifyError::CounterSigPowerInsufficient is unreachable
+// under v1's hardcoded POWER_THRESHOLDS.invite = 0 because every
+// owner address (whether a joined member or not) materializes to
+// power ≥ 0. The variant is reserved for ZEB-251 (per-community
+// threshold customization). When ZEB-251 ships, add a test here
+// that constructs a custom-threshold scenario and exercises this
+// rejection path.
+
+#[test]
+fn verify_event_rejects_when_actor_signature_invalid() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let bob_key = SigningKey::from_bytes(&[2u8; 32]); // different signer
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event(&payload, &alice_key).expect("sign");
+
+    let bob_pubkey = bob_key.verifying_key();
+    let ctx = VerifyContext {
+        is_invite_only: false,
+        actor_pubkey: &bob_pubkey, // wrong pubkey for actor
+        countersigner_pubkey: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::SignatureInvalid);
 }

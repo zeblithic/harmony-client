@@ -456,6 +456,126 @@ pub fn materialize(
     m
 }
 
+/// Caller-provided context for verify_event. Carries the prior
+/// materialized state (so the function is pure — verify_event doesn't
+/// load state from anywhere) plus the pubkeys needed for signature
+/// checking.
+///
+/// `actor_pubkey` MUST be the ed25519 verifying key for `event.actor`.
+/// Sub-A's owner-key cache is the canonical source — verify_event
+/// itself doesn't resolve OwnerAddr → pubkey, the caller does.
+///
+/// `countersigner_pubkey` is None for open communities and for non-
+/// Join events. For invite-only Joins it MUST be Some, with the key
+/// matching `event.countersig.signer`.
+pub struct VerifyContext<'a> {
+    pub is_invite_only: bool,
+    pub actor_pubkey: &'a VerifyingKey,
+    pub countersigner_pubkey: Option<&'a VerifyingKey>,
+}
+
+/// Full membership-event verification per ZEB-217 spec §"Verification".
+///
+/// Run BEFORE materializing an event into the CRDT. Caller must:
+/// 1. Compute the prior materialized state (using `materialize` over
+///    all events strictly before `event` in HLC order).
+/// 2. Resolve `event.actor` → pubkey via Sub-A's owner-key cache.
+/// 3. For invite-only Joins, also resolve the countersig signer.
+///
+/// Verifies in this order:
+/// 1. Actor's signature on the event payload.
+/// 2. For invite-only Join: countersig present + valid + signer's
+///    power ≥ invite_threshold.
+/// 3. Action-specific power rules:
+///    - Kick: actor's power ≥ kick_threshold AND > target's power
+///    - SetPower: actor's power ≥ set_power_threshold
+///    - Invite: actor's power ≥ invite_threshold (currently 0 — any
+///      joined member can invite)
+///    - Join, Leave: no power check (anyone can leave; join is gated
+///      by invite-only countersig logic above)
+///
+/// Power lookups treat unset entries as 0 (the default per the spec).
+/// Bootstrap (admin_addr → 100) is already baked into prior_state by
+/// `materialize`, so the lookup here is uniform across all actors.
+// allow: POWER_THRESHOLDS.invite is hardcoded 0 in v1, so `power < invite`
+// is always false for u8. The comparisons are structural placeholders for
+// ZEB-251 per-community threshold customization where invite_threshold > 0
+// will make them firable. Suppressing avoids the lint while keeping the
+// rule shape correct for the planned extension.
+#[allow(clippy::absurd_extreme_comparisons)]
+pub fn verify_event(
+    event: &SignedMembershipEvent,
+    prior_state: &MaterializedMembership,
+    ctx: &VerifyContext,
+) -> Result<(), VerifyError> {
+    // 1. Actor's signature must verify.
+    verify_signature(event, ctx.actor_pubkey)?;
+
+    // 2. For invite-only Joins, countersig is required + valid + the
+    //    signer must have sufficient power at the prior state's snapshot.
+    //
+    // Note: under v1's hardcoded POWER_THRESHOLDS.invite = 0, the
+    // power check below is unreachable (any owner addr defaults to
+    // power 0 ≥ 0). The check exists because per-community threshold
+    // customization (ZEB-251) will make it firable when invite_threshold
+    // > 0. Keeping the rule structurally in place now means ZEB-251
+    // doesn't need to revisit verify_event.
+    if matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only {
+        let cs = event
+            .countersig
+            .as_ref()
+            .ok_or(VerifyError::CounterSigRequired)?;
+        let cs_pubkey = ctx
+            .countersigner_pubkey
+            .ok_or(VerifyError::CounterSigRequired)?;
+        verify_countersig(event, cs_pubkey)?;
+
+        let signer_power = prior_state
+            .power_levels
+            .get(&cs.signer)
+            .copied()
+            .unwrap_or(0);
+        if signer_power < POWER_THRESHOLDS.invite {
+            return Err(VerifyError::CounterSigPowerInsufficient);
+        }
+    }
+
+    // 3. Per-kind power rules.
+    let actor_power = prior_state
+        .power_levels
+        .get(&event.actor)
+        .copied()
+        .unwrap_or(0);
+    match &event.kind {
+        MembershipEventKind::Join | MembershipEventKind::Leave => {
+            // No power check — Join is gated by the countersig logic
+            // above (invite-only) or unconditionally allowed (open).
+            // Leave is always allowed for the actor themselves.
+        }
+        MembershipEventKind::Invite { .. } => {
+            if actor_power < POWER_THRESHOLDS.invite {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
+        }
+        MembershipEventKind::Kick { target, .. } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
+            let target_power = prior_state.power_levels.get(target).copied().unwrap_or(0);
+            if actor_power <= target_power {
+                return Err(VerifyError::KickTargetPowerNotLower);
+            }
+        }
+        MembershipEventKind::SetPower { .. } => {
+            if actor_power < POWER_THRESHOLDS.set_power {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Per-community power thresholds. v1 hardcoded; per-community
 /// customization is deferred to ZEB-251.
 #[derive(Debug, Clone, Copy)]
