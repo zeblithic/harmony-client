@@ -1,7 +1,8 @@
 //! Unit tests for community_state_crdt.rs Phase 2 types.
 
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext, VerifyError,
+    sign_event_with_identity, EventPayload, MemberStatus, MembershipEventKind, VerifyContext,
+    VerifyError,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
@@ -17,8 +18,8 @@ fn empty_community_state_round_trips() {
     assert!(decoded.events.is_empty());
 }
 
-fn make_test_identity() -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let identity = PrivateIdentity::from_seed(&[0xa1; 32]);
+fn make_test_identity(seed: u8) -> (PrivateIdentity, [u8; 64], OwnerAddr) {
+    let identity = PrivateIdentity::from_seed(&[seed; 32]);
     let identity_pub = identity.identity.to_public_bytes();
     let addr = OwnerAddr(identity.identity.address_hash);
     (identity, identity_pub, addr)
@@ -34,7 +35,7 @@ fn hlc(wall_ms: u64) -> Hlc {
 
 #[test]
 fn insert_rejects_event_with_wrong_community() {
-    let (identity, identity_pub, addr) = make_test_identity();
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let other_community = SpaceId([2u8; 16]);
 
@@ -71,7 +72,7 @@ fn insert_rejects_event_with_wrong_community() {
 
 #[test]
 fn insert_accepts_admin_self_join_in_open_community() {
-    let (identity, identity_pub, addr) = make_test_identity();
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -96,14 +97,14 @@ fn insert_accepts_admin_self_join_in_open_community() {
         },
     );
 
-    assert!(matches!(outcome, InsertOutcome::Inserted));
+    assert_eq!(outcome, InsertOutcome::Inserted);
     assert_eq!(state.events.len(), 1);
     assert!(state.events.contains_key(&event_id));
 }
 
 #[test]
 fn insert_is_idempotent_on_duplicate_event_id() {
-    let (identity, identity_pub, addr) = make_test_identity();
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -123,13 +124,51 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         actor_identity_pub: &identity_pub,
         countersigner_identity_pub: None,
     };
-    assert!(matches!(
+    assert_eq!(
         state.insert_event(event.clone(), &ctx),
         InsertOutcome::Inserted
-    ));
-    assert!(matches!(
-        state.insert_event(event, &ctx),
-        InsertOutcome::AlreadyKnown
-    ));
+    );
+    assert_eq!(state.insert_event(event, &ctx), InsertOutcome::AlreadyKnown);
     assert_eq!(state.events.len(), 1);
+}
+
+/// Build a `CommunityState` containing one verified admin self-Join.
+/// Returned tuple matches the call-site shape of the other tests so
+/// future tests can extend the log without rewriting setup.
+fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityState, OwnerAddr) {
+    let (identity, identity_pub, addr) = make_test_identity(seed);
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: addr,
+        at: hlc(100),
+    };
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
+    let mut state = CommunityState::new(community_id);
+    let outcome = state.insert_event(
+        event,
+        &VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: addr,
+            is_invite_only: false,
+            actor_identity_pub: &identity_pub,
+            countersigner_identity_pub: None,
+        },
+    );
+    assert_eq!(outcome, InsertOutcome::Inserted);
+    (state, addr)
+}
+
+#[test]
+fn materialize_now_reflects_admin_self_join() {
+    let community_id = SpaceId([1u8; 16]);
+    let (state, addr) = state_with_admin_self_join(0xa1, community_id);
+
+    let view = state.materialize_now(addr);
+    let member = view
+        .members
+        .get(&addr)
+        .expect("admin self-Join should appear in materialized view");
+    assert_eq!(member.status, MemberStatus::Joined);
 }

@@ -40,15 +40,6 @@ pub struct CommunityState {
     pub events: BTreeMap<EventId, SignedMembershipEvent>,
 }
 
-impl CommunityState {
-    pub fn new(community_id: SpaceId) -> Self {
-        Self {
-            community_id,
-            events: BTreeMap::new(),
-        }
-    }
-}
-
 impl CanonicalPayloadSealed for CommunityState {}
 impl CanonicalPayload for CommunityState {}
 
@@ -69,6 +60,13 @@ pub enum InsertOutcome {
 }
 
 impl CommunityState {
+    pub fn new(community_id: SpaceId) -> Self {
+        Self {
+            community_id,
+            events: BTreeMap::new(),
+        }
+    }
+
     /// Insert a `SignedMembershipEvent` after running `verify_event`
     /// against the current materialized state. The state used for
     /// authorization is computed via `prior_state_at_event` so the
@@ -107,7 +105,7 @@ impl CommunityState {
 
     /// Materialize the current event log. Pure; no caching at this
     /// layer — callers that want a cached view should hold the
-    /// `materialized()` result and invalidate on every successful
+    /// `materialize_now()` result and invalidate on every successful
     /// `insert_event`. Task 3 adds the cache.
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
