@@ -571,6 +571,200 @@ fn materialize_kick_marks_target_banned() {
 }
 
 #[test]
+fn materialize_invite_refreshes_left_member_to_invited() {
+    // Re-inviting a former member (status = Left) should transition
+    // them to Invited so the UI can show "alice has been re-invited".
+    // The previous behavior used entry().or_insert() which silently
+    // dropped re-invites for any address already in the members map.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let alice_join = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &alice_key).expect("sign")
+    };
+    let alice_leave = {
+        let payload = EventPayload {
+            id: [3u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Leave,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &alice_key).expect("sign")
+    };
+    let alice_reinvite = {
+        let payload = EventPayload {
+            id: [4u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Invite { target: alice },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 400,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let m = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            alice_join,
+            alice_leave,
+            alice_reinvite,
+        ],
+        admin,
+    );
+    let s = m.members.get(&alice).expect("alice present");
+    assert_eq!(
+        s.status,
+        MemberStatus::Invited,
+        "Left → re-invited must surface as Invited"
+    );
+    assert_eq!(
+        s.joined_at.wall_ms, 400,
+        "joined_at should reflect the new invite (entry effectively starts over)"
+    );
+    assert!(s.left_at.is_none(), "left_at cleared on re-invite");
+}
+
+#[test]
+fn materialize_invite_no_op_on_joined_member() {
+    // Inviting an already-Joined member is a no-op (they're past the
+    // Invited stage). Their joined_at must NOT be overwritten.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let alice_join = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &alice_key).expect("sign")
+    };
+    let redundant_invite = {
+        let payload = EventPayload {
+            id: [3u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Invite { target: alice },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let m = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            alice_join,
+            redundant_invite,
+        ],
+        admin,
+    );
+    let s = m.members.get(&alice).expect("alice present");
+    assert_eq!(s.status, MemberStatus::Joined);
+    assert_eq!(s.joined_at.wall_ms, 200, "Joined wins; joined_at preserved");
+}
+
+#[test]
+fn materialize_invite_no_op_on_banned_member() {
+    // Banned must remain sticky against an Invite event — otherwise
+    // a future admin (or a malicious one) could "re-invite" a banned
+    // member, defeating the ban.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        {
+            let payload = EventPayload {
+                id: [2u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: alice,
+                at: Hlc {
+                    wall_ms: 200,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &alice_key).expect("sign")
+        },
+        {
+            let payload = EventPayload {
+                id: [3u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Kick {
+                    target: alice,
+                    reason: None,
+                },
+                actor: admin,
+                at: Hlc {
+                    wall_ms: 300,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &admin_key).expect("sign")
+        },
+        {
+            let payload = EventPayload {
+                id: [4u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Invite { target: alice },
+                actor: admin,
+                at: Hlc {
+                    wall_ms: 400,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &admin_key).expect("sign")
+        },
+    ];
+
+    let m = materialize(&events, admin);
+    assert_eq!(
+        m.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Banned),
+        "Banned must remain sticky against re-Invite"
+    );
+}
+
+#[test]
 fn materialize_invite_marks_target_invited() {
     let admin = OwnerAddr([100u8; 16]);
     let carol = OwnerAddr([3u8; 16]);

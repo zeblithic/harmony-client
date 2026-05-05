@@ -668,13 +668,34 @@ pub fn materialize(
                 // from a malformed event.
             }
             MembershipEventKind::Invite { target } => {
-                m.members.entry(*target).or_insert(MemberState {
-                    status: MemberStatus::Invited,
-                    joined_at: event.at.clone(),
-                    left_at: None,
-                });
-                // If target was already Joined/Left/Banned, Invite is
-                // a no-op — they're already past the "invited" stage.
+                // Per-prior-status transition table:
+                //   - never seen → set Invited / joined_at = event.at
+                //   - Invited → refresh joined_at (re-invite arrived later)
+                //   - Joined → no-op (already past the "invited" stage)
+                //   - Left → refresh to Invited (legitimate re-invite of
+                //     a former member; UI shows "alice has been re-invited")
+                //   - Banned → no-op (Banned is sticky; re-Invite must
+                //     not silently un-ban)
+                //
+                // Refresh = replace MemberState entirely (status=Invited,
+                // joined_at=event.at, left_at=None) so a re-invited entry
+                // looks like a fresh invitation rather than carrying stale
+                // left_at from the prior departure.
+                let prior_status = m.members.get(target).map(|s| s.status);
+                let should_refresh = match prior_status {
+                    None | Some(MemberStatus::Invited) | Some(MemberStatus::Left) => true,
+                    Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
+                };
+                if should_refresh {
+                    m.members.insert(
+                        *target,
+                        MemberState {
+                            status: MemberStatus::Invited,
+                            joined_at: event.at.clone(),
+                            left_at: None,
+                        },
+                    );
+                }
             }
             MembershipEventKind::Kick { target, .. } => {
                 let s = m.members.entry(*target).or_insert(MemberState {
