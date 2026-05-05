@@ -3233,14 +3233,23 @@ In `src-tauri/src/community_state_sync.rs`, append:
 /// RegisterDevice events; this resolver picks the FIRST recorded
 /// identity_pub for the queried owner.
 ///
-/// Multi-device note: an OwnerAddr can have multiple DeviceIdentityHashes
-/// registered (each binding the same owner key to a different device).
-/// For verify_event purposes, the actor's pubkey is the OWNER pubkey
-/// — every bound device shares the same Ed25519 signing key derived
-/// from the master seed. So picking any registered identity_pub for
-/// the owner is correct AS LONG AS all registered devices agree on
-/// the owner's pubkey, which is enforced by RegisterDevice signature
-/// verification in Sub-A.
+/// Semantic note on OwnerAddr ↔ DeviceIdentityHash: community_membership's
+/// `event.actor: OwnerAddr` carries the SAME 16 bytes as a
+/// `DeviceIdentityHash` — both are `SHA256(X25519_pub || Ed25519_pub)[:16]`
+/// of the signing identity. The Phase 1 `verify_signature` enforces this
+/// via `Identity::from_public_bytes(actor_identity_pub).address_hash ==
+/// event.actor.0`, so the resolver must look up identity_pub by treating
+/// `event.actor` as a device-hash key.
+///
+/// The cache stores one `OwnerDeviceEntry` per OWNER (master OwnerAddr),
+/// each entry carrying a parallel-vec `(devices: Vec<DeviceIdentityHash>,
+/// device_identity_pubs: Vec<Option<[u8; 64]>>)`. To resolve an
+/// event-actor → identity_pub, we must iterate ALL owner entries and
+/// binary-search each entry's `devices` vec for the target hash. The
+/// existing `crate::dm_outbox::lookup_pubkey_for_device` helper
+/// (`dm_outbox.rs:1575`) does exactly this — `OwnerDeviceCacheResolver`
+/// is a thin wrapper around it that adapts the OwnerAddr ↔
+/// DeviceIdentityHash newtype boundary.
 pub struct OwnerDeviceCacheResolver {
     cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
 }
@@ -3253,21 +3262,23 @@ impl OwnerDeviceCacheResolver {
 
 impl IdentityResolver for OwnerDeviceCacheResolver {
     fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-        // Synchronous trait fn over an async Mutex — use blocking
-        // lookup. In production this runs on the engine's tokio
-        // task; the cache lock is held briefly. If contention
-        // becomes a real cost, switch to a synchronous std::sync::RwLock
-        // in a future refactor.
+        use crate::dm_outbox::lookup_pubkey_for_device;
+        use crate::owner_state_types::DeviceIdentityHash;
+        // Synchronous trait fn over an async Mutex — use try_lock so a
+        // contended cache surfaces as None (treated as
+        // UnknownSigningKey, which is the correct fallback) rather than
+        // blocking the engine's tokio task. The Mutex is short-held in
+        // production paths.
         let cache = self.cache.try_lock().ok()?;
-        cache
-            .owner_device_cache
-            .get(addr)
-            .and_then(|devices| devices.values().next().cloned())
+        // OwnerAddr and DeviceIdentityHash are bytes-compatible newtypes
+        // (both wrap [u8; 16]). Reinterpret without copying.
+        let device_hash = DeviceIdentityHash(addr.0);
+        lookup_pubkey_for_device(&cache.owner_device_cache, device_hash)
     }
 }
 ```
 
-The exact field name on `OwnerState` for the device cache may be `owner_device_cache` or similar — verify via `grep -n "owner_device_cache\|register_device" src-tauri/src/owner_state_crdt.rs`. The `.values().next()` selection is correct under the multi-device note above.
+The cache field is `OwnerState.owner_device_cache: OwnerDeviceCache` (verified at `owner_state_crdt.rs:46` and `owner_state_types.rs:328-331`). The Phase-1-shipped `lookup_pubkey_for_device` helper at `dm_outbox.rs:1575` already implements the parallel-vec lookup — no need to re-implement.
 
 - [ ] **Step 13.2: Wire the registry into start_node**
 
