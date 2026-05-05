@@ -112,13 +112,20 @@ pub struct SignedMembershipEvent {
 /// This means the countersig binds to the joiner's exact event, not
 /// just to the community ID, preventing a malicious admin from
 /// "reusing" a countersig across different join attempts.
+///
+/// Wire codes match the semantic mapping used by SignedMembershipEvent:
+/// `sg` always means signature (Ed25519 64-byte) at every nesting
+/// level; `sn` means signer (the OwnerAddr who produced the signature).
+/// Earlier drafts inverted these (signer=`sg`, sig=`sx`) — fixed
+/// before Phase 1 merge so cross-language deserializers and raw-CBOR
+/// audits don't have to special-case CounterSignature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterSignature {
-    #[serde(rename = "sg")]
+    #[serde(rename = "sn")]
     pub signer: OwnerAddr,
 
     #[serde(
-        rename = "sx",
+        rename = "sg",
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
     )]

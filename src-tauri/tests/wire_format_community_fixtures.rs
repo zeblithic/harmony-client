@@ -125,7 +125,16 @@ fn countersignature_wire_bytes_pinned() {
     let bytes = canonical_cbor_encode(&cs).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("countersignature hex: {hex}");
-    assert_eq!(hex, "a262736750777777777777777777777777777777776273785840cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "CounterSignature wire format changed");
+    // Wire layout (post-PR#82 round 6 rename):
+    //   a2                      ; map(2)
+    //   62 73 6e 50 <16 bytes>  ; text(2) "sn" / bstr(16) signer
+    //   62 73 67 58 40 <64 b>   ; text(2) "sg" / bstr(64) signature
+    //
+    // "sn" = signer, "sg" = signature — keeps "sg" semantically pinned
+    // to "Ed25519 signature" at every nesting level (was previously
+    // signer="sg" / sig="sx", which conflicted with
+    // SignedMembershipEvent.sig also using "sg").
+    assert_eq!(hex, "a262736e50777777777777777777777777777777776273675840cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "CounterSignature wire format changed");
 }
 
 #[test]
