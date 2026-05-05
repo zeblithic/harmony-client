@@ -1039,7 +1039,12 @@ mod apply_space_tests {
         use crate::owner_state_types::MembershipKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(7, OwnerAddr([1u8; 16]), MembershipKey::new([0xaa; 32]), false);
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1049,7 +1054,10 @@ mod apply_space_tests {
         let outcome = s.apply_space(takeover);
         match outcome {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
-                assert!(msg.contains("admin_addr"), "expected admin_addr rejection; got: {msg}");
+                assert!(
+                    msg.contains("admin_addr"),
+                    "expected admin_addr rejection; got: {msg}"
+                );
             }
             other => panic!("expected InvariantFail rejection, got {other:?}"),
         }
@@ -1065,7 +1073,12 @@ mod apply_space_tests {
         use crate::owner_state_types::MembershipKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(7, OwnerAddr([1u8; 16]), MembershipKey::new([0xaa; 32]), false);
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1075,7 +1088,10 @@ mod apply_space_tests {
         let outcome = s.apply_space(rotation);
         match outcome {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
-                assert!(msg.contains("membership_key"), "expected membership_key rejection; got: {msg}");
+                assert!(
+                    msg.contains("membership_key"),
+                    "expected membership_key rejection; got: {msg}"
+                );
             }
             other => panic!("expected InvariantFail rejection, got {other:?}"),
         }
@@ -1086,7 +1102,12 @@ mod apply_space_tests {
         use crate::owner_state_types::MembershipKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(7, OwnerAddr([1u8; 16]), MembershipKey::new([0xaa; 32]), false);
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1096,7 +1117,10 @@ mod apply_space_tests {
         let outcome = s.apply_space(flip);
         match outcome {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
-                assert!(msg.contains("is_invite_only"), "expected is_invite_only rejection; got: {msg}");
+                assert!(
+                    msg.contains("is_invite_only"),
+                    "expected is_invite_only rejection; got: {msg}"
+                );
             }
             other => panic!("expected InvariantFail rejection, got {other:?}"),
         }
@@ -1111,7 +1135,12 @@ mod apply_space_tests {
         use crate::owner_state_types::MembershipKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(7, OwnerAddr([1u8; 16]), MembershipKey::new([0xaa; 32]), false);
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1121,7 +1150,10 @@ mod apply_space_tests {
         let outcome = s.apply_space(backdate);
         match outcome {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
-                assert!(msg.contains("created_at"), "expected created_at rejection; got: {msg}");
+                assert!(
+                    msg.contains("created_at"),
+                    "expected created_at rejection; got: {msg}"
+                );
             }
             other => panic!("expected InvariantFail rejection, got {other:?}"),
         }
@@ -1132,7 +1164,12 @@ mod apply_space_tests {
         use crate::owner_state_types::MembershipKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(7, OwnerAddr([1u8; 16]), MembershipKey::new([0xaa; 32]), false);
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
