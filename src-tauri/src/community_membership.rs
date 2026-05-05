@@ -273,6 +273,13 @@ pub enum VerifyError {
     CounterSigPowerInsufficient,
     ActorPowerInsufficient,
     KickTargetPowerNotLower,
+    /// Kick targeted an OwnerAddr that has never appeared in this
+    /// community's member list. Without this guard, materialize would
+    /// insert a fresh MemberState with status=Banned and
+    /// joined_at=kick_time for someone who never actually joined —
+    /// misleading state and a "phantom member" entry. Banning a
+    /// recently-Left member is still allowed (Left ∈ members).
+    KickTargetNotMember,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -340,6 +347,12 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::KickTargetPowerNotLower => {
                 write!(f, "kick requires actor.power > target.power")
+            }
+            VerifyError::KickTargetNotMember => {
+                write!(
+                    f,
+                    "kick target has no member record in this community"
+                )
             }
             VerifyError::PowerLevelOutOfRange => {
                 write!(f, "SetPower level exceeds POWER_THRESHOLDS.max")
@@ -927,6 +940,14 @@ pub fn verify_event(
         MembershipEventKind::Kick { target, .. } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ActorPowerInsufficient);
+            }
+            // Target must have a member record (Joined / Invited /
+            // Left / Banned). Never-seen targets would otherwise
+            // materialize as a phantom MemberState with status=Banned
+            // and joined_at=kick_time — misleading state about
+            // someone who was never part of the community.
+            if !prior_state.members.contains_key(target) {
+                return Err(VerifyError::KickTargetNotMember);
             }
             let target_power = prior_state.power_levels.get(target).copied().unwrap_or(0);
             if actor_power <= target_power {

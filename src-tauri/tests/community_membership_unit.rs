@@ -934,6 +934,128 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
 }
 
 #[test]
+fn verify_event_rejects_kick_on_target_who_never_joined() {
+    // An admin can sign a Kick targeting any OwnerAddr they please —
+    // power and actor-membership checks pass. But if target ∉ members,
+    // materialize() would insert a brand-new MemberState with status
+    // Banned and joined_at=kick_time, claiming the target was a member
+    // when they never were. Reject at verify time to keep state honest.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let stranger = OwnerAddr([0xEEu8; 16]); // never appeared in any event
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+    assert!(
+        prior_state.members.get(&stranger).is_none(),
+        "test setup: stranger must not be in prior state"
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Kick {
+            target: stranger,
+            reason: None,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::KickTargetNotMember);
+}
+
+#[test]
+fn verify_event_accepts_kick_on_left_member() {
+    // Banning a recently-Left member is a legitimate use case (admin
+    // wants to make sure they don't come back). Target = Left should
+    // still pass the membership check — they ARE in the members map,
+    // just not Joined. Power-side checks then govern the rest.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+
+    let alice_join = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &alice_priv).expect("sign")
+    };
+    let alice_leave = {
+        let payload = EventPayload {
+            id: [3u8; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::Leave,
+            actor: alice,
+            at: Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &alice_priv).expect("sign")
+    };
+    let prior_state = materialize(
+        &[
+            make_signed(1, MembershipEventKind::Join, admin, 100),
+            alice_join,
+            alice_leave,
+        ],
+        admin,
+    );
+    assert_eq!(
+        prior_state.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Left),
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Kick {
+            target: alice,
+            reason: Some("post-departure ban".into()),
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 400,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    verify_event(&event, &prior_state, &ctx).expect("must accept Left → Banned");
+}
+
+#[test]
 fn verify_event_rejects_kick_when_target_power_equals_actor() {
     let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
     let (_admin2_priv, _admin2_id_pub, admin2) = make_test_identity(99);
