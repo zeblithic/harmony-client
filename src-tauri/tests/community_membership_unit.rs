@@ -1220,6 +1220,78 @@ fn verify_event_rejects_leave_from_banned_actor() {
 }
 
 #[test]
+fn materialize_preserves_banned_status_against_join_replay() {
+    // Defense in depth, symmetric with the Leave handler's guard:
+    // even if a Join from a Banned actor slips past verify_event
+    // (e.g., loaded from a corrupted on-disk log, or replayed from
+    // before the Ban arrived), materialize must NOT transition status
+    // back to Joined. Banned is sticky until a dedicated unban flow
+    // exists.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let alice = OwnerAddr([1u8; 16]);
+    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        {
+            let payload = EventPayload {
+                id: [2u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: alice,
+                at: Hlc {
+                    wall_ms: 200,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &alice_key).expect("sign")
+        },
+        {
+            let payload = EventPayload {
+                id: [3u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Kick {
+                    target: alice,
+                    reason: None,
+                },
+                actor: admin,
+                at: Hlc {
+                    wall_ms: 300,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &admin_key).expect("sign")
+        },
+        // After the kick, alice's Join slips through (corrupted log,
+        // missing verify, etc). materialize must keep Banned sticky.
+        {
+            let payload = EventPayload {
+                id: [4u8; 16],
+                community_id: SpaceId([3u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: alice,
+                at: Hlc {
+                    wall_ms: 400,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            };
+            sign_event(&payload, &alice_key).expect("sign")
+        },
+    ];
+
+    let m = materialize(&events, admin);
+    assert_eq!(
+        m.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Banned),
+        "Join must not override Banned — Banned is sticky"
+    );
+}
+
+#[test]
 fn materialize_preserves_banned_status_against_leave_replay() {
     // Defense in depth: even if a Leave from a Banned actor slips past
     // verify_event (e.g., loaded from a corrupted on-disk log, or replayed

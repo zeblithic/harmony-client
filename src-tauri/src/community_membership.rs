@@ -607,14 +607,27 @@ pub fn materialize(
     for event in sorted {
         match &event.kind {
             MembershipEventKind::Join => {
-                m.members.insert(
-                    event.actor,
-                    MemberState {
-                        status: MemberStatus::Joined,
-                        joined_at: event.at.clone(),
-                        left_at: None,
-                    },
+                // Banned is sticky: a Join from a Banned actor must NOT
+                // transition status back to Joined. verify_event also
+                // rejects this case (BannedActorJoin); the materializer
+                // guard is defense-in-depth — handles bad events that
+                // slip past verification (corrupted on-disk log, replay
+                // from before the Ban arrived). Symmetric with the
+                // Leave handler below.
+                let already_banned = matches!(
+                    m.members.get(&event.actor),
+                    Some(s) if s.status == MemberStatus::Banned
                 );
+                if !already_banned {
+                    m.members.insert(
+                        event.actor,
+                        MemberState {
+                            status: MemberStatus::Joined,
+                            joined_at: event.at.clone(),
+                            left_at: None,
+                        },
+                    );
+                }
             }
             MembershipEventKind::Leave => {
                 if let Some(s) = m.members.get_mut(&event.actor) {
