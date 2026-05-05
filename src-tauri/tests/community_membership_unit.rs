@@ -397,7 +397,7 @@ fn power_thresholds_struct_constructible() {
     assert_eq!(custom.invite, 10);
 }
 
-use harmony_app::community_membership::materialize;
+use harmony_app::community_membership::{event_sort_key, materialize, prior_state_at_event};
 use harmony_app::community_membership::{verify_event, VerifyContext};
 
 fn make_signed(
@@ -419,6 +419,92 @@ fn make_signed(
         },
     };
     sign_event(&payload, &signing_key).expect("sign")
+}
+
+#[test]
+fn prior_state_at_event_excludes_target_and_later_events() {
+    // The helper computes the materialized state STRICTLY BEFORE the
+    // target event in canonical (HLC, EventId, sig) order. Same-HLC
+    // events that sort *after* the target must NOT be in the prior
+    // state.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let admin_join = make_signed(1, MembershipEventKind::Join, admin, 100);
+    let alice_join = make_signed(2, MembershipEventKind::Join, alice, 200);
+    let target = make_signed(3, MembershipEventKind::Join, bob, 300);
+    let after_target = make_signed(4, MembershipEventKind::Leave, bob, 400);
+
+    let prior = prior_state_at_event(
+        &[
+            after_target.clone(),
+            target.clone(),
+            alice_join.clone(),
+            admin_join.clone(),
+        ],
+        &target,
+        admin,
+    );
+
+    assert_eq!(
+        prior.members.get(&admin).map(|s| s.status),
+        Some(MemberStatus::Joined)
+    );
+    assert_eq!(
+        prior.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Joined)
+    );
+    assert_eq!(
+        prior.members.get(&bob),
+        None,
+        "target itself must be excluded"
+    );
+}
+
+#[test]
+fn event_sort_key_total_order_matches_materialize() {
+    // The exposed sort_key must agree with materialize's internal sort
+    // — that's the contract callers depend on. This test pins the
+    // equivalence so any future divergence (e.g., adding a 6th
+    // tiebreaker without updating the public helper) breaks loudly.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+
+    let mk = |id: u8, level: u8| {
+        let payload = EventPayload {
+            id: [id; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: OwnerAddr([99u8; 16]),
+                level,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 500,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let a = mk(1, 30);
+    let b = mk(2, 70);
+
+    // a's id [1; 16] < b's id [2; 16] under the comparator.
+    assert!(event_sort_key(&a) < event_sort_key(&b));
+
+    // Replay both orders and confirm they converge — same property
+    // materialize delivers internally.
+    let bootstrap = vec![make_signed(0, MembershipEventKind::Join, admin, 100)];
+    let mut o1 = bootstrap.clone();
+    o1.push(a.clone());
+    o1.push(b.clone());
+    let mut o2 = bootstrap.clone();
+    o2.push(b.clone());
+    o2.push(a.clone());
+    assert_eq!(materialize(&o1, admin), materialize(&o2, admin));
 }
 
 #[test]

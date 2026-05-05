@@ -554,25 +554,55 @@ impl CanonicalPayload for MemberState {}
 impl CanonicalPayloadSealed for MemberStatus {}
 impl CanonicalPayload for MemberStatus {}
 
+/// Canonical total order for membership events.
+///
+/// Replay-order is `(wall_ms, logical, device_id, EventId, sig)`
+/// ascending — the same tuple `materialize()` and `prior_state_at_event`
+/// use. Exposed so callers building a "prefix" of the log (e.g., the
+/// Phase 2 sync layer computing prior_state for verify_event) can sort
+/// with the EXACT comparator used downstream and never drift.
+///
+/// Why each field is needed:
+/// - HLC `(wall_ms, logical, device_id)`: causal-ish order across
+///   devices. Partial — two events authored on different devices in
+///   the same wall_ms / logical / device_id string collide.
+/// - `EventId`: strong tiebreaker, but caller-supplied — a buggy or
+///   malicious peer could emit two distinct events with the same id.
+/// - `sig`: 64-byte ed25519 signature; deterministic for distinct
+///   payloads under the same key, and signature security guarantees
+///   distinct payloads → distinct sigs. This is the field that makes
+///   the order truly total across any malformed input.
+pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
+    (
+        e.at.wall_ms,
+        e.at.logical,
+        &e.at.device_id,
+        &e.id,
+        e.sig.as_slice(),
+    )
+}
+
 /// Replay a community's signed event log into a MaterializedMembership.
 ///
 /// Implements the spec's "Materialization rules" verbatim:
 ///
 /// 1. Bootstrap: power_levels[admin_addr] = 100 BEFORE replaying any
 ///    events. Admin can later SetPower themselves to a different value.
-/// 2. Events are applied in HLC ascending order, regardless of input
-///    order — the input may arrive partial-ordered from DAG-sync.
+/// 2. Events are applied in `event_sort_key` ascending order
+///    (`(wall_ms, logical, device_id, EventId, sig)`), regardless of
+///    input order — the input may arrive partial-ordered from DAG-sync.
 /// 3. Per-kind effects:
-///    - Join: members[actor] = Joined / joined_at: at
-///    - Leave: members[actor].status = Left, .left_at = at
+///    - Join: members[actor] = Joined / joined_at: at (Banned-sticky)
+///    - Leave: members[actor].status = Left, .left_at = at (Banned-sticky)
 ///    - Invite { target }: members[target] = Invited / joined_at: at
 ///    - Kick { target }: members[target].status = Banned, .left_at = at
 ///    - SetPower { target, level }: power_levels[target] = level
 ///
 /// Pure function — does NOT verify signatures or power rules. That's
-/// `verify_event` (Task 10). Materialization assumes pre-verified
-/// events; the Phase 2 sync layer rejects unverified events before
-/// they reach this function.
+/// `verify_event`. Materialization assumes pre-verified events; the
+/// Phase 2 sync layer rejects unverified events before they reach
+/// this function. Banned-stickiness on Join/Leave is defense-in-depth
+/// for events that slip past verification.
 pub fn materialize(
     events: &[SignedMembershipEvent],
     admin_addr: OwnerAddr,
@@ -583,41 +613,13 @@ pub fn materialize(
     // (replayed below) can override.
     m.power_levels.insert(admin_addr, 100);
 
-    // HLC-sort. We don't assume the input is sorted because DAG-sync
-    // delivers events partial-ordered. Cloning is fine here — the
-    // event vec is small (community sizes are bounded; even very
-    // active communities have O(thousands) of events at the long
-    // tail, not millions).
+    // Sort by the canonical total order. We don't assume the input
+    // is sorted because DAG-sync delivers events partial-ordered.
+    // Cloning the &-refs is fine — the event vec is small (community
+    // sizes are bounded; even very active communities have O(thousands)
+    // of events at the long tail, not millions).
     let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
-    sorted.sort_by(|a, b| {
-        // Total order: HLC tuple → EventId → sig.
-        //
-        // HLC alone is partial — two events authored on different devices in
-        // the same wall_ms with the same logical counter and identical
-        // device_id strings would otherwise be input-order-dependent.
-        //
-        // EventId is a strong tiebreaker but caller-supplied — a buggy
-        // or malicious peer could emit two distinct events with the same
-        // id. Append the 64-byte ed25519 sig (deterministic for distinct
-        // payloads under the same key, divergent across actors) as the
-        // final field so total order survives any EventId reuse: distinct
-        // signed payloads have distinct sigs by signature security.
-        let key_a = (
-            a.at.wall_ms,
-            a.at.logical,
-            &a.at.device_id,
-            &a.id,
-            a.sig.as_slice(),
-        );
-        let key_b = (
-            b.at.wall_ms,
-            b.at.logical,
-            &b.at.device_id,
-            &b.id,
-            b.sig.as_slice(),
-        );
-        key_a.cmp(&key_b)
-    });
+    sorted.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
 
     for event in sorted {
         match &event.kind {
@@ -691,6 +693,44 @@ pub fn materialize(
     m
 }
 
+/// Compute the prior materialized state for an event — the state
+/// `verify_event` should authorize against.
+///
+/// Materializes every event in `all_events` whose `event_sort_key` is
+/// STRICTLY less than `target`'s, using the same total order
+/// `materialize` uses internally. Equivalent to
+/// `materialize(events.filter(|e| event_sort_key(e) < event_sort_key(target)), admin_addr)`
+/// but exposed as a helper so callers can't drift from the comparator.
+///
+/// Why a dedicated helper:
+/// - Re-implementing the prefix selection in caller code (e.g., "all
+///   events strictly before in HLC order") would miss the EventId / sig
+///   tie-breakers and silently authorize a target event against state
+///   that DOESN'T include same-HLC predecessors — masking stale
+///   membership/power lookups when wall_ms ties occur.
+/// - The Phase 2 sync layer is the production caller; this helper is
+///   the single source of truth for "what state was true just before
+///   this event", and changes to the comparator (e.g., a future
+///   tiebreaker) propagate to all call sites automatically.
+///
+/// `target` must be an event from `all_events` (or one whose sort key
+/// is at least defined relative to them). Events EQUAL to `target`
+/// under the comparator are excluded — verification of an event at
+/// position N looks at the prefix [0, N).
+pub fn prior_state_at_event(
+    all_events: &[SignedMembershipEvent],
+    target: &SignedMembershipEvent,
+    admin_addr: OwnerAddr,
+) -> MaterializedMembership {
+    let target_key = event_sort_key(target);
+    let prefix: Vec<SignedMembershipEvent> = all_events
+        .iter()
+        .filter(|e| event_sort_key(e) < target_key)
+        .cloned()
+        .collect();
+    materialize(&prefix, admin_addr)
+}
+
 /// Caller-provided context for verify_event. Carries the expected
 /// community_id, the prior materialized state (so the function is pure
 /// — verify_event doesn't load state from anywhere), the policy bit,
@@ -723,10 +763,16 @@ pub struct VerifyContext<'a> {
 /// Full membership-event verification per ZEB-217 spec §"Verification".
 ///
 /// Run BEFORE materializing an event into the CRDT. Caller must:
-/// 1. Compute the prior materialized state (using `materialize` over
-///    all events strictly before `event` in HLC order).
-/// 2. Resolve `event.actor` → pubkey via Sub-A's owner-key cache.
-/// 3. For invite-only Joins, also resolve the countersig signer.
+/// 1. Compute `prior_state` by materializing every event whose
+///    `event_sort_key` is STRICTLY less than `event`'s — i.e., the
+///    `(wall_ms, logical, device_id, EventId, sig)` tuple strictly
+///    less than the target's. Use `prior_state_at_event` to do this
+///    correctly without re-implementing the comparator (which would
+///    drift from `materialize`'s tie-breakers and silently authorize
+///    against stale state when same-HLC predecessors exist).
+/// 2. Resolve `event.actor` → identity_pub via Sub-A's owner-device cache.
+/// 3. For invite-only Joins, also resolve the countersig signer's
+///    identity_pub.
 ///
 /// Verifies in this order:
 /// 1. Actor's signature on the event payload.
