@@ -57,9 +57,16 @@ fn community_invite_payload_round_trips_invite_only_form() {
 
     assert!(decoded.is_invite_only);
     assert_eq!(
+        decoded.expires_at.as_ref().map(|h| h.wall_ms),
+        Some(9999),
+        "expires_at must round-trip — central to invite-only TTL semantics"
+    );
+    assert_eq!(
         decoded.invite_token.as_ref().map(|t| t.invitee_hint),
         Some(Some(OwnerAddr([6u8; 16])))
     );
+    assert_eq!(decoded.invite_token.as_ref().map(|t| t.inviter), Some(token.inviter));
+    assert_eq!(decoded.invite_token.as_ref().map(|t| t.sig), Some(token.sig));
 }
 
 #[test]

@@ -803,6 +803,24 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         (None, Some(ck)) => (Some(ck.clone()), vec![]),
     };
 
+    // admin_addr, membership_key, and is_invite_only are creation-pinned
+    // for Community spaces (per ZEB-217 spec: no admin transfer, no
+    // membership-key rotation, no flip-to-private in v1). LWW on
+    // updated_at would let a malicious or buggy peer publish a same-
+    // SpaceId Space with a fresher HLC and different bootstrap admin /
+    // encryption key / privacy mode — silently shifting power-100
+    // authority, locking prior encrypted state, or flipping the
+    // community model from open to invite-only. Pin to the side with
+    // the OLDER created_at instead. Same-SpaceId merge with the same
+    // original creator yields identical values; cross-creator
+    // divergence is an invariant violation caught upstream by
+    // validate_invariants.
+    let creator_side = if a.created_at.is_strictly_newer_than(&b.created_at) {
+        b
+    } else {
+        a
+    };
+
     Space {
         id: newer.id,
         kind: newer.kind, // kind shouldn't change in practice; LWW for safety
@@ -816,17 +834,13 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         // left_at is also LWW — newer overrides (re-invitation clears to None).
         left_at: newer.left_at.clone(),
         // created_at is monotonically the earliest.
-        created_at: if a.created_at.is_strictly_newer_than(&b.created_at) {
-            b.created_at.clone()
-        } else {
-            a.created_at.clone()
-        },
+        created_at: creator_side.created_at.clone(),
         updated_at: newer.updated_at.clone(),
         content_key,
         prior_content_keys,
-        membership_key: newer.membership_key.clone(),
-        admin_addr: newer.admin_addr,
-        is_invite_only: newer.is_invite_only,
+        membership_key: creator_side.membership_key.clone(),
+        admin_addr: creator_side.admin_addr,
+        is_invite_only: creator_side.is_invite_only,
     }
 }
 
@@ -945,6 +959,83 @@ mod apply_space_tests {
     /// same content_key. The cap-rule merge on prior_content_keys must union
     /// both sides' priors, dedup, sort, and cap. Winner content_key is
     /// preserved unchanged.
+    /// Defense-in-depth for ZEB-217: admin_addr, membership_key, and
+    /// is_invite_only are creation-pinned for Community spaces. A
+    /// fresher updated_at on a same-SpaceId Space must NOT shift the
+    /// bootstrap admin, rotate the membership key, or flip privacy
+    /// mode — those are explicit higher-level operations that don't
+    /// exist in v1. Pinning to the older created_at side defends
+    /// against a malicious or buggy peer publishing a Space with the
+    /// same SpaceId but a hostile admin/key/policy.
+    #[test]
+    fn lww_merge_community_pins_creation_fields_to_older_creator() {
+        use crate::owner_state_types::MembershipKey;
+
+        let original_admin = OwnerAddr([1u8; 16]);
+        let original_key = MembershipKey::new([0xaa; 32]);
+        let earlier = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "earlier".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100), // older creator
+            updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(original_key.clone()),
+            admin_addr: Some(original_admin),
+            is_invite_only: Some(false),
+        };
+        let attacker_replay = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "later".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(200),     // newer (attacker pretends to be original creator)
+            updated_at: hlc(300),     // even fresher
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0xbb; 32])), // hostile rotation
+            admin_addr: Some(OwnerAddr([99u8; 16])),              // hostile admin takeover
+            is_invite_only: Some(true),                           // hostile flip to private
+        };
+
+        let merged = lww_merge_space(&earlier, &attacker_replay);
+
+        assert_eq!(
+            merged.admin_addr,
+            Some(original_admin),
+            "admin_addr must pin to the older creator — power-100 authority can't shift via LWW"
+        );
+        assert_eq!(
+            merged.membership_key,
+            Some(original_key),
+            "membership_key must pin to creation — rotation would lock prior encrypted state"
+        );
+        assert_eq!(
+            merged.is_invite_only,
+            Some(false),
+            "is_invite_only must pin to creation — privacy mode is set once"
+        );
+        // Mutable fields still LWW (newer wins)
+        assert_eq!(
+            merged.name, "later",
+            "mutable fields like name still take the newer side"
+        );
+    }
+
     #[test]
     fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
