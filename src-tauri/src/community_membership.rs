@@ -764,6 +764,12 @@ pub fn prior_state_at_event(
 /// cross-community authorization (caller has community A's state but
 /// the event was signed for community B).
 ///
+/// `admin_addr` is the community's bootstrap admin (Space.admin_addr).
+/// Admin self-Join in an invite-only community is exempt from the
+/// countersig requirement — without this exemption a fresh invite-only
+/// community would be unbootstrappable (every Join would need a
+/// countersig from a Joined member, but no one is Joined initially).
+///
 /// `actor_identity_pub` is the canonical 64-byte combined identity
 /// public bytes (`X25519_pub(32) || Ed25519_pub(32)`) for the OwnerAddr
 /// claimed in `event.actor`. Sub-A's owner-device cache is the source.
@@ -772,11 +778,13 @@ pub fn prior_state_at_event(
 /// cache entry, or a key-substitution attack all surface as
 /// ActorPubkeyMismatch instead of being silently accepted.
 ///
-/// `countersigner_identity_pub` is None for open communities and for
-/// non-Join events. For invite-only Joins it MUST be Some, with the
-/// hashed bytes matching `event.countersig.signer`.
+/// `countersigner_identity_pub` is None for open communities, for
+/// non-Join events, and for admin self-Join in invite-only. For all
+/// other invite-only Joins it MUST be Some, with the hashed bytes
+/// matching `event.countersig.signer`.
 pub struct VerifyContext<'a> {
     pub expected_community_id: SpaceId,
+    pub admin_addr: OwnerAddr,
     pub is_invite_only: bool,
     pub actor_identity_pub: &'a [u8; 64],
     pub countersigner_identity_pub: Option<&'a [u8; 64]>,
@@ -836,16 +844,20 @@ pub fn verify_event(
     }
 
     // 0b. Countersig presence rule: a countersig is allowed ONLY on
-    //     invite-only Join events. The actor sig intentionally excludes
-    //     countersig (so an inviter can append it without invalidating
-    //     the actor's sig), which makes countersig malleable on the
-    //     wire. Reject any countersig outside its allowed slot so the
-    //     invariant "countersig present iff invite-only Join" holds
-    //     end-to-end (also closes a wire-dedupe hole: two events with
-    //     identical actor sig but differing countersig bytes hash to
-    //     different canonical-CBOR bytes, so a malicious peer could
-    //     replay-fan one event as N at the byte layer).
-    let countersig_allowed = matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only;
+    //     non-admin invite-only Join events. The actor sig intentionally
+    //     excludes countersig (so an inviter can append it without
+    //     invalidating the actor's sig), which makes countersig
+    //     malleable on the wire. Reject any countersig outside its
+    //     allowed slot so the invariant "countersig present iff
+    //     non-admin invite-only Join" holds end-to-end (closes a
+    //     wire-dedupe hole and keeps admin's bootstrap Join indistinguishable
+    //     from open-Join wrt countersig).
+    let admin_self_invite_only_join = matches!(event.kind, MembershipEventKind::Join)
+        && ctx.is_invite_only
+        && event.actor == ctx.admin_addr;
+    let countersig_allowed = matches!(event.kind, MembershipEventKind::Join)
+        && ctx.is_invite_only
+        && !admin_self_invite_only_join;
     if event.countersig.is_some() && !countersig_allowed {
         return Err(VerifyError::UnexpectedCounterSig);
     }
@@ -883,8 +895,11 @@ pub fn verify_event(
         }
     }
 
-    // 3. For invite-only Joins, countersig is required + valid +
-    //    countersigner is a Joined member with sufficient power.
+    // 3. For non-admin invite-only Joins, countersig is required +
+    //    valid + countersigner is a Joined member with sufficient
+    //    power. Admin self-Join in invite-only is exempt (bootstrap
+    //    rule — the community would otherwise be unbootstrappable
+    //    since no Joined member exists to countersign).
     //
     // Note: under v1's hardcoded POWER_THRESHOLDS.invite = 0, the
     // power check below is unreachable (any owner addr defaults to
@@ -897,7 +912,10 @@ pub fn verify_event(
     // critical gate in v1: without it, any non-member with a valid
     // countersig key (e.g., a former member who was Kicked but whose
     // power_levels entry persists) could vouch for new joiners.
-    if matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only {
+    if matches!(event.kind, MembershipEventKind::Join)
+        && ctx.is_invite_only
+        && !admin_self_invite_only_join
+    {
         let cs = event
             .countersig
             .as_ref()

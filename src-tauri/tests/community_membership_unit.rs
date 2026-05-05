@@ -1012,6 +1012,7 @@ fn verify_event_accepts_valid_join_in_open_community() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1042,6 +1043,7 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1049,6 +1051,81 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
     assert_eq!(err, VerifyError::CounterSigRequired);
+}
+
+#[test]
+fn verify_event_accepts_admin_self_join_in_invite_only_community_without_countersig() {
+    // Bootstrap exemption: an invite-only community would otherwise be
+    // unbootstrappable — every Join needs a countersig from a Joined
+    // member, but no one is Joined initially. Admin is implicitly
+    // trusted by virtue of being admin_addr; their self-Join is the
+    // bootstrap event that puts the first Joined member into the CRDT.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+
+    let prior_state = materialize(&[], admin); // empty community
+
+    let payload = EventPayload {
+        id: [1u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
+        is_invite_only: true,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    verify_event(&event, &prior_state, &ctx).expect("admin self-Join must bootstrap");
+}
+
+#[test]
+fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
+    // Admin self-Join in invite-only is exempt from the countersig
+    // requirement — but if a countersig IS attached, that's malformed
+    // input. Reject as UnexpectedCounterSig (consistent with how
+    // open-community Join with countersig is rejected). Defends against
+    // wire-malleability via the countersig field.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (someone_priv, _someone_id_pub, _someone) = make_test_identity(2);
+
+    let prior_state = materialize(&[], admin);
+
+    let payload = EventPayload {
+        id: [1u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+    // Spurious countersig from someone else.
+    let event =
+        attach_countersig_with_identity(&event, &someone_priv).expect("countersig");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
+        is_invite_only: true,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::UnexpectedCounterSig);
 }
 
 #[test]
@@ -1077,6 +1154,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&admin_id_pub),
@@ -1118,6 +1196,7 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1164,6 +1243,7 @@ fn verify_event_rejects_kick_on_target_who_never_joined() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1241,6 +1321,7 @@ fn verify_event_accepts_kick_on_left_member() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1289,6 +1370,7 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1330,6 +1412,7 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1377,6 +1460,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1430,6 +1514,7 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1480,6 +1565,7 @@ fn verify_event_rejects_setpower_from_non_joined_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1533,6 +1619,7 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&outsider_id_pub),
@@ -1612,6 +1699,7 @@ fn verify_event_rejects_leave_from_banned_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1841,6 +1929,7 @@ fn verify_event_rejects_join_replay_after_kick() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1885,6 +1974,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1926,6 +2016,7 @@ fn verify_event_accepts_setpower_at_max_boundary() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1966,6 +2057,7 @@ fn verify_event_rejects_countersig_on_open_community_join() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false, // OPEN community
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -2003,6 +2095,7 @@ fn verify_event_rejects_countersig_on_invite_event() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -2048,6 +2141,7 @@ fn verify_event_rejects_event_for_wrong_community() {
 
     let ctx = VerifyContext {
         expected_community_id: community_a, // verify against A
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -2093,6 +2187,7 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
 
     let ctx = VerifyContext {
         expected_community_id: SpaceId([3u8; 16]),
+        admin_addr: admin,
         is_invite_only: false,
         actor_identity_pub: &bob_id_pub, // wrong identity for actor=alice
         countersigner_identity_pub: None,
