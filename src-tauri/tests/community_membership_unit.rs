@@ -135,3 +135,180 @@ fn sign_event_produces_signature_verifiable_with_pubkey() {
         )
         .expect("signature must verify against signer pubkey");
 }
+
+use harmony_app::community_membership::{
+    attach_countersig, verify_countersig, verify_signature, VerifyError,
+};
+
+#[test]
+fn verify_signature_accepts_valid_event() {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let pubkey = signing_key.verifying_key();
+
+    let pk_bytes = pubkey.to_bytes();
+    let mut actor_bytes = [0u8; 16];
+    actor_bytes.copy_from_slice(&pk_bytes[..16]);
+    let actor = OwnerAddr(actor_bytes);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event(&payload, &signing_key).expect("sign");
+    verify_signature(&event, &pubkey).expect("must verify");
+}
+
+#[test]
+fn verify_signature_rejects_tampered_event() {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let pubkey = signing_key.verifying_key();
+    let pk_bytes = pubkey.to_bytes();
+    let mut actor_bytes = [0u8; 16];
+    actor_bytes.copy_from_slice(&pk_bytes[..16]);
+    let actor = OwnerAddr(actor_bytes);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let mut event = sign_event(&payload, &signing_key).expect("sign");
+    // Tamper with the kind: flip Join to Leave. Sig was over the
+    // original payload; verify must reject.
+    event.kind = MembershipEventKind::Leave;
+
+    let err = verify_signature(&event, &pubkey).expect_err("must reject tampered");
+    assert!(matches!(err, VerifyError::SignatureInvalid));
+}
+
+#[test]
+fn verify_signature_rejects_wrong_pubkey() {
+    let signing_key_a = SigningKey::from_bytes(&[42u8; 32]);
+    let signing_key_b = SigningKey::from_bytes(&[99u8; 32]);
+    let pubkey_b = signing_key_b.verifying_key();
+
+    let pk_bytes = signing_key_a.verifying_key().to_bytes();
+    let mut actor_bytes = [0u8; 16];
+    actor_bytes.copy_from_slice(&pk_bytes[..16]);
+    let actor = OwnerAddr(actor_bytes);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event(&payload, &signing_key_a).expect("sign");
+    let err = verify_signature(&event, &pubkey_b).expect_err("must reject wrong pubkey");
+    assert!(matches!(err, VerifyError::SignatureInvalid));
+}
+
+#[test]
+fn attach_and_verify_countersig_round_trip() {
+    let actor_key = SigningKey::from_bytes(&[42u8; 32]);
+    let inviter_key = SigningKey::from_bytes(&[55u8; 32]);
+    let inviter_pubkey = inviter_key.verifying_key();
+
+    let pk_bytes = actor_key.verifying_key().to_bytes();
+    let mut actor_bytes = [0u8; 16];
+    actor_bytes.copy_from_slice(&pk_bytes[..16]);
+    let actor = OwnerAddr(actor_bytes);
+
+    let inviter_pk_bytes = inviter_pubkey.to_bytes();
+    let mut inviter_addr_bytes = [0u8; 16];
+    inviter_addr_bytes.copy_from_slice(&inviter_pk_bytes[..16]);
+    let inviter = OwnerAddr(inviter_addr_bytes);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event(&payload, &actor_key).expect("sign");
+    let event_with_cs = attach_countersig(&event, inviter, &inviter_key).expect("countersign");
+
+    assert!(event_with_cs.countersig.is_some());
+    let cs = event_with_cs.countersig.as_ref().unwrap();
+    assert_eq!(cs.signer, inviter);
+
+    verify_countersig(&event_with_cs, &inviter_pubkey).expect("countersig must verify");
+}
+
+#[test]
+fn verify_countersig_rejects_when_payload_changed_after_countersign() {
+    let actor_key = SigningKey::from_bytes(&[42u8; 32]);
+    let inviter_key = SigningKey::from_bytes(&[55u8; 32]);
+    let inviter_pubkey = inviter_key.verifying_key();
+
+    let pk_bytes = actor_key.verifying_key().to_bytes();
+    let mut actor_bytes = [0u8; 16];
+    actor_bytes.copy_from_slice(&pk_bytes[..16]);
+    let actor = OwnerAddr(actor_bytes);
+
+    let inviter_pk_bytes = inviter_pubkey.to_bytes();
+    let mut inviter_addr_bytes = [0u8; 16];
+    inviter_addr_bytes.copy_from_slice(&inviter_pk_bytes[..16]);
+    let inviter = OwnerAddr(inviter_addr_bytes);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event(&payload, &actor_key).expect("sign");
+    let mut event_with_cs = attach_countersig(&event, inviter, &inviter_key).expect("countersign");
+
+    // Mutate the payload after counter-signing: change `at`. The
+    // countersig was over the original payload bytes; verify must reject.
+    event_with_cs.at = Hlc {
+        wall_ms: 9999,
+        logical: 0,
+        device_id: "d".into(),
+    };
+
+    let err = verify_countersig(&event_with_cs, &inviter_pubkey)
+        .expect_err("must reject mutated payload");
+    // Note: verify_countersig may surface this as CounterSigInvalid
+    // (since the attached countersig is stale) OR SignatureInvalid
+    // (since the underlying ed25519 verify fails). The exact discriminant
+    // depends on implementation. Accept either.
+    assert!(matches!(
+        err,
+        VerifyError::CounterSigInvalid | VerifyError::SignatureInvalid
+    ));
+}
