@@ -259,6 +259,52 @@ impl std::fmt::Debug for DmContentKey {
     }
 }
 
+/// 32-byte symmetric key for community membership-topic encryption
+/// (ChaCha20-Poly1305). Wire format: bstr(32). In-memory: zeroized
+/// on drop. Debug redacts bytes to avoid log leakage.
+///
+/// Mirrors DmContentKey precisely — same shape, different purpose.
+/// Distributed via CommunityInvitePayload at invite-link generation;
+/// stored in the community Space's `membership_key` field on every
+/// member's owner-state CRDT (where it inherits encryption-at-rest
+/// from ZEB-211).
+///
+/// See ZEB-217 spec §"Data model — Space struct additions".
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+pub struct MembershipKey(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    [u8; 32],
+);
+
+impl MembershipKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Generate a fresh random key from OS entropy. Used when
+    /// creating a new community.
+    pub fn random() -> Self {
+        use rand::RngCore;
+        use zeroize::Zeroizing;
+        let mut k = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(k.as_mut());
+        Self(*k)
+    }
+}
+
+impl std::fmt::Debug for MembershipKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MembershipKey(<32 bytes redacted>)")
+    }
+}
+
 /// 16-byte Reticulum device identity hash. Wire format: bstr(16).
 /// See ZEB-216 §"OwnerDeviceCache".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -992,6 +1038,7 @@ impl_canonical!(
     ContentId,
     OutboxEntryId,
     DmContentKey,
+    MembershipKey, // ← NEW (Phase 1: ZEB-217)
     DeviceIdentityHash,
     OwnerDeviceCache,
     OwnerDeviceEntry,
@@ -3082,5 +3129,44 @@ mod owner_device_entry_deserialize_tests {
             msg.contains("identity pub") && msg.contains("device hash"),
             "expected error mentioning identity pub deriving to a different device hash, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod membership_key_tests {
+    use super::*;
+
+    #[test]
+    fn membership_key_round_trips_through_canonical_cbor() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let key = MembershipKey::new(bytes);
+
+        let encoded = canonical_cbor_encode(&key).expect("encode");
+        let decoded: MembershipKey = canonical_cbor_decode(&encoded).expect("decode");
+
+        assert_eq!(key.as_bytes(), decoded.as_bytes());
+    }
+
+    #[test]
+    fn membership_key_debug_is_redacted() {
+        let key = MembershipKey::new([0xAB; 32]);
+        let formatted = format!("{:?}", key);
+        assert!(
+            !formatted.contains("AB"),
+            "MembershipKey Debug must not leak bytes; got: {formatted}"
+        );
+        assert!(formatted.contains("redacted"));
+    }
+
+    #[test]
+    fn membership_key_random_produces_distinct_values() {
+        let a = MembershipKey::random();
+        let b = MembershipKey::random();
+        assert_ne!(a.as_bytes(), b.as_bytes(), "OsRng entropy was identical?!");
     }
 }
