@@ -2193,7 +2193,13 @@ async fn delete_outbox_entry(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    let (dm_outbox, crdt_state) = {
+    //
+    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
+    // with the Arcs so the post-stop check below can detect a
+    // stop+restart racing through this command. See send_dm for the
+    // full rationale on why both `generation` and handle-attachment
+    // need to be re-verified.
+    let (dm_outbox, crdt_state, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -2202,6 +2208,7 @@ async fn delete_outbox_entry(
                 .clone()
                 .ok_or("node not running or no owner identity")?,
             g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.generation,
         )
     };
 
@@ -2223,8 +2230,44 @@ async fn delete_outbox_entry(
             .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
     };
 
-    // Locks dropped (block scope ended). Emit IPC event only if
-    // something actually changed (idempotent missing-id is no-op).
+    // Locks dropped (block scope ended).
+    //
+    // ZEB-245 (PR #81 round 6): post-stop check before emitting
+    // dm-deleted. If a stop+restart fired during the .await chain
+    // above, our cloned `crdt_state` Arc is now detached from the
+    // live NodeState — the deletion landed in an orphan that won't
+    // be persisted. Emitting dm-deleted in that case would prune the
+    // message from the UI even though it'll reappear on next start.
+    // Surface as Err instead so the caller (App.svelte's deleteDm)
+    // can re-show the message + retry against the live node.
+    //
+    // Mirrors send_dm's fence (lib.rs ~1762): same residual TOCTOU
+    // applies — a stop_inner that flushes the cloned crdt_state
+    // between mutate and post-check still persists the deletion, so
+    // ZEB-234's shutdown fence is the real fix. This guard closes the
+    // common case (stop_node alone, no flush) which is the only
+    // detach path Phase 4 UI can actually trigger.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during delete_outbox_entry (was {}, now {}); \
+                 deletion was applied to a detached crdt_state and won't be persisted — \
+                 retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during delete_outbox_entry; deletion was \
+                applied to a detached crdt_state and won't be persisted"
+                .to_string());
+        }
+    }
+
+    // Emit IPC event only if something actually changed (idempotent
+    // missing-id is no-op).
     if let (Some(space_id), Some(message_cid)) = (outcome.space_id, outcome.message_cid) {
         let _ = app.emit(
             "dm-deleted",
@@ -2602,6 +2645,12 @@ async fn add_space(
     // Snapshot all handles under the sync mutex; release before any
     // .await. (Same pattern as send_dm — NodeState's sync mutex must
     // not span .await boundaries.)
+    //
+    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
+    // with the Arcs so the post-stop check below can detect a
+    // stop+restart racing through this command — see send_dm for the
+    // full rationale on why both `generation` and handle-attachment
+    // need to be re-verified.
     let (
         dm_outbox,
         crdt_state,
@@ -2610,6 +2659,7 @@ async fn add_space(
         self_owner,
         unicast_send_tx,
         identity_pub_64,
+        snapshot_generation,
     ) = {
         let g = state_lock
             .lock()
@@ -2625,6 +2675,7 @@ async fn add_space(
             g.unicast_send_tx.clone().ok_or("unicast_send_tx missing")?,
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing (start_node didn't capture it?)")?,
+            g.generation,
         )
     };
 
@@ -2699,6 +2750,41 @@ async fn add_space(
         (canonical_id, sends, was_merge, stamped)
     };
     let _ = new_hlc; // borrowed only to pin the tracker update timing
+
+    // ZEB-245 (PR #81 round 6): post-stop check BEFORE dispatching
+    // invites. If a stop+restart fired during the .await chain above,
+    // our cloned `crdt_state` Arc is now detached from the live
+    // NodeState — the Space landed in an orphan that won't be
+    // persisted, but if we still dispatched invites the recipients
+    // would auto-accept and ship messages to a Space the sender lost
+    // on restart (cross-device divergence). Suppressing the dispatch
+    // when we detect detachment closes the worst-case asymmetry.
+    //
+    // Mirrors send_dm's fence (lib.rs ~1762) and delete_outbox_entry's
+    // fence below: same residual TOCTOU applies — a stop_inner that
+    // flushes the cloned crdt_state between mutate and post-check
+    // still persists the Space + invites, so ZEB-234's shutdown fence
+    // is the real fix. This guard closes the common case (stop_node
+    // alone, no flush) which is the only detach path Phase 4 UI can
+    // actually trigger.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during add_space (was {}, now {}); \
+                 Space was created in a detached crdt_state and won't be persisted — \
+                 invites suppressed; retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during add_space; Space was created in a \
+                detached crdt_state and won't be persisted — invites suppressed"
+                .to_string());
+        }
+    }
 
     // Dispatch invites only when our minted Space actually became the
     // live entry (or extended one with same id). When `was_merge==true`
