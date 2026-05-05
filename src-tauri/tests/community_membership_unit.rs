@@ -90,3 +90,48 @@ fn event_id_type_is_16_bytes() {
     let id: EventId = [0u8; 16];
     assert_eq!(std::mem::size_of_val(&id), 16);
 }
+
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use harmony_app::community_membership::{sign_event, EventPayload};
+
+#[test]
+fn sign_event_produces_signature_verifiable_with_pubkey() {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let pubkey: VerifyingKey = signing_key.verifying_key();
+    let actor = OwnerAddr({
+        // Simplified: use first 16 bytes of raw pubkey as actor.
+        // Real OwnerAddr is BLAKE3(pubkey)[..16] but sign_event
+        // doesn't care, it just signs whatever bytes you hand it.
+        let pk_bytes = pubkey.to_bytes();
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&pk_bytes[..16]);
+        a
+    });
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event(&payload, &signing_key).expect("sign");
+    assert_eq!(event.id, payload.id);
+    assert_eq!(event.actor, payload.actor);
+    assert_eq!(event.kind, payload.kind);
+    assert_eq!(event.countersig, None);
+
+    // Verify the signature manually using ed25519-dalek directly.
+    let signed_bytes = canonical_cbor_encode(&payload).expect("encode payload");
+    pubkey
+        .verify_strict(
+            &signed_bytes,
+            &ed25519_dalek::Signature::from_bytes(&event.sig),
+        )
+        .expect("signature must verify against signer pubkey");
+}

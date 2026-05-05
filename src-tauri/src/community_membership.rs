@@ -128,3 +128,67 @@ impl CanonicalPayloadSealed for SignedMembershipEvent {}
 impl CanonicalPayload for SignedMembershipEvent {}
 impl CanonicalPayloadSealed for CounterSignature {}
 impl CanonicalPayload for CounterSignature {}
+
+use ed25519_dalek::{Signer, SigningKey};
+
+use crate::owner_state_crypto::{canonical_cbor_encode, CryptoError};
+
+/// The unsigned portion of a SignedMembershipEvent. Encoded canonically
+/// and signed; the resulting signature populates SignedMembershipEvent.sig.
+///
+/// Keeping this as a separate type (vs. signing SignedMembershipEvent
+/// itself with sig=zero) means the signed bytes are unambiguous —
+/// there's no place to put "the actual sig went here" in the encoded
+/// form. Mirrors how dm_envelope::SignedDmCidNotify is signed in
+/// ZEB-227 (Phase 3b).
+///
+/// All 5 field keys are 2 chars to satisfy the same-length-keys
+/// invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventPayload {
+    #[serde(
+        rename = "id",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub id: EventId,
+
+    #[serde(rename = "ci")]
+    pub community_id: SpaceId,
+
+    #[serde(rename = "kn")]
+    pub kind: MembershipEventKind,
+
+    #[serde(rename = "ac")]
+    pub actor: OwnerAddr,
+
+    #[serde(rename = "at")]
+    pub at: Hlc,
+}
+
+impl CanonicalPayloadSealed for EventPayload {}
+impl CanonicalPayload for EventPayload {}
+
+/// Sign an unsigned event payload with the actor's ed25519 key.
+/// Returns a SignedMembershipEvent ready for canonical encoding +
+/// publication. The countersig field is None — invite-only Joins
+/// must be counter-signed via `attach_countersig` (Task 7).
+///
+/// Errors only on canonical CBOR encoding failure (vanishingly rare
+/// for in-memory values — would indicate a broken serde impl).
+pub fn sign_event(
+    payload: &EventPayload,
+    signing_key: &SigningKey,
+) -> Result<SignedMembershipEvent, CryptoError> {
+    let bytes = canonical_cbor_encode(payload)?;
+    let sig = signing_key.sign(&bytes).to_bytes();
+    Ok(SignedMembershipEvent {
+        id: payload.id,
+        community_id: payload.community_id,
+        kind: payload.kind.clone(),
+        actor: payload.actor,
+        at: payload.at.clone(),
+        sig,
+        countersig: None,
+    })
+}
