@@ -823,8 +823,7 @@ pub fn verify_event(
     //     identical actor sig but differing countersig bytes hash to
     //     different canonical-CBOR bytes, so a malicious peer could
     //     replay-fan one event as N at the byte layer).
-    let countersig_allowed =
-        matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only;
+    let countersig_allowed = matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only;
     if event.countersig.is_some() && !countersig_allowed {
         return Err(VerifyError::UnexpectedCounterSig);
     }
