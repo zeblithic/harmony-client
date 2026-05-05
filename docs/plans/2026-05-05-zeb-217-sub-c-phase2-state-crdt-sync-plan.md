@@ -264,7 +264,7 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_identity::PrivateIdentity;
 
 fn make_test_identity() -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let identity = PrivateIdentity::generate();
+    let identity = PrivateIdentity::from_seed(&[0xa1; 32]);
     let identity_pub = identity.identity.to_public_bytes();
     let addr = OwnerAddr(identity.identity.address_hash);
     (identity, identity_pub, addr)
@@ -291,7 +291,7 @@ fn insert_rejects_event_with_wrong_community() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
 
     let mut state = CommunityState::new(community_id);
     let outcome = state.insert_event(
@@ -324,7 +324,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
     let event_id = event.id;
 
     let mut state = CommunityState::new(community_id);
@@ -356,7 +356,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
 
     let mut state = CommunityState::new(community_id);
     let ctx = VerifyContext {
@@ -538,7 +538,7 @@ fn materialized_cache_returns_same_object_until_insert() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
     state.insert_event(
         event,
         &VerifyContext {
@@ -1900,7 +1900,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     let community_id = SpaceId([1u8; 16]);
     let mk = MembershipKey::new([0x42; 32]);
 
-    let identity_a = PrivateIdentity::generate();
+    let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(identity_a.identity.address_hash);
     let identity_a_pub = identity_a.identity.to_public_bytes();
 
@@ -1936,7 +1936,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
             actor: admin,
             at: Hlc { wall_ms: 100, logical: 0, device_id: "a-dev".into() },
         };
-        let event = sign_event_with_identity(payload, &identity_a).expect("sign");
+        let event = sign_event_with_identity(&payload, &identity_a).expect("sign");
         let outcome = sa.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
@@ -3503,7 +3503,7 @@ async fn two_members_dag_sync_full_event_log() {
     let community_id = SpaceId([1u8; 16]);
     let mk = MembershipKey::new([0x42; 32]);
 
-    let id_admin = PrivateIdentity::generate();
+    let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
 
@@ -3628,7 +3628,7 @@ Now finish the test:
                 device_id: "a-dev".into(),
             },
         };
-        let event = sign_event_with_identity(payload, &id_admin).expect("sign");
+        let event = sign_event_with_identity(&payload, &id_admin).expect("sign");
         let outcome = sa.insert_event(
             event,
             &VerifyContext {
