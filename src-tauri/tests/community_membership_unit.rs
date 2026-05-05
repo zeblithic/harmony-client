@@ -1533,6 +1533,84 @@ fn verify_event_accepts_setpower_at_max_boundary() {
 }
 
 #[test]
+fn verify_event_rejects_countersig_on_open_community_join() {
+    // Countersig is only meaningful for invite-only Join. On any
+    // other event (Invite/Kick/SetPower) and on open-community Join,
+    // the field MUST be None — otherwise the wire form is malleable
+    // (sig excludes countersig, so a peer can append/strip/replace
+    // it without invalidating the actor sig). Reject explicitly.
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    // Append a countersig that wasn't requested (open community).
+    let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersig");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        is_invite_only: false, // OPEN community
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::UnexpectedCounterSig);
+}
+
+#[test]
+fn verify_event_rejects_countersig_on_invite_event() {
+    // Even with the right context, Invite events never carry countersigs.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Invite { target: bob },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+    // Spurious countersig.
+    let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersig");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::UnexpectedCounterSig);
+}
+
+#[test]
 fn verify_event_rejects_event_for_wrong_community() {
     // The caller passes a prior_state and policy (is_invite_only) for
     // community A. If the verified event was signed for community B,

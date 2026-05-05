@@ -243,6 +243,16 @@ pub enum VerifyError {
     WrongCommunity,
     SignatureInvalid,
     CounterSigRequired,
+    /// A countersig is present on an event where it shouldn't be —
+    /// any event other than an invite-only Join (i.e., Invite, Kick,
+    /// SetPower, Leave, and open-community Join). The actor's sig
+    /// intentionally excludes countersig (so an inviter can append
+    /// their counter-signature without invalidating the actor's sig
+    /// on a Join), which means countersig is malleable on the wire:
+    /// a peer could append/strip/replace it on any event without
+    /// breaking the actor sig. Reject explicitly so the invariant
+    /// "countersig present iff invite-only Join" holds end-to-end.
+    UnexpectedCounterSig,
     CounterSigInvalid,
     CounterSigPowerInsufficient,
     ActorPowerInsufficient,
@@ -300,6 +310,11 @@ impl std::fmt::Display for VerifyError {
             ),
             VerifyError::SignatureInvalid => write!(f, "signature invalid"),
             VerifyError::CounterSigRequired => write!(f, "invite-only Join requires countersig"),
+            VerifyError::UnexpectedCounterSig => write!(
+                f,
+                "countersig present on a non-invite-only-Join event (sig excludes countersig — \
+                 reject to keep the wire form unmalleable)"
+            ),
             VerifyError::CounterSigInvalid => write!(f, "countersig invalid"),
             VerifyError::CounterSigPowerInsufficient => {
                 write!(f, "countersig signer's power is below invite_threshold")
@@ -750,6 +765,22 @@ pub fn verify_event(
     //    real cause).
     if event.community_id != ctx.expected_community_id {
         return Err(VerifyError::WrongCommunity);
+    }
+
+    // 0b. Countersig presence rule: a countersig is allowed ONLY on
+    //     invite-only Join events. The actor sig intentionally excludes
+    //     countersig (so an inviter can append it without invalidating
+    //     the actor's sig), which makes countersig malleable on the
+    //     wire. Reject any countersig outside its allowed slot so the
+    //     invariant "countersig present iff invite-only Join" holds
+    //     end-to-end (also closes a wire-dedupe hole: two events with
+    //     identical actor sig but differing countersig bytes hash to
+    //     different canonical-CBOR bytes, so a malicious peer could
+    //     replay-fan one event as N at the byte layer).
+    let countersig_allowed =
+        matches!(event.kind, MembershipEventKind::Join) && ctx.is_invite_only;
+    if event.countersig.is_some() && !countersig_allowed {
+        return Err(VerifyError::UnexpectedCounterSig);
     }
 
     // 1. Actor's identity_pub must hash to event.actor AND its
