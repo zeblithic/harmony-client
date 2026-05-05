@@ -312,3 +312,48 @@ fn verify_countersig_rejects_when_payload_changed_after_countersign() {
         VerifyError::CounterSigInvalid | VerifyError::SignatureInvalid
     ));
 }
+
+use harmony_app::community_membership::{
+    MaterializedMembership, MemberStatus, PowerThresholds, POWER_THRESHOLDS,
+};
+
+#[test]
+fn materialized_membership_is_constructible_and_default_empty() {
+    let m = MaterializedMembership::default();
+    assert!(m.members.is_empty());
+    assert!(m.power_levels.is_empty());
+}
+
+#[test]
+fn member_status_round_trips_through_canonical_cbor() {
+    let statuses = [
+        MemberStatus::Joined,
+        MemberStatus::Invited,
+        MemberStatus::Left,
+        MemberStatus::Banned,
+    ];
+    for s in &statuses {
+        let bytes = canonical_cbor_encode(s).expect("encode");
+        let decoded: MemberStatus = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(decoded, *s);
+    }
+}
+
+#[test]
+fn power_thresholds_match_spec_defaults() {
+    assert_eq!(POWER_THRESHOLDS.invite, 0);
+    assert_eq!(POWER_THRESHOLDS.kick, 50);
+    assert_eq!(POWER_THRESHOLDS.set_power, 100);
+    assert_eq!(POWER_THRESHOLDS.max, 100);
+}
+
+#[test]
+fn power_thresholds_struct_constructible() {
+    let custom = PowerThresholds {
+        invite: 10,
+        kick: 60,
+        set_power: 90,
+        max: 100,
+    };
+    assert_eq!(custom.invite, 10);
+}

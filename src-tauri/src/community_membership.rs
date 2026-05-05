@@ -8,6 +8,7 @@
 //! See `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::OwnerAddr;
@@ -317,3 +318,66 @@ pub fn verify_countersig(
         .verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::CounterSigInvalid)
 }
+
+/// Materialized view computed from a community's signed event log.
+/// Pure function of the log + the community Space's admin_addr (per
+/// the bootstrap rule). Re-computed when needed; caching belongs at
+/// the call site (Phase 2's CommunityState owns the cache + version
+/// counter, mirroring the inbox_entries_for_space pattern from
+/// owner_state_crdt.rs).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedMembership {
+    pub members: BTreeMap<OwnerAddr, MemberState>,
+    /// Per-actor power level. Unset key = 0 = default. The community
+    /// admin (Space.admin_addr) starts at 100 implicitly via the
+    /// bootstrap rule — see `materialize` (Task 9). SetPower events
+    /// override.
+    pub power_levels: BTreeMap<OwnerAddr, u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberState {
+    #[serde(rename = "st")]
+    pub status: MemberStatus,
+    #[serde(rename = "ja")]
+    pub joined_at: Hlc,
+    #[serde(rename = "la", skip_serializing_if = "Option::is_none", default)]
+    pub left_at: Option<Hlc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberStatus {
+    #[serde(rename = "j")]
+    Joined,
+    #[serde(rename = "i")]
+    Invited,
+    #[serde(rename = "l")]
+    Left,
+    #[serde(rename = "b")]
+    Banned,
+}
+
+impl CanonicalPayloadSealed for MaterializedMembership {}
+impl CanonicalPayload for MaterializedMembership {}
+impl CanonicalPayloadSealed for MemberState {}
+impl CanonicalPayload for MemberState {}
+impl CanonicalPayloadSealed for MemberStatus {}
+impl CanonicalPayload for MemberStatus {}
+
+/// Per-community power thresholds. v1 hardcoded; per-community
+/// customization is deferred to ZEB-251.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerThresholds {
+    pub invite: u8,
+    pub kick: u8,
+    pub set_power: u8,
+    pub max: u8,
+}
+
+/// Sub-C v1 hardcoded defaults — see ZEB-217 spec §"Power thresholds".
+pub const POWER_THRESHOLDS: PowerThresholds = PowerThresholds {
+    invite: 0,
+    kick: 50,
+    set_power: 100,
+    max: 100,
+};
