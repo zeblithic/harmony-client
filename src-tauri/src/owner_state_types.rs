@@ -1628,9 +1628,25 @@ impl Space {
                 // content_key invariant for Community is enforced in the Community
                 // arm of the kind-invariants match above (with its own rationale
                 // message — "membership_key is the community's symmetric key").
-                // Excluding it here prevents a duplicated check from firing with
-                // a less-informative error if the kind-invariants match is ever
-                // refactored to fall through.
+                // Excluding the content_key check here prevents a duplicated
+                // error firing with a less-informative message if the
+                // kind-invariants match is ever refactored to fall through.
+                //
+                // prior_content_keys must still be empty (Community has no
+                // historical content-key chain — the membership_key is fixed
+                // for the lifetime of the community in v1; key rotation is
+                // ZEB-253 follow-up). Enforce it here because the catch-all
+                // _ arm below would also reject content_key=Some, which
+                // Community legitimately disallows via its own message above
+                // — so falling through would surface a worse error.
+                if !self.prior_content_keys.is_empty() {
+                    return Err(InvariantError(
+                        "community must have prior_content_keys=[] \
+                         (no historical content-key chain — membership_key \
+                         is fixed in v1; rotation is ZEB-253)"
+                            .into(),
+                    ));
+                }
             }
             _ => {
                 if self.content_key.is_some() {
@@ -3159,6 +3175,50 @@ mod space_tests {
         assert!(
             err.0.contains("members=[]"),
             "expected error mentioning empty members invariant; got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn community_space_rejects_non_empty_prior_content_keys() {
+        // ZEB-216 §"Validate invariants extension" requires non-DM kinds
+        // (including Community) to have prior_content_keys=[]. The
+        // community arm of the content-key match doesn't fall through
+        // to the catch-all rule because the catch-all also rejects
+        // content_key=Some, which Community has its own rule for —
+        // so the prior_content_keys check must be present in the
+        // Community arm too.
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![DmContentKey::new([5u8; 32])], // ← invariant violation
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(
+            err.0.contains("prior_content_keys"),
+            "expected error mentioning prior_content_keys invariant; got: {}",
             err.0
         );
     }
