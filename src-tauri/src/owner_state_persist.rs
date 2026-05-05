@@ -288,6 +288,9 @@ mod tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         s.spaces.insert(folder.id, folder);
         s.outbox.insert(
@@ -473,6 +476,9 @@ mod tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         state.apply_space_with_canonicalization(dm_space);
 

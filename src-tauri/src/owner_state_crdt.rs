@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::owner_state_types::{
     DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
     OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space,
-    SpaceId, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
+    SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +157,49 @@ impl OwnerState {
                      merges must stay deterministic on the same ULID)",
                     incoming.id
                 )));
+            }
+            // Reject same-SpaceId Community creation-pinned field changes.
+            // lww_merge_space pins these to the older-created_at side, but
+            // an attacker that backdates `created_at` could "win" the pin
+            // and shift admin authority / rotate the membership key /
+            // flip privacy mode — none of which are valid v1 operations.
+            // Reject at apply time so divergent state never enters the
+            // CRDT (mirrors content_key rejection above).
+            //
+            // Phase 1 has no community-creation IPC, so this branch is
+            // unreachable today; Phase 2's encrypted Zenoh state-root
+            // sync is where it becomes load-bearing. Adding the gate now
+            // means Phase 2 can't accidentally regress it.
+            if existing.kind == SpaceKind::Community {
+                if existing.membership_key != incoming.membership_key {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes membership_key for {:?} \
+                         (creation-pinned in v1; rotation is ZEB-253)",
+                        incoming.id
+                    )));
+                }
+                if existing.admin_addr != incoming.admin_addr {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes admin_addr for {:?} \
+                         (creation-pinned in v1; admin transfer needs explicit semantics)",
+                        incoming.id
+                    )));
+                }
+                if existing.is_invite_only != incoming.is_invite_only {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes is_invite_only for {:?} \
+                         (creation-pinned in v1; privacy mode is set once)",
+                        incoming.id
+                    )));
+                }
+                if existing.created_at != incoming.created_at {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes created_at for {:?} \
+                         (immutable; defends against backdating attacks that would \
+                         hijack the lww_merge_space creator-pin)",
+                        incoming.id
+                    )));
+                }
             }
             let merged = lww_merge_space(existing, &incoming);
             self.spaces.insert(incoming.id, merged);
@@ -803,6 +846,24 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         (None, Some(ck)) => (Some(ck.clone()), vec![]),
     };
 
+    // admin_addr, membership_key, and is_invite_only are creation-pinned
+    // for Community spaces (per ZEB-217 spec: no admin transfer, no
+    // membership-key rotation, no flip-to-private in v1). LWW on
+    // updated_at would let a malicious or buggy peer publish a same-
+    // SpaceId Space with a fresher HLC and different bootstrap admin /
+    // encryption key / privacy mode — silently shifting power-100
+    // authority, locking prior encrypted state, or flipping the
+    // community model from open to invite-only. Pin to the side with
+    // the OLDER created_at instead. Same-SpaceId merge with the same
+    // original creator yields identical values; cross-creator
+    // divergence is an invariant violation caught upstream by
+    // validate_invariants.
+    let creator_side = if a.created_at.is_strictly_newer_than(&b.created_at) {
+        b
+    } else {
+        a
+    };
+
     Space {
         id: newer.id,
         kind: newer.kind, // kind shouldn't change in practice; LWW for safety
@@ -816,14 +877,13 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         // left_at is also LWW — newer overrides (re-invitation clears to None).
         left_at: newer.left_at.clone(),
         // created_at is monotonically the earliest.
-        created_at: if a.created_at.is_strictly_newer_than(&b.created_at) {
-            b.created_at.clone()
-        } else {
-            a.created_at.clone()
-        },
+        created_at: creator_side.created_at.clone(),
         updated_at: newer.updated_at.clone(),
         content_key,
         prior_content_keys,
+        membership_key: creator_side.membership_key.clone(),
+        admin_addr: creator_side.admin_addr,
+        is_invite_only: creator_side.is_invite_only,
     }
 }
 
@@ -856,6 +916,36 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
+        }
+    }
+
+    fn community_space(
+        id: u8,
+        admin_addr: OwnerAddr,
+        membership_key: crate::owner_state_types::MembershipKey,
+        invite_only: bool,
+    ) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "C".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(membership_key),
+            admin_addr: Some(admin_addr),
+            is_invite_only: Some(invite_only),
         }
     }
 
@@ -878,6 +968,9 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -936,6 +1029,235 @@ mod apply_space_tests {
     /// same content_key. The cap-rule merge on prior_content_keys must union
     /// both sides' priors, dedup, sort, and cap. Winner content_key is
     /// preserved unchanged.
+    /// apply_space rejects same-SpaceId Community updates that change
+    /// the creation-pinned fields (membership_key, admin_addr,
+    /// is_invite_only, created_at). Without this check, a backdated
+    /// incoming Space could win the lww_merge_space creator-pin and
+    /// hijack admin authority / rotate the symmetric key.
+    #[test]
+    fn apply_space_rejects_same_space_id_community_admin_addr_change() {
+        use crate::owner_state_types::MembershipKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut takeover = original.clone();
+        takeover.admin_addr = Some(OwnerAddr([99u8; 16])); // attacker
+        takeover.updated_at = hlc(999);
+        let outcome = s.apply_space(takeover);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("admin_addr"),
+                    "expected admin_addr rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+        assert_eq!(
+            s.spaces.get(&SpaceId([7; 16])).unwrap().admin_addr,
+            Some(OwnerAddr([1u8; 16])),
+            "admin_addr must be unchanged after rejection"
+        );
+    }
+
+    #[test]
+    fn apply_space_rejects_same_space_id_community_membership_key_change() {
+        use crate::owner_state_types::MembershipKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut rotation = original.clone();
+        rotation.membership_key = Some(MembershipKey::new([0xbb; 32]));
+        rotation.updated_at = hlc(999);
+        let outcome = s.apply_space(rotation);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("membership_key"),
+                    "expected membership_key rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_space_rejects_same_space_id_community_is_invite_only_flip() {
+        use crate::owner_state_types::MembershipKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut flip = original.clone();
+        flip.is_invite_only = Some(true); // open → invite-only takeover
+        flip.updated_at = hlc(999);
+        let outcome = s.apply_space(flip);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("is_invite_only"),
+                    "expected is_invite_only rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_space_rejects_same_space_id_community_created_at_backdate() {
+        // The backdating attack from CodeRabbit: even though
+        // lww_merge_space pins to the older created_at side, an attacker
+        // can set their incoming created_at older than the legitimate
+        // creator's to "win" the pin. Reject the change at apply time.
+        use crate::owner_state_types::MembershipKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut backdate = original.clone();
+        backdate.created_at = hlc(1); // claim to be older than original (created_at=1)
+        backdate.updated_at = hlc(999);
+        let outcome = s.apply_space(backdate);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("created_at"),
+                    "expected created_at rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_space_accepts_same_space_id_community_mutable_field_update() {
+        use crate::owner_state_types::MembershipKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(
+            7,
+            OwnerAddr([1u8; 16]),
+            MembershipKey::new([0xaa; 32]),
+            false,
+        );
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut renamed = original.clone();
+        renamed.name = "renamed".into();
+        renamed.updated_at = hlc(999);
+        let outcome = s.apply_space(renamed);
+        assert_eq!(outcome, ApplyOutcome::Merged { old_id: None });
+        assert_eq!(s.spaces.get(&SpaceId([7; 16])).unwrap().name, "renamed");
+    }
+
+    /// Defense-in-depth for ZEB-217: admin_addr, membership_key, and
+    /// is_invite_only are creation-pinned for Community spaces. A
+    /// fresher updated_at on a same-SpaceId Space must NOT shift the
+    /// bootstrap admin, rotate the membership key, or flip privacy
+    /// mode — those are explicit higher-level operations that don't
+    /// exist in v1. Pinning to the older created_at side defends
+    /// against a malicious or buggy peer publishing a Space with the
+    /// same SpaceId but a hostile admin/key/policy.
+    #[test]
+    fn lww_merge_community_pins_creation_fields_to_older_creator() {
+        use crate::owner_state_types::MembershipKey;
+
+        let original_admin = OwnerAddr([1u8; 16]);
+        let original_key = MembershipKey::new([0xaa; 32]);
+        let earlier = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "earlier".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100), // older creator
+            updated_at: hlc(100),
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(original_key.clone()),
+            admin_addr: Some(original_admin),
+            is_invite_only: Some(false),
+        };
+        let attacker_replay = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "later".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(200), // newer (attacker pretends to be original creator)
+            updated_at: hlc(300), // even fresher
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0xbb; 32])), // hostile rotation
+            admin_addr: Some(OwnerAddr([99u8; 16])),              // hostile admin takeover
+            is_invite_only: Some(true),                           // hostile flip to private
+        };
+
+        let merged = lww_merge_space(&earlier, &attacker_replay);
+
+        assert_eq!(
+            merged.admin_addr,
+            Some(original_admin),
+            "admin_addr must pin to the older creator — power-100 authority can't shift via LWW"
+        );
+        assert_eq!(
+            merged.membership_key,
+            Some(original_key),
+            "membership_key must pin to creation — rotation would lock prior encrypted state"
+        );
+        assert_eq!(
+            merged.is_invite_only,
+            Some(false),
+            "is_invite_only must pin to creation — privacy mode is set once"
+        );
+        // Mutable fields still LWW (newer wins)
+        assert_eq!(
+            merged.name, "later",
+            "mutable fields like name still take the newer side"
+        );
+    }
+
     #[test]
     fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
@@ -959,6 +1281,9 @@ mod apply_space_tests {
             updated_at: hlc(1),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x10; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let b = Space {
             id: SpaceId([1; 16]),
@@ -977,6 +1302,9 @@ mod apply_space_tests {
             updated_at: hlc(2),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x20; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
 
         // Order-independent: both call orderings yield the same merged prior.
@@ -1115,6 +1443,9 @@ mod apply_space_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -1137,6 +1468,9 @@ mod apply_space_tests {
             updated_at: hlc(200),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -1783,6 +2117,9 @@ mod canonicalization_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2075,6 +2412,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2164,6 +2504,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: Some(DmContentKey::new([0xcc; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -2846,6 +3189,9 @@ mod merge_prior_content_keys_tests {
             updated_at: hlc,
             content_key: Some(content_key),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -3002,6 +3348,9 @@ mod dm_crypto_integration_tests {
             updated_at: hlc,
             content_key: Some(ck),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
