@@ -567,6 +567,58 @@ fn materialize_setpower_overrides_admin_bootstrap() {
 }
 
 #[test]
+fn materialize_total_order_holds_when_event_id_is_reused() {
+    // EventId is caller-supplied. A buggy or malicious peer could emit
+    // two distinct SignedMembershipEvents with identical (HLC, EventId)
+    // but conflicting content (different `level` on the same target).
+    // The sort must still produce a total order across replicas —
+    // appending sig as the final tiebreaker makes the final state
+    // independent of input order.
+    let admin = OwnerAddr([100u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    // Two SetPower events on the same target with same id + same HLC
+    // but different levels → they produce different sigs (sig is over
+    // canonical CBOR which includes level), so sig-based tiebreaking
+    // picks a deterministic winner.
+    let mk = |level: u8| {
+        let payload = EventPayload {
+            id: [1u8; 16], // collide on EventId
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::SetPower { target: bob, level },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 500,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    let bootstrap = vec![make_signed(0, MembershipEventKind::Join, admin, 100)];
+    let collide_a = mk(30);
+    let collide_b = mk(70);
+
+    let mut order_1 = bootstrap.clone();
+    order_1.push(collide_a.clone());
+    order_1.push(collide_b.clone());
+
+    let mut order_2 = bootstrap.clone();
+    order_2.push(collide_b.clone());
+    order_2.push(collide_a.clone());
+
+    let m1 = materialize(&order_1, admin);
+    let m2 = materialize(&order_2, admin);
+
+    assert_eq!(
+        m1, m2,
+        "materialize must converge even when EventId is reused — sig is the final tiebreaker"
+    );
+}
+
+#[test]
 fn materialize_total_order_uses_event_id_tiebreaker_when_hlc_collides() {
     // Two SetPower events on the same target with identical HLC tuples
     // but different EventIds. Sort must be deterministic — the same

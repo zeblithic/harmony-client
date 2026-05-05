@@ -556,13 +556,32 @@ pub fn materialize(
     // tail, not millions).
     let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
     sorted.sort_by(|a, b| {
-        // Total order: HLC tuple first, EventId as deterministic tiebreaker.
+        // Total order: HLC tuple → EventId → sig.
+        //
         // HLC alone is partial — two events authored on different devices in
         // the same wall_ms with the same logical counter and identical
-        // device_id strings (rare, but possible across replicas) would
-        // otherwise be input-order-dependent and diverge across nodes.
-        let key_a = (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id);
-        let key_b = (b.at.wall_ms, b.at.logical, &b.at.device_id, &b.id);
+        // device_id strings would otherwise be input-order-dependent.
+        //
+        // EventId is a strong tiebreaker but caller-supplied — a buggy
+        // or malicious peer could emit two distinct events with the same
+        // id. Append the 64-byte ed25519 sig (deterministic for distinct
+        // payloads under the same key, divergent across actors) as the
+        // final field so total order survives any EventId reuse: distinct
+        // signed payloads have distinct sigs by signature security.
+        let key_a = (
+            a.at.wall_ms,
+            a.at.logical,
+            &a.at.device_id,
+            &a.id,
+            a.sig.as_slice(),
+        );
+        let key_b = (
+            b.at.wall_ms,
+            b.at.logical,
+            &b.at.device_id,
+            &b.id,
+            b.sig.as_slice(),
+        );
         key_a.cmp(&key_b)
     });
 
