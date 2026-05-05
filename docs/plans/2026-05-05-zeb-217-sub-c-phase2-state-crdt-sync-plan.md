@@ -994,8 +994,13 @@ the invite payload). Two modes:
   (key, plaintext) pair yields the same ciphertext, and thus the
   same ContentId for CAS dedup across replicas
 
-Both bind domain-separated AAD so a blob can't be substituted as a
-root-publish wire packet.
+Domain separation: encrypt_blob uses a prefix-tagged deterministic
+nonce derivation (SHA-256 of "harmony-community-blob-v1" || mk ||
+plaintext); encrypt_root_publish additionally binds a static
+"harmony-community-root-publish-v1" AAD. The nonce-prefix vs AAD
+asymmetry is intentional — blob nonces double as content-addressing
+inputs, AAD is incorrect there because it doesn't change the
+ciphertext bytes.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1198,6 +1203,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         community_id,
         membership_key: mk,
         admin_addr: admin,
+        is_invite_only: false,
         device_id: "test-device".into(),
         state: Arc::clone(&state),
         tracker: Arc::clone(&tracker),
@@ -1209,6 +1215,8 @@ async fn engine_constructs_and_shuts_down_cleanly() {
             replay: std::env::temp_dir().join("test_replay.cbor"),
         },
         debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
     });
 
     // Shutdown without ever sending dirty — clean path.
@@ -1313,10 +1321,45 @@ pub struct PersistPaths {
     pub replay: PathBuf,
 }
 
+/// Resolves an OwnerAddr → 64-byte identity_pub at receive-side
+/// verify-event time. Production implementation wraps Sub-A's
+/// owner-device cache (Task 13's `OwnerDeviceCacheResolver`); tests
+/// use a static mapping. The trait is declared at Task 6 so the
+/// `CommunitySyncEngineConfig::identity_resolver` field can reference
+/// it; concrete implementations (other than test stubs) land in
+/// later tasks.
+pub trait IdentityResolver: Send + Sync {
+    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]>;
+}
+
+/// One degraded-path report from an engine. Sent on the engine's
+/// `error_tx` channel to a registry-level receiver, which translates
+/// each report into a `community-state-sync-degraded` Tauri IPC event
+/// (Task 13 wires the receiver). Decoupling the engine from the
+/// `tauri::AppHandle` keeps the CRDT layer Tauri-agnostic and makes
+/// the engine unit-testable without spinning up a Tauri runtime.
+#[derive(Debug, Clone)]
+pub struct CommunityDegradedReport {
+    pub community_id: SpaceId,
+    /// Short tag identifying the failure class. Stable across versions
+    /// so the frontend's banner copy can switch on it. Examples:
+    /// "decrypt_failed", "blob_fetch_failed", "verify_event_rejected",
+    /// "wire_decode_failed", "subscriber_channel_closed".
+    pub reason_tag: &'static str,
+    /// Human-readable detail. Not localised; surfaced to the frontend
+    /// for telemetry / debug display rather than user-facing copy.
+    pub detail: String,
+}
+
 pub struct CommunitySyncEngineConfig {
     pub community_id: SpaceId,
     pub membership_key: MembershipKey,
     pub admin_addr: OwnerAddr,
+    /// Whether this community requires invite-only counter-sigs on
+    /// non-admin Joins. Plumbed into VerifyContext at receive time
+    /// (Task 8 consumes this). Defaults to `false` for tests that
+    /// don't exercise the invite-only path.
+    pub is_invite_only: bool,
     pub device_id: String,
     pub state: Arc<Mutex<CommunityState>>,
     pub tracker: Arc<Mutex<CommunityRootHlcTracker>>,
@@ -1325,6 +1368,17 @@ pub struct CommunitySyncEngineConfig {
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
     pub paths: PersistPaths,
     pub debounce_ms: u64,
+    /// Resolver for OwnerAddr → 64-byte identity_pub at receive-side
+    /// verify_event time. `None` means receive-side verify will skip
+    /// every event (with a tracing::warn) — acceptable for Task 6/7
+    /// tests that exercise the publish path only; Task 8's tests must
+    /// supply a Some(resolver).
+    pub identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    /// Channel for degraded-path reports. Cloned by the registry from
+    /// a single shared receiver lived in start_node (Task 13). `None`
+    /// means degraded paths log via `tracing::warn!` only — acceptable
+    /// for tests that don't assert on IPC-event emission.
+    pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
 }
 
 pub struct CommunitySyncEngine {
@@ -1349,6 +1403,7 @@ impl CommunitySyncEngine {
             community_id: cfg.community_id,
             membership_key: cfg.membership_key,
             admin_addr: cfg.admin_addr,
+            is_invite_only: cfg.is_invite_only,
             device_id: cfg.device_id,
             state: cfg.state,
             tracker: cfg.tracker,
@@ -1361,6 +1416,8 @@ impl CommunitySyncEngine {
             has_pending_dirty: Arc::clone(&has_pending_dirty),
             flush_now_rx,
             shutdown_rx,
+            identity_resolver: cfg.identity_resolver,
+            error_tx: cfg.error_tx,
         }));
 
         Self {
@@ -1402,6 +1459,7 @@ struct InternalCtx {
     community_id: SpaceId,
     membership_key: MembershipKey,
     admin_addr: OwnerAddr,
+    is_invite_only: bool,
     device_id: String,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityRootHlcTracker>>,
@@ -1414,6 +1472,8 @@ struct InternalCtx {
     has_pending_dirty: Arc<AtomicBool>,
     flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
+    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
 }
 
 async fn internal_task_stub(mut ctx: InternalCtx) {
@@ -1527,6 +1587,7 @@ async fn flush_now_publishes_one_root_publish() {
         community_id,
         membership_key: mk,
         admin_addr: admin,
+        is_invite_only: false,
         device_id: "test-device".into(),
         state: Arc::clone(&state),
         tracker: Arc::clone(&tracker),
@@ -1538,6 +1599,8 @@ async fn flush_now_publishes_one_root_publish() {
             replay: std::env::temp_dir().join("flush_test_replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -1890,11 +1953,15 @@ async fn engine_receives_remote_publish_and_merges_event() {
         ));
     }
 
-    // Spawn engines.
+    // Spawn engines. Task 6 added is_invite_only / identity_resolver
+    // / error_tx fields with sensible defaults; Task 8's tests fill
+    // in `identity_resolver: Some(...)` so receive-side verify_event
+    // can resolve identity_pubs for the admin's signed events.
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
         membership_key: mk.clone(),
         admin_addr: admin,
+        is_invite_only: false,
         device_id: "a-dev".into(),
         state: Arc::clone(&state_a),
         tracker: Arc::clone(&tracker_a),
@@ -1906,12 +1973,13 @@ async fn engine_receives_remote_publish_and_merges_event() {
             replay: std::env::temp_dir().join("a_replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
     });
 
     // B needs an OwnerDeviceCache-style lookup that returns
-    // identity_a_pub for `admin`. Plumbing this is part of Task 8's
-    // implementation — the engine_b config includes a verify-time
-    // identity-resolver fn.
+    // identity_a_pub for `admin`. Production wires Task 13's
+    // `OwnerDeviceCacheResolver`; this test uses a static stub.
     let identity_resolver: Arc<dyn harmony_app::community_state_sync::IdentityResolver> =
         Arc::new(SingleIdentityResolver {
             addr: admin,
@@ -1922,6 +1990,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         community_id,
         membership_key: mk,
         admin_addr: admin,
+        is_invite_only: false,
         device_id: "b-dev".into(),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
@@ -1933,8 +2002,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
             replay: std::env::temp_dir().join("b_replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
-    }
-    .with_identity_resolver(identity_resolver));
+        identity_resolver: Some(identity_resolver),
+        error_tx: None,
+    });
 
     // Trigger A's publish. B's subscriber arm should fire and merge.
     engine_a.flush_now().await.expect("flush_now");
@@ -1999,21 +2069,50 @@ pub trait IdentityResolver: Send + Sync {
 /// only when local state actually changed.
 #[derive(Debug)]
 enum IncomingOutcome {
+    /// `would_accept` rejected the wire HLC at the early replay-check
+    /// (step 2). No state change. Don't persist.
     Duplicate,
+    /// Tracker advanced AND ≥ 1 new event was Inserted into the CRDT.
+    /// Persist both `crdt.cbor` and `replay.cbor`.
     Mutated,
+    /// Tracker advanced but every event in the remote blob was already
+    /// in our log (`AlreadyKnown`). The CRDT is byte-identical; only
+    /// `replay.cbor` needs to flush. Distinguishing this from `Mutated`
+    /// lets Task 10's persist path skip the larger `crdt.cbor` fsync
+    /// when a peer re-broadcasts the same event set with an advanced
+    /// clock.
+    MutatedTrackerOnly,
+    /// Failure occurred BEFORE step 6 (decrypt-root, payload decode,
+    /// blob fetch, blob decrypt, blob decode, misrouted-blob check).
+    /// No state change. Don't persist.
     ErrPreMutation(CommunitySyncError),
+    /// Failure occurred AFTER the tracker advanced. Tracker is in-
+    /// memory dirty; persist defensively so a restart doesn't replay
+    /// the same publish.
     ErrPostMutation(CommunitySyncError),
 }
 
 impl IncomingOutcome {
+    /// Whether the disk needs flushing. Task 10's `persist_both` is
+    /// the broad case (CRDT + replay); for `MutatedTrackerOnly` callers
+    /// can use `persist_replay_only` to skip the CRDT fsync.
     fn needs_persist(&self) -> bool {
+        matches!(
+            self,
+            Self::Mutated | Self::MutatedTrackerOnly | Self::ErrPostMutation(_)
+        )
+    }
+
+    /// Whether the CRDT itself changed (≥ 1 event Inserted). Used by
+    /// Task 10 to decide between `persist_both` and `persist_replay_only`.
+    fn crdt_mutated(&self) -> bool {
         matches!(self, Self::Mutated | Self::ErrPostMutation(_))
     }
 
     fn error(&self) -> Option<&CommunitySyncError> {
         match self {
             Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
-            Self::Duplicate | Self::Mutated => None,
+            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly => None,
         }
     }
 }
@@ -2095,6 +2194,7 @@ async fn handle_incoming_publish(
     };
 
     let mut state = ctx.state.lock().await;
+    let mut inserted_any = false;
     for event in remote.events.into_values() {
         // Skip events we already have.
         if state.events.contains_key(&event.id) {
@@ -2146,69 +2246,71 @@ async fn handle_incoming_publish(
         };
 
         match state.insert_event(event, &ctx_v) {
-            crate::community_state_crdt::InsertOutcome::Inserted
-            | crate::community_state_crdt::InsertOutcome::AlreadyKnown => {}
+            crate::community_state_crdt::InsertOutcome::Inserted => {
+                inserted_any = true;
+            }
+            crate::community_state_crdt::InsertOutcome::AlreadyKnown => {
+                // Skip — already in our log. Don't flip inserted_any
+                // because the CRDT is unchanged; without this, every
+                // duplicate Zenoh fanout echo would trigger a
+                // disk-persist on the Mutated arm at Task 10.
+            }
             crate::community_state_crdt::InsertOutcome::Rejected(verr) => {
                 tracing::warn!(
                     community_id = ?ctx.community_id,
                     error = ?verr,
                     "skipping incoming event: verify_event rejected"
                 );
-                // Continue — one bad event must not block valid ones
-                // delivered in the same publish. Defense-in-depth at
-                // both layers (Phase 1 spec §"Defense-in-depth").
+                // Surface the rejection as a degraded-path report —
+                // verify_event rejections at receive time are the
+                // most useful signal for the frontend banner (forged
+                // sigs, insufficient power, banned-actor replays
+                // etc). One bad event does not block valid ones in
+                // the same publish — defense-in-depth at both
+                // layers (Phase 1 spec §"Defense-in-depth").
+                if let Some(tx) = ctx.error_tx.as_ref() {
+                    let _ = tx
+                        .send(CommunityDegradedReport {
+                            community_id: ctx.community_id,
+                            reason_tag: "verify_event_rejected",
+                            detail: format!("{verr:?}"),
+                        })
+                        .await;
+                }
             }
         }
     }
 
-    IncomingOutcome::Mutated
-}
-```
-
-Update `InternalCtx` to carry the resolver and `is_invite_only` flag:
-
-```rust
-struct InternalCtx {
-    community_id: SpaceId,
-    membership_key: MembershipKey,
-    admin_addr: OwnerAddr,
-    is_invite_only: bool,
-    device_id: String,
-    state: Arc<Mutex<CommunityState>>,
-    tracker: Arc<Mutex<CommunityRootHlcTracker>>,
-    content_store: Arc<dyn ContentStore>,
-    publisher_tx: mpsc::Sender<Vec<u8>>,
-    subscriber_rx: mpsc::Receiver<Vec<u8>>,
-    paths: PersistPaths,
-    debounce: std::time::Duration,
-    notify_dirty: Arc<Notify>,
-    has_pending_dirty: Arc<AtomicBool>,
-    flush_now_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
-    shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
-    identity_resolver: Option<Arc<dyn IdentityResolver>>,
-}
-```
-
-Add `is_invite_only` and `with_identity_resolver` to `CommunitySyncEngineConfig`:
-
-```rust
-pub struct CommunitySyncEngineConfig {
-    // ... existing fields ...
-    pub is_invite_only: bool,
-    pub identity_resolver: Option<Arc<dyn IdentityResolver>>,
-}
-
-impl CommunitySyncEngineConfig {
-    pub fn with_identity_resolver(mut self, r: Arc<dyn IdentityResolver>) -> Self {
-        self.identity_resolver = Some(r);
-        self
+    // The tracker advanced (step 6) regardless of whether any event
+    // was Inserted. Differentiate:
+    //   - inserted_any=true  → Mutated (CRDT changed; persist both)
+    //   - inserted_any=false → MutatedTrackerOnly (tracker advanced
+    //                          but CRDT unchanged; persist replay
+    //                          only — without persisting the
+    //                          tracker advance, a restart would
+    //                          re-process this publish on next-boot
+    //                          and waste a CAS fetch)
+    //
+    // Why not return Duplicate when inserted_any=false: Duplicate is
+    // reserved for the EARLY exit at step 2 where would_accept
+    // rejected the wire HLC outright. Once we've passed step 2 the
+    // tracker has accepted, and it's now state worth persisting.
+    //
+    // The split between Mutated and MutatedTrackerOnly lets Task 10's
+    // persist code save just `replay.cbor` when the CRDT is unchanged
+    // — useful when a peer re-broadcasts the same event set with an
+    // advanced clock, so we skip the larger crdt.cbor fsync.
+    if inserted_any {
+        IncomingOutcome::Mutated
+    } else {
+        IncomingOutcome::MutatedTrackerOnly
     }
 }
 ```
 
-Update `CommunitySyncEngine::new` to thread these through to `InternalCtx`.
+**`is_invite_only` / `identity_resolver` / `error_tx` are already on `CommunitySyncEngineConfig` and `InternalCtx` from Task 6** (with `Option`/default values). Task 8 only consumes them — no new fields, no builder methods. The `IdentityResolver` trait is also already declared in Task 6; the only thing Task 8 adds at the type-system level is `IncomingOutcome` (above) and the test-only `SingleIdentityResolver` impl.
 
-Update the subscriber arm in `internal_task`:
+Update the subscriber arm in `internal_task` to call `handle_incoming_publish` AND emit a degraded-path report on errors:
 
 ```rust
 maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
@@ -2217,16 +2319,55 @@ maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
             community_id = ?ctx.community_id,
             "community subscriber channel closed; sync inbound disabled"
         );
+        if let Some(tx) = ctx.error_tx.as_ref() {
+            let _ = tx
+                .send(CommunityDegradedReport {
+                    community_id: ctx.community_id,
+                    reason_tag: "subscriber_channel_closed",
+                    detail: "Zenoh adapter dropped subscriber_tx; engine in publish-only mode".into(),
+                })
+                .await;
+        }
         inbound_closed = true;
         continue;
     };
     let outcome = handle_incoming_publish(&ctx, bytes).await;
     if let Some(err) = outcome.error() {
         tracing::warn!(community_id = ?ctx.community_id, error = %err, "community incoming publish dropped");
+        // Surface the failure-class as a degraded-path report so
+        // start_node's drain task can translate it into a
+        // `community-state-sync-degraded` Tauri event. Per the spec
+        // (§ "IPC surface → Events"), the frontend uses these to
+        // surface "this community's sync is degraded" banners.
+        if let Some(tx) = ctx.error_tx.as_ref() {
+            let _ = tx
+                .send(CommunityDegradedReport {
+                    community_id: ctx.community_id,
+                    reason_tag: classify_incoming_error(err),
+                    detail: format!("{err}"),
+                })
+                .await;
+        }
     }
     // Persist on Mutated | ErrPostMutation lands in Task 10.
 }
 ```
+
+Add a small classifier helper alongside `handle_incoming_publish`:
+
+```rust
+fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
+    match err {
+        CommunitySyncError::Crypto(_) => "decrypt_failed",
+        CommunitySyncError::CborEncode(_) | CommunitySyncError::CborDecode(_) => "wire_decode_failed",
+        CommunitySyncError::ContentStore(_) => "blob_fetch_failed",
+        CommunitySyncError::TransportClosed => "transport_closed",
+        CommunitySyncError::Persist(_) => "persist_failed",
+    }
+}
+```
+
+Stable `reason_tag` values let the frontend banner-copy switch on them without parsing free-form `detail` strings; new variants get appended over time as new failure classes surface.
 
 - [ ] **Step 8.4: Run tests**
 
@@ -2573,24 +2714,29 @@ if let Err(e) = persist_result {
 }
 ```
 
-After the subscriber arm's `handle_incoming_publish` block:
+After the subscriber arm's `handle_incoming_publish` block — dispatch on whether the CRDT itself changed, so a tracker-only update skips the larger `crdt.cbor` fsync:
 
 ```rust
 if outcome.needs_persist() {
-    if let Err(e) = persist_both(&ctx).await {
-        tracing::warn!(community_id = ?ctx.community_id, error = %e, "persist_both after merge failed");
+    let persist_result = if outcome.crdt_mutated() {
+        persist_both(&ctx).await
+    } else {
+        persist_replay_only(&ctx).await
+    };
+    if let Err(e) = persist_result {
+        tracing::warn!(community_id = ?ctx.community_id, error = %e, "persist after merge failed");
     }
 }
 ```
 
-In the shutdown arm, add a final persist before sending the response:
+In the shutdown arm, add a final persist before sending the response. Shutdown always uses `persist_both` because we can't cheaply tell from outside whether the CRDT mutated since the last persist:
 
 ```rust
 let persist_result = persist_both(&ctx).await;
 let _ = resp_tx.send(pub_result.and(persist_result));
 ```
 
-Add the helper:
+Add both helpers:
 
 ```rust
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
@@ -2599,6 +2745,18 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     save_crdt(&ctx.paths.crdt, &state)
         .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
     drop(state);
+    let tracker = ctx.tracker.lock().await;
+    save_replay(&ctx.paths.replay, &tracker)
+        .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    Ok(())
+}
+
+/// Replay-only persist for the `MutatedTrackerOnly` case — every event
+/// in the remote blob was AlreadyKnown but the tracker advanced. The
+/// CRDT is byte-identical, so re-fsyncing `crdt.cbor` would be wasted
+/// I/O on every duplicate-but-clock-advanced publish.
+async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    use crate::community_state_persist::save_replay;
     let tracker = ctx.tracker.lock().await;
     save_replay(&ctx.paths.replay, &tracker)
         .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
@@ -2697,6 +2855,7 @@ async fn registry_spawns_and_tears_down_per_community() {
         identity_resolver: Arc::new(NopResolver),
         identity_dir: dir.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
     });
 
     let cid_a = SpaceId([1u8; 16]);
@@ -2748,6 +2907,12 @@ pub struct CommunityRegistryConfig {
     pub identity_resolver: Arc<dyn IdentityResolver>,
     pub identity_dir: PathBuf,
     pub debounce_ms: u64,
+    /// Optional degraded-path channel. When `Some`, the registry
+    /// clones the sender into every engine's `CommunitySyncEngineConfig`,
+    /// and the receiver-side (owned by start_node — Task 13) translates
+    /// `CommunityDegradedReport`s into `community-state-sync-degraded`
+    /// Tauri events. `None` for tests that don't assert on IPC events.
+    pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
 }
 
 pub struct CommunitySyncRegistry {
@@ -2814,6 +2979,7 @@ impl CommunitySyncRegistry {
             paths,
             debounce_ms: self.cfg.debounce_ms,
             identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
+            error_tx: self.cfg.error_tx.clone(),
         }));
 
         engines.insert(community_id, engine);
@@ -3109,6 +3275,18 @@ In `src-tauri/src/lib.rs`, locate the section that constructs `sync_engine_arc` 
 
 ```rust
 // ZEB-217 Sub-C Phase 2: per-community state CRDT sync.
+//
+// degraded-path channel: each spawned engine clones the sender into
+// its CommunitySyncEngineConfig. The receiver lives here and feeds a
+// drain task that emits `community-state-sync-degraded` Tauri events
+// per the spec (§ "IPC surface → Events"). Channel capacity is sized
+// for burst-tolerance under degraded conditions (e.g., a flaky peer
+// continuously republishing malformed bytes); a full channel falls
+// back to dropping the report so a single noisy community can't
+// starve the rest of the engine pool.
+let (community_error_tx, mut community_error_rx) =
+    tokio::sync::mpsc::channel::<crate::community_state_sync::CommunityDegradedReport>(64);
+
 let community_registry: Arc<crate::community_state_sync::CommunitySyncRegistry> = {
     let resolver: Arc<dyn crate::community_state_sync::IdentityResolver> = Arc::new(
         crate::community_state_sync::OwnerDeviceCacheResolver::new(Arc::clone(&crdt_state)),
@@ -3119,9 +3297,38 @@ let community_registry: Arc<crate::community_state_sync::CommunitySyncRegistry> 
         identity_resolver: resolver,
         identity_dir: identity_dir.clone(),
         debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+        error_tx: Some(community_error_tx),
     };
     Arc::new(crate::community_state_sync::CommunitySyncRegistry::new(cfg))
 };
+
+// Spawn the drain task that translates each report into a Tauri
+// event. The frontend's CommunityService subscribes to this event
+// (Phase 3 / Phase 5) to surface the "this community's sync is
+// degraded" banner.
+{
+    let app_handle = app.handle().clone();
+    tokio::spawn(async move {
+        use tauri::Emitter;
+        while let Some(report) = community_error_rx.recv().await {
+            let id_hex: String = report
+                .community_id
+                .0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let payload = serde_json::json!({
+                "communityId": id_hex,
+                "reason": report.reason_tag,
+                "detail": report.detail,
+            });
+            if let Err(e) = app_handle.emit("community-state-sync-degraded", payload) {
+                tracing::warn!(error = ?e, "failed to emit community-state-sync-degraded");
+            }
+        }
+        tracing::info!("community-state-sync-degraded drain task exiting (registry shutdown)");
+    });
+}
 
 // Scan owner-state for joined communities and spawn an engine each.
 {
@@ -3171,6 +3378,8 @@ let community_registry: Arc<crate::community_state_sync::CommunitySyncRegistry> 
 ```
 
 The `zenoh_session` variable name above is illustrative — match the actual variable in `start_node` that holds the Zenoh session. Likely `zenoh` or `zenoh_session_arc`; verify via `grep -n "zenoh::Session\|zenoh_session" src-tauri/src/lib.rs`.
+
+The `app` reference in the degraded-path drain task is the Tauri `App` / `AppHandle` parameter that `start_node` already accepts (Phase 1 + ZEB-228 use it for `app.emit(...)` calls). Match the actual variable name in this codebase — likely `app` or `app_handle`; the call surface needed is `app.handle().clone()` and `app_handle.emit("event-name", payload)`. If `start_node` doesn't already carry an `AppHandle`, take one as an additional argument (Phase 1's owner-state SyncEngine wiring may have established the precedent — verify via `grep -n "tauri::AppHandle\|app_handle\|app.emit" src-tauri/src/lib.rs`).
 
 Add the registry to the global state struct (`OwnerStateContext` or whichever struct holds the SyncEngine). Phase 3 IPC will reach it through this struct.
 
@@ -3309,6 +3518,7 @@ async fn two_members_dag_sync_full_event_log() {
         identity_resolver: Arc::clone(&resolver),
         identity_dir: dir_a.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -3316,6 +3526,7 @@ async fn two_members_dag_sync_full_event_log() {
         identity_resolver: Arc::clone(&resolver),
         identity_dir: dir_b.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
     });
 
     // B's publisher and A's subscriber are unused in this test (one-
@@ -3638,7 +3849,7 @@ Run these inline before declaring the plan finished. Fix any failures by editing
     - Per-community RootHlcTracker → Task 9
     - HLC monotonicity on dedupe-merge → Task 9
     - Verify-on-receive → Task 8
-    - `community-state-sync-degraded` event → planned for Phase 3 (when IPC surface lands; Phase 2 logs via `tracing::warn` only)
+    - `community-state-sync-degraded` event → emitted by Task 13's drain task; engines push `CommunityDegradedReport`s on their `error_tx`, the registry-level receiver translates each into a Tauri event with `{ communityId, reason, detail }`
     - Persistence → Task 10
     - Multi-community lifecycle → Task 11
     - start_node wiring → Task 13
