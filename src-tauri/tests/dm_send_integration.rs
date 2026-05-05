@@ -57,6 +57,9 @@ async fn send_dm_round_trip_through_dm_outbox() {
         },
         content_key: Some(DmContentKey::new([0xAB; 32])),
         prior_content_keys: vec![],
+        membership_key: None,
+        admin_addr: None,
+        is_invite_only: None,
     };
     let space_id = space.id;
     assert!(matches!(

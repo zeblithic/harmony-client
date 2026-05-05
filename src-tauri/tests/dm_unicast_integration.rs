@@ -122,6 +122,9 @@ fn make_dm_space(
         },
         content_key: Some(content_key),
         prior_content_keys: vec![],
+        membership_key: None,
+        admin_addr: None,
+        is_invite_only: None,
     }
 }
 

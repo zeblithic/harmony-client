@@ -2443,6 +2443,9 @@ pub fn add_space_dm_inner(
         updated_at: creation_hlc.clone(),
         content_key: Some(content_key.clone()),
         prior_content_keys: vec![],
+        membership_key: None,
+        admin_addr: None,
+        is_invite_only: None,
     };
 
     // Validate invariants up front — catches programmer error before we

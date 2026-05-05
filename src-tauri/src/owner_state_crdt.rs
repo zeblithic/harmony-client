@@ -824,6 +824,9 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         updated_at: newer.updated_at.clone(),
         content_key,
         prior_content_keys,
+        membership_key: newer.membership_key.clone(),
+        admin_addr: newer.admin_addr,
+        is_invite_only: newer.is_invite_only,
     }
 }
 
@@ -856,6 +859,9 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -878,6 +884,9 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -959,6 +968,9 @@ mod apply_space_tests {
             updated_at: hlc(1),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x10; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let b = Space {
             id: SpaceId([1; 16]),
@@ -977,6 +989,9 @@ mod apply_space_tests {
             updated_at: hlc(2),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x20; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
 
         // Order-independent: both call orderings yield the same merged prior.
@@ -1115,6 +1130,9 @@ mod apply_space_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -1137,6 +1155,9 @@ mod apply_space_tests {
             updated_at: hlc(200),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -1783,6 +1804,9 @@ mod canonicalization_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2075,6 +2099,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2164,6 +2191,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: Some(DmContentKey::new([0xcc; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -2846,6 +2876,9 @@ mod merge_prior_content_keys_tests {
             updated_at: hlc,
             content_key: Some(content_key),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -3002,6 +3035,9 @@ mod dm_crypto_integration_tests {
             updated_at: hlc,
             content_key: Some(ck),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 

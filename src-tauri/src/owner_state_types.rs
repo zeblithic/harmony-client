@@ -1337,7 +1337,7 @@ mod enum_tests {
 /// The unified Space CRDT entry — see ZEB-206 spec §"Space — unified
 /// entry in owner-state CRDT".
 ///
-/// Wire-format note: every field is renamed to a 2-char code so all 14
+/// Wire-format note: every field is renamed to a 2-char code so all 17
 /// keys at this nesting level have identical encoded length (CBOR
 /// text(2) = 3 bytes per key). Mixing 1-char and 2-char renames here
 /// would re-introduce the same-length-keys violation Hlc had before
@@ -1398,6 +1398,28 @@ pub struct Space {
         deserialize_with = "deserialize_prior_content_keys"
     )]
     pub prior_content_keys: Vec<DmContentKey>,
+
+    /// Per-community symmetric key for membership topic encryption.
+    /// MUST be Some for kind == Community; MUST be None otherwise.
+    /// Wire: bstr(32) under "mk".  Zeroized on drop (via the
+    /// MembershipKey newtype's ZeroizeOnDrop impl).
+    /// See ZEB-217 spec §"Data model — Space struct additions".
+    #[serde(rename = "mk", skip_serializing_if = "Option::is_none", default)]
+    pub membership_key: Option<MembershipKey>,
+
+    /// Initial admin (creator) — receives power 100 implicitly via the
+    /// bootstrap rule (see ZEB-217 spec §"Materialization rules /
+    /// Bootstrap"). MUST be Some for kind == Community; MUST be None
+    /// otherwise. Wire: bstr(16) under "ad".
+    #[serde(rename = "ad", skip_serializing_if = "Option::is_none", default)]
+    pub admin_addr: Option<OwnerAddr>,
+
+    /// Policy flag — false = open (peers publish join events directly),
+    /// true = invite-only (join requires counter-sig from member with
+    /// power ≥ POWER_THRESHOLDS.invite). MUST be Some for kind ==
+    /// Community; MUST be None otherwise. Wire: bool under "io".
+    #[serde(rename = "io", skip_serializing_if = "Option::is_none", default)]
+    pub is_invite_only: Option<bool>,
 }
 
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
@@ -1959,6 +1981,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2000,6 +2025,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(mk_dm(0).validate_invariants().is_err());
         assert!(mk_dm(1).validate_invariants().is_err());
@@ -2026,6 +2054,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(mk(2).validate_invariants().is_err());
         assert!(mk(3).validate_invariants().is_ok());
@@ -2055,6 +2086,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
         // Distinct members still pass.
@@ -2086,6 +2120,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
         // Sorted ascending passes.
@@ -2116,6 +2153,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(g.validate_invariants().is_err());
         g.members = vec![
@@ -2152,6 +2192,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(g.validate_invariants().is_err());
     }
@@ -2174,6 +2217,9 @@ mod space_tests {
                 updated_at: hlc(1),
                 content_key: None,
                 prior_content_keys: vec![],
+                membership_key: None,
+                admin_addr: None,
+                is_invite_only: None,
             };
         // Missing community_id → reject.
         assert!(
@@ -2223,6 +2269,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let a = OwnerAddr([1u8; 16]);
         let b = OwnerAddr([2u8; 16]);
@@ -2252,6 +2301,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert_eq!(
             pc.dedupe_key(),
@@ -2298,6 +2350,9 @@ mod space_tests {
             },
             content_key: None, // ← invariant violation
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2331,6 +2386,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2362,6 +2420,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])), // ← invariant violation
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2391,6 +2452,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![DmContentKey::new([0xbb; 32])], // ← invariant violation
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2423,6 +2487,9 @@ mod space_tests {
             },
             content_key: Some(dup.clone()),
             prior_content_keys: vec![dup], // ← same as content_key — violation
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2456,6 +2523,9 @@ mod space_tests {
             prior_content_keys: (0u8..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
                 .map(|i| DmContentKey::new([i; 32]))
                 .collect(),
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2492,6 +2562,9 @@ mod space_tests {
             // never fires by accident.
             content_key: Some(DmContentKey::new([0xff; 32])),
             prior_content_keys: priors,
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         }
     }
 
@@ -2663,6 +2736,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -2696,6 +2772,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -2712,6 +2791,112 @@ mod space_tests {
             !bytes.windows(2).any(|w| w == needle_pk),
             "Folder serialization unexpectedly contains 'pk' key"
         );
+    }
+
+    #[test]
+    fn community_space_round_trips_with_new_fields() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let admin = OwnerAddr([1u8; 16]);
+        let community_id = SpaceId([2u8; 16]);
+        let key = MembershipKey::new([3u8; 32]);
+
+        let space = Space {
+            id: community_id,
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None, // community Space IS the community
+            name: "harmony-design".to_string(),
+            transport: None,
+            members: vec![], // membership lives in CommunityState CRDT
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(key.clone()),
+            admin_addr: Some(admin),
+            is_invite_only: Some(true),
+        };
+
+        let encoded = canonical_cbor_encode(&space).expect("encode");
+        let decoded: Space = canonical_cbor_decode(&encoded).expect("decode");
+
+        assert_eq!(decoded.kind, SpaceKind::Community);
+        assert_eq!(
+            decoded.membership_key.as_ref().map(|k| *k.as_bytes()),
+            Some(*key.as_bytes())
+        );
+        assert_eq!(decoded.admin_addr, Some(admin));
+        assert_eq!(decoded.is_invite_only, Some(true));
+    }
+
+    #[test]
+    fn non_community_space_skips_membership_fields_in_wire() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let dm = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".to_string(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([2u8; 16]), OwnerAddr([3u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([5u8; 32])),
+            prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
+        };
+
+        let bytes = canonical_cbor_encode(&dm).expect("encode");
+        // skip_serializing_if guarantees these CBOR map keys DON'T appear
+        // in the encoded blob for non-community Spaces (defense against
+        // wire-bloat regression). Each 2-char key encodes as CBOR text(2):
+        // 0x62 (major type 3, length 2) followed by the two ASCII bytes.
+        // We check the full 3-byte sequence to avoid false positives from
+        // data values that incidentally contain the same 2-char byte pair
+        // (e.g. device_id "d" = 0x61 0x64 would spuriously match "ad").
+        let needles: &[[u8; 3]] = &[
+            [0x62, b'm', b'k'], // CBOR text(2) "mk"
+            [0x62, b'a', b'd'], // CBOR text(2) "ad"
+            [0x62, b'i', b'o'], // CBOR text(2) "io"
+        ];
+        for needle in needles {
+            let found = bytes.windows(3).any(|w| w == needle);
+            assert!(
+                !found,
+                "non-community Space wire blob contained CBOR key {:?} — \
+                 skip_serializing_if regression",
+                std::str::from_utf8(&needle[1..]).unwrap()
+            );
+        }
     }
 }
 

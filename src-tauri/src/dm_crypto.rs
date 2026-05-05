@@ -260,6 +260,9 @@ mod tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
         };
         let mut s2 = s1.clone();
         s2.id = SpaceId([99; 16]); // different SpaceId

@@ -53,6 +53,9 @@ fn make_dm_space(space_id: SpaceId, alice: OwnerAddr, bob: OwnerAddr) -> Space {
         },
         content_key: Some(DmContentKey::new([0xAB; 32])),
         prior_content_keys: vec![],
+        membership_key: None,
+        admin_addr: None,
+        is_invite_only: None,
     }
 }
 
