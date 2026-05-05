@@ -234,6 +234,13 @@ pub fn sign_event_with_identity(
 /// + CounterSigInvalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
+    /// The event's community_id doesn't match the verifier's expected
+    /// community_id. Defends against cross-community authorization —
+    /// the caller has prior_state and is_invite_only for community A,
+    /// but the event was signed for community B; without this binding,
+    /// power lookups and invite-only countersigning would credit the
+    /// wrong community's state.
+    WrongCommunity,
     SignatureInvalid,
     CounterSigRequired,
     CounterSigInvalid,
@@ -287,6 +294,10 @@ pub enum VerifyError {
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            VerifyError::WrongCommunity => write!(
+                f,
+                "event.community_id does not match the verifier's expected community"
+            ),
             VerifyError::SignatureInvalid => write!(f, "signature invalid"),
             VerifyError::CounterSigRequired => write!(f, "invite-only Join requires countersig"),
             VerifyError::CounterSigInvalid => write!(f, "countersig invalid"),
@@ -652,10 +663,16 @@ pub fn materialize(
     m
 }
 
-/// Caller-provided context for verify_event. Carries the prior
-/// materialized state (so the function is pure — verify_event doesn't
-/// load state from anywhere) plus the 64-byte identity_pubs needed for
-/// pubkey-to-claimed-signer binding + signature verification.
+/// Caller-provided context for verify_event. Carries the expected
+/// community_id, the prior materialized state (so the function is pure
+/// — verify_event doesn't load state from anywhere), the policy bit,
+/// and the 64-byte identity_pubs needed for pubkey-to-claimed-signer
+/// binding + signature verification.
+///
+/// `expected_community_id` MUST match `event.community_id` — verify_event
+/// rejects a mismatch BEFORE any other check, defending against
+/// cross-community authorization (caller has community A's state but
+/// the event was signed for community B).
 ///
 /// `actor_identity_pub` is the canonical 64-byte combined identity
 /// public bytes (`X25519_pub(32) || Ed25519_pub(32)`) for the OwnerAddr
@@ -669,6 +686,7 @@ pub fn materialize(
 /// non-Join events. For invite-only Joins it MUST be Some, with the
 /// hashed bytes matching `event.countersig.signer`.
 pub struct VerifyContext<'a> {
+    pub expected_community_id: SpaceId,
     pub is_invite_only: bool,
     pub actor_identity_pub: &'a [u8; 64],
     pub countersigner_identity_pub: Option<&'a [u8; 64]>,
@@ -708,6 +726,19 @@ pub fn verify_event(
     prior_state: &MaterializedMembership,
     ctx: &VerifyContext,
 ) -> Result<(), VerifyError> {
+    // 0. Community binding: the event must belong to the community
+    //    whose state the caller is verifying against. Without this
+    //    check, an event signed for community B could be authorized
+    //    using community A's prior_state/is_invite_only — granting
+    //    the wrong invite or moderation rights. This guard fires
+    //    before any cryptographic work so a misrouted event is
+    //    rejected with the specific WrongCommunity discriminant
+    //    rather than e.g. SignatureInvalid (which would mask the
+    //    real cause).
+    if event.community_id != ctx.expected_community_id {
+        return Err(VerifyError::WrongCommunity);
+    }
+
     // 1. Actor's identity_pub must hash to event.actor AND its
     //    Ed25519 component must verify the signature.
     verify_signature(event, ctx.actor_identity_pub)?;

@@ -731,6 +731,7 @@ fn verify_event_accepts_valid_join_in_open_community() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -760,6 +761,7 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -794,6 +796,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
     let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&admin_id_pub),
@@ -834,6 +837,7 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -882,6 +886,7 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -922,6 +927,7 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -968,6 +974,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1020,6 +1027,7 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1069,6 +1077,7 @@ fn verify_event_rejects_setpower_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1121,6 +1130,7 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
     let event = attach_countersig_with_identity(&event, &outsider_priv).expect("countersign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&outsider_id_pub),
@@ -1199,6 +1209,7 @@ fn verify_event_rejects_leave_from_banned_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1355,6 +1366,7 @@ fn verify_event_rejects_join_replay_after_kick() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
@@ -1398,6 +1410,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
@@ -1438,12 +1451,58 @@ fn verify_event_accepts_setpower_at_max_boundary() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept level == max");
+}
+
+#[test]
+fn verify_event_rejects_event_for_wrong_community() {
+    // The caller passes a prior_state and policy (is_invite_only) for
+    // community A. If the verified event was signed for community B,
+    // the authorization is wrong — the caller would otherwise grant
+    // power lookups, invite-only countersigning, etc. against the
+    // wrong community's state. Bind the verification to the expected
+    // community_id at the top of verify_event.
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+
+    let community_a = SpaceId([0xAA; 16]);
+    let community_b = SpaceId([0xBB; 16]);
+
+    // prior_state is for community A.
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 100)],
+        admin,
+    );
+
+    // Alice signs a Join event for community B.
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: community_b, // event for B
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_a, // verify against A
+        is_invite_only: false,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::WrongCommunity);
 }
 
 #[test]
@@ -1481,6 +1540,7 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        expected_community_id: SpaceId([3u8; 16]),
         is_invite_only: false,
         actor_identity_pub: &bob_id_pub, // wrong identity for actor=alice
         countersigner_identity_pub: None,
