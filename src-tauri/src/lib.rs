@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 pub mod community_invite;
 pub mod community_membership;
+pub mod community_state_crdt;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
