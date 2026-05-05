@@ -528,6 +528,62 @@ fn materialize_setpower_overrides_admin_bootstrap() {
 }
 
 #[test]
+fn materialize_total_order_uses_event_id_tiebreaker_when_hlc_collides() {
+    // Two SetPower events on the same target with identical HLC tuples
+    // but different EventIds. Sort must be deterministic — the same
+    // input order should produce the same final state regardless of
+    // how DAG-sync presented the events to us.
+    //
+    // Fixed total-order rule: (wall_ms, logical, device_id, event.id).
+    // EventId is the deterministic, unique tiebreaker.
+    let admin = OwnerAddr([100u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
+
+    let mk = |id: u8, level: u8| {
+        let payload = EventPayload {
+            id: [id; 16],
+            community_id: SpaceId([3u8; 16]),
+            kind: MembershipEventKind::SetPower { target: bob, level },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 500,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        sign_event(&payload, &admin_key).expect("sign")
+    };
+
+    // ID [1; 16] sorts before [2; 16]; under tiebreaker, the level-from-id-1
+    // event applies first and the level-from-id-2 event wins.
+    let bootstrap = vec![make_signed(0, MembershipEventKind::Join, admin, 100)];
+    let collide_a = mk(1, 30);
+    let collide_b = mk(2, 70);
+
+    let mut order_1 = bootstrap.clone();
+    order_1.push(collide_a.clone());
+    order_1.push(collide_b.clone());
+
+    let mut order_2 = bootstrap.clone();
+    order_2.push(collide_b.clone());
+    order_2.push(collide_a.clone());
+
+    let m1 = materialize(&order_1, admin);
+    let m2 = materialize(&order_2, admin);
+
+    assert_eq!(
+        m1, m2,
+        "materialize must converge regardless of input order when HLCs collide"
+    );
+    assert_eq!(
+        m1.power_levels.get(&bob).copied(),
+        Some(70),
+        "later EventId (id=2) must win the tie"
+    );
+}
+
+#[test]
 fn materialize_replays_in_hlc_order_not_input_order() {
     // Events arrive in a different order than they should apply.
     // Materialization must re-sort by HLC.

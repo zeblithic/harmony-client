@@ -400,9 +400,13 @@ pub fn materialize(
     // tail, not millions).
     let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
     sorted.sort_by(|a, b| {
-        // HLC tuple ordering: (wall_ms, logical, device_id) ascending.
-        let key_a = (a.at.wall_ms, a.at.logical, &a.at.device_id);
-        let key_b = (b.at.wall_ms, b.at.logical, &b.at.device_id);
+        // Total order: HLC tuple first, EventId as deterministic tiebreaker.
+        // HLC alone is partial — two events authored on different devices in
+        // the same wall_ms with the same logical counter and identical
+        // device_id strings (rare, but possible across replicas) would
+        // otherwise be input-order-dependent and diverge across nodes.
+        let key_a = (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id);
+        let key_b = (b.at.wall_ms, b.at.logical, &b.at.device_id, &b.id);
         key_a.cmp(&key_b)
     });
 
