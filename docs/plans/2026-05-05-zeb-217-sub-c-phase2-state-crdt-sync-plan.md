@@ -522,7 +522,7 @@ Append to `src-tauri/tests/community_state_crdt_unit.rs`:
 ```rust
 #[test]
 fn materialized_cache_returns_same_object_until_insert() {
-    let (identity, identity_pub, addr) = make_test_identity();
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let mut state = CommunityState::new(community_id);
 
