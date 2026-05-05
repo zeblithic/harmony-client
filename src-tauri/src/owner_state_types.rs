@@ -1456,6 +1456,30 @@ impl Space {
     /// (locally produced) and after merge (incoming). See ZEB-206 spec
     /// §"Invariants".
     pub fn validate_invariants(&self) -> Result<(), InvariantError> {
+        // Universal: community-only fields MUST be None unless kind == Community.
+        // Checked before the per-kind match so every non-community kind gets
+        // the same enforcement without per-arm duplication.
+        if self.kind != SpaceKind::Community {
+            if self.membership_key.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have membership_key=None (only Community carries it)",
+                    self.kind
+                )));
+            }
+            if self.admin_addr.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have admin_addr=None (only Community carries it)",
+                    self.kind
+                )));
+            }
+            if self.is_invite_only.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have is_invite_only=None (only Community carries it)",
+                    self.kind
+                )));
+            }
+        }
+
         match self.kind {
             SpaceKind::Folder => {
                 if self.transport.is_some() {
@@ -1542,8 +1566,39 @@ impl Space {
                 }
             }
             SpaceKind::Community => {
-                // community must have a corresponding CommunityMembership CRDT
-                // — that lives in Sub-C scope, not validated here.
+                if self.membership_key.is_none() {
+                    return Err(InvariantError("community must have membership_key".into()));
+                }
+                if self.admin_addr.is_none() {
+                    return Err(InvariantError("community must have admin_addr".into()));
+                }
+                if self.is_invite_only.is_none() {
+                    return Err(InvariantError("community must have is_invite_only".into()));
+                }
+                if !self.members.is_empty() {
+                    return Err(InvariantError(
+                        "community must have members=[] in owner-state Space \
+                         (real membership is in CommunityState CRDT)"
+                            .into(),
+                    ));
+                }
+                if self.transport.is_some() {
+                    return Err(InvariantError("community must have transport=None".into()));
+                }
+                if self.community_id.is_some() {
+                    return Err(InvariantError(
+                        "community must have community_id=None \
+                         (community Space IS the community)"
+                            .into(),
+                    ));
+                }
+                if self.content_key.is_some() {
+                    return Err(InvariantError(
+                        "community must have content_key=None \
+                         (membership_key is the community's symmetric key)"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -2852,6 +2907,193 @@ mod space_tests {
         decoded
             .validate_invariants()
             .expect("community Space must pass validate_invariants after round-trip");
+    }
+
+    #[test]
+    fn community_space_validates_when_all_required_fields_present() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "ok".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        assert!(s.validate_invariants().is_ok());
+    }
+
+    #[test]
+    fn community_space_rejects_missing_membership_key() {
+        let mut s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: None, // ← invariant violation
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("membership_key"));
+
+        // Now also confirm missing admin_addr and missing is_invite_only fail.
+        s.membership_key = Some(MembershipKey::new([0u8; 32]));
+        s.admin_addr = None;
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("admin_addr"));
+
+        s.admin_addr = Some(OwnerAddr([2u8; 16]));
+        s.is_invite_only = None;
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("is_invite_only"));
+    }
+
+    #[test]
+    fn community_space_rejects_non_empty_members() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![OwnerAddr([99u8; 16])], // ← invariant violation
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(
+            err.0.contains("members=[]"),
+            "expected error mentioning empty members invariant; got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn community_space_rejects_transport_present() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: Some(TransportBinding::Zenoh {
+                topic: "wat".into(),
+            }),
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("transport=None"));
+    }
+
+    #[test]
+    fn dm_space_rejects_membership_key_present() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([5u8; 32])),
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([7u8; 32])), // ← wrong kind
+            admin_addr: None,
+            is_invite_only: None,
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(
+            err.0.contains("membership_key"),
+            "expected error about non-community membership_key; got: {}",
+            err.0
+        );
     }
 
     #[test]
