@@ -130,7 +130,7 @@ impl CanonicalPayload for SignedMembershipEvent {}
 impl CanonicalPayloadSealed for CounterSignature {}
 impl CanonicalPayload for CounterSignature {}
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 
 use crate::owner_state_crypto::{canonical_cbor_encode, CryptoError};
 
@@ -173,16 +173,49 @@ impl CanonicalPayload for EventPayload {}
 /// Sign an unsigned event payload with the actor's ed25519 key.
 /// Returns a SignedMembershipEvent ready for canonical encoding +
 /// publication. The countersig field is None — invite-only Joins
-/// must be counter-signed via `attach_countersig` (Task 7).
+/// must be counter-signed via `attach_countersig`.
 ///
 /// Errors only on canonical CBOR encoding failure (vanishingly rare
 /// for in-memory values — would indicate a broken serde impl).
+///
+/// NOTE: this is the low-level primitive that takes only the Ed25519
+/// SigningKey. For production callers that hold a full
+/// `harmony_identity::PrivateIdentity`, prefer `sign_event_with_identity`
+/// — it's a thin wrapper that uses `PrivateIdentity::sign` so tests
+/// and production share the same code path. The two are wire-compatible
+/// (PrivateIdentity::sign internally calls signing_key.sign).
 pub fn sign_event(
     payload: &EventPayload,
     signing_key: &SigningKey,
 ) -> Result<SignedMembershipEvent, CryptoError> {
     let bytes = canonical_cbor_encode(payload)?;
     let sig = signing_key.sign(&bytes).to_bytes();
+    Ok(SignedMembershipEvent {
+        id: payload.id,
+        community_id: payload.community_id,
+        kind: payload.kind.clone(),
+        actor: payload.actor,
+        at: payload.at.clone(),
+        sig,
+        countersig: None,
+    })
+}
+
+/// Sign an unsigned event payload using a `harmony_identity::PrivateIdentity`.
+/// Equivalent to sign_event but routes through `PrivateIdentity::sign`,
+/// which is the production signing path (PrivateIdentity's signing_key
+/// field is private — there's no way to obtain a `&SigningKey` for it
+/// directly).
+///
+/// Caller is responsible for ensuring `payload.actor` matches
+/// `private.identity.address_hash` — otherwise verify_signature will
+/// reject with ActorPubkeyMismatch on the receiving side.
+pub fn sign_event_with_identity(
+    payload: &EventPayload,
+    private: &harmony_identity::PrivateIdentity,
+) -> Result<SignedMembershipEvent, CryptoError> {
+    let bytes = canonical_cbor_encode(payload)?;
+    let sig = private.sign(&bytes);
     Ok(SignedMembershipEvent {
         id: payload.id,
         community_id: payload.community_id,
@@ -226,6 +259,23 @@ pub enum VerifyError {
     /// that is not currently a Joined member. Mirrors ActorNotJoined
     /// for the countersigner side.
     CounterSignerNotJoined,
+    /// The 64-byte identity_pub provided for actor-signature verification
+    /// hashes to a different address than `event.actor`. Defends against
+    /// caller-side cache-lookup bugs that pair a looked-up pubkey with
+    /// the wrong actor — without this binding, a malicious peer could
+    /// claim event.actor=victim while signing with their own key, and
+    /// downstream power lookups would credit the victim's identity.
+    ActorPubkeyMismatch,
+    /// The 64-byte identity_pub for countersig verification hashes to
+    /// a different address than `event.countersig.signer`. Defends the
+    /// countersigner side of the same attack; without it a valid
+    /// countersignature from key A could be attributed to a higher-power
+    /// signer B, bypassing the invite-only authorization gate.
+    CounterSignerPubkeyMismatch,
+    /// The 64-byte identity_pub bytes don't form a valid ed25519 +
+    /// x25519 keypair (e.g., bad point encoding on either curve).
+    /// Treat as a signature failure with extra context.
+    InvalidIdentityPub,
     EncodeError(String),
 }
 
@@ -262,6 +312,17 @@ impl std::fmt::Display for VerifyError {
                     "countersig signer is not currently a Joined member of this community"
                 )
             }
+            VerifyError::ActorPubkeyMismatch => write!(
+                f,
+                "actor identity_pub does not hash to event.actor — pubkey-to-claimed-signer binding violated"
+            ),
+            VerifyError::CounterSignerPubkeyMismatch => write!(
+                f,
+                "countersigner identity_pub does not hash to cs.signer — pubkey-to-claimed-signer binding violated"
+            ),
+            VerifyError::InvalidIdentityPub => {
+                write!(f, "identity_pub bytes are not a valid (X25519, Ed25519) public-key pair")
+            }
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
     }
@@ -275,20 +336,33 @@ impl From<CryptoError> for VerifyError {
     }
 }
 
-/// Verify the actor's signature on a SignedMembershipEvent.
-/// Returns Ok(()) only if the sig is valid for the actor's pubkey
-/// over the canonical encoding of the event's payload (excluding sig
-/// and countersig).
+/// Verify the actor's signature on a SignedMembershipEvent, with a
+/// pubkey-to-claimed-signer binding check.
 ///
-/// Use `verify_strict` (not `verify`) — strict mode rejects
-/// signatures with non-canonical S values and small-order R points,
-/// matching the EdDSA RFC 8032 strict subset and protecting against
-/// signature malleability attacks. Mirrors how dm_envelope verifies
-/// its own signed payloads.
+/// Steps:
+/// 1. Derive `address_hash` from `actor_identity_pub` (the canonical
+///    `harmony_identity::Identity` derivation: SHA256(X25519 || Ed25519)[:16]).
+///    Reject if it does not equal `event.actor.0` — defends against
+///    callers that pair a pubkey with the wrong claimed identity (cache
+///    lookup bug, malicious peer substitution, etc.).
+/// 2. Use the Ed25519 verifying key from `actor_identity_pub[32..]` to
+///    verify_strict the signature over the canonical CBOR encoding of
+///    the event's payload (excluding sig and countersig).
+///
+/// Use `verify_strict` (not `verify`) — strict mode rejects signatures
+/// with non-canonical S values and small-order R points, matching the
+/// EdDSA RFC 8032 strict subset and protecting against signature
+/// malleability attacks. Mirrors how dm_envelope verifies its own
+/// signed payloads.
 pub fn verify_signature(
     event: &SignedMembershipEvent,
-    actor_pubkey: &VerifyingKey,
+    actor_identity_pub: &[u8; 64],
 ) -> Result<(), VerifyError> {
+    let identity = harmony_identity::Identity::from_public_bytes(actor_identity_pub)
+        .map_err(|_| VerifyError::InvalidIdentityPub)?;
+    if identity.address_hash != event.actor.0 {
+        return Err(VerifyError::ActorPubkeyMismatch);
+    }
     let payload = EventPayload {
         id: event.id,
         community_id: event.community_id,
@@ -298,7 +372,8 @@ pub fn verify_signature(
     };
     let bytes = canonical_cbor_encode(&payload)?;
     let sig = Signature::from_bytes(&event.sig);
-    actor_pubkey
+    identity
+        .verifying_key
         .verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::SignatureInvalid)
 }
@@ -307,6 +382,10 @@ pub fn verify_signature(
 /// community. The signer's key signs the SAME canonical bytes the
 /// actor signed (the EventPayload), so the countersig binds to the
 /// exact joiner event, not just to the community ID.
+///
+/// Caller is responsible for ensuring `signer` matches the OwnerAddr
+/// derived from `signer_key`'s identity — otherwise verify_countersig
+/// will reject with CounterSignerPubkeyMismatch.
 pub fn attach_countersig(
     event: &SignedMembershipEvent,
     signer: OwnerAddr,
@@ -326,22 +405,61 @@ pub fn attach_countersig(
     Ok(out)
 }
 
-/// Verify the counter-signature on an event. Returns Ok(()) if a
-/// countersig is present AND its signer's pubkey verifies the
-/// signature over the same canonical bytes as the actor signed.
+/// Attach a counter-signature using a `harmony_identity::PrivateIdentity`.
+/// Sets `cs.signer = OwnerAddr(private.identity.address_hash)` so the
+/// pubkey-binding check on the receiving side will pass.
+pub fn attach_countersig_with_identity(
+    event: &SignedMembershipEvent,
+    private: &harmony_identity::PrivateIdentity,
+) -> Result<SignedMembershipEvent, CryptoError> {
+    let payload = EventPayload {
+        id: event.id,
+        community_id: event.community_id,
+        kind: event.kind.clone(),
+        actor: event.actor,
+        at: event.at.clone(),
+    };
+    let bytes = canonical_cbor_encode(&payload)?;
+    let sig = private.sign(&bytes);
+    let mut out = event.clone();
+    out.countersig = Some(CounterSignature {
+        signer: OwnerAddr(private.identity.address_hash),
+        sig,
+    });
+    Ok(out)
+}
+
+/// Verify the counter-signature on an event, with a pubkey-to-claimed-
+/// signer binding check.
+///
+/// Steps:
+/// 1. Derive `address_hash` from `signer_identity_pub` and reject if
+///    it doesn't equal `event.countersig.signer.0` — without this,
+///    a valid countersignature from key A could be attributed to an
+///    arbitrary claimed signer B (typically a higher-power one),
+///    bypassing the invite-only authorization gate.
+/// 2. Use the Ed25519 verifying key from `signer_identity_pub[32..]`
+///    to verify_strict the countersignature over the same canonical
+///    bytes the actor signed.
 ///
 /// Returns CounterSigRequired if the countersig is missing.
-/// Returns CounterSigInvalid if the signature doesn't verify.
-/// Power-level checking on the signer happens elsewhere
-/// (verify_event in Task 10) — this function is purely cryptographic.
+/// Returns CounterSignerPubkeyMismatch if step 1 fails.
+/// Returns CounterSigInvalid if step 2 fails.
+/// Power-level checking on the signer happens elsewhere (verify_event)
+/// — this function is purely cryptographic.
 pub fn verify_countersig(
     event: &SignedMembershipEvent,
-    signer_pubkey: &VerifyingKey,
+    signer_identity_pub: &[u8; 64],
 ) -> Result<(), VerifyError> {
     let cs = event
         .countersig
         .as_ref()
         .ok_or(VerifyError::CounterSigRequired)?;
+    let identity = harmony_identity::Identity::from_public_bytes(signer_identity_pub)
+        .map_err(|_| VerifyError::InvalidIdentityPub)?;
+    if identity.address_hash != cs.signer.0 {
+        return Err(VerifyError::CounterSignerPubkeyMismatch);
+    }
     let payload = EventPayload {
         id: event.id,
         community_id: event.community_id,
@@ -351,7 +469,8 @@ pub fn verify_countersig(
     };
     let bytes = canonical_cbor_encode(&payload)?;
     let sig = Signature::from_bytes(&cs.sig);
-    signer_pubkey
+    identity
+        .verifying_key
         .verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::CounterSigInvalid)
 }
@@ -499,20 +618,24 @@ pub fn materialize(
 
 /// Caller-provided context for verify_event. Carries the prior
 /// materialized state (so the function is pure — verify_event doesn't
-/// load state from anywhere) plus the pubkeys needed for signature
-/// checking.
+/// load state from anywhere) plus the 64-byte identity_pubs needed for
+/// pubkey-to-claimed-signer binding + signature verification.
 ///
-/// `actor_pubkey` MUST be the ed25519 verifying key for `event.actor`.
-/// Sub-A's owner-key cache is the canonical source — verify_event
-/// itself doesn't resolve OwnerAddr → pubkey, the caller does.
+/// `actor_identity_pub` is the canonical 64-byte combined identity
+/// public bytes (`X25519_pub(32) || Ed25519_pub(32)`) for the OwnerAddr
+/// claimed in `event.actor`. Sub-A's owner-device cache is the source.
+/// verify_event derives the address_hash from these bytes and checks
+/// it matches `event.actor` — so a caller cache-lookup bug, a stale
+/// cache entry, or a key-substitution attack all surface as
+/// ActorPubkeyMismatch instead of being silently accepted.
 ///
-/// `countersigner_pubkey` is None for open communities and for non-
-/// Join events. For invite-only Joins it MUST be Some, with the key
-/// matching `event.countersig.signer`.
+/// `countersigner_identity_pub` is None for open communities and for
+/// non-Join events. For invite-only Joins it MUST be Some, with the
+/// hashed bytes matching `event.countersig.signer`.
 pub struct VerifyContext<'a> {
     pub is_invite_only: bool,
-    pub actor_pubkey: &'a VerifyingKey,
-    pub countersigner_pubkey: Option<&'a VerifyingKey>,
+    pub actor_identity_pub: &'a [u8; 64],
+    pub countersigner_identity_pub: Option<&'a [u8; 64]>,
 }
 
 /// Full membership-event verification per ZEB-217 spec §"Verification".
@@ -549,8 +672,9 @@ pub fn verify_event(
     prior_state: &MaterializedMembership,
     ctx: &VerifyContext,
 ) -> Result<(), VerifyError> {
-    // 1. Actor's signature must verify.
-    verify_signature(event, ctx.actor_pubkey)?;
+    // 1. Actor's identity_pub must hash to event.actor AND its
+    //    Ed25519 component must verify the signature.
+    verify_signature(event, ctx.actor_identity_pub)?;
 
     // 2. Banned-status guard: a Banned actor's Join must be rejected
     //    BEFORE materialize() would silently overwrite the Banned
@@ -584,10 +708,10 @@ pub fn verify_event(
             .countersig
             .as_ref()
             .ok_or(VerifyError::CounterSigRequired)?;
-        let cs_pubkey = ctx
-            .countersigner_pubkey
+        let cs_identity_pub = ctx
+            .countersigner_identity_pub
             .ok_or(VerifyError::CounterSigRequired)?;
-        verify_countersig(event, cs_pubkey)?;
+        verify_countersig(event, cs_identity_pub)?;
 
         if !is_joined_member(prior_state, &cs.signer) {
             return Err(VerifyError::CounterSignerNotJoined);

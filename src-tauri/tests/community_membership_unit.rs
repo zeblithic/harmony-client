@@ -91,22 +91,36 @@ fn event_id_type_is_16_bytes() {
     assert_eq!(std::mem::size_of_val(&id), 16);
 }
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use harmony_app::community_membership::{sign_event, EventPayload};
+use ed25519_dalek::SigningKey;
+use harmony_app::community_membership::{
+    sign_event, sign_event_with_identity, EventPayload,
+};
+use harmony_identity::PrivateIdentity;
+
+/// Build a deterministic test identity from a one-byte seed.
+/// Returns (private, identity_pub, owner_addr) where owner_addr ==
+/// OwnerAddr(identity.address_hash). The identity_pub is the canonical
+/// 64-byte combined `X25519_pub || Ed25519_pub` blob.
+///
+/// Use this anywhere a test needs a real OwnerAddr/identity_pub pair
+/// — verify_signature and verify_countersig now derive address_hash
+/// from identity_pub and check it against event.actor / cs.signer,
+/// so arbitrary OwnerAddr bytes will not pass the binding check.
+fn make_test_identity(seed: u8) -> (PrivateIdentity, [u8; 64], OwnerAddr) {
+    let private = PrivateIdentity::from_seed(&[seed; 32]);
+    let identity_pub = private.identity.to_public_bytes();
+    let owner_addr = OwnerAddr(private.identity.address_hash);
+    (private, identity_pub, owner_addr)
+}
 
 #[test]
 fn sign_event_produces_signature_verifiable_with_pubkey() {
+    // Low-level sign_event taking SigningKey. Production callers use
+    // sign_event_with_identity (covered by the verify_signature_* tests
+    // below). This test pins the SigningKey path for completeness.
     let signing_key = SigningKey::from_bytes(&[42u8; 32]);
-    let pubkey: VerifyingKey = signing_key.verifying_key();
-    let actor = OwnerAddr({
-        // Simplified: use first 16 bytes of raw pubkey as actor.
-        // Real OwnerAddr is BLAKE3(pubkey)[..16] but sign_event
-        // doesn't care, it just signs whatever bytes you hand it.
-        let pk_bytes = pubkey.to_bytes();
-        let mut a = [0u8; 16];
-        a.copy_from_slice(&pk_bytes[..16]);
-        a
-    });
+    let pubkey = signing_key.verifying_key();
+    let actor = OwnerAddr([0u8; 16]); // arbitrary — sign_event doesn't bind
 
     let payload = EventPayload {
         id: [11u8; 16],
@@ -137,18 +151,12 @@ fn sign_event_produces_signature_verifiable_with_pubkey() {
 }
 
 use harmony_app::community_membership::{
-    attach_countersig, verify_countersig, verify_signature, VerifyError,
+    attach_countersig_with_identity, verify_countersig, verify_signature, VerifyError,
 };
 
 #[test]
 fn verify_signature_accepts_valid_event() {
-    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
-    let pubkey = signing_key.verifying_key();
-
-    let pk_bytes = pubkey.to_bytes();
-    let mut actor_bytes = [0u8; 16];
-    actor_bytes.copy_from_slice(&pk_bytes[..16]);
-    let actor = OwnerAddr(actor_bytes);
+    let (private, identity_pub, actor) = make_test_identity(42);
 
     let payload = EventPayload {
         id: [11u8; 16],
@@ -162,18 +170,13 @@ fn verify_signature_accepts_valid_event() {
         },
     };
 
-    let event = sign_event(&payload, &signing_key).expect("sign");
-    verify_signature(&event, &pubkey).expect("must verify");
+    let event = sign_event_with_identity(&payload, &private).expect("sign");
+    verify_signature(&event, &identity_pub).expect("must verify");
 }
 
 #[test]
 fn verify_signature_rejects_tampered_event() {
-    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
-    let pubkey = signing_key.verifying_key();
-    let pk_bytes = pubkey.to_bytes();
-    let mut actor_bytes = [0u8; 16];
-    actor_bytes.copy_from_slice(&pk_bytes[..16]);
-    let actor = OwnerAddr(actor_bytes);
+    let (private, identity_pub, actor) = make_test_identity(42);
 
     let payload = EventPayload {
         id: [11u8; 16],
@@ -187,64 +190,55 @@ fn verify_signature_rejects_tampered_event() {
         },
     };
 
-    let mut event = sign_event(&payload, &signing_key).expect("sign");
+    let mut event = sign_event_with_identity(&payload, &private).expect("sign");
     // Tamper with the kind: flip Join to Leave. Sig was over the
     // original payload; verify must reject.
     event.kind = MembershipEventKind::Leave;
 
-    let err = verify_signature(&event, &pubkey).expect_err("must reject tampered");
-    assert!(matches!(err, VerifyError::SignatureInvalid));
+    let err = verify_signature(&event, &identity_pub).expect_err("must reject tampered");
+    assert_eq!(err, VerifyError::SignatureInvalid);
 }
 
 #[test]
-fn verify_signature_rejects_wrong_pubkey() {
-    let signing_key_a = SigningKey::from_bytes(&[42u8; 32]);
-    let signing_key_b = SigningKey::from_bytes(&[99u8; 32]);
-    let pubkey_b = signing_key_b.verifying_key();
-
-    let pk_bytes = signing_key_a.verifying_key().to_bytes();
-    let mut actor_bytes = [0u8; 16];
-    actor_bytes.copy_from_slice(&pk_bytes[..16]);
-    let actor = OwnerAddr(actor_bytes);
+fn verify_signature_rejects_pubkey_not_matching_actor() {
+    // Bob signs an event but claims actor=alice. The Ed25519 sig
+    // would verify against bob's pubkey alone, but verify_signature
+    // now derives the OwnerAddr from the supplied identity_pub and
+    // checks it matches event.actor — so passing bob's identity_pub
+    // for an event with actor=alice surfaces as ActorPubkeyMismatch
+    // (defends against caller cache-lookup bugs and key-substitution
+    // attacks where attacker's pubkey is paired with victim's claimed
+    // identity).
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, bob_id_pub, _bob) = make_test_identity(2);
 
     let payload = EventPayload {
         id: [11u8; 16],
         community_id: SpaceId([3u8; 16]),
         kind: MembershipEventKind::Join,
-        actor,
+        actor: alice,
         at: Hlc {
             wall_ms: 1000,
             logical: 0,
             device_id: "d".into(),
         },
     };
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let event = sign_event(&payload, &signing_key_a).expect("sign");
-    let err = verify_signature(&event, &pubkey_b).expect_err("must reject wrong pubkey");
-    assert!(matches!(err, VerifyError::SignatureInvalid));
+    let err = verify_signature(&event, &bob_id_pub).expect_err("must reject wrong identity");
+    assert_eq!(err, VerifyError::ActorPubkeyMismatch);
 }
 
 #[test]
 fn attach_and_verify_countersig_round_trip() {
-    let actor_key = SigningKey::from_bytes(&[42u8; 32]);
-    let inviter_key = SigningKey::from_bytes(&[55u8; 32]);
-    let inviter_pubkey = inviter_key.verifying_key();
-
-    let pk_bytes = actor_key.verifying_key().to_bytes();
-    let mut actor_bytes = [0u8; 16];
-    actor_bytes.copy_from_slice(&pk_bytes[..16]);
-    let actor = OwnerAddr(actor_bytes);
-
-    let inviter_pk_bytes = inviter_pubkey.to_bytes();
-    let mut inviter_addr_bytes = [0u8; 16];
-    inviter_addr_bytes.copy_from_slice(&inviter_pk_bytes[..16]);
-    let inviter = OwnerAddr(inviter_addr_bytes);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
 
     let payload = EventPayload {
         id: [11u8; 16],
         community_id: SpaceId([3u8; 16]),
         kind: MembershipEventKind::Join,
-        actor,
+        actor: alice,
         at: Hlc {
             wall_ms: 1000,
             logical: 0,
@@ -252,37 +246,27 @@ fn attach_and_verify_countersig_round_trip() {
         },
     };
 
-    let event = sign_event(&payload, &actor_key).expect("sign");
-    let event_with_cs = attach_countersig(&event, inviter, &inviter_key).expect("countersign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    let event_with_cs =
+        attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     assert!(event_with_cs.countersig.is_some());
     let cs = event_with_cs.countersig.as_ref().unwrap();
-    assert_eq!(cs.signer, inviter);
+    assert_eq!(cs.signer, admin);
 
-    verify_countersig(&event_with_cs, &inviter_pubkey).expect("countersig must verify");
+    verify_countersig(&event_with_cs, &admin_id_pub).expect("countersig must verify");
 }
 
 #[test]
 fn verify_countersig_rejects_when_payload_changed_after_countersign() {
-    let actor_key = SigningKey::from_bytes(&[42u8; 32]);
-    let inviter_key = SigningKey::from_bytes(&[55u8; 32]);
-    let inviter_pubkey = inviter_key.verifying_key();
-
-    let pk_bytes = actor_key.verifying_key().to_bytes();
-    let mut actor_bytes = [0u8; 16];
-    actor_bytes.copy_from_slice(&pk_bytes[..16]);
-    let actor = OwnerAddr(actor_bytes);
-
-    let inviter_pk_bytes = inviter_pubkey.to_bytes();
-    let mut inviter_addr_bytes = [0u8; 16];
-    inviter_addr_bytes.copy_from_slice(&inviter_pk_bytes[..16]);
-    let inviter = OwnerAddr(inviter_addr_bytes);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (admin_priv, admin_id_pub, _admin) = make_test_identity(100);
 
     let payload = EventPayload {
         id: [11u8; 16],
         community_id: SpaceId([3u8; 16]),
         kind: MembershipEventKind::Join,
-        actor,
+        actor: alice,
         at: Hlc {
             wall_ms: 1000,
             logical: 0,
@@ -290,8 +274,9 @@ fn verify_countersig_rejects_when_payload_changed_after_countersign() {
         },
     };
 
-    let event = sign_event(&payload, &actor_key).expect("sign");
-    let mut event_with_cs = attach_countersig(&event, inviter, &inviter_key).expect("countersign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    let mut event_with_cs =
+        attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     // Mutate the payload after counter-signing: change `at`. The
     // countersig was over the original payload bytes; verify must reject.
@@ -301,15 +286,72 @@ fn verify_countersig_rejects_when_payload_changed_after_countersign() {
         device_id: "d".into(),
     };
 
-    let err = verify_countersig(&event_with_cs, &inviter_pubkey)
+    let err = verify_countersig(&event_with_cs, &admin_id_pub)
         .expect_err("must reject mutated payload");
-    // Note: verify_countersig may surface this as CounterSigInvalid
-    // (since the attached countersig is stale) OR SignatureInvalid
-    // (since the underlying ed25519 verify fails). The exact discriminant
-    // depends on implementation. Accept either.
+    // verify_countersig may surface this as CounterSigInvalid (the
+    // attached sig doesn't match the new payload bytes).
     assert!(matches!(
         err,
         VerifyError::CounterSigInvalid | VerifyError::SignatureInvalid
+    ));
+}
+
+#[test]
+fn verify_countersig_rejects_pubkey_not_matching_signer() {
+    // The attack from PR #82 review (Qodo + qodo-code-review): valid
+    // countersig from key A, but cs.signer claims address B (typically
+    // a higher-power signer). Without binding, the Ed25519 verify
+    // would pass (sig is from A, pubkey is A) and the power lookup
+    // would credit B's authority — bypassing invite-only authorization.
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (admin_priv, _admin_id_pub, _admin) = make_test_identity(100);
+    let (_carol_priv, carol_id_pub, carol) = make_test_identity(50);
+
+    let payload = EventPayload {
+        id: [11u8; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: alice,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    // Forge a countersig with cs.signer=carol but signed by admin's key.
+    // (Real attack: admin signs, claims carol, hopes verifier looks up
+    //  carol's pubkey and rejects only on signature mismatch — but the
+    //  binding check fires first.)
+    let mut event = event;
+    let payload_for_cs = EventPayload {
+        id: event.id,
+        community_id: event.community_id,
+        kind: event.kind.clone(),
+        actor: event.actor,
+        at: event.at.clone(),
+    };
+    let bytes = canonical_cbor_encode(&payload_for_cs).expect("encode");
+    let admin_sig = admin_priv.sign(&bytes);
+    event.countersig = Some(harmony_app::community_membership::CounterSignature {
+        signer: carol, // claim carol
+        sig: admin_sig, // but signed by admin
+    });
+
+    let err = verify_countersig(&event, &carol_id_pub).expect_err("must reject");
+    // Either:
+    //   - verifier picks up carol's identity_pub (matches cs.signer ✓)
+    //     but the sig is from admin → CounterSigInvalid
+    // OR (the bot-flagged scenario where caller passes admin's pubkey
+    // by mistake):
+    //   - verifier passes admin's identity_pub → derives admin's address
+    //     hash → mismatches cs.signer (carol) → CounterSignerPubkeyMismatch
+    // The first path fires here (we passed carol_id_pub). Both are
+    // correct rejections.
+    assert!(matches!(
+        err,
+        VerifyError::CounterSigInvalid | VerifyError::CounterSignerPubkeyMismatch
     ));
 }
 
@@ -616,9 +658,8 @@ fn materialize_replays_in_hlc_order_not_input_order() {
 
 #[test]
 fn verify_event_accepts_valid_join_in_open_community() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
 
     // Pre-existing materialized state: admin has joined.
     let prior_state = materialize(
@@ -638,13 +679,12 @@ fn verify_event_accepts_valid_join_in_open_community() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept");
@@ -652,9 +692,8 @@ fn verify_event_accepts_valid_join_in_open_community() {
 
 #[test]
 fn verify_event_rejects_invite_only_join_without_countersig() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
 
     let prior_state = materialize(&[], admin);
 
@@ -669,13 +708,12 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: true,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -684,10 +722,8 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
 
 #[test]
 fn verify_event_accepts_invite_only_join_with_valid_countersig() {
-    let admin = OwnerAddr([100u8; 16]);
-    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 100)],
@@ -705,15 +741,14 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
-    let event = attach_countersig(&event, admin, &admin_key).expect("countersign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    let event =
+        attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
-    let alice_pubkey = alice_key.verifying_key();
-    let admin_pubkey = admin_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: true,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: Some(&admin_pubkey),
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: Some(&admin_id_pub),
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept");
@@ -721,10 +756,9 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
 
 #[test]
 fn verify_event_rejects_kick_when_actor_power_below_threshold() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let bob = OwnerAddr([2u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[
@@ -749,13 +783,12 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -764,9 +797,8 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
 
 #[test]
 fn verify_event_rejects_kick_when_target_power_equals_actor() {
-    let admin = OwnerAddr([100u8; 16]);
-    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
-    let admin2 = OwnerAddr([99u8; 16]);
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (_admin2_priv, _admin2_id_pub, admin2) = make_test_identity(99);
 
     let prior_state = materialize(
         &[
@@ -799,13 +831,12 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &admin_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
-    let admin_pubkey = admin_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &admin_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -814,10 +845,9 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
 
 #[test]
 fn verify_event_rejects_setpower_when_actor_power_insufficient() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let bob = OwnerAddr([2u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[
@@ -841,13 +871,12 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -867,10 +896,9 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
     // Under v1 POWER_THRESHOLDS.invite = 0, the power check alone
     // accepts anyone — so a non-member can otherwise emit a valid
     // Invite. Membership must be the operative gate.
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let bob = OwnerAddr([2u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     // Only admin has joined; alice has NOT.
     let prior_state = materialize(
@@ -889,13 +917,12 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -904,10 +931,9 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
 
 #[test]
 fn verify_event_rejects_kick_from_non_joined_actor() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let bob = OwnerAddr([2u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     // Alice has high power (somehow assigned), but never Joined.
     // She must still be rejected from kicking — power without
@@ -943,13 +969,12 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -958,10 +983,9 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
 
 #[test]
 fn verify_event_rejects_setpower_from_non_joined_actor() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let bob = OwnerAddr([2u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[
@@ -994,13 +1018,12 @@ fn verify_event_rejects_setpower_from_non_joined_actor() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1013,11 +1036,9 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
     // countersigner must be a current Joined member — otherwise an
     // attacker who somehow obtained an invite token from a non-member
     // could vouch for arbitrary joiners.
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
-    let outsider = OwnerAddr([99u8; 16]);
-    let outsider_key = SigningKey::from_bytes(&[99u8; 32]);
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (outsider_priv, outsider_id_pub, outsider) = make_test_identity(99);
 
     // Only admin Joined; outsider exists in power_levels (e.g., from a
     // pre-departure SetPower) but has never Joined.
@@ -1048,15 +1069,14 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
-    let event = attach_countersig(&event, outsider, &outsider_key).expect("countersign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
+    let event =
+        attach_countersig_with_identity(&event, &outsider_priv).expect("countersign");
 
-    let alice_pubkey = alice_key.verifying_key();
-    let outsider_pubkey = outsider_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: true,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: Some(&outsider_pubkey),
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: Some(&outsider_id_pub),
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1072,10 +1092,8 @@ fn verify_event_rejects_join_replay_after_kick() {
     //
     // Kick = effective ban until an explicit unban flow exists
     // (deferred to a follow-up).
-    let admin = OwnerAddr([100u8; 16]);
-    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
 
     // alice joined, then was kicked by admin.
     let prior_state = materialize(
@@ -1093,7 +1111,7 @@ fn verify_event_rejects_join_replay_after_kick() {
                         device_id: "d".into(),
                     },
                 };
-                sign_event(&payload, &alice_key).expect("sign")
+                sign_event_with_identity(&payload, &alice_priv).expect("sign")
             },
             {
                 let payload = EventPayload {
@@ -1110,7 +1128,7 @@ fn verify_event_rejects_join_replay_after_kick() {
                         device_id: "d".into(),
                     },
                 };
-                sign_event(&payload, &admin_key).expect("sign")
+                sign_event_with_identity(&payload, &admin_priv).expect("sign")
             },
         ],
         admin,
@@ -1133,13 +1151,12 @@ fn verify_event_rejects_join_replay_after_kick() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let alice_pubkey = alice_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &alice_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &alice_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1152,9 +1169,8 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
     // SetPower must NOT be able to assign 200/255/etc. — the cap is
     // structural to the moderation model (no member can hold a power
     // higher than admin can revoke).
-    let admin = OwnerAddr([100u8; 16]);
-    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
-    let bob = OwnerAddr([2u8; 16]);
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[
@@ -1178,13 +1194,12 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &admin_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
-    let admin_pubkey = admin_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &admin_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1194,9 +1209,8 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
 #[test]
 fn verify_event_accepts_setpower_at_max_boundary() {
     // Boundary check: level == POWER_THRESHOLDS.max (100) is allowed.
-    let admin = OwnerAddr([100u8; 16]);
-    let admin_key = SigningKey::from_bytes(&[100u8; 32]);
-    let bob = OwnerAddr([2u8; 16]);
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[
@@ -1220,24 +1234,32 @@ fn verify_event_accepts_setpower_at_max_boundary() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &admin_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
-    let admin_pubkey = admin_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &admin_pubkey,
-        countersigner_pubkey: None,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept level == max");
 }
 
 #[test]
-fn verify_event_rejects_when_actor_signature_invalid() {
-    let admin = OwnerAddr([100u8; 16]);
-    let alice = OwnerAddr([1u8; 16]);
-    let alice_key = SigningKey::from_bytes(&[1u8; 32]);
-    let bob_key = SigningKey::from_bytes(&[2u8; 32]); // different signer
+fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
+    // The bot-flagged scenario: alice signs a Join, but the caller
+    // passes bob's identity_pub. Without binding, the Ed25519 sig
+    // would also need to verify under bob's pubkey (it won't, so
+    // SignatureInvalid would fire). With binding, address-hash check
+    // fires first → ActorPubkeyMismatch.
+    //
+    // The original test name ("verify_event_rejects_when_actor_signature_invalid")
+    // tested the without-binding path; under the binding fix the same
+    // setup now surfaces a more specific error, which is the desired
+    // behavior.
+    let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (_bob_priv, bob_id_pub, _bob) = make_test_identity(2);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 100)],
@@ -1255,15 +1277,14 @@ fn verify_event_rejects_when_actor_signature_invalid() {
             device_id: "d".into(),
         },
     };
-    let event = sign_event(&payload, &alice_key).expect("sign");
+    let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
-    let bob_pubkey = bob_key.verifying_key();
     let ctx = VerifyContext {
         is_invite_only: false,
-        actor_pubkey: &bob_pubkey, // wrong pubkey for actor
-        countersigner_pubkey: None,
+        actor_identity_pub: &bob_id_pub, // wrong identity for actor=alice
+        countersigner_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
-    assert_eq!(err, VerifyError::SignatureInvalid);
+    assert_eq!(err, VerifyError::ActorPubkeyMismatch);
 }
