@@ -1567,13 +1567,22 @@ impl Space {
             }
             SpaceKind::Community => {
                 if self.membership_key.is_none() {
-                    return Err(InvariantError("community must have membership_key".into()));
+                    return Err(InvariantError(
+                        "community must have membership_key (symmetric key for the membership topic)"
+                            .into(),
+                    ));
                 }
                 if self.admin_addr.is_none() {
-                    return Err(InvariantError("community must have admin_addr".into()));
+                    return Err(InvariantError(
+                        "community must have admin_addr (creator who holds power 100 via the bootstrap rule)"
+                            .into(),
+                    ));
                 }
                 if self.is_invite_only.is_none() {
-                    return Err(InvariantError("community must have is_invite_only".into()));
+                    return Err(InvariantError(
+                        "community must have is_invite_only (open vs invite-only policy flag)"
+                            .into(),
+                    ));
                 }
                 if !self.members.is_empty() {
                     return Err(InvariantError(
@@ -1611,6 +1620,14 @@ impl Space {
                         self.kind
                     )));
                 }
+            }
+            SpaceKind::Community => {
+                // content_key invariant for Community is enforced in the Community
+                // arm of the kind-invariants match above (with its own rationale
+                // message — "membership_key is the community's symmetric key").
+                // Excluding it here prevents a duplicated check from firing with
+                // a less-informative error if the kind-invariants match is ever
+                // refactored to fall through.
             }
             _ => {
                 if self.content_key.is_some() {
@@ -2943,7 +2960,7 @@ mod space_tests {
 
     #[test]
     fn community_space_rejects_missing_membership_key() {
-        let mut s = Space {
+        let s = Space {
             id: SpaceId([1u8; 16]),
             kind: SpaceKind::Community,
             parent: None,
@@ -2972,17 +2989,138 @@ mod space_tests {
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("membership_key"));
+    }
 
-        // Now also confirm missing admin_addr and missing is_invite_only fail.
-        s.membership_key = Some(MembershipKey::new([0u8; 32]));
-        s.admin_addr = None;
+    #[test]
+    fn community_space_rejects_missing_admin_addr() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: None, // ← invariant violation
+            is_invite_only: Some(false),
+        };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("admin_addr"));
+    }
 
-        s.admin_addr = Some(OwnerAddr([2u8; 16]));
-        s.is_invite_only = None;
+    #[test]
+    fn community_space_rejects_missing_is_invite_only() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: None, // ← invariant violation
+        };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("is_invite_only"));
+    }
+
+    #[test]
+    fn community_space_rejects_community_id_present() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: Some(SpaceId([99u8; 16])), // ← invariant violation
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("community_id=None"));
+    }
+
+    #[test]
+    fn community_space_rejects_content_key_present() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([7u8; 32])), // ← invariant violation
+            prior_content_keys: vec![],
+            membership_key: Some(MembershipKey::new([0u8; 32])),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = s.validate_invariants().expect_err("must reject");
+        assert!(err.0.contains("content_key=None"));
     }
 
     #[test]
