@@ -8,6 +8,7 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+pub mod community_invite;
 pub mod community_membership;
 pub mod content_index;
 pub mod content_store;
