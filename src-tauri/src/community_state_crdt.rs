@@ -14,13 +14,14 @@
 //! at this nesting level — both field codes (`ci` for community_id,
 //! `ev` for events) are 2 chars.
 
-use crate::community_membership::{EventId, SignedMembershipEvent};
-use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
-use crate::owner_state_types::SpaceId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+use crate::community_membership::{EventId, SignedMembershipEvent};
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
+use crate::owner_state_types::SpaceId;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityState {
     /// The community this state belongs to. Persisted in the wire form
     /// so that a misrouted blob (wrong file, wrong ContentStore key) is
