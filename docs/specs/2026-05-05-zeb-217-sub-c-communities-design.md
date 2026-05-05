@@ -368,7 +368,7 @@ The pattern reuses ZEB-215 Phase 3a/3b mechanics: subscribers maintain a per-com
 
 ### Race: simultaneous join from two of my devices
 
-Phone and desktop both publish `Join { actor: my_addr, at: hlc_phone }` and `Join { actor: my_addr, at: hlc_desktop }` (different ULIDs, slightly different HLCs). Both are valid signed events. Both land in the Prolly Tree on every member. Materialized state's `members[my_addr]` reflects whichever has the earlier HLC for `joined_at` — idempotent at the user-visible layer.
+Phone and desktop both publish `Join { actor: my_addr, at: hlc_phone }` and `Join { actor: my_addr, at: hlc_desktop }` (different `EventId`s, slightly different HLCs). Both are valid signed events. Both land in the per-community CRDT on every member. Materialized state's `members[my_addr]` reflects whichever event sorts first under `event_sort_key` — `(wall_ms, logical, device_id, EventId, sig)` ascending — typically the earlier HLC, with `EventId` then `sig` providing the deterministic tie-break when HLC components collide. Idempotent at the user-visible layer.
 
 ### Encryption-key rotation on membership change
 
@@ -638,10 +638,10 @@ If any verification fails at points 1 or 2, the event is rejected and **not** re
 | Event from actor with insufficient power | Rejected at receive — same as above |
 | Two-device race: same admin kicks the same target simultaneously | Both events valid + signed by same actor with sufficient power. Both land in Prolly Tree. Materialized state shows kick once (idempotent at status=Banned) |
 | Race: A sets bob's power to 75 on phone, simultaneously sets to 25 on desktop | Both events valid. HLC ordering picks last-writer-wins. The "loser" event lands in Prolly Tree but has no materialized effect (overwritten) |
-| Race: A kicks B who is simultaneously kicking A | Whichever event has earlier HLC wins. The later event verifies against materialized state at its HLC, which includes the earlier kick — so the kicker who's already been kicked has insufficient power → rejected |
+| Race: A kicks B who is simultaneously kicking A | Whichever event sorts first under `event_sort_key` wins (typically earlier HLC; ties resolved by `EventId` then `sig`). The later event verifies against `prior_state_at_event` at its position, which includes the earlier kick — so the kicker who's already been kicked has insufficient power → rejected |
 | Invite-only Join with countersig from a member who LATER lost power | The countersig was valid at the time the Join event was created (verified against materialized state at HLC time). HLC-ordered replay preserves the original verification. Join stays valid |
 | Reticulum CommunityInvite delivery fails (no member online) | v1 returns `Err` immediately; user retries. Persistent retry / "join pending" UX deferred to [ZEB-254](https://linear.app/zeblith/issue/ZEB-254/) |
-| Two of my devices both redeem the same invite link | Both publish Join events signed by my owner key with slightly different HLCs. Both land in Prolly Tree. Materialized members[my_addr] reflects whichever has earlier HLC. Idempotent at user level |
+| Two of my devices both redeem the same invite link | Both publish Join events signed by my owner key with slightly different HLCs. Both land in the per-community CRDT. Materialized `members[my_addr]` reflects whichever event sorts first under `event_sort_key` (typically earlier HLC; `EventId`/`sig` tie-break). Idempotent at user level |
 | Local DB corruption on one device | Owner-state DAG-syncs Space from peer bound device → membership_key recovered → community state DAG-syncs from peer member |
 | MembershipKey leak (someone exfiltrates from device) | Attacker can decrypt the membership topic's history. Cannot publish events without a valid signing key for an existing member. Mitigation: rotation deferred to [ZEB-249](https://linear.app/zeblith/issue/ZEB-249/) |
 | Invite link leak (attacker grabs a `harmony://invite/...` URL) | For open communities: attacker can join. Admin can kick. For invite-only with `invitee_hint = None`: same — attacker can redeem. For invite-only with `invitee_hint = Some(addr)`: attacker can't redeem (the Join event signature won't match the hint). Mitigation: prefer targeted invites; admin can revoke open invites |
@@ -651,7 +651,7 @@ If any verification fails at points 1 or 2, the event is rejected and **not** re
 ### Multi-device convergence properties
 
 - **All membership events are content-addressed** by their CBOR canonical encoding → DAG-sync deduplicates naturally
-- **HLC ordering is total across the owner's bound devices** (logical counter dominates wall-clock skew)
+- **Canonical event ordering uses `event_sort_key`** — `(wall_ms, logical, device_id, EventId, sig)` ascending. The HLC triple `(wall_ms, logical, device_id)` provides causal ordering with the logical counter dominating wall-clock skew; `EventId` (16-byte ULID) is a strong but caller-supplied tiebreaker; the 64-byte `sig` makes the order truly total across any malformed input. Implementations that fall back to "HLC alone" miss the `EventId`/`sig` tiebreakers and silently authorize against stale state when same-HLC predecessors exist — use the `event_sort_key` helper (and `prior_state_at_event` for the verifier prefix) so the comparator can't drift.
 - **Membership-CRDT root is per-community**, not per-owner → my desktop and phone independently subscribe + DAG-sync
 - **Materialized state is deterministic** given the same event log → all bound devices converge to the same view
 
