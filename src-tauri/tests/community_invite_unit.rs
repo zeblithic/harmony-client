@@ -65,8 +65,14 @@ fn community_invite_payload_round_trips_invite_only_form() {
         decoded.invite_token.as_ref().map(|t| t.invitee_hint),
         Some(Some(OwnerAddr([6u8; 16])))
     );
-    assert_eq!(decoded.invite_token.as_ref().map(|t| t.inviter), Some(token.inviter));
-    assert_eq!(decoded.invite_token.as_ref().map(|t| t.sig), Some(token.sig));
+    assert_eq!(
+        decoded.invite_token.as_ref().map(|t| t.inviter),
+        Some(token.inviter)
+    );
+    assert_eq!(
+        decoded.invite_token.as_ref().map(|t| t.sig),
+        Some(token.sig)
+    );
 }
 
 #[test]

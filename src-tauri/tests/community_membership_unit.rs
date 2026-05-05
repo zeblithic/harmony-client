@@ -92,9 +92,7 @@ fn event_id_type_is_16_bytes() {
 }
 
 use ed25519_dalek::SigningKey;
-use harmony_app::community_membership::{
-    sign_event, sign_event_with_identity, EventPayload,
-};
+use harmony_app::community_membership::{sign_event, sign_event_with_identity, EventPayload};
 use harmony_identity::PrivateIdentity;
 
 /// Build a deterministic test identity from a one-byte seed.
@@ -247,8 +245,7 @@ fn attach_and_verify_countersig_round_trip() {
     };
 
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
-    let event_with_cs =
-        attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
+    let event_with_cs = attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     assert!(event_with_cs.countersig.is_some());
     let cs = event_with_cs.countersig.as_ref().unwrap();
@@ -286,8 +283,8 @@ fn verify_countersig_rejects_when_payload_changed_after_countersign() {
         device_id: "d".into(),
     };
 
-    let err = verify_countersig(&event_with_cs, &admin_id_pub)
-        .expect_err("must reject mutated payload");
+    let err =
+        verify_countersig(&event_with_cs, &admin_id_pub).expect_err("must reject mutated payload");
     // verify_countersig may surface this as CounterSigInvalid (the
     // attached sig doesn't match the new payload bytes).
     assert!(matches!(
@@ -335,7 +332,7 @@ fn verify_countersig_rejects_pubkey_not_matching_signer() {
     let bytes = canonical_cbor_encode(&payload_for_cs).expect("encode");
     let admin_sig = admin_priv.sign(&bytes);
     event.countersig = Some(harmony_app::community_membership::CounterSignature {
-        signer: carol, // claim carol
+        signer: carol,  // claim carol
         sig: admin_sig, // but signed by admin
     });
 
@@ -742,8 +739,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
         },
     };
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
-    let event =
-        attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
+    let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     let ctx = VerifyContext {
         is_invite_only: true,
@@ -1070,8 +1066,7 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
         },
     };
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
-    let event =
-        attach_countersig_with_identity(&event, &outsider_priv).expect("countersign");
+    let event = attach_countersig_with_identity(&event, &outsider_priv).expect("countersign");
 
     let ctx = VerifyContext {
         is_invite_only: true,

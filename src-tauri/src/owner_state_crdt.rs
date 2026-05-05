@@ -1003,8 +1003,8 @@ mod apply_space_tests {
             custom_name: None,
             notification_pref: None,
             left_at: None,
-            created_at: hlc(200),     // newer (attacker pretends to be original creator)
-            updated_at: hlc(300),     // even fresher
+            created_at: hlc(200), // newer (attacker pretends to be original creator)
+            updated_at: hlc(300), // even fresher
             content_key: None,
             prior_content_keys: vec![],
             membership_key: Some(MembershipKey::new([0xbb; 32])), // hostile rotation
