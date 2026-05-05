@@ -2,9 +2,11 @@
 
 **Linear:** [ZEB-217](https://linear.app/zeblith/issue/ZEB-217/zeb-206-sub-c-harmony-client-community-membership-crdt-invitejoin)
 **Parent epic:** [ZEB-206](https://linear.app/zeblith/issue/ZEB-206/) (nav-tree real-data wiring)
-**Date:** 2026-05-05
-**Status:** Design — pending implementation
-**Author:** brainstormed against shipped ZEB-215 (owner-state CRDT) + ZEB-216 (DM transport) patterns
+**Date:** 2026-05-05 (refreshed 2026-05-05 against shipped Phase 1 — PR #82, merge commit `bd1d01b`)
+**Status:** Phase 1 shipped; Phases 2–5 pending implementation
+**Author:** brainstormed against shipped ZEB-215 (owner-state CRDT) + ZEB-216 (DM transport) patterns; refreshed against shipped Phase 1 primitives
+
+> **Refresh note (2026-05-05):** This spec was originally written before Phase 1 implementation. After PR #82 landed the membership-CRDT primitives, six rounds of bot review surfaced invariants that weren't pinned in the original draft (pubkey-to-OwnerAddr binding, bootstrap-admin self-Join exemption, defense-in-depth at both verify-event AND materialize layers, the full `event_sort_key` tiebreak chain, CounterSignature wire codes, same-SpaceId apply-time rejection of community-creation field changes, idempotent state transitions, the `EventPayload` named unsigned-portion type, and ed25519 `verify_strict`). The "Data model", "Materialization rules", "Verification", and "Phase 1" sections below now describe the shipped primitives so Phases 2–5 can reference them precisely.
 
 ## Goal
 
@@ -96,6 +98,12 @@ pub struct Space {
 
 All three new field codes are 2-char to preserve the **same-length-keys CBOR invariant** at the Space nesting level (every key here is exactly 2 chars → CBOR text(2) = 3 bytes per key, deterministic encoded length). `MembershipKey` is a new newtype with `ZeroizeOnDrop`, identical shape to `DmContentKey`.
 
+**LWW creation-pinning (shipped Phase 1, load-bearing for Phase 2):** `lww_merge_space` pins `admin_addr`, `membership_key`, `is_invite_only`, AND `created_at` to the side with the OLDER `created_at`. Without this, an attacker that backdates `created_at` could "win" the LWW pin and shift bootstrap-admin authority, rotate the membership key (locking prior encrypted state), or flip privacy mode. Cross-creator divergence is an invariant violation caught upstream by `validate_invariants`; same-creator merge yields identical values.
+
+**Same-SpaceId apply-time rejection (shipped Phase 1, defense-in-depth for the LWW pin):** `apply_space` rejects any same-SpaceId update where `kind == Community` AND `membership_key` / `admin_addr` / `is_invite_only` / `created_at` differs from the existing entry. Mirrors the `content_key` rejection for DMs. Phase 1 has no community-creation IPC, so this branch is unreachable today; it becomes load-bearing in Phase 2 once encrypted Zenoh state-root sync can deliver remote Space writes.
+
+**`validate_invariants` adds (shipped Phase 1):** `prior_content_keys` MUST be empty for `SpaceKind::Community` (no historical content-key chain — `membership_key` is fixed for the lifetime of the community in v1; rotation deferred to ZEB-249).
+
 ### `validate_invariants` extension for Community kind
 
 ```rust
@@ -143,7 +151,7 @@ pub struct SignedMembershipEvent {
     pub actor: OwnerAddr,
     pub at: Hlc,
     pub sig: [u8; 64],                     // ed25519 over canonical CBOR
-    pub countersig: Option<CounterSignature>,  // required for invite-only Join
+    pub countersig: Option<CounterSignature>,  // required for non-admin invite-only Join
 }
 
 pub enum MembershipEventKind {
@@ -155,10 +163,27 @@ pub enum MembershipEventKind {
 }
 
 pub struct CounterSignature {
-    pub signer: OwnerAddr,   // existing member with power ≥ invite_threshold
-    pub sig: [u8; 64],       // signs the joiner's signed Join event payload
+    pub signer: OwnerAddr,   // existing member with power ≥ invite_threshold;  wire code "sn"
+    pub sig: [u8; 64],       // signs the joiner's signed Join event payload;   wire code "sg"
+}
+
+/// Unsigned portion of `SignedMembershipEvent` — the bytes the actor's
+/// `sig` AND (when present) the countersig cover. Named so signing /
+/// verifying paths share a single source of truth for field order +
+/// coverage (no "sign with sig=zeros" ambiguity). `From<&SignedMembershipEvent>`
+/// extracts it.
+pub struct EventPayload {
+    pub id: EventId,
+    pub community_id: SpaceId,
+    pub kind: MembershipEventKind,
+    pub actor: OwnerAddr,
+    pub at: Hlc,
 }
 ```
+
+**Wire-key invariant (verified against PR #82):** every nesting level of these types satisfies the **same-length-keys CBOR invariant** — all field codes at any single map nesting are exactly 2 chars (text(2) = 3 bytes per key). For `CounterSignature`, the codes `sn` (signer) and `sg` (sig) match the convention "sg = signature at every nesting level"; an earlier draft used `sg`/`sx` (inverted) and was fixed before Phase 1 merge so cross-language deserializers don't have to special-case CounterSignature.
+
+**Sig coverage:** The actor's `sig` covers the canonical-CBOR encoding of `EventPayload` — `sig` and `countersig` are excluded so an inviter can append a countersig without invalidating the actor's sig. Because countersig is therefore wire-malleable (a peer could append, strip, or replace it on any event without breaking the actor sig), the verifier MUST reject any event carrying a countersig outside its allowed slot — see "Verification" below.
 
 ### Materialized views
 
@@ -196,23 +221,90 @@ Per-community customization is deferred to [ZEB-251](https://linear.app/zeblith/
 
 **Bootstrap (read before processing any events):** the community's `admin_addr` field on the owner-state Space IS the creator's power-100 designation. Materialized state initializes with `power_levels[admin_addr] = 100` BEFORE replaying any events. This sidesteps the chicken-and-egg problem where the first SetPower event would otherwise require the actor to already have power 100. The creator can later issue a SetPower to demote themselves or grant power 100 to others; SetPower events override the bootstrap value.
 
-Replay events in HLC order:
+**Replay order — `event_sort_key` (canonical total ordering):**
 
-- **`Join { actor, at }`** → `members[actor] = MemberState { status: Joined, joined_at: at }`. For invite-only communities, requires `countersig` to be present + valid. The creator's first event MUST be a Join (they implicitly hold power 100 from the bootstrap rule, but they're not a "member" until they Join — same way every other member must Join to be counted in `members`).
-- **`Leave { actor, at }`** → updates `members[actor].status = Left, left_at = at`. Reversible by re-Join.
-- **`Invite { actor, target, at }`** → `members[target] = MemberState { status: Invited, joined_at: at, left_at: None }` (target still needs a Join event to become a full member).
-- **`Kick { actor, target, at }`** → updates `members[target].status = Banned, left_at = at`. Requires `actor.power > target.power` AND `actor.power ≥ kick_threshold`.
-- **`SetPower { actor, target, level, at }`** → `power_levels[target] = level`. Requires `actor.power ≥ set_power_threshold`.
+Events are replayed in `(wall_ms, logical, device_id, EventId, sig)` ascending. The HLC triple is causal-ish but not total — two events with the same `wall_ms` / `logical` / `device_id` collide. `EventId` is a strong but caller-supplied tiebreaker; a buggy or malicious peer could emit two distinct events with the same id. The 64-byte `sig` is the field that makes the order truly total across any malformed input — distinct payloads under the same key produce distinct sigs, and signature security guarantees no useful collisions.
+
+Phase 2 sync MUST use the same `event_sort_key` comparator when computing the verifier's prior-state prefix; re-implementing "all events strictly before in HLC order" elsewhere would miss the EventId / sig tiebreakers and silently authorize against stale state when same-HLC predecessors exist. Use the `prior_state_at_event` helper.
+
+**Per-kind transition tables.** Materialize is a pure function over a pre-verified event log; `verify_event` enforces the same invariants at the input layer. Materialize re-pins them as defense-in-depth for events that slip past verification (corrupted log, replay before a Ban arrived):
+
+- **`Join { actor, at }`** —
+    - prior status `None` / `Invited` / `Left` → set `Joined`, `joined_at = at`
+    - prior status `Joined` → **no-op** (idempotent; preserves original `joined_at` so an actor can't push their own join date forward by replaying Join with no privilege gate)
+    - prior status `Banned` → **no-op** (Banned-sticky)
+- **`Leave { actor, at }`** —
+    - prior status `Joined` / `Invited` / `Left` (via existing record) → set `Left`, `left_at = at`
+    - prior status `Banned` → **no-op** (Banned-sticky; verify_event also rejects `BannedActorLeave`)
+    - actor never joined → **no-op** (verify_event tolerates this; insert-with-Left would corrupt state from a malformed event)
+- **`Invite { actor, target, at }`** —
+    - prior target status `None` / `Left` → set `Invited`, `joined_at = at`, `left_at = None` (replace entry; legitimate re-invite of a former member)
+    - prior target status `Invited` → **no-op** (idempotent; preserves original invite timestamp)
+    - prior target status `Joined` → **no-op** (already past invited stage)
+    - prior target status `Banned` → **no-op** (Banned-sticky; verify_event also rejects `InviteTargetBanned`)
+- **`Kick { actor, target, at }`** —
+    - target HAS an existing entry → set `Banned`, `left_at = at`
+    - target never joined → **no-op** (verify_event rejects `KickTargetNotMember` at the input layer; falling back to `entry().or_insert(...)` would fabricate a phantom `Banned` entry with `joined_at = kick_time`)
+- **`SetPower { actor, target, level, at }`** → `power_levels[target] = level`. (Power-rule checks live in `verify_event`; materialize is a pure write.)
 
 ### Verification (run at every event before insertion into Prolly Tree)
 
-1. **Signature** valid against `actor`'s owner pubkey
-2. **For invite-only Join:** `countersig` valid AND `signer`'s current power ≥ `invite_threshold`
-3. **Action's required power** ≤ `actor`'s current power (computed from materialized state at HLC time)
-4. **For Kick:** actor's power strictly > target's power
-5. Reject + don't replicate on any failure
+Phase 1 ships `verify_event` as the single source of truth for "is this event authorized?". Pure function — caller supplies prior materialized state + the verifier's expectations:
 
-Verification is **idempotent and pure** — given the same prior event log + the same candidate event, returns the same accept/reject. This makes Prolly Tree DAG-sync convergent: two devices that receive the same set of events will materialize the same state regardless of arrival order.
+```rust
+pub struct VerifyContext<'a> {
+    /// Caller's expected community_id; must match event.community_id.
+    pub expected_community_id: SpaceId,
+    /// Community's bootstrap admin (Space.admin_addr). Admin self-Join
+    /// in invite-only communities is exempt from the countersig
+    /// requirement — without this exemption a fresh invite-only
+    /// community is unbootstrappable from empty state.
+    pub admin_addr: OwnerAddr,
+    pub is_invite_only: bool,
+    /// Canonical 64-byte combined identity public bytes
+    /// (X25519_pub(32) || Ed25519_pub(32)) for `event.actor`.
+    /// Source: Sub-A's owner-device cache.
+    pub actor_identity_pub: &'a [u8; 64],
+    /// Same shape, for the countersig signer. None for open communities,
+    /// non-Join events, and admin self-Join in invite-only.
+    pub countersigner_identity_pub: Option<&'a [u8; 64]>,
+}
+
+pub fn verify_event(
+    event: &SignedMembershipEvent,
+    prior_state: &MaterializedMembership,
+    ctx: &VerifyContext,
+) -> Result<(), VerifyError>;
+```
+
+**Verification order (every gate fires BEFORE the next):**
+
+1. **Community binding** — reject `WrongCommunity` if `event.community_id != ctx.expected_community_id`. Defends against cross-community authorization (caller has community A's state, event signed for community B). Fires before any cryptographic work so a misrouted event surfaces with the specific discriminant rather than `SignatureInvalid` masking the cause.
+2. **Countersig presence rule** — reject `UnexpectedCounterSig` if `event.countersig.is_some()` AND the slot is not "non-admin invite-only Join". Because `sig` excludes countersig (so an inviter can append it without invalidating the actor sig), countersig is wire-malleable; rejecting it outside its allowed slot keeps the invariant "countersig present iff non-admin invite-only Join" end-to-end.
+3. **Pubkey-to-claimed-signer binding (actor)** — derive `address_hash = SHA256(X25519_pub || Ed25519_pub)[:16]` from `ctx.actor_identity_pub`. Reject `ActorPubkeyMismatch` if it does not equal `event.actor.0`. Defends against caller-side cache-lookup bugs that pair a pubkey with the wrong claimed identity (cache lookup bug, stale cache, key-substitution attack). Bad bytes (non-curve points) → `InvalidIdentityPub`.
+4. **Actor signature** — verify the Ed25519 component of `ctx.actor_identity_pub` against canonical-CBOR-encoded `EventPayload::from(event)` using `verify_strict` (NOT `verify`). Strict mode rejects non-canonical S values and small-order R points, matching RFC 8032's strict subset and protecting against signature malleability. Mirrors how `dm_envelope` verifies its own signed payloads.
+5. **Banned-status guard** — for `Join` and `Leave`, look up `prior_state.members[event.actor]`. Reject `BannedActorJoin` / `BannedActorLeave` if the prior status is `Banned`. Without this, a kicked actor could send Leave (no power gate) to flip status from Banned → Left, then Join (no longer Banned-blocked) to rejoin — defeating Kick-as-ban.
+6. **Invite-only countersig logic** — for `Join` in an invite-only community where `event.actor != ctx.admin_addr`:
+    - Reject `CounterSigRequired` if `event.countersig.is_none()`.
+    - Reject `CounterSignerPubkeyMismatch` if `ctx.countersigner_identity_pub` does not hash to `event.countersig.signer`.
+    - Reject `CounterSigInvalid` if the countersig doesn't verify (Ed25519 strict over the same bytes the actor sig covers — `EventPayload::from(event)`).
+    - Reject `CounterSignerNotJoined` if `prior_state.members[signer].status != Joined`.
+    - Reject `CounterSigPowerInsufficient` if `power(signer) < POWER_THRESHOLDS.invite`.
+    - **Admin self-Join exemption:** when `event.actor == ctx.admin_addr`, no countersig is required (and an UnexpectedCounterSig at step 2 already rejects a stray countersig on this slot).
+7. **Joined-membership gate (Invite / Kick / SetPower)** — reject `ActorNotJoined` if the actor's prior status is not `Joined`. Power levels alone aren't sufficient — a non-member with high assigned power (former member after Leave/Kick, or an address that received SetPower without ever Joining) cannot wield community moderation.
+8. **Per-kind power rules:**
+    - **Invite** — actor power ≥ `invite_threshold` (currently 0); reject `InviteTargetBanned` if `prior_state.members[target].status == Banned` (admin must unban first; materialize() also no-ops Banned-sticky).
+    - **Kick** — actor power ≥ `kick_threshold` (50) AND `> target.power`; reject `KickTargetNotMember` if target has no member record (don't fabricate a phantom Banned entry).
+    - **SetPower** — actor power ≥ `set_power_threshold` (100); reject `PowerLevelOutOfRange` if `level > POWER_THRESHOLDS.max` (an authorized actor cannot grant a power higher than the cap, since that would create a member admin can no longer kick).
+    - **Join, Leave** — no further power check (anyone can Leave; Join is gated by invite-only countersig logic above).
+
+**Power lookups treat unset entries as 0** (the default per the spec). Bootstrap (`admin_addr` → 100) is already baked into `prior_state` by `materialize`, so the lookup is uniform across all actors.
+
+**Verification is idempotent and pure** — given the same prior event log + the same candidate event, returns the same accept/reject. This makes Prolly Tree DAG-sync convergent: two devices that receive the same set of events materialize the same state regardless of arrival order.
+
+**Defense-in-depth (Phase 2 sync layer note):** every invariant above ALSO appears in `materialize`'s transition tables (Banned-stickiness, KickTargetNotMember, idempotent Join/Invite). Phase 2's sync layer rejects unverified events before they reach `materialize`, but if a corrupted log or unverified replay surfaces an out-of-policy event, materialize stays correct rather than silently fabricating phantom state.
+
+**`VerifyError` discriminants (Phase 1, 19 variants):** `WrongCommunity`, `SignatureInvalid`, `CounterSigRequired`, `UnexpectedCounterSig`, `CounterSigInvalid`, `CounterSigPowerInsufficient`, `ActorPowerInsufficient`, `KickTargetPowerNotLower`, `KickTargetNotMember`, `InviteTargetBanned`, `PowerLevelOutOfRange`, `BannedActorJoin`, `BannedActorLeave`, `ActorNotJoined`, `CounterSignerNotJoined`, `ActorPubkeyMismatch`, `CounterSignerPubkeyMismatch`, `InvalidIdentityPub`, `EncodeError(String)`. Phase 2's sync layer surfaces each as the corresponding `community-state-sync-degraded` reason or `Err` to the IPC caller.
 
 ## Sync protocol
 
@@ -230,16 +322,21 @@ When `community_state_sync.rs` starts, it scans `owner_state.spaces` for any `Sp
 
 ```
 1. Frontend → IPC (e.g., kick_from_community)
-2. community_membership.rs builds + signs the SignedMembershipEvent
-3. community_state_crdt.rs verifies it locally (signature + power)
+2. community_membership::sign_event_with_identity builds + signs
+   the SignedMembershipEvent
+3. community_state_crdt verifies locally:
+     prior = prior_state_at_event(&log, &event, admin_addr)
+     verify_event(&event, &prior, &VerifyContext { ... })?
 4. Prolly Tree insert → new root CID
 5. Encrypt root CID + new block(s) with MembershipKey
 6. Publish encrypted root CID to harmony/community/{id}/state-root
 7. Other members subscribe → receive root → decrypt → DAG-sync missing
    blocks via existing CAS/DAG-sync (ZEB-215 Phase 3b machinery)
-8. Each subscriber re-runs verification on every newly-fetched event
-   before inserting into their local Prolly Tree (defense-in-depth —
-   peers don't trust each other's verification)
+8. Each subscriber re-runs verify_event with the SAME prior-state helper
+   on every newly-fetched event before inserting into their local
+   Prolly Tree (defense-in-depth — peers don't trust each other's
+   verification; same comparator everywhere prevents drift between
+   author-side and receiver-side authorization)
 ```
 
 ### New-joiner bootstrap
@@ -521,13 +618,15 @@ Member rows use a 5-column grid: status-icon | name | power-chip | joined-time |
 
 ### Verification rules (defense-in-depth)
 
-Every `SignedMembershipEvent` is verified at THREE points:
+> See "Data model → Verification" above for the full `verify_event` contract (input order, error variants, pubkey binding, bootstrap-admin exemption). This subsection states the layered policy.
 
-1. **At local append** — before publishing to the topic
-2. **At receive time on every peer** — before insertion into local Prolly Tree (peers don't trust each other's verification)
-3. **At materialization time** — when computing power levels for any new event, replay-verify against the current materialized state (catches HLC reordering edge cases)
+Every `SignedMembershipEvent` is gated at THREE points:
 
-If any verification fails, the event is rejected and **not** replicated. The Prolly Tree DAG-sync still considers the block "fetched" so we don't re-fetch it endlessly, but the materialized state ignores it.
+1. **At local append** — `verify_event` runs before publishing to the topic, with prior_state computed via `prior_state_at_event` against the current event log.
+2. **At receive time on every peer** — `verify_event` runs before insertion into the local Prolly Tree (peers don't trust each other's verification). Same comparator and prior-state helper as the local-append path.
+3. **At materialize time** — `materialize`'s per-kind transition tables re-pin Banned-stickiness, KickTargetNotMember, and idempotent Join/Invite as a state-machine defense. This catches events that slip past `verify_event` (corrupted log, replay before a Ban arrived, peers running out-of-date verifier code).
+
+If any verification fails at points 1 or 2, the event is rejected and **not** replicated. The Prolly Tree DAG-sync still considers the block "fetched" so we don't re-fetch it endlessly, but the materialized state ignores it.
 
 ### Failure modes
 
@@ -610,31 +709,48 @@ From PR #81 retrospective (lessons from DM transport):
 
 Five phases, each one PR. Same cadence as ZEB-216.
 
-### Phase 1 — Membership CRDT primitives (Rust only)
+### Phase 1 — Membership CRDT primitives (Rust only) — SHIPPED 2026-05-05
 
-**Goal:** Land the type definitions, signing, verification, and materialization logic. No IPC, no Zenoh, no UI. Pure-function tests.
+**Goal (achieved):** Land the type definitions, signing, verification, and materialization logic. No IPC, no Zenoh, no UI. Pure-function tests.
 
-**Files:**
-- New: `src-tauri/src/community_membership.rs`
-- New: `src-tauri/src/community_invite.rs` (CommunityInvitePayload + InviteToken types only — Reticulum send path lands in Phase 4)
-- Modified: `src-tauri/src/owner_state_types.rs` — add `MembershipKey` newtype, extend `Space` with `mk` / `ad` / `io` fields + invariant rules
-- New: `src-tauri/tests/community_membership_unit.rs`
-- New: `src-tauri/tests/wire_format_community_fixtures.rs` (CBOR golden files for the 5 event kinds + invite payloads)
+**Shipped via PR #82, merge commit `bd1d01b`.**
 
-**Deliverables:** Materialization rules + verification + power thresholds + dedupe key for Community Space + CBOR canonicalization. Standalone unit tests pass; integration tests do not yet exist.
+**Files (as shipped):**
+- New: `src-tauri/src/community_membership.rs` — types, `sign_event` / `sign_event_with_identity`, `attach_countersig` / `attach_countersig_with_identity`, `verify_signature` / `verify_countersig`, `event_sort_key`, `materialize`, `prior_state_at_event`, `verify_event` (19-variant `VerifyError`), `POWER_THRESHOLDS`
+- New: `src-tauri/src/community_invite.rs` — `CommunityInvitePayload` + `InviteToken` types only (Reticulum send path lands in Phase 4)
+- Modified: `src-tauri/src/owner_state_types.rs` — `MembershipKey` newtype, `Space` extended with `mk` / `ad` / `io` fields, `validate_invariants` extended for Community kind (incl. `prior_content_keys.is_empty()`)
+- Modified: `src-tauri/src/owner_state_crdt.rs` — `lww_merge_space` creation-pinning for community fields; `apply_space` same-SpaceId rejection of community-creation field changes (defensive — unreachable until Phase 2 sync, but cheaper to gate from day 1 than retrofit)
+- Modified: `src-tauri/src/dm_crypto.rs`, `src-tauri/src/dm_outbox.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/owner_state_persist.rs`, `src-tauri/src/owner_state_sync.rs` — Space-extension call-site adjustments (new fields wired through)
+- New: `src-tauri/tests/community_membership_unit.rs` — 58 unit tests covering signing, verification, materialization, the full transition tables, defense-in-depth at both layers
+- New: `src-tauri/tests/community_invite_unit.rs` — CommunityInvitePayload + InviteToken round-trip tests (open + invite-only forms)
+- New: `src-tauri/tests/wire_format_community_fixtures.rs` — 12 pinned-byte CBOR golden fixtures (5 event kinds × wire layout + CounterSignature + invite payloads)
+
+**Delta from original Phase 1 plan (caught during 6 rounds of bot review on PR #82):**
+
+- `VerifyContext` shape with `actor_identity_pub: &[u8; 64]` + `countersigner_identity_pub` for pubkey-to-OwnerAddr binding (defense against caller cache-lookup bugs and key-substitution attacks)
+- Bootstrap-admin self-Join exemption from countersig requirement (otherwise invite-only is unreachable from empty state)
+- Defense-in-depth at BOTH `verify_event` AND `materialize` layers for Banned-stickiness, KickTargetNotMember, idempotent transitions
+- `event_sort_key` exposed publicly with `(wall_ms, logical, device_id, EventId, sig)` total ordering
+- `prior_state_at_event` helper so Phase 2 callers can't drift from the comparator
+- `EventPayload` named type with `From<&SignedMembershipEvent>` impl (centralised so signing/verifying paths can't drift in field order or coverage)
+- CounterSignature wire codes finalized as `sn` / `sg` (matching "sg = signature at every nesting level" convention)
+- `verify_strict` (RFC 8032) for both actor sig and countersig
+- `apply_space` same-SpaceId rejection of community-creation field changes (load-bearing for Phase 2's Zenoh sync path)
+
+All deltas are documented in the Materialization rules / Verification / Data model sections above.
 
 ### Phase 2 — Per-community state CRDT + encrypted Zenoh sync
 
-**Goal:** Multi-owner CRDT replicates across members via the encrypted state-root topic. Mirrors ZEB-215 Phase 3a/3b architecture for owner-state.
+**Goal:** Multi-owner CRDT replicates across members via the encrypted state-root topic. Mirrors ZEB-215 Phase 3a/3b architecture for owner-state. Consumes the Phase 1 primitives — `verify_event`, `materialize`, `prior_state_at_event`, `event_sort_key`, `POWER_THRESHOLDS` — without modifying them.
 
 **Files:**
-- New: `src-tauri/src/community_state_crdt.rs` (Prolly Tree per community)
-- New: `src-tauri/src/community_state_sync.rs` (encrypted topic publish/subscribe + DAG-sync)
-- Modified: `src-tauri/src/event_loop.rs` — new select arms for community state ops (subscribe / publish / DAG-sync)
+- New: `src-tauri/src/community_state_crdt.rs` (Prolly Tree per community; insert path calls `verify_event` with prior_state computed via `prior_state_at_event`)
+- New: `src-tauri/src/community_state_sync.rs` (encrypted topic publish/subscribe + DAG-sync; per-community `RootHlcTracker` mirrors `OwnerStateRootHlcTracker`)
+- Modified: `src-tauri/src/event_loop.rs` — new select arms for community state ops (subscribe / publish / DAG-sync); subscription scan covers `Space { kind: Community }` rows on start_node
 - Modified: `src-tauri/src/lib.rs` — community state-sync wiring on start_node
 - New: `src-tauri/tests/community_sync_integration.rs`
 
-**Deliverables:** Two-member community DAG-syncs the full event log; degraded paths (decrypt failure, timeout) emit `community-state-sync-degraded`; per-community RootHlcTracker dedupes redundant roots.
+**Deliverables:** Two-member community DAG-syncs the full event log; verification fires at receive time using the same comparator + helpers Phase 1 ships; degraded paths (decrypt failure, timeout, any of the 19 `VerifyError` discriminants) emit `community-state-sync-degraded`; per-community `RootHlcTracker` dedupes redundant roots; HLC-tracker monotonicity preserved on dedupe-merge (the bug fixed in PR #81 round 3 — community Spaces use `Id` dedupe key, same trap as DM Spaces).
 
 ### Phase 3 — Open community flow (create + join + leave)
 
