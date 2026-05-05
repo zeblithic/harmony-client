@@ -46,3 +46,85 @@ pub enum MembershipEventKind {
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
 impl CanonicalPayload for MembershipEventKind {}
+
+use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
+use crate::owner_state_types::{Hlc, SpaceId};
+
+/// 16-byte ULID identifying a single signed membership event within
+/// a community's CRDT log. Generated client-side at event creation.
+pub type EventId = [u8; 16];
+
+/// One signed event in a community's membership CRDT.
+///
+/// Wire format: 8-key CBOR map. All keys are 2 chars (text(2) = 3 bytes
+/// each) to satisfy the same-length-keys invariant at this nesting
+/// level. Adjacently-tagged inner enums (MembershipEventKind,
+/// CounterSignature) follow the same rule recursively.
+///
+/// `sig` covers the canonical-CBOR encoding of (id, community_id, kind,
+/// actor, at) — countersig is excluded so an inviter can append their
+/// counter-signature without invalidating the actor's signature. See
+/// `sign_event` (Task 6) for the exact byte layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedMembershipEvent {
+    #[serde(
+        rename = "id",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub id: EventId,
+
+    #[serde(rename = "ci")]
+    pub community_id: SpaceId,
+
+    #[serde(rename = "kn")]
+    pub kind: MembershipEventKind,
+
+    #[serde(rename = "ac")]
+    pub actor: OwnerAddr,
+
+    #[serde(rename = "at")]
+    pub at: Hlc,
+
+    /// Ed25519 signature over canonical CBOR of
+    /// `(id, community_id, kind, actor, at)`. 64 bytes.
+    #[serde(
+        rename = "sg",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub sig: [u8; 64],
+
+    /// Required for Join events in invite-only communities. None
+    /// otherwise. Verified at receive time against the signer's
+    /// power level at the time of the join.
+    #[serde(rename = "cs", skip_serializing_if = "Option::is_none", default)]
+    pub countersig: Option<CounterSignature>,
+}
+
+/// Counter-signature appended by an existing community member to vouch
+/// for a new joiner in an invite-only community. The signer's power
+/// must be ≥ POWER_THRESHOLDS.invite at the time of signing.
+///
+/// `sig` covers the same canonical-CBOR bytes as `SignedMembershipEvent.sig`
+/// — i.e., the joiner's signed `(id, community_id, kind, actor, at)`.
+/// This means the countersig binds to the joiner's exact event, not
+/// just to the community ID, preventing a malicious admin from
+/// "reusing" a countersig across different join attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterSignature {
+    #[serde(rename = "sg")]
+    pub signer: OwnerAddr,
+
+    #[serde(
+        rename = "sx",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub sig: [u8; 64],
+}
+
+impl CanonicalPayloadSealed for SignedMembershipEvent {}
+impl CanonicalPayload for SignedMembershipEvent {}
+impl CanonicalPayloadSealed for CounterSignature {}
+impl CanonicalPayload for CounterSignature {}

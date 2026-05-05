@@ -15,7 +15,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Helper: serialize byte array as CBOR bstr, not as array.
-fn serialize_bytes_as_bstr<const N: usize, S>(b: &[u8; N], s: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_bytes_as_bstr<const N: usize, S>(
+    b: &[u8; N],
+    s: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -80,7 +83,7 @@ where
 }
 
 /// Helper: deserialize CBOR bstr into byte array.
-fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
+pub(crate) fn deserialize_bytes_from_bstr<'de, const N: usize, D>(d: D) -> Result<[u8; N], D::Error>
 where
     D: Deserializer<'de>,
 {
