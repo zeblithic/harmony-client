@@ -163,16 +163,20 @@ export class NavService {
       // Fix G from PR #81 review: a duplicate `added` (reconnect /
       // cold-start replay) must not wipe user-applied UI state. Preserve
       // parentId (folder placement), expanded, and unread counters from
-      // the existing node — only the network-derived fields (name, type,
-      // peer) get refreshed.
+      // the existing node. Round 3: also preserve the cached peer when
+      // the replayed payload omits members (mirrors what the modified
+      // path already does — without this, a name-only re-emit would
+      // drop displayName/avatarUrl back to undefined).
       const existing = this.nodes.find((n) => n.id === spaceId);
       if (existing) {
+        const peerWasDerivedFromPayload = members !== undefined;
         const merged: NavNode = {
           ...newNode,
           parentId: existing.parentId,
           expanded: existing.expanded,
           unreadCount: existing.unreadCount,
           unreadLevel: existing.unreadLevel,
+          peer: peerWasDerivedFromPayload ? newNode.peer : existing.peer,
         };
         this.nodes = this.nodes.map((n) => (n.id === spaceId ? merged : n));
       } else {

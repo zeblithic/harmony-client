@@ -1512,16 +1512,21 @@ async loadDmThread(spaceId: string, pageSize: number = 50): Promise<void> {
   if (results.length === 0) return;
 
   const newMessages: Message[] = results.map((r) => ({
-    id: r.messageCid,
-    messageId: r.isSelfOutbound ? r.messageCid : undefined, // self uses messageCid as messageId for delete correlation
-    senderAddress: r.from,
-    senderName: r.from,
+    id: r.messageCid, // stable content id — matches dm-received + dm-deleted
+    // For self-entries: backend provides messageId (OutboxEntryId) only when
+    // an OutboxEntry is still present. Post-Complete-GC self-entries omit it
+    // (and their delete affordance — already delivered, nothing to delete).
+    messageId: r.messageId,
+    senderAddress: r.isSelfOutbound ? 'self' : r.from,
+    senderName: r.isSelfOutbound ? 'You' : r.from,
     channel: spaceId,
     hub: '',
     text: new TextDecoder().decode(hexToBytes(r.body)),
     timestamp: r.sentAt,
     priority: 'normal',
-    deliveryState: r.isSelfOutbound ? 'delivered' : undefined, // historical: assume delivered if it's in our inbox
+    // Backend joins outbox→delivery_state on the read_dm_thread call;
+    // 'sending' means the OutboxEntry is still Pending/Partial at restart.
+    deliveryState: r.deliveryState,
   })).reverse(); // backend sends newest-first; UI wants oldest-first
 
   this.messages = [...newMessages, ...this.messages];
@@ -1877,19 +1882,23 @@ Check both files. The nav rendering is likely in App.svelte passed as a slot to 
   async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
     try {
       const spaceId: string = await tauriAdapter.invoke('add_space', {
-        kind: args.kind === 'dm' ? 'Dm' : 'GroupDm',
+        kind: args.kind, // backend accepts 'dm' / 'group-dm' wire codes directly
         name: args.name,
-        parent: null,
-        members: args.members,
-        transport: null, // backend defaults to Reticulum for DM kinds
+        members: args.members, // recipients only — backend adds self
       });
-      // The backend's apply_space + nav-updated emit will trigger
-      // NavService to insert the NavNode; we can switch to it after
-      // a tick to give NavService time to receive the event.
-      setTimeout(() => {
-        const newNode = navService.nodes.find((n) => n.id === spaceId);
-        if (newNode) switchChannel(newNode);
-      }, 50);
+      // The backend has no `nav-updated` IPC emit for DMs; insert the
+      // NavNode directly via the public method instead of waiting on a
+      // non-existent event. Synchronous → switch immediately.
+      navService.addOrUpdateDmSpace({
+        action: 'added',
+        spaceId,
+        kind: args.kind,
+        name: args.name,
+        members: args.members,
+        parentId: null,
+      });
+      const newNode = navService.nodes.find((n) => n.id === spaceId);
+      if (newNode) switchChannel(newNode);
       dmCreateDialogOpen = false;
     } catch (e) {
       console.error('add_space failed:', e);

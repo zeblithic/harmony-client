@@ -1825,6 +1825,19 @@ pub struct DmThreadMessage {
     /// outbox awaiting delivery — Qodo flagged that on PR #81 review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_state: Option<String>,
+    /// For self-entries: hex-encoded `OutboxEntryId` (16 bytes → 32 hex
+    /// chars), populated only when the OutboxEntry is still present in
+    /// `state.outbox`. The frontend's `TextMessage.canDelete` requires
+    /// `messageId !== undefined` to expose the inline ⓧ button — without
+    /// this field, scrollback-loaded self-messages stuck in `'sending'`
+    /// or `'expired'` couldn't be deleted after a cold restart (Cursor
+    /// Bugbot flagged this on PR #81 review).
+    ///
+    /// `None` for: received entries (no outbox row), or self-entries
+    /// whose OutboxEntry was already GC'd post-Complete (in which case
+    /// `delivery_state == "delivered"` and there's nothing to delete).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// Pure helper: sort InboxEntries by `received_at` descending, drop entries
@@ -2071,25 +2084,31 @@ async fn decrypt_inbox_entries(
         // the frontend's loadDmThread used to apply unconditionally;
         // we narrow it here so Pending/Partial/Expired surface
         // accurately.
-        let delivery_state = if is_self_outbound {
-            let status = outbox_snapshot.values().find_map(|e| {
+        // For self entries, capture BOTH the OutboxEntryId (so the
+        // frontend can correlate dm-delivered/expired/deleted IPC events
+        // and gate the delete button) AND the delivery_status (so
+        // scrollback reflects current outbox state, not a hardcoded
+        // 'delivered'). One linear scan over the snapshot serves both.
+        let (delivery_state, message_id) = if is_self_outbound {
+            let hit = outbox_snapshot.iter().find_map(|(id, e)| {
                 if e.space_id == entry.space_id && e.message_cid == entry.message_cid {
-                    Some(e.delivery_status)
+                    Some((*id, e.delivery_status))
                 } else {
                     None
                 }
             });
-            Some(
-                match status {
-                    Some(crate::owner_state_types::DeliveryStatus::Pending)
-                    | Some(crate::owner_state_types::DeliveryStatus::Partial) => "sending",
-                    Some(crate::owner_state_types::DeliveryStatus::Expired) => "expired",
-                    Some(crate::owner_state_types::DeliveryStatus::Complete) | None => "delivered",
-                }
-                .to_string(),
+            let state = match hit.map(|(_, s)| s) {
+                Some(crate::owner_state_types::DeliveryStatus::Pending)
+                | Some(crate::owner_state_types::DeliveryStatus::Partial) => "sending",
+                Some(crate::owner_state_types::DeliveryStatus::Expired) => "expired",
+                Some(crate::owner_state_types::DeliveryStatus::Complete) | None => "delivered",
+            };
+            (
+                Some(state.to_string()),
+                hit.map(|(id, _)| hex::encode(id.0)),
             )
         } else {
-            None
+            (None, None)
         };
         out.push(DmThreadMessage {
             message_cid: hex::encode(entry.message_cid.to_bytes()),
@@ -2100,6 +2119,7 @@ async fn decrypt_inbox_entries(
             mime_type: payload.mime_type,
             is_self_outbound,
             delivery_state,
+            message_id,
         });
     }
     Ok(out)
@@ -2616,7 +2636,21 @@ async fn add_space(
                  (apply_space_with_canonicalization invariants broken?)"
                     .to_string()
             })?;
-        tracker_g.insert(device_id.clone(), stamped.clone());
+        // HLC monotonicity: a dedupe-merge can land on an EXISTING Space
+        // whose `created_at` is OLDER than our local tracker's prev_hlc
+        // (the existing Space was created before our most recent HLC-
+        // stamping operation). Writing `stamped` to the tracker in that
+        // case would regress the cursor below prev_hlc, breaking the
+        // monotonicity next_hlc relies on. Only update the tracker when
+        // `stamped` strictly advances from prev_hlc; otherwise leave the
+        // tracker as-is. (CodeRabbit flagged this on PR #81 review.)
+        let should_advance_tracker = match prev_hlc.as_ref() {
+            None => true,
+            Some(prev) => stamped.is_strictly_newer_than(prev),
+        };
+        if should_advance_tracker {
+            tracker_g.insert(device_id.clone(), stamped.clone());
+        }
 
         (canonical_id, sends, was_merge, stamped)
     };

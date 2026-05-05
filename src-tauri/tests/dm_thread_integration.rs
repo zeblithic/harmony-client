@@ -309,4 +309,43 @@ async fn read_dm_thread_self_message_delivery_state_reflects_outbox_status() {
 
     // Sanity: every entry IS self-outbound (we sent all five).
     assert!(result.iter().all(|m| m.is_self_outbound));
+
+    // Cursor Bugbot finding (PR #81 round 2): self entries with a
+    // surviving OutboxEntry must surface the OutboxEntryId so the
+    // frontend's TextMessage.canDelete (which requires
+    // messageId !== undefined) can render the inline ⓧ on
+    // stuck/expired scrollback entries. Entries whose OutboxEntry
+    // was already GC'd post-Complete have message_id == None
+    // (delivery_state == "delivered" — nothing to delete).
+    assert_eq!(result[0].message_id, None, "msg-4: GC'd → no messageId");
+    assert!(
+        result[1].message_id.is_some(),
+        "msg-3 (Expired): messageId surfaces so user can delete the expired entry"
+    );
+    assert!(
+        result[2].message_id.is_some(),
+        "msg-2 (Complete but not GC'd): messageId surfaces"
+    );
+    assert!(
+        result[3].message_id.is_some(),
+        "msg-1 (Partial): messageId surfaces so user can delete a stuck entry"
+    );
+    assert!(
+        result[4].message_id.is_some(),
+        "msg-0 (Pending): messageId surfaces so user can delete a stuck entry"
+    );
+
+    // Each surfaced messageId is the hex of an OutboxEntryId — verify
+    // it's the right one (parses to OutboxEntryId, matches the entry).
+    for (i, m) in result.iter().enumerate() {
+        let inbox_idx = 4 - i; // result is newest-first; msg-4 → result[0]
+        if let Some(mid_hex) = &m.message_id {
+            let bytes = hex::decode(mid_hex).expect("message_id is valid hex");
+            let arr: [u8; 16] = bytes.as_slice().try_into().expect("16 bytes");
+            assert_eq!(
+                arr, msg_ids[inbox_idx].0,
+                "result[{i}].message_id matches msg_ids[{inbox_idx}]"
+            );
+        }
+    }
 }

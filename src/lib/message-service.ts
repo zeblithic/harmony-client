@@ -61,6 +61,12 @@ export class MessageService {
    *  oldest `received_at.wall_ms` we've fetched so the next page-up
    *  call can ask for entries strictly older than this. */
   private dmThreadCursors = new Map<string, number>();
+  /** SpaceIds we've already loaded scrollback for in this session.
+   *  `loadDmThread` is called on every channel switch (see App.svelte
+   *  handleNodeClick) — without this guard each switch would advance
+   *  `dmThreadCursors` and prepend progressively older history pages
+   *  the user didn't request (Cursor Bugbot finding on PR #81 round 2). */
+  private loadedDmSpaces = new Set<string>();
 
   constructor() {
     // Seed with mock data — real messages append on top.
@@ -286,15 +292,24 @@ export class MessageService {
    * history for `spaceId` via the `read_dm_thread` IPC and merges the
    * results into the per-channel buffer in oldest-first display order.
    *
-   * Tracks a per-channel `before_hlc` cursor so consecutive calls
-   * page backward through history (UI scrolls up to load more). On
-   * the first call the cursor is undefined → backend returns the
-   * newest page; subsequent calls pass the oldest `received_at.wall_ms`
-   * from the previous page so the backend skips entries we already have.
+   * **First-visit-only by default.** Once a SpaceId has been loaded in
+   * this session, subsequent calls are no-ops. App.svelte calls this on
+   * every channel switch; without the guard each switch would advance
+   * the per-channel `before_hlc` cursor and prepend progressively older
+   * pages of history the user didn't ask for (Cursor Bugbot caught this
+   * on PR #81 round 2). When scroll-to-top backfill arrives in a future
+   * phase, it should call `loadOlderPage(spaceId)` (not yet implemented)
+   * which bypasses the guard.
    *
-   * Self-sent historical messages are stamped `deliveryState='delivered'`
-   * — if they're in our local inbox, peer ack is implicit (we got the
-   * dm-delivered IPC at the time, even if we since restarted).
+   * Tracks a per-channel `before_hlc` cursor so a future backfill caller
+   * can page backward through history. On the first call the cursor is
+   * undefined → backend returns the newest page.
+   *
+   * For self-sent historical messages, the backend joins inbox→outbox
+   * to surface the OutboxEntryId (`messageId`) and the current delivery
+   * state (`'sending' | 'delivered' | 'expired'`). The frontend uses
+   * `messageId` to gate the inline ⓧ delete button on stuck/expired
+   * scrollback entries (Cursor Bugbot finding from PR #81 round 2).
    *
    * No-op when no adapter is connected (offline / pre-bootstrap), or
    * when the IPC returns an empty page (already at the start of the
@@ -302,6 +317,9 @@ export class MessageService {
    */
   async loadDmThread(spaceId: string, pageSize: number = 50): Promise<void> {
     if (!this.adapter) return;
+    // First-visit guard: skip the IPC roundtrip + cursor advance if
+    // we've already loaded this SpaceId once in this session.
+    if (this.loadedDmSpaces.has(spaceId)) return;
     const cursor = this.dmThreadCursors.get(spaceId);
     type Wire = {
       messageCid: string;
@@ -315,12 +333,21 @@ export class MessageService {
        *  outbound messages: 'sending' | 'delivered' | 'expired' | 'failed'.
        *  Undefined for received entries. (Fix E from PR #81 review.) */
       deliveryState?: 'sending' | 'delivered' | 'expired' | 'failed';
+      /** Self-entries with a surviving OutboxEntry surface its hex id so
+       *  the frontend can gate the manual-delete button + correlate
+       *  dm-delivered/expired/deleted IPC events. Undefined for received
+       *  entries and for self-entries whose OutboxEntry was already GC'd
+       *  post-Complete. (PR #81 round 3 fix for Cursor Bugbot.) */
+      messageId?: string;
     };
     const results = await this.adapter.invoke('read_dm_thread', {
       spaceId,
       limit: pageSize,
       beforeHlc: cursor,
     }) as Wire[];
+    // Mark the SpaceId as loaded BEFORE the early-return so the guard
+    // also kicks in for empty-page responses (start-of-thread cold case).
+    this.loadedDmSpaces.add(spaceId);
     if (results.length === 0) return;
 
     // Backend ships newest-first; UI displays oldest-first (scroll-to-
@@ -350,6 +377,14 @@ export class MessageService {
           // outbox.delivery_status, e.g. 'sending' for entries not yet
           // ack'd at restart time, 'expired' for the 30-day TTL run-out).
           msg.deliveryState = r.deliveryState ?? undefined;
+          // Round 3: surface the OutboxEntryId so TextMessage.canDelete
+          // can render the inline ⓧ for stuck/expired scrollback entries.
+          // Backend returns this only when the OutboxEntry still exists;
+          // post-Complete-GC self-entries have no messageId (and no
+          // delete affordance is needed since they're already delivered).
+          if (r.messageId) {
+            msg.messageId = r.messageId;
+          }
         }
         return msg;
       })

@@ -295,19 +295,19 @@ Use the existing ConfirmDialog component (per user's DRY preference) unless the 
 
 1. User clicks "+ New DM" → `DmCreateDialog` opens.
 2. User searches/selects Bob → counter shows "1 of 15 recipients."
-3. User clicks "Start DM" → frontend invokes `add_space(kind: 'dm', name: 'DM with Bob', members: [Alice, Bob])`.
-4. Backend generates content_key, builds Space CRDT, applies locally, fans out DmInviteSigned to Bob's known devices.
-5. Backend returns SpaceId.
-6. Frontend switches active channel to the new SpaceId → empty `TextFeed` rendered.
-7. `nav-updated` IPC fires (CRDT change emitted same as any other Space change) → NavService inserts the new NavNode at top-level.
+3. User clicks "Start DM" → frontend invokes `add_space(kind: 'dm', name: 'DM with Bob', members: [Bob])`. The `members` field carries recipients only; the backend adds self to the resulting Space.
+4. Backend generates content_key, builds Space CRDT (members = sorted [self, Bob]), applies locally via `apply_space_with_canonicalization`, fans out DmInviteSigned to Bob's known devices.
+5. Backend returns the canonical SpaceId. (If a 1:1 DM with the same recipient already existed, dedupe-merge returns the existing SpaceId and skips the invite re-dispatch.)
+6. Frontend calls `navService.addOrUpdateDmSpace({action: 'added', spaceId, kind, name, members, parentId: null})` synchronously to insert the NavNode (the backend doesn't emit a `nav-updated` event for DM creation in Phase 4).
+7. Frontend switches active channel to the new SpaceId → empty `TextFeed` rendered (no scrollback yet for a brand-new Space; `loadDmThread` will be a no-op for the first visit since no InboxEntries exist).
 
 ### Flow B: Send a message
 
 1. User types in `ComposeBar`, presses Enter.
 2. App.svelte's onSend detects `activeChannelType ∈ {dm, group-chat}` → optimistically pushes Message with `deliveryState: 'sending'` to MessageService → invokes `send_dm` IPC.
-3. Backend encrypts, writes to CAS, creates OutboxEntry, **writes self-InboxEntry**, returns MessageId.
+3. Backend encrypts, writes to CAS, creates OutboxEntry, **writes self-InboxEntry**, returns `{messageId, messageCid}`. The frontend uses `messageCid` as the stable Message id (matching dm-received and read_dm_thread) and `messageId` as the OutboxEntryId for lifecycle correlation. (The backend does NOT emit a self `dm-received` event — that's receiver-side only via `handle_cidnotify`. Self-history surfaces via the optimistic push for live messages and `loadDmThread` for cold-start scrollback.)
 4. Backend's drain loop sends DmCidNotify to recipient(s) on next tick.
-5. Recipient acks; `dm-delivered` IPC fires → MessageService transitions Message to `'delivered'`.
+5. Recipient acks; `dm-delivered` IPC fires → MessageService transitions the self-Message (correlated by `messageId`) to `'delivered'`.
 
 ### Flow C: Receive a message
 
