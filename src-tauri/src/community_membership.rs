@@ -364,6 +364,98 @@ impl CanonicalPayload for MemberState {}
 impl CanonicalPayloadSealed for MemberStatus {}
 impl CanonicalPayload for MemberStatus {}
 
+/// Replay a community's signed event log into a MaterializedMembership.
+///
+/// Implements the spec's "Materialization rules" verbatim:
+///
+/// 1. Bootstrap: power_levels[admin_addr] = 100 BEFORE replaying any
+///    events. Admin can later SetPower themselves to a different value.
+/// 2. Events are applied in HLC ascending order, regardless of input
+///    order — the input may arrive partial-ordered from DAG-sync.
+/// 3. Per-kind effects:
+///    - Join: members[actor] = Joined / joined_at: at
+///    - Leave: members[actor].status = Left, .left_at = at
+///    - Invite { target }: members[target] = Invited / joined_at: at
+///    - Kick { target }: members[target].status = Banned, .left_at = at
+///    - SetPower { target, level }: power_levels[target] = level
+///
+/// Pure function — does NOT verify signatures or power rules. That's
+/// `verify_event` (Task 10). Materialization assumes pre-verified
+/// events; the Phase 2 sync layer rejects unverified events before
+/// they reach this function.
+pub fn materialize(
+    events: &[SignedMembershipEvent],
+    admin_addr: OwnerAddr,
+) -> MaterializedMembership {
+    let mut m = MaterializedMembership::default();
+
+    // Bootstrap: admin holds power 100 implicitly. SetPower events
+    // (replayed below) can override.
+    m.power_levels.insert(admin_addr, 100);
+
+    // HLC-sort. We don't assume the input is sorted because DAG-sync
+    // delivers events partial-ordered. Cloning is fine here — the
+    // event vec is small (community sizes are bounded; even very
+    // active communities have O(thousands) of events at the long
+    // tail, not millions).
+    let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
+    sorted.sort_by(|a, b| {
+        // HLC tuple ordering: (wall_ms, logical, device_id) ascending.
+        let key_a = (a.at.wall_ms, a.at.logical, &a.at.device_id);
+        let key_b = (b.at.wall_ms, b.at.logical, &b.at.device_id);
+        key_a.cmp(&key_b)
+    });
+
+    for event in sorted {
+        match &event.kind {
+            MembershipEventKind::Join => {
+                m.members.insert(
+                    event.actor,
+                    MemberState {
+                        status: MemberStatus::Joined,
+                        joined_at: event.at.clone(),
+                        left_at: None,
+                    },
+                );
+            }
+            MembershipEventKind::Leave => {
+                if let Some(s) = m.members.get_mut(&event.actor) {
+                    s.status = MemberStatus::Left;
+                    s.left_at = Some(event.at.clone());
+                }
+                // If actor never joined, Leave is silently no-op.
+                // verify_event (Task 10) can choose to reject this case
+                // for stricter semantics; materialization tolerates it
+                // because the alternative (insert-with-Left) would
+                // corrupt state from a malformed event.
+            }
+            MembershipEventKind::Invite { target } => {
+                m.members.entry(*target).or_insert(MemberState {
+                    status: MemberStatus::Invited,
+                    joined_at: event.at.clone(),
+                    left_at: None,
+                });
+                // If target was already Joined/Left/Banned, Invite is
+                // a no-op — they're already past the "invited" stage.
+            }
+            MembershipEventKind::Kick { target, .. } => {
+                let s = m.members.entry(*target).or_insert(MemberState {
+                    status: MemberStatus::Banned,
+                    joined_at: event.at.clone(),
+                    left_at: Some(event.at.clone()),
+                });
+                s.status = MemberStatus::Banned;
+                s.left_at = Some(event.at.clone());
+            }
+            MembershipEventKind::SetPower { target, level } => {
+                m.power_levels.insert(*target, *level);
+            }
+        }
+    }
+
+    m
+}
+
 /// Per-community power thresholds. v1 hardcoded; per-community
 /// customization is deferred to ZEB-251.
 #[derive(Debug, Clone, Copy)]

@@ -357,3 +357,202 @@ fn power_thresholds_struct_constructible() {
     };
     assert_eq!(custom.invite, 10);
 }
+
+use harmony_app::community_membership::materialize;
+
+fn make_signed(
+    id: u8,
+    kind: MembershipEventKind,
+    actor: OwnerAddr,
+    at_ms: u64,
+) -> SignedMembershipEvent {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let payload = EventPayload {
+        id: [id; 16],
+        community_id: SpaceId([3u8; 16]),
+        kind,
+        actor,
+        at: Hlc {
+            wall_ms: at_ms,
+            logical: 0,
+            device_id: "d".into(),
+        },
+    };
+    sign_event(&payload, &signing_key).expect("sign")
+}
+
+#[test]
+fn materialize_join_marks_actor_joined() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Join, alice, 200),
+    ];
+
+    let m = materialize(&events, admin);
+    assert_eq!(
+        m.members.get(&admin).map(|s| s.status),
+        Some(MemberStatus::Joined)
+    );
+    assert_eq!(
+        m.members.get(&alice).map(|s| s.status),
+        Some(MemberStatus::Joined)
+    );
+}
+
+#[test]
+fn materialize_leave_marks_actor_left_with_left_at() {
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Join, alice, 200),
+        make_signed(3, MembershipEventKind::Leave, alice, 300),
+    ];
+
+    let m = materialize(&events, admin);
+    let alice_state = m.members.get(&alice).expect("alice present");
+    assert_eq!(alice_state.status, MemberStatus::Left);
+    assert_eq!(alice_state.left_at.as_ref().map(|h| h.wall_ms), Some(300));
+}
+
+#[test]
+fn materialize_kick_marks_target_banned() {
+    let admin = OwnerAddr([100u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Join, bob, 200),
+        make_signed(
+            3,
+            MembershipEventKind::Kick {
+                target: bob,
+                reason: Some("spam".into()),
+            },
+            admin,
+            300,
+        ),
+    ];
+
+    let m = materialize(&events, admin);
+    let bob_state = m.members.get(&bob).expect("bob present");
+    assert_eq!(bob_state.status, MemberStatus::Banned);
+    assert_eq!(bob_state.left_at.as_ref().map(|h| h.wall_ms), Some(300));
+}
+
+#[test]
+fn materialize_invite_marks_target_invited() {
+    let admin = OwnerAddr([100u8; 16]);
+    let carol = OwnerAddr([3u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Invite { target: carol }, admin, 200),
+    ];
+
+    let m = materialize(&events, admin);
+    let carol_state = m.members.get(&carol).expect("carol present");
+    assert_eq!(carol_state.status, MemberStatus::Invited);
+    assert!(carol_state.left_at.is_none());
+}
+
+#[test]
+fn materialize_setpower_updates_power_level() {
+    let admin = OwnerAddr([100u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Join, bob, 200),
+        make_signed(
+            3,
+            MembershipEventKind::SetPower {
+                target: bob,
+                level: 75,
+            },
+            admin,
+            300,
+        ),
+    ];
+
+    let m = materialize(&events, admin);
+    assert_eq!(m.power_levels.get(&bob).copied(), Some(75));
+}
+
+#[test]
+fn materialize_bootstrap_grants_admin_power_100_even_with_zero_events() {
+    let admin = OwnerAddr([100u8; 16]);
+    let m = materialize(&[], admin);
+    assert_eq!(m.power_levels.get(&admin).copied(), Some(100));
+    // But admin is NOT a member until they Join (intentional — admin
+    // is a power designation, not a membership status).
+    assert!(m.members.is_empty());
+}
+
+#[test]
+fn materialize_setpower_overrides_admin_bootstrap() {
+    let admin = OwnerAddr([100u8; 16]);
+    let new_admin = OwnerAddr([99u8; 16]);
+
+    let events = vec![
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+        make_signed(2, MembershipEventKind::Join, new_admin, 200),
+        make_signed(
+            3,
+            MembershipEventKind::SetPower {
+                target: new_admin,
+                level: 100,
+            },
+            admin,
+            300,
+        ),
+        make_signed(
+            4,
+            MembershipEventKind::SetPower {
+                target: admin,
+                level: 0,
+            },
+            admin,
+            400,
+        ),
+    ];
+
+    let m = materialize(&events, admin);
+    assert_eq!(m.power_levels.get(&admin).copied(), Some(0));
+    assert_eq!(m.power_levels.get(&new_admin).copied(), Some(100));
+}
+
+#[test]
+fn materialize_replays_in_hlc_order_not_input_order() {
+    // Events arrive in a different order than they should apply.
+    // Materialization must re-sort by HLC.
+    let admin = OwnerAddr([100u8; 16]);
+    let bob = OwnerAddr([2u8; 16]);
+
+    let events = vec![
+        // Out of order: kick at 300 listed BEFORE join at 200.
+        make_signed(
+            3,
+            MembershipEventKind::Kick {
+                target: bob,
+                reason: None,
+            },
+            admin,
+            300,
+        ),
+        make_signed(2, MembershipEventKind::Join, bob, 200),
+        make_signed(1, MembershipEventKind::Join, admin, 100),
+    ];
+
+    let m = materialize(&events, admin);
+    // Despite the input order, the replay walks HLC ascending, so:
+    // 100: admin joins, 200: bob joins, 300: bob is kicked.
+    assert_eq!(
+        m.members.get(&bob).map(|s| s.status),
+        Some(MemberStatus::Banned)
+    );
+}
