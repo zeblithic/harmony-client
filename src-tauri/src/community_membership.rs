@@ -249,6 +249,11 @@ pub enum VerifyError {
     /// Kick = effective ban until a dedicated unban flow exists, so a
     /// replayed Join must not silently overwrite the Banned status.
     BannedActorJoin,
+    /// Leave from an actor whose prior state is MemberStatus::Banned.
+    /// Without this guard, a kicked actor could send Leave (no power
+    /// gate) to flip status from Banned → Left, then send Join (no
+    /// longer Banned-blocked) to rejoin — defeating Kick-as-ban.
+    BannedActorLeave,
     /// Invite/Kick/SetPower issued by an actor who is not currently a
     /// Joined member of the community. Power levels alone are not
     /// sufficient — a non-member with high assigned power (e.g., a
@@ -299,6 +304,9 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::BannedActorJoin => {
                 write!(f, "Join rejected: actor's prior status is Banned")
+            }
+            VerifyError::BannedActorLeave => {
+                write!(f, "Leave rejected: actor's prior status is Banned")
             }
             VerifyError::ActorNotJoined => {
                 write!(
@@ -599,14 +607,23 @@ pub fn materialize(
             }
             MembershipEventKind::Leave => {
                 if let Some(s) = m.members.get_mut(&event.actor) {
-                    s.status = MemberStatus::Left;
-                    s.left_at = Some(event.at.clone());
+                    // Banned is sticky: a Leave from a Banned actor
+                    // must NOT transition status back to Left. Without
+                    // this guard, a kicked actor could replay Leave
+                    // to mask the Ban, then re-Join (since the Banned
+                    // guard in verify_event would no longer fire).
+                    // Defense in depth: verify_event also rejects
+                    // Leave from Banned.
+                    if s.status != MemberStatus::Banned {
+                        s.status = MemberStatus::Left;
+                        s.left_at = Some(event.at.clone());
+                    }
                 }
                 // If actor never joined, Leave is silently no-op.
-                // verify_event (Task 10) can choose to reject this case
-                // for stricter semantics; materialization tolerates it
-                // because the alternative (insert-with-Left) would
-                // corrupt state from a malformed event.
+                // verify_event tolerates this case (no rejection) so
+                // the materialization path stays simple — the
+                // alternative (insert-with-Left) would corrupt state
+                // from a malformed event.
             }
             MembershipEventKind::Invite { target } => {
                 m.members.entry(*target).or_insert(MemberState {
@@ -695,15 +712,31 @@ pub fn verify_event(
     //    Ed25519 component must verify the signature.
     verify_signature(event, ctx.actor_identity_pub)?;
 
-    // 2. Banned-status guard: a Banned actor's Join must be rejected
-    //    BEFORE materialize() would silently overwrite the Banned
-    //    status. Applies in both open and invite-only communities —
-    //    Kick is the operative ban primitive in v1, and re-joining
-    //    after Kick requires a dedicated unban flow (deferred).
-    if matches!(event.kind, MembershipEventKind::Join) {
+    // 2. Banned-status guard: a Banned actor's Join OR Leave must be
+    //    rejected BEFORE materialize() would silently overwrite the
+    //    Banned status.
+    //
+    //    Join: bans-then-rejoins is the obvious bypass.
+    //    Leave: a Banned actor can sign Leave (no power gate); without
+    //    this guard, materialize() would set status=Left, masking the
+    //    Ban — and a subsequent Join would no longer hit the Banned
+    //    guard (since prior_state.members[actor].status is now Left,
+    //    not Banned). Reject Leave from Banned to keep Banned sticky.
+    //
+    //    Re-joining after Kick requires a dedicated unban flow
+    //    (deferred). materialize() also pins Banned-stickiness as a
+    //    state-machine defense (see Leave handler).
+    if matches!(
+        event.kind,
+        MembershipEventKind::Join | MembershipEventKind::Leave
+    ) {
         if let Some(state) = prior_state.members.get(&event.actor) {
             if state.status == MemberStatus::Banned {
-                return Err(VerifyError::BannedActorJoin);
+                return Err(match event.kind {
+                    MembershipEventKind::Join => VerifyError::BannedActorJoin,
+                    MembershipEventKind::Leave => VerifyError::BannedActorLeave,
+                    _ => unreachable!("guarded by outer matches!"),
+                });
             }
         }
     }
