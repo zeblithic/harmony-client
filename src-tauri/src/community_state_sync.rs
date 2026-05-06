@@ -14,6 +14,9 @@
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::owner_state_types::MembershipKey;
 
@@ -26,9 +29,13 @@ pub enum CommunityCryptoError {
     Truncated,
 }
 
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+const MIN_WIRE_LEN: usize = NONCE_LEN + TAG_LEN;
+
 /// Domain-separation prefix for the per-community blob nonce.
 /// Combined with the SHA-256 of the plaintext to derive a deterministic
-/// 12-byte nonce — see `encrypt_blob` for the full derivation.
+/// nonce — see `encrypt_blob` for the full derivation.
 const COMMUNITY_BLOB_NONCE_PREFIX: &[u8] = b"harmony-community-blob-v1";
 
 /// Domain-separation prefix for root-publish AEAD AAD. Bound to the
@@ -47,11 +54,8 @@ pub fn encrypt_root_publish(
     mk: &MembershipKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CommunityCryptoError> {
-    use rand::rngs::OsRng;
-    use rand::RngCore;
-
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
-    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -65,7 +69,7 @@ pub fn encrypt_root_publish(
         )
         .map_err(|_| CommunityCryptoError::AeadFailed)?;
 
-    let mut wire = Vec::with_capacity(12 + ct.len());
+    let mut wire = Vec::with_capacity(NONCE_LEN + ct.len());
     wire.extend_from_slice(&nonce_bytes);
     wire.extend_from_slice(&ct);
     Ok(wire)
@@ -73,18 +77,18 @@ pub fn encrypt_root_publish(
 
 /// Decrypt a state-root publish wire packet produced by
 /// `encrypt_root_publish`. Verifies the AAD binding; rejects packets
-/// shorter than `12 (nonce) + 16 (Poly1305 tag) = 28` bytes before
-/// slicing to avoid panics on truncated input.
+/// shorter than `NONCE_LEN + TAG_LEN` bytes before slicing to avoid
+/// panics on truncated input.
 pub fn decrypt_root_publish(
     mk: &MembershipKey,
     wire: &[u8],
 ) -> Result<Vec<u8>, CommunityCryptoError> {
-    if wire.len() < 12 + 16 {
+    if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
-    let nonce = Nonce::from_slice(&wire[..12]);
-    let ct = &wire[12..];
+    let nonce = Nonce::from_slice(&wire[..NONCE_LEN]);
+    let ct = &wire[NONCE_LEN..];
     cipher
         .decrypt(
             nonce,
@@ -108,14 +112,14 @@ pub fn decrypt_root_publish(
 /// derive the nonce, so a chosen-plaintext nonce-collision attack
 /// requires already having the key).
 pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
-    use sha2::{Digest, Sha256};
-
     let mut h = Sha256::new();
     h.update(COMMUNITY_BLOB_NONCE_PREFIX);
     h.update(mk.as_bytes());
     h.update(plaintext);
     let digest = h.finalize();
-    let nonce_bytes: [u8; 12] = digest[..12].try_into().expect("SHA-256 >= 12 bytes");
+    let nonce_bytes: [u8; NONCE_LEN] = digest[..NONCE_LEN]
+        .try_into()
+        .expect("SHA-256 digest is 32 bytes");
 
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -123,23 +127,23 @@ pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, Com
         .encrypt(nonce, plaintext)
         .map_err(|_| CommunityCryptoError::AeadFailed)?;
 
-    let mut wire = Vec::with_capacity(12 + ct.len());
+    let mut wire = Vec::with_capacity(NONCE_LEN + ct.len());
     wire.extend_from_slice(&nonce_bytes);
     wire.extend_from_slice(&ct);
     Ok(wire)
 }
 
-/// Decrypt a blob produced by `encrypt_blob`. The 12-byte nonce
-/// embedded at the head is treated as opaque; correctness rests on
-/// the Poly1305 tag, not on re-deriving the nonce. Rejects wires
-/// shorter than `12 + 16` bytes before slicing.
+/// Decrypt a blob produced by `encrypt_blob`. The nonce embedded at
+/// the head is treated as opaque; correctness rests on the Poly1305
+/// tag, not on re-deriving the nonce. Rejects wires shorter than
+/// `NONCE_LEN + TAG_LEN` bytes before slicing.
 pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
-    if wire.len() < 12 + 16 {
+    if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
-    let nonce = Nonce::from_slice(&wire[..12]);
-    let ct = &wire[12..];
+    let nonce = Nonce::from_slice(&wire[..NONCE_LEN]);
+    let ct = &wire[NONCE_LEN..];
     cipher
         .decrypt(nonce, ct)
         .map_err(|_| CommunityCryptoError::AeadFailed)
