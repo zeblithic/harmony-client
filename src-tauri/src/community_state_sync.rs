@@ -871,23 +871,41 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    // Read once — both the logical-counter computation and the
-    // effective-wall pin need the same `prev`. `saturating_add` on
-    // logical bounds pathological wraparound under sustained backward
-    // NTP correction at the cost of a stuck publisher (which the
-    // receiver will reject) — preferable to silent replay.
     let prev = tracker.per_device.get(&ctx.device_id).cloned();
-    let (logical, prev_wall) = match prev.as_ref() {
-        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) => (0, p.wall_ms),
-        None => (0, 0),
-    };
-    let effective_wall = std::cmp::max(wall_ms, prev_wall);
-    let now = Hlc {
-        wall_ms: effective_wall,
-        logical,
-        device_id: ctx.device_id.clone(),
+    // Three branches:
+    //   (a) No prev → first publish for this device.
+    //   (b) Wall advanced past prev_wall → reset logical to 0.
+    //   (c) Same or earlier wall → bump logical, but if logical
+    //       saturates at u32::MAX manufacture a wall_ms advance to
+    //       keep producing strictly-newer HLCs. Otherwise the
+    //       resulting HLC would equal prev exactly, and `record()`
+    //       would panic via debug_assert (we'd also be silently
+    //       republishing the same logical clock, which receivers
+    //       reject as replay).
+    let now = match prev.as_ref() {
+        None => Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: ctx.device_id.clone(),
+        },
+        Some(p) if wall_ms > p.wall_ms => Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: ctx.device_id.clone(),
+        },
+        Some(p) if p.logical == u32::MAX => Hlc {
+            // Saturation escape: bump wall (vanishingly unlikely in
+            // production — 4B publishes within one wall-millisecond —
+            // but the alternative is debug-mode panic).
+            wall_ms: p.wall_ms.saturating_add(1),
+            logical: 0,
+            device_id: ctx.device_id.clone(),
+        },
+        Some(p) => Hlc {
+            wall_ms: p.wall_ms,
+            logical: p.logical + 1,
+            device_id: ctx.device_id.clone(),
+        },
     };
     tracker.record(now.clone());
     now
@@ -1208,23 +1226,39 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     }
 }
 
-/// Snapshot the CRDT and replay tracker to disk. Locks held briefly:
-/// state lock for `save_crdt`, then dropped before re-locking the
-/// tracker for `save_replay`. The interleave matters — holding both
-/// locks across both saves would force every concurrent CRDT mutation
-/// (foreground command handlers) to wait through two fsyncs.
+/// Snapshot the CRDT and replay tracker to disk.
+///
+/// **Lock and runtime discipline:** snapshot both Arcs under their
+/// respective async locks (briefly), drop the guards, then offload
+/// the actual `save_crdt` / `save_replay` calls to
+/// `tokio::task::spawn_blocking`. Without spawn_blocking the sync
+/// `std::fs::write` + `std::fs::rename` calls would park the tokio
+/// worker thread for the full disk-write cost on every debounce
+/// wakeup and every merge cycle.
 ///
 /// Both saves are atomic-rename-via-tempfile, so a partial save can't
 /// corrupt the live file. Failures bubble up as
 /// `CommunitySyncError::Persist` so the shutdown arm can surface them
 /// to the caller; the wakeup / merge arms log + continue.
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
-    let state = ctx.state.lock().await;
-    save_crdt(&ctx.paths.crdt, &state).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
-    drop(state);
-    let tracker = ctx.tracker.lock().await;
-    save_replay(&ctx.paths.replay, &tracker)
-        .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    // Snapshot under locks — clones are cheap (CRDT is a BTreeMap of
+    // signed events, tracker is a small per-device map), and far
+    // cheaper than holding a lock across blocking I/O.
+    let state_snap = ctx.state.lock().await.clone();
+    let tracker_snap = ctx.tracker.lock().await.clone();
+    let crdt_path = ctx.paths.crdt.clone();
+    let replay_path = ctx.paths.replay.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
+        save_crdt(&crdt_path, &state_snap)
+            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        save_replay(&replay_path, &tracker_snap)
+            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        Ok(())
+    })
+    .await
+    .map_err(|join_err| {
+        CommunitySyncError::Persist(format!("spawn_blocking join failed: {join_err}"))
+    })??;
     Ok(())
 }
 
@@ -1233,10 +1267,21 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 /// CRDT is byte-identical, so re-fsyncing `crdt.cbor` would be wasted
 /// I/O on every duplicate-but-clock-advanced publish. Only `replay.cbor`
 /// rewrites here.
+///
+/// Same lock + runtime discipline as `persist_both`: snapshot under
+/// the tracker lock, drop the guard, run the disk write in
+/// `spawn_blocking`.
 async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
-    let tracker = ctx.tracker.lock().await;
-    save_replay(&ctx.paths.replay, &tracker)
-        .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    let tracker_snap = ctx.tracker.lock().await.clone();
+    let replay_path = ctx.paths.replay.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
+        save_replay(&replay_path, &tracker_snap)
+            .map_err(|e| CommunitySyncError::Persist(e.to_string()))
+    })
+    .await
+    .map_err(|join_err| {
+        CommunitySyncError::Persist(format!("spawn_blocking join failed: {join_err}"))
+    })??;
     Ok(())
 }
 

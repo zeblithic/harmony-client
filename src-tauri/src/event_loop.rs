@@ -2284,11 +2284,23 @@ pub fn spawn_community_state_zenoh_adapter(
             //      surface-level visibility.
             //   3. `closing` flag flips — bounded-time shutdown, mirrors
             //      the publisher arm above.
+            //   4. `subscriber_tx.closed()` resolves — the engine
+            //      dropped its subscriber_rx (e.g., registry.stop_engine
+            //      tore down a community while no inbound was flowing).
+            //      Without this arm the loop stays blocked on
+            //      `sub.recv_async` until the next sample arrives,
+            //      leaving the JoinHandle unresolved indefinitely.
             loop {
                 tokio::select! {
                     // Data-flow arm first (see publisher loop above
                     // for rationale).
                     biased;
+                    _ = subscriber_tx.closed() => {
+                        // Engine dropped subscriber_rx — nothing to
+                        // forward to anymore. Silent exit; engine
+                        // owns the shutdown trace if relevant.
+                        break;
+                    }
                     res = sub.recv_async() => {
                         match res {
                             Ok(sample) => {
