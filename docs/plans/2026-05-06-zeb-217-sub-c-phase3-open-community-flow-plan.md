@@ -15,7 +15,7 @@
 
 **Architecture:** Phase 3 is a thin IPC layer over the shipped Phase 2 engine. The engine grows two new affordances: a `delta_tx` channel that fires `CommunityMembershipDelta` on every `InsertOutcome::Inserted` (covering both the receive-path inserts already in `handle_incoming_publish` AND a new `insert_local_event` method IPCs call to mint own events), and a Tauri-side consumer task (spawned at `start_node`) that owns the `AppHandle`, drains the delta channel, and emits `community-members-changed` events. IPCs that mutate community CRDT state inherit the snapshot-then-spawn fence hardened in PR #81 round 6 (`send_dm` / `add_space` / `delete_outbox_entry`) so a stop+restart racing through an in-flight IPC can't orphan-write to a detached state. Open invite URLs are `harmony://invite/{base64url(canonical_cbor(payload))}` strings returned to the caller for manual sharing — Phase 5 lands the deep-link plugin that makes them clickable.
 
-**Tech Stack:** Rust 1.79+, tokio (async runtime), Tauri 2 (IPC), serde / ciborium (canonical CBOR), base64 0.22 (URL-safe-no-pad), thiserror (error taxonomy). Frontend: nothing in Phase 3 (vitest tests under `__tests__/` not exercised here; Phase 5 ships UI).
+**Tech Stack:** Rust 1.88+ (per `src-tauri/Cargo.toml` `rust-version`), tokio (async runtime), Tauri 2 (IPC), serde / ciborium (canonical CBOR), base64 0.22 (URL-safe-no-pad), thiserror (error taxonomy). Frontend: nothing in Phase 3 (vitest tests under `__tests__/` not exercised here; Phase 5 ships UI).
 
 **Spec:** `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md` (commit `0b84296` on `main`). Phase 3 implements the "Open community redemption" flow (spec §"Invite system" + §"IPC surface").
 
@@ -49,7 +49,7 @@ The plan is one PR, ~14 tasks, each ending with a commit.
 **Files to modify:**
 
 - `src-tauri/Cargo.toml` — add `base64 = "0.22"` to `[dependencies]`.
-- `src-tauri/src/community_invite.rs` — add `encode_invite_url(payload) -> String` and `decode_invite_url(url) -> Result<CommunityInvitePayload, InviteUrlError>` helpers + new `InviteUrlError` enum.
+- `src-tauri/src/community_invite.rs` — add `encode_invite_url(payload) -> Result<String, InviteUrlError>` and `decode_invite_url(url) -> Result<CommunityInvitePayload, InviteUrlError>` helpers + new `InviteUrlError` enum. (Encode is fallible because canonical CBOR encoding can theoretically fail; in practice it's vanishingly rare for in-memory values.)
 - `src-tauri/src/community_state_sync.rs` — add `CommunityMembershipDelta` struct, extend `CommunitySyncEngineConfig` with `delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>`, plumb into `InternalCtx`, emit on every `Inserted` outcome inside `handle_incoming_publish`, add `pub async fn insert_local_event` method on `CommunitySyncEngine`.
 - `src-tauri/src/lib.rs` — register five new IPCs (`create_community`, `redeem_invite`, `leave_community`, `list_community_members`, `generate_invite`); add DTO types (`MemberInfoDto`, `CommunityMembersChangedPayload`, `MembershipChange`); spawn the delta consumer task in `start_node`; extend `NodeState` with the delta channel sender (so IPC handlers and the consumer share the same channel); register five `tauri::generate_handler!` entries.
 
@@ -1108,13 +1108,18 @@ In `src-tauri/src/lib.rs`, near the other `#[tauri::command]` functions, add:
 ```rust
 /// Read-only IPC over a community's materialized member list.
 /// Returns rows sorted by power desc then joined_at asc (see
-/// `member_info_for`). `community_id_hex` is the 32-char lowercase
+/// `member_info_for`). `community_id` is the 32-char lowercase
 /// hex of the 16-byte SpaceId.
 ///
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
 /// - `Err("no community_registry — node not running?")` — start_node
 ///   hasn't wired the registry.
+/// - `Err("no Space for community {hex} in owner-state")` — we
+///   haven't joined this community (or we left and removed the Space).
+/// - `Err("community Space missing admin_addr (corrupt row?)")` —
+///   defensive guard; should be unreachable since `validate_invariants`
+///   rejects these on apply.
 /// - `Err("no engine for community {hex} — not joined or not yet
 ///   started")` — the community isn't in the registry's map.
 #[tauri::command]
@@ -1129,11 +1134,39 @@ async fn list_community_members(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let registry = {
+    let (crdt_state, registry) = {
         let g = state_lock.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_registry
-            .clone()
-            .ok_or("no community_registry — node not running?")?
+        (
+            g.crdt_state.clone().ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+        )
+    };
+
+    // Read admin_addr from the owner-state Space row — single source of
+    // truth, set at create_community / redeem_invite time and pinned
+    // by lww_merge_space's creation-pinning rule (Phase 1, owner_state_crdt.rs).
+    // Deriving it from the engine's event log instead would be wrong:
+    // CommunityState.events is BTreeMap<EventId, _> keyed by random ULID
+    // bytes, so values().first() is NOT guaranteed to be the bootstrap
+    // Join (Qodo flagged this on PR #86 round 1).
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!("no Space for community {} in owner-state", hex::encode(space_id.0))
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0), space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
     };
 
     let engine_state = registry
@@ -1146,24 +1179,6 @@ async fn list_community_members(
             )
         })?;
 
-    let admin_addr = {
-        let engines = registry.known_ids().await;
-        if !engines.iter().any(|id| *id == space_id) {
-            return Err(format!(
-                "engine vanished for community {} between state_for and known_ids",
-                hex::encode(space_id.0)
-            ));
-        }
-        let g = engine_state.lock().await;
-        let log: Vec<crate::community_membership::SignedMembershipEvent> =
-            g.events.values().cloned().collect();
-        if let Some(first) = log.first() {
-            first.actor
-        } else {
-            return Ok(Vec::new());
-        }
-    };
-
     let materialized = {
         let g = engine_state.lock().await;
         g.materialize_now(admin_addr)
@@ -1173,9 +1188,9 @@ async fn list_community_members(
 }
 ```
 
-**Note on the `admin_addr` derivation:** Phase 3 doesn't yet plumb the per-community `admin_addr` from the owner-state Space row through to the IPC layer (`registry.state_for` only hands back the CRDT). For `list_community_members` we approximate by reading the bootstrap `Join` event's `actor` (which IS the admin in v1, since open communities only have one creator and `redeem_invite` doesn't change `admin_addr`). Task 9 will plumb the real `admin_addr` via a registry accessor; until then the bootstrap-Join shortcut is correct for open-only Phase 3.
+**Note on the `admin_addr` source:** Read from the owner-state `Space.admin_addr` field — set at `create_community` / `redeem_invite` time, pinned by `lww_merge_space`'s creation-pinning rule (shipped in Phase 1 — `owner_state_crdt.rs`). Reading from the engine's event log instead would be wrong: `CommunityState.events` is `BTreeMap<EventId, _>` keyed by random ULID bytes, so `values().first()` is NOT guaranteed to be the bootstrap Join.
 
-If the engine has zero events (hasn't received its own bootstrap insert yet because the frontend called `list_community_members` faster than the local insert + flush completed), return an empty Vec rather than `Err` — this is the natural empty-state shape and the frontend can show "No members yet."
+If the engine has zero events yet (rare race — the IPC fired faster than the local insert), `materialize_now(admin_addr)` returns a `MaterializedMembership` with `power_levels[admin_addr] = 100` from the bootstrap rule but an empty `members` map. `member_info_for` projects an empty Vec, which is the natural empty-state shape; the frontend can show "No members yet."
 
 Then add `list_community_members` to the `tauri::generate_handler!` macro near the bottom of the `run()` function. Search for `tauri::generate_handler!` and append `list_community_members,` to the comma-separated list.
 
@@ -1401,7 +1416,9 @@ git commit -m "feat(zeb-217-phase3): generate_invite IPC (open path)"
 
 **Files:**
 
-- Modify: `src-tauri/src/lib.rs` — add `CommunityMembersChangedPayload`, `MembershipChange` enum, and a free function `delta_to_change(delta: &CommunityMembershipDelta) -> Option<(String, MembershipChange)>` that returns `(community_id_hex, change)` or `None` if the event kind is unrepresentable (forward-compat slot).
+- Modify: `src-tauri/src/lib.rs` — add `CommunityMembersChangedPayload { community_id, changes: Vec<MembershipChange> }`, `MembershipChange { type, target, by, detail, at_wall_ms }` flat struct (matching spec line 561's `{type, target, by?, detail?}` shape), `MembershipChangeType` and `MembershipChangeDetail` enums, and a free function `delta_to_change(delta: &CommunityMembershipDelta) -> Option<(String, MembershipChange)>` that returns `(community_id_hex, change)` or `None` if the event kind is unrepresentable (forward-compat slot).
+
+**Wire-shape divergence note:** the spec defines the IPC event payload as `{ communityId, changes: [{type, target, by?, detail?}] }` — plural `changes` array even though Phase 3's engine fires one delta at a time. Phase 3 emits a single-element array per IPC event; future phases (or batch-receive optimisations) can expand to multi-element arrays without breaking the wire format. Using plural from day 1 avoids a wire-format break later.
 
 **Why this task is separate from start_node wiring (Task 8):** the projection logic is pure and testable without spinning up a runtime, plus the types are needed by Task 8's consumer task. Splitting keeps the test surface for the projection visible.
 
@@ -1432,42 +1449,59 @@ mod community_delta_projection_tests {
     }
 
     #[test]
-    fn join_projects_to_joined_change() {
+    fn join_projects_with_target_and_no_by() {
         let actor = OwnerAddr([1; 16]);
         let (cid_hex, change) = delta_to_change(&make_delta(MembershipEventKind::Join, actor))
             .expect("Join projects");
         assert_eq!(cid_hex, hex::encode([4u8; 16]));
-        match change {
-            MembershipChange::Joined { addr, at_wall_ms } => {
-                assert_eq!(addr, hex::encode(actor.0));
-                assert_eq!(at_wall_ms, 1234);
-            }
-            other => panic!("expected Joined, got {other:?}"),
-        }
+        assert_eq!(change.r#type, MembershipChangeType::Joined);
+        assert_eq!(change.target, hex::encode(actor.0));
+        assert!(change.by.is_none(), "Join is self-action; by is None");
+        assert!(change.detail.is_none());
+        assert_eq!(change.at_wall_ms, 1234);
     }
 
     #[test]
-    fn leave_projects_to_left_change() {
+    fn leave_projects_with_target_and_no_by() {
         let actor = OwnerAddr([2; 16]);
         let (_, change) = delta_to_change(&make_delta(MembershipEventKind::Leave, actor)).unwrap();
-        assert!(matches!(change, MembershipChange::Left { addr, .. } if addr == hex::encode(actor.0)));
+        assert_eq!(change.r#type, MembershipChangeType::Left);
+        assert_eq!(change.target, hex::encode(actor.0));
+        assert!(change.by.is_none());
+        assert!(change.detail.is_none());
     }
 
     #[test]
-    fn kick_projects_with_target_and_actor_as_by() {
+    fn kick_projects_with_target_by_and_reason_detail() {
         let actor = OwnerAddr([3; 16]);
         let target = OwnerAddr([4; 16]);
         let (_, change) = delta_to_change(&make_delta(
             MembershipEventKind::Kick { target, reason: Some("spam".into()) },
             actor,
         )).unwrap();
-        match change {
-            MembershipChange::Kicked { addr, by, reason, .. } => {
-                assert_eq!(addr, hex::encode(target.0));
-                assert_eq!(by, hex::encode(actor.0));
-                assert_eq!(reason.as_deref(), Some("spam"));
-            }
-            other => panic!("expected Kicked, got {other:?}"),
+        assert_eq!(change.r#type, MembershipChangeType::Kicked);
+        assert_eq!(change.target, hex::encode(target.0));
+        assert_eq!(change.by.as_deref(), Some(hex::encode(actor.0).as_str()));
+        match change.detail.as_ref() {
+            Some(MembershipChangeDetail::Reason(s)) => assert_eq!(s, "spam"),
+            other => panic!("expected Reason detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_power_projects_with_target_by_and_level_detail() {
+        let actor = OwnerAddr([5; 16]);
+        let target = OwnerAddr([6; 16]);
+        let (_, change) = delta_to_change(&make_delta(
+            MembershipEventKind::SetPower { target, level: 50 },
+            actor,
+        )).unwrap();
+        assert_eq!(change.r#type, MembershipChangeType::PowerChanged);
+        assert_eq!(change.target, hex::encode(target.0));
+        assert_eq!(change.by.as_deref(), Some(hex::encode(actor.0).as_str()));
+        match change.detail.as_ref() {
+            Some(MembershipChangeDetail::Level(n)) => assert_eq!(*n, 50),
+            other => panic!("expected Level detail, got {other:?}"),
         }
     }
 }
@@ -1488,64 +1522,110 @@ Expected: compile error — `delta_to_change`, `MembershipChange`, `CommunityMem
 Add to `src-tauri/src/lib.rs`:
 
 ```rust
-/// Delta-style payload for the `community-members-changed` Tauri event.
-/// One emit per CRDT mutation — own appends AND DAG-synced peer events.
-/// Frontend updates incrementally without re-fetching the full member
-/// list. Phase 3 fires only `Joined` / `Left`; Phase 4 fires
-/// `Invited` / `Kicked` / `PowerChanged`.
+/// Delta payload for the `community-members-changed` Tauri event.
+/// Matches the spec line 561 wire shape:
+/// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
+/// IPC event per engine-level CRDT mutation; Phase 3's engine fires
+/// one delta at a time so `changes` is always a single-element array
+/// in this phase. Future batch-receive optimisations can grow the
+/// array without breaking the wire format. Frontend updates
+/// incrementally without re-fetching the full member list.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommunityMembersChangedPayload {
     pub community_id: String,
-    pub change: MembershipChange,
+    pub changes: Vec<MembershipChange>,
 }
 
-/// Per-event projection. `addr` is the entity whose membership state
-/// changed; `by` (when present) is the actor who caused the change.
-/// `at_wall_ms` is the event's HLC wall-ms — frontend uses it to sort
-/// or de-dupe rapid-fire deltas.
+/// One delta in `CommunityMembersChangedPayload.changes`. Flat shape
+/// per spec — `type` discriminates the event kind, `target` is the
+/// entity whose membership state changed, `by` is the actor when
+/// distinct from target (kick/setpower/invite), `detail` carries
+/// kind-specific info (kick reason, new power level). `at_wall_ms`
+/// is an extension over the spec — useful for the frontend to sort
+/// or de-dupe rapid-fire deltas; documented as part of the wire
+/// contract here so future consumers don't strip it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum MembershipChange {
-    Joined { addr: String, at_wall_ms: u64 },
-    Left { addr: String, at_wall_ms: u64 },
-    Invited { addr: String, by: String, at_wall_ms: u64 },
-    Kicked { addr: String, by: String, reason: Option<String>, at_wall_ms: u64 },
-    PowerChanged { addr: String, by: String, level: u8, at_wall_ms: u64 },
+#[serde(rename_all = "camelCase")]
+pub struct MembershipChange {
+    #[serde(rename = "type")]
+    pub r#type: MembershipChangeType,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<MembershipChangeDetail>,
+    pub at_wall_ms: u64,
 }
 
-/// Project a `CommunityMembershipDelta` into the IPC change tuple. The
-/// caller (the start_node consumer task) wraps this in
-/// `CommunityMembersChangedPayload` and emits the Tauri event.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MembershipChangeType {
+    Joined,
+    Left,
+    Invited,
+    Kicked,
+    PowerChanged,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum MembershipChangeDetail {
+    Reason(String),
+    Level(u8),
+}
+
+/// Project a `CommunityMembershipDelta` into `(community_id_hex, change)`.
+/// The caller (the start_node consumer task) wraps the change in
+/// `CommunityMembersChangedPayload { community_id, changes: vec![change] }`
+/// and emits the Tauri event.
 ///
 /// Returns `None` for kinds we can't yet represent (none today; reserved
-/// for forward-compat if the membership enum grows).
+/// for forward-compat if `MembershipEventKind` grows).
 pub fn delta_to_change(
     delta: &crate::community_state_sync::CommunityMembershipDelta,
 ) -> Option<(String, MembershipChange)> {
     let cid_hex = hex::encode(delta.community_id.0);
-    let by = hex::encode(delta.event.actor.0);
+    let actor_hex = hex::encode(delta.event.actor.0);
     let at_wall_ms = delta.event.at.wall_ms;
     let change = match &delta.event.kind {
-        crate::community_membership::MembershipEventKind::Join => {
-            MembershipChange::Joined { addr: by.clone(), at_wall_ms }
-        }
-        crate::community_membership::MembershipEventKind::Leave => {
-            MembershipChange::Left { addr: by.clone(), at_wall_ms }
-        }
-        crate::community_membership::MembershipEventKind::Invite { target } => {
-            MembershipChange::Invited {
-                addr: hex::encode(target.0), by, at_wall_ms,
-            }
-        }
+        crate::community_membership::MembershipEventKind::Join => MembershipChange {
+            r#type: MembershipChangeType::Joined,
+            target: actor_hex,
+            by: None,
+            detail: None,
+            at_wall_ms,
+        },
+        crate::community_membership::MembershipEventKind::Leave => MembershipChange {
+            r#type: MembershipChangeType::Left,
+            target: actor_hex,
+            by: None,
+            detail: None,
+            at_wall_ms,
+        },
+        crate::community_membership::MembershipEventKind::Invite { target } => MembershipChange {
+            r#type: MembershipChangeType::Invited,
+            target: hex::encode(target.0),
+            by: Some(actor_hex),
+            detail: None,
+            at_wall_ms,
+        },
         crate::community_membership::MembershipEventKind::Kick { target, reason } => {
-            MembershipChange::Kicked {
-                addr: hex::encode(target.0), by, reason: reason.clone(), at_wall_ms,
+            MembershipChange {
+                r#type: MembershipChangeType::Kicked,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: reason.clone().map(MembershipChangeDetail::Reason),
+                at_wall_ms,
             }
         }
         crate::community_membership::MembershipEventKind::SetPower { target, level } => {
-            MembershipChange::PowerChanged {
-                addr: hex::encode(target.0), by, level: *level, at_wall_ms,
+            MembershipChange {
+                r#type: MembershipChangeType::PowerChanged,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: Some(MembershipChangeDetail::Level(*level)),
+                at_wall_ms,
             }
         }
     };
@@ -1637,7 +1717,9 @@ mod delta_consumer_task_tests {
         let cap = captured.lock().await;
         assert_eq!(cap.len(), 1);
         assert_eq!(cap[0].community_id, hex::encode(community_id.0));
-        assert!(matches!(cap[0].change, MembershipChange::Joined { .. }));
+        assert_eq!(cap[0].changes.len(), 1, "Phase 3 emits one change per IPC event");
+        assert_eq!(cap[0].changes[0].r#type, MembershipChangeType::Joined);
+        assert_eq!(cap[0].changes[0].target, hex::encode(actor.0));
         drop(tx);
         let _ = handle.await;
     }
@@ -1676,7 +1758,14 @@ pub async fn run_community_delta_consumer<F, Fut>(
 {
     while let Some(delta) = delta_rx.recv().await {
         if let Some((community_id, change)) = delta_to_change(&delta) {
-            let payload = CommunityMembersChangedPayload { community_id, change };
+            // Phase 3 emits a single-element `changes` array per IPC event;
+            // the engine fires one delta at a time. Future batch-receive
+            // optimisations can collect multiple deltas before emit
+            // without breaking the wire format.
+            let payload = CommunityMembersChangedPayload {
+                community_id,
+                changes: vec![change],
+            };
             emit(payload).await;
         }
     }
@@ -2700,7 +2789,7 @@ use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
 use harmony_app::{
     delta_to_change, member_info_for, mint_community_creation, mint_leave_event,
-    mint_redemption, MembershipChange,
+    mint_redemption, MembershipChangeType,
 };
 use harmony_identity::PrivateIdentity;
 use std::collections::HashMap;
@@ -2841,7 +2930,8 @@ async fn open_community_create_redeem_leave_round_trip() {
         .await.expect("A own delta").expect("channel open");
     let (cid_hex_a, change_a) = delta_to_change(&delta_a_first).expect("project");
     assert_eq!(cid_hex_a, hex::encode(community_id.0));
-    assert!(matches!(change_a, MembershipChange::Joined { .. }));
+    assert_eq!(change_a.r#type, MembershipChangeType::Joined);
+    assert_eq!(change_a.target, hex::encode(owner_a.0));
 
     assert!(wait_until(|| async {
         state_b.lock().await.events.len() == 1
