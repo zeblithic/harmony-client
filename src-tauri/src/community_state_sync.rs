@@ -246,6 +246,15 @@ pub enum CommunitySyncError {
     /// would misdirect operators chasing format bugs.
     #[error("misrouted blob: expected community_id {expected:?}, got {found:?}")]
     MisroutedBlob { expected: SpaceId, found: SpaceId },
+    /// CAS returned `Ok(None)` for the published `root_cid` — the slot
+    /// is unpopulated (fetch timed out or admit-rejected). Distinct
+    /// from `ContentStore` (which carries an actual transport / disk
+    /// `ContentStoreError::Io`) because the failure class is "blob
+    /// not yet available," not an I/O fault. Surfacing it as `Io`
+    /// would misdirect operators chasing disk / network bugs and
+    /// muddy any future retry-vs-give-up logic.
+    #[error("blob not found in CAS for cid {cid:?} (fetch timeout or admit-rejected)")]
+    BlobNotFound { cid: ContentId },
     /// Engine config has `identity_resolver: None`, so receive-side
     /// `verify_event` can't resolve identity_pubs. Distinct error
     /// class because the cause is configuration (Sub-A's owner-device
@@ -1041,12 +1050,9 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(
-                crate::content_store::ContentStoreError::Io(format!(
-                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
-                    payload.root_cid
-                )),
-            ));
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::BlobNotFound {
+                cid: payload.root_cid,
+            });
         }
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
     };
@@ -1337,6 +1343,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
             "wire_decode_failed"
         }
         CommunitySyncError::ContentStore(_) => "blob_fetch_failed",
+        CommunitySyncError::BlobNotFound { .. } => "blob_not_found",
         CommunitySyncError::TransportClosed => "transport_closed",
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
