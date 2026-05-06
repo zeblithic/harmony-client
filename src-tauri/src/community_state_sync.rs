@@ -225,6 +225,19 @@ pub enum CommunitySyncError {
     TransportClosed,
     #[error("persist: {0}")]
     Persist(String),
+    /// Decoded blob's `community_id` doesn't match the engine's
+    /// expected community. Distinct from `CborDecode` because the
+    /// wire form parsed cleanly — the failure is routing/integrity,
+    /// not malformed bytes. Surfacing it as `wire_decode_failed`
+    /// would misdirect operators chasing format bugs.
+    #[error("misrouted blob: expected community_id {expected:?}, got {found:?}")]
+    MisroutedBlob { expected: SpaceId, found: SpaceId },
+    /// Engine config has `identity_resolver: None`, so receive-side
+    /// `verify_event` can't resolve identity_pubs. Distinct error
+    /// class because the cause is configuration (Sub-A's owner-device
+    /// cache wasn't wired in), not transport or crypto failure.
+    #[error("no identity resolver configured — Phase 2 receive-side verify needs one")]
+    MissingIdentityResolver,
 }
 
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
@@ -456,13 +469,12 @@ impl CommunitySyncEngine {
     }
 }
 
-/// Internal context bag passed to the spawned task. Task 7's loop
-/// reads most fields; `paths`, `is_invite_only`, `admin_addr`,
-/// `identity_resolver`, and `error_tx` are still unread pending
-/// Tasks 8/10/13 (persist hook, verify-on-receive, degraded-path
-/// reporter). `#[allow(dead_code)]` stays until those tasks land —
-/// removing fields just because the current task doesn't read them
-/// would force a churn cycle when the next task adds them back.
+/// Internal context bag passed to the spawned task. Tasks 7-8 wired
+/// the publish loop and receive pipeline, which together consume
+/// every field except `paths` (Task 10's persist hook). The
+/// `#[allow(dead_code)]` stays until Task 10 lands — removing
+/// `paths` just because the current task doesn't read it would
+/// force a churn cycle when the next task adds it back.
 #[allow(dead_code)]
 struct InternalCtx {
     community_id: SpaceId,
@@ -565,15 +577,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                     // sync-disabled. Engine stays alive in publish-
                     // only mode; the latch prevents tight-looping
                     // on a closed channel.
-                    if let Some(tx) = ctx.error_tx.as_ref() {
-                        let _ = tx
-                            .send(CommunityDegradedReport {
-                                community_id: ctx.community_id,
-                                reason_tag: "subscriber_channel_closed",
-                                detail: "Zenoh adapter dropped subscriber_tx; engine in publish-only mode".into(),
-                            })
-                            .await;
-                    }
+                    report_degraded(
+                        ctx.error_tx.as_ref(),
+                        ctx.community_id,
+                        "subscriber_channel_closed",
+                        "Zenoh adapter dropped subscriber_tx; engine in publish-only mode".into(),
+                    )
+                    .await;
                     inbound_closed = true;
                     continue;
                 };
@@ -590,15 +600,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                     // Tauri event. Per the spec (§ "IPC surface →
                     // Events"), the frontend uses these to surface
                     // "this community's sync is degraded" banners.
-                    if let Some(tx) = ctx.error_tx.as_ref() {
-                        let _ = tx
-                            .send(CommunityDegradedReport {
-                                community_id: ctx.community_id,
-                                reason_tag: classify_incoming_error(err),
-                                detail: format!("{err}"),
-                            })
-                            .await;
-                    }
+                    report_degraded(
+                        ctx.error_tx.as_ref(),
+                        ctx.community_id,
+                        classify_incoming_error(err),
+                        format!("{err}"),
+                    )
+                    .await;
                 }
                 // Persist on Mutated | MutatedTrackerOnly |
                 // ErrPostMutation lands in Task 10 (consumes
@@ -823,6 +831,19 @@ impl IncomingOutcome {
 ///    identity_pubs (skip-on-error); call `state.insert_event` with a
 ///    fresh `VerifyContext`; surface `Rejected` outcomes as
 ///    `CommunityDegradedReport` on `error_tx`.
+///
+/// **Divergence from `owner_state_sync::handle_incoming_publish`:**
+/// owner-state advances the tracker IMMEDIATELY after the replay-check
+/// (so blob-fetch / decrypt / decode failures land as
+/// `ErrPostMutation`). We delay the advance until step 8 — AFTER the
+/// blob has been fetched, decrypted, decoded, AND passed the
+/// misrouted-blob check. The rationale is asymmetric trust: a
+/// misrouted blob (foreign community's state surfaced under our
+/// CID) means the publisher's HLC carries no useful information for
+/// OUR replay tracker, so advancing it would let a correctly-routed
+/// re-publish at the same HLC be silently dropped. owner-state
+/// doesn't have this concern because there's only one owner-CRDT
+/// per identity.
 async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
     // 1. Decrypt root publish.
     let payload_bytes = match decrypt_root_publish(&ctx.membership_key, &wire) {
@@ -883,10 +904,10 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //     but cheap to gate) or buggy callsite could surface a
     //     foreign community's events under our key.
     if remote.community_id != ctx.community_id {
-        return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(format!(
-            "remote blob community_id {:?} != expected {:?}",
-            remote.community_id, ctx.community_id
-        )));
+        return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
+            expected: ctx.community_id,
+            found: remote.community_id,
+        });
     }
 
     // 6. Advance the replay tracker BEFORE merging events. This is
@@ -901,17 +922,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
     // 7. Merge events. Each event must re-verify against B's
     //    prior_state_at_event — we don't trust A's verification.
-    let resolver = match ctx.identity_resolver.as_ref() {
-        Some(r) => Arc::clone(r),
-        None => {
-            // Phase 2's receive-side verify needs an identity resolver
-            // to map event.actor → identity_pub. None means we can't
-            // verify any incoming event. Tracker already advanced;
-            // surface as ErrPostMutation so persist hook still runs.
-            return IncomingOutcome::ErrPostMutation(CommunitySyncError::CborDecode(
-                "no identity resolver configured — Phase 2 receive-side verify needs one".into(),
-            ));
-        }
+    let Some(resolver) = ctx.identity_resolver.as_deref() else {
+        // Phase 2's receive-side verify needs an identity resolver
+        // to map event.actor → identity_pub. None means we can't
+        // verify any incoming event. Tracker already advanced;
+        // surface as ErrPostMutation so persist hook still runs.
+        return IncomingOutcome::ErrPostMutation(CommunitySyncError::MissingIdentityResolver);
     };
 
     let mut state = ctx.state.lock().await;
@@ -990,15 +1006,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 // etc). One bad event does not block valid ones in
                 // the same publish — defense-in-depth at both
                 // layers (Phase 1 spec §"Defense-in-depth").
-                if let Some(tx) = ctx.error_tx.as_ref() {
-                    let _ = tx
-                        .send(CommunityDegradedReport {
-                            community_id: ctx.community_id,
-                            reason_tag: "verify_event_rejected",
-                            detail: format!("{verr:?}"),
-                        })
-                        .await;
-                }
+                report_degraded(
+                    ctx.error_tx.as_ref(),
+                    ctx.community_id,
+                    "verify_event_rejected",
+                    format!("{verr:?}"),
+                )
+                .await;
             }
         }
     }
@@ -1011,6 +1025,27 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         IncomingOutcome::Mutated
     } else {
         IncomingOutcome::MutatedTrackerOnly
+    }
+}
+
+/// Send a `CommunityDegradedReport` if `error_tx` is wired. Helper for
+/// the three emit sites in `internal_task` and `handle_incoming_publish`
+/// — they all `if let Some(tx) ... let _ = tx.send(...)` the same shape,
+/// and Task 13 will add a fourth site for start_node-level reporting.
+async fn report_degraded(
+    error_tx: Option<&mpsc::Sender<CommunityDegradedReport>>,
+    community_id: SpaceId,
+    reason_tag: &'static str,
+    detail: String,
+) {
+    if let Some(tx) = error_tx {
+        let _ = tx
+            .send(CommunityDegradedReport {
+                community_id,
+                reason_tag,
+                detail,
+            })
+            .await;
     }
 }
 
@@ -1028,5 +1063,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::ContentStore(_) => "blob_fetch_failed",
         CommunitySyncError::TransportClosed => "transport_closed",
         CommunitySyncError::Persist(_) => "persist_failed",
+        CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
+        CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
     }
 }

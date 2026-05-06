@@ -1,7 +1,8 @@
-//! CommunitySyncEngine unit tests — covers construction + clean
-//! shutdown plus the flush_now → publish_root_now → wire-bytes path.
-//! The handle_incoming_publish receive path is exercised in Task 8;
-//! the multi-engine registry in Task 11.
+//! CommunitySyncEngine unit tests — covers (1) construction + clean
+//! shutdown, (2) the flush_now → publish_root_now → wire-bytes
+//! path, and (3) the two-engine round-trip exercising
+//! handle_incoming_publish with verify-on-receive. The multi-engine
+//! registry lands in Task 11; the start_node wire-up in Task 13.
 
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
