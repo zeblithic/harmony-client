@@ -6268,6 +6268,237 @@ mod redeem_invite_inner_tests {
     }
 }
 
+// ── ZEB-217 Sub-C Phase 3 Task 11: leave_community ───────────────────
+//
+// Mints a self-Leave SignedMembershipEvent and inserts it into the
+// per-community engine. Does NOT mutate owner-state Space (per spec
+// line 514): the Space row stays around with its existing fields so
+// the user can see "you've left this community" in the UI and choose
+// to remove it later via the existing `remove_space` IPC. The Leave
+// event in the CRDT is what peers see + what the materialized member
+// list reflects.
+//
+// Engine lifecycle: Phase 3 does NOT call registry.stop_engine on
+// leave. The Leave event must publish to peers and the engine's
+// debounced publish loop owns that — stopping immediately could race
+// the publish. The user's eventual `remove_space` (or a future
+// `forget_community` IPC) would call `stop_engine`; for Phase 3 the
+// engine stays running.
+
+/// Pure function: mint a self-Leave `SignedMembershipEvent` for a
+/// community we currently belong to. Mirrors the
+/// `mint_redemption` / `mint_community_creation` shape — pure / sync /
+/// no I/O so the canonical-CBOR / signing path is unit-testable
+/// without standing up a Tauri test harness.
+pub fn mint_leave_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let leave_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::Leave,
+        actor: self_owner,
+        at: leave_hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign leave: {e}"))
+}
+
+/// Tauri IPC: leave a community we currently belong to.
+///
+/// Mints a self-Leave event, looks up the per-community engine via
+/// `community_registry.engine_arc`, and inserts the event through
+/// `engine.insert_local_event` so the debounced publish loop pushes
+/// it to peers. Advances the local HLC tracker on success.
+///
+/// Owner-state Space NOT mutated (per spec line 514): the Space row
+/// stays around so the UI can show "you've left this community" and
+/// the user can choose to call `remove_space` later. The membership
+/// CRDT is the source of truth for community membership; `Space.left_at`
+/// is only meaningful for DM Spaces (which have no membership CRDT).
+///
+/// Snapshot-then-spawn-equivalent fence: after minting but before
+/// engine ops we re-acquire the std `NodeState` lock and check
+/// `generation`. If the node was stopped (or stop+restart raced), we
+/// return Err so the Leave doesn't land on a soon-to-be-detached
+/// engine.
+///
+/// Engine lookup: `engine_arc` returns `None` if no engine is running
+/// for this community — surfaced as "not currently joined". We do NOT
+/// spawn an engine here (unlike `redeem_invite`); leave operates only
+/// on existing live engines.
+///
+/// HLC tracker advanced AFTER successful insert so a verify failure
+/// doesn't bump the tracker into "future" state that would cause the
+/// next outgoing event to skip a tick.
+#[tauri::command]
+async fn leave_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint the self-Leave. Read prev_hlc under the tracker lock then
+    // drop the guard before signing (sign is sync; releasing eagerly
+    // keeps the tracker available to other tasks). Borrow the
+    // SigningKey from `dm_outbox` — same canonical local-device key
+    // create_community / redeem_invite use.
+    let leave = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_leave_event(
+            space_id,
+            self_owner,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // Snapshot-then-spawn-equivalent fence: ensure node generation
+    // hasn't changed. If it has, the engine we'd touch would be
+    // detached from a stopped node and the Leave wouldn't be
+    // persisted — surface Err rather than silently writing into a
+    // doomed engine.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during leave_community (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(leave.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(format!("Leave rejected by CRDT verify: {outcome:?}"));
+    }
+
+    // Advance HLC tracker only after a successful (non-Rejected)
+    // insert. AlreadyKnown still warrants advancing because the event
+    // we minted is the event the engine accepted (or had); the
+    // next_hlc step is real either way.
+    {
+        let mut t = hlc_tracker.lock().await;
+        t.insert(device_id.clone(), leave.at.clone());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod leave_community_inner_tests {
+    use super::*;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    #[test]
+    fn mint_leave_produces_self_leave_event() {
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let identity_pub = identity.identity.to_public_bytes();
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        // Mirror Task 9/10's test pattern: pull the canonical 32-byte
+        // Ed25519 seed from bytes 32..64 of `to_private_bytes()`. The
+        // production IPC borrows this same SigningKey from `dm_outbox`.
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+
+        let community_id = SpaceId([0x77; 16]);
+        let device_id = "leaver-dev";
+        let prev_hlc: Option<Hlc> = None;
+        let wall_now_ms = 1_700_000_500_000u64;
+
+        let event = mint_leave_event(
+            community_id,
+            self_owner,
+            &signing_key,
+            device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )
+        .expect("mint");
+
+        assert_eq!(event.actor, self_owner);
+        assert_eq!(event.community_id, community_id);
+        assert!(matches!(
+            event.kind,
+            crate::community_membership::MembershipEventKind::Leave
+        ));
+        assert_eq!(event.at.wall_ms, wall_now_ms);
+
+        // Self-Leave sig must verify against the leaver's identity_pub —
+        // the engine's verify_event runs the same check on insert.
+        crate::community_membership::verify_signature(&event, &identity_pub)
+            .expect("self-leave signature must verify against leaver identity_pub");
+    }
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -6615,6 +6846,7 @@ pub fn run() {
             generate_invite,
             create_community,
             redeem_invite,
+            leave_community,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
