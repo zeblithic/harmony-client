@@ -108,7 +108,18 @@ pub enum InviteUrlError {
     Base64(String),
     #[error("CBOR decode failed: {0}")]
     Cbor(String),
+    /// Defends the CBOR decoder against unbounded input: a hostile
+    /// paste of a multi-MB body would otherwise burn allocator + decode
+    /// time before failing. A real invite is ~120-180 bytes; the cap is
+    /// generous enough to absorb future field growth without becoming
+    /// a DoS vector.
+    #[error("invite payload exceeds 4096 byte limit (got {0})")]
+    TooLarge(usize),
 }
+
+/// Hard cap on the base64url body length (post-prefix-strip) we'll
+/// hand to the base64 + CBOR decoders. See `InviteUrlError::TooLarge`.
+const MAX_INVITE_BODY_BYTES: usize = 4096;
 
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
@@ -121,10 +132,22 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
 
 /// Strip the `harmony://invite/` prefix, base64url-decode, then
 /// canonical-CBOR-decode into a `CommunityInvitePayload`.
+///
+/// Trims surrounding whitespace before scheme inspection — paste flows
+/// (chat / email / messenger clients) routinely add leading or trailing
+/// whitespace, and `harmony://invite/...\n` would otherwise fail with
+/// `WrongScheme` for the trailing newline alone.
+///
+/// Caps the post-prefix body length at `MAX_INVITE_BODY_BYTES` to
+/// bound the work the base64 + CBOR decoders do on untrusted input.
 pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlError> {
+    let url = url.trim();
     let body = url
         .strip_prefix(URL_PREFIX)
         .ok_or_else(|| InviteUrlError::WrongScheme(url.chars().take(URL_PREFIX.len()).collect()))?;
+    if body.len() > MAX_INVITE_BODY_BYTES {
+        return Err(InviteUrlError::TooLarge(body.len()));
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(body)
         .map_err(|e| InviteUrlError::Base64(e.to_string()))?;

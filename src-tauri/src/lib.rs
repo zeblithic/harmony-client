@@ -5291,6 +5291,34 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 
 // ── ZEB-217 community IPC types ──────────────────────────────────────────
 
+/// Frontend-facing member status. Mirrors `MemberStatus` from
+/// `community_membership` but serializes with human-readable strings
+/// ("joined" / "left" / "invited" / "banned") instead of the CBOR wire
+/// codes ("j" / "l" / "i" / "b") — the CBOR renames exist for canonical
+/// CBOR compactness on the wire, but the Tauri IPC boundary should
+/// surface a string the frontend can read directly without a lookup
+/// table.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MemberStatusDto {
+    Joined,
+    Left,
+    Invited,
+    Banned,
+}
+
+impl From<crate::community_membership::MemberStatus> for MemberStatusDto {
+    fn from(s: crate::community_membership::MemberStatus) -> Self {
+        use crate::community_membership::MemberStatus;
+        match s {
+            MemberStatus::Joined => Self::Joined,
+            MemberStatus::Left => Self::Left,
+            MemberStatus::Invited => Self::Invited,
+            MemberStatus::Banned => Self::Banned,
+        }
+    }
+}
+
 /// Member-list row returned by `list_community_members` IPC. Mirrors
 /// the spec's MemberInfo type. `addr` is hex of OwnerAddr (16 bytes →
 /// 32 chars). `display_name` is None in Phase 3 — the existing profile
@@ -5300,7 +5328,7 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 pub struct MemberInfoDto {
     pub addr: String,
     pub display_name: Option<String>,
-    pub status: crate::community_membership::MemberStatus,
+    pub status: MemberStatusDto,
     pub power: u8,
     pub joined_at: crate::owner_state_types::Hlc,
 }
@@ -5318,7 +5346,7 @@ pub fn member_info_for(
         .map(|(addr, state)| MemberInfoDto {
             addr: hex::encode(addr.0),
             display_name: None,
-            status: state.status,
+            status: state.status.into(),
             power: m.power_levels.get(addr).copied().unwrap_or(0),
             joined_at: state.joined_at.clone(),
         })
@@ -5783,13 +5811,19 @@ async fn create_community(
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
     community_adapter_tx
-        .send(crate::event_loop::CommunityAdapterRequest {
+        .try_send(crate::event_loop::CommunityAdapterRequest {
             id_hex: hex::encode(minted.community_id.0),
             publisher_rx: pub_rx,
             subscriber_tx: sub_tx,
         })
-        .await
-        .map_err(|e| format!("community_adapter_tx send: {e}"))?;
+        .map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "adapter request queue full; please retry".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "adapter request channel closed (event_loop stopped?)".to_string()
+            }
+        })?;
 
     // Now bootstrap-Join via the engine. The engine's
     // `insert_local_event` runs verify_event (which authorizes the
@@ -5987,7 +6021,16 @@ pub fn mint_redemption(
         prior_content_keys: Vec::new(),
         membership_key: Some(payload.membership_key.clone()),
         admin_addr: Some(payload.admin_addr),
-        is_invite_only: Some(false),
+        // Use the invite's declared is_invite_only so the redeemer's
+        // Space row matches the creator's row (Phase 1's CRDT same-
+        // SpaceId rejection of community-creation field changes would
+        // silently reject the redemption Space if these disagreed).
+        // In Phase 3 the IPC guard rejects invite-only payloads before
+        // we ever reach mint_redemption, so this currently equals
+        // Some(false) at runtime — but pinning to payload.is_invite_only
+        // unblocks Phase 4 invite-only redemption with no further mint
+        // edits.
+        is_invite_only: Some(payload.is_invite_only),
     };
 
     Ok(MintedCommunity {
@@ -6030,9 +6073,17 @@ pub fn mint_redemption(
 /// address, which must match the creator's identity — the joining
 /// peer is just a member.
 ///
-/// Idempotence: registry.spawn_engine is idempotent on repeat calls
+/// **NOT idempotent.** A second call with the same invite mints a fresh
+/// self-Join event with a new (random) event_id, which the CRDT accepts
+/// as a distinct event. The materialized state is unchanged (last Join
+/// still wins per LWW on `MemberState`), but the event log grows by one
+/// every retry. `registry.spawn_engine` IS idempotent on repeat calls
 /// for the same community_id (returns the existing engine handle), so
-/// re-redeeming the same invite is a no-op rather than an error.
+/// the engine spawn itself is a no-op — the non-idempotence is purely
+/// in the minted event. The frontend should debounce or guard against
+/// repeated redemption clicks; a follow-up (ZEB-258 family) may add a
+/// pre-mint materialized-state lookup so already-Joined re-redemption
+/// short-circuits before minting.
 #[tauri::command]
 async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -6174,13 +6225,19 @@ async fn redeem_invite(
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
     community_adapter_tx
-        .send(crate::event_loop::CommunityAdapterRequest {
+        .try_send(crate::event_loop::CommunityAdapterRequest {
             id_hex: hex::encode(minted.community_id.0),
             publisher_rx: pub_rx,
             subscriber_tx: sub_tx,
         })
-        .await
-        .map_err(|e| format!("community_adapter_tx send: {e}"))?;
+        .map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "adapter request queue full; please retry".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "adapter request channel closed (event_loop stopped?)".to_string()
+            }
+        })?;
 
     // Now self-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the open Join via signature
@@ -6673,7 +6730,7 @@ pub async fn run_community_degraded_consumer<F, Fut>(
 
 #[cfg(test)]
 mod community_member_dto_tests {
-    use super::member_info_for;
+    use super::{member_info_for, MemberStatusDto};
     use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
     use crate::owner_state_types::{Hlc, OwnerAddr};
     use std::collections::BTreeMap;
@@ -6776,8 +6833,8 @@ mod community_member_dto_tests {
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);
         let statuses: Vec<_> = dto.iter().map(|d| d.status).collect();
-        assert!(statuses.contains(&MemberStatus::Left));
-        assert!(statuses.contains(&MemberStatus::Banned));
+        assert!(statuses.contains(&MemberStatusDto::Left));
+        assert!(statuses.contains(&MemberStatusDto::Banned));
     }
 }
 
@@ -7526,7 +7583,7 @@ mod list_community_members_ipc_tests {
                 },
             };
             let evt = sign_event_with_identity(&payload, &identity).expect("sign");
-            let _ = sa.insert_event(
+            let outcome = sa.insert_event(
                 evt,
                 &crate::community_membership::VerifyContext {
                     expected_community_id: community_id,
@@ -7535,6 +7592,13 @@ mod list_community_members_ipc_tests {
                     actor_identity_pub: &identity_pub,
                     countersigner_identity_pub: None,
                 },
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    crate::community_state_crdt::InsertOutcome::Inserted
+                ),
+                "fixture insert must succeed; got {outcome:?}"
             );
         }
 

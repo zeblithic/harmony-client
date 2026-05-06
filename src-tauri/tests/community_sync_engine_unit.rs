@@ -403,7 +403,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
             },
         };
         let event = sign_event_with_identity(&payload, &identity_a).expect("sign");
-        let _ = sa.insert_event(
+        let outcome = sa.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
@@ -412,6 +412,13 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
             },
+        );
+        assert!(
+            matches!(
+                outcome,
+                harmony_app::community_state_crdt::InsertOutcome::Inserted
+            ),
+            "fixture insert must succeed; got {outcome:?}"
         );
     }
 
@@ -625,16 +632,17 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
     };
     let bad_event = sign_event_with_identity(&bad_payload, &identity).expect("sign");
     let result = engine.insert_local_event(bad_event).await;
-    // Plan's matches! pattern omitted UnknownActor; with this
-    // StaticResolver the bad-actor address returns None at resolve time,
-    // so the impl short-circuits with Err(UnknownActor) BEFORE
-    // verify_event runs. Widening the matcher preserves the test's
-    // intent ("a bogus actor must not insert") while reflecting the
-    // actual short-circuit path.
+    // With this StaticResolver the bad-actor address returns None at
+    // resolve time, so the impl short-circuits with Err(UnknownActor)
+    // BEFORE verify_event runs. Verify failures (when the resolver does
+    // resolve the actor) surface as Ok(InsertOutcome::Rejected(_)) — the
+    // engine's `insert_local_event` no longer carries a `Verify` variant
+    // because the verify-rejection path always reaches the CRDT layer
+    // and gets folded into the Insert outcome. Widening the matcher
+    // preserves the test's intent ("a bogus actor must not insert").
     assert!(matches!(
         result,
-        Err(LocalInsertError::Verify(_))
-            | Err(LocalInsertError::UnknownActor(_))
+        Err(LocalInsertError::UnknownActor(_))
             | Ok(harmony_app::community_state_crdt::InsertOutcome::Rejected(
                 _
             ))

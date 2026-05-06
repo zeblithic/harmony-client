@@ -148,3 +148,33 @@ fn decode_rejects_truncated_cbor() {
     let err = decode_invite_url(&url).unwrap_err();
     assert!(matches!(err, InviteUrlError::Cbor(_)));
 }
+
+#[test]
+fn decode_rejects_oversized_payload() {
+    use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
+    let huge_body = "A".repeat(10_000);
+    let url = format!("harmony://invite/{huge_body}");
+    let err = decode_invite_url(&url).unwrap_err();
+    assert!(matches!(err, InviteUrlError::TooLarge(_)));
+}
+
+#[test]
+fn decode_trims_whitespace() {
+    use harmony_app::community_invite::{
+        decode_invite_url, encode_invite_url, CommunityInvitePayload,
+    };
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "WhitespaceTest".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+    };
+    let url = encode_invite_url(&payload).expect("encode");
+    let padded = format!("  \n{url}\t  ");
+    let decoded = decode_invite_url(&padded).expect("decode trimmed");
+    assert_eq!(decoded, payload);
+}

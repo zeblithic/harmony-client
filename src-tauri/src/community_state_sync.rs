@@ -274,8 +274,17 @@ pub enum LocalInsertError {
     MissingIdentityResolver,
     #[error("actor identity not in resolver: {0:?}")]
     UnknownActor(OwnerAddr),
-    #[error("verify_event rejected the local event: {0}")]
-    Verify(crate::community_membership::VerifyError),
+    /// Defense-in-depth guard at `insert_local_event` entry — caller
+    /// passed an event whose embedded `community_id` does not match the
+    /// engine's configured `community_id`. Without this guard the misroute
+    /// would silently surface as a verify rejection (`expected_community_id`
+    /// mismatch), which is harder to diagnose. Surfacing it as a distinct
+    /// error class lets the IPC layer return a clear "wrong community"
+    /// diagnostic to the frontend.
+    #[error(
+        "event community_id {got:?} doesn't match engine's configured community_id {expected:?}"
+    )]
+    WrongCommunity { expected: SpaceId, got: SpaceId },
 }
 
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
@@ -463,6 +472,18 @@ pub struct CommunitySyncEngine {
     /// reaching into `InternalCtx`. Phase 3 ships the public IPC
     /// surface; this accessor stays `#[doc(hidden)]` until then.
     state: Arc<Mutex<CommunityState>>,
+    /// Community identity this engine was configured with. Bound at
+    /// construction so `insert_local_event` can:
+    ///   1. Reject mis-routed events (caller passed an event whose
+    ///      `community_id` doesn't match this engine) with a clear
+    ///      `LocalInsertError::WrongCommunity` rather than letting the
+    ///      mismatch surface as an opaque verify rejection.
+    ///   2. Bind `VerifyContext.expected_community_id` to the engine's
+    ///      configured value rather than the (caller-controlled) event
+    ///      payload — without this, a malicious or buggy IPC could
+    ///      bypass the cross-community routing check by setting
+    ///      `event.community_id == self.community_id` falsely.
+    community_id: SpaceId,
     /// Admin OwnerAddr for the community. Retained so future read-side
     /// `materialize()` callers (Phase 3 IPC) can construct a
     /// `VerifyContext` without having to thread `admin_addr` through
@@ -500,6 +521,7 @@ impl CommunitySyncEngine {
         // into the InternalCtx — both the spawned task and the engine
         // accessor share the same underlying Mutex<CommunityState>.
         let state_for_engine = Arc::clone(&cfg.state);
+        let community_id_for_engine = cfg.community_id;
         let admin_addr = cfg.admin_addr;
         let identity_resolver_for_engine = cfg.identity_resolver.clone();
         let is_invite_only_for_engine = cfg.is_invite_only;
@@ -534,6 +556,7 @@ impl CommunitySyncEngine {
             shutdown_tx,
             task: Mutex::new(Some(task)),
             state: state_for_engine,
+            community_id: community_id_for_engine,
             admin_addr,
             identity_resolver: identity_resolver_for_engine,
             is_invite_only: is_invite_only_for_engine,
@@ -577,13 +600,28 @@ impl CommunitySyncEngine {
     /// notified. `Ok(InsertOutcome::AlreadyKnown)` — duplicate; no delta,
     /// no publish-notify (the previous insert already did both).
     /// `Ok(InsertOutcome::Rejected(VerifyError))` — verify failed at the
-    /// CRDT layer (banned-stickiness etc.). `Err(LocalInsertError::*)`
-    /// — failure BEFORE we got far enough to call insert (no resolver,
-    /// or resolver couldn't find the actor).
+    /// CRDT layer (banned-stickiness, signature mismatch, invite-only
+    /// missing countersig, etc.). `Err(LocalInsertError::*)` — failure
+    /// BEFORE we got far enough to call insert (event mis-routed to a
+    /// different community's engine, no resolver, or resolver couldn't
+    /// find the actor).
     pub async fn insert_local_event(
         &self,
         event: crate::community_membership::SignedMembershipEvent,
     ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        // Defense in depth: reject mis-routed events at the entry point
+        // with a clear error class. The VerifyContext below ALSO binds
+        // expected_community_id to self.community_id (NOT event.community_id),
+        // so even without this guard the receive-side check would catch
+        // the mismatch — but as an opaque verify rejection rather than a
+        // routing diagnostic.
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+
         let resolver = self
             .identity_resolver
             .as_ref()
@@ -600,8 +638,14 @@ impl CommunitySyncEngine {
             None
         };
 
+        // Bind expected_community_id to the engine's configured value,
+        // NOT the (caller-controlled) event payload. Without this, a
+        // malicious or buggy IPC could bypass the cross-community routing
+        // check by passing an event whose community_id matches what it
+        // claims. The entry-point guard above gives a clearer error class
+        // for the common honest mismatch case.
         let ctx = crate::community_membership::VerifyContext {
-            expected_community_id: event.community_id,
+            expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &actor_pub,

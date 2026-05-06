@@ -13,7 +13,7 @@
 //! AppHandle in tests until ZEB-247). The IPC wrappers are thin
 //! plumbing over the inner pure helpers tested here.
 
-use harmony_app::community_membership::{MaterializedMembership, MemberStatus};
+use harmony_app::community_membership::MaterializedMembership;
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
     CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
@@ -23,7 +23,7 @@ use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::OwnerAddr;
 use harmony_app::{
     delta_to_change, member_info_for, mint_community_creation, mint_leave_event, mint_redemption,
-    MembershipChangeType,
+    MemberStatusDto, MembershipChangeType,
 };
 use harmony_identity::PrivateIdentity;
 use std::collections::HashMap;
@@ -337,7 +337,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         .iter()
         .find(|d| d.addr == hex::encode(owner_b.0))
         .expect("B still in member list (Left, not removed)");
-    assert_eq!(b_row.status, MemberStatus::Left);
+    assert_eq!(b_row.status, MemberStatusDto::Left);
 
     engine_a.shutdown().await.expect("shutdown a");
     engine_b.shutdown().await.expect("shutdown b");
