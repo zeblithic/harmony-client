@@ -12,8 +12,11 @@
 //! wire type, the `CommunityRootHlcTracker`, and the
 //! `CommunitySyncEngine`. The internal task ships the debounced
 //! publish loop (notify_dirty → debounce → publish_root_now,
-//! flush_now → force-publish, shutdown → final flush); the subscriber
-//! arm is still a stub (Task 8 fills in handle_incoming_publish).
+//! flush_now → force-publish, shutdown → final flush) and the
+//! receive pipeline (`handle_incoming_publish` decrypts root publishes,
+//! fetches + decrypts the encrypted blob from CAS, re-runs
+//! `verify_event` per event, and merges into local CRDT state, with
+//! per-publisher-device replay protection via `CommunityRootHlcTracker`).
 //! Subsequent tasks add persistence flushes and the registry.
 
 use chacha20poly1305::aead::Aead;
@@ -30,9 +33,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::community_state_crdt::CommunityState;
+use crate::community_membership::VerifyContext;
+use crate::community_state_crdt::{CommunityState, InsertOutcome};
 use crate::content_store::ContentStore;
-use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
+use crate::owner_state_crypto::{
+    canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
+};
 use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
 
 /// Errors specific to community-state encryption + decryption.
@@ -549,17 +555,54 @@ async fn internal_task(mut ctx: InternalCtx) {
                 let _ = resp_tx.send(pub_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
-                let Some(_bytes) = maybe_bytes else {
+                let Some(bytes) = maybe_bytes else {
                     tracing::error!(
                         community_id = ?ctx.community_id,
                         "community subscriber channel closed; sync inbound disabled"
                     );
+                    // Surface as a degraded-path report so the
+                    // frontend banner can flag this community as
+                    // sync-disabled. Engine stays alive in publish-
+                    // only mode; the latch prevents tight-looping
+                    // on a closed channel.
+                    if let Some(tx) = ctx.error_tx.as_ref() {
+                        let _ = tx
+                            .send(CommunityDegradedReport {
+                                community_id: ctx.community_id,
+                                reason_tag: "subscriber_channel_closed",
+                                detail: "Zenoh adapter dropped subscriber_tx; engine in publish-only mode".into(),
+                            })
+                            .await;
+                    }
                     inbound_closed = true;
                     continue;
                 };
-                // Task 8 fills in handle_incoming_publish. For now we
-                // drop the bytes — the engine stays alive in
-                // publish-only mode.
+                let outcome = handle_incoming_publish(&ctx, bytes).await;
+                if let Some(err) = outcome.error() {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        error = %err,
+                        "community incoming publish dropped"
+                    );
+                    // Surface the failure-class as a degraded-path
+                    // report so start_node's drain task can translate
+                    // it into a `community-state-sync-degraded`
+                    // Tauri event. Per the spec (§ "IPC surface →
+                    // Events"), the frontend uses these to surface
+                    // "this community's sync is degraded" banners.
+                    if let Some(tx) = ctx.error_tx.as_ref() {
+                        let _ = tx
+                            .send(CommunityDegradedReport {
+                                community_id: ctx.community_id,
+                                reason_tag: classify_incoming_error(err),
+                                detail: format!("{err}"),
+                            })
+                            .await;
+                    }
+                }
+                // Persist on Mutated | MutatedTrackerOnly |
+                // ErrPostMutation lands in Task 10 (consumes
+                // `outcome.needs_persist()` + `outcome.crdt_mutated()`).
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
@@ -697,4 +740,293 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     };
     tracker.record(now.clone());
     now
+}
+
+/// Outcome of processing one inbound state-root publish. Mirrors the
+/// `IncomingOutcome` enum from `owner_state_sync` — the variants
+/// distinguish where the failure happened so the caller persists only
+/// when local state actually changed (Task 10's persist hook).
+///
+/// Community-state introduces a tri-state on the success side
+/// (`Mutated` vs `MutatedTrackerOnly`) because the receiver may accept
+/// a publish whose blob carries only events we already have in our
+/// log (`AlreadyKnown`). The tracker still advances — we don't want
+/// next-boot to re-fetch the same blob — but the CRDT itself is
+/// byte-identical, so Task 10 can skip the larger `crdt.cbor` fsync
+/// and only flush `replay.cbor`.
+#[derive(Debug)]
+enum IncomingOutcome {
+    /// `would_accept` rejected the wire HLC at the early replay-check
+    /// (step 2). No state change. Don't persist.
+    Duplicate,
+    /// Tracker advanced AND ≥ 1 new event was Inserted into the CRDT.
+    /// Persist both `crdt.cbor` and `replay.cbor`.
+    Mutated,
+    /// Tracker advanced but every event in the remote blob was already
+    /// in our log (`AlreadyKnown`). The CRDT is byte-identical; only
+    /// `replay.cbor` needs to flush. Distinguishing this from `Mutated`
+    /// lets Task 10's persist path skip the larger `crdt.cbor` fsync
+    /// when a peer re-broadcasts the same event set with an advanced
+    /// clock.
+    MutatedTrackerOnly,
+    /// Failure occurred BEFORE the tracker advanced (decrypt-root,
+    /// payload decode, blob fetch, blob decrypt, blob decode,
+    /// misrouted-blob check). No state change. Don't persist.
+    ErrPreMutation(CommunitySyncError),
+    /// Failure occurred AFTER the tracker advanced. Tracker is in-
+    /// memory dirty; persist defensively so a restart doesn't replay
+    /// the same publish.
+    ErrPostMutation(CommunitySyncError),
+}
+
+impl IncomingOutcome {
+    /// Whether the disk needs flushing. Task 10's `persist_both` is
+    /// the broad case (CRDT + replay); for `MutatedTrackerOnly`
+    /// callers can use `persist_replay_only` to skip the CRDT fsync.
+    #[allow(dead_code)] // consumed in Task 10's persist hook.
+    fn needs_persist(&self) -> bool {
+        matches!(
+            self,
+            Self::Mutated | Self::MutatedTrackerOnly | Self::ErrPostMutation(_)
+        )
+    }
+
+    /// Whether the CRDT itself changed (≥ 1 event Inserted). Used by
+    /// Task 10 to decide between `persist_both` and `persist_replay_only`.
+    #[allow(dead_code)] // consumed in Task 10's persist hook.
+    fn crdt_mutated(&self) -> bool {
+        matches!(self, Self::Mutated | Self::ErrPostMutation(_))
+    }
+
+    fn error(&self) -> Option<&CommunitySyncError> {
+        match self {
+            Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
+            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly => None,
+        }
+    }
+}
+
+/// Process one inbound state-root publish. See `IncomingOutcome` for
+/// the return-value semantics.
+///
+/// Pipeline:
+/// 1. Decrypt the wire packet (random-nonce + AAD).
+/// 2. Decode `CommunityRootPublishPayload`.
+/// 3. Replay-check via `tracker.would_accept` (early-exit Duplicate).
+/// 4. Fetch the encrypted blob from CAS (cache miss → ErrPreMutation).
+/// 5. Decrypt the blob (deterministic-nonce).
+/// 6. Decode `CommunityState`.
+/// 7. Misrouted-blob check: `remote.community_id == ctx.community_id`.
+/// 8. Advance `tracker` — single mutation point. Subsequent failures
+///    are ErrPostMutation so the caller persists tracker advance.
+/// 9. For each event: skip-if-known; resolve actor + countersigner
+///    identity_pubs (skip-on-error); call `state.insert_event` with a
+///    fresh `VerifyContext`; surface `Rejected` outcomes as
+///    `CommunityDegradedReport` on `error_tx`.
+async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
+    // 1. Decrypt root publish.
+    let payload_bytes = match decrypt_root_publish(&ctx.membership_key, &wire) {
+        Ok(b) => b,
+        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+    };
+    let payload: CommunityRootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(e.to_string()))
+        }
+    };
+
+    // 2. Replay-protect via per-community RootHlcTracker. Read-only —
+    //    the `record` step happens after the rest of the receive
+    //    pipeline succeeds (single state-mutation point at step 8).
+    {
+        let tracker = ctx.tracker.lock().await;
+        if !tracker.would_accept(&payload.at) {
+            return IncomingOutcome::Duplicate;
+        }
+    }
+
+    // 3. Fetch the encrypted blob from CAS. Cache-miss is a pre-mutation
+    //    failure — the publish carries a CID we couldn't resolve in
+    //    time; CRDT eventual consistency lets the next state-root from
+    //    any peer recover.
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(
+                crate::content_store::ContentStoreError::Io(format!(
+                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
+                    payload.root_cid
+                )),
+            ));
+        }
+        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
+    };
+
+    // 4. Decrypt blob (deterministic-nonce).
+    let blob_cleartext = match decrypt_blob(&ctx.membership_key, &blob_ciphertext) {
+        Ok(b) => b,
+        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+    };
+
+    // 5. Decode CommunityState.
+    let remote: CommunityState = match canonical_cbor_decode(&blob_cleartext) {
+        Ok(s) => s,
+        Err(e) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(e.to_string()))
+        }
+    };
+
+    // 5b. Reject misrouted blob: blob's community_id must match the
+    //     engine's expected community_id. Without this, a
+    //     ContentStore-collision (vanishingly unlikely with SHA-256
+    //     but cheap to gate) or buggy callsite could surface a
+    //     foreign community's events under our key.
+    if remote.community_id != ctx.community_id {
+        return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(format!(
+            "remote blob community_id {:?} != expected {:?}",
+            remote.community_id, ctx.community_id
+        )));
+    }
+
+    // 6. Advance the replay tracker BEFORE merging events. This is
+    //    the single state-mutation point — if any subsequent step
+    //    fails, we mark the outcome ErrPostMutation so the caller
+    //    persists tracker advance to disk (preventing replay on
+    //    next-boot).
+    {
+        let mut tracker = ctx.tracker.lock().await;
+        tracker.record(payload.at.clone());
+    }
+
+    // 7. Merge events. Each event must re-verify against B's
+    //    prior_state_at_event — we don't trust A's verification.
+    let resolver = match ctx.identity_resolver.as_ref() {
+        Some(r) => Arc::clone(r),
+        None => {
+            // Phase 2's receive-side verify needs an identity resolver
+            // to map event.actor → identity_pub. None means we can't
+            // verify any incoming event. Tracker already advanced;
+            // surface as ErrPostMutation so persist hook still runs.
+            return IncomingOutcome::ErrPostMutation(CommunitySyncError::CborDecode(
+                "no identity resolver configured — Phase 2 receive-side verify needs one".into(),
+            ));
+        }
+    };
+
+    let mut state = ctx.state.lock().await;
+    let mut inserted_any = false;
+    for event in remote.events.into_values() {
+        // Skip events we already have. Avoids the prior_state_at_event
+        // recomputation cost on every duplicate Zenoh fanout echo.
+        if state.events.contains_key(&event.id) {
+            continue;
+        }
+
+        // Resolve identity_pub for this event's actor + (if present)
+        // countersig signer. Skip-on-error, log+continue if either
+        // can't be resolved — mirrors the skip-on-error pattern from
+        // decrypt_inbox_entries (DM transport). A single corrupt or
+        // unknown-pubkey event must not fail the whole replay.
+        let actor_pub = match resolver.resolve(&event.actor) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    actor = ?event.actor,
+                    "skipping incoming event: unknown actor identity_pub"
+                );
+                continue;
+            }
+        };
+
+        let cs_pub_storage;
+        let cs_pub: Option<&[u8; 64]> = match event.countersig.as_ref() {
+            None => None,
+            Some(cs) => match resolver.resolve(&cs.signer) {
+                Some(p) => {
+                    cs_pub_storage = p;
+                    Some(&cs_pub_storage)
+                }
+                None => {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        signer = ?cs.signer,
+                        "skipping incoming event: unknown countersigner identity_pub"
+                    );
+                    continue;
+                }
+            },
+        };
+
+        let ctx_v = VerifyContext {
+            expected_community_id: ctx.community_id,
+            admin_addr: ctx.admin_addr,
+            is_invite_only: ctx.is_invite_only,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: cs_pub,
+        };
+
+        match state.insert_event(event, &ctx_v) {
+            InsertOutcome::Inserted => {
+                inserted_any = true;
+            }
+            InsertOutcome::AlreadyKnown => {
+                // Skip — already in our log. Don't flip inserted_any
+                // because the CRDT is unchanged; without this, every
+                // duplicate Zenoh fanout echo would trigger a
+                // disk-persist on the Mutated arm at Task 10.
+            }
+            InsertOutcome::Rejected(verr) => {
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    error = ?verr,
+                    "skipping incoming event: verify_event rejected"
+                );
+                // Surface the rejection as a degraded-path report —
+                // verify_event rejections at receive time are the
+                // most useful signal for the frontend banner (forged
+                // sigs, insufficient power, banned-actor replays
+                // etc). One bad event does not block valid ones in
+                // the same publish — defense-in-depth at both
+                // layers (Phase 1 spec §"Defense-in-depth").
+                if let Some(tx) = ctx.error_tx.as_ref() {
+                    let _ = tx
+                        .send(CommunityDegradedReport {
+                            community_id: ctx.community_id,
+                            reason_tag: "verify_event_rejected",
+                            detail: format!("{verr:?}"),
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    // The tracker advanced (step 6) regardless of whether any event
+    // was Inserted. Differentiate so Task 10 can persist the smaller
+    // replay.cbor file alone when the CRDT is unchanged. See the
+    // `IncomingOutcome` doc comments for the full rationale.
+    if inserted_any {
+        IncomingOutcome::Mutated
+    } else {
+        IncomingOutcome::MutatedTrackerOnly
+    }
+}
+
+/// Translate a `CommunitySyncError` into a stable short reason-tag for
+/// `CommunityDegradedReport`. Stable across versions so the frontend's
+/// banner copy can switch on the tag without parsing free-form
+/// `detail` strings; new variants get appended over time as new
+/// failure classes surface.
+fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
+    match err {
+        CommunitySyncError::Crypto(_) => "decrypt_failed",
+        CommunitySyncError::CborEncode(_) | CommunitySyncError::CborDecode(_) => {
+            "wire_decode_failed"
+        }
+        CommunitySyncError::ContentStore(_) => "blob_fetch_failed",
+        CommunitySyncError::TransportClosed => "transport_closed",
+        CommunitySyncError::Persist(_) => "persist_failed",
+    }
 }
