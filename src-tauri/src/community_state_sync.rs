@@ -1352,3 +1352,52 @@ impl CommunitySyncRegistry {
         self.engines.lock().await.keys().cloned().collect()
     }
 }
+
+/// Identity resolver backed by Sub-A's owner-device cache. The cache
+/// maps OwnerAddr → DeviceIdentityHash → identity_pub bytes via
+/// RegisterDevice events; this resolver picks the FIRST recorded
+/// identity_pub for the queried owner.
+///
+/// Semantic note on OwnerAddr ↔ DeviceIdentityHash: community_membership's
+/// `event.actor: OwnerAddr` carries the SAME 16 bytes as a
+/// `DeviceIdentityHash` — both are `SHA256(X25519_pub || Ed25519_pub)[:16]`
+/// of the signing identity. The Phase 1 `verify_signature` enforces this
+/// via `Identity::from_public_bytes(actor_identity_pub).address_hash ==
+/// event.actor.0`, so the resolver must look up identity_pub by treating
+/// `event.actor` as a device-hash key.
+///
+/// The cache stores one `OwnerDeviceEntry` per OWNER (master OwnerAddr),
+/// each entry carrying a parallel-vec `(devices: Vec<DeviceIdentityHash>,
+/// device_identity_pubs: Vec<Option<[u8; 64]>>)`. To resolve an
+/// event-actor → identity_pub, we must iterate ALL owner entries and
+/// binary-search each entry's `devices` vec for the target hash. The
+/// existing `crate::dm_outbox::lookup_pubkey_for_device` helper
+/// (`dm_outbox.rs:1575`) does exactly this — `OwnerDeviceCacheResolver`
+/// is a thin wrapper around it that adapts the OwnerAddr ↔
+/// DeviceIdentityHash newtype boundary.
+pub struct OwnerDeviceCacheResolver {
+    cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+}
+
+impl OwnerDeviceCacheResolver {
+    pub fn new(cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>) -> Self {
+        Self { cache }
+    }
+}
+
+impl IdentityResolver for OwnerDeviceCacheResolver {
+    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        use crate::dm_outbox::lookup_pubkey_for_device;
+        use crate::owner_state_types::DeviceIdentityHash;
+        // Synchronous trait fn over an async Mutex — use try_lock so a
+        // contended cache surfaces as None (treated as
+        // UnknownSigningKey, which is the correct fallback) rather than
+        // blocking the engine's tokio task. The Mutex is short-held in
+        // production paths.
+        let cache = self.cache.try_lock().ok()?;
+        // OwnerAddr and DeviceIdentityHash are bytes-compatible newtypes
+        // (both wrap [u8; 16]). Reinterpret without copying.
+        let device_hash = DeviceIdentityHash(addr.0);
+        lookup_pubkey_for_device(&cache.owner_device_cache, device_hash)
+    }
+}

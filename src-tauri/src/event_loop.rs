@@ -38,6 +38,39 @@ pub struct SyncEngineHandles {
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// One per-community adapter request handed from `start_node` (lib.rs)
+/// into the event loop's Zenoh-session scope.
+///
+/// `start_node` owns the `CommunitySyncRegistry` and the
+/// per-community channel pairs the registry's engines consume; the
+/// matching halves (publisher_rx + subscriber_tx) need to be wired
+/// to a Zenoh publisher / subscriber on
+/// `harmony/community/{id_hex}/state-root-v1`. But the Zenoh
+/// `Session` is opened inside `event_loop::run`, not in `start_node`,
+/// so `start_node` builds one of these per joined community and
+/// passes the `Vec<CommunityAdapterRequest>` into `event_loop::run`.
+/// `event_loop::run` iterates the Vec after the session is open and
+/// calls `spawn_community_state_zenoh_adapter` for each entry.
+///
+/// Mirrors the `SyncEngineHandles` cross-boundary pattern used for
+/// the owner-state SyncEngine (see above) — same reason (the engine
+/// constructor needs the channels' OTHER halves at start_node time,
+/// before the session exists), same shape (one struct carrying the
+/// halves we need to keep alive until session-open).
+pub struct CommunityAdapterRequest {
+    /// Hex-encoded community SpaceId (32 chars, lowercase) — used to
+    /// form the per-community state-root topic key
+    /// `harmony/community/{id_hex}/state-root-v1`.
+    pub id_hex: String,
+    /// Engine's outbound channel: bytes the engine writes here drain
+    /// into Zenoh `put` on the per-community topic.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Engine's inbound channel: bytes Zenoh receives on the per-
+    /// community topic are forwarded here, where the engine reads
+    /// them out via its paired `subscriber_rx`.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -180,6 +213,17 @@ pub async fn run<R: Runtime>(
     // both directions push; event_loop drains via unicast_send_rx for
     // both. None when no owner identity is loaded.
     unicast_send_tx: Option<mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    // ZEB-217 Sub-C Phase 2 Task 13: per-community state-CRDT Zenoh
+    // adapter requests. `start_node` scans owner-state for joined
+    // communities, spawns one engine per community via
+    // `CommunitySyncRegistry`, and passes the matching channel halves
+    // through this Vec so we can call
+    // `spawn_community_state_zenoh_adapter` once the session is open.
+    // Empty Vec when no owner identity is loaded or no communities
+    // joined yet — Phase 3 IPC ships `create_community` /
+    // `redeem_invite` which spawn additional engines at runtime
+    // through the registry directly (those bypass this Vec).
+    community_adapters: Vec<CommunityAdapterRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -381,6 +425,35 @@ pub async fn run<R: Runtime>(
                 // handles.outbound_rx and handles.inbound_tx drop at end
                 // of this arm; engine sees both channels close.
             }
+        }
+    }
+
+    // ── ZEB-217 Sub-C Phase 2: per-community state-CRDT Zenoh adapters ──
+    // start_node spawned one engine per joined community via
+    // `CommunitySyncRegistry` and handed us the matching channel halves
+    // through `community_adapters`. Wire each to a Zenoh pub/sub on
+    // `harmony/community/{id_hex}/state-root-v1` now that the session
+    // is open and the `closing` flag exists. Each adapter runs as an
+    // independent task — failure to bind one community's topic doesn't
+    // affect any other.
+    //
+    // `spawn_community_state_zenoh_adapter` (shipped by Task 12) takes
+    // `Arc<Session>` rather than the raw `Session`-clone shape used
+    // by the owner-state adapter above, so wrap the session in Arc
+    // once and bump the count per adapter. The owner-state adapter
+    // continues to use `session.clone()` directly via Zenoh's
+    // internal-Arc shape — both paths terminate at the same session
+    // object.
+    if !community_adapters.is_empty() {
+        let session_arc = Arc::new(session.clone());
+        for req in community_adapters {
+            spawn_community_state_zenoh_adapter(
+                Arc::clone(&session_arc),
+                req.id_hex,
+                req.publisher_rx,
+                req.subscriber_tx,
+                Arc::clone(&closing),
+            );
         }
     }
 

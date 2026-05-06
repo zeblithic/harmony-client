@@ -192,6 +192,19 @@ pub struct NodeState {
     /// owner identity (master_seed) is available. Shutdown is called
     /// explicitly in `stop_inner` before the event-loop thread is joined.
     sync_engine: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    /// ZEB-217 Sub-C Phase 2: registry of per-community state-CRDT
+    /// SyncEngines. Lifted from start_node (mirrors `sync_engine`
+    /// above) so Phase 3 IPC handlers (create_community,
+    /// redeem_invite, leave_community, list_community_members) can
+    /// reach the engine pool without holding the per-engine Arcs
+    /// directly. Shared with the event-loop ONLY through the
+    /// per-community `CommunityAdapterRequest`s passed at startup;
+    /// the registry itself is owned exclusively by NodeState.
+    /// Shutdown (`registry.shutdown_all()`) is awaited explicitly in
+    /// `stop_inner` BEFORE the event-loop thread is joined so each
+    /// engine's final flush + persist runs while the Zenoh session
+    /// (and thus the publisher) is still live.
+    community_registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
@@ -270,6 +283,7 @@ impl Default for NodeState {
             node_addr: String::new(),
             pairing_handle: None,
             sync_engine: None,
+            community_registry: None,
             dm_outbox: None,
             dm_transport: None,
             crdt_state: None,
@@ -440,6 +454,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         _mail_sync,
         pairing_handle,
         sync_engine,
+        community_registry,
         dm_outbox,
         dm_transport,
         crdt_state,
@@ -478,6 +493,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.mail_sync.take(),
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
+            guard.community_registry.take(),
             guard.dm_outbox.take(),
             guard.dm_transport.take(),
             guard.crdt_state.take(),
@@ -529,6 +545,46 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // last reference reach the close threshold. The event_loop's receiver
     // gets None on its next .recv() and the select arm de-registers.
     drop(unicast_send_tx);
+    // ZEB-217 Sub-C Phase 2: shut down the per-community engine pool
+    // BEFORE the owner-state SyncEngine. Each community engine drives
+    // its own debounced final-publish + persist pass on
+    // `shutdown()`; running this before the event-loop thread joins
+    // keeps the Zenoh session (and per-community publisher tasks)
+    // alive long enough for the final state-root publish to land on
+    // the wire. Awaiting all engines also closes their internal
+    // `error_tx` clones, which lets the start_node-spawned drain task
+    // exit cleanly when its receiver returns None.
+    //
+    // Same `thread::scope` + ephemeral-runtime pattern as the
+    // SyncEngine shutdown below — `stop_inner` is sync but reachable
+    // from async contexts, and a `block_on` from inside an existing
+    // runtime panics.
+    if let Some(registry) = community_registry {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(registry.shutdown_all()) {
+                            tracing::error!(
+                                error = %e,
+                                "CommunitySyncRegistry shutdown_all failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for \
+                             CommunitySyncRegistry shutdown — final publish/persist skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -683,6 +739,7 @@ async fn start_node(
         old_voice_channel,
         old_pairing_handle,
         old_sync_engine,
+        old_community_registry,
         old_dm_outbox,
         old_dm_transport,
         old_crdt_state,
@@ -705,6 +762,10 @@ async fn start_node(
             guard.voice_channel_tx.take(),
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
+            // ZEB-217 Sub-C Phase 2: take + shutdown the previous
+            // identity's per-community engine pool. Mirrors stop_inner's
+            // ordering — drain communities BEFORE the owner SyncEngine.
+            guard.community_registry.take(),
             // ZEB-225 Sub-B Phase 2: take + drop the per-identity DM
             // handles so a restart doesn't carry stale Arc<DmOutbox> /
             // Arc<DmTransport> / Arc<OwnerState> / Arc<HlcTracker> /
@@ -759,6 +820,20 @@ async fn start_node(
     // so the new generation's RuntimeUnicastTransport (Task 11) sees no
     // stale clones outside the new NodeState.
     drop(old_unicast_send_tx);
+    // ZEB-217 Sub-C Phase 2: explicitly await the previous community
+    // engine pool's shutdown BEFORE the owner SyncEngine. Mirrors
+    // stop_inner's ordering — community engines need their final
+    // state-root publish to land on the wire before the event-loop
+    // thread joins. We're in async start_node so no thread::scope
+    // juggling needed (unlike stop_inner).
+    if let Some(registry) = old_community_registry {
+        if let Err(e) = registry.shutdown_all().await {
+            tracing::error!(
+                error = %e,
+                "previous CommunitySyncRegistry shutdown_all failed during start_node restart"
+            );
+        }
+    }
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping
@@ -862,6 +937,19 @@ async fn start_node(
             std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
         > = None;
         let mut dm_transport_arc: Option<std::sync::Arc<dyn crate::dm_outbox::DmTransport>> = None;
+        // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
+        // adapter requests handed to the event loop. Both stay None /
+        // empty when no owner identity is loaded (registry depends on
+        // crdt_state). When an owner IS loaded, we build the registry
+        // inside the if-let block below, scan owner-state for joined
+        // communities, spawn one engine per community, and push one
+        // CommunityAdapterRequest per spawn for event_loop::run to
+        // wire up against the Zenoh session.
+        let mut community_registry_arc: Option<
+            std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+        > = None;
+        let mut community_adapter_requests: Vec<crate::event_loop::CommunityAdapterRequest> =
+            Vec::new();
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -998,6 +1086,153 @@ async fn start_node(
                         inbound_tx: in_tx,
                     });
 
+                    // ── ZEB-217 Sub-C Phase 2: per-community state CRDT sync ─
+                    //
+                    // Build the registry (owns the multi-community engine pool)
+                    // and the degraded-event drain task. Each spawned engine
+                    // clones `community_error_tx` into its
+                    // CommunitySyncEngineConfig; the receiver lives here and
+                    // feeds a tokio task that emits
+                    // `community-state-sync-degraded` Tauri events per the
+                    // spec. Channel capacity is sized for burst-tolerance
+                    // under degraded conditions (e.g., a flaky peer
+                    // continuously republishing malformed bytes); a full
+                    // channel falls back to dropping the report (`error_tx`'s
+                    // emit sites use `tx.send(...).await.ok()`-style fire-
+                    // and-forget) so a single noisy community can't starve
+                    // the rest of the engine pool.
+                    let (community_error_tx, mut community_error_rx) = tokio::sync::mpsc::channel::<
+                        crate::community_state_sync::CommunityDegradedReport,
+                    >(64);
+
+                    let registry: std::sync::Arc<
+                        crate::community_state_sync::CommunitySyncRegistry,
+                    > = {
+                        let resolver: std::sync::Arc<
+                            dyn crate::community_state_sync::IdentityResolver,
+                        > = std::sync::Arc::new(
+                            crate::community_state_sync::OwnerDeviceCacheResolver::new(
+                                std::sync::Arc::clone(&crdt_state),
+                            ),
+                        );
+                        let cfg = crate::community_state_sync::CommunityRegistryConfig {
+                            device_id: device_id.clone(),
+                            content_store: std::sync::Arc::clone(&content_store),
+                            identity_resolver: resolver,
+                            identity_dir: identity_dir.clone(),
+                            debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                            error_tx: Some(community_error_tx),
+                        };
+                        std::sync::Arc::new(
+                            crate::community_state_sync::CommunitySyncRegistry::new(cfg),
+                        )
+                    };
+
+                    // Drain task: translate each degraded report into a
+                    // Tauri event. The frontend's CommunityService
+                    // subscribes to surface a "this community's sync is
+                    // degraded" banner. Task exits cleanly when
+                    // `community_error_rx.recv()` returns None — that
+                    // happens after every engine's `error_tx` clone
+                    // drops, which is when `registry.shutdown_all()`
+                    // completes (each engine's internal task ends and
+                    // its config-owned sender drops with it).
+                    {
+                        let app_handle = app.clone();
+                        tokio::spawn(async move {
+                            while let Some(report) = community_error_rx.recv().await {
+                                let id_hex = hex::encode(report.community_id.0);
+                                let payload = serde_json::json!({
+                                    "communityId": id_hex,
+                                    "reason": report.reason_tag,
+                                    "detail": report.detail,
+                                });
+                                if let Err(e) =
+                                    app_handle.emit("community-state-sync-degraded", payload)
+                                {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "failed to emit community-state-sync-degraded"
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                "community-state-sync-degraded drain task exiting (registry shutdown)"
+                            );
+                        });
+                    }
+
+                    // Scan owner-state for joined communities and spawn
+                    // one engine per community. Each spawn allocates a
+                    // pair of mpsc channels here (publisher_tx /
+                    // subscriber_rx for the engine; matching
+                    // publisher_rx / subscriber_tx into a
+                    // CommunityAdapterRequest the event loop wires to
+                    // Zenoh after `zenoh::open`). Skip any Community
+                    // Space that's missing membership_key or admin_addr
+                    // — those fields are MUST-be-Some-for-Community per
+                    // owner_state_types.rs:1420 / 1427, so a missing
+                    // value means a corrupt or partially-applied row;
+                    // logging + skipping keeps boot resilient rather
+                    // than crashing the node.
+                    {
+                        let state_snap = crdt_state.lock().await;
+                        for (space_id, space) in &state_snap.spaces {
+                            if space.kind != crate::owner_state_types::SpaceKind::Community {
+                                continue;
+                            }
+                            if space.left_at.is_some() {
+                                continue;
+                            }
+                            let mk = match space.membership_key.as_ref() {
+                                Some(k) => k.clone(),
+                                None => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        "community Space missing membership_key — skipping engine spawn"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let admin = match space.admin_addr {
+                                Some(a) => a,
+                                None => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        "community Space missing admin_addr — skipping engine spawn"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let is_invite_only = space.is_invite_only.unwrap_or(false);
+
+                            let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                            let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+                            let id_hex = hex::encode(space_id.0);
+                            community_adapter_requests.push(
+                                crate::event_loop::CommunityAdapterRequest {
+                                    id_hex,
+                                    publisher_rx: pub_rx,
+                                    subscriber_tx: sub_tx,
+                                },
+                            );
+
+                            if let Err(e) = registry
+                                .spawn_engine(*space_id, mk, admin, is_invite_only, pub_tx, sub_rx)
+                                .await
+                            {
+                                tracing::error!(
+                                    ?space_id,
+                                    error = %e,
+                                    "failed to spawn community engine"
+                                );
+                            }
+                        }
+                    }
+
+                    community_registry_arc = Some(registry);
+
                     // Lift the per-identity handles out for NodeState
                     // assignment below.
                     device_id_for_state = Some(device_id);
@@ -1103,6 +1338,11 @@ async fn start_node(
         //   outbound CidNotify. Same channel, both directions push.
         let cas_handle_for_loop = content_store_for_state.clone();
         let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
+        // ZEB-217 Sub-C Phase 2: per-community Zenoh adapter requests.
+        // Move (not clone) — the Vec carries Receiver halves the engines
+        // already own the matching Sender / other-half for; only the
+        // event loop reads from this Vec, no other consumer.
+        let community_adapter_requests_for_loop = std::mem::take(&mut community_adapter_requests);
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -1195,6 +1435,7 @@ async fn start_node(
                         Some(unicast_send_rx),
                         cas_handle_for_loop,
                         unicast_send_tx_for_loop,
+                        community_adapter_requests_for_loop,
                     )
                     .await;
                 });
@@ -1228,6 +1469,11 @@ async fn start_node(
                 guard.mail_sync = Some(mail_sync);
                 guard.node_addr = node_addr_for_state;
                 guard.sync_engine = sync_engine_arc.clone();
+                // ZEB-217 Sub-C Phase 2: stash the per-community engine
+                // registry on NodeState so Phase 3 IPC handlers can
+                // reach it. Cloned (Arc bump) — `community_registry_arc`
+                // is also held by the failure-cleanup tuple below.
+                guard.community_registry = community_registry_arc.clone();
                 // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
                 // handles on NodeState for send_dm IPC + (T7) drain tick.
                 guard.dm_outbox = dm_outbox_arc.clone();
@@ -1254,20 +1500,33 @@ async fn start_node(
                 thread_install_failure = Some(format!("failed to spawn runtime thread: {e}"));
             }
         }
-        // The third tuple element carries the SyncEngine Arc back out
-        // of the block so the failure-cleanup path below can await
-        // `shutdown()` on it without holding the std `MutexGuard`
-        // across an await (the guard is `!Send`). On success this
-        // Arc is discarded; NodeState already owns its own clone.
+        // The third + fourth tuple elements carry the SyncEngine + the
+        // CommunitySyncRegistry Arcs back out of the block so the
+        // failure-cleanup path below can await `shutdown()` on each
+        // without holding the std `MutexGuard` across an await (the
+        // guard is `!Send`). On success these Arcs are discarded;
+        // NodeState already owns its own clone of each.
         (
             guard.generation,
             thread_install_failure,
             sync_engine_arc.clone(),
+            community_registry_arc.clone(),
         )
     };
-    let (our_gen, thread_spawn_failure, engine_for_cleanup) = our_gen;
+    let (our_gen, thread_spawn_failure, engine_for_cleanup, registry_for_cleanup) = our_gen;
 
     if let Some(msg) = thread_spawn_failure {
+        // ZEB-217 Sub-C Phase 2: shutdown the registry FIRST so each
+        // community engine's final flush completes before the owner
+        // SyncEngine tears down. Mirrors stop_inner's ordering.
+        if let Some(registry) = registry_for_cleanup {
+            if let Err(e) = registry.shutdown_all().await {
+                tracing::error!(
+                    error = %e,
+                    "CommunitySyncRegistry cleanup after runtime-thread spawn failure"
+                );
+            }
+        }
         if let Some(engine) = engine_for_cleanup {
             if let Err(e) = engine.shutdown().await {
                 tracing::error!(
