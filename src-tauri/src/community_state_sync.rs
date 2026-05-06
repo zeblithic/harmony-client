@@ -20,7 +20,14 @@
 //! and the per-arm persist hooks (Task 10) that flush
 //! `crdt.cbor` + `replay.cbor` to disk through `community_state_persist`
 //! after debounce wakeups, after merge of incoming publishes, and on
-//! shutdown. Subsequent tasks add the multi-community registry.
+//! shutdown. The multi-community lifecycle layer ships in
+//! `CommunitySyncRegistry` (Task 11) — it owns
+//! `BTreeMap<SpaceId, Arc<CommunitySyncEngine>>` under a Mutex,
+//! derives per-community persist paths under
+//! `identity_dir/communities/{id_hex}/`, loads any prior CRDT + replay
+//! snapshot from disk before spawning each engine, and surfaces idempotent
+//! `spawn_engine` / `stop_engine` / `shutdown_all` / `known_ids` for the
+//! owner-state subscription scan in Task 12.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -38,7 +45,7 @@ use tokio::task::JoinHandle;
 
 use crate::community_membership::VerifyContext;
 use crate::community_state_crdt::{CommunityState, InsertOutcome};
-use crate::community_state_persist::{save_crdt, save_replay};
+use crate::community_state_persist::{load_crdt, load_replay, save_crdt, save_replay};
 use crate::content_store::ContentStore;
 use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
@@ -1145,5 +1152,199 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
         CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
+    }
+}
+
+/// Construction-time config for `CommunitySyncRegistry::new`. The
+/// registry clones the relevant pieces into every spawned engine's
+/// `CommunitySyncEngineConfig` (content_store + identity_resolver +
+/// device_id + debounce_ms + error_tx). The persist paths are derived
+/// per-community from `identity_dir` via `paths_for`.
+pub struct CommunityRegistryConfig {
+    /// This device's stable ID, used as the publisher key in every
+    /// engine's HLC and replay tracker.
+    pub device_id: String,
+    /// Shared CAS handle. Cloned (Arc bump) into every engine.
+    pub content_store: Arc<dyn ContentStore>,
+    /// Resolver for `OwnerAddr` -> 64-byte identity_pub at receive-side
+    /// `verify_event` time. Production wires Sub-A's owner-device
+    /// cache via `OwnerDeviceCacheResolver` (Task 13); test stubs
+    /// implement the trait directly.
+    pub identity_resolver: Arc<dyn IdentityResolver>,
+    /// Filesystem root under which per-community subdirectories live
+    /// (`identity_dir/communities/{id_hex}/`). The registry derives
+    /// each engine's `PersistPaths` from this.
+    pub identity_dir: PathBuf,
+    /// Debounce window between local mutations and the resulting
+    /// state-root publish. See `DEFAULT_DEBOUNCE_MS`.
+    pub debounce_ms: u64,
+    /// Optional degraded-path channel. When `Some`, the registry
+    /// clones the sender into every engine's `CommunitySyncEngineConfig`,
+    /// and the receiver-side (owned by start_node — Task 13) translates
+    /// `CommunityDegradedReport`s into `community-state-sync-degraded`
+    /// Tauri events. `None` for tests that don't assert on IPC events.
+    pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+}
+
+/// Multi-community engine lifecycle manager. Owns
+/// `BTreeMap<SpaceId, Arc<CommunitySyncEngine>>` under a `tokio::Mutex`
+/// — `BTreeMap` rather than `HashMap` so `known_ids()` returns a stable
+/// ordering (Task 12 diffs against the owner-state membership snapshot,
+/// and a stable order keeps that diff readable in logs).
+///
+/// All public methods are async because they take the engines map
+/// under the tokio Mutex; callers should not assume any of them are
+/// cheap. `spawn_engine` in particular performs disk I/O
+/// (`load_crdt` + `load_replay`) under the lock.
+pub struct CommunitySyncRegistry {
+    cfg: Arc<CommunityRegistryConfig>,
+    engines: tokio::sync::Mutex<BTreeMap<SpaceId, Arc<CommunitySyncEngine>>>,
+}
+
+impl CommunitySyncRegistry {
+    pub fn new(cfg: CommunityRegistryConfig) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            engines: tokio::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Derive per-community persist paths under
+    /// `identity_dir/communities/{id_hex}/{crdt|replay}.cbor`.
+    ///
+    /// `id_hex` is lowercase, zero-padded, 32 chars (one byte per pair)
+    /// for the 16-byte `SpaceId`. Stable across boots — the registry
+    /// owns the layout convention so multiple `CommunitySyncEngine`
+    /// instances writing concurrently can never collide on the same
+    /// directory.
+    fn paths_for(&self, community_id: SpaceId) -> PersistPaths {
+        let id_hex: String = community_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = self.cfg.identity_dir.join("communities").join(&id_hex);
+        PersistPaths {
+            crdt: dir.join("crdt.cbor"),
+            replay: dir.join("replay.cbor"),
+        }
+    }
+
+    /// Spawn a new `CommunitySyncEngine` for `community_id` and insert
+    /// it into the registry's map. Loads any prior `crdt.cbor` +
+    /// `replay.cbor` from disk first so the engine starts from the
+    /// last persisted snapshot rather than empty state.
+    ///
+    /// **Idempotency:** re-spawning an already-known community is a
+    /// no-op (returns `Ok(())`), NOT an error. This tolerates duplicate
+    /// add events from owner-state mutations — Phase 3+'s subscription
+    /// scan can fire the same `Membership::Joined` delta twice without
+    /// the registry double-spawning or surfacing a spurious failure.
+    ///
+    /// **Lock scope:** the engines map lock is held across the disk
+    /// I/O (`load_crdt` + `load_replay`) and the `CommunitySyncEngine::new`
+    /// call. Concurrent `spawn_engine` calls for distinct communities
+    /// will serialise on this lock — acceptable because spawn is rare
+    /// (once per Joined event), and holding the lock through engine
+    /// construction is the only way to keep the contains-key check
+    /// race-free against another spawn for the same community.
+    pub async fn spawn_engine(
+        &self,
+        community_id: SpaceId,
+        membership_key: MembershipKey,
+        admin_addr: OwnerAddr,
+        is_invite_only: bool,
+        publisher_tx: mpsc::Sender<Vec<u8>>,
+        subscriber_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<(), CommunitySyncError> {
+        let mut engines = self.engines.lock().await;
+        if engines.contains_key(&community_id) {
+            // Idempotent — re-spawn is a no-op rather than an error
+            // so the registry tolerates duplicate add events from
+            // owner-state mutations.
+            return Ok(());
+        }
+
+        let paths = self.paths_for(community_id);
+        let initial_state = load_crdt(&paths.crdt, community_id)
+            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        let initial_tracker =
+            load_replay(&paths.replay).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+
+        let state = Arc::new(Mutex::new(initial_state));
+        let tracker = Arc::new(Mutex::new(initial_tracker));
+
+        let engine = Arc::new(CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key,
+            admin_addr,
+            is_invite_only,
+            device_id: self.cfg.device_id.clone(),
+            state,
+            tracker,
+            content_store: Arc::clone(&self.cfg.content_store),
+            publisher_tx,
+            subscriber_rx,
+            paths,
+            debounce_ms: self.cfg.debounce_ms,
+            identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
+            error_tx: self.cfg.error_tx.clone(),
+        }));
+
+        engines.insert(community_id, engine);
+        Ok(())
+    }
+
+    /// `true` if an engine is currently spawned for `community_id`.
+    /// Snapshot read — the answer can change immediately after the
+    /// caller drops the future, so callers should not assume it for
+    /// invariant checks.
+    pub async fn has_engine(&self, community_id: &SpaceId) -> bool {
+        self.engines.lock().await.contains_key(community_id)
+    }
+
+    /// Remove `community_id`'s engine from the map and await its
+    /// shutdown. Idempotent: if no engine is registered, returns
+    /// `Ok(())` (mirrors `spawn_engine`'s no-op-on-already-present
+    /// behavior — the registry treats stop-of-unknown the same way).
+    pub async fn stop_engine(&self, community_id: &SpaceId) -> Result<(), CommunitySyncError> {
+        let engine = {
+            let mut engines = self.engines.lock().await;
+            engines.remove(community_id)
+        };
+        match engine {
+            Some(e) => e.shutdown().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Drain every spawned engine, awaiting each one's shutdown in turn.
+    /// Surfaces the LAST error encountered after attempting to shut down
+    /// all engines — bailing on the first error would leak the engines
+    /// after it, which is the worse failure mode (their tasks would
+    /// outlive the registry and continue publishing). One log line per
+    /// failure preserves enough detail for post-mortem.
+    pub async fn shutdown_all(&self) -> Result<(), CommunitySyncError> {
+        let engines: Vec<Arc<CommunitySyncEngine>> = {
+            let mut e = self.engines.lock().await;
+            std::mem::take(&mut *e).into_values().collect()
+        };
+        let mut last_err: Option<CommunitySyncError> = None;
+        for e in engines {
+            if let Err(err) = e.shutdown().await {
+                tracing::warn!(error = %err, "engine shutdown failed during shutdown_all");
+                last_err = Some(err);
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Snapshot of currently-spawned community IDs. Used by Task 12's
+    /// owner-state subscription scan to compute add/remove deltas
+    /// against the membership snapshot. `BTreeMap` iteration order is
+    /// stable (sorted by `SpaceId`), so the returned `Vec` is
+    /// deterministic — useful for logging and for any caller that
+    /// wants to bisect by index.
+    pub async fn known_ids(&self) -> Vec<SpaceId> {
+        self.engines.lock().await.keys().cloned().collect()
     }
 }
