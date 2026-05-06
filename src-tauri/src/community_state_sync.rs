@@ -404,6 +404,16 @@ pub struct CommunitySyncEngine {
     /// shape exactly.
     shutdown_tx: mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Shared CRDT handle. Retained on the engine so the registry can
+    /// expose it via `state_for` for test-only inspection without
+    /// reaching into `InternalCtx`. Phase 3 ships the public IPC
+    /// surface; this accessor stays `#[doc(hidden)]` until then.
+    state: Arc<Mutex<CommunityState>>,
+    /// Admin OwnerAddr for the community. Retained so future read-side
+    /// `materialize()` callers (Phase 3 IPC) can construct a
+    /// `VerifyContext` without having to thread `admin_addr` through
+    /// the registry separately.
+    admin_addr: OwnerAddr,
 }
 
 impl CommunitySyncEngine {
@@ -418,6 +428,12 @@ impl CommunitySyncEngine {
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        // Clone the state Arc into the engine BEFORE moving cfg.state
+        // into the InternalCtx — both the spawned task and the engine
+        // accessor share the same underlying Mutex<CommunityState>.
+        let state_for_engine = Arc::clone(&cfg.state);
+        let admin_addr = cfg.admin_addr;
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -446,7 +462,29 @@ impl CommunitySyncEngine {
             flush_now_tx,
             shutdown_tx,
             task: Mutex::new(Some(task)),
+            state: state_for_engine,
+            admin_addr,
         }
+    }
+
+    /// Returns a clone of the inner `CommunityState` Arc. Test-only —
+    /// production callers go through Phase 3's IPC layer
+    /// (`materialize()` projection over a snapshot). Kept on the engine
+    /// so the registry's `state_for` doesn't need to reach into
+    /// `InternalCtx`.
+    #[doc(hidden)]
+    pub fn state(&self) -> Arc<Mutex<CommunityState>> {
+        Arc::clone(&self.state)
+    }
+
+    /// Returns the admin `OwnerAddr` this engine was configured with.
+    /// Retained so Phase 3's IPC handlers can rebuild a `VerifyContext`
+    /// for read-side `materialize()` without re-plumbing the field
+    /// through the registry. Currently unused outside that future
+    /// callsite; the integration tests don't read it.
+    #[doc(hidden)]
+    pub fn admin_addr(&self) -> OwnerAddr {
+        self.admin_addr
     }
 
     /// Hint that local CRDT state has mutated and a debounced publish
@@ -1353,6 +1391,46 @@ impl CommunitySyncRegistry {
     /// wants to bisect by index.
     pub async fn known_ids(&self) -> Vec<SpaceId> {
         self.engines.lock().await.keys().cloned().collect()
+    }
+
+    /// Returns a clone of the engine's `CommunityState` Arc for a
+    /// community, if an engine is spawned for it. **Test-only** —
+    /// production callers go through Phase 3's IPC layer; this surface
+    /// is gated as `#[doc(hidden)]` and exists so the integration test
+    /// in `tests/community_sync_integration.rs` can inspect post-
+    /// merge CRDT state without reaching into private fields.
+    #[doc(hidden)]
+    pub async fn state_for(&self, community_id: &SpaceId) -> Option<Arc<Mutex<CommunityState>>> {
+        self.engines
+            .lock()
+            .await
+            .get(community_id)
+            .map(|e| e.state())
+    }
+
+    /// Force the engine for `community_id` to publish its current CRDT
+    /// state immediately, bypassing the debounce window. Returns
+    /// `Err(CommunitySyncError::TransportClosed)` if no engine is
+    /// registered for the community (callers can treat this as a
+    /// no-op-on-unknown by ignoring that variant). **Test-only** —
+    /// Phase 3 IPC will ship the public flush surface; this accessor
+    /// is gated as `#[doc(hidden)]` to keep the integration test
+    /// contract minimal until then.
+    #[doc(hidden)]
+    pub async fn flush_now(&self, community_id: &SpaceId) -> Result<(), CommunitySyncError> {
+        // Clone the Arc<Engine> out from under the map lock so we don't
+        // hold the registry mutex through the engine's flush_now (which
+        // awaits a oneshot reply from the engine task). Holding the
+        // outer lock across that wait would serialise every other
+        // registry operation behind one engine's publish window.
+        let engine = {
+            let engines = self.engines.lock().await;
+            engines.get(community_id).cloned()
+        };
+        match engine {
+            Some(e) => e.flush_now().await,
+            None => Err(CommunitySyncError::TransportClosed),
+        }
     }
 }
 
