@@ -172,3 +172,44 @@ fn materialize_now_reflects_admin_self_join() {
         .expect("admin self-Join should appear in materialized view");
     assert_eq!(member.status, MemberStatus::Joined);
 }
+
+#[test]
+fn materialized_cache_returns_same_object_until_insert() {
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let community_id = SpaceId([1u8; 16]);
+    let mut state = CommunityState::new(community_id);
+
+    let v0 = state.materialized_version();
+    let _m1 = state.materialized(addr);
+    let _m2 = state.materialized(addr);
+    assert_eq!(
+        state.materialized_version(),
+        v0,
+        "version unchanged on read"
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: addr,
+        at: hlc(100),
+    };
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
+    state.insert_event(
+        event,
+        &VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: addr,
+            is_invite_only: false,
+            actor_identity_pub: &identity_pub,
+            countersigner_identity_pub: None,
+        },
+    );
+
+    let v1 = state.materialized_version();
+    assert!(v1 > v0, "version bumps on successful insert");
+
+    let m_after = state.materialized(addr);
+    assert_eq!(m_after.members.len(), 1, "Join event materialized");
+}
