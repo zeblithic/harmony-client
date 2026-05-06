@@ -368,6 +368,23 @@ pub struct CommunityDegradedReport {
     pub detail: String,
 }
 
+/// Membership-CRDT mutation surfaced from the engine to the IPC layer.
+/// Fired on every `InsertOutcome::Inserted` — covers both the engine's
+/// receive pipeline (DAG-synced events from peers) AND IPC-driven local
+/// inserts via `CommunitySyncEngine::insert_local_event`.
+///
+/// Shipped as a flat `event` clone rather than a delta-typed payload
+/// because the consumer (Phase 3's start_node delta task) needs the
+/// event's `kind`, `actor`, `at`, and (for Kick) `reason` to build the
+/// `community-members-changed` Tauri event payload — and shipping the
+/// signed event is cheap (a few hundred bytes) and avoids duplicating
+/// the per-kind switch inside the engine.
+#[derive(Debug, Clone)]
+pub struct CommunityMembershipDelta {
+    pub community_id: SpaceId,
+    pub event: SignedMembershipEvent,
+}
+
 /// Construction-time config bag for `CommunitySyncEngine::new`. Bundles
 /// the per-community key + identity, the shared CRDT + tracker arcs,
 /// the wire channels, the persist paths, and the optional degraded-path
@@ -401,6 +418,11 @@ pub struct CommunitySyncEngineConfig {
     /// means degraded paths log via `tracing::warn!` only — acceptable
     /// for tests that don't assert on IPC-event emission.
     pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    /// Optional sink for membership CRDT mutations. Best-effort
+    /// `try_send`; a closed or full channel surfaces as a dropped delta
+    /// (the IPC consumer is purely informational, so back-pressuring
+    /// the engine on a stuck consumer is wrong).
+    pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -471,6 +493,7 @@ impl CommunitySyncEngine {
             shutdown_rx,
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
+            delta_tx: cfg.delta_tx,
         }));
 
         Self {
@@ -571,6 +594,7 @@ struct InternalCtx {
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     identity_resolver: Option<Arc<dyn IdentityResolver>>,
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -1161,6 +1185,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // resolved event, collect rejections for out-of-lock reporting.
     let mut inserted_any = false;
     let mut rejection_reports: Vec<crate::community_membership::VerifyError> = Vec::new();
+    // Buffer inserted-event clones for delta emission AFTER the state
+    // lock is released. Same lock-discipline rationale as
+    // `rejection_reports`: holding the state mutex across an
+    // `mpsc::Sender::try_send` is technically non-blocking but keeping
+    // the emit lock-free preserves the "no channel ops while holding
+    // state" invariant the rest of this module follows.
+    let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
         for (event, actor_pub, cs_pub_owned) in resolved {
@@ -1180,9 +1211,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 actor_identity_pub: &actor_pub,
                 countersigner_identity_pub: cs_pub_ref,
             };
+            // Clone before `insert_event` consumes the event so we can
+            // surface the delta if the outcome is `Inserted`. The clone
+            // is cheap (a few hundred bytes of signed event) and only
+            // paid on the merge path; duplicates short-circuit above.
+            let event_clone = event.clone();
             match state.insert_event(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
+                    inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
                     // Skip — already in our log. Don't flip inserted_any
@@ -1205,6 +1242,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
     } // state lock released here
+
+    // Phase C-pre: emit membership-delta for every inserted event
+    // outside the state lock. `try_send` is fire-and-forget — a closed
+    // or full channel drops the delta rather than back-pressuring the
+    // engine (the IPC consumer is purely informational).
+    if let Some(tx) = ctx.delta_tx.as_ref() {
+        for event in inserted_events {
+            let _ = tx.try_send(CommunityMembershipDelta {
+                community_id: ctx.community_id,
+                event,
+            });
+        }
+    }
 
     // Phase C: emit rejection reports outside the state lock.
     // verify_event rejections at receive time are the most useful
@@ -1510,6 +1560,7 @@ impl CommunitySyncRegistry {
             debounce_ms: self.cfg.debounce_ms,
             identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
             error_tx: self.cfg.error_tx.clone(),
+            delta_tx: None,
         }));
 
         engines.insert(community_id, engine);
