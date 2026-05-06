@@ -12,12 +12,15 @@
 //! wire type, the `CommunityRootHlcTracker`, and the
 //! `CommunitySyncEngine`. The internal task ships the debounced
 //! publish loop (notify_dirty → debounce → publish_root_now,
-//! flush_now → force-publish, shutdown → final flush) and the
-//! receive pipeline (`handle_incoming_publish` decrypts root publishes,
+//! flush_now → force-publish, shutdown → final flush), the receive
+//! pipeline (`handle_incoming_publish` decrypts root publishes,
 //! fetches + decrypts the encrypted blob from CAS, re-runs
 //! `verify_event` per event, and merges into local CRDT state, with
-//! per-publisher-device replay protection via `CommunityRootHlcTracker`).
-//! Subsequent tasks add persistence flushes and the registry.
+//! per-publisher-device replay protection via `CommunityRootHlcTracker`),
+//! and the per-arm persist hooks (Task 10) that flush
+//! `crdt.cbor` + `replay.cbor` to disk through `community_state_persist`
+//! after debounce wakeups, after merge of incoming publishes, and on
+//! shutdown. Subsequent tasks add the multi-community registry.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -243,13 +246,22 @@ pub enum CommunitySyncError {
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
 /// in-memory replay tracker shape, but keyed externally by community_id
 /// (one tracker instance per joined community).
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so Task 10's
+/// `community_state_persist::save_replay` can canonical-CBOR-encode the
+/// tracker to `replay.cbor`. The single `per_device` field is a
+/// `BTreeMap<String, Hlc>` — both inner types already round-trip through
+/// canonical CBOR, so no custom field renames are needed.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CommunityRootHlcTracker {
     /// Per-publisher-device latest-accepted HLC. New incoming root
     /// publishes are accepted only if STRICTLY NEWER per their
     /// device_id key.
     pub per_device: BTreeMap<String, Hlc>,
 }
+
+impl CanonicalPayloadSealed for CommunityRootHlcTracker {}
+impl CanonicalPayload for CommunityRootHlcTracker {}
 
 impl CommunityRootHlcTracker {
     /// Test the candidate HLC against the per-device latest. Returns
@@ -470,12 +482,9 @@ impl CommunitySyncEngine {
 }
 
 /// Internal context bag passed to the spawned task. Tasks 7-8 wired
-/// the publish loop and receive pipeline, which together consume
-/// every field except `paths` (Task 10's persist hook). The
-/// `#[allow(dead_code)]` stays until Task 10 lands — removing
-/// `paths` just because the current task doesn't read it would
-/// force a churn cycle when the next task adds it back.
-#[allow(dead_code)]
+/// the publish loop and receive pipeline; Task 10 added the persist
+/// hooks that consume `paths`. All fields are now read by the
+/// `internal_task` `select!` loop or its helpers.
 struct InternalCtx {
     community_id: SpaceId,
     membership_key: MembershipKey,
@@ -553,9 +562,19 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.has_pending_dirty.store(true, Ordering::Release);
                     }
                 }
-                // Persistence is unimplemented until Task 10 — there
-                // is no on-disk state at all yet, so each publish is
-                // memory-only on the publisher side.
+                // Persist after the wire-side publish so the next
+                // boot recovers from the same state we just told peers
+                // about. Errors are logged + swallowed — a debounce
+                // wakeup has no caller to surface a Result to, and
+                // dropping the publish loop on a transient disk error
+                // would silently disable sync for this community.
+                if let Err(e) = persist_both(&ctx).await {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        error = %e,
+                        "community persist_both failed after debounce publish"
+                    );
+                }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
                 next_wakeup = None;
@@ -609,8 +628,24 @@ async fn internal_task(mut ctx: InternalCtx) {
                     .await;
                 }
                 // Persist on Mutated | MutatedTrackerOnly |
-                // ErrPostMutation lands in Task 10 (consumes
-                // `outcome.needs_persist()` + `outcome.crdt_mutated()`).
+                // ErrPostMutation. `crdt_mutated()` lets the
+                // tracker-only branch skip the larger `crdt.cbor`
+                // fsync — the CRDT is byte-identical when every
+                // event in the remote blob was AlreadyKnown.
+                if outcome.needs_persist() {
+                    let persist_result = if outcome.crdt_mutated() {
+                        persist_both(&ctx).await
+                    } else {
+                        persist_replay_only(&ctx).await
+                    };
+                    if let Err(e) = persist_result {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            error = %e,
+                            "community persist after merge failed"
+                        );
+                    }
+                }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
@@ -618,7 +653,19 @@ async fn internal_task(mut ctx: InternalCtx) {
                 } else {
                     Ok(())
                 };
-                let _ = resp_tx.send(pub_result);
+                // Always flush on shutdown — we can't cheaply tell
+                // from outside whether the CRDT mutated since the
+                // last persist, and losing the final disk flush
+                // silently corrupts next-boot replay (the in-memory
+                // tracker would advance again on a re-broadcast and
+                // miss whatever we accepted in this session).
+                let persist_result = persist_both(&ctx).await;
+                // `pub_result.and(persist_result)` returns Ok only if
+                // BOTH steps succeeded; otherwise the first Err
+                // surfaces. Persist failures must reach the caller —
+                // suppressing them mirrors the same silent-corruption
+                // failure mode `owner_state_sync` explicitly rejects.
+                let _ = resp_tx.send(pub_result.and(persist_result));
                 return;
             }
         }
@@ -791,7 +838,6 @@ impl IncomingOutcome {
     /// Whether the disk needs flushing. Task 10's `persist_both` is
     /// the broad case (CRDT + replay); for `MutatedTrackerOnly`
     /// callers can use `persist_replay_only` to skip the CRDT fsync.
-    #[allow(dead_code)] // consumed in Task 10's persist hook.
     fn needs_persist(&self) -> bool {
         matches!(
             self,
@@ -800,8 +846,8 @@ impl IncomingOutcome {
     }
 
     /// Whether the CRDT itself changed (≥ 1 event Inserted). Used by
-    /// Task 10 to decide between `persist_both` and `persist_replay_only`.
-    #[allow(dead_code)] // consumed in Task 10's persist hook.
+    /// the subscriber arm to decide between `persist_both` and
+    /// `persist_replay_only`.
     fn crdt_mutated(&self) -> bool {
         matches!(self, Self::Mutated | Self::ErrPostMutation(_))
     }
@@ -1026,6 +1072,40 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     } else {
         IncomingOutcome::MutatedTrackerOnly
     }
+}
+
+/// Snapshot the CRDT and replay tracker to disk. Locks held briefly:
+/// state lock for `save_crdt`, then dropped before re-locking the
+/// tracker for `save_replay`. The interleave matters — holding both
+/// locks across both saves would force every concurrent CRDT mutation
+/// (foreground command handlers) to wait through two fsyncs.
+///
+/// Both saves are atomic-rename-via-tempfile, so a partial save can't
+/// corrupt the live file. Failures bubble up as
+/// `CommunitySyncError::Persist` so the shutdown arm can surface them
+/// to the caller; the wakeup / merge arms log + continue.
+async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    use crate::community_state_persist::{save_crdt, save_replay};
+    let state = ctx.state.lock().await;
+    save_crdt(&ctx.paths.crdt, &state).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    drop(state);
+    let tracker = ctx.tracker.lock().await;
+    save_replay(&ctx.paths.replay, &tracker)
+        .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    Ok(())
+}
+
+/// Replay-only persist for the `MutatedTrackerOnly` case — every event
+/// in the remote blob was `AlreadyKnown` but the tracker advanced. The
+/// CRDT is byte-identical, so re-fsyncing `crdt.cbor` would be wasted
+/// I/O on every duplicate-but-clock-advanced publish. Only `replay.cbor`
+/// rewrites here.
+async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    use crate::community_state_persist::save_replay;
+    let tracker = ctx.tracker.lock().await;
+    save_replay(&ctx.paths.replay, &tracker)
+        .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+    Ok(())
 }
 
 /// Send a `CommunityDegradedReport` if `error_tx` is wired. Helper for
