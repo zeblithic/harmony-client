@@ -46,6 +46,27 @@ fn load_crdt_truncated_file_returns_err() {
 }
 
 #[test]
+fn load_crdt_misrouted_file_returns_mismatch_err() {
+    // Save with one community_id, load expecting a different one —
+    // the bytes parse cleanly but the routing guard must reject.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("crdt.cbor");
+
+    let saved_id = SpaceId([1u8; 16]);
+    let expected_id = SpaceId([2u8; 16]);
+    save_crdt(&path, &CommunityState::new(saved_id)).expect("save");
+
+    let result = load_crdt(&path, expected_id);
+    match result {
+        Err(PersistError::CommunityIdMismatch { found, expected }) => {
+            assert_eq!(found, saved_id);
+            assert_eq!(expected, expected_id);
+        }
+        other => panic!("expected CommunityIdMismatch, got {other:?}"),
+    }
+}
+
+#[test]
 fn save_and_load_replay_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("replay.cbor");

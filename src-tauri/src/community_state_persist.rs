@@ -78,10 +78,16 @@ pub fn save_crdt(path: &Path, state: &CommunityState) -> Result<(), PersistError
 ///   files (wrong directory copied in manually, registry-path bug,
 ///   etc.) — the bytes parsed, but the file belongs elsewhere.
 pub fn load_crdt(path: &Path, expected_id: SpaceId) -> Result<CommunityState, PersistError> {
-    if !path.exists() {
-        return Ok(CommunityState::new(expected_id));
-    }
-    let bytes = std::fs::read(path)?;
+    // Single-syscall NotFound handling: avoids the TOCTOU window
+    // between `path.exists()` and `read` if the file is unlinked
+    // between the two calls.
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CommunityState::new(expected_id));
+        }
+        Err(e) => return Err(PersistError::Io(e)),
+    };
     let state: CommunityState =
         canonical_cbor_decode(&bytes).map_err(|e| PersistError::CborDecode(e.to_string()))?;
     if state.community_id != expected_id {
@@ -118,10 +124,13 @@ pub fn save_replay(path: &Path, tracker: &CommunityRootHlcTracker) -> Result<(),
 /// check lives entirely on the CRDT side. The path itself encodes
 /// the community via the registry's directory layout.
 pub fn load_replay(path: &Path) -> Result<CommunityRootHlcTracker, PersistError> {
-    if !path.exists() {
-        return Ok(CommunityRootHlcTracker::default());
-    }
-    let bytes = std::fs::read(path)?;
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CommunityRootHlcTracker::default());
+        }
+        Err(e) => return Err(PersistError::Io(e)),
+    };
     canonical_cbor_decode(&bytes).map_err(|e| PersistError::CborDecode(e.to_string()))
 }
 

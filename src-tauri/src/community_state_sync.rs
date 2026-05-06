@@ -38,6 +38,7 @@ use tokio::task::JoinHandle;
 
 use crate::community_membership::VerifyContext;
 use crate::community_state_crdt::{CommunityState, InsertOutcome};
+use crate::community_state_persist::{save_crdt, save_replay};
 use crate::content_store::ContentStore;
 use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
@@ -300,9 +301,10 @@ impl CommunityRootHlcTracker {
 }
 
 /// Filesystem paths for the per-community CRDT + replay-tracker
-/// snapshots. Task 10 replaces this in-module type with a re-export
-/// from `community_state_persist`; kept inline for now so the engine
-/// scaffold can land before the persist layer.
+/// snapshots. Lives here rather than in `community_state_persist` so
+/// the engine config can construct it without depending on the
+/// persist module's types — the persist module is path-agnostic and
+/// operates on whatever `&Path` the engine hands it.
 #[derive(Debug, Clone)]
 pub struct PersistPaths {
     pub crdt: PathBuf,
@@ -1085,7 +1087,6 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 /// `CommunitySyncError::Persist` so the shutdown arm can surface them
 /// to the caller; the wakeup / merge arms log + continue.
 async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
-    use crate::community_state_persist::{save_crdt, save_replay};
     let state = ctx.state.lock().await;
     save_crdt(&ctx.paths.crdt, &state).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
     drop(state);
@@ -1101,7 +1102,6 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 /// I/O on every duplicate-but-clock-advanced publish. Only `replay.cbor`
 /// rewrites here.
 async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
-    use crate::community_state_persist::save_replay;
     let tracker = ctx.tracker.lock().await;
     save_replay(&ctx.paths.replay, &tracker)
         .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
