@@ -24,7 +24,7 @@ use crate::community_membership::{
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommunityState {
     /// The community this state belongs to. Persisted in the wire form
     /// so that a misrouted blob (wrong file, wrong ContentStore key) is

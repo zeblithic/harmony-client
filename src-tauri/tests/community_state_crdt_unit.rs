@@ -180,13 +180,14 @@ fn materialized_cache_returns_same_object_until_insert() {
     let mut state = CommunityState::new(community_id);
 
     let v0 = state.materialized_version();
-    let _m1 = state.materialized(addr);
-    let _m2 = state.materialized(addr);
+    let m1 = state.materialized(addr);
+    let m2 = state.materialized(addr);
     assert_eq!(
         state.materialized_version(),
         v0,
         "version unchanged on read"
     );
+    assert_eq!(m1, m2, "cache hit returns equal value");
 
     let payload = EventPayload {
         id: [3u8; 16],
