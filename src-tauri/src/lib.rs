@@ -5215,6 +5215,85 @@ pub fn member_info_for(
     rows
 }
 
+/// Read-only IPC over a community's materialized member list.
+/// Returns rows sorted by power desc then joined_at asc (see
+/// `member_info_for`). `community_id` is the 32-char lowercase
+/// hex of the 16-byte SpaceId.
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
+/// - `Err("no community_registry — node not running?")` — start_node
+///   hasn't wired the registry.
+/// - `Err("no Space for community {hex} in owner-state")` — we
+///   haven't joined this community (or we left and removed the Space).
+/// - `Err("community Space missing admin_addr (corrupt row?)")` —
+///   defensive guard; should be unreachable since `validate_invariants`
+///   rejects these on apply.
+/// - `Err("no engine for community {hex} — not joined or not yet
+///   started")` — the community isn't in the registry's map.
+#[tauri::command]
+async fn list_community_members(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<MemberInfoDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+        )
+    };
+
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let materialized = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+
+    Ok(member_info_for(&materialized))
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5388,6 +5467,7 @@ pub fn run() {
             pairing_commands::confirm_pairing_sas,
             pairing_commands::cancel_pairing,
             pairing_commands::get_pairing_state,
+            list_community_members,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -6030,5 +6110,59 @@ mod pin_persistence_tests {
         assert!(parse_sidecar_id(&id).is_ok());
         assert!(parse_sidecar_id("").is_err(), "empty rejected");
         assert!(parse_sidecar_id("not-a-uuid").is_err(), "garbage rejected");
+    }
+}
+
+#[cfg(test)]
+mod list_community_members_ipc_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind,
+    };
+    use crate::community_state_crdt::CommunityState;
+    use crate::owner_state_types::*;
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn list_members_returns_sorted_dto_for_known_community() {
+        let community_id = SpaceId([5; 16]);
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let admin = OwnerAddr(identity.identity.address_hash);
+        let identity_pub = identity.identity.to_public_bytes();
+
+        let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        {
+            let mut sa = state.lock().await;
+            let payload = EventPayload {
+                id: [1; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "x".into(),
+                },
+            };
+            let evt = sign_event_with_identity(&payload, &identity).expect("sign");
+            let _ = sa.insert_event(
+                evt,
+                &crate::community_membership::VerifyContext {
+                    expected_community_id: community_id,
+                    admin_addr: admin,
+                    is_invite_only: false,
+                    actor_identity_pub: &identity_pub,
+                    countersigner_identity_pub: None,
+                },
+            );
+        }
+
+        let materialized = state.lock().await.materialize_now(admin);
+        let dto = member_info_for(&materialized);
+        assert_eq!(dto.len(), 1);
+        assert_eq!(dto[0].addr, hex::encode(admin.0));
+        assert_eq!(dto[0].power, 100);
     }
 }
