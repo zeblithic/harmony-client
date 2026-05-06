@@ -493,3 +493,152 @@ async fn engine_emits_membership_delta_on_remote_insert() {
     engine_a.shutdown().await.expect("shutdown a");
     engine_b.shutdown().await.expect("shutdown b");
 }
+
+#[tokio::test]
+async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
+    use harmony_app::community_state_sync::{CommunityMembershipDelta, LocalInsertError};
+    use std::time::Duration;
+
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(8);
+    let (delta_tx, mut delta_rx) = mpsc::channel::<CommunityMembershipDelta>(8);
+
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    });
+
+    let community_id = SpaceId([2u8; 16]);
+    let mk = MembershipKey::new([0x33; 32]);
+    let identity = PrivateIdentity::from_seed(&[0xc1; 32]);
+    let admin = OwnerAddr(identity.identity.address_hash);
+    let identity_pub = identity.identity.to_public_bytes();
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    struct StaticResolver {
+        addr: OwnerAddr,
+        identity_pub: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl harmony_app::community_state_sync::IdentityResolver for StaticResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.addr {
+                Some(self.identity_pub)
+            } else {
+                None
+            }
+        }
+    }
+    let resolver: Arc<dyn harmony_app::community_state_sync::IdentityResolver> =
+        Arc::new(StaticResolver {
+            addr: admin,
+            identity_pub,
+        });
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "local-dev".into(),
+        state: Arc::clone(&state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: Some(resolver),
+        error_tx: None,
+        delta_tx: Some(delta_tx),
+    });
+
+    let payload = EventPayload {
+        id: [7u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "local-dev".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
+
+    let outcome = engine
+        .insert_local_event(event.clone())
+        .await
+        .expect("insert_local_event should succeed");
+    assert_eq!(
+        outcome,
+        harmony_app::community_state_crdt::InsertOutcome::Inserted
+    );
+
+    let delta = tokio::time::timeout(Duration::from_secs(1), delta_rx.recv())
+        .await
+        .expect("delta within 1s")
+        .expect("delta channel open");
+    assert_eq!(delta.event.id, event.id);
+
+    let _bytes = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+        .await
+        .expect("publish within 2s")
+        .expect("publisher channel open");
+
+    let outcome2 = engine.insert_local_event(event).await.expect("idempotent");
+    assert_eq!(
+        outcome2,
+        harmony_app::community_state_crdt::InsertOutcome::AlreadyKnown
+    );
+    let none_delta = tokio::time::timeout(Duration::from_millis(200), delta_rx.recv()).await;
+    assert!(none_delta.is_err(), "AlreadyKnown must not emit a delta");
+
+    let bad_payload = EventPayload {
+        id: [8u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: OwnerAddr([0xff; 16]),
+        at: Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "local-dev".into(),
+        },
+    };
+    let bad_event = sign_event_with_identity(&bad_payload, &identity).expect("sign");
+    let result = engine.insert_local_event(bad_event).await;
+    // Plan's matches! pattern omitted UnknownActor; with this
+    // StaticResolver the bad-actor address returns None at resolve time,
+    // so the impl short-circuits with Err(UnknownActor) BEFORE
+    // verify_event runs. Widening the matcher preserves the test's
+    // intent ("a bogus actor must not insert") while reflecting the
+    // actual short-circuit path.
+    assert!(matches!(
+        result,
+        Err(LocalInsertError::Verify(_))
+            | Err(LocalInsertError::UnknownActor(_))
+            | Ok(harmony_app::community_state_crdt::InsertOutcome::Rejected(
+                _
+            ))
+    ));
+
+    engine.shutdown().await.expect("shutdown");
+}

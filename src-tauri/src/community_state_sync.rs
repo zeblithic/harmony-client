@@ -263,6 +263,21 @@ pub enum CommunitySyncError {
     MissingIdentityResolver,
 }
 
+/// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
+/// Distinct enum (not a variant on `CommunitySyncError`) because local-
+/// insert failures are caller-driven (bad event from IPC) rather than
+/// transport / crypto class — the IPC layer needs to surface them as
+/// distinct error strings to the frontend.
+#[derive(thiserror::Error, Debug)]
+pub enum LocalInsertError {
+    #[error("identity_resolver not configured — engine cannot verify local events")]
+    MissingIdentityResolver,
+    #[error("actor identity not in resolver: {0:?}")]
+    UnknownActor(OwnerAddr),
+    #[error("verify_event rejected the local event: {0}")]
+    Verify(crate::community_membership::VerifyError),
+}
+
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
 /// in-memory replay tracker shape, but keyed externally by community_id
 /// (one tracker instance per joined community).
@@ -453,6 +468,19 @@ pub struct CommunitySyncEngine {
     /// `VerifyContext` without having to thread `admin_addr` through
     /// the registry separately.
     admin_addr: OwnerAddr,
+    /// Resolver retained on the engine so `insert_local_event` can
+    /// build a `VerifyContext` for locally-minted events without
+    /// re-plumbing it through the registry. Cloned from the config
+    /// alongside the spawned task's copy.
+    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    /// Invite-only flag retained on the engine for the same reason as
+    /// `identity_resolver` — `insert_local_event` needs it to populate
+    /// `VerifyContext`.
+    is_invite_only: bool,
+    /// Membership-delta sink retained on the engine so
+    /// `insert_local_event` can emit a delta on `Inserted` outcomes,
+    /// matching the receive pipeline's behaviour.
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 impl CommunitySyncEngine {
@@ -473,6 +501,9 @@ impl CommunitySyncEngine {
         // accessor share the same underlying Mutex<CommunityState>.
         let state_for_engine = Arc::clone(&cfg.state);
         let admin_addr = cfg.admin_addr;
+        let identity_resolver_for_engine = cfg.identity_resolver.clone();
+        let is_invite_only_for_engine = cfg.is_invite_only;
+        let delta_tx_for_engine = cfg.delta_tx.clone();
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -504,6 +535,9 @@ impl CommunitySyncEngine {
             task: Mutex::new(Some(task)),
             state: state_for_engine,
             admin_addr,
+            identity_resolver: identity_resolver_for_engine,
+            is_invite_only: is_invite_only_for_engine,
+            delta_tx: delta_tx_for_engine,
         }
     }
 
@@ -525,6 +559,74 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn admin_addr(&self) -> OwnerAddr {
         self.admin_addr
+    }
+
+    /// Insert a locally-minted event into the community CRDT, verify it
+    /// using the engine's `identity_resolver`, fire the membership-delta
+    /// channel on `Inserted`, and notify the publish loop so the change
+    /// reaches peers.
+    ///
+    /// Centralises the local-mint path so every IPC that mutates this
+    /// community's CRDT (`create_community`, `redeem_invite`,
+    /// `leave_community`, and Phase 4's kick / set_power / invite-only
+    /// redeem) shares a single verify-then-insert-then-emit-delta path.
+    /// Without this method, each IPC would grow a copy of the dance and
+    /// the delta-emission rule would inevitably drift on a new variant.
+    ///
+    /// `Ok(InsertOutcome::Inserted)` — event landed; delta fired; publish
+    /// notified. `Ok(InsertOutcome::AlreadyKnown)` — duplicate; no delta,
+    /// no publish-notify (the previous insert already did both).
+    /// `Ok(InsertOutcome::Rejected(VerifyError))` — verify failed at the
+    /// CRDT layer (banned-stickiness etc.). `Err(LocalInsertError::*)`
+    /// — failure BEFORE we got far enough to call insert (no resolver,
+    /// or resolver couldn't find the actor).
+    pub async fn insert_local_event(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        let resolver = self
+            .identity_resolver
+            .as_ref()
+            .ok_or(LocalInsertError::MissingIdentityResolver)?;
+
+        let actor_pub = resolver
+            .resolve(&event.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(event.actor))?;
+
+        let countersigner_pub = if let Some(cs) = event.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        let ctx = crate::community_membership::VerifyContext {
+            expected_community_id: event.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: countersigner_pub.as_ref(),
+        };
+
+        let outcome = {
+            let mut state_g = self.state.lock().await;
+            state_g.insert_event(event.clone(), &ctx)
+        };
+
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Inserted
+        ) {
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: event.community_id,
+                    event,
+                });
+            }
+            self.notify_dirty();
+        }
+
+        Ok(outcome)
     }
 
     /// Hint that local CRDT state has mutated and a debounced publish
