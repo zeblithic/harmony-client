@@ -94,3 +94,57 @@ fn invite_token_round_trips_with_hint_none() {
     assert_eq!(decoded.invitee_hint, None);
     assert_eq!(decoded.inviter, OwnerAddr([1u8; 16]));
 }
+
+#[test]
+fn invite_url_round_trips_open_payload() {
+    use harmony_app::community_invite::{
+        decode_invite_url, encode_invite_url, CommunityInvitePayload,
+    };
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "Hackers United".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+    };
+
+    let url = encode_invite_url(&payload).expect("encode");
+    let body = url
+        .strip_prefix("harmony://invite/")
+        .expect("URL must start with harmony://invite/");
+    assert!(
+        !body.contains('+') && !body.contains('/') && !body.contains('='),
+        "base64url no-pad body must not contain +, /, or ="
+    );
+
+    let decoded = decode_invite_url(&url).expect("decode");
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn decode_rejects_wrong_scheme() {
+    use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
+    let err = decode_invite_url("https://example.com/invite/abc").unwrap_err();
+    assert!(matches!(err, InviteUrlError::WrongScheme(_)));
+}
+
+#[test]
+fn decode_rejects_invalid_base64() {
+    use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
+    let err = decode_invite_url("harmony://invite/!!!not-base64!!!").unwrap_err();
+    assert!(matches!(err, InviteUrlError::Base64(_)));
+}
+
+#[test]
+fn decode_rejects_truncated_cbor() {
+    use base64::Engine;
+    use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
+    let truncated = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xa1, 0x62]);
+    let url = format!("harmony://invite/{truncated}");
+    let err = decode_invite_url(&url).unwrap_err();
+    assert!(matches!(err, InviteUrlError::Cbor(_)));
+}

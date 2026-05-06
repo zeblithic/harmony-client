@@ -90,3 +90,44 @@ impl CanonicalPayloadSealed for CommunityInvitePayload {}
 impl CanonicalPayload for CommunityInvitePayload {}
 impl CanonicalPayloadSealed for InviteToken {}
 impl CanonicalPayload for InviteToken {}
+
+use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+use base64::Engine;
+
+const URL_PREFIX: &str = "harmony://invite/";
+
+/// Errors decoding a `harmony://invite/...` URL into a
+/// `CommunityInvitePayload`. Distinct variants per failure class so the
+/// IPC layer can surface a precise diagnostic to the frontend (and a
+/// future telemetry dashboard can tally each independently).
+#[derive(thiserror::Error, Debug)]
+pub enum InviteUrlError {
+    #[error("invite URL scheme must be `harmony://invite/`, got `{0}`")]
+    WrongScheme(String),
+    #[error("base64url decode failed: {0}")]
+    Base64(String),
+    #[error("CBOR decode failed: {0}")]
+    Cbor(String),
+}
+
+/// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
+/// and prefix `harmony://invite/`. The output is copy-paste-safe across
+/// chat / email / messaging clients that munge `+`, `/`, or `=`.
+pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, InviteUrlError> {
+    let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+    Ok(format!("{URL_PREFIX}{b64}"))
+}
+
+/// Strip the `harmony://invite/` prefix, base64url-decode, then
+/// canonical-CBOR-decode into a `CommunityInvitePayload`.
+pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlError> {
+    let body = url
+        .strip_prefix(URL_PREFIX)
+        .ok_or_else(|| InviteUrlError::WrongScheme(url.chars().take(URL_PREFIX.len()).collect()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .map_err(|e| InviteUrlError::Base64(e.to_string()))?;
+    canonical_cbor_decode::<CommunityInvitePayload>(&bytes)
+        .map_err(|e| InviteUrlError::Cbor(e.to_string()))
+}
