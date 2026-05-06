@@ -2,11 +2,13 @@
 
 **Linear:** [ZEB-217](https://linear.app/zeblith/issue/ZEB-217/zeb-206-sub-c-harmony-client-community-membership-crdt-invitejoin)
 **Parent epic:** [ZEB-206](https://linear.app/zeblith/issue/ZEB-206/) (nav-tree real-data wiring)
-**Date:** 2026-05-05 (refreshed 2026-05-05 against shipped Phase 1 — PR #82, merge commit `bd1d01b`)
-**Status:** Phase 1 shipped; Phases 2–5 pending implementation
-**Author:** brainstormed against shipped ZEB-215 (owner-state CRDT) + ZEB-216 (DM transport) patterns; refreshed against shipped Phase 1 primitives
+**Date:** 2026-05-05 (refreshed 2026-05-06 against shipped Phase 2 — PR #84, merge commit `466e6c2`; previously refreshed 2026-05-05 against shipped Phase 1 — PR #82, merge commit `bd1d01b`)
+**Status:** Phases 1 + 2 shipped; Phases 3–5 pending implementation
+**Author:** brainstormed against shipped ZEB-215 (owner-state CRDT) + ZEB-216 (DM transport) patterns; refreshed against shipped Phase 1 + Phase 2 primitives
 
 > **Refresh note (2026-05-05):** This spec was originally written before Phase 1 implementation. After PR #82 landed the membership-CRDT primitives, six rounds of bot review surfaced invariants that weren't pinned in the original draft (pubkey-to-OwnerAddr binding, bootstrap-admin self-Join exemption, defense-in-depth at both verify-event AND materialize layers, the full `event_sort_key` tiebreak chain, CounterSignature wire codes, same-SpaceId apply-time rejection of community-creation field changes, idempotent state transitions, the `EventPayload` named unsigned-portion type, and ed25519 `verify_strict`). The "Data model", "Materialization rules", "Verification", and "Phase 1" sections below now describe the shipped primitives so Phases 2–5 can reference them precisely.
+
+> **Refresh note (2026-05-06):** PR #84 landed Phase 2 — encrypted-Zenoh state-root sync — through six rounds of bot review that surfaced a similar set of operational invariants the original Phase 2 plan didn't pin. The "Phase 2" section below now describes the shipped sync engine + the deltas caught during review; the "Bug-class coverage we know to watch for" section adds Phase 2 lessons that Phases 3–5 should inherit. One Critical-class gap remains explicitly **deferred to [ZEB-256](https://linear.app/zeblith/issue/ZEB-256/)**: cryptographic publisher authentication on the state-root publish envelope. Phase 2's `CommunityRootPublishPayload.publisher_device_id` is authenticated only by the per-community AEAD (`MembershipKey`), so any current member can spoof another member's `publisher_device_id` and silently advance their slot in the replay tracker. The gap has no exploitation path while Phase 2 ships open communities only with no IPC surface; **it MUST close before Phase 4 invite-only flows ship**, because a kicked member retains the `MembershipKey` until [ZEB-249](https://linear.app/zeblith/issue/ZEB-249/) (TreeKEM rotation) lands and could otherwise censor admin publishes.
 
 ## Goal
 
@@ -707,6 +709,19 @@ From PR #81 retrospective (lessons from DM transport):
 - **First-visit-guard for community switching** — when frontend opens a different community, the lazy state-DAG-sync should fire ONCE per community, not on every switch. Mirrors `loadedDmSpaces` Set pattern from ZEB-228 Phase 4
 - **Skip-on-error in `decrypt_inbox_entries` style helpers** — community materialization MUST tolerate a single corrupt event (skip + log) rather than failing the whole replay
 
+From PR #84 retrospective (lessons from Phase 2 sync engine — Phases 3–5 should inherit these by default):
+
+- **No `.await` while holding the state mutex** — Phase 2's 3-phase receive pipeline (resolve → batch insert → emit reports) is the load-bearing pattern. Phase 3's IPC handlers MUST follow the same shape: snapshot the lock-guarded state, drop the guard, run any async resolver work, re-acquire briefly to mutate, drop, then emit. Holding a state mutex across `.await` deadlocks on contended re-entry.
+- **Snapshot-then-spawn fence on every CRDT-mutating IPC** — pre-IPC snapshot of `(state_arc, registry_arc)` before any spawn / await; post-mutation re-attachment via the registry handle. Phase 1's `apply_space` rejection of community-creation field changes is one defense; the snapshot fence is the other. Without it, joining + leaving + re-joining a community in rapid succession can race the registry's engine lifecycle and lose updates. The pattern is force-multiplied by Phase 4's invite-redemption flow which spans `redeem_invite` → counter-signer await → state mutation.
+- **Sync I/O on async runtime → `tokio::task::spawn_blocking`** — `std::fs::read` / `write` / `rename` calls are sync. Phase 3+ persistence helpers (any new `save_*` / `load_*` for community-related on-disk state) MUST wrap in `spawn_blocking` to avoid stalling worker threads. Pattern matches `owner_state_sync.rs:376` and `community_state_sync.rs::persist_both`.
+- **Best-effort channels use `try_send`, not `send().await`** — degraded-report channels (`error_tx`, IPC-event emitters) are sources, not sinks. `try_send`'s `Full(_)` / `Closed(_)` should be dropped silently. A `send().await` on a full channel back-pressures the producer pipeline (e.g., the receive loop), which is wrong for "tell the user something went wrong" semantics.
+- **Distinct error variants per failure class** — `CommunitySyncError` ships 7 variants because each maps to a stable reason-tag the frontend's eventual degraded-banner copy switches on. Phase 3+ should keep adding variants rather than collapsing into `Generic(String)`. The taxonomy is part of the contract.
+- **`tokio::select! biased` is a contract** — arm order is load-bearing under `biased`. Comments claiming "Data-flow arm first" must reflect actual ordering. The publisher and subscriber loops in `event_loop.rs::spawn_community_state_zenoh_adapter` are the reference templates; new select loops should follow the same pattern (data-flow first, then sender-closed detection, then timeout fallback).
+- **Saturation handling for HLC counters** — `next_hlc` must handle `prev.logical == u32::MAX` by advancing `wall_ms` instead of incrementing logical. Phases 3+ that produce events under sustained same-millisecond bursts (e.g., bulk-import flows) hit this without the guard.
+- **Persist self-heal beats hard-fail** — corrupted on-disk per-community CRDT files quarantine via `.corrupt.<unix_ms>` rename + start-with-default. Per-community state is recoverable from peers via the next state-root publish, so hard-failing engine spawn would maroon the community when the data is available across the network. Same logic applies to any new on-disk artifacts Phases 3–5 add.
+- **Two-mode AEAD nonce discipline** — random-nonce for envelope publishes (each publish independent), deterministic-nonce for content-addressed blobs (CID dedup requires plaintext-stable ciphertext under the same key). Phase 4's `CommunityInvite` Reticulum payload should follow the same discipline; the trap to avoid is sharing a random-nonce CAS-side or a deterministic-nonce envelope-side.
+- **Cryptographic publisher authentication is required before Phase 4 ([ZEB-256](https://linear.app/zeblith/issue/ZEB-256/))** — Phase 2 ships open-only with a known spoof gap on `publisher_device_id`. Phase 3 ships open-only and inherits the same scope. Phase 4 invite-only changes the threat model (kicked members retain `MembershipKey` until [ZEB-249](https://linear.app/zeblith/issue/ZEB-249/) rotates) and CANNOT ship until ZEB-256 closes the gap.
+
 ## Phasing
 
 Five phases, each one PR. Same cadence as ZEB-216.
@@ -741,18 +756,41 @@ Five phases, each one PR. Same cadence as ZEB-216.
 
 All deltas are documented in the Materialization rules / Verification / Data model sections above.
 
-### Phase 2 — Per-community state CRDT + encrypted Zenoh sync
+### Phase 2 — Per-community state CRDT + encrypted Zenoh sync — SHIPPED 2026-05-06
 
-**Goal:** Multi-owner CRDT replicates across members via the encrypted state-root topic. Mirrors ZEB-215 Phase 3a/3b architecture for owner-state. Consumes the Phase 1 primitives — `verify_event`, `materialize`, `prior_state_at_event`, `event_sort_key`, `POWER_THRESHOLDS` — without modifying them.
+**Goal (achieved):** Multi-owner CRDT replicates across members via the encrypted state-root topic. Mirrors ZEB-215 Phase 3a/3b architecture for owner-state, multi-instanced (one `CommunitySyncEngine` per joined community, lifecycled by `CommunitySyncRegistry`). Consumes the Phase 1 primitives — `verify_event`, `materialize`, `prior_state_at_event`, `event_sort_key`, `POWER_THRESHOLDS` — without modifying them.
 
-**Files:**
-- New: `src-tauri/src/community_state_crdt.rs` (Prolly Tree per community; insert path calls `verify_event` with prior_state computed via `prior_state_at_event`)
-- New: `src-tauri/src/community_state_sync.rs` (encrypted topic publish/subscribe + DAG-sync; per-community `RootHlcTracker` mirrors `OwnerStateRootHlcTracker`)
-- Modified: `src-tauri/src/event_loop.rs` — new select arms for community state ops (subscribe / publish / DAG-sync); subscription scan covers `Space { kind: Community }` rows on start_node
-- Modified: `src-tauri/src/lib.rs` — community state-sync wiring on start_node
-- New: `src-tauri/tests/community_sync_integration.rs`
+**Shipped via PR #84, merge commit `466e6c2`.**
 
-**Deliverables:** Two-member community DAG-syncs the full event log; verification fires at receive time using the same comparator + helpers Phase 1 ships; degraded paths (decrypt failure, timeout, any of the 19 `VerifyError` discriminants) emit `community-state-sync-degraded`; per-community `RootHlcTracker` dedupes redundant roots; HLC-tracker monotonicity preserved on dedupe-merge (the bug fixed in PR #81 round 3 — community Spaces use `Id` dedupe key, same trap as DM Spaces).
+**Files (as shipped):**
+- New: `src-tauri/src/community_state_crdt.rs` — `CommunityState` Prolly Tree, `insert_event` calling `verify_event` with prior_state via `prior_state_at_event`, `MaterializedCache` keyed on `(version, admin_addr)` so bootstrap-admin changes correctly invalidate
+- New: `src-tauri/src/community_state_sync.rs` — `CommunitySyncEngine` (debounced publish loop, 3-phase receive pipeline), `CommunitySyncRegistry` (per-community engine lifecycle), `CommunityRootPublishPayload` wire type, `CommunityRootHlcTracker` per-publisher replay protection, AEAD helpers (random-nonce for root publish + deterministic-nonce for content-addressed blob), `CommunitySyncError` taxonomy with stable reason-tags, `IdentityResolver` async trait, `OwnerDeviceCacheResolver` adapter
+- New: `src-tauri/src/community_state_persist.rs` — atomic-rename-via-tempfile persistence for `crdt.cbor` + `replay.cbor`; self-heal on corruption via `.corrupt.<unix_ms>` quarantine + start-with-default
+- Modified: `src-tauri/src/event_loop.rs` — `spawn_community_state_zenoh_adapter` (per-community pub/sub task with biased select arms + `subscriber_tx.closed()` arm); start_node boot scan for `Space { kind: Community }` rows
+- Modified: `src-tauri/src/lib.rs` — `NodeState.community_registry: Option<Arc<CommunitySyncRegistry>>`; snapshot-then-spawn pattern for boot scan
+- Modified: `src-tauri/src/owner_state_types.rs` — minor accessor adjustments
+- New: `src-tauri/tests/community_state_crdt_unit.rs`, `community_state_persist_unit.rs`, `community_state_sync_crypto_unit.rs`, `community_sync_engine_unit.rs`, `community_sync_registry_unit.rs`, `community_root_hlc_tracker_unit.rs` — module-level unit coverage
+- New: `src-tauri/tests/community_sync_integration.rs` — two-engine round-trip with `wait_until` polling helper for deterministic-but-bounded waits
+- New: `src-tauri/tests/wire_format_community_sync_fixtures.rs` — pinned-byte CBOR golden fixture for `CommunityRootPublishPayload`
+
+**Delta from original Phase 2 plan (caught during 6+ rounds of bot review on PR #84):**
+
+- **3-phase receive pipeline** (`handle_incoming_publish`): resolve identities under no state lock → batch-insert events under state lock → emit degraded reports under no lock. Avoids holding the state mutex across `.await` points (`IdentityResolver::resolve` is async because the production resolver is `OwnerDeviceCacheResolver`, which itself awaits cache lookups).
+- **`MaterializedCache` keyed on `(version, admin_addr)`** rather than just `version`. Bootstrap-admin self-Join is exempt from countersig, so a mid-stream `admin_addr` change (rare but possible during initial setup) MUST invalidate the cache — keying on version alone would surface stale materialization.
+- **`next_hlc` saturation guard**: when `prev.logical == u32::MAX`, manufacture `wall_ms + 1` advance and reset logical to 0. Prevents the `record()` debug_assert from firing under sustained same-millisecond bursts.
+- **`CommunitySyncError::BlobNotFound { cid }` distinct from `ContentStore(Io)`**: `Ok(None)` from `content_store.get()` is "blob not yet available, recoverable from next state-root" — semantically different from a transport / disk fault. Distinct reason-tag (`"blob_not_found"`) so the eventual frontend banner can switch on it.
+- **`CommunitySyncError::MisroutedBlob { expected, found }` distinct from `CborDecode`**: a blob whose CBOR parsed cleanly but whose `community_id` mismatches is a routing failure, not a format failure. Distinct reason-tag prevents misdirecting operators chasing format bugs.
+- **`CommunitySyncError::MissingIdentityResolver`** as a configuration-class error: receive-side verify cannot run without an identity resolver; surfacing it as crypto / transport would mislead operators.
+- **Snapshot-then-spawn fence on every IPC mutating community CRDT state**: same hardening pattern PR #81 round 6 forced across `send_dm` / `add_space` / `delete_outbox_entry`. Pre-IPC snapshot of `(state_arc, registry_arc)` before any spawn / await; post-mutation re-attachment via the registry handle. Prevents TOCTOU on community lifecycle (joined/left between snapshot and mutation).
+- **`tokio::task::spawn_blocking` for sync I/O**: `CommunityState`/`tracker` CBOR codec + atomic-write-via-rename are sync `std::fs` calls. Wrapping `spawn_engine`, `persist_both`, and `persist_replay_only` in `spawn_blocking` keeps the async runtime's worker threads from stalling on disk I/O. Pattern matches `owner_state_sync.rs:376`.
+- **`try_send` for fire-and-forget `error_tx`**: degraded reports are best-effort. A blocked `send().await` would back-pressure the receive pipeline; `try_send`'s `Full(_)` / `Closed(_)` are dropped silently.
+- **`subscriber_tx.closed()` arm in adapter loop**: without it, the JoinHandle hangs on `sub.recv_async()` forever after the engine drops `subscriber_rx` while idle. Combined with `biased` arm ordering (data-flow first, closed-detection second) so a same-poll race delivers the inbound sample before exit.
+- **Deterministic two-mode AEAD nonce**: random-nonce for the outer envelope (each publish independent), deterministic-nonce for the content-addressed blob (so the same plaintext under the same key produces a stable CID — required for CAS dedup to work). Two distinct helpers in `community_state_sync.rs::encrypt_*` so the nonce-reuse trap is impossible to step on.
+- **`CommunityRootHlcTracker` monotonicity preserved on dedupe-merge** (the bug fixed in PR #81 round 3 — community Spaces use `Id` dedupe key, same trap as DM Spaces). Tracker advance only after blob fetch + decrypt + decode + misroute check + at least one event accepted; an early advance on a malformed publish would let a correctly-routed re-publish at the same HLC be silently dropped.
+- **Persist self-heal**: `load_crdt` / `load_replay` quarantine corrupted on-disk files via `.corrupt.<unix_ms>` rename + start-with-default. Per-community CRDT is fully recoverable from peers via the next state-root publish, so a hard-fail-on-decode-error would needlessly maroon the community.
+- **HLC publisher authentication gap explicitly deferred to [ZEB-256](https://linear.app/zeblith/issue/ZEB-256/)** — see Refresh note above. Phase 2's `publisher_device_id` field is authenticated only by the per-community AEAD; closing the spoof gap requires an envelope-shape change (per-publisher device signature + identity binding via `OwnerDeviceCache`). Required before Phase 4 invite-only ships.
+
+All deltas above are in the shipped code; the spec's "Architecture" + "Bug-class coverage" sections below absorb the operational lessons so Phases 3–5 inherit them.
 
 ### Phase 3 — Open community flow (create + join + leave)
 
@@ -821,6 +859,7 @@ All deltas are documented in the Materialization rules / Verification / Data mod
 | [ZEB-252](https://linear.app/zeblith/issue/ZEB-252/) | Sub-D library-directory integration with communities |
 | [ZEB-253](https://linear.app/zeblith/issue/ZEB-253/) | harmony-mobile (future): QR code scanning for community invite links |
 | [ZEB-254](https://linear.app/zeblith/issue/ZEB-254/) | Persistent offline-counter-signer queue for invite-only redemption ("join pending" UX) |
+| [ZEB-256](https://linear.app/zeblith/issue/ZEB-256/) | Cryptographic publisher authentication for community state-root publishes (close HLC-spoof gap before Phase 4) |
 
 ## Out of scope (Sub-C v1)
 
