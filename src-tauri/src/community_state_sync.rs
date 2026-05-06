@@ -1748,6 +1748,18 @@ impl CommunitySyncRegistry {
             .map(|e| e.state())
     }
 
+    /// Returns a clone of the `Arc<CommunitySyncEngine>` for
+    /// `community_id`, if an engine is spawned. Used by Phase 3 IPC
+    /// handlers (`create_community`, Phase 4 `redeem_invite`) that need
+    /// to call `engine.insert_local_event(...)` after spawning the
+    /// engine + dispatching the adapter request. Mirrors `state_for`'s
+    /// shape but returns the engine handle rather than just the inner
+    /// state — the engine surface is what fires `notify_dirty` and
+    /// drives the debounced state-root publish.
+    pub async fn engine_arc(&self, community_id: &SpaceId) -> Option<Arc<CommunitySyncEngine>> {
+        self.engines.lock().await.get(community_id).cloned()
+    }
+
     /// Force the engine for `community_id` to publish its current CRDT
     /// state immediately, bypassing the debounce window. Returns
     /// `Err(CommunitySyncError::TransportClosed)` if no engine is

@@ -146,6 +146,14 @@ async fn ingest_list_pin_burn_roundtrip() {
                     None,       // cas_handle — DM transport not exercised in this test
                     None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
+                    {
+                        // Phase 3 Task 9: on-demand adapter request channel; tx
+                        // dropped immediately so the select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
                 )
                 .await;
             });
@@ -395,6 +403,14 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     None,       // cas_handle — DM transport not exercised in this test
                     None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
+                    {
+                        // Phase 3 Task 9: on-demand adapter request channel; tx
+                        // dropped immediately so the select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
                 )
                 .await;
             });
@@ -722,6 +738,14 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     None,       // cas_handle — DM transport not exercised in this test
                     None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
+                    {
+                        // Phase 3 Task 9: on-demand adapter request channel; tx
+                        // dropped immediately so the select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
                 )
                 .await;
             });
