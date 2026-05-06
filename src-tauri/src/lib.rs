@@ -205,6 +205,15 @@ pub struct NodeState {
     /// engine's final flush + persist runs while the Zenoh session
     /// (and thus the publisher) is still live.
     community_registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+    /// Sender side of the community delta channel — kept for stop_node /
+    /// restart to drop on shutdown so the consumer task winds down
+    /// cleanly. The receiver was moved into the consumer task at
+    /// start_node time; this Sender is the only handle on the
+    /// engine-side senders' clone-source. Dropping closes the channel
+    /// after every per-engine clone has also been dropped (which
+    /// happens after `registry.shutdown_all()`).
+    community_delta_tx:
+        Option<tokio::sync::mpsc::Sender<crate::community_state_sync::CommunityMembershipDelta>>,
     /// ZEB-225 Sub-B Phase 2: per-process DM outbox state. Constructed in
     /// start_node alongside the SyncEngine; shared with the IPC handler
     /// (send_dm) and the event-loop drain tick.
@@ -284,6 +293,7 @@ impl Default for NodeState {
             pairing_handle: None,
             sync_engine: None,
             community_registry: None,
+            community_delta_tx: None,
             dm_outbox: None,
             dm_transport: None,
             crdt_state: None,
@@ -455,6 +465,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         pairing_handle,
         sync_engine,
         community_registry,
+        community_delta_tx,
         dm_outbox,
         dm_transport,
         crdt_state,
@@ -494,6 +505,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.pairing_handle.take(),
             guard.sync_engine.take(),
             guard.community_registry.take(),
+            guard.community_delta_tx.take(),
             guard.dm_outbox.take(),
             guard.dm_transport.take(),
             guard.crdt_state.take(),
@@ -585,6 +597,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             });
         });
     }
+    // ZEB-217 Sub-C Phase 3 Task 8: drop the community delta sender after
+    // `registry.shutdown_all()` completes so every per-engine clone has
+    // already been released. The consumer task's receiver then observes
+    // a closed channel and exits cleanly.
+    drop(community_delta_tx);
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -740,6 +757,7 @@ async fn start_node(
         old_pairing_handle,
         old_sync_engine,
         old_community_registry,
+        old_community_delta_tx,
         old_dm_outbox,
         old_dm_transport,
         old_crdt_state,
@@ -766,6 +784,10 @@ async fn start_node(
             // identity's per-community engine pool. Mirrors stop_inner's
             // ordering — drain communities BEFORE the owner SyncEngine.
             guard.community_registry.take(),
+            // ZEB-217 Sub-C Phase 3 Task 8: take the previous identity's
+            // delta sender; dropped after `registry.shutdown_all()` below
+            // so the consumer task exits cleanly.
+            guard.community_delta_tx.take(),
             // ZEB-225 Sub-B Phase 2: take + drop the per-identity DM
             // handles so a restart doesn't carry stale Arc<DmOutbox> /
             // Arc<DmTransport> / Arc<OwnerState> / Arc<HlcTracker> /
@@ -834,6 +856,10 @@ async fn start_node(
             );
         }
     }
+    // ZEB-217 Sub-C Phase 3 Task 8: drop the prior delta sender after the
+    // registry shut down so every per-engine clone is gone first; the
+    // consumer task drains pending events and exits.
+    drop(old_community_delta_tx);
     // Phase 3a: explicitly await the previous SyncEngine's shutdown
     // before installing the replacement, so any pending debounced
     // publish flushes and the final persist pass completes. Dropping
@@ -947,6 +973,14 @@ async fn start_node(
         // wire up against the Zenoh session.
         let mut community_registry_arc: Option<
             std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+        > = None;
+        // ZEB-217 Sub-C Phase 3 Task 8: outer-scope holder for the
+        // community delta sender. The original is created inside the
+        // if-let-Some(owner_loaded) block alongside the registry; we
+        // lift a clone out here so it can be stashed on NodeState below
+        // for stop_node / restart cleanup.
+        let mut community_delta_tx_for_state: Option<
+            tokio::sync::mpsc::Sender<crate::community_state_sync::CommunityMembershipDelta>,
         > = None;
         let mut community_adapter_requests: Vec<crate::event_loop::CommunityAdapterRequest> =
             Vec::new();
@@ -1086,24 +1120,37 @@ async fn start_node(
                         inbound_tx: in_tx,
                     });
 
-                    // ── ZEB-217 Sub-C Phase 2: per-community state CRDT sync ─
+                    // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
                     //
                     // Build the registry (owns the multi-community engine pool)
-                    // and the degraded-event drain task. Each spawned engine
-                    // clones `community_error_tx` into its
-                    // CommunitySyncEngineConfig; the receiver lives here and
-                    // feeds a tokio task that emits
-                    // `community-state-sync-degraded` Tauri events per the
-                    // spec. Channel capacity is sized for burst-tolerance
-                    // under degraded conditions (e.g., a flaky peer
-                    // continuously republishing malformed bytes); a full
-                    // channel falls back to dropping the report (`error_tx`'s
-                    // emit sites use `tx.send(...).await.ok()`-style fire-
-                    // and-forget) so a single noisy community can't starve
-                    // the rest of the engine pool.
-                    let (community_error_tx, mut community_error_rx) = tokio::sync::mpsc::channel::<
+                    // along with two consumer tasks:
+                    //   - `community-members-changed` (Phase 3 Task 8) — the
+                    //     engine fires one `CommunityMembershipDelta` per
+                    //     CRDT mutation; the consumer projects each delta
+                    //     into `CommunityMembersChangedPayload` via
+                    //     `delta_to_change` and emits a Tauri event so the
+                    //     frontend updates the member list incrementally.
+                    //   - `community-state-sync-degraded` (Phase 2) — every
+                    //     spawned engine clones `community_degraded_tx`
+                    //     into its `CommunitySyncEngineConfig`; the
+                    //     consumer receives reports and surfaces a degraded
+                    //     banner per-community.
+                    //
+                    // Both channels are created BEFORE the registry config
+                    // so the senders can be passed into `CommunityRegistryConfig`
+                    // and cloned into every per-engine config inside
+                    // `spawn_engine`. Channel capacity (256) is sized for
+                    // burst-tolerance under degraded / mass-receive
+                    // conditions; a full channel falls back to dropping
+                    // the message (`try_send`-style fire-and-forget) so a
+                    // single noisy community can't starve the rest of the
+                    // engine pool.
+                    let (community_delta_tx, community_delta_rx) = tokio::sync::mpsc::channel::<
+                        crate::community_state_sync::CommunityMembershipDelta,
+                    >(256);
+                    let (community_degraded_tx, community_degraded_rx) = tokio::sync::mpsc::channel::<
                         crate::community_state_sync::CommunityDegradedReport,
-                    >(64);
+                    >(256);
 
                     let registry: std::sync::Arc<
                         crate::community_state_sync::CommunitySyncRegistry,
@@ -1121,46 +1168,70 @@ async fn start_node(
                             identity_resolver: resolver,
                             identity_dir: identity_dir.clone(),
                             debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
-                            error_tx: Some(community_error_tx),
+                            error_tx: Some(community_degraded_tx),
+                            delta_tx: Some(community_delta_tx.clone()),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),
                         )
                     };
 
-                    // Drain task: translate each degraded report into a
-                    // Tauri event. The frontend's CommunityService
-                    // subscribes to surface a "this community's sync is
-                    // degraded" banner. Task exits cleanly when
-                    // `community_error_rx.recv()` returns None — that
-                    // happens after every engine's `error_tx` clone
-                    // drops, which is when `registry.shutdown_all()`
-                    // completes (each engine's internal task ends and
-                    // its config-owned sender drops with it).
+                    // Spawn the delta consumer: each `CommunityMembershipDelta`
+                    // becomes one `community-members-changed` Tauri event.
+                    // Task exits cleanly when every per-engine `delta_tx`
+                    // clone AND the start_node-held clone have all
+                    // dropped — which happens after `registry.shutdown_all()`
+                    // and the explicit `drop(community_delta_tx)` in
+                    // stop_inner / start_node restart.
                     {
-                        let app_handle = app.clone();
-                        tokio::spawn(async move {
-                            while let Some(report) = community_error_rx.recv().await {
-                                let id_hex = hex::encode(report.community_id.0);
-                                let payload = serde_json::json!({
-                                    "communityId": id_hex,
-                                    "reason": report.reason_tag,
-                                    "detail": report.detail,
-                                });
-                                if let Err(e) =
-                                    app_handle.emit("community-state-sync-degraded", payload)
-                                {
-                                    tracing::warn!(
-                                        error = ?e,
-                                        "failed to emit community-state-sync-degraded"
-                                    );
+                        let app_for_delta = app.clone();
+                        tokio::spawn(run_community_delta_consumer(
+                            community_delta_rx,
+                            move |payload| {
+                                let app = app_for_delta.clone();
+                                async move {
+                                    if let Err(e) = app.emit("community-members-changed", &payload)
+                                    {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "failed to emit community-members-changed"
+                                        );
+                                    }
                                 }
-                            }
-                            tracing::info!(
-                                "community-state-sync-degraded drain task exiting (registry shutdown)"
-                            );
-                        });
+                            },
+                        ));
                     }
+
+                    // Spawn the degraded consumer: each `CommunityDegradedReport`
+                    // becomes one `community-state-sync-degraded` Tauri event.
+                    // Task exits cleanly when `community_degraded_rx.recv()`
+                    // returns None — happens after every engine's
+                    // `error_tx` clone drops on `registry.shutdown_all()`.
+                    {
+                        let app_for_degraded = app.clone();
+                        tokio::spawn(run_community_degraded_consumer(
+                            community_degraded_rx,
+                            move |payload| {
+                                let app = app_for_degraded.clone();
+                                async move {
+                                    if let Err(e) =
+                                        app.emit("community-state-sync-degraded", &payload)
+                                    {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "failed to emit community-state-sync-degraded"
+                                        );
+                                    }
+                                }
+                            },
+                        ));
+                    }
+
+                    // Lift the start_node-held delta sender out for
+                    // NodeState assignment so stop_node / restart can
+                    // drop it after `registry.shutdown_all()` to close
+                    // the consumer's channel.
+                    community_delta_tx_for_state = Some(community_delta_tx);
 
                     // Scan owner-state for joined communities and spawn
                     // one engine per community. Each spawn allocates a
@@ -1502,6 +1573,11 @@ async fn start_node(
                 // reach it. Cloned (Arc bump) — `community_registry_arc`
                 // is also held by the failure-cleanup tuple below.
                 guard.community_registry = community_registry_arc.clone();
+                // ZEB-217 Sub-C Phase 3 Task 8: store the start_node-held
+                // delta sender so stop_node / restart can drop it after
+                // `registry.shutdown_all()` and the consumer task winds
+                // down cleanly.
+                guard.community_delta_tx = community_delta_tx_for_state.clone();
                 // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
                 // handles on NodeState for send_dm IPC + (T7) drain tick.
                 guard.dm_outbox = dm_outbox_arc.clone();
@@ -5505,6 +5581,66 @@ pub fn delta_to_change(
     Some((cid_hex, change))
 }
 
+/// Drain `delta_rx`, project each delta into `CommunityMembersChangedPayload`,
+/// and pass to `emit`. Stops cleanly when the channel closes (last sender
+/// dropped — typically on `stop_node`).
+///
+/// Phase 3 emits one change per IPC event (engine fires one delta per
+/// CRDT mutation); the wire format leaves room for batched future
+/// deltas without a contract break.
+pub async fn run_community_delta_consumer<F, Fut>(
+    mut delta_rx: tokio::sync::mpsc::Receiver<
+        crate::community_state_sync::CommunityMembershipDelta,
+    >,
+    mut emit: F,
+) where
+    F: FnMut(CommunityMembersChangedPayload) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    while let Some(delta) = delta_rx.recv().await {
+        if let Some((community_id, change)) = delta_to_change(&delta) {
+            let payload = CommunityMembersChangedPayload {
+                community_id,
+                changes: vec![change],
+            };
+            emit(payload).await;
+        }
+    }
+}
+
+/// Mirror for `CommunityDegradedReport`. Emits `{ communityId, reason, detail }`
+/// — matches the prior inline drain task's wire shape so the frontend
+/// banner consumer doesn't break.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityStateSyncDegradedPayload {
+    pub community_id: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Drain `degraded_rx` and emit each report through `emit`. Stops
+/// cleanly when the channel closes (every engine's `error_tx` clone has
+/// dropped — happens when `registry.shutdown_all()` finishes).
+pub async fn run_community_degraded_consumer<F, Fut>(
+    mut degraded_rx: tokio::sync::mpsc::Receiver<
+        crate::community_state_sync::CommunityDegradedReport,
+    >,
+    mut emit: F,
+) where
+    F: FnMut(CommunityStateSyncDegradedPayload) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    while let Some(report) = degraded_rx.recv().await {
+        let payload = CommunityStateSyncDegradedPayload {
+            community_id: hex::encode(report.community_id.0),
+            reason: report.reason_tag.to_string(),
+            detail: report.detail,
+        };
+        emit(payload).await;
+    }
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -6497,5 +6633,70 @@ mod community_delta_projection_tests {
             Some(MembershipChangeDetail::Level(n)) => assert_eq!(*n, 50),
             other => panic!("expected Level detail, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod delta_consumer_task_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind,
+    };
+    use crate::community_state_sync::CommunityMembershipDelta;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    #[tokio::test]
+    async fn consumer_emits_payload_via_handler() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<CommunityMembershipDelta>(8);
+        let captured: std::sync::Arc<tokio::sync::Mutex<Vec<CommunityMembersChangedPayload>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_for_handler = std::sync::Arc::clone(&captured);
+
+        let handle = tokio::spawn(async move {
+            run_community_delta_consumer(rx, move |payload| {
+                let captured = std::sync::Arc::clone(&captured_for_handler);
+                async move {
+                    captured.lock().await.push(payload);
+                }
+            })
+            .await
+        });
+
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let community_id = SpaceId([6; 16]);
+        let payload = EventPayload {
+            id: [9; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "x".into(),
+            },
+        };
+        let event = sign_event_with_identity(&payload, &identity).unwrap();
+        tx.send(CommunityMembershipDelta {
+            community_id,
+            event,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cap = captured.lock().await;
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].community_id, hex::encode(community_id.0));
+        assert_eq!(
+            cap[0].changes.len(),
+            1,
+            "Phase 3 emits one change per IPC event"
+        );
+        assert_eq!(cap[0].changes[0].r#type, MembershipChangeType::Joined);
+        assert_eq!(cap[0].changes[0].target, hex::encode(actor.0));
+        drop(tx);
+        let _ = handle.await;
     }
 }

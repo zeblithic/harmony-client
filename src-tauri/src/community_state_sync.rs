@@ -1532,6 +1532,13 @@ pub struct CommunityRegistryConfig {
     /// `CommunityDegradedReport`s into `community-state-sync-degraded`
     /// Tauri events. `None` for tests that don't assert on IPC events.
     pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    /// Optional membership-delta channel. When `Some`, the registry
+    /// clones the sender into every engine's `CommunitySyncEngineConfig`,
+    /// and the receiver-side (owned by start_node — Phase 3 Task 8)
+    /// translates `CommunityMembershipDelta`s into
+    /// `community-members-changed` Tauri events. `None` for tests that
+    /// don't assert on IPC events.
+    pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -1662,7 +1669,7 @@ impl CommunitySyncRegistry {
             debounce_ms: self.cfg.debounce_ms,
             identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
             error_tx: self.cfg.error_tx.clone(),
-            delta_tx: None,
+            delta_tx: self.cfg.delta_tx.clone(),
         }));
 
         engines.insert(community_id, engine);
