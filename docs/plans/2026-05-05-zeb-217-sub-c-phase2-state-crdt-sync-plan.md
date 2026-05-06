@@ -2173,7 +2173,7 @@ async fn handle_incoming_publish(
     //    next-boot).
     {
         let mut tracker = ctx.tracker.lock().await;
-        tracker.advance(payload.at.clone());
+        tracker.record(payload.at.clone());
     }
 
     // 7. Merge events. Each event must re-verify against B's
@@ -2446,7 +2446,7 @@ fn would_accept_returns_true_for_unseen_device() {
 #[test]
 fn would_accept_rejects_equal_or_older() {
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(100, 0, "a"));
+    t.record(h(100, 0, "a"));
     assert!(!t.would_accept(&h(100, 0, "a")), "exact replay rejected");
     assert!(!t.would_accept(&h(99, 5, "a")), "older wall_ms rejected");
     assert!(t.would_accept(&h(100, 1, "a")), "later logical accepted");
@@ -2454,38 +2454,44 @@ fn would_accept_rejects_equal_or_older() {
 }
 
 #[test]
-fn advance_does_not_regress_on_older_input() {
+fn would_accept_blocks_regression_at_caller() {
     // The bug-class from PR #81 round 3: if two paths ever feed the
-    // tracker out of order and `advance` regresses to the older HLC,
-    // the next legitimate publish from that device would be rejected
-    // (it's "older than" the regressed value but we already saw a
-    // newer one).
+    // tracker out of order and the caller skips `would_accept`, the
+    // next legitimate publish from that device could be rejected (it's
+    // "older than" the regressed value but we already saw a newer
+    // one). The new API surfaces that bug at the caller — record()
+    // debug_asserts the precondition — so this test pins that the
+    // caller-facing check correctly rejects the older input.
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(200, 0, "a"));
-    t.advance(h(100, 0, "a")); // older — must not regress
+    t.record(h(200, 0, "a"));
+    assert!(
+        !t.would_accept(&h(100, 0, "a")),
+        "older HLC must be caller-rejected, never reach record()"
+    );
+    // The state remains pinned at 200 because record(100) was skipped.
     assert!(!t.would_accept(&h(150, 0, "a")), "still bounded by 200");
     assert!(t.would_accept(&h(201, 0, "a")), "201 > 200");
 }
 
 #[test]
-fn advance_per_device_isolates_clocks() {
+fn record_per_device_isolates_clocks() {
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(500, 0, "a"));
+    t.record(h(500, 0, "a"));
     // device b is unseen; new HLC accepted regardless of a's clock
     assert!(t.would_accept(&h(100, 0, "b")));
-    t.advance(h(100, 0, "b"));
+    t.record(h(100, 0, "b"));
     assert!(!t.would_accept(&h(99, 0, "b")));
 }
 ```
 
-- [ ] **Step 9.2: Run tests to verify pass (advance() defensive guard already in Task 6)**
+- [ ] **Step 9.2: Run tests to verify pass (would_accept guard surfaces regressions to caller)**
 
 ```bash
 cd src-tauri
 cargo test --test community_root_hlc_tracker_unit 2>&1 | grep "^test result:"
 ```
 
-Expected: PASS (4 tests). The defensive guard in `advance()` (Task 6's Step 6.3) already prevents regression — these tests pin the behavior so a future refactor can't silently strip it.
+Expected: PASS (4 tests). The `would_accept`/`record` split (Task 6's Step 6.3) makes regressions caller-visible rather than silently no-opping — these tests pin that behavior so a future refactor can't accidentally let bad calls slip through.
 
 - [ ] **Step 9.3: Run gates + commit**
 
@@ -2575,7 +2581,7 @@ fn save_and_load_replay_round_trips() {
     let path = dir.path().join("replay.cbor");
 
     let mut tracker = CommunityRootHlcTracker::default();
-    tracker.advance(Hlc {
+    tracker.record(Hlc {
         wall_ms: 1000,
         logical: 5,
         device_id: "dev".into(),
