@@ -8,17 +8,20 @@
 //! machinery, decrypts, and merges remote events into local
 //! `CommunityState` after re-running `verify_event` per event.
 //!
-//! This file ships the AEAD helpers today; subsequent tasks fill in
-//! the wire types (`CommunityRootPublishPayload`), `RootHlcTracker`,
-//! engine task, and registry incrementally.
+//! This file ships the AEAD helpers and the `CommunityRootPublishPayload`
+//! wire type today; subsequent tasks fill in `RootHlcTracker`, engine
+//! task, and registry incrementally.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use harmony_content::cid::ContentId;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::owner_state_types::MembershipKey;
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
+use crate::owner_state_types::{Hlc, MembershipKey};
 
 /// Errors specific to community-state encryption + decryption.
 #[derive(thiserror::Error, Debug)]
@@ -148,3 +151,30 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
         .decrypt(nonce, ct)
         .map_err(|_| CommunityCryptoError::AeadFailed)
 }
+
+/// State-root publish payload for a community. Sent over
+/// `harmony/community/{id_hex}/state-root-v1` after AEAD-encryption
+/// via `encrypt_root_publish`. Receivers fetch `root_cid` from CAS
+/// to retrieve the encrypted CommunityState blob, then decrypt with
+/// `decrypt_blob`.
+///
+/// Wire format: 2-key CBOR map. Both field codes are 2 chars
+/// (`rc` + `at`) to satisfy the same-length-keys invariant at this
+/// nesting level. The HLC `at` is the publisher's monotonic counter
+/// — receivers' RootHlcTrackers reject anything not strictly newer
+/// per (publisher_device_id, hlc) (replay protection; mirrors
+/// owner_state_sync's RootPublishPayload at line 429).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRootPublishPayload {
+    /// Content-ID of the encrypted CommunityState blob in the
+    /// shared ContentStore.
+    #[serde(rename = "rc")]
+    pub root_cid: ContentId,
+    /// Publisher's HLC at publish time. Monotonically increasing per
+    /// device_id; receivers track per-device latest-seen.
+    #[serde(rename = "at")]
+    pub at: Hlc,
+}
+
+impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
+impl CanonicalPayload for CommunityRootPublishPayload {}
