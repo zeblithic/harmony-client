@@ -2293,14 +2293,16 @@ pub fn spawn_community_state_zenoh_adapter(
             loop {
                 tokio::select! {
                     // Data-flow arm first (see publisher loop above
-                    // for rationale).
+                    // for rationale). If `subscriber_tx.closed()`
+                    // resolves on the same poll as an inbound sample,
+                    // delivering the sample is harmless: the
+                    // subsequent `subscriber_tx.send` returns Err and
+                    // breaks the loop on the next iteration. Putting
+                    // `closed()` first instead would silently discard
+                    // that sample — contradicting the documented
+                    // intent and masking edge-case message loss
+                    // during teardown.
                     biased;
-                    _ = subscriber_tx.closed() => {
-                        // Engine dropped subscriber_rx — nothing to
-                        // forward to anymore. Silent exit; engine
-                        // owns the shutdown trace if relevant.
-                        break;
-                    }
                     res = sub.recv_async() => {
                         match res {
                             Ok(sample) => {
@@ -2320,6 +2322,12 @@ pub fn spawn_community_state_zenoh_adapter(
                                 break;
                             }
                         }
+                    }
+                    _ = subscriber_tx.closed() => {
+                        // Engine dropped subscriber_rx — nothing to
+                        // forward to anymore. Silent exit; engine
+                        // owns the shutdown trace if relevant.
+                        break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         if closing_sub.load(Ordering::SeqCst) { break; }
