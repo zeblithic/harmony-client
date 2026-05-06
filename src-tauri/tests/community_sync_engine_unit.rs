@@ -285,8 +285,18 @@ async fn engine_receives_remote_publish_and_merges_event() {
     // Trigger A's publish. B's subscriber arm should fire and merge.
     engine_a.flush_now().await.expect("flush_now");
 
-    // Give B a moment to process.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait deterministically for B to merge. A bounded poll keeps the
+    // test from flaking on slow CI runners.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state_b.lock().await.events.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B should have merged A's event within 2s");
 
     let sb = state_b.lock().await;
     assert_eq!(sb.events.len(), 1, "B should have merged A's event");

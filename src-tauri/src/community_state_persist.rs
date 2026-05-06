@@ -195,6 +195,14 @@ fn quarantine_corrupted(path: &Path, decode_err: &str) {
 /// (cross-device rename would fall back to copy + unlink, defeating
 /// the atomicity guarantee).
 ///
+/// **Concurrent-write safety:** the fixed `.tmp` name is only safe
+/// because each `CommunitySyncEngine`'s internal task is single-
+/// threaded — there's exactly one writer per (community_id, file)
+/// pair, and persist calls are serialized by the engine's `select!`
+/// loop. If a future caller invokes `save_*` from outside the engine
+/// (e.g., a parallel migration tool) the fixed temp-name would race;
+/// switch to `tempfile::NamedTempFile::new_in(parent)` at that point.
+///
 /// On Unix `rename` is atomic at the directory-entry level; on
 /// Windows NTFS in-volume rename is similarly atomic. We don't fsync
 /// the directory entry here (unlike `owner_state_persist`'s heavier

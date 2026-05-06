@@ -676,8 +676,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.community_id,
                         "subscriber_channel_closed",
                         "Zenoh adapter dropped subscriber_tx; engine in publish-only mode".into(),
-                    )
-                    .await;
+                    );
                     inbound_closed = true;
                     continue;
                 };
@@ -699,8 +698,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.community_id,
                         classify_incoming_error(err),
                         format!("{err}"),
-                    )
-                    .await;
+                    );
                 }
                 // Persist on Mutated | MutatedTrackerOnly |
                 // ErrPostMutation. `crdt_mutated()` lets the
@@ -723,24 +721,47 @@ async fn internal_task(mut ctx: InternalCtx) {
                 }
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
-                let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                // Final-flush only if the in-memory pending-dirty flag
+                // says we owe peers a publish. Lock-relaxed is fine
+                // because there's no concurrent mutator past this
+                // point — we're in the shutdown branch.
+                let was_dirty = ctx.has_pending_dirty.load(Ordering::Relaxed);
+                let pub_result = if was_dirty {
                     publish_root_now(&ctx).await
                 } else {
                     Ok(())
                 };
-                // Always flush on shutdown — we can't cheaply tell
-                // from outside whether the CRDT mutated since the
-                // last persist, and losing the final disk flush
-                // silently corrupts next-boot replay (the in-memory
-                // tracker would advance again on a re-broadcast and
-                // miss whatever we accepted in this session).
-                let persist_result = persist_both(&ctx).await;
-                // `pub_result.and(persist_result)` returns Ok only if
-                // BOTH steps succeeded; otherwise the first Err
-                // surfaces. Persist failures must reach the caller —
+                // Persist gating mirrors the debounce / flush_now arms:
+                // only checkpoint state to disk after a SUCCESSFUL
+                // publish. Persisting after a failed publish would
+                // record next_hlc's tracker advance even though peers
+                // never received the final root — on restart the in-
+                // memory `has_pending_dirty` is gone, so there's no
+                // signal to retry. The receive-side (no publish, just
+                // a tracker advance from accepted inbound) is a
+                // separate concern: persist runs on every successful
+                // accept-and-merge in the subscriber arm, so by the
+                // time we reach shutdown the on-disk replay tracker is
+                // already up to date for accepted publishes.
+                //
+                // If we never even attempted a publish (was_dirty=false)
+                // we still flush so any receive-side updates this loop
+                // accepted but didn't yet persist (only possible if a
+                // shutdown raced in between accept and persist) reach
+                // disk. In practice the subscriber arm calls persist
+                // before yielding back to select!, so this is a belt-
+                // and-suspenders flush — cheap, safe, and visible in
+                // tests.
+                let final_result = if pub_result.is_ok() {
+                    let persist_result = persist_both(&ctx).await;
+                    pub_result.and(persist_result)
+                } else {
+                    pub_result
+                };
+                // Surface persist+publish failures to the caller —
                 // suppressing them mirrors the same silent-corruption
                 // failure mode `owner_state_sync` explicitly rejects.
-                let _ = resp_tx.send(pub_result.and(persist_result));
+                let _ = resp_tx.send(final_result);
                 return;
             }
         }
@@ -922,9 +943,16 @@ impl IncomingOutcome {
 
     /// Whether the CRDT itself changed (≥ 1 event Inserted). Used by
     /// the subscriber arm to decide between `persist_both` and
-    /// `persist_replay_only`.
+    /// `persist_replay_only`. `ErrPostMutation` is deliberately
+    /// excluded — every current ErrPostMutation path (only
+    /// `MissingIdentityResolver` today) returns BEFORE entering the
+    /// per-event merge loop, so the CRDT is byte-identical to its
+    /// last-persisted form. Including it here would force an
+    /// unnecessary `crdt.cbor` fsync. Future ErrPostMutation paths
+    /// that DO mutate the CRDT mid-loop must surface a separate
+    /// outcome variant rather than overload this one.
     fn crdt_mutated(&self) -> bool {
-        matches!(self, Self::Mutated | Self::ErrPostMutation(_))
+        matches!(self, Self::Mutated)
     }
 
     fn error(&self) -> Option<&CommunitySyncError> {
@@ -1057,8 +1085,26 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // Phase 3 IPC handlers that lock owner_state then community_state.
     // Skip-on-error logs + drops events with unknown actor / cs
     // identity_pubs; mirrors decrypt_inbox_entries (DM transport).
+    //
+    // **Replay order matters.** `BTreeMap<EventId, _>::into_values()`
+    // walks in `EventId` byte order, but `insert_event` authorizes
+    // each candidate against `prior_state_at_event` — i.e., everything
+    // already in the local log that strictly precedes the candidate by
+    // `event_sort_key`. If two events arrive in the same blob and the
+    // later-by-replay-order event is processed first, its earlier
+    // predecessor (still pending in our pre-resolve queue) is missing
+    // from prior_state, and a valid event can land as `Rejected`. Sort
+    // explicitly by `event_sort_key` so we merge in the same order
+    // `materialize` would replay.
+    let mut events_in_replay_order: Vec<SignedMembershipEvent> =
+        remote.events.into_values().collect();
+    events_in_replay_order.sort_by(|a, b| {
+        crate::community_membership::event_sort_key(a)
+            .cmp(&crate::community_membership::event_sort_key(b))
+    });
+
     let mut resolved: Vec<(SignedMembershipEvent, [u8; 64], Option<[u8; 64]>)> = Vec::new();
-    for event in remote.events.into_values() {
+    for event in events_in_replay_order {
         let actor_pub = match resolver.resolve(&event.actor).await {
             Some(p) => p,
             None => {
@@ -1148,8 +1194,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             ctx.community_id,
             "verify_event_rejected",
             format!("{verr:?}"),
-        )
-        .await;
+        );
     }
 
     // The tracker advanced (step 6) regardless of whether any event
@@ -1195,24 +1240,43 @@ async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError
     Ok(())
 }
 
-/// Send a `CommunityDegradedReport` if `error_tx` is wired. Helper for
-/// the three emit sites in `internal_task` and `handle_incoming_publish`
-/// — they all `if let Some(tx) ... let _ = tx.send(...)` the same shape,
-/// and Task 13 will add a fourth site for start_node-level reporting.
-async fn report_degraded(
+/// Send a `CommunityDegradedReport` if `error_tx` is wired.
+///
+/// **Fire-and-forget semantics.** Uses `try_send` so a full degraded
+/// channel falls back to dropping the report rather than back-
+/// pressuring the engine's `select!` loop. The engine is already
+/// degraded by the time we emit — adding a tokio task stall on a full
+/// channel would compound the degradation. A dropped report is logged
+/// at debug level for diagnostics; the next degraded event from the
+/// same community will re-trigger the frontend banner.
+fn report_degraded(
     error_tx: Option<&mpsc::Sender<CommunityDegradedReport>>,
     community_id: SpaceId,
     reason_tag: &'static str,
     detail: String,
 ) {
     if let Some(tx) = error_tx {
-        let _ = tx
-            .send(CommunityDegradedReport {
-                community_id,
-                reason_tag,
-                detail,
-            })
-            .await;
+        match tx.try_send(CommunityDegradedReport {
+            community_id,
+            reason_tag,
+            detail,
+        }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(report)) => {
+                tracing::debug!(
+                    community_id = ?report.community_id,
+                    reason_tag = report.reason_tag,
+                    "community degraded report dropped: channel full"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(report)) => {
+                tracing::warn!(
+                    community_id = ?report.community_id,
+                    reason_tag = report.reason_tag,
+                    "community degraded report dropped: channel closed (drain task gone)"
+                );
+            }
+        }
     }
 }
 
@@ -1319,15 +1383,16 @@ impl CommunitySyncRegistry {
     /// scan can fire the same `Membership::Joined` delta twice without
     /// the registry double-spawning or surfacing a spurious failure.
     ///
-    /// **Lock scope:** the engines map lock is held across the disk
-    /// I/O (`load_crdt` + `load_replay`), the `CommunitySyncEngine::new`
-    /// call, AND the `tokio::spawn` of the engine's internal task that
-    /// `new` performs. Concurrent `spawn_engine` calls for distinct
-    /// communities will serialise on this lock — acceptable because
-    /// spawn is rare (once per Joined event), and holding the lock
-    /// through engine construction is the only way to keep the
-    /// contains-key check race-free against another spawn for the
-    /// same community.
+    /// **Lock scope:** disk I/O (`load_crdt` + `load_replay`) runs
+    /// BEFORE acquiring the engines map lock to avoid parking a tokio
+    /// worker thread behind synchronous `std::fs::read` calls. The
+    /// idempotency check then re-runs under the lock so two concurrent
+    /// spawns for the same community still resolve to a single engine
+    /// (the second one's pre-loaded state is discarded — cheap, since
+    /// the file is what survives anyway). The `CommunitySyncEngine::new`
+    /// call (which itself does a `tokio::spawn` for the internal task)
+    /// stays under the lock so the insert + spawn pair is atomic vs
+    /// other spawn races.
     pub async fn spawn_engine(
         &self,
         community_id: SpaceId,
@@ -1337,6 +1402,22 @@ impl CommunitySyncRegistry {
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<(), CommunitySyncError> {
+        // Phase 1: blocking disk I/O OUTSIDE the lock. Both load_crdt
+        // and load_replay call std::fs::read; on the multi-thread
+        // tokio runtime that parks one worker, on current_thread it
+        // would starve all tasks. Doing this first is also harmless on
+        // a re-spawn race: the second caller's loaded state is just
+        // dropped at the idempotency check below.
+        let paths = self.paths_for(community_id);
+        let initial_state = load_crdt(&paths.crdt, community_id)
+            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        let initial_tracker =
+            load_replay(&paths.replay).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+
+        // Phase 2: take the engines lock, re-check idempotency, build
+        // and insert the engine. Lock is held across CommunitySyncEngine::new
+        // (which spawns the internal task) so a concurrent spawn for
+        // the same community can't race past the contains_key check.
         let mut engines = self.engines.lock().await;
         if engines.contains_key(&community_id) {
             // Idempotent — re-spawn is a no-op rather than an error
@@ -1344,12 +1425,6 @@ impl CommunitySyncRegistry {
             // owner-state mutations.
             return Ok(());
         }
-
-        let paths = self.paths_for(community_id);
-        let initial_state = load_crdt(&paths.crdt, community_id)
-            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
-        let initial_tracker =
-            load_replay(&paths.replay).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
 
         let state = Arc::new(Mutex::new(initial_state));
         let tracker = Arc::new(Mutex::new(initial_tracker));

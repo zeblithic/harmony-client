@@ -62,6 +62,28 @@ impl IdentityResolver for StaticResolver {
     }
 }
 
+/// Bounded poll helper. Drives `predicate` every `poll_interval` until
+/// it returns true OR `timeout` elapses; panics on timeout. Replaces
+/// fixed `tokio::time::sleep` waits in tests with deterministic
+/// convergence so the suite returns as soon as the engine settles and
+/// only fails when convergence never happens.
+async fn wait_until<F, Fut>(timeout: Duration, poll_interval: Duration, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            if predicate().await {
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    })
+    .await
+    .expect("wait_until: condition timed out");
+}
+
 /// Spawn a background task servicing `CasOp::PutLocal` and
 /// `CasOp::GetOrFetch` over an in-memory `HashMap`. Returns the
 /// shared sender both registries' `RuntimeContentStore` instances
@@ -209,14 +231,25 @@ async fn two_members_dag_sync_full_event_log() {
     // to sleep through the full window.
     registry_a.flush_now(&community_id).await.expect("flush a");
 
-    // Give B's subscriber arm a window to receive, fetch, decrypt,
-    // verify, and merge. 200 ms matches the unit test in Task 8.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let state_b = registry_b
         .state_for(&community_id)
         .await
         .expect("engine spawned");
+
+    // Wait deterministically for B's subscriber arm to receive, fetch,
+    // decrypt, verify, and merge the event. Bounded poll instead of a
+    // fixed sleep keeps CI runners with variable latency happy.
+    let state_b_for_poll = Arc::clone(&state_b);
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        move || {
+            let s = Arc::clone(&state_b_for_poll);
+            async move { s.lock().await.events.len() == 1 }
+        },
+    )
+    .await;
+
     {
         let sb = state_b.lock().await;
         assert_eq!(sb.events.len(), 1, "B should have merged A's event");
@@ -478,14 +511,22 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let valid_wire = a_pub_rx.recv().await.expect("A produced no wire packet");
     b_sub_tx.send(valid_wire).await.expect("send valid wire");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // Liveness check: B's engine survived the malformed packet and
     // processed the subsequent valid publish.
     let state_b = registry_b
         .state_for(&community_id)
         .await
         .expect("engine spawned");
+    let state_b_for_poll = Arc::clone(&state_b);
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        move || {
+            let s = Arc::clone(&state_b_for_poll);
+            async move { s.lock().await.events.len() == 1 }
+        },
+    )
+    .await;
     {
         let sb = state_b.lock().await;
         assert_eq!(
@@ -611,12 +652,30 @@ async fn replay_of_same_root_publish_is_idempotent() {
     b_sub_tx.send(wire.clone()).await.expect("send 1");
     b_sub_tx.send(wire).await.expect("send 2");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let state_b = registry_b
         .state_for(&community_id)
         .await
         .expect("engine spawned");
+
+    // Wait for at least one merge to land. The test's invariant is
+    // that exactly one event survives — but checking events.len() == 1
+    // immediately would race the second-delivery's tracker-only
+    // rejection. Poll until ≥ 1 event lands, then sleep briefly to
+    // give the second delivery a chance to NOT change anything, then
+    // assert.
+    let state_b_for_poll = Arc::clone(&state_b);
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        move || {
+            let s = Arc::clone(&state_b_for_poll);
+            async move { !s.lock().await.events.is_empty() }
+        },
+    )
+    .await;
+    // Brief settle so the second delivery has time to be processed
+    // and (correctly) hit the tracker-only Duplicate path.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     {
         let sb = state_b.lock().await;
         assert_eq!(
