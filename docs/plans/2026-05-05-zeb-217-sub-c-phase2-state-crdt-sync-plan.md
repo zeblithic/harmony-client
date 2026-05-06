@@ -1032,16 +1032,10 @@ use harmony_content::cid::ContentId;
 
 #[test]
 fn community_root_publish_payload_wire_bytes_pinned() {
-    // 28-byte ContentId is the SHA-256-truncated digest. We construct
-    // a deterministic instance from a fixed byte pattern.
-    let cid = ContentId::from_raw(
-        harmony_content::cid::ContentFlags {
-            encrypted: true,
-            ..Default::default()
-        },
-        [0xAA; 28],
-    )
-    .expect("from_raw");
+    // ContentId is 32 bytes (4-byte header + 28-byte hash). For the
+    // fixture we use a fully synthetic byte pattern — `from_bytes` is
+    // the standard test constructor (see owner_state_sync.rs:1129).
+    let cid = ContentId::from_bytes([0xAA; 32]);
     let p = CommunityRootPublishPayload {
         root_cid: cid,
         at: Hlc {
