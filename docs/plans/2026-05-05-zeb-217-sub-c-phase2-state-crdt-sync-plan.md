@@ -1958,6 +1958,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
     // / error_tx fields with sensible defaults; Task 8's tests fill
     // in `identity_resolver: Some(...)` so receive-side verify_event
     // can resolve identity_pubs for the admin's signed events.
+    let tmp_a = tempfile::tempdir().expect("tempdir a");
+    let tmp_b = tempfile::tempdir().expect("tempdir b");
+
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
         membership_key: mk.clone(),
@@ -1970,8 +1973,8 @@ async fn engine_receives_remote_publish_and_merges_event() {
         publisher_tx: a_out_tx,
         subscriber_rx: a_in_rx,
         paths: harmony_app::community_state_sync::PersistPaths {
-            crdt: std::env::temp_dir().join("a_crdt.cbor"),
-            replay: std::env::temp_dir().join("a_replay.cbor"),
+            crdt: tmp_a.path().join("crdt.cbor"),
+            replay: tmp_a.path().join("replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
         identity_resolver: None,
@@ -1999,8 +2002,8 @@ async fn engine_receives_remote_publish_and_merges_event() {
         publisher_tx: b_out_tx,
         subscriber_rx: b_in_rx,
         paths: harmony_app::community_state_sync::PersistPaths {
-            crdt: std::env::temp_dir().join("b_crdt.cbor"),
-            replay: std::env::temp_dir().join("b_replay.cbor"),
+            crdt: tmp_b.path().join("crdt.cbor"),
+            replay: tmp_b.path().join("replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
         identity_resolver: Some(identity_resolver),
@@ -2143,9 +2146,20 @@ async fn handle_incoming_publish(
         }
     }
 
-    // 3. Fetch the encrypted blob from CAS.
-    let blob_ciphertext = match ctx.content_store.get(payload.root_cid).await {
-        Ok(b) => b,
+    // 3. Fetch the encrypted blob from CAS. Cache-miss is a pre-
+    //    mutation failure — the publish carries a CID we couldn't
+    //    resolve in time; CRDT eventual consistency lets the next
+    //    state-root from any peer recover.
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(
+                crate::content_store::ContentStoreError::Io(format!(
+                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
+                    payload.root_cid
+                )),
+            ));
+        }
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
     };
 
