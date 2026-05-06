@@ -535,8 +535,9 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.has_pending_dirty.store(true, Ordering::Release);
                     }
                 }
-                // Persist invocation deferred to Task 10; for now we
-                // accept that on-disk state lags by one wakeup tick.
+                // Persistence is unimplemented until Task 10 — there
+                // is no on-disk state at all yet, so each publish is
+                // memory-only on the publisher side.
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
                 next_wakeup = None;

@@ -1,5 +1,7 @@
-//! CommunitySyncEngine scaffold tests — verify construction +
-//! shutdown without exercising the full sync loop yet.
+//! CommunitySyncEngine unit tests — covers construction + clean
+//! shutdown plus the flush_now → publish_root_now → wire-bytes path.
+//! The handle_incoming_publish receive path is exercised in Task 8;
+//! the multi-engine registry in Task 11.
 
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
@@ -103,7 +105,7 @@ async fn flush_now_publishes_one_root_publish() {
             crdt: tmp.path().join("crdt.cbor"),
             replay: tmp.path().join("replay.cbor"),
         },
-        debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
         identity_resolver: None,
         error_tx: None,
     });
