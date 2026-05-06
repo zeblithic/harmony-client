@@ -10,9 +10,11 @@
 //!
 //! This file ships the AEAD helpers, the `CommunityRootPublishPayload`
 //! wire type, the `CommunityRootHlcTracker`, and the
-//! `CommunitySyncEngine` scaffold (construct + shutdown only — the
-//! internal task is a stub). Subsequent tasks fill in the real
-//! publish/subscribe loop and registry incrementally.
+//! `CommunitySyncEngine`. The internal task ships the debounced
+//! publish loop (notify_dirty → debounce → publish_root_now,
+//! flush_now → force-publish, shutdown → final flush); the subscriber
+//! arm is still a stub (Task 8 fills in handle_incoming_publish).
+//! Subsequent tasks add persistence flushes and the registry.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -40,6 +42,14 @@ pub enum CommunityCryptoError {
     AeadFailed,
     #[error("ciphertext too short to contain nonce + tag")]
     Truncated,
+    /// `harmony_content::cid::ContentId::for_book` rejected the
+    /// ciphertext input (e.g. exceeds the structured-CID size budget).
+    /// Distinct from `AeadFailed` because the failure class is
+    /// content-addressing, not cryptography — surfacing it as
+    /// `AeadFailed` would mislead the operator into checking key
+    /// material when the actual fault is in the blob layer.
+    #[error("ContentId derivation failed: {0}")]
+    ContentIdDerivation(String),
 }
 
 const NONCE_LEN: usize = 12;
@@ -354,17 +364,19 @@ pub struct CommunitySyncEngine {
 }
 
 impl CommunitySyncEngine {
-    /// Construct the engine and spawn its internal task. Task 7
-    /// replaces the stub task with the real publish/subscribe loop;
-    /// today the stub just waits on shutdown so construction +
-    /// teardown can be exercised independently.
+    /// Construct the engine and spawn its internal task. The task
+    /// runs the debounced publish loop: `notify_dirty` arms the
+    /// debounce timer, the timer fires `publish_root_now`,
+    /// `flush_now` forces an immediate publish, and `shutdown`
+    /// performs one final dirty-only publish before the task exits.
+    /// The subscriber arm is a stub pending Task 8.
     pub fn new(cfg: CommunitySyncEngineConfig) -> Self {
         let notify_dirty = Arc::new(Notify::new());
         let has_pending_dirty = Arc::new(AtomicBool::new(false));
         let (flush_now_tx, flush_now_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let task = tokio::spawn(internal_task_stub(InternalCtx {
+        let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
             membership_key: cfg.membership_key,
             admin_addr: cfg.admin_addr,
@@ -438,11 +450,13 @@ impl CommunitySyncEngine {
     }
 }
 
-/// Internal context bag passed to the spawned task. Most fields are
-/// only consumed by Task 7's real loop; the stub touches only
-/// `shutdown_rx`. The `#[allow(dead_code)]` is explicit "this is a
-/// scaffold for Task 7" — once the real loop lands, every field is
-/// read and the allow can come off.
+/// Internal context bag passed to the spawned task. Task 7's loop
+/// reads most fields; `paths`, `is_invite_only`, `admin_addr`,
+/// `identity_resolver`, and `error_tx` are still unread pending
+/// Tasks 8/10/13 (persist hook, verify-on-receive, degraded-path
+/// reporter). `#[allow(dead_code)]` stays until those tasks land —
+/// removing fields just because the current task doesn't read them
+/// would force a churn cycle when the next task adds them back.
 #[allow(dead_code)]
 struct InternalCtx {
     community_id: SpaceId,
@@ -465,10 +479,221 @@ struct InternalCtx {
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
 }
 
-/// Stub task: waits for shutdown, replies with `Ok(())`. Task 7
-/// replaces this with the real publish/subscribe `select!` loop.
-async fn internal_task_stub(mut ctx: InternalCtx) {
-    if let Some(resp_tx) = ctx.shutdown_rx.recv().await {
-        let _ = resp_tx.send(Ok(()));
+/// Internal task: `select!` loop multiplexing dirty signals, the
+/// debounce wakeup, forced flushes, inbound publishes, and shutdown.
+/// Mirrors `owner_state_sync::internal_task` exactly, minus the
+/// persist-both invocation (Task 10) and minus the inbound-publish
+/// handling beyond a stub (Task 8).
+///
+/// `Notified` is pinned outside the loop so its consumed-permit state
+/// survives a `select!` arm-cancel — see the long-form comment in
+/// `owner_state_sync::internal_task` for the full justification. We
+/// re-arm with `notified.set(notify.notified())` after each fire.
+async fn internal_task(mut ctx: InternalCtx) {
+    use std::time::Instant;
+
+    let mut next_wakeup: Option<Instant> = None;
+    // Latched after we observe `None` on `subscriber_rx` to prevent
+    // tight-looping on a closed channel; engine remains alive in
+    // publish-only mode. Mirrors owner_state_sync's same latch.
+    let mut inbound_closed = false;
+
+    let notify = Arc::clone(&ctx.notify_dirty);
+    let notified = notify.notified();
+    tokio::pin!(notified);
+
+    loop {
+        let sleep_dur = next_wakeup
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+
+        tokio::select! {
+            _ = notified.as_mut() => {
+                // Sliding debounce: each notify resets the wakeup so
+                // a burst of mutations collapses to one publish after
+                // `debounce` from the last call in the burst.
+                if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                    next_wakeup = Some(Instant::now() + ctx.debounce);
+                }
+                notified.set(notify.notified());
+            }
+            _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
+                next_wakeup = None;
+                // `swap` rather than `store(false)` so a publish
+                // failure restores the dirty bit; otherwise a
+                // transient Zenoh / CAS error silently consumes the
+                // signal and the next shutdown skips the retry.
+                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let pub_result = publish_root_now(&ctx).await;
+                if let Err(e) = &pub_result {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        error = %e,
+                        "community publish_root_now failed"
+                    );
+                    if was_dirty {
+                        ctx.has_pending_dirty.store(true, Ordering::Release);
+                    }
+                }
+                // Persist invocation deferred to Task 10; for now we
+                // accept that on-disk state lags by one wakeup tick.
+            }
+            Some(resp_tx) = ctx.flush_now_rx.recv() => {
+                next_wakeup = None;
+                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let pub_result = publish_root_now(&ctx).await;
+                if pub_result.is_err() && was_dirty {
+                    ctx.has_pending_dirty.store(true, Ordering::Release);
+                }
+                let _ = resp_tx.send(pub_result);
+            }
+            maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
+                let Some(_bytes) = maybe_bytes else {
+                    tracing::error!(
+                        community_id = ?ctx.community_id,
+                        "community subscriber channel closed; sync inbound disabled"
+                    );
+                    inbound_closed = true;
+                    continue;
+                };
+                // Task 8 fills in handle_incoming_publish. For now we
+                // drop the bytes — the engine stays alive in
+                // publish-only mode.
+            }
+            Some(resp_tx) = ctx.shutdown_rx.recv() => {
+                let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                    publish_root_now(&ctx).await
+                } else {
+                    Ok(())
+                };
+                let _ = resp_tx.send(pub_result);
+                return;
+            }
+        }
     }
+}
+
+/// Snapshot the local CRDT, encrypt it, write to CAS, build a
+/// `CommunityRootPublishPayload`, AEAD-wrap it for the wire, and ship
+/// it on `publisher_tx`.
+///
+/// Snapshot-clone-under-brief-lock: we hold `state.lock()` only long
+/// enough to `clone()` the CRDT, then drop the guard before the
+/// expensive CBOR encode + AEAD + CAS hops. This keeps the lock
+/// non-contended for foreground command handlers that mutate state
+/// concurrently — the alternative (holding the lock through CAS.put)
+/// would serialise all CRDT mutations behind one outbound publish.
+///
+/// Encryption split is intentional and load-bearing:
+/// - `encrypt_blob` (deterministic nonce) for the on-CAS ciphertext,
+///   so two devices encrypting the same `CommunityState` derive the
+///   same ContentId and the CAS slot is shared (dedup, replica
+///   convergence on `root_cid`).
+/// - `encrypt_root_publish` (random nonce + AAD) for the wire packet,
+///   so each publish is independently fresh and the AAD prefix binds
+///   the ciphertext to its wire-context (replay protection lives in
+///   the receiver's `RootHlcTracker`, not in nonce reuse).
+///
+/// Don't swap them — sharing a deterministic-nonce wire-side would
+/// make every retransmit byte-identical and hide replay errors;
+/// sharing a random-nonce CAS-side would defeat ContentId dedup.
+async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
+    use crate::owner_state_crypto::canonical_cbor_encode;
+
+    // Snapshot CRDT state under brief lock; drop guard before the
+    // expensive encode + AEAD + CAS hops below.
+    let snapshot = {
+        let state = ctx.state.lock().await;
+        state.clone()
+    };
+
+    // 1. Canonical-CBOR encode the CommunityState as the cleartext blob.
+    let blob_cleartext = canonical_cbor_encode(&snapshot)
+        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+
+    // 2. Encrypt with deterministic-nonce blob AEAD so cipher_cid is
+    //    reproducible across replicas (dedup + convergence).
+    let blob_ciphertext = encrypt_blob(&ctx.membership_key, &blob_cleartext)?;
+
+    // 3. Derive structured ContentId for the encrypted blob. Flagged
+    //    `encrypted: true` so the eviction policy classifies it as
+    //    EncryptedDurable (priority 0 — never auto-burns).
+    let root_cid = harmony_content::cid::ContentId::for_book(
+        &blob_ciphertext,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| {
+        CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
+    })?;
+
+    // 4. Put into ContentStore (routes through CasOp::PutLocal).
+    ctx.content_store.put(root_cid, blob_ciphertext).await?;
+
+    // 5. Build state-root payload with a strictly-newer HLC.
+    let now = next_hlc(ctx).await;
+    let payload = CommunityRootPublishPayload { root_cid, at: now };
+    let payload_bytes = canonical_cbor_encode(&payload)
+        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+
+    // 6. Encrypt with random-nonce root AEAD (every publish is fresh).
+    let wire = encrypt_root_publish(&ctx.membership_key, &payload_bytes)?;
+
+    // 7. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
+    ctx.publisher_tx
+        .send(wire)
+        .await
+        .map_err(|_| CommunitySyncError::TransportClosed)?;
+
+    Ok(())
+}
+
+/// Build an HLC that is strictly newer than every prior HLC published
+/// by this device. The strict-newer guarantee is structural, not
+/// probabilistic: at least one of `(wall_ms, logical)` lex-increases
+/// on every call.
+///
+/// - If `now`'s wall clock advanced past the previous wall, `wall_ms`
+///   bumps and `logical` resets to 0.
+/// - If wall is the same or moved BACKWARDS (NTP correction, monotonic
+///   clock drift), we pin `effective_wall = max(now, prev_wall)` and
+///   `logical = prev.logical + 1`.
+///
+/// We route through `tracker.record(...)` rather than direct
+/// `per_device.insert(...)` so a backward-jump (would_accept fails)
+/// trips the `debug_assert!` in dev/test. Direct insert would silently
+/// smooth over a system-clock anomaly that the receiver-side replay
+/// tracker would otherwise reject — surfacing the bug at the publisher
+/// is strictly cheaper than chasing a "why is my publish being
+/// dropped" report from a peer.
+async fn next_hlc(ctx: &InternalCtx) -> Hlc {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut tracker = ctx.tracker.lock().await;
+    // Read once — both the logical-counter computation and the
+    // effective-wall pin need the same `prev`. `saturating_add` on
+    // logical bounds pathological wraparound under sustained backward
+    // NTP correction at the cost of a stuck publisher (which the
+    // receiver will reject) — preferable to silent replay.
+    let prev = tracker.per_device.get(&ctx.device_id).cloned();
+    let (logical, prev_wall) = match prev.as_ref() {
+        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) => (0, p.wall_ms),
+        None => (0, 0),
+    };
+    let effective_wall = std::cmp::max(wall_ms, prev_wall);
+    let now = Hlc {
+        wall_ms: effective_wall,
+        logical,
+        device_id: ctx.device_id.clone(),
+    };
+    tracker.record(now.clone());
+    now
 }
