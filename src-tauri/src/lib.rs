@@ -5171,7 +5171,161 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
     Ok(())
 }
 
+// ── ZEB-217 community IPC types ──────────────────────────────────────────
+
+/// Member-list row returned by `list_community_members` IPC. Mirrors
+/// the spec's MemberInfo type. `addr` is hex of OwnerAddr (16 bytes →
+/// 32 chars). `display_name` is None in Phase 3 — the existing profile
+/// cache lookup is wired in Phase 5.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberInfoDto {
+    pub addr: String,
+    pub display_name: Option<String>,
+    pub status: crate::community_membership::MemberStatus,
+    pub power: u8,
+    pub joined_at: crate::owner_state_types::Hlc,
+}
+
+/// Project a materialized membership into the IPC DTO list, sorted by
+/// power level descending then joined_at ascending. Stable for two
+/// addrs at the same power+joined_at — falls through to OwnerAddr-bytes
+/// comparison so the order is deterministic across calls.
+pub fn member_info_for(
+    m: &crate::community_membership::MaterializedMembership,
+) -> Vec<MemberInfoDto> {
+    let mut rows: Vec<MemberInfoDto> = m
+        .members
+        .iter()
+        .map(|(addr, state)| MemberInfoDto {
+            addr: hex::encode(addr.0),
+            display_name: None,
+            status: state.status,
+            power: m.power_levels.get(addr).copied().unwrap_or(0),
+            joined_at: state.joined_at.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.power
+            .cmp(&a.power)
+            .then_with(|| a.joined_at.wall_ms.cmp(&b.joined_at.wall_ms))
+            .then_with(|| a.joined_at.logical.cmp(&b.joined_at.logical))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
+    rows
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod community_member_dto_tests {
+    use super::member_info_for;
+    use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use std::collections::BTreeMap;
+
+    fn hlc(wall: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    #[test]
+    fn member_info_sorts_by_power_desc_then_joined_at_asc() {
+        let admin = OwnerAddr([1; 16]);
+        let mod_user = OwnerAddr([2; 16]);
+        let early = OwnerAddr([3; 16]);
+        let late = OwnerAddr([4; 16]);
+
+        let mut members = BTreeMap::new();
+        members.insert(
+            admin,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: hlc(100, "a"),
+                left_at: None,
+            },
+        );
+        members.insert(
+            mod_user,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: hlc(200, "b"),
+                left_at: None,
+            },
+        );
+        members.insert(
+            early,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: hlc(150, "c"),
+                left_at: None,
+            },
+        );
+        members.insert(
+            late,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: hlc(300, "d"),
+                left_at: None,
+            },
+        );
+
+        let mut power_levels = BTreeMap::new();
+        power_levels.insert(admin, 100);
+        power_levels.insert(mod_user, 50);
+
+        let materialized = MaterializedMembership {
+            members,
+            power_levels,
+        };
+        let dto = member_info_for(&materialized);
+
+        assert_eq!(dto.len(), 4);
+        assert_eq!(dto[0].addr, hex::encode(admin.0));
+        assert_eq!(dto[0].power, 100);
+        assert_eq!(dto[1].addr, hex::encode(mod_user.0));
+        assert_eq!(dto[1].power, 50);
+        assert_eq!(dto[2].addr, hex::encode(early.0));
+        assert_eq!(dto[2].power, 0);
+        assert_eq!(dto[3].addr, hex::encode(late.0));
+        assert_eq!(dto[3].power, 0);
+    }
+
+    #[test]
+    fn member_info_includes_left_and_banned_members() {
+        let a = OwnerAddr([1; 16]);
+        let b = OwnerAddr([2; 16]);
+        let mut members = BTreeMap::new();
+        members.insert(
+            a,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: hlc(100, "x"),
+                left_at: Some(hlc(200, "x")),
+            },
+        );
+        members.insert(
+            b,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: hlc(50, "y"),
+                left_at: Some(hlc(150, "y")),
+            },
+        );
+        let materialized = MaterializedMembership {
+            members,
+            power_levels: BTreeMap::new(),
+        };
+        let dto = member_info_for(&materialized);
+        assert_eq!(dto.len(), 2);
+        let statuses: Vec<_> = dto.iter().map(|d| d.status).collect();
+        assert!(statuses.contains(&MemberStatus::Left));
+        assert!(statuses.contains(&MemberStatus::Banned));
+    }
+}
 
 pub fn run() {
     tauri::Builder::default()
