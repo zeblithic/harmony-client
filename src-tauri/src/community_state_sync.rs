@@ -163,8 +163,8 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
 /// nesting level. The HLC `at` is the publisher's monotonic counter
 /// — receivers' RootHlcTrackers reject anything not strictly newer
 /// per (publisher_device_id, hlc) (replay protection; mirrors
-/// owner_state_sync's RootPublishPayload at line 429).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `crate::owner_state_types::RootPublishPayload`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityRootPublishPayload {
     /// Content-ID of the encrypted CommunityState blob in the
     /// shared ContentStore.

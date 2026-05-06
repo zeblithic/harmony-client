@@ -12,7 +12,7 @@ use harmony_content::cid::ContentId;
 fn community_root_publish_payload_wire_bytes_pinned() {
     // ContentId is 32 bytes (4-byte header + 28-byte hash). For the
     // fixture we use a fully synthetic byte pattern — `from_bytes` is
-    // the standard test constructor (see owner_state_sync.rs:1129).
+    // the standard test constructor.
     let cid = ContentId::from_bytes([0xAA; 32]);
     let p = CommunityRootPublishPayload {
         root_cid: cid,
@@ -40,6 +40,5 @@ fn community_root_publish_payload_wire_bytes_pinned() {
     );
 
     let decoded: CommunityRootPublishPayload = canonical_cbor_decode(&bytes).expect("decode");
-    assert_eq!(decoded.at.wall_ms, 1_700_000_000_000);
-    assert_eq!(decoded.at.logical, 7);
+    assert_eq!(decoded, p, "decoded payload must round-trip identically");
 }
