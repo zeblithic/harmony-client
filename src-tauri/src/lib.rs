@@ -1175,60 +1175,88 @@ async fn start_node(
                     // value means a corrupt or partially-applied row;
                     // logging + skipping keeps boot resilient rather
                     // than crashing the node.
-                    {
+                    // Snapshot community metadata under the crdt_state
+                    // lock first, then drop the lock before awaiting
+                    // spawn_engine. Holding crdt_state across await
+                    // would create a lock-order hazard with engine
+                    // initialization paths and prevent other tasks from
+                    // reading owner-state during boot. Adapter requests
+                    // are only enqueued after spawn_engine succeeds so
+                    // a failed spawn doesn't leave an orphaned channel
+                    // pair for the event_loop to wire to a dead engine.
+                    type CommunitySpawnSnapshot = (
+                        crate::owner_state_types::SpaceId,
+                        crate::owner_state_types::MembershipKey,
+                        crate::owner_state_types::OwnerAddr,
+                        bool,
+                    );
+                    let community_snapshots: Vec<CommunitySpawnSnapshot> = {
                         let state_snap = crdt_state.lock().await;
-                        for (space_id, space) in &state_snap.spaces {
-                            if space.kind != crate::owner_state_types::SpaceKind::Community {
-                                continue;
-                            }
-                            if space.left_at.is_some() {
-                                continue;
-                            }
-                            let mk = match space.membership_key.as_ref() {
-                                Some(k) => k.clone(),
-                                None => {
-                                    tracing::warn!(
-                                        ?space_id,
-                                        "community Space missing membership_key — skipping engine spawn"
-                                    );
-                                    continue;
+                        state_snap
+                            .spaces
+                            .iter()
+                            .filter_map(|(space_id, space)| {
+                                if space.kind
+                                    != crate::owner_state_types::SpaceKind::Community
+                                {
+                                    return None;
                                 }
-                            };
-                            let admin = match space.admin_addr {
-                                Some(a) => a,
-                                None => {
-                                    tracing::warn!(
-                                        ?space_id,
-                                        "community Space missing admin_addr — skipping engine spawn"
-                                    );
-                                    continue;
+                                if space.left_at.is_some() {
+                                    return None;
                                 }
-                            };
-                            let is_invite_only = space.is_invite_only.unwrap_or(false);
+                                let mk = match space.membership_key.as_ref() {
+                                    Some(k) => k.clone(),
+                                    None => {
+                                        tracing::warn!(
+                                            ?space_id,
+                                            "community Space missing membership_key — skipping engine spawn"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                let admin = match space.admin_addr {
+                                    Some(a) => a,
+                                    None => {
+                                        tracing::warn!(
+                                            ?space_id,
+                                            "community Space missing admin_addr — skipping engine spawn"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                let is_invite_only =
+                                    space.is_invite_only.unwrap_or(false);
+                                Some((*space_id, mk, admin, is_invite_only))
+                            })
+                            .collect()
+                    }; // crdt_state lock released here
 
-                            let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                            let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                    for (space_id, mk, admin, is_invite_only) in community_snapshots {
+                        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-                            let id_hex = hex::encode(space_id.0);
-                            community_adapter_requests.push(
-                                crate::event_loop::CommunityAdapterRequest {
-                                    id_hex,
-                                    publisher_rx: pub_rx,
-                                    subscriber_tx: sub_tx,
-                                },
+                        if let Err(e) = registry
+                            .spawn_engine(space_id, mk, admin, is_invite_only, pub_tx, sub_rx)
+                            .await
+                        {
+                            tracing::error!(
+                                ?space_id,
+                                error = %e,
+                                "failed to spawn community engine"
                             );
-
-                            if let Err(e) = registry
-                                .spawn_engine(*space_id, mk, admin, is_invite_only, pub_tx, sub_rx)
-                                .await
-                            {
-                                tracing::error!(
-                                    ?space_id,
-                                    error = %e,
-                                    "failed to spawn community engine"
-                                );
-                            }
+                            // Drop pub_rx + sub_tx implicitly — no
+                            // adapter request enqueued, so the
+                            // event_loop won't try to wire orphan
+                            // channels to a non-existent engine.
+                            continue;
                         }
+                        community_adapter_requests.push(
+                            crate::event_loop::CommunityAdapterRequest {
+                                id_hex: hex::encode(space_id.0),
+                                publisher_rx: pub_rx,
+                                subscriber_tx: sub_tx,
+                            },
+                        );
                     }
 
                     community_registry_arc = Some(registry);

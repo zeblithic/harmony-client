@@ -50,10 +50,20 @@ pub struct CommunityState {
 #[derive(Default, Debug)]
 struct MaterializedCache {
     /// Bumps every time `events` mutates. Reads hand out a clone of
-    /// the cached value if `cached_version == version`; otherwise
+    /// the cached value if `cached_version == version` AND
+    /// `cached_admin_addr == Some(requested_admin_addr)`; otherwise
     /// re-materialize and update.
     version: u64,
     cached_version: Option<u64>,
+    /// Admin address used to materialize the cached view. The
+    /// `MaterializedMembership` shape depends on `admin_addr`
+    /// (admin-power bootstrap), so the same `events` log can produce
+    /// different materialized views under different admin_addr.
+    /// Caching by version alone would let a caller passing a
+    /// different `admin_addr` receive the wrong view at the same
+    /// version. Phase 2 only ever has one admin_addr per community,
+    /// but pinning this is cheap defense in depth.
+    cached_admin_addr: Option<OwnerAddr>,
     cached: Option<MaterializedMembership>,
 }
 
@@ -130,11 +140,14 @@ impl CommunityState {
     /// the lock is released before the cloned value is returned.
     pub fn materialized(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let mut cache = self.cache.lock().expect("cache mutex poisoned");
-        if cache.cached_version != Some(cache.version) {
+        let cache_hit = cache.cached_version == Some(cache.version)
+            && cache.cached_admin_addr == Some(admin_addr);
+        if !cache_hit {
             let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
             let m = materialize(&log, admin_addr);
             cache.cached = Some(m.clone());
             cache.cached_version = Some(cache.version);
+            cache.cached_admin_addr = Some(admin_addr);
             return m;
         }
         cache

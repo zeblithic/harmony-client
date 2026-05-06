@@ -2217,14 +2217,30 @@ pub fn spawn_community_state_zenoh_adapter(
         let topic_pub = topic.clone();
         let closing_pub = Arc::clone(&closing);
         let pub_handle = tokio::spawn(async move {
-            while let Some(bytes) = publisher_rx.recv().await {
-                if let Err(e) = session_pub.put(&key_pub, bytes).await {
-                    if !closing_pub.load(Ordering::SeqCst) {
-                        tracing::warn!(
-                            topic = %topic_pub,
-                            error = %e,
-                            "community state-root publish failed"
-                        );
+            // Bounded-time shutdown: poll `closing` every second so a
+            // node-stop event terminates the publisher within ~1s even
+            // if no bytes are flowing on `publisher_rx`. Without this,
+            // the outer JoinHandle this fn returns could only resolve
+            // when the engine drops its publisher_tx — fine under the
+            // documented teardown order (registry.shutdown_all first),
+            // but easy for a future caller to misuse.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                    maybe = publisher_rx.recv() => {
+                        let Some(bytes) = maybe else { break; };
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    topic = %topic_pub,
+                                    error = %e,
+                                    "community state-root publish failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2252,7 +2268,7 @@ pub fn spawn_community_state_zenoh_adapter(
                     return;
                 }
             };
-            // Two ways the loop ends:
+            // Three ways the loop ends:
             //   1. `subscriber_tx.send` fails — engine cleanly shut down
             //      (registry tore the engine down). Stay silent so a
             //      routine community-leave / shutdown doesn't log.
@@ -2260,23 +2276,33 @@ pub fn spawn_community_state_zenoh_adapter(
             //      died. Warn (gated on !closing) and exit; the engine's
             //      own subscriber_channel_closed degraded report covers
             //      surface-level visibility.
+            //   3. `closing` flag flips — bounded-time shutdown, mirrors
+            //      the publisher arm above.
             loop {
-                match sub.recv_async().await {
-                    Ok(sample) => {
-                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                        if subscriber_tx.send(bytes).await.is_err() {
-                            break;
-                        }
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
                     }
-                    Err(e) => {
-                        if !closing_sub.load(Ordering::SeqCst) {
-                            tracing::warn!(
-                                topic = %topic_sub,
-                                error = %e,
-                                "community state-root subscriber closed unexpectedly"
-                            );
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "community state-root subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
                         }
-                        break;
                     }
                 }
             }
@@ -2285,30 +2311,4 @@ pub fn spawn_community_state_zenoh_adapter(
         let _ = pub_handle.await;
         let _ = sub_handle.await;
     })
-}
-
-/// 4-tuple of mpsc channel ends returned by [`community_zenoh_channels`]:
-/// `(publisher_tx, publisher_rx, subscriber_rx, subscriber_tx)`.
-pub type CommunityZenohChannels = (
-    tokio::sync::mpsc::Sender<Vec<u8>>,
-    tokio::sync::mpsc::Receiver<Vec<u8>>,
-    tokio::sync::mpsc::Receiver<Vec<u8>>,
-    tokio::sync::mpsc::Sender<Vec<u8>>,
-);
-
-/// Build the four mpsc channel ends needed to wire a community's
-/// SyncEngine to the Zenoh adapter.
-///
-/// Returns `(publisher_tx, publisher_rx, subscriber_rx, subscriber_tx)`:
-///   - `publisher_tx` → handed to the engine; bytes the engine writes here
-///     drain via `publisher_rx` into Zenoh `put`.
-///   - `subscriber_rx` → handed to the engine; bytes Zenoh receives are
-///     forwarded by the adapter into `subscriber_tx` and read out here.
-///
-/// Channel depth (64) matches the owner-state engine sizing — one or two
-/// state-root frames per CRDT epoch, well below saturation.
-pub fn community_zenoh_channels() -> CommunityZenohChannels {
-    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    (pub_tx, pub_rx, sub_rx, sub_tx)
 }
