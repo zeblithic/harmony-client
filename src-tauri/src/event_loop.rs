@@ -2226,10 +2226,13 @@ pub fn spawn_community_state_zenoh_adapter(
             // but easy for a future caller to misuse.
             loop {
                 tokio::select! {
+                    // Data-flow arm first: when both arms are ready
+                    // (i.e., a byte is queued AND the 1s timer fires)
+                    // the actual publish wins. With the previous arm
+                    // order the biased eval would always pick the
+                    // closing-check, delaying every collision-case
+                    // publish by one loop iteration.
                     biased;
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_pub.load(Ordering::SeqCst) { break; }
-                    }
                     maybe = publisher_rx.recv() => {
                         let Some(bytes) = maybe else { break; };
                         if let Err(e) = session_pub.put(&key_pub, bytes).await {
@@ -2241,6 +2244,9 @@ pub fn spawn_community_state_zenoh_adapter(
                                 );
                             }
                         }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
                     }
                 }
             }
@@ -2280,10 +2286,9 @@ pub fn spawn_community_state_zenoh_adapter(
             //      the publisher arm above.
             loop {
                 tokio::select! {
+                    // Data-flow arm first (see publisher loop above
+                    // for rationale).
                     biased;
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if closing_sub.load(Ordering::SeqCst) { break; }
-                    }
                     res = sub.recv_async() => {
                         match res {
                             Ok(sample) => {
@@ -2303,6 +2308,9 @@ pub fn spawn_community_state_zenoh_adapter(
                                 break;
                             }
                         }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
                     }
                 }
             }

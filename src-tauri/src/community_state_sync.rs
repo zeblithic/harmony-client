@@ -1402,17 +1402,31 @@ impl CommunitySyncRegistry {
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<(), CommunitySyncError> {
-        // Phase 1: blocking disk I/O OUTSIDE the lock. Both load_crdt
-        // and load_replay call std::fs::read; on the multi-thread
-        // tokio runtime that parks one worker, on current_thread it
-        // would starve all tasks. Doing this first is also harmless on
-        // a re-spawn race: the second caller's loaded state is just
-        // dropped at the idempotency check below.
+        // Phase 1: blocking disk I/O off the runtime entirely. Both
+        // load_crdt and load_replay call std::fs::read, so even with
+        // the registry mutex released they'd block the tokio worker
+        // (one worker per spawn_engine call, multiplied across the
+        // boot-time scan of every joined community). spawn_blocking
+        // offloads to the dedicated blocking pool — mirrors
+        // owner_state_sync's persist path (line 376). Doing this
+        // outside the engines lock is also harmless on a re-spawn
+        // race: the second caller's loaded state is dropped at the
+        // idempotency check below.
         let paths = self.paths_for(community_id);
-        let initial_state = load_crdt(&paths.crdt, community_id)
-            .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
-        let initial_tracker =
-            load_replay(&paths.replay).map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+        let paths_for_io = paths.clone();
+        let (initial_state, initial_tracker) = tokio::task::spawn_blocking(
+            move || -> Result<(CommunityState, CommunityRootHlcTracker), CommunitySyncError> {
+                let state = load_crdt(&paths_for_io.crdt, community_id)
+                    .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+                let tracker = load_replay(&paths_for_io.replay)
+                    .map_err(|e| CommunitySyncError::Persist(e.to_string()))?;
+                Ok((state, tracker))
+            },
+        )
+        .await
+        .map_err(|join_err| {
+            CommunitySyncError::Persist(format!("spawn_blocking join failed: {join_err}"))
+        })??;
 
         // Phase 2: take the engines lock, re-check idempotency, build
         // and insert the engine. Lock is held across CommunitySyncEngine::new
