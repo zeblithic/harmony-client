@@ -5907,6 +5907,367 @@ mod create_community_inner_tests {
     }
 }
 
+// ── ZEB-217 Sub-C Phase 3 Task 10: redeem_invite ─────────────────────
+//
+// Joiner-side mirror of `create_community`: decodes a
+// `harmony://invite/...` URL, mints a signed self-Join, applies the
+// derived Community Space row to owner-state CRDT, advances the local
+// HLC tracker, spawns a CommunitySyncEngine via the registry (passing
+// the invite's admin_addr — NOT the joining peer — so the engine's
+// authority root matches the inviter's), hands the adapter wiring to
+// event_loop, and finally `insert_local_event`s the self-Join so the
+// debounced state-root publish picks it up.
+//
+// Phase 3 supports OPEN-only redemption; invite-only (with countersig
+// fan-out via Reticulum) ships in Phase 4.
+//
+// Cross-peer dedupe: the new Space row's id is `payload.community_id`,
+// IDENTICAL to the creator's Space row id. apply_space's CRDT
+// last-writer-wins on (id, hlc) collapses the two rows correctly when
+// the peers eventually sync. Phase 1's same-SpaceId rejection of
+// community-creation field changes (admin_addr / membership_key /
+// is_invite_only) defends against malicious or stale invites trying
+// to drift the canonical row out from under the original creator.
+
+/// Pure function: mint a joiner-side self-Join + derived Community
+/// Space row from an invite payload.
+///
+/// Generates a random 16-byte event id, advances HLC from `prev_hlc`,
+/// constructs the Community Space row using the invite's
+/// `community_id` / `membership_key` / `admin_addr` / `community_name`
+/// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
+/// (actor = `self_owner`, community_id = `payload.community_id`).
+///
+/// Pure / sync / no I/O — every random byte and HLC tick is sourced
+/// from the args, so the test (`redeem_invite_inner_tests`) can cover
+/// the full mint without spawning channels, mutexes, or a Tauri
+/// runtime.
+pub fn mint_redemption(
+    payload: &crate::community_invite::CommunityInvitePayload,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<MintedCommunity, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use crate::owner_state_types::{Space, SpaceKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let join_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+
+    let join_payload = EventPayload {
+        id: event_id_bytes,
+        community_id: payload.community_id,
+        kind: MembershipEventKind::Join,
+        actor: self_owner,
+        at: join_hlc.clone(),
+    };
+    let bootstrap_join =
+        sign_event(&join_payload, signing_key).map_err(|e| format!("sign self-join: {e}"))?;
+
+    let space = Space {
+        id: payload.community_id,
+        kind: SpaceKind::Community,
+        parent: None,
+        community_id: None,
+        name: payload.community_name.clone(),
+        transport: None,
+        members: Vec::new(),
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: join_hlc.clone(),
+        updated_at: join_hlc,
+        content_key: None,
+        prior_content_keys: Vec::new(),
+        membership_key: Some(payload.membership_key.clone()),
+        admin_addr: Some(payload.admin_addr),
+        is_invite_only: Some(false),
+    };
+
+    Ok(MintedCommunity {
+        community_id: payload.community_id,
+        membership_key: payload.membership_key.clone(),
+        space,
+        bootstrap_join,
+    })
+}
+
+/// Tauri IPC: redeem an OPEN community invite URL.
+///
+/// Phase 3 ships only OPEN redemption; invite-only redeem returns Err
+/// until Phase 4 lands the Reticulum counter-sig dance.
+///
+/// Lock-order discipline (mirrors `create_community`): the `crdt_state`
+/// `tokio::sync::Mutex` guard MUST drop before `hlc_tracker.lock().await`
+/// is acquired. Holding `state_g` across `tracker_g.lock().await` would
+/// (a) violate the project-wide "no `.await` while holding state mutex"
+/// rule, and (b) invert lock order vs callers that take `hlc_tracker`
+/// first — a deadlock risk under concurrent IPCs.
+///
+/// Snapshot-then-spawn fence: after applying the Space + advancing the
+/// tracker but BEFORE spawning the engine, we re-acquire the std
+/// `NodeState` lock and check `generation` + `community_registry`. If
+/// the node was stopped (or a stop+restart raced our await chain),
+/// returning Err here suppresses the engine spawn — otherwise the
+/// engine would attach to a detached `crdt_state` that won't be
+/// persisted, leaving a phantom-state engine running in the background.
+///
+/// Adapter wiring flows through `event_loop` (not directly through the
+/// Zenoh `Session` from this command's task) per spec §"Architecture /
+/// Adapter wiring": this command sends a `CommunityAdapterRequest` over
+/// an mpsc; the event loop's `select!` drains it and calls
+/// `spawn_community_state_zenoh_adapter` against the live session.
+///
+/// Note vs `create_community`: spawn_engine takes `payload.admin_addr`
+/// (the original community admin from the invite), NOT `self_owner`.
+/// The engine's bootstrap-Join authorization rule keys off the admin
+/// address, which must match the creator's identity — the joining
+/// peer is just a member.
+///
+/// Idempotence: registry.spawn_engine is idempotent on repeat calls
+/// for the same community_id (returns the existing engine handle), so
+/// re-redeeming the same invite is a no-op rather than an error.
+#[tauri::command]
+async fn redeem_invite(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    url: String,
+) -> Result<String, String> {
+    let payload = crate::community_invite::decode_invite_url(&url)
+        .map_err(|e| format!("decode invite URL: {e}"))?;
+    if payload.is_invite_only {
+        return Err(
+            "Phase 3 supports OPEN invite redemption only; invite-only ships in Phase 4"
+                .to_string(),
+        );
+    }
+
+    let (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.community_adapter_request_tx
+                .clone()
+                .ok_or("community_adapter_request_tx missing")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint the self-Join + derived Space. Read prev_hlc under the
+    // tracker lock then drop the guard before signing — sign is sync,
+    // but releasing eagerly keeps the tracker available to other tasks.
+    // Borrow the SigningKey from `dm_outbox` (where start_node already
+    // wired the canonical local-device key).
+    let minted = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_redemption(
+            &payload,
+            self_owner,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // Apply the derived Community Space row, then DROP the guard BEFORE
+    // awaiting hlc_tracker. See doc comment above for the lock-order
+    // rationale.
+    {
+        let mut state_g = crdt_state.lock().await;
+        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
+        if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
+            return Err(format!(
+                "apply_space rejected redemption Space: {outcome:?}"
+            ));
+        }
+    } // state_g dropped here
+
+    {
+        let mut tracker_g = hlc_tracker.lock().await;
+        // Bootstrap redemption: prev_hlc was either None or strictly
+        // older than `created_at` (next_hlc guarantees forward step),
+        // so unconditionally advancing the tracker is correct.
+        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+    }
+
+    // Snapshot-then-spawn fence: ensure node generation hasn't changed
+    // and the registry is still wired. If either fails, the engine
+    // we'd spawn would be detached from a stopped node.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during redeem_invite (was {}, now {}); \
+                 redemption minted on a detached crdt_state and won't be persisted — \
+                 engine spawn suppressed",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during redeem_invite — engine spawn suppressed"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Channel pair shape mirrors create_community / start_node's
+    // per-community spawn: pub_tx / sub_rx feed the engine, pub_rx /
+    // sub_tx feed the Zenoh adapter.
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    // NOTE: spawn_engine takes payload.admin_addr (the original
+    // community admin from the invite), NOT self_owner. The engine's
+    // authority root is the creator's identity; the joining peer is
+    // just a member.
+    community_registry
+        .spawn_engine(
+            minted.community_id,
+            minted.membership_key.clone(),
+            payload.admin_addr,
+            false, // is_invite_only — OPEN-only in Phase 3
+            pub_tx,
+            sub_rx,
+        )
+        .await
+        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
+
+    community_adapter_tx
+        .send(crate::event_loop::CommunityAdapterRequest {
+            id_hex: hex::encode(minted.community_id.0),
+            publisher_rx: pub_rx,
+            subscriber_tx: sub_tx,
+        })
+        .await
+        .map_err(|e| format!("community_adapter_tx send: {e}"))?;
+
+    // Now self-Join via the engine. The engine's `insert_local_event`
+    // runs verify_event (which authorizes the open Join via signature
+    // alone) and fires `notify_dirty` on success; the debounced publish
+    // picks up the event and writes to the per-community state-root
+    // topic so the creator (and any other peer) sees the new member.
+    let engine_arc = community_registry
+        .engine_arc(&minted.community_id)
+        .await
+        .ok_or("engine vanished immediately after spawn — registry race")?;
+    let outcome = engine_arc
+        .insert_local_event(minted.bootstrap_join)
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if !matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        return Err(format!("self Join not inserted (got {outcome:?})"));
+    }
+
+    Ok(hex::encode(minted.community_id.0))
+}
+
+#[cfg(test)]
+mod redeem_invite_inner_tests {
+    use super::*;
+    use crate::community_invite::CommunityInvitePayload;
+    use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    #[test]
+    fn mint_redemption_produces_self_join_and_matching_space() {
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let identity_pub = identity.identity.to_public_bytes();
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        // Mirror Task 9's test pattern: pull the canonical 32-byte
+        // Ed25519 seed from bytes 32..64 of `to_private_bytes()`. The
+        // production IPC borrows this same SigningKey from `dm_outbox`.
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+
+        let payload = CommunityInvitePayload {
+            community_id: SpaceId([0xee; 16]),
+            membership_key: MembershipKey::new([0x77; 32]),
+            admin_addr: OwnerAddr([0x33; 16]),
+            community_name: "TestCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+        };
+
+        let device_id = "joiner-dev";
+        let wall_now_ms = 1_700_000_999_000u64;
+        let prev_hlc: Option<Hlc> = None;
+
+        let minted = mint_redemption(
+            &payload,
+            self_owner,
+            &signing_key,
+            device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )
+        .expect("mint");
+
+        assert_eq!(minted.community_id, payload.community_id);
+        assert_eq!(minted.space.id, payload.community_id);
+        assert_eq!(minted.space.admin_addr, Some(payload.admin_addr));
+        assert_eq!(minted.space.is_invite_only, Some(false));
+        assert_eq!(minted.bootstrap_join.actor, self_owner);
+        assert_eq!(minted.bootstrap_join.community_id, payload.community_id);
+        assert!(matches!(
+            minted.bootstrap_join.kind,
+            crate::community_membership::MembershipEventKind::Join
+        ));
+
+        // Self-join sig must verify against the joiner's identity_pub —
+        // the engine's verify_event runs the same check on insert.
+        crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
+            .expect("self-join signature must verify against joiner identity_pub");
+    }
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -6253,6 +6614,7 @@ pub fn run() {
             list_community_members,
             generate_invite,
             create_community,
+            redeem_invite,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
