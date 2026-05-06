@@ -1560,8 +1560,11 @@ async fn flush_now_publishes_one_root_publish() {
     tokio::spawn(async move {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
-            if let CasOp::PutLocal { resp, .. } = op {
-                let _ = resp.send(Ok(()));
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let _ = reply.send(Ok(()));
             }
         }
     });
@@ -1870,15 +1873,19 @@ async fn engine_receives_remote_publish_and_merges_event() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, bytes, resp } => {
-                    cas_for_servicer.lock().await.insert(cid, bytes);
-                    let _ = resp.send(Ok(()));
+                CasOp::PutLocal { cid, blob, reply } => {
+                    cas_for_servicer.lock().await.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
-                CasOp::GetLocal { cid, resp } => {
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
-                    let _ = resp.send(v.ok_or_else(|| {
-                        harmony_app::content_store::ContentStoreError::NotFound(cid)
-                    }));
+                    let _ = reply.send(Ok(v));
                 }
             }
         }
@@ -3478,13 +3485,19 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, bytes, resp } => {
-                    store.lock().await.insert(cid, bytes);
-                    let _ = resp.send(Ok(()));
+                CasOp::PutLocal { cid, blob, reply } => {
+                    store.lock().await.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
-                CasOp::GetLocal { cid, resp } => {
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
                     let v = store.lock().await.get(&cid).cloned();
-                    let _ = resp.send(v.ok_or(ContentStoreError::NotFound(cid)));
+                    let _ = reply.send(Ok(v));
                 }
             }
         }
