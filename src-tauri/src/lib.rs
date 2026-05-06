@@ -5395,6 +5395,116 @@ async fn generate_invite(
     build_open_invite_url(&payload)
 }
 
+/// Delta payload for the `community-members-changed` Tauri event.
+/// Matches the spec line 561 wire shape:
+/// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
+/// IPC event per engine-level CRDT mutation; Phase 3's engine fires
+/// one delta at a time so `changes` is always a single-element array
+/// in this phase. Future batch-receive optimisations can grow the
+/// array without breaking the wire format. Frontend updates
+/// incrementally without re-fetching the full member list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityMembersChangedPayload {
+    pub community_id: String,
+    pub changes: Vec<MembershipChange>,
+}
+
+/// One delta in `CommunityMembersChangedPayload.changes`. Flat shape
+/// per spec — `type` discriminates the event kind, `target` is the
+/// entity whose membership state changed, `by` is the actor when
+/// distinct from target (kick/setpower/invite), `detail` carries
+/// kind-specific info (kick reason, new power level). `at_wall_ms`
+/// is an extension over the spec — useful for the frontend to sort
+/// or de-dupe rapid-fire deltas; documented as part of the wire
+/// contract here so future consumers don't strip it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MembershipChange {
+    #[serde(rename = "type")]
+    pub r#type: MembershipChangeType,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<MembershipChangeDetail>,
+    pub at_wall_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MembershipChangeType {
+    Joined,
+    Left,
+    Invited,
+    Kicked,
+    PowerChanged,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum MembershipChangeDetail {
+    Reason(String),
+    Level(u8),
+}
+
+/// Project a `CommunityMembershipDelta` into `(community_id_hex, change)`.
+/// The caller (the start_node consumer task) wraps the change in
+/// `CommunityMembersChangedPayload { community_id, changes: vec![change] }`
+/// and emits the Tauri event.
+///
+/// Returns `None` for kinds we can't yet represent (none today; reserved
+/// for forward-compat if `MembershipEventKind` grows).
+pub fn delta_to_change(
+    delta: &crate::community_state_sync::CommunityMembershipDelta,
+) -> Option<(String, MembershipChange)> {
+    let cid_hex = hex::encode(delta.community_id.0);
+    let actor_hex = hex::encode(delta.event.actor.0);
+    let at_wall_ms = delta.event.at.wall_ms;
+    let change = match &delta.event.kind {
+        crate::community_membership::MembershipEventKind::Join => MembershipChange {
+            r#type: MembershipChangeType::Joined,
+            target: actor_hex,
+            by: None,
+            detail: None,
+            at_wall_ms,
+        },
+        crate::community_membership::MembershipEventKind::Leave => MembershipChange {
+            r#type: MembershipChangeType::Left,
+            target: actor_hex,
+            by: None,
+            detail: None,
+            at_wall_ms,
+        },
+        crate::community_membership::MembershipEventKind::Invite { target } => MembershipChange {
+            r#type: MembershipChangeType::Invited,
+            target: hex::encode(target.0),
+            by: Some(actor_hex),
+            detail: None,
+            at_wall_ms,
+        },
+        crate::community_membership::MembershipEventKind::Kick { target, reason } => {
+            MembershipChange {
+                r#type: MembershipChangeType::Kicked,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: reason.clone().map(MembershipChangeDetail::Reason),
+                at_wall_ms,
+            }
+        }
+        crate::community_membership::MembershipEventKind::SetPower { target, level } => {
+            MembershipChange {
+                r#type: MembershipChangeType::PowerChanged,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: Some(MembershipChangeDetail::Level(*level)),
+                at_wall_ms,
+            }
+        }
+    };
+    Some((cid_hex, change))
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -6293,5 +6403,99 @@ mod generate_invite_helper_tests {
             decoded.invite_token.is_none(),
             "open path must be token-less"
         );
+    }
+}
+
+#[cfg(test)]
+mod community_delta_projection_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind,
+    };
+    use crate::community_state_sync::CommunityMembershipDelta;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    fn make_delta(kind: MembershipEventKind, actor: OwnerAddr) -> CommunityMembershipDelta {
+        let identity = PrivateIdentity::from_seed(&[0xee; 32]);
+        let community_id = SpaceId([4; 16]);
+        let payload = EventPayload {
+            id: [0xab; 16],
+            community_id,
+            kind,
+            actor,
+            at: Hlc {
+                wall_ms: 1234,
+                logical: 0,
+                device_id: "x".into(),
+            },
+        };
+        let event = sign_event_with_identity(&payload, &identity).expect("sign");
+        CommunityMembershipDelta {
+            community_id,
+            event,
+        }
+    }
+
+    #[test]
+    fn join_projects_with_target_and_no_by() {
+        let actor = OwnerAddr([1; 16]);
+        let (cid_hex, change) =
+            delta_to_change(&make_delta(MembershipEventKind::Join, actor)).expect("Join projects");
+        assert_eq!(cid_hex, hex::encode([4u8; 16]));
+        assert_eq!(change.r#type, MembershipChangeType::Joined);
+        assert_eq!(change.target, hex::encode(actor.0));
+        assert!(change.by.is_none(), "Join is self-action; by is None");
+        assert!(change.detail.is_none());
+        assert_eq!(change.at_wall_ms, 1234);
+    }
+
+    #[test]
+    fn leave_projects_with_target_and_no_by() {
+        let actor = OwnerAddr([2; 16]);
+        let (_, change) = delta_to_change(&make_delta(MembershipEventKind::Leave, actor)).unwrap();
+        assert_eq!(change.r#type, MembershipChangeType::Left);
+        assert_eq!(change.target, hex::encode(actor.0));
+        assert!(change.by.is_none());
+        assert!(change.detail.is_none());
+    }
+
+    #[test]
+    fn kick_projects_with_target_by_and_reason_detail() {
+        let actor = OwnerAddr([3; 16]);
+        let target = OwnerAddr([4; 16]);
+        let (_, change) = delta_to_change(&make_delta(
+            MembershipEventKind::Kick {
+                target,
+                reason: Some("spam".into()),
+            },
+            actor,
+        ))
+        .unwrap();
+        assert_eq!(change.r#type, MembershipChangeType::Kicked);
+        assert_eq!(change.target, hex::encode(target.0));
+        assert_eq!(change.by.as_deref(), Some(hex::encode(actor.0).as_str()));
+        match change.detail.as_ref() {
+            Some(MembershipChangeDetail::Reason(s)) => assert_eq!(s, "spam"),
+            other => panic!("expected Reason detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_power_projects_with_target_by_and_level_detail() {
+        let actor = OwnerAddr([5; 16]);
+        let target = OwnerAddr([6; 16]);
+        let (_, change) = delta_to_change(&make_delta(
+            MembershipEventKind::SetPower { target, level: 50 },
+            actor,
+        ))
+        .unwrap();
+        assert_eq!(change.r#type, MembershipChangeType::PowerChanged);
+        assert_eq!(change.target, hex::encode(target.0));
+        assert_eq!(change.by.as_deref(), Some(hex::encode(actor.0).as_str()));
+        match change.detail.as_ref() {
+            Some(MembershipChangeDetail::Level(n)) => assert_eq!(*n, 50),
+            other => panic!("expected Level detail, got {other:?}"),
+        }
     }
 }
