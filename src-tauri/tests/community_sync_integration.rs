@@ -421,9 +421,10 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         .await
         .expect("spawn b");
 
-    // Inject 64 random bytes — too short to be a valid root-publish
-    // wire (would otherwise pass MIN_WIRE_LEN), but the AEAD tag
-    // verification will fail and the engine drops the packet.
+    // Inject 64 random bytes — long enough to pass MIN_WIRE_LEN
+    // (28 = nonce 12 + tag 16) but with no valid nonce / tag, so
+    // ChaCha20-Poly1305 AEAD verification fails and the engine
+    // drops the packet via IncomingOutcome::ErrPreMutation.
     let garbage: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(31)).collect();
     b_sub_tx.send(garbage).await.expect("send garbage");
 
@@ -468,9 +469,11 @@ async fn malformed_wire_packet_does_not_panic_engine() {
 
     registry_a.flush_now(&community_id).await.expect("flush a");
 
-    // Forward A's outbound packet to B's subscriber channel directly
-    // (no async forwarder task — we want a deterministic ordering
-    // relative to the garbage injection).
+    // Forward A's outbound packet to B's subscriber channel directly.
+    // FIFO ordering on `b_sub_tx` already guarantees the garbage from
+    // line 428 reaches B before this valid wire; the 50ms sleep above
+    // is the actual timing hedge that lets B's task drain the garbage
+    // before we deliver the liveness probe.
     let valid_wire = a_pub_rx.recv().await.expect("A produced no wire packet");
     b_sub_tx.send(valid_wire).await.expect("send valid wire");
 
