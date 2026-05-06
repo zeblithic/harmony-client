@@ -1642,7 +1642,7 @@ set -o pipefail
 cargo test community_delta_projection_tests 2>&1 | tail -10
 ```
 
-Expected: 3 PASS.
+Expected: 4 PASS (the four projection tests — Joined, Left, Kicked, PowerChanged).
 
 - [ ] **Step 5: Run all gates**
 
@@ -2127,12 +2127,21 @@ async fn create_community(
         )?
     };
 
+    // Apply the Space under crdt_state, then DROP the guard before
+    // awaiting hlc_tracker. Holding crdt_state's tokio::sync::Mutex
+    // guard across `hlc_tracker.lock().await` would (a) violate the
+    // plan's "no .await while holding state mutex" hard rule, and (b)
+    // invert the lock order vs any caller that acquires hlc_tracker
+    // first — a deadlock risk under concurrent IPCs (Greptile flagged
+    // this on PR #86 round 2).
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             return Err(format!("apply_space rejected new community: {outcome:?}"));
         }
+    } // state_g dropped here
+    {
         let mut tracker_g = hlc_tracker.lock().await;
         tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
     }
@@ -2177,16 +2186,10 @@ async fn create_community(
         .await
         .map_err(|e| format!("community_adapter_tx send: {e}"))?;
 
-    let engine_state = community_registry
-        .state_for(&minted.community_id)
-        .await
-        .ok_or("engine vanished immediately after spawn — registry race")?;
-    let _ = engine_state;
-
     let engine_arc = community_registry
         .engine_arc(&minted.community_id)
         .await
-        .ok_or("engine vanished immediately after spawn (engine_arc lookup)")?;
+        .ok_or("engine vanished immediately after spawn — registry race")?;
     let outcome = engine_arc
         .insert_local_event(minted.bootstrap_join)
         .await
@@ -2462,12 +2465,19 @@ async fn redeem_invite(
         )?
     };
 
+    // Apply the Space under crdt_state, then DROP the guard before
+    // awaiting hlc_tracker. Same lock-order discipline as
+    // `create_community` — no .await while holding state mutex; no
+    // crdt_state-then-hlc_tracker ordering inversion (Greptile flagged
+    // this on PR #86 round 2).
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             return Err(format!("apply_space rejected redemption Space: {outcome:?}"));
         }
+    } // state_g dropped here
+    {
         let mut tracker_g = hlc_tracker.lock().await;
         tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
     }
@@ -2568,7 +2578,8 @@ git commit -m "feat(zeb-217-phase3): redeem_invite IPC (open path)"
 3. Mint a `Leave` event signed under `identity` with `actor = self_owner`.
 4. Look up the engine via `community_registry.engine_arc(&space_id)`. If not present → `Err` (you can't leave a community you're not in).
 5. `engine.insert_local_event(leave_event)` — fires delta, triggers publish so peers learn we left.
-6. Optionally bump the local Space's `left_at` field via owner-state mutation. Per spec §"IPC surface": `leave_community` does NOT remove the Space — caller must follow with `remove_space`. Phase 3 follows this pattern: only the CRDT Leave event + Space.left_at update; Space removal is a separate IPC. (The existing `remove_space` IPC handles Space removal generically.)
+
+**Owner-state Space is NOT mutated by `leave_community`.** Per spec §"IPC surface" (line 514): `leave_community` only sets the actor's MemberState to Left in the per-community CRDT — it does NOT touch the owner-state Space. The Space stays around (with its existing `created_at` / `name` / `membership_key` etc.) so the user can see "you've left this community" in the UI and choose to remove it later via the existing `remove_space` IPC. The Leave event in the CRDT is what peers see + what the materialized member-list reflects. The DM transport's `Space.left_at` field (which DM Spaces use) is conceptually different — DMs have no membership CRDT, so `left_at` IS the leave signal there. For communities, the membership CRDT is the source of truth and `Space.left_at` is unused.
 
 **Engine lifecycle on leave:** Phase 3 does NOT call `registry.stop_engine` from `leave_community`. Reason: the Leave event must publish to peers, and the engine's debounced publish loop owns that. Stopping the engine immediately after `insert_local_event` could race the publish. The user's eventual `remove_space` call (or a follow-up `forget_community` IPC, which is out of scope here) would call `registry.stop_engine`. For Phase 3 we leave the engine running so peers receive the Leave broadcast.
 
