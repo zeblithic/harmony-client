@@ -291,6 +291,15 @@ impl MembershipKey {
         &self.0
     }
 
+    /// Expose this key as a borrowed `chacha20poly1305::Key` for AEAD
+    /// helpers. Borrows the underlying 32 bytes — the cipher must not
+    /// outlive `self`. Used by `community_state_sync` for both random-
+    /// nonce wire encryption and deterministic-nonce blob encryption
+    /// at per-community granularity (no KeyTree derivation).
+    pub fn as_chacha_key(&self) -> &chacha20poly1305::Key {
+        chacha20poly1305::Key::from_slice(&self.0)
+    }
+
     /// Generate a fresh random key from OS entropy. Used when
     /// creating a new community.
     pub fn random() -> Self {

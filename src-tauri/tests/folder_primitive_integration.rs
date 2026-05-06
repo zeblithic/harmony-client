@@ -246,14 +246,15 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     pin_intent,
                     fetch_completion_tx,
                     fetch_completion_rx,
-                    None, // pairing_in_tx — pairing not exercised in this test
-                    None, // sync_handles — SyncEngine not exercised in this test
-                    None, // dm_outbox — DM outbox not exercised in this test
-                    None, // dm_transport — DM outbox not exercised in this test
-                    None, // crdt_state — DM outbox not exercised in this test
-                    None, // unicast_send_rx — DM transport not exercised in this test
-                    None, // cas_handle — DM transport not exercised in this test
-                    None, // unicast_send_tx — DM transport not exercised in this test
+                    None,       // pairing_in_tx — pairing not exercised in this test
+                    None,       // sync_handles — SyncEngine not exercised in this test
+                    None,       // dm_outbox — DM outbox not exercised in this test
+                    None,       // dm_transport — DM outbox not exercised in this test
+                    None,       // crdt_state — DM outbox not exercised in this test
+                    None,       // unicast_send_rx — DM transport not exercised in this test
+                    None,       // cas_handle — DM transport not exercised in this test
+                    None,       // unicast_send_tx — DM transport not exercised in this test
+                    Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
                 )
                 .await;
             });

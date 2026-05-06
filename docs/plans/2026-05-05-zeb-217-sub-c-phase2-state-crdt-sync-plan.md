@@ -161,7 +161,7 @@ Create `src-tauri/src/community_state_crdt.rs`:
 //! `ev` for events) are 2 chars.
 
 use crate::community_membership::{EventId, SignedMembershipEvent};
-use crate::owner_state_crypto::{CanonicalPayload, CanonicalPayloadSealed};
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::SpaceId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -264,7 +264,7 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_identity::PrivateIdentity;
 
 fn make_test_identity() -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let identity = PrivateIdentity::generate();
+    let identity = PrivateIdentity::from_seed(&[0xa1; 32]);
     let identity_pub = identity.identity.to_public_bytes();
     let addr = OwnerAddr(identity.identity.address_hash);
     (identity, identity_pub, addr)
@@ -291,7 +291,7 @@ fn insert_rejects_event_with_wrong_community() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
 
     let mut state = CommunityState::new(community_id);
     let outcome = state.insert_event(
@@ -324,7 +324,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
     let event_id = event.id;
 
     let mut state = CommunityState::new(community_id);
@@ -356,7 +356,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
 
     let mut state = CommunityState::new(community_id);
     let ctx = VerifyContext {
@@ -522,7 +522,7 @@ Append to `src-tauri/tests/community_state_crdt_unit.rs`:
 ```rust
 #[test]
 fn materialized_cache_returns_same_object_until_insert() {
-    let (identity, identity_pub, addr) = make_test_identity();
+    let (identity, identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let mut state = CommunityState::new(community_id);
 
@@ -538,7 +538,7 @@ fn materialized_cache_returns_same_object_until_insert() {
         actor: addr,
         at: hlc(100),
     };
-    let event = sign_event_with_identity(payload, &identity).expect("sign");
+    let event = sign_event_with_identity(&payload, &identity).expect("sign");
     state.insert_event(
         event,
         &VerifyContext {
@@ -1032,16 +1032,10 @@ use harmony_content::cid::ContentId;
 
 #[test]
 fn community_root_publish_payload_wire_bytes_pinned() {
-    // 28-byte ContentId is the SHA-256-truncated digest. We construct
-    // a deterministic instance from a fixed byte pattern.
-    let cid = ContentId::from_raw(
-        harmony_content::cid::ContentFlags {
-            encrypted: true,
-            ..Default::default()
-        },
-        [0xAA; 28],
-    )
-    .expect("from_raw");
+    // ContentId is 32 bytes (4-byte header + 28-byte hash). For the
+    // fixture we use a fully synthetic byte pattern — `from_bytes` is
+    // the standard test constructor (see owner_state_sync.rs:1129).
+    let cid = ContentId::from_bytes([0xAA; 32]);
     let p = CommunityRootPublishPayload {
         root_cid: cid,
         at: Hlc {
@@ -1079,7 +1073,7 @@ Note the placeholder `REPLACE_AFTER_FIRST_GENERATION` — the first run will fai
 Append to `src-tauri/src/community_state_sync.rs`:
 
 ```rust
-use crate::owner_state_crypto::{CanonicalPayload, CanonicalPayloadSealed};
+use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
 use serde::{Deserialize, Serialize};
@@ -1566,8 +1560,11 @@ async fn flush_now_publishes_one_root_publish() {
     tokio::spawn(async move {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
-            if let CasOp::PutLocal { resp, .. } = op {
-                let _ = resp.send(Ok(()));
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let _ = reply.send(Ok(()));
             }
         }
     });
@@ -1876,15 +1873,19 @@ async fn engine_receives_remote_publish_and_merges_event() {
         use harmony_app::content_store::CasOp;
         while let Some(op) = cas_op_rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, bytes, resp } => {
-                    cas_for_servicer.lock().await.insert(cid, bytes);
-                    let _ = resp.send(Ok(()));
+                CasOp::PutLocal { cid, blob, reply } => {
+                    cas_for_servicer.lock().await.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
-                CasOp::GetLocal { cid, resp } => {
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
-                    let _ = resp.send(v.ok_or_else(|| {
-                        harmony_app::content_store::ContentStoreError::NotFound(cid)
-                    }));
+                    let _ = reply.send(Ok(v));
                 }
             }
         }
@@ -1900,7 +1901,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     let community_id = SpaceId([1u8; 16]);
     let mk = MembershipKey::new([0x42; 32]);
 
-    let identity_a = PrivateIdentity::generate();
+    let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(identity_a.identity.address_hash);
     let identity_a_pub = identity_a.identity.to_public_bytes();
 
@@ -1936,7 +1937,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
             actor: admin,
             at: Hlc { wall_ms: 100, logical: 0, device_id: "a-dev".into() },
         };
-        let event = sign_event_with_identity(payload, &identity_a).expect("sign");
+        let event = sign_event_with_identity(&payload, &identity_a).expect("sign");
         let outcome = sa.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
@@ -1957,6 +1958,9 @@ async fn engine_receives_remote_publish_and_merges_event() {
     // / error_tx fields with sensible defaults; Task 8's tests fill
     // in `identity_resolver: Some(...)` so receive-side verify_event
     // can resolve identity_pubs for the admin's signed events.
+    let tmp_a = tempfile::tempdir().expect("tempdir a");
+    let tmp_b = tempfile::tempdir().expect("tempdir b");
+
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
         membership_key: mk.clone(),
@@ -1969,8 +1973,8 @@ async fn engine_receives_remote_publish_and_merges_event() {
         publisher_tx: a_out_tx,
         subscriber_rx: a_in_rx,
         paths: harmony_app::community_state_sync::PersistPaths {
-            crdt: std::env::temp_dir().join("a_crdt.cbor"),
-            replay: std::env::temp_dir().join("a_replay.cbor"),
+            crdt: tmp_a.path().join("crdt.cbor"),
+            replay: tmp_a.path().join("replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
         identity_resolver: None,
@@ -1998,8 +2002,8 @@ async fn engine_receives_remote_publish_and_merges_event() {
         publisher_tx: b_out_tx,
         subscriber_rx: b_in_rx,
         paths: harmony_app::community_state_sync::PersistPaths {
-            crdt: std::env::temp_dir().join("b_crdt.cbor"),
-            replay: std::env::temp_dir().join("b_replay.cbor"),
+            crdt: tmp_b.path().join("crdt.cbor"),
+            replay: tmp_b.path().join("replay.cbor"),
         },
         debounce_ms: harmony_app::community_state_sync::DEFAULT_DEBOUNCE_MS,
         identity_resolver: Some(identity_resolver),
@@ -2142,9 +2146,20 @@ async fn handle_incoming_publish(
         }
     }
 
-    // 3. Fetch the encrypted blob from CAS.
-    let blob_ciphertext = match ctx.content_store.get(payload.root_cid).await {
-        Ok(b) => b,
+    // 3. Fetch the encrypted blob from CAS. Cache-miss is a pre-
+    //    mutation failure — the publish carries a CID we couldn't
+    //    resolve in time; CRDT eventual consistency lets the next
+    //    state-root from any peer recover.
+    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(
+                crate::content_store::ContentStoreError::Io(format!(
+                    "missing root blob for cid {:?} (fetch timeout or admit-rejected)",
+                    payload.root_cid
+                )),
+            ));
+        }
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
     };
 
@@ -2179,7 +2194,7 @@ async fn handle_incoming_publish(
     //    next-boot).
     {
         let mut tracker = ctx.tracker.lock().await;
-        tracker.advance(payload.at.clone());
+        tracker.record(payload.at.clone());
     }
 
     // 7. Merge events. Each event must re-verify against B's
@@ -2452,7 +2467,7 @@ fn would_accept_returns_true_for_unseen_device() {
 #[test]
 fn would_accept_rejects_equal_or_older() {
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(100, 0, "a"));
+    t.record(h(100, 0, "a"));
     assert!(!t.would_accept(&h(100, 0, "a")), "exact replay rejected");
     assert!(!t.would_accept(&h(99, 5, "a")), "older wall_ms rejected");
     assert!(t.would_accept(&h(100, 1, "a")), "later logical accepted");
@@ -2460,38 +2475,44 @@ fn would_accept_rejects_equal_or_older() {
 }
 
 #[test]
-fn advance_does_not_regress_on_older_input() {
+fn would_accept_blocks_regression_at_caller() {
     // The bug-class from PR #81 round 3: if two paths ever feed the
-    // tracker out of order and `advance` regresses to the older HLC,
-    // the next legitimate publish from that device would be rejected
-    // (it's "older than" the regressed value but we already saw a
-    // newer one).
+    // tracker out of order and the caller skips `would_accept`, the
+    // next legitimate publish from that device could be rejected (it's
+    // "older than" the regressed value but we already saw a newer
+    // one). The new API surfaces that bug at the caller — record()
+    // debug_asserts the precondition — so this test pins that the
+    // caller-facing check correctly rejects the older input.
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(200, 0, "a"));
-    t.advance(h(100, 0, "a")); // older — must not regress
+    t.record(h(200, 0, "a"));
+    assert!(
+        !t.would_accept(&h(100, 0, "a")),
+        "older HLC must be caller-rejected, never reach record()"
+    );
+    // The state remains pinned at 200 because record(100) was skipped.
     assert!(!t.would_accept(&h(150, 0, "a")), "still bounded by 200");
     assert!(t.would_accept(&h(201, 0, "a")), "201 > 200");
 }
 
 #[test]
-fn advance_per_device_isolates_clocks() {
+fn record_per_device_isolates_clocks() {
     let mut t = CommunityRootHlcTracker::default();
-    t.advance(h(500, 0, "a"));
+    t.record(h(500, 0, "a"));
     // device b is unseen; new HLC accepted regardless of a's clock
     assert!(t.would_accept(&h(100, 0, "b")));
-    t.advance(h(100, 0, "b"));
+    t.record(h(100, 0, "b"));
     assert!(!t.would_accept(&h(99, 0, "b")));
 }
 ```
 
-- [ ] **Step 9.2: Run tests to verify pass (advance() defensive guard already in Task 6)**
+- [ ] **Step 9.2: Run tests to verify pass (would_accept guard surfaces regressions to caller)**
 
 ```bash
 cd src-tauri
 cargo test --test community_root_hlc_tracker_unit 2>&1 | grep "^test result:"
 ```
 
-Expected: PASS (4 tests). The defensive guard in `advance()` (Task 6's Step 6.3) already prevents regression — these tests pin the behavior so a future refactor can't silently strip it.
+Expected: PASS (4 tests). The `would_accept`/`record` split (Task 6's Step 6.3) makes regressions caller-visible rather than silently no-opping — these tests pin that behavior so a future refactor can't accidentally let bad calls slip through.
 
 - [ ] **Step 9.3: Run gates + commit**
 
@@ -2581,7 +2602,7 @@ fn save_and_load_replay_round_trips() {
     let path = dir.path().join("replay.cbor");
 
     let mut tracker = CommunityRootHlcTracker::default();
-    tracker.advance(Hlc {
+    tracker.record(Hlc {
         wall_ms: 1000,
         logical: 5,
         device_id: "dev".into(),
@@ -3233,14 +3254,23 @@ In `src-tauri/src/community_state_sync.rs`, append:
 /// RegisterDevice events; this resolver picks the FIRST recorded
 /// identity_pub for the queried owner.
 ///
-/// Multi-device note: an OwnerAddr can have multiple DeviceIdentityHashes
-/// registered (each binding the same owner key to a different device).
-/// For verify_event purposes, the actor's pubkey is the OWNER pubkey
-/// — every bound device shares the same Ed25519 signing key derived
-/// from the master seed. So picking any registered identity_pub for
-/// the owner is correct AS LONG AS all registered devices agree on
-/// the owner's pubkey, which is enforced by RegisterDevice signature
-/// verification in Sub-A.
+/// Semantic note on OwnerAddr ↔ DeviceIdentityHash: community_membership's
+/// `event.actor: OwnerAddr` carries the SAME 16 bytes as a
+/// `DeviceIdentityHash` — both are `SHA256(X25519_pub || Ed25519_pub)[:16]`
+/// of the signing identity. The Phase 1 `verify_signature` enforces this
+/// via `Identity::from_public_bytes(actor_identity_pub).address_hash ==
+/// event.actor.0`, so the resolver must look up identity_pub by treating
+/// `event.actor` as a device-hash key.
+///
+/// The cache stores one `OwnerDeviceEntry` per OWNER (master OwnerAddr),
+/// each entry carrying a parallel-vec `(devices: Vec<DeviceIdentityHash>,
+/// device_identity_pubs: Vec<Option<[u8; 64]>>)`. To resolve an
+/// event-actor → identity_pub, we must iterate ALL owner entries and
+/// binary-search each entry's `devices` vec for the target hash. The
+/// existing `crate::dm_outbox::lookup_pubkey_for_device` helper
+/// (`dm_outbox.rs:1575`) does exactly this — `OwnerDeviceCacheResolver`
+/// is a thin wrapper around it that adapts the OwnerAddr ↔
+/// DeviceIdentityHash newtype boundary.
 pub struct OwnerDeviceCacheResolver {
     cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
 }
@@ -3253,21 +3283,23 @@ impl OwnerDeviceCacheResolver {
 
 impl IdentityResolver for OwnerDeviceCacheResolver {
     fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
-        // Synchronous trait fn over an async Mutex — use blocking
-        // lookup. In production this runs on the engine's tokio
-        // task; the cache lock is held briefly. If contention
-        // becomes a real cost, switch to a synchronous std::sync::RwLock
-        // in a future refactor.
+        use crate::dm_outbox::lookup_pubkey_for_device;
+        use crate::owner_state_types::DeviceIdentityHash;
+        // Synchronous trait fn over an async Mutex — use try_lock so a
+        // contended cache surfaces as None (treated as
+        // UnknownSigningKey, which is the correct fallback) rather than
+        // blocking the engine's tokio task. The Mutex is short-held in
+        // production paths.
         let cache = self.cache.try_lock().ok()?;
-        cache
-            .owner_device_cache
-            .get(addr)
-            .and_then(|devices| devices.values().next().cloned())
+        // OwnerAddr and DeviceIdentityHash are bytes-compatible newtypes
+        // (both wrap [u8; 16]). Reinterpret without copying.
+        let device_hash = DeviceIdentityHash(addr.0);
+        lookup_pubkey_for_device(&cache.owner_device_cache, device_hash)
     }
 }
 ```
 
-The exact field name on `OwnerState` for the device cache may be `owner_device_cache` or similar — verify via `grep -n "owner_device_cache\|register_device" src-tauri/src/owner_state_crdt.rs`. The `.values().next()` selection is correct under the multi-device note above.
+The cache field is `OwnerState.owner_device_cache: OwnerDeviceCache` (verified at `owner_state_crdt.rs:46` and `owner_state_types.rs:328-331`). The Phase-1-shipped `lookup_pubkey_for_device` helper at `dm_outbox.rs:1575` already implements the parallel-vec lookup — no need to re-implement.
 
 - [ ] **Step 13.2: Wire the registry into start_node**
 
@@ -3467,13 +3499,19 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             match op {
-                CasOp::PutLocal { cid, bytes, resp } => {
-                    store.lock().await.insert(cid, bytes);
-                    let _ = resp.send(Ok(()));
+                CasOp::PutLocal { cid, blob, reply } => {
+                    store.lock().await.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
-                CasOp::GetLocal { cid, resp } => {
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout: _,
+                    reply,
+                } => {
                     let v = store.lock().await.get(&cid).cloned();
-                    let _ = resp.send(v.ok_or(ContentStoreError::NotFound(cid)));
+                    let _ = reply.send(Ok(v));
                 }
             }
         }
@@ -3492,7 +3530,7 @@ async fn two_members_dag_sync_full_event_log() {
     let community_id = SpaceId([1u8; 16]);
     let mk = MembershipKey::new([0x42; 32]);
 
-    let id_admin = PrivateIdentity::generate();
+    let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
 
@@ -3617,7 +3655,7 @@ Now finish the test:
                 device_id: "a-dev".into(),
             },
         };
-        let event = sign_event_with_identity(payload, &id_admin).expect("sign");
+        let event = sign_event_with_identity(&payload, &id_admin).expect("sign");
         let outcome = sa.insert_event(
             event,
             &VerifyContext {

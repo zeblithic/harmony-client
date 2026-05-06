@@ -38,6 +38,39 @@ pub struct SyncEngineHandles {
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// One per-community adapter request handed from `start_node` (lib.rs)
+/// into the event loop's Zenoh-session scope.
+///
+/// `start_node` owns the `CommunitySyncRegistry` and the
+/// per-community channel pairs the registry's engines consume; the
+/// matching halves (publisher_rx + subscriber_tx) need to be wired
+/// to a Zenoh publisher / subscriber on
+/// `harmony/community/{id_hex}/state-root-v1`. But the Zenoh
+/// `Session` is opened inside `event_loop::run`, not in `start_node`,
+/// so `start_node` builds one of these per joined community and
+/// passes the `Vec<CommunityAdapterRequest>` into `event_loop::run`.
+/// `event_loop::run` iterates the Vec after the session is open and
+/// calls `spawn_community_state_zenoh_adapter` for each entry.
+///
+/// Mirrors the `SyncEngineHandles` cross-boundary pattern used for
+/// the owner-state SyncEngine (see above) — same reason (the engine
+/// constructor needs the channels' OTHER halves at start_node time,
+/// before the session exists), same shape (one struct carrying the
+/// halves we need to keep alive until session-open).
+pub struct CommunityAdapterRequest {
+    /// Hex-encoded community SpaceId (32 chars, lowercase) — used to
+    /// form the per-community state-root topic key
+    /// `harmony/community/{id_hex}/state-root-v1`.
+    pub id_hex: String,
+    /// Engine's outbound channel: bytes the engine writes here drain
+    /// into Zenoh `put` on the per-community topic.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Engine's inbound channel: bytes Zenoh receives on the per-
+    /// community topic are forwarded here, where the engine reads
+    /// them out via its paired `subscriber_rx`.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -180,6 +213,17 @@ pub async fn run<R: Runtime>(
     // both directions push; event_loop drains via unicast_send_rx for
     // both. None when no owner identity is loaded.
     unicast_send_tx: Option<mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    // ZEB-217 Sub-C Phase 2 Task 13: per-community state-CRDT Zenoh
+    // adapter requests. `start_node` scans owner-state for joined
+    // communities, spawns one engine per community via
+    // `CommunitySyncRegistry`, and passes the matching channel halves
+    // through this Vec so we can call
+    // `spawn_community_state_zenoh_adapter` once the session is open.
+    // Empty Vec when no owner identity is loaded or no communities
+    // joined yet — Phase 3 IPC ships `create_community` /
+    // `redeem_invite` which spawn additional engines at runtime
+    // through the registry directly (those bypass this Vec).
+    community_adapters: Vec<CommunityAdapterRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -381,6 +425,35 @@ pub async fn run<R: Runtime>(
                 // handles.outbound_rx and handles.inbound_tx drop at end
                 // of this arm; engine sees both channels close.
             }
+        }
+    }
+
+    // ── ZEB-217 Sub-C Phase 2: per-community state-CRDT Zenoh adapters ──
+    // start_node spawned one engine per joined community via
+    // `CommunitySyncRegistry` and handed us the matching channel halves
+    // through `community_adapters`. Wire each to a Zenoh pub/sub on
+    // `harmony/community/{id_hex}/state-root-v1` now that the session
+    // is open and the `closing` flag exists. Each adapter runs as an
+    // independent task — failure to bind one community's topic doesn't
+    // affect any other.
+    //
+    // `spawn_community_state_zenoh_adapter` (shipped by Task 12) takes
+    // `Arc<Session>` rather than the raw `Session`-clone shape used
+    // by the owner-state adapter above, so wrap the session in Arc
+    // once and bump the count per adapter. The owner-state adapter
+    // continues to use `session.clone()` directly via Zenoh's
+    // internal-Arc shape — both paths terminate at the same session
+    // object.
+    if !community_adapters.is_empty() {
+        let session_arc = Arc::new(session.clone());
+        for req in community_adapters {
+            spawn_community_state_zenoh_adapter(
+                Arc::clone(&session_arc),
+                req.id_hex,
+                req.publisher_rx,
+                req.subscriber_tx,
+                Arc::clone(&closing),
+            );
         }
     }
 
@@ -2081,4 +2154,189 @@ fn emit_frontend_event<R: Runtime>(
             }
         }
     }
+}
+
+// ── ZEB-217 Sub-C Phase 2 Task 12: per-community state Zenoh adapter ──────
+//
+// Mirrors the owner-state adapter at lines 273-385 above, with the topic
+// substituted for a per-community key expression and the Tauri AppHandle /
+// `state-root-sync-degraded` emit removed. Per the Phase 2 design, transport
+// degradation flows through the engine's `error_tx` channel; the registry's
+// drain task (Task 13) converts those reports into the
+// `community-state-sync-degraded` Tauri event. So this adapter logs+lets
+// the channel close on transport failure and trusts the engine's
+// `subscriber_channel_closed` degraded report to surface it.
+
+/// Spawn a Zenoh publisher + subscriber for one community's state-root
+/// topic (`harmony/community/{id_hex}/state-root-v1`).
+///
+/// Wires:
+///   - `publisher_rx` (engine's outbound bytes) → `session.put(key, bytes)`
+///   - Zenoh subscriber on the same key → `subscriber_tx` (engine's inbound)
+///
+/// `closing` is the event-loop-wide shutdown flag; when set, transport
+/// errors are downgraded to silence so a clean `stop_node` doesn't spam
+/// "publish failed" / "subscriber closed unexpectedly" warnings.
+///
+/// Returns a `JoinHandle<()>` so the registry / `start_node` can await
+/// teardown if needed. Internally spawns two child tasks (publisher and
+/// subscriber) and joins them before the outer handle resolves.
+///
+/// On failure to construct a `KeyExpr` from the topic string, the function
+/// logs and returns a JoinHandle that resolves immediately — both
+/// `publisher_rx` and `subscriber_tx` drop here, which the engine sees as
+/// transport-closed (publish-only / fully-degraded mode).
+pub fn spawn_community_state_zenoh_adapter(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let topic = format!("harmony/community/{}/state-root-v1", community_id_hex);
+
+    tokio::spawn(async move {
+        let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "community state-root key_expr invalid; adapter skipped"
+                );
+                // publisher_rx and subscriber_tx drop on this arm's exit;
+                // engine's transport sees both channels close and falls
+                // into degraded mode.
+                return;
+            }
+        };
+
+        // Outbound: drain engine's publisher_rx → Zenoh put.
+        let session_pub = Arc::clone(&session);
+        let key_pub = key_expr.clone();
+        let topic_pub = topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let pub_handle = tokio::spawn(async move {
+            // Bounded-time shutdown: poll `closing` every second so a
+            // node-stop event terminates the publisher within ~1s even
+            // if no bytes are flowing on `publisher_rx`. Without this,
+            // the outer JoinHandle this fn returns could only resolve
+            // when the engine drops its publisher_tx — fine under the
+            // documented teardown order (registry.shutdown_all first),
+            // but easy for a future caller to misuse.
+            loop {
+                tokio::select! {
+                    // Data-flow arm first: when both arms are ready
+                    // (i.e., a byte is queued AND the 1s timer fires)
+                    // the actual publish wins. With the previous arm
+                    // order the biased eval would always pick the
+                    // closing-check, delaying every collision-case
+                    // publish by one loop iteration.
+                    biased;
+                    maybe = publisher_rx.recv() => {
+                        let Some(bytes) = maybe else { break; };
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    topic = %topic_pub,
+                                    error = %e,
+                                    "community state-root publish failed"
+                                );
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // Inbound: Zenoh subscriber → engine's subscriber_tx.
+        let session_sub = session;
+        let key_sub = key_expr;
+        let topic_sub = topic;
+        let closing_sub = Arc::clone(&closing);
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare community state-root subscriber"
+                        );
+                    }
+                    // subscriber_tx drops on this arm's exit; engine's
+                    // subscriber_rx hits None and latches inbound_closed,
+                    // continuing in publish-only mode.
+                    return;
+                }
+            };
+            // Three ways the loop ends:
+            //   1. `subscriber_tx.send` fails — engine cleanly shut down
+            //      (registry tore the engine down). Stay silent so a
+            //      routine community-leave / shutdown doesn't log.
+            //   2. `sub.recv_async` returns Err — Zenoh session/subscriber
+            //      died. Warn (gated on !closing) and exit; the engine's
+            //      own subscriber_channel_closed degraded report covers
+            //      surface-level visibility.
+            //   3. `closing` flag flips — bounded-time shutdown, mirrors
+            //      the publisher arm above.
+            //   4. `subscriber_tx.closed()` resolves — the engine
+            //      dropped its subscriber_rx (e.g., registry.stop_engine
+            //      tore down a community while no inbound was flowing).
+            //      Without this arm the loop stays blocked on
+            //      `sub.recv_async` until the next sample arrives,
+            //      leaving the JoinHandle unresolved indefinitely.
+            loop {
+                tokio::select! {
+                    // Data-flow arm first (see publisher loop above
+                    // for rationale). If `subscriber_tx.closed()`
+                    // resolves on the same poll as an inbound sample,
+                    // delivering the sample is harmless: the
+                    // subsequent `subscriber_tx.send` returns Err and
+                    // breaks the loop on the next iteration. Putting
+                    // `closed()` first instead would silently discard
+                    // that sample — contradicting the documented
+                    // intent and masking edge-case message loss
+                    // during teardown.
+                    biased;
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "community state-root subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = subscriber_tx.closed() => {
+                        // Engine dropped subscriber_rx — nothing to
+                        // forward to anymore. Silent exit; engine
+                        // owns the shutdown trace if relevant.
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
+    })
 }
