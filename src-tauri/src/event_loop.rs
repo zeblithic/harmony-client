@@ -2082,3 +2082,160 @@ fn emit_frontend_event<R: Runtime>(
         }
     }
 }
+
+// ── ZEB-217 Sub-C Phase 2 Task 12: per-community state Zenoh adapter ──────
+//
+// Mirrors the owner-state adapter at lines 273-385 above, with the topic
+// substituted for a per-community key expression and the Tauri AppHandle /
+// `state-root-sync-degraded` emit removed. Per the Phase 2 design, transport
+// degradation flows through the engine's `error_tx` channel; the registry's
+// drain task (Task 13) converts those reports into the
+// `community-state-sync-degraded` Tauri event. So this adapter logs+lets
+// the channel close on transport failure and trusts the engine's
+// `subscriber_channel_closed` degraded report to surface it.
+
+/// Spawn a Zenoh publisher + subscriber for one community's state-root
+/// topic (`harmony/community/{id_hex}/state-root-v1`).
+///
+/// Wires:
+///   - `publisher_rx` (engine's outbound bytes) → `session.put(key, bytes)`
+///   - Zenoh subscriber on the same key → `subscriber_tx` (engine's inbound)
+///
+/// `closing` is the event-loop-wide shutdown flag; when set, transport
+/// errors are downgraded to silence so a clean `stop_node` doesn't spam
+/// "publish failed" / "subscriber closed unexpectedly" warnings.
+///
+/// Returns a `JoinHandle<()>` so the registry / `start_node` can await
+/// teardown if needed. Internally spawns two child tasks (publisher and
+/// subscriber) and joins them before the outer handle resolves.
+///
+/// On failure to construct a `KeyExpr` from the topic string, the function
+/// logs and returns a JoinHandle that resolves immediately — both
+/// `publisher_rx` and `subscriber_tx` drop here, which the engine sees as
+/// transport-closed (publish-only / fully-degraded mode).
+pub fn spawn_community_state_zenoh_adapter(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let topic = format!("harmony/community/{}/state-root-v1", community_id_hex);
+
+    tokio::spawn(async move {
+        let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "community state-root key_expr invalid; adapter skipped"
+                );
+                // publisher_rx and subscriber_tx drop on this arm's exit;
+                // engine's transport sees both channels close and falls
+                // into degraded mode.
+                return;
+            }
+        };
+
+        // Outbound: drain engine's publisher_rx → Zenoh put.
+        let session_pub = Arc::clone(&session);
+        let key_pub = key_expr.clone();
+        let topic_pub = topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let pub_handle = tokio::spawn(async move {
+            while let Some(bytes) = publisher_rx.recv().await {
+                if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                    if !closing_pub.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            topic = %topic_pub,
+                            error = %e,
+                            "community state-root publish failed"
+                        );
+                    }
+                }
+            }
+        });
+
+        // Inbound: Zenoh subscriber → engine's subscriber_tx.
+        let session_sub = session;
+        let key_sub = key_expr;
+        let topic_sub = topic;
+        let closing_sub = Arc::clone(&closing);
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare community state-root subscriber"
+                        );
+                    }
+                    // subscriber_tx drops on this arm's exit; engine's
+                    // subscriber_rx hits None and latches inbound_closed,
+                    // continuing in publish-only mode.
+                    return;
+                }
+            };
+            // Two ways the loop ends:
+            //   1. `subscriber_tx.send` fails — engine cleanly shut down
+            //      (registry tore the engine down). Stay silent so a
+            //      routine community-leave / shutdown doesn't log.
+            //   2. `sub.recv_async` returns Err — Zenoh session/subscriber
+            //      died. Warn (gated on !closing) and exit; the engine's
+            //      own subscriber_channel_closed degraded report covers
+            //      surface-level visibility.
+            loop {
+                match sub.recv_async().await {
+                    Ok(sample) => {
+                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                        if subscriber_tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if !closing_sub.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                topic = %topic_sub,
+                                error = %e,
+                                "community state-root subscriber closed unexpectedly"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
+    })
+}
+
+/// 4-tuple of mpsc channel ends returned by [`community_zenoh_channels`]:
+/// `(publisher_tx, publisher_rx, subscriber_rx, subscriber_tx)`.
+pub type CommunityZenohChannels = (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+);
+
+/// Build the four mpsc channel ends needed to wire a community's
+/// SyncEngine to the Zenoh adapter.
+///
+/// Returns `(publisher_tx, publisher_rx, subscriber_rx, subscriber_tx)`:
+///   - `publisher_tx` → handed to the engine; bytes the engine writes here
+///     drain via `publisher_rx` into Zenoh `put`.
+///   - `subscriber_rx` → handed to the engine; bytes Zenoh receives are
+///     forwarded by the adapter into `subscriber_tx` and read out here.
+///
+/// Channel depth (64) matches the owner-state engine sizing — one or two
+/// state-root frames per CRDT epoch, well below saturation.
+pub fn community_zenoh_channels() -> CommunityZenohChannels {
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    (pub_tx, pub_rx, sub_rx, sub_tx)
+}
