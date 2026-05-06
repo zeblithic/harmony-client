@@ -5295,7 +5295,7 @@ pub fn rotate_passphrase_cli(new_passphrase_file: &std::path::Path) -> Result<()
 /// the spec's MemberInfo type. `addr` is hex of OwnerAddr (16 bytes →
 /// 32 chars). `display_name` is None in Phase 3 — the existing profile
 /// cache lookup is wired in Phase 5.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberInfoDto {
     pub addr: String,
