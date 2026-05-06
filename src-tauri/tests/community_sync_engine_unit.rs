@@ -27,6 +27,8 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         std::time::Duration::from_millis(1000),
     ));
 
+    let tmp = tempfile::tempdir().expect("tempdir");
+
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
         membership_key: mk,
@@ -39,8 +41,8 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         publisher_tx: out_tx,
         subscriber_rx: in_rx,
         paths: harmony_app::community_state_sync::PersistPaths {
-            crdt: std::env::temp_dir().join("test_crdt.cbor"),
-            replay: std::env::temp_dir().join("test_replay.cbor"),
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
         },
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         identity_resolver: None,

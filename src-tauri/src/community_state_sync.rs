@@ -214,7 +214,7 @@ pub enum CommunitySyncError {
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
 /// in-memory replay tracker shape, but keyed externally by community_id
 /// (one tracker instance per joined community).
-#[derive(Default, Clone, Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct CommunityRootHlcTracker {
     /// Per-publisher-device latest-accepted HLC. New incoming root
     /// publishes are accepted only if STRICTLY NEWER per their
@@ -227,9 +227,10 @@ impl CommunityRootHlcTracker {
     /// `true` if the candidate strictly dominates the recorded entry
     /// (or there is none); `false` otherwise.
     ///
-    /// Does NOT mutate — the caller decides whether to advance after
-    /// the rest of the receive pipeline succeeds. Mirrors the
-    /// "advance-after-success" idiom from owner-state's tracker.
+    /// Does NOT mutate — `record` is a separate step the caller invokes
+    /// after the rest of the receive pipeline succeeds. The split
+    /// implements the "advance-after-success" idiom that owner-state's
+    /// call sites apply manually to a bare BTreeMap.
     pub fn would_accept(&self, candidate: &Hlc) -> bool {
         match self.per_device.get(&candidate.device_id) {
             None => true,
@@ -238,17 +239,22 @@ impl CommunityRootHlcTracker {
     }
 
     /// Record `candidate` as the latest-accepted HLC for its device.
-    /// Defensive: only advances if `would_accept` would have passed,
-    /// catching accidental backward-jumps from buggy call sites.
-    pub fn advance(&mut self, candidate: Hlc) {
+    ///
+    /// Precondition: caller MUST have just verified `would_accept`
+    /// returned `true`. We `debug_assert!` the precondition so a
+    /// buggy call site surfaces in dev/test rather than silently
+    /// no-opping (which would mask the bug). In release builds the
+    /// insert is unconditional — at this point the caller has
+    /// committed to advancing and a backward-jump indicates upstream
+    /// state corruption that no amount of guarding here can repair.
+    pub fn record(&mut self, candidate: Hlc) {
+        debug_assert!(
+            self.would_accept(&candidate),
+            "CommunityRootHlcTracker::record called without would_accept check; backward-jump for device {}",
+            candidate.device_id
+        );
         let device_id = candidate.device_id.clone();
-        let should_advance = match self.per_device.get(&device_id) {
-            None => true,
-            Some(prev) => candidate.is_strictly_newer_than(prev),
-        };
-        if should_advance {
-            self.per_device.insert(device_id, candidate);
-        }
+        self.per_device.insert(device_id, candidate);
     }
 }
 
