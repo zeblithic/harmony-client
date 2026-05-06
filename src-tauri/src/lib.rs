@@ -5294,6 +5294,107 @@ async fn list_community_members(
     Ok(member_info_for(&materialized))
 }
 
+/// Encode a CommunityInvitePayload into the harmony://invite/ URL form.
+/// Thin wrapper over `community_invite::encode_invite_url` so call sites
+/// don't need to import the lower-level error type — surfaces failures
+/// as `Result<String, String>` matching the IPC convention.
+pub fn build_open_invite_url(
+    payload: &crate::community_invite::CommunityInvitePayload,
+) -> Result<String, String> {
+    crate::community_invite::encode_invite_url(payload)
+        .map_err(|e| format!("encode invite URL: {e}"))
+}
+
+/// Generate a `harmony://invite/...` URL for an OPEN community. The
+/// returned URL carries the community id + symmetric `MembershipKey` +
+/// admin addr + community name, so any holder can decrypt the
+/// state-root topic and publish their own Join event.
+///
+/// `invitee_hint` and `expires_at` are accepted to match the spec's IPC
+/// contract but are unused in Phase 3 — Phase 4 will sign an
+/// `InviteToken` carrying both. Phase 3 returns a token-less payload.
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` — bad hex.
+/// - `Err("no community_registry — node not running?")` — registry not
+///   wired (start_node hasn't run).
+/// - `Err("no Space for community {hex} in owner-state")` — the
+///   community isn't in our local owner-state (we haven't joined or
+///   we left).
+/// - `Err("community Space missing membership_key / admin_addr / kind")`
+///   — defensive guard; should be unreachable since
+///   `validate_invariants` rejects these on apply, but cheap to check.
+#[tauri::command]
+async fn generate_invite(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    invitee_hint: Option<String>,
+    expires_at: Option<u64>,
+) -> Result<String, String> {
+    let _ = (invitee_hint, expires_at); // Phase 4 wiring; ignored in Phase 3.
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state
+            .clone()
+            .ok_or("crdt_state missing — node not running?")?
+    };
+
+    let space = {
+        let s = crdt_state.lock().await;
+        s.spaces.get(&space_id).cloned()
+    }
+    .ok_or_else(|| {
+        format!(
+            "no Space for community {} in owner-state",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    if space.kind != crate::owner_state_types::SpaceKind::Community {
+        return Err(format!(
+            "Space {} exists but is kind {:?}, not Community",
+            hex::encode(space_id.0),
+            space.kind
+        ));
+    }
+    let mk = space
+        .membership_key
+        .clone()
+        .ok_or("community Space missing membership_key (corrupt row?)")?;
+    let admin = space
+        .admin_addr
+        .ok_or("community Space missing admin_addr (corrupt row?)")?;
+    let is_invite_only = space.is_invite_only.unwrap_or(false);
+
+    if is_invite_only {
+        return Err(
+            "Phase 3 supports OPEN communities only; invite-only generate_invite ships in Phase 4"
+                .to_string(),
+        );
+    }
+
+    let payload = crate::community_invite::CommunityInvitePayload {
+        community_id: space_id,
+        membership_key: mk,
+        admin_addr: admin,
+        community_name: space.name.clone(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+    };
+    build_open_invite_url(&payload)
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5468,6 +5569,7 @@ pub fn run() {
             pairing_commands::cancel_pairing,
             pairing_commands::get_pairing_state,
             list_community_members,
+            generate_invite,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -6164,5 +6266,32 @@ mod list_community_members_ipc_tests {
         assert_eq!(dto.len(), 1);
         assert_eq!(dto[0].addr, hex::encode(admin.0));
         assert_eq!(dto[0].power, 100);
+    }
+}
+
+#[cfg(test)]
+mod generate_invite_helper_tests {
+    use super::*;
+    use crate::community_invite::{decode_invite_url, CommunityInvitePayload};
+    use crate::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+
+    #[test]
+    fn build_open_invite_payload_round_trips_via_url() {
+        let payload = CommunityInvitePayload {
+            community_id: SpaceId([7; 16]),
+            membership_key: MembershipKey::new([0x99; 32]),
+            admin_addr: OwnerAddr([0x11; 16]),
+            community_name: "DoorClub".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+        };
+        let url = build_open_invite_url(&payload).expect("url");
+        let decoded = decode_invite_url(&url).expect("decode");
+        assert_eq!(decoded, payload);
+        assert!(
+            decoded.invite_token.is_none(),
+            "open path must be token-less"
+        );
     }
 }
