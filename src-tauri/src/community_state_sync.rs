@@ -1218,7 +1218,9 @@ impl CommunitySyncRegistry {
     /// instances writing concurrently can never collide on the same
     /// directory.
     fn paths_for(&self, community_id: SpaceId) -> PersistPaths {
-        let id_hex: String = community_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        // hex::encode is the codebase convention for OwnerAddr/SpaceId/
+        // device_id rendering — see event_loop.rs, dm_outbox.rs, etc.
+        let id_hex = hex::encode(community_id.0);
         let dir = self.cfg.identity_dir.join("communities").join(&id_hex);
         PersistPaths {
             crdt: dir.join("crdt.cbor"),
@@ -1238,12 +1240,14 @@ impl CommunitySyncRegistry {
     /// the registry double-spawning or surfacing a spurious failure.
     ///
     /// **Lock scope:** the engines map lock is held across the disk
-    /// I/O (`load_crdt` + `load_replay`) and the `CommunitySyncEngine::new`
-    /// call. Concurrent `spawn_engine` calls for distinct communities
-    /// will serialise on this lock — acceptable because spawn is rare
-    /// (once per Joined event), and holding the lock through engine
-    /// construction is the only way to keep the contains-key check
-    /// race-free against another spawn for the same community.
+    /// I/O (`load_crdt` + `load_replay`), the `CommunitySyncEngine::new`
+    /// call, AND the `tokio::spawn` of the engine's internal task that
+    /// `new` performs. Concurrent `spawn_engine` calls for distinct
+    /// communities will serialise on this lock — acceptable because
+    /// spawn is rare (once per Joined event), and holding the lock
+    /// through engine construction is the only way to keep the
+    /// contains-key check race-free against another spawn for the
+    /// same community.
     pub async fn spawn_engine(
         &self,
         community_id: SpaceId,
