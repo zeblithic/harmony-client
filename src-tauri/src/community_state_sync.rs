@@ -27,7 +27,10 @@
 //! `identity_dir/communities/{id_hex}/`, loads any prior CRDT + replay
 //! snapshot from disk before spawning each engine, and surfaces idempotent
 //! `spawn_engine` / `stop_engine` / `shutdown_all` / `known_ids` for the
-//! owner-state subscription scan in Task 12.
+//! owner-state subscription scan in Task 12. The production
+//! `IdentityResolver` impl `OwnerDeviceCacheResolver` (Task 13) wraps
+//! Sub-A's RegisterDevice cache to bridge `event.actor: OwnerAddr` →
+//! 64-byte identity_pub for receive-side `verify_event`.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -1390,10 +1393,16 @@ impl IdentityResolver for OwnerDeviceCacheResolver {
         use crate::dm_outbox::lookup_pubkey_for_device;
         use crate::owner_state_types::DeviceIdentityHash;
         // Synchronous trait fn over an async Mutex — use try_lock so a
-        // contended cache surfaces as None (treated as
-        // UnknownSigningKey, which is the correct fallback) rather than
-        // blocking the engine's tokio task. The Mutex is short-held in
-        // production paths.
+        // contended cache surfaces as None rather than blocking the
+        // engine's tokio task. The Mutex is short-held in Phase 2's
+        // current paths (only the SyncEngine's snapshot+publish + the
+        // dm_outbox drain hold it). KNOWN LIMITATION: under Phase 3's
+        // IPC handlers (create_community / redeem_invite / etc.) this
+        // can race more visibly — the engine logs "unknown actor
+        // identity_pub" both when the actor is genuinely unknown AND
+        // when the lock was contended. Phase 3 should distinguish
+        // these via either an async-aware resolver trait or a separate
+        // "contended" return path. Tracked alongside the Phase 3 plan.
         let cache = self.cache.try_lock().ok()?;
         // OwnerAddr and DeviceIdentityHash are bytes-compatible newtypes
         // (both wrap [u8; 16]). Reinterpret without copying.
