@@ -55,8 +55,9 @@ struct StaticResolver {
     map: std::collections::HashMap<OwnerAddr, [u8; 64]>,
 }
 
+#[async_trait::async_trait]
 impl IdentityResolver for StaticResolver {
-    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
         self.map.get(addr).copied()
     }
 }

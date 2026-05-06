@@ -70,13 +70,22 @@ pub fn save_crdt(path: &Path, state: &CommunityState) -> Result<(), PersistError
 ///   the first-boot or just-joined-community common case; surfacing
 ///   `NotFound` as an error would force every caller to special-case
 ///   it.
-/// - Decode error → returns `PersistError::CborDecode`. Corrupted
-///   files MUST be loud; silently starting empty would mask disk
-///   corruption / schema drift.
+/// - Decode error → quarantine the corrupted file (rename to
+///   `path.cbor.corrupt.<unix_ms>`) and return the empty default with
+///   a `tracing::warn!`. Self-heal is correct here: a corrupted
+///   per-community CRDT recovers from peers via the next state-root
+///   publish (`write_atomic` skips fsync precisely because of this
+///   peer-recoverability), so leaving the engine unable to spawn
+///   would maroon the community despite the data being available.
+///   The original bytes are preserved on disk under the `.corrupt.*`
+///   suffix for forensic analysis.
 /// - `community_id` mismatch → returns
 ///   `PersistError::CommunityIdMismatch`. Guards against misrouted
 ///   files (wrong directory copied in manually, registry-path bug,
-///   etc.) — the bytes parsed, but the file belongs elsewhere.
+///   etc.) — the bytes parsed, but the file belongs elsewhere; we
+///   intentionally do NOT auto-quarantine here because the file
+///   probably belongs to a different community and overwriting it
+///   would lose that community's state too.
 pub fn load_crdt(path: &Path, expected_id: SpaceId) -> Result<CommunityState, PersistError> {
     // Single-syscall NotFound handling: avoids the TOCTOU window
     // between `path.exists()` and `read` if the file is unlinked
@@ -88,15 +97,21 @@ pub fn load_crdt(path: &Path, expected_id: SpaceId) -> Result<CommunityState, Pe
         }
         Err(e) => return Err(PersistError::Io(e)),
     };
-    let state: CommunityState =
-        canonical_cbor_decode(&bytes).map_err(|e| PersistError::CborDecode(e.to_string()))?;
-    if state.community_id != expected_id {
-        return Err(PersistError::CommunityIdMismatch {
-            found: state.community_id,
-            expected: expected_id,
-        });
+    match canonical_cbor_decode::<CommunityState>(&bytes) {
+        Ok(state) => {
+            if state.community_id != expected_id {
+                return Err(PersistError::CommunityIdMismatch {
+                    found: state.community_id,
+                    expected: expected_id,
+                });
+            }
+            Ok(state)
+        }
+        Err(decode_err) => {
+            quarantine_corrupted(path, &decode_err.to_string());
+            Ok(CommunityState::new(expected_id))
+        }
     }
-    Ok(state)
 }
 
 /// Save the per-community replay tracker to `path`. Same atomic-write
@@ -116,8 +131,10 @@ pub fn save_replay(path: &Path, tracker: &CommunityRootHlcTracker) -> Result<(),
 ///   (empty `per_device` map). On first boot we haven't seen any
 ///   peer's HLCs yet; replay protection rebuilds organically as
 ///   publishes arrive.
-/// - Decode error → returns `PersistError::CborDecode`. Same loud-
-///   not-silent rationale as `load_crdt`.
+/// - Decode error → quarantine + return default (same self-heal as
+///   `load_crdt`). A corrupted tracker only causes us to re-merge
+///   already-known events from the next root publish (cheap), so
+///   surfacing a hard error would needlessly block engine spawn.
 ///
 /// No `community_id` guard here: the tracker doesn't carry a
 /// `community_id` field (it's a flat per-device map), so the routing
@@ -131,7 +148,42 @@ pub fn load_replay(path: &Path) -> Result<CommunityRootHlcTracker, PersistError>
         }
         Err(e) => return Err(PersistError::Io(e)),
     };
-    canonical_cbor_decode(&bytes).map_err(|e| PersistError::CborDecode(e.to_string()))
+    match canonical_cbor_decode::<CommunityRootHlcTracker>(&bytes) {
+        Ok(t) => Ok(t),
+        Err(decode_err) => {
+            quarantine_corrupted(path, &decode_err.to_string());
+            Ok(CommunityRootHlcTracker::default())
+        }
+    }
+}
+
+/// Move a corrupted CBOR file aside under `<path>.corrupt.<unix_ms>` so
+/// the next `write_atomic` can land cleanly while preserving the
+/// original bytes for forensic analysis. Failures here are logged and
+/// swallowed — even if quarantine fails the caller still gets default
+/// state, so the engine can spawn and resync from peers.
+fn quarantine_corrupted(path: &Path, decode_err: &str) {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut quarantine = path.as_os_str().to_owned();
+    quarantine.push(format!(".corrupt.{suffix}"));
+    let quarantine_path = std::path::PathBuf::from(quarantine);
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => tracing::warn!(
+            ?path,
+            quarantine = ?quarantine_path,
+            error = %decode_err,
+            "community persist: corrupted file quarantined; recovering with default state"
+        ),
+        Err(rename_err) => tracing::error!(
+            ?path,
+            decode_error = %decode_err,
+            rename_error = %rename_err,
+            "community persist: failed to quarantine corrupted file; recovering with default state anyway"
+        ),
+    }
 }
 
 /// Atomically replace `path` with `bytes` via temp-file + rename.

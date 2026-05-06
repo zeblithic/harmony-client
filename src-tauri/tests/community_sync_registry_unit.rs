@@ -12,8 +12,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 struct NopResolver;
+#[async_trait::async_trait]
 impl IdentityResolver for NopResolver {
-    fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+    async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
         None
     }
 }

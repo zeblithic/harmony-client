@@ -46,7 +46,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::community_membership::VerifyContext;
+use crate::community_membership::{SignedMembershipEvent, VerifyContext};
 use crate::community_state_crdt::{CommunityState, InsertOutcome};
 use crate::community_state_persist::{load_crdt, load_replay, save_crdt, save_replay};
 use crate::content_store::ContentStore;
@@ -324,12 +324,20 @@ pub struct PersistPaths {
 /// Resolves an `OwnerAddr` -> 64-byte identity_pub at receive-side
 /// `verify_event` time. Production implementation wraps Sub-A's
 /// owner-device cache (Task 13's `OwnerDeviceCacheResolver`); tests
-/// use a static mapping. The trait is declared at Task 6 so the
-/// `CommunitySyncEngineConfig::identity_resolver` field can reference
-/// it; concrete implementations (other than test stubs) land in later
-/// tasks.
+/// use a static mapping.
+///
+/// **Async by design.** Earlier the trait was synchronous, which forced
+/// the production resolver to use `try_lock()` over the async
+/// `Mutex<OwnerState>`. Lock contention then collapsed to `None`, and
+/// the receive pipeline interpreted that as "unknown actor" — it had
+/// already advanced the per-device replay tracker, so the dropped
+/// events became unrecoverable until a strictly-newer publish arrived.
+/// Making the trait async lets the production resolver wait on the
+/// real lock, so contention now produces a brief await instead of
+/// silently discarding a valid publish.
+#[async_trait::async_trait]
 pub trait IdentityResolver: Send + Sync {
-    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]>;
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]>;
 }
 
 /// One degraded-path report from an engine. Sent on the engine's
@@ -612,18 +620,23 @@ async fn internal_task(mut ctx: InternalCtx) {
                         ctx.has_pending_dirty.store(true, Ordering::Release);
                     }
                 }
-                // Persist after the wire-side publish so the next
-                // boot recovers from the same state we just told peers
-                // about. Errors are logged + swallowed — a debounce
-                // wakeup has no caller to surface a Result to, and
-                // dropping the publish loop on a transient disk error
-                // would silently disable sync for this community.
-                if let Err(e) = persist_both(&ctx).await {
-                    tracing::warn!(
-                        community_id = ?ctx.community_id,
-                        error = %e,
-                        "community persist_both failed after debounce publish"
-                    );
+                // Only persist after a SUCCESSFUL publish. Persisting
+                // on failure would record next_hlc's tracker advance
+                // even though peers never received the publish — a
+                // restart would skip the retry and leave the community
+                // out-of-sync until clock-time advances past the
+                // unpersisted HLC. Errors here are logged + swallowed
+                // (debounce wakeup has no caller to surface a Result
+                // to; dropping the loop on a transient disk error
+                // would silently disable sync for this community).
+                if pub_result.is_ok() {
+                    if let Err(e) = persist_both(&ctx).await {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            error = %e,
+                            "community persist_both failed after debounce publish"
+                        );
+                    }
                 }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
@@ -633,7 +646,19 @@ async fn internal_task(mut ctx: InternalCtx) {
                 if pub_result.is_err() && was_dirty {
                     ctx.has_pending_dirty.store(true, Ordering::Release);
                 }
-                let _ = resp_tx.send(pub_result);
+                // Persist matches the public contract: flush_now()
+                // returns after both publish AND on-disk persist
+                // complete (mirrors owner_state_sync::SyncEngine). Only
+                // persist on publish success to avoid recording an
+                // unpublished HLC advance; on persist failure surface
+                // the error to the caller via and()-chained Result.
+                let final_result = if pub_result.is_ok() {
+                    let persist_result = persist_both(&ctx).await;
+                    pub_result.and(persist_result)
+                } else {
+                    pub_result
+                };
+                let _ = resp_tx.send(final_result);
             }
             maybe_bytes = ctx.subscriber_rx.recv(), if !inbound_closed => {
                 let Some(bytes) = maybe_bytes else {
@@ -1026,21 +1051,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         return IncomingOutcome::ErrPostMutation(CommunitySyncError::MissingIdentityResolver);
     };
 
-    let mut state = ctx.state.lock().await;
-    let mut inserted_any = false;
+    // Phase A: pre-resolve identity_pubs OUTSIDE the community state
+    // lock. The resolver awaits owner_state's mutex; holding community
+    // state at the same time would create a lock-order hazard with
+    // Phase 3 IPC handlers that lock owner_state then community_state.
+    // Skip-on-error logs + drops events with unknown actor / cs
+    // identity_pubs; mirrors decrypt_inbox_entries (DM transport).
+    let mut resolved: Vec<(SignedMembershipEvent, [u8; 64], Option<[u8; 64]>)> = Vec::new();
     for event in remote.events.into_values() {
-        // Skip events we already have. Avoids the prior_state_at_event
-        // recomputation cost on every duplicate Zenoh fanout echo.
-        if state.events.contains_key(&event.id) {
-            continue;
-        }
-
-        // Resolve identity_pub for this event's actor + (if present)
-        // countersig signer. Skip-on-error, log+continue if either
-        // can't be resolved — mirrors the skip-on-error pattern from
-        // decrypt_inbox_entries (DM transport). A single corrupt or
-        // unknown-pubkey event must not fail the whole replay.
-        let actor_pub = match resolver.resolve(&event.actor) {
+        let actor_pub = match resolver.resolve(&event.actor).await {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -1051,15 +1070,10 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 continue;
             }
         };
-
-        let cs_pub_storage;
-        let cs_pub: Option<&[u8; 64]> = match event.countersig.as_ref() {
+        let cs_pub: Option<[u8; 64]> = match event.countersig.as_ref() {
             None => None,
-            Some(cs) => match resolver.resolve(&cs.signer) {
-                Some(p) => {
-                    cs_pub_storage = p;
-                    Some(&cs_pub_storage)
-                }
+            Some(cs) => match resolver.resolve(&cs.signer).await {
+                Some(p) => Some(p),
                 None => {
                     tracing::warn!(
                         community_id = ?ctx.community_id,
@@ -1070,47 +1084,72 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 }
             },
         };
+        resolved.push((event, actor_pub, cs_pub));
+    }
 
-        let ctx_v = VerifyContext {
-            expected_community_id: ctx.community_id,
-            admin_addr: ctx.admin_addr,
-            is_invite_only: ctx.is_invite_only,
-            actor_identity_pub: &actor_pub,
-            countersigner_identity_pub: cs_pub,
-        };
-
-        match state.insert_event(event, &ctx_v) {
-            InsertOutcome::Inserted => {
-                inserted_any = true;
+    // Phase B: lock community state once, run insert_event for each
+    // resolved event, collect rejections for out-of-lock reporting.
+    let mut inserted_any = false;
+    let mut rejection_reports: Vec<crate::community_membership::VerifyError> = Vec::new();
+    {
+        let mut state = ctx.state.lock().await;
+        for (event, actor_pub, cs_pub_owned) in resolved {
+            if state.events.contains_key(&event.id) {
+                continue;
             }
-            InsertOutcome::AlreadyKnown => {
-                // Skip — already in our log. Don't flip inserted_any
-                // because the CRDT is unchanged; without this, every
-                // duplicate Zenoh fanout echo would trigger a
-                // disk-persist on the Mutated arm at Task 10.
-            }
-            InsertOutcome::Rejected(verr) => {
-                tracing::warn!(
-                    community_id = ?ctx.community_id,
-                    error = ?verr,
-                    "skipping incoming event: verify_event rejected"
-                );
-                // Surface the rejection as a degraded-path report —
-                // verify_event rejections at receive time are the
-                // most useful signal for the frontend banner (forged
-                // sigs, insufficient power, banned-actor replays
-                // etc). One bad event does not block valid ones in
-                // the same publish — defense-in-depth at both
-                // layers (Phase 1 spec §"Defense-in-depth").
-                report_degraded(
-                    ctx.error_tx.as_ref(),
-                    ctx.community_id,
-                    "verify_event_rejected",
-                    format!("{verr:?}"),
-                )
-                .await;
+            // Inline `Option::as_ref` because rustc can't always infer
+            // the right `AsRef` impl on `[u8; 64]`.
+            let cs_pub_ref: Option<&[u8; 64]> = match &cs_pub_owned {
+                Some(p) => Some(p),
+                None => None,
+            };
+            let ctx_v = VerifyContext {
+                expected_community_id: ctx.community_id,
+                admin_addr: ctx.admin_addr,
+                is_invite_only: ctx.is_invite_only,
+                actor_identity_pub: &actor_pub,
+                countersigner_identity_pub: cs_pub_ref,
+            };
+            match state.insert_event(event, &ctx_v) {
+                InsertOutcome::Inserted => {
+                    inserted_any = true;
+                }
+                InsertOutcome::AlreadyKnown => {
+                    // Skip — already in our log. Don't flip inserted_any
+                    // because the CRDT is unchanged; without this, every
+                    // duplicate Zenoh fanout echo would trigger a
+                    // disk-persist on the Mutated arm at Task 10.
+                }
+                InsertOutcome::Rejected(verr) => {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        error = ?verr,
+                        "skipping incoming event: verify_event rejected"
+                    );
+                    // Buffer rejection for out-of-lock reporting (Phase
+                    // C below). Holding the state lock across the
+                    // degraded-channel send would block local mutators
+                    // when the channel is back-pressured.
+                    rejection_reports.push(verr);
+                }
             }
         }
+    } // state lock released here
+
+    // Phase C: emit rejection reports outside the state lock.
+    // verify_event rejections at receive time are the most useful
+    // signal for the frontend banner (forged sigs, insufficient power,
+    // banned-actor replays etc). One bad event does not block valid
+    // ones in the same publish — defense-in-depth at both layers
+    // (Phase 1 spec §"Defense-in-depth").
+    for verr in rejection_reports {
+        report_degraded(
+            ctx.error_tx.as_ref(),
+            ctx.community_id,
+            "verify_event_rejected",
+            format!("{verr:?}"),
+        )
+        .await;
     }
 
     // The tracker advanced (step 6) regardless of whether any event
@@ -1466,22 +1505,18 @@ impl OwnerDeviceCacheResolver {
     }
 }
 
+#[async_trait::async_trait]
 impl IdentityResolver for OwnerDeviceCacheResolver {
-    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
         use crate::dm_outbox::lookup_pubkey_for_device;
         use crate::owner_state_types::DeviceIdentityHash;
-        // Synchronous trait fn over an async Mutex — use try_lock so a
-        // contended cache surfaces as None rather than blocking the
-        // engine's tokio task. The Mutex is short-held in Phase 2's
-        // current paths (only the SyncEngine's snapshot+publish + the
-        // dm_outbox drain hold it). KNOWN LIMITATION: under Phase 3's
-        // IPC handlers (create_community / redeem_invite / etc.) this
-        // can race more visibly — the engine logs "unknown actor
-        // identity_pub" both when the actor is genuinely unknown AND
-        // when the lock was contended. Phase 3 should distinguish
-        // these via either an async-aware resolver trait or a separate
-        // "contended" return path. Tracked alongside the Phase 3 plan.
-        let cache = self.cache.try_lock().ok()?;
+        // Async trait fn — the resolver waits on the real Mutex rather
+        // than collapsing contention to None. The lookup itself is
+        // O(devices) per owner-entry, so the lock is short-held; the
+        // owner-state critical sections that run concurrently
+        // (SyncEngine snapshot+publish, dm_outbox drain, Phase 3 IPC
+        // handlers) interleave normally.
+        let cache = self.cache.lock().await;
         // OwnerAddr and DeviceIdentityHash are bytes-compatible newtypes
         // (both wrap [u8; 16]). Reinterpret without copying.
         let device_hash = DeviceIdentityHash(addr.0);

@@ -301,8 +301,9 @@ struct SingleIdentityResolver {
     identity_pub: [u8; 64],
 }
 
+#[async_trait::async_trait]
 impl harmony_app::community_state_sync::IdentityResolver for SingleIdentityResolver {
-    fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
         if *addr == self.addr {
             Some(self.identity_pub)
         } else {

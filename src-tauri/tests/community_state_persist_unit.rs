@@ -34,15 +34,47 @@ fn load_crdt_missing_file_returns_empty_state() {
 }
 
 #[test]
-fn load_crdt_truncated_file_returns_err() {
+fn load_crdt_truncated_file_self_heals_to_default() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("truncated.cbor");
     // 2-byte CBOR fragment that's invalid for `CommunityState`'s
     // 2-key map shape — `\x82` opens a 2-element array, which the
     // map-shaped decoder rejects.
     std::fs::write(&path, b"\x82\x00").expect("write garbage");
-    let result = load_crdt(&path, SpaceId([1u8; 16]));
-    assert!(matches!(result, Err(PersistError::CborDecode(_))));
+    let community_id = SpaceId([1u8; 16]);
+    let recovered = load_crdt(&path, community_id).expect("self-heal returns default");
+    assert_eq!(recovered.community_id, community_id);
+    assert!(recovered.events.is_empty());
+
+    // The corrupted file should have been quarantined under a
+    // `.corrupt.<ts>` suffix so the next save_crdt lands cleanly.
+    assert!(
+        !path.exists(),
+        "corrupted file should have been moved aside"
+    );
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(|r| r.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("truncated.cbor.corrupt.")
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one quarantined sibling");
+}
+
+#[test]
+fn load_replay_truncated_file_self_heals_to_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("replay.cbor");
+    std::fs::write(&path, b"\xff\xff").expect("write garbage");
+    let recovered = load_replay(&path).expect("self-heal returns default");
+    assert!(recovered.per_device.is_empty());
+    assert!(
+        !path.exists(),
+        "corrupted replay file should have been moved aside"
+    );
 }
 
 #[test]
