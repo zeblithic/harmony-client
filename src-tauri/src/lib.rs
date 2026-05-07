@@ -5787,15 +5787,19 @@ pub async fn create_community_inner(
     }) {
         // Engine is in the registry but adapter wiring failed. Tear it
         // down so we don't accumulate a zombie engine. ZEB-258 win:
-        // owner-state is still untouched at this point. Task 7 of the
-        // Phase 4 plan swaps stop_engine for
-        // shutdown_engine_and_cleanup_persistence (which also removes
-        // the orphan per-community persistence dir).
-        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+        // owner-state is still untouched at this point. ZEB-262 Task 7:
+        // shutdown_engine_and_cleanup_persistence also removes the
+        // orphan per-community persistence dir, closing the disk-leak
+        // gap that the bare stop_engine call tolerated.
+        if let Err(stop_err) = community_registry
+            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+            .await
+        {
             tracing::warn!(
                 error = %stop_err,
                 community_id = %hex::encode(minted.community_id.0),
-                "stop_engine failed during create_community rollback (adapter dispatch)"
+                "shutdown_engine_and_cleanup_persistence failed during create_community \
+                 rollback (adapter dispatch)"
             );
         }
         return Err(match e {
@@ -5829,11 +5833,17 @@ pub async fn create_community_inner(
         // Bootstrap Join didn't insert — engine state is inconsistent
         // with the user-visible "creator just made this community"
         // expectation. Tear down + bail. Owner-state still untouched.
-        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+        // ZEB-262 Task 7: cleanup also removes the per-community
+        // persist dir.
+        if let Err(stop_err) = community_registry
+            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+            .await
+        {
             tracing::warn!(
                 error = %stop_err,
                 community_id = %hex::encode(minted.community_id.0),
-                "stop_engine failed during create_community rollback (bootstrap-Join not inserted)"
+                "shutdown_engine_and_cleanup_persistence failed during create_community \
+                 rollback (bootstrap-Join not inserted)"
             );
         }
         return Err(format!("bootstrap Join not inserted (got {outcome:?})"));
@@ -5868,11 +5878,19 @@ pub async fn create_community_inner(
     match verdict {
         FenceVerdict::Ok => {}
         FenceVerdict::GenerationChanged(now_gen) => {
-            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            // ZEB-262 Task 7: shutdown_engine_and_cleanup_persistence
+            // tears the engine down AND removes the per-community
+            // persist dir, so a fence-aborted community doesn't leave
+            // an orphan crdt.cbor / replay.cbor on disk.
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
                 tracing::warn!(
                     error = %stop_err,
                     community_id = %hex::encode(minted.community_id.0),
-                    "stop_engine failed during create_community fence-abort"
+                    "shutdown_engine_and_cleanup_persistence failed during \
+                     create_community fence-abort"
                 );
             }
             return Err(format!(
@@ -5883,11 +5901,15 @@ pub async fn create_community_inner(
             ));
         }
         FenceVerdict::RegistryGone => {
-            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
                 tracing::warn!(
                     error = %stop_err,
                     community_id = %hex::encode(minted.community_id.0),
-                    "stop_engine failed during create_community fence-abort"
+                    "shutdown_engine_and_cleanup_persistence failed during \
+                     create_community fence-abort"
                 );
             }
             return Err(
@@ -5921,15 +5943,18 @@ pub async fn create_community_inner(
             // owner-state has no Space row — tear the engine down so
             // we don't leak a zombie. Drop the state_g guard FIRST so
             // we don't hold a `tokio::sync::Mutex` guard across the
-            // `.await` of `stop_engine`. Task 7 of the Phase 4 plan
-            // swaps stop_engine for
-            // shutdown_engine_and_cleanup_persistence.
+            // `.await` of the registry call. ZEB-262 Task 7: cleanup
+            // also removes the per-community persist dir.
             drop(state_g);
-            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
                 tracing::warn!(
                     error = %stop_err,
                     community_id = %hex::encode(minted.community_id.0),
-                    "stop_engine failed during create_community rollback (apply_space rejected)"
+                    "shutdown_engine_and_cleanup_persistence failed during \
+                     create_community rollback (apply_space rejected)"
                 );
             }
             return Err(format!("apply_space rejected new community: {outcome:?}"));

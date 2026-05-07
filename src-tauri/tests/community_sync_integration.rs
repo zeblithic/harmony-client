@@ -2172,6 +2172,7 @@ mod task3_kick_setpower_round_trip {
             identity_resolver: Some(Arc::clone(&resolver)),
             error_tx: None,
             delta_tx: Some(delta_a_tx),
+            pending_redemptions: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2194,6 +2195,7 @@ mod task3_kick_setpower_round_trip {
             identity_resolver: Some(Arc::clone(&resolver)),
             error_tx: None,
             delta_tx: Some(delta_b_tx),
+            pending_redemptions: None,
         });
 
         // Step 1: A inserts its bootstrap Join.

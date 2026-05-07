@@ -149,3 +149,320 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         "shutdown_all must empty the map"
     );
 }
+
+// ── ZEB-262 Phase 4 Task 7: shutdown_engine_and_cleanup_persistence ──
+// + pending_redemptions map ─────────────────────────────────────────
+
+#[tokio::test]
+async fn shutdown_engine_and_cleanup_persistence_idempotent_on_unknown_id() {
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(NopResolver),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: OwnerAddr([0x01; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+    });
+
+    let unknown_id = SpaceId([0xff; 16]);
+    registry
+        .shutdown_engine_and_cleanup_persistence(&unknown_id)
+        .await
+        .expect("idempotent on unknown id must return Ok");
+}
+
+#[tokio::test]
+async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops() {
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(8);
+    // RuntimeContentStore expects someone to service CasOps. Without
+    // this, `flush_now`'s `content_store.put` hangs forever waiting
+    // for the PutLocal reply. Spawn a no-op servicer that just acks
+    // every PutLocal — the persist+publish cycle is what we're
+    // exercising, not the CAS layer itself.
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    });
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(NopResolver),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: OwnerAddr([0x01; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+    });
+
+    let cid = SpaceId([1u8; 16]);
+    let mk = MembershipKey::new([0xaa; 32]);
+    let admin = OwnerAddr([0xbb; 16]);
+
+    let (pub_tx, mut pub_rx) = mpsc::channel(8);
+    let (_sub_tx, sub_rx) = mpsc::channel(8);
+    registry
+        .spawn_engine(cid, mk, admin, false, pub_tx, sub_rx)
+        .await
+        .expect("spawn");
+
+    // The per-community dir is created lazily on the first persist
+    // write. Drive a flush_now so the engine emits one publish + one
+    // persist cycle, materialising the directory before we tear it
+    // down. Drain the publish channel so flush_now isn't backpressured
+    // on a full mpsc.
+    tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
+    registry.flush_now(&cid).await.expect("flush_now");
+
+    let community_dir = dir.path().join("communities").join(hex::encode(cid.0));
+    assert!(
+        community_dir.exists(),
+        "community dir should exist after flush_now: {:?}",
+        community_dir
+    );
+
+    registry
+        .shutdown_engine_and_cleanup_persistence(&cid)
+        .await
+        .expect("teardown");
+
+    // Engine no longer in registry.
+    assert!(
+        !registry.has_engine(&cid).await,
+        "engine map still holds {} after shutdown",
+        hex::encode(cid.0)
+    );
+
+    // Persistence directory removed.
+    assert!(
+        !community_dir.exists(),
+        "per-community persist dir not removed: {:?}",
+        community_dir
+    );
+}
+
+#[tokio::test]
+async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::Hlc;
+
+    struct AdminResolver {
+        addr: OwnerAddr,
+        pubkey: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl IdentityResolver for AdminResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.addr {
+                Some(self.pubkey)
+            } else {
+                None
+            }
+        }
+    }
+
+    let identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+    let admin_addr = OwnerAddr(identity.identity.address_hash);
+    let admin_pub = identity.identity.to_public_bytes();
+    let admin_sk = {
+        let priv_bytes = identity.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
+    };
+
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "admin-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(AdminResolver {
+            addr: admin_addr,
+            pubkey: admin_pub,
+        }),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: admin_addr,
+        signing_key: Arc::clone(&admin_sk),
+    }));
+
+    let cid = SpaceId([0x10; 16]);
+    let mk = MembershipKey::new([0xaa; 32]);
+    let (pub_tx, _pub_rx) = mpsc::channel(8);
+    let (_sub_tx, sub_rx) = mpsc::channel(8);
+    registry
+        .spawn_engine(
+            cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx,
+        )
+        .await
+        .expect("spawn");
+
+    // Mint a self-Join event and register a oneshot keyed on its EventId.
+    let event_id = [0x77u8; 16];
+    let join = sign_event(
+        &EventPayload {
+            id: event_id,
+            community_id: cid,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+        },
+        admin_sk.as_ref(),
+    )
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    registry.register_pending_redemption(event_id, tx).await;
+
+    let engine = registry.engine_arc(&cid).await.expect("engine present");
+    engine
+        .insert_local_event(join.clone())
+        .await
+        .expect("insert");
+
+    // Oneshot fires on Inserted.
+    tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("oneshot did not fire within 2s")
+        .expect("oneshot sender dropped without firing");
+}
+
+#[tokio::test]
+async fn pending_redemption_unregistered_when_no_match() {
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::Hlc;
+
+    struct AdminResolver {
+        addr: OwnerAddr,
+        pubkey: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl IdentityResolver for AdminResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.addr {
+                Some(self.pubkey)
+            } else {
+                None
+            }
+        }
+    }
+
+    let identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+    let admin_addr = OwnerAddr(identity.identity.address_hash);
+    let admin_pub = identity.identity.to_public_bytes();
+    let admin_sk = {
+        let priv_bytes = identity.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
+    };
+
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "admin-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(AdminResolver {
+            addr: admin_addr,
+            pubkey: admin_pub,
+        }),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: admin_addr,
+        signing_key: Arc::clone(&admin_sk),
+    }));
+
+    let cid = SpaceId([0x10; 16]);
+    let mk = MembershipKey::new([0xaa; 32]);
+    let (pub_tx, _pub_rx) = mpsc::channel(8);
+    let (_sub_tx, sub_rx) = mpsc::channel(8);
+    registry
+        .spawn_engine(
+            cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx,
+        )
+        .await
+        .expect("spawn");
+
+    // Register a oneshot keyed on EventId X but insert an event with
+    // EventId Y. The notify hook on Inserted is keyed off the event's
+    // OWN id, so the X-keyed oneshot must NOT fire.
+    let registered_id = [0xeeu8; 16];
+    let inserted_id = [0x11u8; 16];
+    assert_ne!(registered_id, inserted_id);
+
+    let join = sign_event(
+        &EventPayload {
+            id: inserted_id,
+            community_id: cid,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+        },
+        admin_sk.as_ref(),
+    )
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    registry
+        .register_pending_redemption(registered_id, tx)
+        .await;
+
+    let engine = registry.engine_arc(&cid).await.expect("engine present");
+    engine
+        .insert_local_event(join.clone())
+        .await
+        .expect("insert");
+
+    // Short timeout — we want to verify the oneshot did NOT fire.
+    // 200ms is comfortably longer than the engine's local-insert path
+    // takes (entirely in-process; no I/O between insert and the hook
+    // firing or not firing).
+    tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+        .await
+        .expect_err(
+            "oneshot must NOT fire when the inserted event id doesn't match the registered key",
+        );
+}
