@@ -154,6 +154,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                         >(1);
                         rx
                     },
+                    None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                 )
                 .await;
             });
@@ -411,6 +412,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                         >(1);
                         rx
                     },
+                    None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                 )
                 .await;
             });
@@ -746,6 +748,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                         >(1);
                         rx
                     },
+                    None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                 )
                 .await;
             });

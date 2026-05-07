@@ -687,3 +687,216 @@ pub fn verify_envelope_sig(
         .verify_strict(signed_bytes, &sig)
         .map_err(|_| CommunityInviteVerifyError::EnvelopeSigInvalid)
 }
+
+// =====================================================================
+// ZEB-262 Phase 4 Task 9 — receive-side dispatch
+// =====================================================================
+
+/// Tiny trait so `handle_unicast` can take either a real
+/// `tauri::AppHandle` or a test stub (`None::<&()>`). Production impl on
+/// `tauri::AppHandle` lives in `lib.rs` (small adapter that calls
+/// `app.emit("community-state-sync-degraded", …)`). Tests typically
+/// pass `None`.
+pub trait AppHandleEmit {
+    /// Emit a `community-state-sync-degraded` Tauri event with the
+    /// community id (lowercase hex) and reason tag.
+    fn emit_degraded(&self, community_id_hex: &str, reason_tag: &'static str);
+}
+
+/// Unit-type impl: tests can pass `None::<&()>` and the trait method is
+/// never called in the None path. Provided here so the bound resolves
+/// without forcing tests to define their own stub.
+impl AppHandleEmit for () {
+    fn emit_degraded(&self, _: &str, _: &'static str) {}
+}
+
+fn emit_degraded<H: AppHandleEmit>(
+    app: Option<&H>,
+    community_id: &crate::owner_state_types::SpaceId,
+    reason_tag: &'static str,
+) {
+    if let Some(app) = app {
+        app.emit_degraded(&hex::encode(community_id.0), reason_tag);
+    } else {
+        tracing::warn!(
+            community_id = %hex::encode(community_id.0),
+            reason = reason_tag,
+            "community_invite verify failed (no app handle); not emitting Tauri event"
+        );
+    }
+}
+
+/// ZEB-262 Phase 4 Task 9: receive-side handler for Reticulum unicast
+/// packets with discriminant 0x10. Runs the verify chain per spec
+/// §"Receive path", attaches the counter-sig via
+/// [`crate::community_membership::attach_countersig_with_identity`],
+/// inserts the counter-signed Join via `engine.insert_local_event`. The
+/// engine's post-Inserted hook (Task 7) fires the joiner-side
+/// `pending_redemptions[event_id]` oneshot.
+///
+/// On any verify failure, emits `community-state-sync-degraded` (when
+/// `app` is `Some`) and returns `Err`. No retry — Reticulum retransmit
+/// will redrive from the sender if needed.
+///
+/// `crdt_state` is plumbed through but unused in v1: the receive-side
+/// only mutates the per-community CRDT (inside the engine), not the
+/// owner-state Space. The arg is kept for future expansion (e.g.,
+/// resolving the inviter's devices for ack-back routing in ZEB-251).
+#[allow(clippy::too_many_arguments)] // 5 args — clippy default is 7; kept here for symmetry with future expansion.
+pub async fn handle_unicast<H: AppHandleEmit>(
+    community_registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    dm_outbox: &std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    _crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    packet_bytes: Vec<u8>,
+    app: Option<&H>,
+) -> Result<(), CommunityInviteVerifyError> {
+    // 1. decode_packet — peels the 0x10 discriminant + 64-byte trailer,
+    //    canonical-CBOR-checks the inner body, enforces the
+    //    SHA256(joiner_identity_pub)[..16] == signing_device_hash bind.
+    let packet = match decode_packet(&packet_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            // Decode failure: caller can't identify a community_id, so
+            // there's no community to flag in a degraded event. Drop +
+            // warn. Returning a generic envelope-sig variant lets
+            // handle_unicast keep a uniform error type without forcing
+            // CommunityInviteVerifyError to absorb decode variants.
+            tracing::warn!(error = %e, "community_invite decode_packet failed; dropping");
+            return Err(CommunityInviteVerifyError::EnvelopeSigInvalid);
+        }
+    };
+    let CommunityInvitePacket::Invite {
+        signed,
+        signature,
+        signed_bytes,
+    } = packet;
+
+    // 2. Snapshot self_owner + private_identity from dm_outbox under
+    //    its lock; drop the guard before any further `.await`.
+    let (self_owner, self_private_identity) = {
+        let outbox_g = dm_outbox.lock().await;
+        (
+            outbox_g.self_owner,
+            std::sync::Arc::clone(&outbox_g.private_identity),
+        )
+    };
+
+    // 3a. Path B envelope sig over signed_bytes (joiner's signature
+    //     over the canonical-CBOR body).
+    if let Err(e) = verify_envelope_sig(&signed_bytes, &signature, &signed.joiner_identity_pub) {
+        emit_degraded(app, &signed.community_id, e.reason_tag());
+        return Err(e);
+    }
+    // 3b. Pure verify chain (community_id agreement, invitee_hint,
+    //     expiry/clock-skew, InviteToken signer == self, Join sig,
+    //     InviteToken sig).
+    let join_event = match verify_packet_pure(
+        &signed,
+        self_owner,
+        || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        },
+        self_private_identity.as_ref(),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
+    };
+
+    // 4. Resolve engine + state for community_id.
+    let engine_arc = match community_registry.engine_arc(&signed.community_id).await {
+        Some(e) => e,
+        None => {
+            let e = CommunityInviteVerifyError::CommunityUnknown {
+                community_id: signed.community_id,
+            };
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
+    };
+    let state_arc = match community_registry.state_for(&signed.community_id).await {
+        Some(s) => s,
+        None => {
+            let e = CommunityInviteVerifyError::CommunityUnknown {
+                community_id: signed.community_id,
+            };
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
+    };
+
+    // 5. Self-eligibility: must be Joined; power ≥ invite_threshold
+    //    (= 0 in v1 — structural no-op + stable hook for ZEB-251).
+    let (self_status, self_power) = {
+        let s = state_arc.lock().await;
+        let events: Vec<_> = s.events.values().cloned().collect();
+        drop(s);
+        let mat = crate::community_membership::materialize(&events, engine_arc.admin_addr());
+        let st = mat.members.get(&self_owner).map(|m| m.status);
+        let pw = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+        (st, pw)
+    };
+    if self_status != Some(crate::community_membership::MemberStatus::Joined) {
+        let e = CommunityInviteVerifyError::SelfNotJoined;
+        emit_degraded(app, &signed.community_id, e.reason_tag());
+        return Err(e);
+    }
+    let invite_threshold: u8 = 0;
+    if self_power < invite_threshold {
+        let e = CommunityInviteVerifyError::SelfPowerInsufficient {
+            self_power,
+            threshold: invite_threshold,
+        };
+        emit_degraded(app, &signed.community_id, e.reason_tag());
+        return Err(e);
+    }
+
+    // 6. Attach countersig with our identity.
+    let counter_signed = match crate::community_membership::attach_countersig_with_identity(
+        &join_event,
+        self_private_identity.as_ref(),
+    ) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(error = %err, "attach_countersig_with_identity failed");
+            // Encoder error — vanishingly rare; map to JoinSigInvalid
+            // for the degraded reason (closest fit; counter-sig is part
+            // of the Join event's verification chain).
+            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
+    };
+
+    // 7. Insert via engine. The engine's post-Inserted hook (Task 7's
+    //    `notify_pending_redemption_in_map`) fires
+    //    `pending_redemptions[event_id]` for the joiner side — this
+    //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
+    //    the counter-signed Join propagates back via Phase 2's
+    //    state-root publish.
+    match engine_arc.insert_local_event(counter_signed).await {
+        Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+        Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
+            // Idempotent retransmit (Reticulum can deliver duplicates).
+            // Treat as success — we've already counter-signed this id.
+            Ok(())
+        }
+        Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+            tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
+            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            Err(e)
+        }
+        Err(local_err) => {
+            tracing::warn!(error = %local_err, "engine.insert_local_event errored");
+            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            Err(e)
+        }
+    }
+}

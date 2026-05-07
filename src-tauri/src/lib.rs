@@ -24,6 +24,7 @@ pub mod folders;
 mod follows;
 pub mod identity;
 pub mod identity_commands;
+pub mod inbound_packet;
 pub mod mail;
 pub mod mail_sync;
 pub mod owner_commands;
@@ -39,6 +40,24 @@ pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
 pub mod voice;
+
+/// ZEB-262 Phase 4 Task 9: production impl of
+/// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets
+/// `community_invite::handle_unicast` emit
+/// `community-state-sync-degraded` events without depending on `tauri`
+/// directly (the trait + unit-type stub live in `community_invite.rs`
+/// so tests can compile without a Tauri runtime).
+impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHandle<R> {
+    fn emit_degraded(&self, community_id_hex: &str, reason_tag: &'static str) {
+        let _ = self.emit(
+            "community-state-sync-degraded",
+            serde_json::json!({
+                "communityId": community_id_hex,
+                "reason": reason_tag,
+            }),
+        );
+    }
+}
 
 // ── Chunked ingest (ZEB-154) ──────────────────────────────────────────────
 
@@ -1511,6 +1530,11 @@ async fn start_node(
         // IPC side rather than blocking under contention.
         let (community_adapter_request_tx, community_adapter_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(32);
+        // ZEB-262 Phase 4 Task 9: clone the community_registry handle
+        // for event_loop::run BEFORE the closure capture below moves
+        // `community_registry_arc` (the post-spawn `guard.community_registry`
+        // assignment still needs the original handle).
+        let community_registry_for_loop = community_registry_arc.clone();
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -1605,6 +1629,7 @@ async fn start_node(
                         unicast_send_tx_for_loop,
                         community_adapter_requests_for_loop,
                         community_adapter_request_rx,
+                        community_registry_for_loop,
                     )
                     .await;
                 });
