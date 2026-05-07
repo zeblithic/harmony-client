@@ -294,3 +294,214 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
     canonical_cbor_decode::<CommunityInvitePayload>(&bytes)
         .map_err(|e| InviteUrlError::Cbor(e.to_string()))
 }
+
+// =====================================================================
+// ZEB-262 Phase 4 — packet codec + envelope-sig verify
+//
+// Mirrors `dm_envelope::encode_packet` / `decode_packet` /
+// `build_signed_invite` exactly (see src-tauri/src/dm_envelope.rs:262-492).
+// Wire layout: `[u8 disc=0x10][CBOR(signed)][64 raw signature bytes]`.
+// =====================================================================
+
+/// Errors produced by [`encode_packet`] / [`build_signed_invite_packet`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommunityInviteEncodeError {
+    #[error("CBOR encode failed: {0}")]
+    Cbor(String),
+    /// Re-encoding `signed` to canonical CBOR failed inside encode_packet.
+    /// build_signed_invite_packet already round-tripped this value through
+    /// the same encoder, so this should be unreachable in practice — surface
+    /// as a clear distinct variant so a regression here doesn't mask as a
+    /// generic Cbor encode failure.
+    #[error("re-encode signed body failed: {0}")]
+    ReSerialize(String),
+    /// encode_packet re-encoded `signed` and the result diverged from the
+    /// cached `signed_bytes` field — the only way this fires is post-build
+    /// mutation of the `signed` field. Mirrors
+    /// `dm_envelope::EncodeError::SignedMutated`.
+    #[error("signed body mutated post-build: {0}")]
+    SignedMutated(String),
+}
+
+/// Errors produced by [`decode_packet`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommunityInviteDecodeError {
+    #[error("packet is empty")]
+    Empty,
+    #[error("packet too short for [disc + body + 64-byte signature] layout")]
+    TooShortForSignature,
+    #[error("unknown discriminant byte 0x{0:02x}")]
+    UnknownDiscriminant(u8),
+    #[error("CBOR decode failed: {0}")]
+    Cbor(String),
+    #[error("trailing bytes after CBOR body: consumed {consumed} of {total}")]
+    TrailingBytes { consumed: u64, total: u64 },
+    #[error("payload invariant violated: {0}")]
+    Invalid(&'static str),
+}
+
+/// Receive-side rejection variants. Full enum + reject paths land in
+/// Task 6; this stub admits only `EnvelopeSigInvalid` so the encode/
+/// decode tests can exercise [`verify_envelope_sig`]. Task 6 EXTENDS
+/// this enum (additive — don't redefine, just append variants).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CommunityInviteVerifyError {
+    #[error("envelope sig invalid")]
+    EnvelopeSigInvalid,
+}
+
+/// Encode a [`CommunityInvitePacket`] to wire bytes.
+///
+/// **Mutation guard.** Re-encodes `signed` and asserts byte-equality
+/// with the cached `signed_bytes` (which was the source for `signature`
+/// at build time); mismatch returns `SignedMutated`. The only way this
+/// fires is post-build mutation of `signed`; no in-crate code path does
+/// this, but the guard catches future regressions cheaply with a memcmp.
+///
+/// On success the function emits the cached `signed_bytes` verbatim
+/// (NOT the freshly re-encoded bytes), preserving byte-exactness on
+/// decode→encode round trips. Mirrors [`crate::dm_envelope::encode_packet`].
+pub fn encode_packet(
+    packet: &CommunityInvitePacket,
+) -> Result<Vec<u8>, CommunityInviteEncodeError> {
+    match packet {
+        CommunityInvitePacket::Invite {
+            signed,
+            signature,
+            signed_bytes,
+        } => {
+            let re_encoded = canonical_cbor_encode(signed)
+                .map_err(|e| CommunityInviteEncodeError::ReSerialize(format!("re-encode: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(CommunityInviteEncodeError::SignedMutated(
+                    "CommunityInvitePacket::Invite: signed mutated post-build (re-encode \
+                     mismatches cached signed_bytes; signature would not cover wire body)"
+                        .into(),
+                ));
+            }
+            let mut out = Vec::with_capacity(1 + signed_bytes.len() + 64);
+            out.push(0x10);
+            out.extend_from_slice(signed_bytes);
+            out.extend_from_slice(signature);
+            Ok(out)
+        }
+    }
+}
+
+/// Decode wire bytes into a [`CommunityInvitePacket`]. Captures
+/// `signed_bytes` exactly as transmitted so envelope-sig verify
+/// operates on bit-exact bytes regardless of encoder drift.
+///
+/// Rejects: unknown discriminants, trailing bytes after the CBOR body,
+/// non-canonical encodings (decode → canonical-re-encode mismatch),
+/// and `signing_device_hash` not equal to `SHA256(joiner_identity_pub)[..16]`
+/// (defense-in-depth before the receive handler runs the Ed25519 verify).
+pub fn decode_packet(bytes: &[u8]) -> Result<CommunityInvitePacket, CommunityInviteDecodeError> {
+    let (disc, rest) = bytes
+        .split_first()
+        .ok_or(CommunityInviteDecodeError::Empty)?;
+    if rest.len() < 64 + 1 {
+        return Err(CommunityInviteDecodeError::TooShortForSignature);
+    }
+    let split_at = rest.len() - 64;
+    let (body_bytes, signature_bytes) = rest.split_at(split_at);
+    let signature: [u8; 64] = signature_bytes
+        .try_into()
+        .expect("just split at len-64; signature_bytes is exactly 64 bytes");
+    let signed_bytes = body_bytes.to_vec();
+    match disc {
+        0x10 => {
+            let mut cursor = std::io::Cursor::new(body_bytes);
+            let signed: CommunityInviteSigned = ciborium::from_reader(&mut cursor)
+                .map_err(|e| CommunityInviteDecodeError::Cbor(e.to_string()))?;
+            let consumed = cursor.position();
+            if consumed as usize != body_bytes.len() {
+                return Err(CommunityInviteDecodeError::TrailingBytes {
+                    consumed,
+                    total: body_bytes.len() as u64,
+                });
+            }
+            // Canonical-encoding round-trip check: re-encode and reject
+            // if the re-encoded bytes differ from body_bytes. Catches
+            // reordered map keys, indefinite-length encodings, oversized
+            // length prefixes — anything where decode → canonical-re-
+            // encode is not byte-identical. Mirrors
+            // dm_envelope::ensure_canonical_body.
+            let canonical = canonical_cbor_encode(&signed)
+                .map_err(|e| CommunityInviteDecodeError::Cbor(e.to_string()))?;
+            if canonical != body_bytes {
+                return Err(CommunityInviteDecodeError::Invalid(
+                    "CommunityInvitePacket body must use canonical CBOR",
+                ));
+            }
+            // Structural check: signing_device_hash must match
+            // SHA256(joiner_identity_pub)[..16]. Not a sig check (no
+            // crypto here); cheap defense-in-depth before the sig
+            // verifier runs in handle_unicast.
+            let derived = device_hash_from_identity_pub(&signed.joiner_identity_pub);
+            if derived != signed.signing_device_hash.0 {
+                return Err(CommunityInviteDecodeError::Invalid(
+                    "CommunityInviteSigned.signing_device_hash must equal \
+                     SHA256(joiner_identity_pub)[..16]",
+                ));
+            }
+            Ok(CommunityInvitePacket::Invite {
+                signed,
+                signature,
+                signed_bytes,
+            })
+        }
+        other => Err(CommunityInviteDecodeError::UnknownDiscriminant(*other)),
+    }
+}
+
+/// Compute `SHA256(identity_pub)[..16]`. Mirrors how `DmInvite` Path B
+/// derives `signing_device_hash`; the receiver checks this binding before
+/// running the (more expensive) Ed25519 verify.
+pub fn device_hash_from_identity_pub(identity_pub: &[u8; 64]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identity_pub);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Build a complete [`CommunityInvitePacket`] ready for [`encode_packet`].
+/// Encodes `signed` to canonical CBOR, signs the resulting bytes via
+/// `signing_key`, bundles into the `Invite` variant. Mirrors
+/// [`crate::dm_envelope::build_signed_invite`].
+pub fn build_signed_invite_packet(
+    signed: CommunityInviteSigned,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<CommunityInvitePacket, CommunityInviteEncodeError> {
+    use ed25519_dalek::Signer;
+    let signed_bytes = canonical_cbor_encode(&signed)
+        .map_err(|e| CommunityInviteEncodeError::Cbor(e.to_string()))?;
+    let signature = signing_key.sign(&signed_bytes).to_bytes();
+    Ok(CommunityInvitePacket::Invite {
+        signed,
+        signature,
+        signed_bytes,
+    })
+}
+
+/// Verify the Path B envelope signature over the captured `signed_bytes`.
+/// Pure crypto check — no membership or expiry semantics. Returns
+/// [`CommunityInviteVerifyError::EnvelopeSigInvalid`] on any failure
+/// (including malformed `identity_pub`). Used by `handle_unicast`
+/// (Task 9) and exercised by the
+/// `community_invite_packet_envelope_sig_rejected_on_tampered_body` test.
+pub fn verify_envelope_sig(
+    signed_bytes: &[u8],
+    signature: &[u8; 64],
+    identity_pub: &[u8; 64],
+) -> Result<(), CommunityInviteVerifyError> {
+    use ed25519_dalek::Signature;
+    let identity = harmony_identity::Identity::from_public_bytes(identity_pub)
+        .map_err(|_| CommunityInviteVerifyError::EnvelopeSigInvalid)?;
+    let sig = Signature::from_bytes(signature);
+    identity
+        .verifying_key
+        .verify_strict(signed_bytes, &sig)
+        .map_err(|_| CommunityInviteVerifyError::EnvelopeSigInvalid)
+}

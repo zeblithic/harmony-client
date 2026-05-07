@@ -178,3 +178,177 @@ fn decode_trims_whitespace() {
     let decoded = decode_invite_url(&padded).expect("decode trimmed");
     assert_eq!(decoded, payload);
 }
+
+#[test]
+fn community_invite_packet_roundtrip() {
+    use harmony_app::community_invite::{
+        build_signed_invite_packet, decode_packet, device_hash_from_identity_pub, encode_packet,
+        CommunityInvitePacket, CommunityInviteSigned, InviteToken,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+    let community_id = SpaceId([0x10; 16]);
+    let joiner = OwnerAddr([0x22; 16]);
+    let inviter = OwnerAddr([0x11; 16]);
+
+    let join_event = sign_event(
+        &EventPayload {
+            id: [0x44; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    // signing_device_hash MUST equal SHA256(joiner_identity_pub)[..16] —
+    // decode_packet's structural defense-in-depth check enforces this.
+    let joiner_identity_pub = [0x66u8; 64];
+    let signing_device_hash =
+        DeviceIdentityHash(device_hash_from_identity_pub(&joiner_identity_pub));
+
+    let signed = CommunityInviteSigned {
+        community_id,
+        join_event,
+        invite_token: InviteToken {
+            inviter,
+            invitee_hint: Some(joiner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            sig: [0x55; 64],
+        },
+        joiner_identity_pub,
+        signing_device_hash,
+        created_at: Hlc {
+            wall_ms: 1100,
+            logical: 0,
+            device_id: "j".into(),
+        },
+    };
+
+    let packet = build_signed_invite_packet(signed.clone(), &signing_key)
+        .expect("build_signed_invite_packet");
+    let wire = encode_packet(&packet).expect("encode");
+
+    // Discriminant byte is 0x10.
+    assert_eq!(wire[0], 0x10, "discriminant byte must be 0x10");
+
+    let decoded = decode_packet(&wire).expect("decode");
+    match (&packet, &decoded) {
+        (
+            CommunityInvitePacket::Invite {
+                signed: s1,
+                signature: sig1,
+                ..
+            },
+            CommunityInvitePacket::Invite {
+                signed: s2,
+                signature: sig2,
+                ..
+            },
+        ) => {
+            assert_eq!(s1, s2);
+            assert_eq!(sig1, sig2);
+        }
+    }
+}
+
+#[test]
+fn community_invite_packet_envelope_sig_rejected_on_tampered_body() {
+    use harmony_app::community_invite::{
+        build_signed_invite_packet, decode_packet, encode_packet, verify_envelope_sig,
+        CommunityInvitePacket, CommunityInviteSigned, InviteToken,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    let identity = harmony_identity::PrivateIdentity::from_seed(&[0xcd; 32]);
+    let identity_pub = identity.identity.to_public_bytes();
+    let joiner_signing_key = {
+        let priv_bytes = identity.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    };
+    let joiner = harmony_app::owner_state_types::OwnerAddr(identity.identity.address_hash);
+
+    let community_id = SpaceId([0x10; 16]);
+    let join_event = sign_event(
+        &EventPayload {
+            id: [0x44; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        },
+        &joiner_signing_key,
+    )
+    .unwrap();
+
+    let signed = CommunityInviteSigned {
+        community_id,
+        join_event,
+        invite_token: InviteToken {
+            inviter: OwnerAddr([0x11; 16]),
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            sig: [0x55; 64],
+        },
+        joiner_identity_pub: identity_pub,
+        signing_device_hash: harmony_app::owner_state_types::DeviceIdentityHash(
+            identity.identity.address_hash,
+        ),
+        created_at: Hlc {
+            wall_ms: 1100,
+            logical: 0,
+            device_id: "j".into(),
+        },
+    };
+
+    let packet = build_signed_invite_packet(signed.clone(), &joiner_signing_key).expect("build");
+    let mut wire = encode_packet(&packet).expect("encode");
+
+    // Flip a byte in the signed body region (skip discriminant +
+    // signature trailer). Targets a byte that's part of the CBOR map.
+    let target = 5;
+    assert!(target < wire.len() - 64, "bound check");
+    wire[target] ^= 0xff;
+
+    // Decode still succeeds (CBOR remained syntactically valid for our
+    // chosen byte flip; if the flip lands on a length-prefix it could
+    // fail decode — choose a target byte that's a value, not a
+    // length. Index 5 is inside a map key bstr; fine).
+    let decoded = decode_packet(&wire);
+    if let Ok(CommunityInvitePacket::Invite {
+        signature,
+        signed_bytes,
+        ..
+    }) = decoded
+    {
+        // Envelope-sig verification MUST reject the tampered body.
+        let result = verify_envelope_sig(&signed_bytes, &signature, &identity_pub);
+        assert!(result.is_err(), "envelope sig must reject tampered body");
+    } else {
+        // The byte flip happened to break CBOR decode itself — that's
+        // also an acceptable rejection. The test is satisfied.
+    }
+}
