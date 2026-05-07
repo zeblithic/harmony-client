@@ -750,3 +750,98 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
     });
     engine.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn publish_carries_valid_publisher_sig() {
+    use ed25519_dalek::Verifier;
+    use harmony_app::community_state_sync::{
+        decrypt_root_publish, CommunityRootHlcTracker, CommunityRootPublishPayload,
+        CommunityRootSignedPayload, CommunitySyncEngine, CommunitySyncEngineConfig,
+        DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel(8);
+
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let _ = reply.send(Ok(()));
+            }
+        }
+    });
+
+    let community_id = SpaceId([1u8; 16]);
+    let mk = MembershipKey::new([0x42; 32]);
+    let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]));
+    let verifying_key = signing_key.verifying_key();
+    // self_owner is just an opaque tag here; the test verifies sig
+    // against verifying_key directly without going through resolver.
+    let self_owner = OwnerAddr([0x12; 16]);
+    let admin = self_owner;
+
+    let state = std::sync::Arc::new(tokio::sync::Mutex::new(
+        harmony_app::community_state_crdt::CommunityState::new(community_id),
+    ));
+    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommunityRootHlcTracker::default()));
+    let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk.clone(),
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "pub-dev".into(),
+        self_owner,
+        signing_key,
+        state,
+        tracker,
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+    });
+
+    engine.flush_now().await.expect("flush_now");
+
+    let wire = out_rx
+        .recv()
+        .await
+        .expect("publisher_tx must have received one wire packet");
+    let payload_bytes = decrypt_root_publish(&mk, &wire).expect("decrypt");
+    let payload: CommunityRootPublishPayload =
+        canonical_cbor_decode(&payload_bytes).expect("decode envelope");
+
+    // The wire envelope's publisher_addr matches self_owner.
+    assert_eq!(payload.publisher_addr, self_owner);
+
+    // The publisher_sig validates against the verifying_key for the
+    // canonical CBOR of CommunityRootSignedPayload::from(&payload).
+    let signed = CommunityRootSignedPayload::from(&payload);
+    let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
+    let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
+    verifying_key
+        .verify(&signed_bytes, &sig)
+        .expect("publisher_sig must verify against signing_key.verifying_key()");
+
+    engine.shutdown().await.expect("shutdown");
+}

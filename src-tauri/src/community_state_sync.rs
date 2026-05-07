@@ -855,11 +855,7 @@ struct InternalCtx {
     admin_addr: OwnerAddr,
     is_invite_only: bool,
     device_id: String,
-    // Read by publish/receive paths in Tasks 5 + 6; the Task 4 commit
-    // only plumbs them from the config into InternalCtx.
-    #[allow(dead_code)]
     self_owner: OwnerAddr,
-    #[allow(dead_code)]
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityRootHlcTracker>>,
@@ -1107,6 +1103,7 @@ async fn internal_task(mut ctx: InternalCtx) {
 /// sharing a random-nonce CAS-side would defeat ContentId dedup.
 async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
+    use ed25519_dalek::Signer;
 
     // Snapshot CRDT state under brief lock; drop guard before the
     // expensive encode + AEAD + CAS hops below.
@@ -1140,25 +1137,30 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     // 4. Put into ContentStore (routes through CasOp::PutLocal).
     ctx.content_store.put(root_cid, blob_ciphertext).await?;
 
-    // 5. Build state-root payload with a strictly-newer HLC.
+    // 5. Build the SIGNED sub-payload with a strictly-newer HLC.
     let now = next_hlc(ctx).await;
-    // TEMP for Task 1 (ZEB-256): publisher_addr / publisher_sig are
-    // placeholders so the workspace continues to compile. Task 5 replaces
-    // both with real values (ctx.self_owner + Ed25519-sign of the
-    // CommunityRootSignedPayload canonical CBOR).
-    let payload = CommunityRootPublishPayload {
+    let signed = CommunityRootSignedPayload {
         root_cid,
-        publisher_addr: OwnerAddr([0; 16]),
+        publisher_addr: ctx.self_owner,
         at: now,
-        publisher_sig: [0; 64],
     };
+
+    // 6. Sign the canonical CBOR of the signed sub-payload. Ed25519
+    //    sign is microseconds, fine on the runtime thread (no
+    //    spawn_blocking).
+    let signed_bytes = canonical_cbor_encode(&signed)
+        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+    let publisher_sig = ctx.signing_key.sign(&signed_bytes).to_bytes();
+
+    // 7. Wrap into the full wire envelope.
+    let payload = signed.into_wire(publisher_sig);
     let payload_bytes = canonical_cbor_encode(&payload)
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
 
-    // 6. Encrypt with random-nonce root AEAD (every publish is fresh).
+    // 8. Encrypt with random-nonce root AEAD (every publish is fresh).
     let wire = encrypt_root_publish(&ctx.membership_key, &payload_bytes)?;
 
-    // 7. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
+    // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
     ctx.publisher_tx
         .send(wire)
         .await
@@ -1193,14 +1195,8 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    // TEMP for Task 2: tracker is keyed by (OwnerAddr, device_id) but
-    // InternalCtx doesn't yet carry self_owner — Task 5 plumbs it
-    // through and replaces this placeholder with the real value.
-    let placeholder_addr = OwnerAddr([0u8; 16]);
-    let prev = tracker
-        .per_device
-        .get(&(placeholder_addr, ctx.device_id.clone()))
-        .cloned();
+    let key = (ctx.self_owner, ctx.device_id.clone());
+    let prev = tracker.per_device.get(&key).cloned();
     // Three branches:
     //   (a) No prev → first publish for this device.
     //   (b) Wall advanced past prev_wall → reset logical to 0.
@@ -1236,7 +1232,7 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
             device_id: ctx.device_id.clone(),
         },
     };
-    tracker.record(placeholder_addr, now.clone());
+    tracker.record(ctx.self_owner, now.clone());
     now
 }
 
