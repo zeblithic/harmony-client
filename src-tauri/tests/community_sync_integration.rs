@@ -163,6 +163,7 @@ async fn two_members_dag_sync_full_event_log() {
         identity_dir: dir_a.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -171,6 +172,7 @@ async fn two_members_dag_sync_full_event_log() {
         identity_dir: dir_b.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way
@@ -303,6 +305,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
         identity_dir: dir_b.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: Some(error_tx),
+        delta_tx: None,
     });
 
     // We need direct access to B's subscriber channel sender to
@@ -433,6 +436,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         identity_dir: dir_a.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -441,6 +445,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         identity_dir: dir_b.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -583,6 +588,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         identity_dir: dir_a.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -591,6 +597,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         identity_dir: dir_b.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);

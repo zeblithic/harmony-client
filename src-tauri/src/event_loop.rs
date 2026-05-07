@@ -224,6 +224,16 @@ pub async fn run<R: Runtime>(
     // `redeem_invite` which spawn additional engines at runtime
     // through the registry directly (those bypass this Vec).
     community_adapters: Vec<CommunityAdapterRequest>,
+    // ZEB-217 Sub-C Phase 3 Task 9: on-demand `CommunityAdapterRequest`
+    // receiver. The IPC `create_community` (and Phase 4
+    // `redeem_invite`) construct a Request from a fresh
+    // `spawn_engine` call's matching channel halves and dispatch it
+    // here; the select arm below binds those halves to a new Zenoh
+    // adapter against the live session. Drained one at a time —
+    // Request order between IPC calls is preserved by mpsc, but
+    // adapter spawn is fire-and-forget so two requests on the same
+    // tick fan out concurrently rather than serializing.
+    mut community_adapter_request_rx: mpsc::Receiver<CommunityAdapterRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -444,17 +454,22 @@ pub async fn run<R: Runtime>(
     // continues to use `session.clone()` directly via Zenoh's
     // internal-Arc shape — both paths terminate at the same session
     // object.
-    if !community_adapters.is_empty() {
-        let session_arc = Arc::new(session.clone());
-        for req in community_adapters {
-            spawn_community_state_zenoh_adapter(
-                Arc::clone(&session_arc),
-                req.id_hex,
-                req.publisher_rx,
-                req.subscriber_tx,
-                Arc::clone(&closing),
-            );
-        }
+    //
+    // `session_arc` is constructed here unconditionally (even when
+    // the boot-time community list is empty) so the select arm below
+    // — Phase 3 Task 9's on-demand adapter request — has a live
+    // `Arc<Session>` to clone for each `create_community` /
+    // `redeem_invite` IPC. Cheap (one Arc bump) and avoids reaching
+    // back into `session` from inside a long-running select! arm.
+    let session_arc = Arc::new(session.clone());
+    for req in community_adapters {
+        spawn_community_state_zenoh_adapter(
+            Arc::clone(&session_arc),
+            req.id_hex,
+            req.publisher_rx,
+            req.subscriber_tx,
+            Arc::clone(&closing),
+        );
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────
@@ -1267,6 +1282,24 @@ pub async fn run<R: Runtime>(
                         }
                     }
                 }
+            }
+
+            // ── ZEB-217 Sub-C Phase 3 Task 9: on-demand adapter ────
+            // Drained when an IPC (`create_community`, Phase 4
+            // `redeem_invite`) dispatches a fresh
+            // `CommunityAdapterRequest`. Spawns the per-community
+            // Zenoh adapter against the live `session_arc`. None on
+            // recv() means stop_node took the matching sender — we
+            // ignore (no break) so the loop continues toward the
+            // shutdown arm below, which is the canonical exit.
+            Some(req) = community_adapter_request_rx.recv() => {
+                spawn_community_state_zenoh_adapter(
+                    Arc::clone(&session_arc),
+                    req.id_hex,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    Arc::clone(&closing),
+                );
             }
 
             // ── Shutdown signal ──────────────────────────────────────

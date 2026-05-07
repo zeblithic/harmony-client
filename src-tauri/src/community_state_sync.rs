@@ -263,6 +263,30 @@ pub enum CommunitySyncError {
     MissingIdentityResolver,
 }
 
+/// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
+/// Distinct enum (not a variant on `CommunitySyncError`) because local-
+/// insert failures are caller-driven (bad event from IPC) rather than
+/// transport / crypto class — the IPC layer needs to surface them as
+/// distinct error strings to the frontend.
+#[derive(thiserror::Error, Debug)]
+pub enum LocalInsertError {
+    #[error("identity_resolver not configured — engine cannot verify local events")]
+    MissingIdentityResolver,
+    #[error("actor identity not in resolver: {0:?}")]
+    UnknownActor(OwnerAddr),
+    /// Defense-in-depth guard at `insert_local_event` entry — caller
+    /// passed an event whose embedded `community_id` does not match the
+    /// engine's configured `community_id`. Without this guard the misroute
+    /// would silently surface as a verify rejection (`expected_community_id`
+    /// mismatch), which is harder to diagnose. Surfacing it as a distinct
+    /// error class lets the IPC layer return a clear "wrong community"
+    /// diagnostic to the frontend.
+    #[error(
+        "event community_id {got:?} doesn't match engine's configured community_id {expected:?}"
+    )]
+    WrongCommunity { expected: SpaceId, got: SpaceId },
+}
+
 /// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
 /// in-memory replay tracker shape, but keyed externally by community_id
 /// (one tracker instance per joined community).
@@ -368,6 +392,23 @@ pub struct CommunityDegradedReport {
     pub detail: String,
 }
 
+/// Membership-CRDT mutation surfaced from the engine to the IPC layer.
+/// Fired on every `InsertOutcome::Inserted` — covers both the engine's
+/// receive pipeline (DAG-synced events from peers) AND IPC-driven local
+/// inserts via `CommunitySyncEngine::insert_local_event`.
+///
+/// Shipped as a flat `event` clone rather than a delta-typed payload
+/// because the consumer (Phase 3's start_node delta task) needs the
+/// event's `kind`, `actor`, `at`, and (for Kick) `reason` to build the
+/// `community-members-changed` Tauri event payload — and shipping the
+/// signed event is cheap (a few hundred bytes) and avoids duplicating
+/// the per-kind switch inside the engine.
+#[derive(Debug, Clone)]
+pub struct CommunityMembershipDelta {
+    pub community_id: SpaceId,
+    pub event: SignedMembershipEvent,
+}
+
 /// Construction-time config bag for `CommunitySyncEngine::new`. Bundles
 /// the per-community key + identity, the shared CRDT + tracker arcs,
 /// the wire channels, the persist paths, and the optional degraded-path
@@ -401,6 +442,11 @@ pub struct CommunitySyncEngineConfig {
     /// means degraded paths log via `tracing::warn!` only — acceptable
     /// for tests that don't assert on IPC-event emission.
     pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    /// Optional sink for membership CRDT mutations. Best-effort
+    /// `try_send`; a closed or full channel surfaces as a dropped delta
+    /// (the IPC consumer is purely informational, so back-pressuring
+    /// the engine on a stuck consumer is wrong).
+    pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -426,11 +472,36 @@ pub struct CommunitySyncEngine {
     /// reaching into `InternalCtx`. Phase 3 ships the public IPC
     /// surface; this accessor stays `#[doc(hidden)]` until then.
     state: Arc<Mutex<CommunityState>>,
+    /// Community identity this engine was configured with. Bound at
+    /// construction so `insert_local_event` can:
+    ///   1. Reject mis-routed events (caller passed an event whose
+    ///      `community_id` doesn't match this engine) with a clear
+    ///      `LocalInsertError::WrongCommunity` rather than letting the
+    ///      mismatch surface as an opaque verify rejection.
+    ///   2. Bind `VerifyContext.expected_community_id` to the engine's
+    ///      configured value rather than the (caller-controlled) event
+    ///      payload — without this, a malicious or buggy IPC could
+    ///      bypass the cross-community routing check by setting
+    ///      `event.community_id == self.community_id` falsely.
+    community_id: SpaceId,
     /// Admin OwnerAddr for the community. Retained so future read-side
     /// `materialize()` callers (Phase 3 IPC) can construct a
     /// `VerifyContext` without having to thread `admin_addr` through
     /// the registry separately.
     admin_addr: OwnerAddr,
+    /// Resolver retained on the engine so `insert_local_event` can
+    /// build a `VerifyContext` for locally-minted events without
+    /// re-plumbing it through the registry. Cloned from the config
+    /// alongside the spawned task's copy.
+    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    /// Invite-only flag retained on the engine for the same reason as
+    /// `identity_resolver` — `insert_local_event` needs it to populate
+    /// `VerifyContext`.
+    is_invite_only: bool,
+    /// Membership-delta sink retained on the engine so
+    /// `insert_local_event` can emit a delta on `Inserted` outcomes,
+    /// matching the receive pipeline's behaviour.
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 impl CommunitySyncEngine {
@@ -450,7 +521,11 @@ impl CommunitySyncEngine {
         // into the InternalCtx — both the spawned task and the engine
         // accessor share the same underlying Mutex<CommunityState>.
         let state_for_engine = Arc::clone(&cfg.state);
+        let community_id_for_engine = cfg.community_id;
         let admin_addr = cfg.admin_addr;
+        let identity_resolver_for_engine = cfg.identity_resolver.clone();
+        let is_invite_only_for_engine = cfg.is_invite_only;
+        let delta_tx_for_engine = cfg.delta_tx.clone();
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -471,6 +546,7 @@ impl CommunitySyncEngine {
             shutdown_rx,
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
+            delta_tx: cfg.delta_tx,
         }));
 
         Self {
@@ -480,7 +556,11 @@ impl CommunitySyncEngine {
             shutdown_tx,
             task: Mutex::new(Some(task)),
             state: state_for_engine,
+            community_id: community_id_for_engine,
             admin_addr,
+            identity_resolver: identity_resolver_for_engine,
+            is_invite_only: is_invite_only_for_engine,
+            delta_tx: delta_tx_for_engine,
         }
     }
 
@@ -502,6 +582,95 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn admin_addr(&self) -> OwnerAddr {
         self.admin_addr
+    }
+
+    /// Insert a locally-minted event into the community CRDT, verify it
+    /// using the engine's `identity_resolver`, fire the membership-delta
+    /// channel on `Inserted`, and notify the publish loop so the change
+    /// reaches peers.
+    ///
+    /// Centralises the local-mint path so every IPC that mutates this
+    /// community's CRDT (`create_community`, `redeem_invite`,
+    /// `leave_community`, and Phase 4's kick / set_power / invite-only
+    /// redeem) shares a single verify-then-insert-then-emit-delta path.
+    /// Without this method, each IPC would grow a copy of the dance and
+    /// the delta-emission rule would inevitably drift on a new variant.
+    ///
+    /// `Ok(InsertOutcome::Inserted)` — event landed; delta fired; publish
+    /// notified. `Ok(InsertOutcome::AlreadyKnown)` — duplicate; no delta,
+    /// no publish-notify (the previous insert already did both).
+    /// `Ok(InsertOutcome::Rejected(VerifyError))` — verify failed at the
+    /// CRDT layer (banned-stickiness, signature mismatch, invite-only
+    /// missing countersig, etc.). `Err(LocalInsertError::*)` — failure
+    /// BEFORE we got far enough to call insert (event mis-routed to a
+    /// different community's engine, no resolver, or resolver couldn't
+    /// find the actor).
+    pub async fn insert_local_event(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        // Defense in depth: reject mis-routed events at the entry point
+        // with a clear error class. The VerifyContext below ALSO binds
+        // expected_community_id to self.community_id (NOT event.community_id),
+        // so even without this guard the receive-side check would catch
+        // the mismatch — but as an opaque verify rejection rather than a
+        // routing diagnostic.
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+
+        let resolver = self
+            .identity_resolver
+            .as_ref()
+            .ok_or(LocalInsertError::MissingIdentityResolver)?;
+
+        let actor_pub = resolver
+            .resolve(&event.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(event.actor))?;
+
+        let countersigner_pub = if let Some(cs) = event.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        // Bind expected_community_id to the engine's configured value,
+        // NOT the (caller-controlled) event payload. Without this, a
+        // malicious or buggy IPC could bypass the cross-community routing
+        // check by passing an event whose community_id matches what it
+        // claims. The entry-point guard above gives a clearer error class
+        // for the common honest mismatch case.
+        let ctx = crate::community_membership::VerifyContext {
+            expected_community_id: self.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: countersigner_pub.as_ref(),
+        };
+
+        let outcome = {
+            let mut state_g = self.state.lock().await;
+            state_g.insert_event(event.clone(), &ctx)
+        };
+
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Inserted
+        ) {
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: event.community_id,
+                    event,
+                });
+            }
+            self.notify_dirty();
+        }
+
+        Ok(outcome)
     }
 
     /// Hint that local CRDT state has mutated and a debounced publish
@@ -571,6 +740,7 @@ struct InternalCtx {
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     identity_resolver: Option<Arc<dyn IdentityResolver>>,
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -1161,6 +1331,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // resolved event, collect rejections for out-of-lock reporting.
     let mut inserted_any = false;
     let mut rejection_reports: Vec<crate::community_membership::VerifyError> = Vec::new();
+    // Buffer inserted-event clones for delta emission AFTER the state
+    // lock is released. Same lock-discipline rationale as
+    // `rejection_reports`: holding the state mutex across an
+    // `mpsc::Sender::try_send` is technically non-blocking but keeping
+    // the emit lock-free preserves the "no channel ops while holding
+    // state" invariant the rest of this module follows.
+    let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
         for (event, actor_pub, cs_pub_owned) in resolved {
@@ -1180,9 +1357,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 actor_identity_pub: &actor_pub,
                 countersigner_identity_pub: cs_pub_ref,
             };
+            // Clone before `insert_event` consumes the event so we can
+            // surface the delta if the outcome is `Inserted`. The clone
+            // is cheap (a few hundred bytes of signed event) and only
+            // paid on the merge path; duplicates short-circuit above.
+            let event_clone = event.clone();
             match state.insert_event(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
+                    inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
                     // Skip — already in our log. Don't flip inserted_any
@@ -1205,6 +1388,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
     } // state lock released here
+
+    // Phase C-pre: emit membership-delta for every inserted event
+    // outside the state lock. `try_send` is fire-and-forget — a closed
+    // or full channel drops the delta rather than back-pressuring the
+    // engine (the IPC consumer is purely informational).
+    if let Some(tx) = ctx.delta_tx.as_ref() {
+        for event in inserted_events {
+            let _ = tx.try_send(CommunityMembershipDelta {
+                community_id: ctx.community_id,
+                event,
+            });
+        }
+    }
 
     // Phase C: emit rejection reports outside the state lock.
     // verify_event rejections at receive time are the most useful
@@ -1380,6 +1576,13 @@ pub struct CommunityRegistryConfig {
     /// `CommunityDegradedReport`s into `community-state-sync-degraded`
     /// Tauri events. `None` for tests that don't assert on IPC events.
     pub error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    /// Optional membership-delta channel. When `Some`, the registry
+    /// clones the sender into every engine's `CommunitySyncEngineConfig`,
+    /// and the receiver-side (owned by start_node — Phase 3 Task 8)
+    /// translates `CommunityMembershipDelta`s into
+    /// `community-members-changed` Tauri events. `None` for tests that
+    /// don't assert on IPC events.
+    pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -1510,6 +1713,7 @@ impl CommunitySyncRegistry {
             debounce_ms: self.cfg.debounce_ms,
             identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
             error_tx: self.cfg.error_tx.clone(),
+            delta_tx: self.cfg.delta_tx.clone(),
         }));
 
         engines.insert(community_id, engine);
@@ -1588,6 +1792,18 @@ impl CommunitySyncRegistry {
             .map(|e| e.state())
     }
 
+    /// Returns a clone of the `Arc<CommunitySyncEngine>` for
+    /// `community_id`, if an engine is spawned. Used by Phase 3 IPC
+    /// handlers (`create_community`, Phase 4 `redeem_invite`) that need
+    /// to call `engine.insert_local_event(...)` after spawning the
+    /// engine + dispatching the adapter request. Mirrors `state_for`'s
+    /// shape but returns the engine handle rather than just the inner
+    /// state — the engine surface is what fires `notify_dirty` and
+    /// drives the debounced state-root publish.
+    pub async fn engine_arc(&self, community_id: &SpaceId) -> Option<Arc<CommunitySyncEngine>> {
+        self.engines.lock().await.get(community_id).cloned()
+    }
+
     /// Force the engine for `community_id` to publish its current CRDT
     /// state immediately, bypassing the debounce window. Returns
     /// `Err(CommunitySyncError::TransportClosed)` if no engine is
@@ -1638,17 +1854,48 @@ impl CommunitySyncRegistry {
 /// DeviceIdentityHash newtype boundary.
 pub struct OwnerDeviceCacheResolver {
     cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// Self's owner address — when an incoming `resolve` call asks for
+    /// our own owner, return `self_identity_pub` directly without
+    /// hitting the cache. The cache lookup treats `OwnerAddr.0` as a
+    /// `DeviceIdentityHash`, which works for peers (the peer's device
+    /// is keyed by its address-as-hash in the cache layout) but fails
+    /// for self because our `address_hash != our local signing device
+    /// hash` in general — so own-authored events would otherwise
+    /// resolve to `None` and fail `LocalInsertError::UnknownActor`.
+    /// CodeRabbit MAJOR finding on PR #87 round 2 (and the
+    /// "Known production-path concern" callout from the PR body).
+    self_owner: OwnerAddr,
+    /// Self's 64-byte identity public bytes — what `insert_local_event`
+    /// needs to verify own-authored events. Same value the local
+    /// `PrivateIdentity` would surface via `to_public_bytes()`; in
+    /// production this is `NodeState.dm_identity_pub_64`.
+    self_identity_pub: [u8; 64],
 }
 
 impl OwnerDeviceCacheResolver {
-    pub fn new(cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>) -> Self {
-        Self { cache }
+    pub fn new(
+        cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+        self_owner: OwnerAddr,
+        self_identity_pub: [u8; 64],
+    ) -> Self {
+        Self {
+            cache,
+            self_owner,
+            self_identity_pub,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl IdentityResolver for OwnerDeviceCacheResolver {
     async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        // Self short-circuit: own-authored events use the local
+        // identity_pub directly. We know who we are without consulting
+        // the cache — and the cache lookup wouldn't find us anyway
+        // (see struct doc).
+        if *addr == self.self_owner {
+            return Some(self.self_identity_pub);
+        }
         use crate::dm_outbox::lookup_pubkey_for_device;
         use crate::owner_state_types::DeviceIdentityHash;
         // Async trait fn — the resolver waits on the real Mutex rather

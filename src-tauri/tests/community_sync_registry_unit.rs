@@ -36,6 +36,7 @@ async fn registry_spawns_and_tears_down_per_community() {
         identity_dir: dir.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
 
     let cid_a = SpaceId([1u8; 16]);
@@ -75,6 +76,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         identity_dir: dir.path().to_path_buf(),
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
+        delta_tx: None,
     });
 
     // Spawn two distinct communities. Use unsorted ID order to verify

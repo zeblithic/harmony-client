@@ -255,6 +255,16 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     None,       // cas_handle — DM transport not exercised in this test
                     None,       // unicast_send_tx — DM transport not exercised in this test
                     Vec::new(), // community_adapters — Phase 2 community sync not exercised in this test
+                    {
+                        // Phase 3 Task 9: on-demand adapter request channel; not
+                        // exercised in this folder-primitive test, so the rx is
+                        // simply held and the matching tx is dropped immediately
+                        // (next .recv() yields None, the select arm idles).
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
                 )
                 .await;
             });
