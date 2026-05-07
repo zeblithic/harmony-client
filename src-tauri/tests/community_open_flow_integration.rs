@@ -182,6 +182,8 @@ async fn open_community_create_redeem_leave_round_trip() {
         admin_addr: owner_a,
         is_invite_only: false,
         device_id: "a-dev".into(),
+        self_owner: owner_a,
+        signing_key: Arc::new(signing_a.clone()),
         state: Arc::clone(&state_a),
         tracker: Arc::clone(&tracker_a),
         content_store: cs_a,
@@ -202,6 +204,8 @@ async fn open_community_create_redeem_leave_round_trip() {
         admin_addr: owner_a,
         is_invite_only: false,
         device_id: "b-dev".into(),
+        self_owner: owner_b,
+        signing_key: Arc::new(signing_b.clone()),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -232,18 +236,35 @@ async fn open_community_create_redeem_leave_round_trip() {
     assert_eq!(change_a.r#type, MembershipChangeType::Joined);
     assert_eq!(change_a.target, hex::encode(owner_a.0));
 
-    // B should converge on A's bootstrap Join via the bridge.
+    // ZEB-256 Task 6: B inserts A's bootstrap Join locally so the
+    // receive-side membership-at-HLC gate admits A's first publish.
+    // Without this seed B would reject `publisher_not_joined`
+    // because B's empty-state pre-Join can't bootstrap a Joined
+    // publisher entry. Production handles this via the redemption
+    // flow — `mint_redemption` reconstructs admin's Join from the
+    // invite payload's cryptographic proof and inserts both events
+    // locally before B publishes. Going through `insert_local_event`
+    // (rather than direct CRDT mutation) preserves the delta-tx
+    // emission the test asserts on below.
+    let _delta_b_a_join = engine_b
+        .insert_local_event(minted_a.bootstrap_join.clone())
+        .await
+        .expect("B insert A's bootstrap Join (pre-seed)");
+
+    // B should converge on A's bootstrap Join (already true via the
+    // pre-seed; the wait_until is a no-op assert that the state is
+    // stable).
     assert!(
         wait_until(
             || async { state_b.lock().await.events.len() == 1 },
             Duration::from_secs(10),
         )
         .await,
-        "B should receive A's bootstrap Join"
+        "B should hold A's bootstrap Join"
     );
     let _delta_b_remote = tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv())
         .await
-        .expect("B remote delta")
+        .expect("B insert-local delta")
         .expect("channel open");
 
     // ── Step 2: B redeems an invite for the same community. ────────────
@@ -269,18 +290,30 @@ async fn open_community_create_redeem_leave_round_trip() {
         .expect("B own delta")
         .expect("channel open");
 
-    // A should converge on B's redemption Join.
+    // ZEB-256 Task 6: A insert-locals B's redemption Join too. The
+    // wire publish from B would normally bridge it, but A's
+    // membership-at-HLC gate on B's publish would reject
+    // (`publisher_not_joined` — B isn't in A's CRDT until A merges
+    // B's Join). Production has a richer cold-cache propagation
+    // story; for this test we simulate the OOB merge that ZEB-256
+    // §5 "Cold-cache transient rejection" relies on.
+    let _delta_a_b_join = engine_a
+        .insert_local_event(minted_b.bootstrap_join.clone())
+        .await
+        .expect("A insert B's redemption Join (post-Task-6 bootstrap simulation)");
+
+    // A should now hold both events (admin Join + B's redemption Join).
     assert!(
         wait_until(
             || async { state_a.lock().await.events.len() == 2 },
             Duration::from_secs(10),
         )
         .await,
-        "A should receive B's redemption Join"
+        "A should hold its own Join + B's redemption Join"
     );
     let _delta_a_remote = tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv())
         .await
-        .expect("A remote delta")
+        .expect("A delta from B-Join insert")
         .expect("channel open");
 
     // ── Step 3: both peers agree on the materialized member list. ─────
@@ -455,6 +488,8 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         admin_addr: owner_a,
         is_invite_only: false,
         device_id: "a-dev".into(),
+        self_owner: owner_a,
+        signing_key: Arc::new(signing_a.clone()),
         state: Arc::clone(&state_a),
         tracker: Arc::clone(&tracker_a),
         content_store: cs_a,
@@ -475,6 +510,8 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         admin_addr: owner_a,
         is_invite_only: false,
         device_id: "b-dev".into(),
+        self_owner: owner_b,
+        signing_key: Arc::new(signing_b.clone()),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -500,18 +537,27 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await
         .expect("A own delta did not arrive within 1s")
         .expect("A delta channel closed before own delta arrived");
+
+    // ZEB-256 Task 6: B insert-locals A's bootstrap Join (cf. spec §5
+    // "Cold-cache transient rejection"). Without this OOB merge, A's
+    // wire publish would be rejected by B's membership-at-HLC gate.
+    engine_b
+        .insert_local_event(minted_a.bootstrap_join.clone())
+        .await
+        .expect("B insert A's bootstrap Join (post-Task-6 bootstrap simulation)");
+
     assert!(
         wait_until(
             || async { state_b.lock().await.events.len() == 1 },
             Duration::from_secs(10),
         )
         .await,
-        "B should receive A's bootstrap Join"
+        "B should hold A's bootstrap Join"
     );
     tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv())
         .await
-        .expect("B remote delta (A's bootstrap) did not arrive within 2s")
-        .expect("B delta channel closed before A's bootstrap delta arrived");
+        .expect("B insert-local delta did not arrive within 2s")
+        .expect("B delta channel closed before bootstrap delta arrived");
 
     // ── First redemption: B mints + inserts ───────────────────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
@@ -535,17 +581,26 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await
         .expect("B own delta (first redemption) did not arrive within 1s")
         .expect("B delta channel closed before B's own redemption delta arrived");
+
+    // ZEB-256 Task 6: A insert-locals B's redemption Join; without
+    // this OOB merge, B's wire publish (publisher_addr=owner_b)
+    // would fail A's membership-at-HLC gate.
+    engine_a
+        .insert_local_event(minted_b1.bootstrap_join.clone())
+        .await
+        .expect("A insert B's first redemption Join (post-Task-6)");
+
     assert!(
         wait_until(
             || async { state_a.lock().await.events.len() == 2 },
             Duration::from_secs(10),
         )
         .await,
-        "A should receive B's first redemption Join"
+        "A should hold its own + B's first redemption Join"
     );
     tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv())
         .await
-        .expect("A remote delta (B's first redemption) did not arrive within 2s")
+        .expect("A insert-local delta (B's first redemption) did not arrive within 2s")
         .expect("A delta channel closed before B's redemption delta arrived");
 
     // ── Second redemption: B mints + inserts AGAIN with the same URL.
@@ -583,6 +638,13 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
             "event log should have A's bootstrap + B's two redemption Joins"
         );
     }
+
+    // ZEB-256 Task 6: same OOB-merge pattern for B's second
+    // redemption Join.
+    engine_a
+        .insert_local_event(minted_b2.bootstrap_join.clone())
+        .await
+        .expect("A insert B's second redemption Join (post-Task-6)");
 
     // Materialized member list is unchanged: still {A: Joined power=100,
     // B: Joined power=0}. CRDT LWW on MemberState absorbs the duplicate.

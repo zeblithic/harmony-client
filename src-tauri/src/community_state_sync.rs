@@ -53,7 +53,9 @@ use crate::content_store::ContentStore;
 use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
-use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, MembershipKey, OwnerAddr, SpaceId,
+};
 
 /// Errors specific to community-state encryption + decryption.
 #[derive(thiserror::Error, Debug)]
@@ -192,32 +194,95 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
         .map_err(|_| CommunityCryptoError::AeadFailed)
 }
 
-/// State-root publish payload for a community. Sent over
-/// `harmony/community/{id_hex}/state-root-v1` after AEAD-encryption
-/// via `encrypt_root_publish`. Receivers fetch `root_cid` from CAS
-/// to retrieve the encrypted CommunityState blob, then decrypt with
-/// `decrypt_blob`.
+/// State-root publish wire envelope. ZEB-256: every publish is signed
+/// by the publisher's local Ed25519 device key. Receivers verify the
+/// signature, the publisher's membership status as of `payload.at`
+/// (via `prior_state_at_hlc(payload.at)` — NOT the publisher's
+/// current materialized status, which would be wrong for lagging-peer
+/// convergence), and the per-(addr, device) replay tracker before
+/// merging events.
 ///
-/// Wire format: 2-key CBOR map. Both field codes are 2 chars
-/// (`rc` + `at`) to satisfy the same-length-keys invariant at this
-/// nesting level. The HLC `at` is the publisher's monotonic counter
-/// — receivers' RootHlcTrackers reject anything not strictly newer
-/// per (publisher_device_id, hlc) (replay protection; mirrors
-/// `crate::owner_state_types::RootPublishPayload`).
+/// Wire format: 4-key CBOR map. All field codes are 2 chars
+/// (`rc`/`pa`/`at`/`ps`) to satisfy the same-length-keys invariant
+/// at this nesting level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityRootPublishPayload {
-    /// Content-ID of the encrypted CommunityState blob in the
-    /// shared ContentStore.
+    /// Content-ID of the encrypted CommunityState blob in the shared
+    /// ContentStore. Unchanged from Phase 2.
     #[serde(rename = "rc")]
     pub root_cid: ContentId,
-    /// Publisher's HLC at publish time. Monotonically increasing per
-    /// device_id; receivers track per-device latest-seen.
+
+    /// Owner address of the publishing member. Receivers use this to
+    /// (a) resolve identity_pub via IdentityResolver, (b) check
+    /// membership-at-publish-HLC, (c) namespace the replay tracker.
+    #[serde(rename = "pa")]
+    pub publisher_addr: OwnerAddr,
+
+    /// Publisher's HLC at publish time. Carries device_id; tracker
+    /// slot key is `(publisher_addr, at.device_id)`. Unchanged shape
+    /// from Phase 2 — only the tracker's interpretation changed.
     #[serde(rename = "at")]
     pub at: Hlc,
+
+    /// Ed25519 signature over canonical CBOR of
+    /// `CommunityRootSignedPayload { root_cid, publisher_addr, at }`.
+    #[serde(
+        rename = "ps",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub publisher_sig: [u8; 64],
 }
 
 impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
 impl CanonicalPayload for CommunityRootPublishPayload {}
+
+/// The unsigned portion of a `CommunityRootPublishPayload` — the
+/// canonical-CBOR bytes the publisher signs. Mirrors `EventPayload` vs
+/// `SignedMembershipEvent`: keeping the signed sub-payload as its own
+/// type means the signed bytes are unambiguous (no place to put "the
+/// actual sig went here" in the encoded form).
+///
+/// All 3 field keys are 2 chars to satisfy the same-length-keys
+/// invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRootSignedPayload {
+    #[serde(rename = "rc")]
+    pub root_cid: ContentId,
+    #[serde(rename = "pa")]
+    pub publisher_addr: OwnerAddr,
+    #[serde(rename = "at")]
+    pub at: Hlc,
+}
+
+impl CanonicalPayloadSealed for CommunityRootSignedPayload {}
+impl CanonicalPayload for CommunityRootSignedPayload {}
+
+impl CommunityRootSignedPayload {
+    /// Convert a signed sub-payload into its full wire envelope by
+    /// attaching the Ed25519 signature.
+    pub fn into_wire(self, publisher_sig: [u8; 64]) -> CommunityRootPublishPayload {
+        CommunityRootPublishPayload {
+            root_cid: self.root_cid,
+            publisher_addr: self.publisher_addr,
+            at: self.at,
+            publisher_sig,
+        }
+    }
+}
+
+/// Convenience: extract the signed sub-payload from a full wire
+/// envelope. Used by receive-side verify to reproduce the canonical
+/// CBOR bytes the publisher signed.
+impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
+    fn from(w: &CommunityRootPublishPayload) -> Self {
+        Self {
+            root_cid: w.root_cid,
+            publisher_addr: w.publisher_addr,
+            at: w.at.clone(),
+        }
+    }
+}
 
 /// Default debounce window between a `notify_dirty` and the resulting
 /// state-root publish. Mirrors `owner_state_sync::DEFAULT_DEBOUNCE_MS`
@@ -261,6 +326,52 @@ pub enum CommunitySyncError {
     /// cache wasn't wired in), not transport or crypto failure.
     #[error("no identity resolver configured — Phase 2 receive-side verify needs one")]
     MissingIdentityResolver,
+
+    /// Publish was signed correctly but the publisher's membership
+    /// state at the publish HLC does NOT have status `Joined`. Either
+    /// they were kicked, banned, never joined, or are still pending
+    /// invitation. Tracker NOT advanced — defends against the
+    /// post-kick censorship attack where a kicked-but-still-keyed
+    /// member tries to squat HLC slots until ZEB-249 (key rotation)
+    /// lands.
+    #[error(
+        "publisher {addr:?} not joined at publish HLC \
+         (status: {status:?}, left_at: {left_at:?})"
+    )]
+    PublisherNotJoined {
+        addr: OwnerAddr,
+        status: crate::community_membership::MemberStatus,
+        /// `MemberState.left_at` field — set on both Leave and Kick
+        /// events (the underlying CRDT field is overloaded). For
+        /// `PublisherNotJoined` triggered by a kick this carries the
+        /// kick HLC; for one triggered by a voluntary Leave-then-
+        /// republish this carries the Leave HLC. `None` when the
+        /// publisher was never a member.
+        left_at: Option<Hlc>,
+    },
+
+    /// `IdentityResolver` returned `None` for `publisher_addr`. Cold
+    /// cache (the publisher's identity_pub hasn't propagated to our
+    /// owner-state cache yet) or the addr was never a member.
+    /// Transient when caused by cold cache; persistent when caused by
+    /// a wholly-fabricated addr — both surface the same way at this
+    /// layer. Tracker NOT advanced; next publish after cache
+    /// propagation succeeds.
+    #[error(
+        "publisher {addr:?} identity not in resolver — \
+         cache cold or addr not yet propagated"
+    )]
+    UnknownPublisher { addr: OwnerAddr },
+
+    /// Ed25519 signature over `canonical_cbor(CommunityRootSignedPayload)`
+    /// did not validate against the resolved identity_pub. This is
+    /// the load-bearing defense against the spoofing attack: a
+    /// malicious member with the `MembershipKey` cannot forge a
+    /// publish claiming another member's `publisher_addr` because
+    /// they don't have that member's signing key. Tracker NOT
+    /// advanced.
+    #[error("publisher signature invalid for addr {addr:?}")]
+    PublisherSigInvalid { addr: OwnerAddr },
 }
 
 /// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
@@ -287,43 +398,48 @@ pub enum LocalInsertError {
     WrongCommunity { expected: SpaceId, got: SpaceId },
 }
 
-/// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
-/// in-memory replay tracker shape, but keyed externally by community_id
-/// (one tracker instance per joined community).
+/// Per-publisher-device latest-accepted HLC, namespaced by publisher
+/// `OwnerAddr`. ZEB-256: re-keyed from `BTreeMap<String, Hlc>` so a
+/// member cannot squat another member's HLC slot via shared
+/// `MembershipKey`. Each publisher's address gets its own per-device
+/// namespace, so a malicious Alice cannot squat Bob's HLC slot even if
+/// she emits a publish carrying `at.device_id == bob_dev`.
 ///
-/// `Serialize` / `Deserialize` are derived so Task 10's
+/// `Serialize` / `Deserialize` are derived so
 /// `community_state_persist::save_replay` can canonical-CBOR-encode the
-/// tracker to `replay.cbor`. The single `per_device` field is a
-/// `BTreeMap<String, Hlc>` — both inner types already round-trip through
-/// canonical CBOR, so no custom field renames are needed.
+/// tracker to `replay.cbor`. The `(OwnerAddr, String)` tuple key
+/// serialises as a CBOR 2-array — `BTreeMap` iteration is by key order,
+/// so the encoded form is deterministic.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CommunityRootHlcTracker {
-    /// Per-publisher-device latest-accepted HLC. New incoming root
-    /// publishes are accepted only if STRICTLY NEWER per their
-    /// device_id key.
-    pub per_device: BTreeMap<String, Hlc>,
+    /// Per-(publisher_addr, device_id) latest-accepted HLC. New incoming
+    /// root publishes are accepted only if STRICTLY NEWER than the
+    /// recorded entry for the same `(addr, device_id)`.
+    pub per_device: BTreeMap<(OwnerAddr, String), Hlc>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootHlcTracker {}
 impl CanonicalPayload for CommunityRootHlcTracker {}
 
 impl CommunityRootHlcTracker {
-    /// Test the candidate HLC against the per-device latest. Returns
-    /// `true` if the candidate strictly dominates the recorded entry
-    /// (or there is none); `false` otherwise.
+    /// Test the candidate HLC against the per-(addr, device) latest.
+    /// Returns `true` if the candidate strictly dominates the recorded
+    /// entry (or there is none); `false` otherwise.
     ///
     /// Does NOT mutate — `record` is a separate step the caller invokes
     /// after the rest of the receive pipeline succeeds. The split
     /// implements the "advance-after-success" idiom that owner-state's
     /// call sites apply manually to a bare BTreeMap.
-    pub fn would_accept(&self, candidate: &Hlc) -> bool {
-        match self.per_device.get(&candidate.device_id) {
+    pub fn would_accept(&self, publisher_addr: &OwnerAddr, candidate: &Hlc) -> bool {
+        let key = (*publisher_addr, candidate.device_id.clone());
+        match self.per_device.get(&key) {
             None => true,
             Some(prev) => candidate.is_strictly_newer_than(prev),
         }
     }
 
-    /// Record `candidate` as the latest-accepted HLC for its device.
+    /// Record `candidate` as the latest-accepted HLC for
+    /// `(publisher_addr, candidate.device_id)`.
     ///
     /// Precondition: caller MUST have just verified `would_accept`
     /// returned `true`. We `debug_assert!` the precondition so a
@@ -332,14 +448,16 @@ impl CommunityRootHlcTracker {
     /// insert is unconditional — at this point the caller has
     /// committed to advancing and a backward-jump indicates upstream
     /// state corruption that no amount of guarding here can repair.
-    pub fn record(&mut self, candidate: Hlc) {
+    pub fn record(&mut self, publisher_addr: OwnerAddr, candidate: Hlc) {
         debug_assert!(
-            self.would_accept(&candidate),
-            "CommunityRootHlcTracker::record called without would_accept check; backward-jump for device {}",
+            self.would_accept(&publisher_addr, &candidate),
+            "CommunityRootHlcTracker::record called without would_accept check; \
+             backward-jump for ({:?}, {})",
+            publisher_addr,
             candidate.device_id
         );
-        let device_id = candidate.device_id.clone();
-        self.per_device.insert(device_id, candidate);
+        let key = (publisher_addr, candidate.device_id.clone());
+        self.per_device.insert(key, candidate);
     }
 }
 
@@ -424,6 +542,17 @@ pub struct CommunitySyncEngineConfig {
     /// don't exercise the invite-only path.
     pub is_invite_only: bool,
     pub device_id: String,
+    /// Owner address of the local member. Embedded in every publish so
+    /// receivers can verify the signature against the right
+    /// identity_pub (resolved via `IdentityResolver`, NOT carried
+    /// inline). Also used by `next_hlc` to namespace tracker entries.
+    pub self_owner: OwnerAddr,
+    /// Local Ed25519 signing key for state-root publish signing. Same
+    /// handle Phase 3's `insert_local_event` already uses for membership
+    /// event signing — sourced from the local `PrivateIdentity` at
+    /// engine spawn time. Wrapped in `Arc` so the engine + every
+    /// internal task share the same key without copying the secret.
+    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     pub state: Arc<Mutex<CommunityState>>,
     pub tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     pub content_store: Arc<dyn ContentStore>,
@@ -472,6 +601,15 @@ pub struct CommunitySyncEngine {
     /// reaching into `InternalCtx`. Phase 3 ships the public IPC
     /// surface; this accessor stays `#[doc(hidden)]` until then.
     state: Arc<Mutex<CommunityState>>,
+    /// Shared replay-tracker handle. Retained on the engine alongside
+    /// `state` so the registry can expose a test-only snapshot accessor
+    /// without reaching into `InternalCtx`. ZEB-256 Task 8: the
+    /// `spoofed_publish_does_not_block_real_publisher` integration
+    /// test inspects per-(addr, device_id) tracker entries to assert
+    /// the receiver's tracker for the real publisher is NOT clobbered
+    /// by a forged publish. `#[doc(hidden)]` until production callers
+    /// need a public surface.
+    tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     /// Community identity this engine was configured with. Bound at
     /// construction so `insert_local_event` can:
     ///   1. Reject mis-routed events (caller passed an event whose
@@ -521,6 +659,10 @@ impl CommunitySyncEngine {
         // into the InternalCtx — both the spawned task and the engine
         // accessor share the same underlying Mutex<CommunityState>.
         let state_for_engine = Arc::clone(&cfg.state);
+        // ZEB-256 Task 8: same pattern for the tracker — engine retains
+        // its own Arc so `tracker_arc()` (registry-side `tracker_snapshot`)
+        // can hand out a snapshot without reaching into InternalCtx.
+        let tracker_for_engine = Arc::clone(&cfg.tracker);
         let community_id_for_engine = cfg.community_id;
         let admin_addr = cfg.admin_addr;
         let identity_resolver_for_engine = cfg.identity_resolver.clone();
@@ -533,6 +675,8 @@ impl CommunitySyncEngine {
             admin_addr: cfg.admin_addr,
             is_invite_only: cfg.is_invite_only,
             device_id: cfg.device_id,
+            self_owner: cfg.self_owner,
+            signing_key: cfg.signing_key,
             state: cfg.state,
             tracker: cfg.tracker,
             content_store: cfg.content_store,
@@ -556,6 +700,7 @@ impl CommunitySyncEngine {
             shutdown_tx,
             task: Mutex::new(Some(task)),
             state: state_for_engine,
+            tracker: tracker_for_engine,
             community_id: community_id_for_engine,
             admin_addr,
             identity_resolver: identity_resolver_for_engine,
@@ -572,6 +717,18 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn state(&self) -> Arc<Mutex<CommunityState>> {
         Arc::clone(&self.state)
+    }
+
+    /// Returns a clone of the engine's `CommunityRootHlcTracker` Arc.
+    /// **Test-only** — production callers don't need to inspect the
+    /// per-publisher replay tracker; ZEB-256 Task 8's spoofing
+    /// integration test uses this to assert that a forged publish at
+    /// HLC `huge` does NOT advance the receiver's tracker for the
+    /// spoofed `publisher_addr`, so the real publisher's next legit
+    /// publish at HLC `Y` (with `huge > Y`) is still admitted.
+    #[doc(hidden)]
+    pub fn tracker_arc(&self) -> Arc<Mutex<CommunityRootHlcTracker>> {
+        Arc::clone(&self.tracker)
     }
 
     /// Returns the admin `OwnerAddr` this engine was configured with.
@@ -727,6 +884,8 @@ struct InternalCtx {
     admin_addr: OwnerAddr,
     is_invite_only: bool,
     device_id: String,
+    self_owner: OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     content_store: Arc<dyn ContentStore>,
@@ -973,6 +1132,7 @@ async fn internal_task(mut ctx: InternalCtx) {
 /// sharing a random-nonce CAS-side would defeat ContentId dedup.
 async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
+    use ed25519_dalek::Signer;
 
     // Snapshot CRDT state under brief lock; drop guard before the
     // expensive encode + AEAD + CAS hops below.
@@ -1006,16 +1166,30 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     // 4. Put into ContentStore (routes through CasOp::PutLocal).
     ctx.content_store.put(root_cid, blob_ciphertext).await?;
 
-    // 5. Build state-root payload with a strictly-newer HLC.
+    // 5. Build the SIGNED sub-payload with a strictly-newer HLC.
     let now = next_hlc(ctx).await;
-    let payload = CommunityRootPublishPayload { root_cid, at: now };
+    let signed = CommunityRootSignedPayload {
+        root_cid,
+        publisher_addr: ctx.self_owner,
+        at: now,
+    };
+
+    // 6. Sign the canonical CBOR of the signed sub-payload. Ed25519
+    //    sign is microseconds, fine on the runtime thread (no
+    //    spawn_blocking).
+    let signed_bytes = canonical_cbor_encode(&signed)
+        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+    let publisher_sig = ctx.signing_key.sign(&signed_bytes).to_bytes();
+
+    // 7. Wrap into the full wire envelope.
+    let payload = signed.into_wire(publisher_sig);
     let payload_bytes = canonical_cbor_encode(&payload)
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
 
-    // 6. Encrypt with random-nonce root AEAD (every publish is fresh).
+    // 8. Encrypt with random-nonce root AEAD (every publish is fresh).
     let wire = encrypt_root_publish(&ctx.membership_key, &payload_bytes)?;
 
-    // 7. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
+    // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
     ctx.publisher_tx
         .send(wire)
         .await
@@ -1050,7 +1224,8 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    let prev = tracker.per_device.get(&ctx.device_id).cloned();
+    let key = (ctx.self_owner, ctx.device_id.clone());
+    let prev = tracker.per_device.get(&key).cloned();
     // Three branches:
     //   (a) No prev → first publish for this device.
     //   (b) Wall advanced past prev_wall → reset logical to 0.
@@ -1086,7 +1261,7 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
             device_id: ctx.device_id.clone(),
         },
     };
-    tracker.record(now.clone());
+    tracker.record(ctx.self_owner, now.clone());
     now
 }
 
@@ -1124,6 +1299,18 @@ enum IncomingOutcome {
     /// Failure occurred AFTER the tracker advanced. Tracker is in-
     /// memory dirty; persist defensively so a restart doesn't replay
     /// the same publish.
+    ///
+    /// **No constructor as of Task 6.** Under the verify-on-receive
+    /// pipeline every fallible step before tracker advance returns
+    /// `ErrPreMutation`; the only post-advance fallible step is the
+    /// per-event merge loop, but `Rejected` outcomes there surface as
+    /// `verify_event_rejected` reports rather than this variant. The
+    /// variant is kept for forward-compatibility — future
+    /// post-advance fallible operations (e.g. an additional integrity
+    /// gate over the merged events) should use it. `#[allow(dead_code)]`
+    /// suppresses the never-constructed lint without erasing the
+    /// shape from the API.
+    #[allow(dead_code)]
     ErrPostMutation(CommunitySyncError),
 }
 
@@ -1141,13 +1328,17 @@ impl IncomingOutcome {
     /// Whether the CRDT itself changed (≥ 1 event Inserted). Used by
     /// the subscriber arm to decide between `persist_both` and
     /// `persist_replay_only`. `ErrPostMutation` is deliberately
-    /// excluded — every current ErrPostMutation path (only
-    /// `MissingIdentityResolver` today) returns BEFORE entering the
-    /// per-event merge loop, so the CRDT is byte-identical to its
-    /// last-persisted form. Including it here would force an
-    /// unnecessary `crdt.cbor` fsync. Future ErrPostMutation paths
-    /// that DO mutate the CRDT mid-loop must surface a separate
-    /// outcome variant rather than overload this one.
+    /// excluded — under the Task 6 verify-on-receive pipeline, the
+    /// only path that advances the tracker AND fails afterward is a
+    /// failed `state.insert_event` call, but `Rejected` outcomes from
+    /// `insert_event` surface as in-place rejection reports rather
+    /// than IncomingOutcome::ErrPostMutation. Reachable
+    /// ErrPostMutation paths after Task 6 are zero, but we keep the
+    /// variant for forward-compatibility with future steps that mutate
+    /// the tracker before a fallible operation. Including ErrPostMutation
+    /// here would force an unnecessary `crdt.cbor` fsync. Future
+    /// ErrPostMutation paths that DO mutate the CRDT mid-loop must
+    /// surface a separate outcome variant rather than overload this one.
     fn crdt_mutated(&self) -> bool {
         matches!(self, Self::Mutated)
     }
@@ -1163,34 +1354,81 @@ impl IncomingOutcome {
 /// Process one inbound state-root publish. See `IncomingOutcome` for
 /// the return-value semantics.
 ///
-/// Pipeline:
+/// Pipeline (ZEB-256 verify-on-receive, Task 6):
 /// 1. Decrypt the wire packet (random-nonce + AAD).
 /// 2. Decode `CommunityRootPublishPayload`.
-/// 3. Replay-check via `tracker.would_accept` (early-exit Duplicate).
-/// 4. Fetch the encrypted blob from CAS (cache miss → ErrPreMutation).
-/// 5. Decrypt the blob (deterministic-nonce).
-/// 6. Decode `CommunityState`.
-/// 7. Misrouted-blob check: `remote.community_id == ctx.community_id`.
-/// 8. Advance `tracker` — single mutation point. Subsequent failures
-///    are ErrPostMutation so the caller persists tracker advance.
-/// 9. For each event: skip-if-known; resolve actor + countersigner
-///    identity_pubs (skip-on-error); call `state.insert_event` with a
-///    fresh `VerifyContext`; surface `Rejected` outcomes as
-///    `CommunityDegradedReport` on `error_tx`.
+/// 3. **Membership-at-HLC gate** — materialize the local log; if
+///    `payload.publisher_addr`'s status is not `Joined`, reject with
+///    `PublisherNotJoined`. Tracker NOT advanced.
+/// 4. **Identity-pub resolution** — `IdentityResolver::resolve` for
+///    `payload.publisher_addr`; `None` → `UnknownPublisher`. Tracker
+///    NOT advanced.
+/// 5. **Ed25519 sig verification** — verify `payload.publisher_sig`
+///    against the resolved identity_pub (Ed25519 half = bytes [32..64])
+///    over `canonical_cbor(CommunityRootSignedPayload::from(&payload))`.
+///    Failure → `PublisherSigInvalid`. Tracker NOT advanced.
+/// 6. Replay-check via `tracker.would_accept(&payload.publisher_addr,
+///    &payload.at)` — early-exit `Duplicate`.
+/// 7. Fetch the encrypted blob from CAS (cache miss → `ErrPreMutation`).
+/// 8. Decrypt the blob (deterministic-nonce).
+/// 9. Decode `CommunityState`.
+/// 10. Misrouted-blob check: `remote.community_id == ctx.community_id`.
+/// 11. Pre-resolve identity_pubs for every inner event OUTSIDE the
+///     state lock (Phase A — avoids the lock-order hazard with
+///     owner-state).
+/// 12. Lock state. RE-CHECK membership-at-HLC under the lock — closes
+///     the TOCTOU race where a concurrent `insert_local_event()` call
+///     lands a Leave/Kick between step 2's snapshot and the merge.
+///     If the publisher is no longer Joined per the current local
+///     state, drop the lock and return `ErrPreMutation::PublisherNotJoined`
+///     WITHOUT advancing the tracker.
+/// 13. Otherwise, merge each event under the same state lock
+///     (skip-if-known; call `state.insert_event` with a fresh
+///     `VerifyContext`; surface `Rejected` outcomes as
+///     `CommunityDegradedReport` on `error_tx`). Drop the state lock.
+/// 14. Advance `tracker` keyed on `payload.publisher_addr` — single
+///     mutation point. Happens AFTER the state merge so a TOCTOU-race
+///     rejection at step 12 leaves the tracker untouched.
+///
+/// **Cheapest-first rejection order.** Membership-at-HLC at step 2 is
+/// a local state lookup (free) used as a DoS pre-filter; identity
+/// resolution is an in-memory cache hit; sig-verify is microseconds
+/// but unnecessary for a publisher we know is no longer Joined.
+/// Surfacing each class as a distinct error variant lets the frontend
+/// banner discriminate "this peer lost membership" (informational)
+/// from "someone forged a publish claiming to be this peer"
+/// (security-relevant). Step 12's re-check is the AUTHORITATIVE gate
+/// w.r.t. local state mutations — step 2's read-then-drop snapshot
+/// can race with `insert_local_event()`.
+///
+/// **Censorship-defense invariant.** None of the rejection gates
+/// advance the tracker — only the `record` at step 14, which runs
+/// only after the state merge succeeds. A kicked-but-still-keyed
+/// member trying to squat HLC slots fails either the cheap step-2
+/// gate or the authoritative step-12 re-check before tracker.record
+/// runs; per-publisher namespacing on the tracker key
+/// `(publisher_addr, device_id)` further isolates the per-addr
+/// HLC space so an attacker can't claim Alice's slot via shared
+/// `MembershipKey`.
 ///
 /// **Divergence from `owner_state_sync::handle_incoming_publish`:**
 /// owner-state advances the tracker IMMEDIATELY after the replay-check
 /// (so blob-fetch / decrypt / decode failures land as
-/// `ErrPostMutation`). We delay the advance until step 8 — AFTER the
-/// blob has been fetched, decrypted, decoded, AND passed the
-/// misrouted-blob check. The rationale is asymmetric trust: a
-/// misrouted blob (foreign community's state surfaced under our
-/// CID) means the publisher's HLC carries no useful information for
-/// OUR replay tracker, so advancing it would let a correctly-routed
-/// re-publish at the same HLC be silently dropped. owner-state
-/// doesn't have this concern because there's only one owner-CRDT
-/// per identity.
+/// `ErrPostMutation`). We delay the advance until step 14 — AFTER the
+/// blob has been fetched, decrypted, decoded, AND merged under the
+/// re-checked membership lock. Two reasons: (a) a misrouted blob
+/// (foreign community's state surfaced under our CID) means the
+/// publisher's HLC carries no useful information for OUR replay
+/// tracker, so advancing it would let a correctly-routed re-publish
+/// at the same HLC be silently dropped; (b) the post-merge tracker
+/// advance is required for TOCTOU defense — see step 12.
+/// owner-state has neither concern because there's only one owner-
+/// CRDT per identity AND no concurrent `insert_local_event` IPC
+/// path.
 async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
+    use crate::community_membership::MemberStatus;
+    use crate::owner_state_crypto::canonical_cbor_encode;
+
     // 1. Decrypt root publish.
     let payload_bytes = match decrypt_root_publish(&ctx.membership_key, &wire) {
         Ok(b) => b,
@@ -1203,17 +1441,188 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     };
 
-    // 2. Replay-protect via per-community RootHlcTracker. Read-only —
-    //    the `record` step happens after the rest of the receive
-    //    pipeline succeeds (single state-mutation point at step 8).
+    // 2. Membership-at-HLC gate (DoS pre-filter — NOT the authoritative
+    //    gate). Cheapest of the three new gates: a local materialize
+    //    over our trusted log + a single map lookup. Run BEFORE
+    //    sig-verify because a stale-membership rejection is
+    //    informational and we shouldn't pay sig-verify cost for a
+    //    publish we'll reject anyway. The check is over our locally-
+    //    trusted state, so there's no integrity risk in trusting it
+    //    pre-sig.
+    //
+    //    Gate-ordering note: this gate AND step 3 (resolver lookup)
+    //    intentionally consume the unauthenticated `publisher_addr`
+    //    before the authoritative sig-verify in step 4. This is by
+    //    design — they're cheapest-first DoS pre-filters that bound
+    //    work on adversarial inbound traffic, not security gates. The
+    //    *security* invariant is enforced at step 4: a forged
+    //    publisher_addr that happens to be a current member can pass
+    //    steps 2+3 but cannot survive step 4 unless the attacker also
+    //    forged a valid Ed25519 signature. The tracker never advances
+    //    on rejection at any step.
+    //
+    //    TOCTOU note: this gate snapshots `state.events` then drops
+    //    the lock so subsequent async work doesn't block the engine.
+    //    A concurrent `insert_local_event()` may land a Leave/Kick
+    //    for `publisher_addr` in the window between this snapshot
+    //    and the merge phase. The authoritative re-check happens at
+    //    step 12 (under the state lock, immediately before the merge)
+    //    so a publish admitted here can still be rejected post-race
+    //    without advancing the tracker.
+    //
+    //    Spec compliance: materialize the prefix of our local log
+    //    strictly before `payload.at` via `prior_state_at_hlc` and
+    //    check the publisher's status as of THAT HLC. This matches
+    //    ZEB-256 § 5 step 3 verbatim. Convergence safety: a lagging
+    //    peer that learned a later Leave/Kick before receiving an
+    //    earlier (valid) publish from the same publisher must not
+    //    permanently reject the earlier publish — the prior-state-at-
+    //    publish-HLC view shows the publisher as `Joined` for any
+    //    publish strictly preceding the membership change in HLC
+    //    order, so the gate admits it.
+    //
+    //    Bootstrap caveat (tracked as ZEB-260): the gate cannot
+    //    inspect events INSIDE the encrypted blob. A new joiner's
+    //    own first publish carries their Join in the blob; if our
+    //    local log doesn't already contain that Join (or an
+    //    admin-issued Invite that resolves to it post-merge), the
+    //    publisher will appear unknown and we will reject. Production
+    //    paves over this in two ways: (a) the redemption flow on the
+    //    joiner's own device inserts the Join locally before the
+    //    first publish; (b) Phase 4's invite-only flow re-Joins via
+    //    an admin-published Invite — admin is already Joined in our
+    //    view, so the gate admits and we learn the Join after merge.
+    //    Self-Re-Join after Leave hits the same bootstrap edge and
+    //    is also deferred under ZEB-260.
+    {
+        let state = ctx.state.lock().await;
+        let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
+        drop(state);
+        let materialized =
+            crate::community_membership::prior_state_at_hlc(&events, &payload.at, ctx.admin_addr);
+        let member_state = materialized.members.get(&payload.publisher_addr).cloned();
+        let status_now = member_state.as_ref().map(|s| s.status);
+        let is_joined = matches!(status_now, Some(MemberStatus::Joined));
+        if !is_joined {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                addr: payload.publisher_addr,
+                // `None` from `members.get` is the catch-all "not
+                // currently Joined per our prior-state-at-publish-HLC
+                // view": the publisher was never a member, has not
+                // yet had their Join propagate to us (cold cache /
+                // out-of-band-bootstrap path), or `publisher_addr`
+                // is fabricated. We collapse all three onto
+                // `MemberStatus::Left` rather than introduce a fourth
+                // variant — the error is diagnostic-only and the
+                // security invariant ("not Joined → reject") is
+                // unchanged. Frontend code that branches on this
+                // field MUST treat `Left` + `left_at: None` as the
+                // "never joined / unknown" case (genuine Leaves
+                // always carry a `left_at`).
+                status: status_now.unwrap_or(MemberStatus::Left),
+                left_at: member_state.and_then(|s| s.left_at),
+            });
+        }
+    }
+
+    // 3. Resolve `publisher_addr` → identity_pub via `IdentityResolver`.
+    //    Distinct from MissingIdentityResolver (config error) vs
+    //    UnknownPublisher (resolver returned None for this addr — cold
+    //    cache or fabricated addr). Tracker NOT advanced on either.
+    let resolver = match ctx.identity_resolver.as_deref() {
+        Some(r) => r,
+        None => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::MissingIdentityResolver);
+        }
+    };
+    let publisher_pub = match resolver.resolve(&payload.publisher_addr).await {
+        Some(p) => p,
+        None => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::UnknownPublisher {
+                addr: payload.publisher_addr,
+            });
+        }
+    };
+
+    // 4. Verify Ed25519 signature over canonical CBOR of
+    //    `CommunityRootSignedPayload::from(&payload)`.
+    //
+    //    Key→address binding: before consuming the resolved key we
+    //    re-derive `address_hash` from the 64-byte identity public
+    //    bytes and reject if it does not equal `payload.publisher_addr`.
+    //    This is defense-in-depth against a buggy / stale resolver
+    //    handing us the wrong identity for `publisher_addr` — without
+    //    this check, a valid signature from key X would be accepted
+    //    under a falsely-claimed address Y. Mirrors the binding step
+    //    in `community_membership::verify_signature` (line 446) and
+    //    `verify_countersig` (line 522), which use the same
+    //    `harmony_identity::Identity::from_public_bytes` derivation.
+    //
+    //    Use `verify_strict` (not `verify`): strict mode rejects
+    //    signatures with non-canonical S values and small-order R
+    //    points (RFC 8032 strict subset), matching
+    //    `community_membership::verify_signature` and
+    //    `dm_envelope`'s posture for signed wire payloads.
+    {
+        let signed_bytes = match canonical_cbor_encode(&CommunityRootSignedPayload::from(&payload))
+        {
+            Ok(b) => b,
+            Err(e) => {
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborEncode(
+                    e.to_string(),
+                ));
+            }
+        };
+        let identity = match harmony_identity::Identity::from_public_bytes(&publisher_pub) {
+            Ok(i) if i.address_hash == payload.publisher_addr.0 => i,
+            // Either the identity bytes are malformed OR the resolver
+            // returned a key whose `address_hash` does not match the
+            // claimed publisher_addr. Both cases collapse to the same
+            // observable outcome: this publish is unauthenticated under
+            // the claimed addr. Surface as `PublisherSigInvalid` so the
+            // existing degraded-report path handles it (rather than
+            // adding a separate "key did not bind to addr" variant —
+            // the security invariant is identical).
+            _ => {
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
+                    addr: payload.publisher_addr,
+                });
+            }
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
+        if identity
+            .verifying_key
+            .verify_strict(&signed_bytes, &sig)
+            .is_err()
+        {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
+                addr: payload.publisher_addr,
+            });
+        }
+    }
+
+    // 5. Replay-protect via per-(addr, device) RootHlcTracker.
+    //    Read-only — the `record` step happens at step 14 (after the
+    //    state-merge under the TOCTOU re-check), so dedup and the
+    //    single-mutation-point are now decoupled into separate steps.
+    //    Keyed on the trusted `payload.publisher_addr` (sig-verify
+    //    above proved the addr).
+    //
+    //    Note: a publish that passes here can still be rejected at
+    //    step 12's re-check (concurrent local Leave/Kick) and
+    //    therefore NOT advance the tracker. That's the intended
+    //    semantic — re-receive of the same publish later will hit
+    //    the same step-12 rejection until either the publisher's
+    //    membership re-Joins (out-of-band) or the publisher republishes
+    //    at a strictly newer HLC.
     {
         let tracker = ctx.tracker.lock().await;
-        if !tracker.would_accept(&payload.at) {
+        if !tracker.would_accept(&payload.publisher_addr, &payload.at) {
             return IncomingOutcome::Duplicate;
         }
     }
 
-    // 3. Fetch the encrypted blob from CAS. Cache-miss is a pre-mutation
+    // 6. Fetch the encrypted blob from CAS. Cache-miss is a pre-mutation
     //    failure — the publish carries a CID we couldn't resolve in
     //    time; CRDT eventual consistency lets the next state-root from
     //    any peer recover.
@@ -1227,13 +1636,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
     };
 
-    // 4. Decrypt blob (deterministic-nonce).
+    // 7. Decrypt blob (deterministic-nonce).
     let blob_cleartext = match decrypt_blob(&ctx.membership_key, &blob_ciphertext) {
         Ok(b) => b,
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
     };
 
-    // 5. Decode CommunityState.
+    // 8. Decode CommunityState.
     let remote: CommunityState = match canonical_cbor_decode(&blob_cleartext) {
         Ok(s) => s,
         Err(e) => {
@@ -1241,7 +1650,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     };
 
-    // 5b. Reject misrouted blob: blob's community_id must match the
+    // 8b. Reject misrouted blob: blob's community_id must match the
     //     engine's expected community_id. Without this, a
     //     ContentStore-collision (vanishingly unlikely with SHA-256
     //     but cheap to gate) or buggy callsite could surface a
@@ -1252,26 +1661,6 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             found: remote.community_id,
         });
     }
-
-    // 6. Advance the replay tracker BEFORE merging events. This is
-    //    the single state-mutation point — if any subsequent step
-    //    fails, we mark the outcome ErrPostMutation so the caller
-    //    persists tracker advance to disk (preventing replay on
-    //    next-boot).
-    {
-        let mut tracker = ctx.tracker.lock().await;
-        tracker.record(payload.at.clone());
-    }
-
-    // 7. Merge events. Each event must re-verify against B's
-    //    prior_state_at_event — we don't trust A's verification.
-    let Some(resolver) = ctx.identity_resolver.as_deref() else {
-        // Phase 2's receive-side verify needs an identity resolver
-        // to map event.actor → identity_pub. None means we can't
-        // verify any incoming event. Tracker already advanced;
-        // surface as ErrPostMutation so persist hook still runs.
-        return IncomingOutcome::ErrPostMutation(CommunitySyncError::MissingIdentityResolver);
-    };
 
     // Phase A: pre-resolve identity_pubs OUTSIDE the community state
     // lock. The resolver awaits owner_state's mutex; holding community
@@ -1340,6 +1729,44 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
+
+        // 12. TOCTOU re-check: a concurrent `insert_local_event()`
+        //     call (the IPC path used by `redeem_invite`,
+        //     `leave_community`, Phase 4 `kick`, etc.) may have
+        //     landed an event between step 2's snapshot and now,
+        //     including a Leave/Kick that would have failed the
+        //     gate. Re-evaluate `prior_state_at_hlc(payload.at)` over
+        //     the CURRENT events (held under the state lock so no
+        //     further concurrent inserts can land before we merge).
+        //     A negative outcome here returns ErrPreMutation WITHOUT
+        //     advancing the tracker — the cheapest-first gate at
+        //     step 2 was a pre-filter; THIS is the authoritative
+        //     security check w.r.t. local state mutations.
+        //     CodeRabbit PR #88 round 3 finding.
+        {
+            let events_now: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
+            let mat_now = crate::community_membership::prior_state_at_hlc(
+                &events_now,
+                &payload.at,
+                ctx.admin_addr,
+            );
+            let pub_state = mat_now.members.get(&payload.publisher_addr).cloned();
+            let pub_status = pub_state.as_ref().map(|s| s.status);
+            if !matches!(pub_status, Some(MemberStatus::Joined)) {
+                // Drop the lock before returning so error reporting
+                // and the caller's persist machinery aren't serialized
+                // behind an unrelated state lock release.
+                drop(state);
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                    addr: payload.publisher_addr,
+                    // Same fallback semantics as step 2 — see the
+                    // longer comment there for the rationale.
+                    status: pub_status.unwrap_or(MemberStatus::Left),
+                    left_at: pub_state.and_then(|s| s.left_at),
+                });
+            }
+        }
+
         for (event, actor_pub, cs_pub_owned) in resolved {
             if state.events.contains_key(&event.id) {
                 continue;
@@ -1389,6 +1816,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     } // state lock released here
 
+    // 14. Advance the replay tracker — the SINGLE state-mutation
+    //     point for tracker progress. Happens AFTER Phase B's
+    //     state-merge (and AFTER the TOCTOU re-check inside Phase B)
+    //     so a concurrent local Leave/Kick that races the gate
+    //     leaves the tracker untouched, preserving the
+    //     "tracker NOT advanced on any rejection" invariant under
+    //     concurrent IPC mutations.
+    {
+        let mut tracker = ctx.tracker.lock().await;
+        tracker.record(payload.publisher_addr, payload.at.clone());
+    }
+
     // Phase C-pre: emit membership-delta for every inserted event
     // outside the state lock. `try_send` is fire-and-forget — a closed
     // or full channel drops the delta rather than back-pressuring the
@@ -1417,7 +1856,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         );
     }
 
-    // The tracker advanced (step 6) regardless of whether any event
+    // The tracker advanced (step 14) regardless of whether any event
     // was Inserted. Differentiate so Task 10 can persist the smaller
     // replay.cbor file alone when the CRDT is unchanged. See the
     // `IncomingOutcome` doc comments for the full rationale.
@@ -1544,7 +1983,18 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
         CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
+        CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
+        CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
+        CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
     }
+}
+
+/// Test-only re-export of `classify_incoming_error`. Lets the unit
+/// test pin the reason_tag → variant mapping without exposing the
+/// internal function as part of the public API.
+#[doc(hidden)]
+pub fn classify_incoming_error_for_test(err: &CommunitySyncError) -> &'static str {
+    classify_incoming_error(err)
 }
 
 /// Construction-time config for `CommunitySyncRegistry::new`. The
@@ -1583,6 +2033,24 @@ pub struct CommunityRegistryConfig {
     /// `community-members-changed` Tauri events. `None` for tests that
     /// don't assert on IPC events.
     pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+
+    /// Owner address of the local member. Cloned into every engine's
+    /// `CommunitySyncEngineConfig.self_owner`. Stable across all
+    /// communities for a single node: one identity, one address.
+    ///
+    /// ZEB-256 (Task 6 verify-on-receive): a peer's `publisher_addr`
+    /// is now load-bearing. The receive-side membership-at-HLC gate
+    /// and sig-verify both key off it. Plumbed here so every
+    /// `spawn_engine` call gets a consistent self-identity rather
+    /// than a per-call argument that could drift.
+    pub self_owner: OwnerAddr,
+
+    /// Local Ed25519 signing key, shared across every spawned engine.
+    /// Wrapped in `Arc` so engine spawns are cheap (Arc bump, no
+    /// secret-byte copy). Sourced from the local `PrivateIdentity` at
+    /// `start_node` time; identical handle to the one Phase 3's
+    /// `insert_local_event` uses for membership-event signing.
+    pub signing_key: Arc<ed25519_dalek::SigningKey>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -1704,6 +2172,14 @@ impl CommunitySyncRegistry {
             admin_addr,
             is_invite_only,
             device_id: self.cfg.device_id.clone(),
+            // ZEB-256 Task 6: self_owner + signing_key are sourced
+            // from the registry config so every engine in a registry
+            // shares one local identity. Task 4's TEMP placeholder
+            // (admin_addr + dummy [0x42; 32] key) is gone — the
+            // membership-at-HLC + sig-verify gates require the real
+            // values for verify-on-receive to admit our publishes.
+            self_owner: self.cfg.self_owner,
+            signing_key: Arc::clone(&self.cfg.signing_key),
             state,
             tracker,
             content_store: Arc::clone(&self.cfg.content_store),
@@ -1790,6 +2266,25 @@ impl CommunitySyncRegistry {
             .await
             .get(community_id)
             .map(|e| e.state())
+    }
+
+    /// Returns a clone of the engine's `CommunityRootHlcTracker` for a
+    /// community, if an engine is spawned for it. **Test-only** —
+    /// gated as `#[doc(hidden)]` and exists so the ZEB-256 Task 8
+    /// `spoofed_publish_does_not_block_real_publisher` integration
+    /// test can inspect per-(addr, device_id) tracker entries without
+    /// reaching into private engine fields. Returns the snapshot
+    /// (cloned out from under the engine's mutex) rather than the live
+    /// Arc so callers don't accidentally hold the lock across awaits.
+    #[doc(hidden)]
+    pub async fn tracker_snapshot(
+        &self,
+        community_id: &SpaceId,
+    ) -> Option<CommunityRootHlcTracker> {
+        let engine = self.engines.lock().await.get(community_id).cloned()?;
+        let tracker = engine.tracker_arc();
+        let snap = tracker.lock().await.clone();
+        Some(snap)
     }
 
     /// Returns a clone of the `Arc<CommunitySyncEngine>` for

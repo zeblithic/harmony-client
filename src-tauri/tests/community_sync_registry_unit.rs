@@ -37,6 +37,12 @@ async fn registry_spawns_and_tears_down_per_community() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: registry holds local identity. This test
+        // exercises spawn/teardown lifecycle only — no publishes
+        // flow, so the OwnerAddr/SigningKey values just need to
+        // satisfy the type bound.
+        self_owner: OwnerAddr([0x01; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
     });
 
     let cid_a = SpaceId([1u8; 16]);
@@ -77,6 +83,10 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: lifecycle/idempotency test — values are
+        // arbitrary, no publishes go through the wire.
+        self_owner: OwnerAddr([0x01; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
     });
 
     // Spawn two distinct communities. Use unsorted ID order to verify

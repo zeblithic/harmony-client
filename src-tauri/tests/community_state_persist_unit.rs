@@ -8,7 +8,7 @@ use harmony_app::community_state_persist::{
     load_crdt, load_replay, save_crdt, save_replay, PersistError,
 };
 use harmony_app::community_state_sync::CommunityRootHlcTracker;
-use harmony_app::owner_state_types::{Hlc, SpaceId};
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
 #[test]
 fn save_and_load_crdt_round_trips() {
@@ -103,14 +103,94 @@ fn save_and_load_replay_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("replay.cbor");
 
+    let alice = OwnerAddr([0xA1; 16]);
     let mut tracker = CommunityRootHlcTracker::default();
-    tracker.record(Hlc {
-        wall_ms: 1000,
-        logical: 5,
-        device_id: "dev".into(),
-    });
+    tracker.record(
+        alice,
+        Hlc {
+            wall_ms: 1000,
+            logical: 5,
+            device_id: "dev".into(),
+        },
+    );
     save_replay(&path, &tracker).expect("save");
     let loaded = load_replay(&path).expect("load");
-    assert_eq!(loaded.per_device.get("dev").map(|h| h.wall_ms), Some(1000));
-    assert_eq!(loaded.per_device.get("dev").map(|h| h.logical), Some(5));
+    let key = (alice, "dev".to_string());
+    assert_eq!(loaded.per_device.get(&key).map(|h| h.wall_ms), Some(1000));
+    assert_eq!(loaded.per_device.get(&key).map(|h| h.logical), Some(5));
+}
+
+#[test]
+fn load_replay_quarantines_and_recovers_from_old_shape() {
+    // ZEB-256 breaks tracker shape (per_device key changed from
+    // String to (OwnerAddr, String)). Old persisted files MUST not
+    // crash boot — load_replay quarantines the unparseable bytes
+    // and returns CommunityRootHlcTracker::default(). The engine
+    // then rebuilds the tracker organically as publishes arrive.
+
+    use std::collections::BTreeMap;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("replay.cbor");
+
+    // Hand-write CBOR bytes for the OLD shape: `{ per_device: {String: Hlc} }`.
+    // Use ciborium (the project's CBOR library — serde_cbor isn't a dep).
+    #[derive(serde::Serialize)]
+    struct OldShape {
+        per_device: BTreeMap<String, Hlc>,
+    }
+    let old = OldShape {
+        per_device: {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "old-dev".to_string(),
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "old-dev".into(),
+                },
+            );
+            m
+        },
+    };
+    let mut old_bytes: Vec<u8> = Vec::new();
+    ciborium::ser::into_writer(&old, &mut old_bytes).expect("encode old shape");
+    std::fs::write(&path, &old_bytes).expect("write");
+
+    let recovered = load_replay(&path).expect("load_replay self-heals");
+    assert!(
+        recovered.per_device.is_empty(),
+        "recovered tracker MUST be empty (default)"
+    );
+
+    // Verify quarantined sibling file exists.
+    let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .any(|n| n.starts_with("replay.cbor.corrupt.")),
+        "quarantined file must exist: {entries:?}"
+    );
+
+    // After self-heal, save_replay writes the new shape cleanly.
+    let mut t = CommunityRootHlcTracker::default();
+    let alice = OwnerAddr([0xA1; 16]);
+    t.record(
+        alice,
+        Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "new-dev".into(),
+        },
+    );
+    save_replay(&path, &t).expect("save_replay");
+    let reloaded = load_replay(&path).expect("reload");
+    assert_eq!(reloaded.per_device.len(), 1);
+    assert!(reloaded
+        .per_device
+        .contains_key(&(alice, "new-dev".to_string())));
 }

@@ -397,7 +397,9 @@ fn power_thresholds_struct_constructible() {
     assert_eq!(custom.invite, 10);
 }
 
-use harmony_app::community_membership::{event_sort_key, materialize, prior_state_at_event};
+use harmony_app::community_membership::{
+    event_sort_key, materialize, prior_state_at_event, prior_state_at_hlc,
+};
 use harmony_app::community_membership::{verify_event, VerifyContext};
 
 fn make_signed(
@@ -459,6 +461,50 @@ fn prior_state_at_event_excludes_target_and_later_events() {
         prior.members.get(&bob),
         None,
         "target itself must be excluded"
+    );
+}
+
+#[test]
+fn prior_state_at_hlc_excludes_events_at_or_after_hlc() {
+    // The HLC-keyed companion to `prior_state_at_event` excludes events
+    // sharing the target's (wall_ms, logical, device_id) triple AND
+    // anything strictly after. Events strictly before the triple are
+    // included. Used by the receive-side membership-at-publish-HLC gate
+    // where the caller has only `payload.at` (a bare `Hlc`), not a full
+    // `SignedMembershipEvent`.
+    let admin = OwnerAddr([100u8; 16]);
+    let alice = OwnerAddr([1u8; 16]);
+
+    // Three events: one strictly before, one at the exact target HLC,
+    // and one strictly after.
+    let before = make_signed(1, MembershipEventKind::Join, admin, 100);
+    let at_target = make_signed(2, MembershipEventKind::Join, alice, 200);
+    let after = make_signed(3, MembershipEventKind::Leave, alice, 300);
+
+    let target_hlc = Hlc {
+        wall_ms: 200,
+        logical: 0,
+        device_id: "d".into(), // matches `make_signed`'s device_id
+    };
+
+    let prior = prior_state_at_hlc(
+        &[after.clone(), at_target.clone(), before.clone()],
+        &target_hlc,
+        admin,
+    );
+
+    // `before` (admin Join at 100) is included → admin is Joined.
+    assert_eq!(
+        prior.members.get(&admin).map(|s| s.status),
+        Some(MemberStatus::Joined)
+    );
+    // `at_target` (alice Join at exact HLC) is excluded — strict prefix.
+    // `after` (alice Leave at 300) is excluded.
+    // Net: alice has no member entry at all.
+    assert_eq!(
+        prior.members.get(&alice),
+        None,
+        "events at the exact target HLC must be excluded"
     );
 }
 
