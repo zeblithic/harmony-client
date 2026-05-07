@@ -6100,10 +6100,12 @@ pub fn mint_redemption(
 /// every retry. `registry.spawn_engine` IS idempotent on repeat calls
 /// for the same community_id (returns the existing engine handle), so
 /// the engine spawn itself is a no-op — the non-idempotence is purely
-/// in the minted event. The frontend should debounce or guard against
-/// repeated redemption clicks; a follow-up (ZEB-258 family) may add a
-/// pre-mint materialized-state lookup so already-Joined re-redemption
-/// short-circuits before minting.
+/// in the minted event. On a re-redemption the body skips the adapter
+/// dispatch (the pre-existing engine already owns its live adapter
+/// pair); see the `engine_already_existed` branch below. The frontend
+/// should debounce or guard against repeated redemption clicks; a
+/// follow-up (ZEB-258 family) may add a pre-mint materialized-state
+/// lookup so already-Joined re-redemption short-circuits before minting.
 #[tauri::command]
 async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -6232,6 +6234,28 @@ async fn redeem_invite(
     // community admin from the invite), NOT self_owner. The engine's
     // authority root is the creator's identity; the joining peer is
     // just a member.
+    //
+    // Re-redemption guard: spawn_engine is idempotent — if an engine
+    // for this community is already in the registry, spawn_engine
+    // returns Ok(()) WITHOUT consuming the fresh `pub_tx`/`sub_rx` we
+    // built above (they are taken by-value and dropped at end of
+    // spawn_engine's body). Unlike `create_community`, redeem_invite's
+    // community_id is not freshly random — the user can legitimately
+    // redeem the same invite URL twice (double-click, retry after
+    // transient error, re-redeem after leaving). Without this guard,
+    // a re-redemption would dispatch a CommunityAdapterRequest with
+    // the orphaned pub_rx/sub_tx, spawning a zombie Zenoh adapter on
+    // dead channels; and on dispatch failure, the error path's
+    // stop_engine would tear down the pre-existing healthy engine
+    // shared with the original redemption. Take the engine_arc check
+    // BEFORE spawn_engine so the gating decision isn't subject to a
+    // race against owner-state add events. Cursor Bugbot finding on
+    // PR #87 round 3.
+    let engine_already_existed = community_registry
+        .engine_arc(&minted.community_id)
+        .await
+        .is_some();
+
     community_registry
         .spawn_engine(
             minted.community_id,
@@ -6244,33 +6268,51 @@ async fn redeem_invite(
         .await
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
-    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
-        id_hex: hex::encode(minted.community_id.0),
-        publisher_rx: pub_rx,
-        subscriber_tx: sub_tx,
-    }) {
-        // Same zombie-engine cleanup as `create_community` on adapter
-        // try_send failure: the engine is in the registry but its
-        // adapter halves were dropped inside the TrySendError variant,
-        // so it can never reach Zenoh. Tear it down before propagating
-        // so a retry doesn't accumulate orphans. Greptile P1 finding on
-        // PR #87 round 2. (Space row already committed — separate
-        // concern tracked by ZEB-258.)
-        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "stop_engine failed while cleaning up after adapter try_send failure"
-            );
+    if !engine_already_existed {
+        // First-time spawn: wire the per-community Zenoh adapter. On
+        // dispatch failure, the engine we just spawned is a zombie
+        // (its adapter halves were dropped inside TrySendError), so
+        // tear it down before propagating. Mirrors the cleanup shape
+        // in `create_community`. The stop_engine call here is safe
+        // precisely because we just spawned this engine — it isn't
+        // shared with any prior redemption. (Space row already
+        // committed — separate concern tracked by ZEB-258.)
+        if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+            id_hex: hex::encode(minted.community_id.0),
+            publisher_rx: pub_rx,
+            subscriber_tx: sub_tx,
+        }) {
+            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "stop_engine failed while cleaning up after adapter try_send failure"
+                );
+            }
+            return Err(match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    "adapter request queue full; please retry".to_string()
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    "adapter request channel closed (event_loop stopped?)".to_string()
+                }
+            });
         }
-        return Err(match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "adapter request queue full; please retry".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "adapter request channel closed (event_loop stopped?)".to_string()
-            }
-        });
+    } else {
+        // Idempotent re-redemption: the pre-existing engine already
+        // owns its live adapter pair from the original spawn. The
+        // fresh `pub_tx`/`sub_rx` we built above were not consumed by
+        // spawn_engine (idempotent no-op) and have already dropped at
+        // end of spawn_engine's body. The matching `pub_rx`/`sub_tx`
+        // we still hold here would pair with dead halves if dispatched
+        // — drop them by NOT dispatching. The bootstrap_join insert
+        // below will append a fresh self-Join event to the existing
+        // engine's CRDT log; LWW materialization absorbs the duplicate
+        // (member list unchanged), but the event log grows by one.
+        // This non-idempotence at the event-log level is documented in
+        // the redeem_invite docstring above.
+        drop(pub_rx);
+        drop(sub_tx);
     }
 
     // Now self-Join via the engine. The engine's `insert_local_event`
