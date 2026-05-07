@@ -79,9 +79,19 @@ async fn fixture() -> (
 
     // Phase 3b: DmOutbox::new takes signing_key + signing_device_hash for
     // ack fan-out. Send-only path here doesn't exercise signing.
+    //
+    // ZEB-262 Phase 4 Task 2: DmOutbox::new also takes Arc<PrivateIdentity>
+    // for the receive-side counter-sign path (not exercised here).
     let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
     let our_device_hash = DeviceIdentityHash([0xaa; 16]);
-    let outbox = DmOutbox::new("alice-device".into(), alice, our_device_hash, signing_key);
+    let private_identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+    let outbox = DmOutbox::new(
+        "alice-device".into(),
+        alice,
+        our_device_hash,
+        signing_key,
+        private_identity,
+    );
 
     (state, outbox, cas, alice, space_id)
 }

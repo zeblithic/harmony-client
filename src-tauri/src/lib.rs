@@ -930,6 +930,30 @@ async fn start_node(
         let identity_pub_64: [u8; 64] = ed25519.public_identity().to_public_bytes();
 
         let reticulum_identity_bytes = Some(zeroize::Zeroizing::new(ed25519.to_private_bytes()));
+        // ZEB-262 Phase 4 Task 2: snapshot a second `PrivateIdentity` instance
+        // BEFORE the local `ed25519` binding is dropped. The Reticulum/Ed25519
+        // identity is the same material we'll later use on the receive-side
+        // counter-sign path (`handle_invite` →
+        // `community_membership::attach_countersig_with_identity`); plumbing
+        // it through `DmOutbox` lets the inbound CommunityInvite handler grab
+        // a reference under the dm_outbox lock without re-reading the
+        // on-disk identity.
+        //
+        // We can't `clone()` `PrivateIdentity` (it carries `ZeroizeOnDrop`
+        // and intentionally does NOT implement Clone), so we reconstruct
+        // from the private bytes we just captured. Round-trip via
+        // `from_private_bytes` is bit-identical: same X25519 secret + same
+        // Ed25519 secret → same `Identity` (verified by
+        // `dm_outbox_holds_private_identity_for_countersign`).
+        let private_identity_arc = std::sync::Arc::new(
+            harmony_identity::PrivateIdentity::from_private_bytes(
+                reticulum_identity_bytes
+                    .as_ref()
+                    .expect("populated above")
+                    .as_slice(),
+            )
+            .expect("private bytes round-trip"),
+        );
         drop(ed25519);
 
         tracing::info!(address = %node_addr, path = %id_path.display(), "identity loaded");
@@ -1099,6 +1123,7 @@ async fn start_node(
                             self_owner,
                             our_signing_device_hash,
                             signing_key_arc.clone(),
+                            std::sync::Arc::clone(&private_identity_arc),
                         ),
                     ));
                     // Production transport: RuntimeUnicastTransport pushes

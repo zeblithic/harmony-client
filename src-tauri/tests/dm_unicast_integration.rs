@@ -38,8 +38,24 @@ use harmony_app::owner_state_types::{
 /// `OwnerAddr` (independent bytes) + `DeviceIdentityHash` (== identity
 /// `address_hash`) + 64-byte combined `identity_pub` (for caching) +
 /// Ed25519 `SigningKey` (extracted from `PrivateIdentity::to_private_bytes()[32..64]`
-/// per Task 11's lib.rs pattern).
-fn make_party(seed_byte: u8) -> (OwnerAddr, DeviceIdentityHash, [u8; 64], Arc<SigningKey>) {
+/// per Task 11's lib.rs pattern) + `Arc<PrivateIdentity>` (the same
+/// material, snapshotted for `DmOutbox::new` per ZEB-262 Phase 4 Task 2).
+///
+/// `PrivateIdentity` does not implement `Clone` (it carries `ZeroizeOnDrop`),
+/// so we round-trip through `to_private_bytes` / `from_private_bytes` to
+/// hand back two byte-identical instances: the `signing_key` derived from
+/// the seed half lives in one `Arc`, and the second `PrivateIdentity` lives
+/// in another. The `dm_outbox_holds_private_identity_for_countersign`
+/// unit test in dm_outbox.rs proves the two are signature-equivalent.
+fn make_party(
+    seed_byte: u8,
+) -> (
+    OwnerAddr,
+    DeviceIdentityHash,
+    [u8; 64],
+    Arc<SigningKey>,
+    Arc<harmony_identity::PrivateIdentity>,
+) {
     let seed = [seed_byte; 32];
     let private = harmony_identity::PrivateIdentity::from_seed(&seed);
     let public = private.public_identity();
@@ -55,7 +71,21 @@ fn make_party(seed_byte: u8) -> (OwnerAddr, DeviceIdentityHash, [u8; 64], Arc<Si
         .try_into()
         .expect("PRIVATE_KEY_LENGTH - 32 == 32");
     let signing_key = Arc::new(SigningKey::from_bytes(&ed25519_seed));
-    (owner, device_hash, identity_pub, signing_key)
+    // ZEB-262 Phase 4 Task 2: round-trip a second `PrivateIdentity` from
+    // the same private bytes for `DmOutbox.private_identity`. Since
+    // `PrivateIdentity` is not Clone, we have to derive it; round-trip is
+    // bit-identical.
+    let private_identity = Arc::new(
+        harmony_identity::PrivateIdentity::from_private_bytes(&private_bytes)
+            .expect("private bytes round-trip"),
+    );
+    (
+        owner,
+        device_hash,
+        identity_pub,
+        signing_key,
+        private_identity,
+    )
 }
 
 /// Pre-populate `state`'s `OwnerDeviceCache` with `(owner → [device])` and
@@ -131,8 +161,10 @@ fn make_dm_space(
 #[tokio::test]
 async fn dm_full_round_trip_through_unicast_channel() {
     // ── Setup: two parties (Alice + Bob), each with their own OwnerState. ──
-    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key) = make_party(0xa1);
-    let (bob_owner, bob_device, bob_identity_pub, bob_signing_key) = make_party(0xb2);
+    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key, alice_private_identity) =
+        make_party(0xa1);
+    let (bob_owner, bob_device, bob_identity_pub, bob_signing_key, bob_private_identity) =
+        make_party(0xb2);
 
     let alice_state = Arc::new(TokioMutex::new(OwnerState::default()));
     let bob_state = Arc::new(TokioMutex::new(OwnerState::default()));
@@ -218,6 +250,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
         alice_owner,
         alice_device,
         alice_signing_key.clone(),
+        Arc::clone(&alice_private_identity),
     )));
 
     let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
@@ -225,6 +258,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
         bob_owner,
         bob_device,
         bob_signing_key.clone(),
+        Arc::clone(&bob_private_identity),
     )));
 
     // ── Send a DM from Alice → Bob. ──
@@ -403,8 +437,10 @@ async fn dm_offline_recipient_then_online_delivers() {
     // real time but only matters once we get to Bob's CidNotify-receive step,
     // by which point we're in the happy-path tail.
 
-    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key) = make_party(0xa1);
-    let (bob_owner, bob_device, bob_identity_pub, bob_signing_key) = make_party(0xb2);
+    let (alice_owner, alice_device, alice_identity_pub, alice_signing_key, alice_private_identity) =
+        make_party(0xa1);
+    let (bob_owner, bob_device, bob_identity_pub, bob_signing_key, bob_private_identity) =
+        make_party(0xb2);
 
     let alice_state = Arc::new(TokioMutex::new(OwnerState::default()));
     let bob_state = Arc::new(TokioMutex::new(OwnerState::default()));
@@ -472,12 +508,14 @@ async fn dm_offline_recipient_then_online_delivers() {
         alice_owner,
         alice_device,
         alice_signing_key.clone(),
+        Arc::clone(&alice_private_identity),
     )));
     let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
         "bob-device".into(),
         bob_owner,
         bob_device,
         bob_signing_key.clone(),
+        Arc::clone(&bob_private_identity),
     )));
 
     // ── Pre-flight: confirm `resolve_destinations` returns [] for Bob
