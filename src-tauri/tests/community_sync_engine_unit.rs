@@ -650,3 +650,39 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
 
     engine.shutdown().await.expect("shutdown");
 }
+
+#[test]
+fn classify_incoming_error_covers_publisher_auth_variants() {
+    use harmony_app::community_membership::MemberStatus;
+    use harmony_app::community_state_sync::CommunitySyncError;
+    use harmony_app::owner_state_types::OwnerAddr;
+
+    // Each variant has a distinct, stable reason_tag — these strings
+    // are the contract with the frontend banner copy.
+    let alice = OwnerAddr([0xA1; 16]);
+    let cases = [
+        (
+            CommunitySyncError::PublisherNotJoined {
+                addr: alice,
+                status: MemberStatus::Banned,
+                left_at: None,
+            },
+            "publisher_not_joined",
+        ),
+        (
+            CommunitySyncError::UnknownPublisher { addr: alice },
+            "publisher_unknown",
+        ),
+        (
+            CommunitySyncError::PublisherSigInvalid { addr: alice },
+            "publisher_sig_invalid",
+        ),
+    ];
+    for (err, expected_tag) in cases {
+        let actual_tag = harmony_app::community_state_sync::classify_incoming_error_for_test(&err);
+        assert_eq!(
+            actual_tag, expected_tag,
+            "reason_tag for {err:?} must be {expected_tag}"
+        );
+    }
+}

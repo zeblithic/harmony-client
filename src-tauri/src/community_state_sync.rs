@@ -323,6 +323,52 @@ pub enum CommunitySyncError {
     /// cache wasn't wired in), not transport or crypto failure.
     #[error("no identity resolver configured — Phase 2 receive-side verify needs one")]
     MissingIdentityResolver,
+
+    /// Publish was signed correctly but the publisher's membership
+    /// state at the publish HLC does NOT have status `Joined`. Either
+    /// they were kicked, banned, never joined, or are still pending
+    /// invitation. Tracker NOT advanced — defends against the
+    /// post-kick censorship attack where a kicked-but-still-keyed
+    /// member tries to squat HLC slots until ZEB-249 (key rotation)
+    /// lands.
+    #[error(
+        "publisher {addr:?} not joined at publish HLC \
+         (status: {status:?}, left_at: {left_at:?})"
+    )]
+    PublisherNotJoined {
+        addr: OwnerAddr,
+        status: crate::community_membership::MemberStatus,
+        /// `MemberState.left_at` field — set on both Leave and Kick
+        /// events (the underlying CRDT field is overloaded). For
+        /// `PublisherNotJoined` triggered by a kick this carries the
+        /// kick HLC; for one triggered by a voluntary Leave-then-
+        /// republish this carries the Leave HLC. `None` when the
+        /// publisher was never a member.
+        left_at: Option<Hlc>,
+    },
+
+    /// `IdentityResolver` returned `None` for `publisher_addr`. Cold
+    /// cache (the publisher's identity_pub hasn't propagated to our
+    /// owner-state cache yet) or the addr was never a member.
+    /// Transient when caused by cold cache; persistent when caused by
+    /// a wholly-fabricated addr — both surface the same way at this
+    /// layer. Tracker NOT advanced; next publish after cache
+    /// propagation succeeds.
+    #[error(
+        "publisher {addr:?} identity not in resolver — \
+         cache cold or addr not yet propagated"
+    )]
+    UnknownPublisher { addr: OwnerAddr },
+
+    /// Ed25519 signature over `canonical_cbor(CommunityRootSignedPayload)`
+    /// did not validate against the resolved identity_pub. This is
+    /// the load-bearing defense against the spoofing attack: a
+    /// malicious member with the `MembershipKey` cannot forge a
+    /// publish claiming another member's `publisher_addr` because
+    /// they don't have that member's signing key. Tracker NOT
+    /// advanced.
+    #[error("publisher signature invalid for addr {addr:?}")]
+    PublisherSigInvalid { addr: OwnerAddr },
 }
 
 /// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
@@ -1638,7 +1684,18 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
         CommunitySyncError::MissingIdentityResolver => "missing_identity_resolver",
+        CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
+        CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
+        CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
     }
+}
+
+/// Test-only re-export of `classify_incoming_error`. Lets the unit
+/// test pin the reason_tag → variant mapping without exposing the
+/// internal function as part of the public API.
+#[doc(hidden)]
+pub fn classify_incoming_error_for_test(err: &CommunitySyncError) -> &'static str {
+    classify_incoming_error(err)
 }
 
 /// Construction-time config for `CommunitySyncRegistry::new`. The
