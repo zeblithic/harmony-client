@@ -7,8 +7,8 @@
 //!      `CommunityInvitePacket` via the Reticulum unicast forwarder
 //!   4. Forwarder routes Bob's packet → Alice's
 //!      `community_invite::handle_unicast` directly (no event_loop in
-//!      this test; the discriminant pre-dispatch is exercised by
-//!      `inbound_packet`'s unit tests + the production wiring)
+//!      this test; the discriminant pre-dispatch is unit-tested in
+//!      `inbound_packet::tests` — Task 9 fix-up)
 //!   5. `handle_unicast` verifies the chain, counter-signs Bob's Join,
 //!      inserts via `engine.insert_local_event`. Alice's engine debounces
 //!      then publishes the counter-signed Join via Phase 2's state-root
