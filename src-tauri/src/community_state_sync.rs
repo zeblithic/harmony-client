@@ -539,6 +539,17 @@ pub struct CommunitySyncEngineConfig {
     /// don't exercise the invite-only path.
     pub is_invite_only: bool,
     pub device_id: String,
+    /// Owner address of the local member. Embedded in every publish so
+    /// receivers can verify the signature against the right
+    /// identity_pub (resolved via `IdentityResolver`, NOT carried
+    /// inline). Also used by `next_hlc` to namespace tracker entries.
+    pub self_owner: OwnerAddr,
+    /// Local Ed25519 signing key for state-root publish signing. Same
+    /// handle Phase 3's `insert_local_event` already uses for membership
+    /// event signing — sourced from the local `PrivateIdentity` at
+    /// engine spawn time. Wrapped in `Arc` so the engine + every
+    /// internal task share the same key without copying the secret.
+    pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     pub state: Arc<Mutex<CommunityState>>,
     pub tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     pub content_store: Arc<dyn ContentStore>,
@@ -648,6 +659,8 @@ impl CommunitySyncEngine {
             admin_addr: cfg.admin_addr,
             is_invite_only: cfg.is_invite_only,
             device_id: cfg.device_id,
+            self_owner: cfg.self_owner,
+            signing_key: cfg.signing_key,
             state: cfg.state,
             tracker: cfg.tracker,
             content_store: cfg.content_store,
@@ -842,6 +855,12 @@ struct InternalCtx {
     admin_addr: OwnerAddr,
     is_invite_only: bool,
     device_id: String,
+    // Read by publish/receive paths in Tasks 5 + 6; the Task 4 commit
+    // only plumbs them from the config into InternalCtx.
+    #[allow(dead_code)]
+    self_owner: OwnerAddr,
+    #[allow(dead_code)]
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     content_store: Arc<dyn ContentStore>,
@@ -1855,6 +1874,14 @@ impl CommunitySyncRegistry {
             admin_addr,
             is_invite_only,
             device_id: self.cfg.device_id.clone(),
+            // TEMP for Task 4: registry config gets self_owner +
+            // signing_key in Task 7. `admin_addr` is deliberately wrong
+            // (it's the community's bootstrap admin, not the local
+            // member) and the dummy [0x42; 32] signing key cannot
+            // produce a valid signature. Task 7 plumbs the real values
+            // through CommunityRegistryConfig and removes these.
+            self_owner: admin_addr,
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             state,
             tracker,
             content_store: Arc::clone(&self.cfg.content_store),

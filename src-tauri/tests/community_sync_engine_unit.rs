@@ -44,6 +44,8 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "test-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state),
         tracker: Arc::clone(&tracker),
         content_store: cs,
@@ -104,6 +106,8 @@ async fn flush_now_publishes_one_root_publish() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "test-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state),
         tracker: Arc::clone(&tracker),
         content_store: cs,
@@ -241,6 +245,8 @@ async fn engine_receives_remote_publish_and_merges_event() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "a-dev".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state_a),
         tracker: Arc::clone(&tracker_a),
         content_store: cs_a,
@@ -271,6 +277,11 @@ async fn engine_receives_remote_publish_and_merges_event() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "b-dev".into(),
+        // Engine B is a distinct local member from the admin — pick a
+        // fresh OwnerAddr. B doesn't publish in this test, so the dummy
+        // signing_key just needs to compile.
+        self_owner: OwnerAddr([0xb1; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -431,6 +442,8 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "a-dev".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state_a),
         tracker: Arc::clone(&tracker_a),
         content_store: cs_a,
@@ -472,6 +485,11 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "b-dev".into(),
+        // Engine B is a distinct local member from the admin — pick a
+        // fresh OwnerAddr. B doesn't publish in this test, so the dummy
+        // signing_key just needs to compile.
+        self_owner: OwnerAddr([0xb1; 16]),
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -563,6 +581,8 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         admin_addr: admin,
         is_invite_only: false,
         device_id: "local-dev".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         state: Arc::clone(&state),
         tracker: Arc::clone(&tracker),
         content_store: cs,
@@ -685,4 +705,48 @@ fn classify_incoming_error_covers_publisher_auth_variants() {
             "reason_tag for {err:?} must be {expected_tag}"
         );
     }
+}
+
+#[tokio::test]
+async fn engine_accepts_self_owner_and_signing_key_in_config() {
+    let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+
+    let community_id = SpaceId([1u8; 16]);
+    let identity = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let self_owner = OwnerAddr(identity.identity.address_hash);
+    let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: self_owner,
+        is_invite_only: false,
+        device_id: "test-device".into(),
+        self_owner,
+        signing_key,
+        state,
+        tracker,
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+    });
+    engine.shutdown().await.expect("shutdown");
 }
