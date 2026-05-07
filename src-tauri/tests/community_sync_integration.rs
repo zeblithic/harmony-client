@@ -2377,24 +2377,28 @@ mod task3_kick_setpower_round_trip {
     }
 }
 
-// ── ZEB-262 Phase 4 Task 8: redeem_invite invite-only timeout regression ─
+// ── ZEB-262 Phase 4 Task 8: redeem_invite invite-only rollback regression ─
 //
-// Construct an invite-only invite from Alice (admin), drop the unicast
-// receiver so Bob's `CommunityInvitePacket` `try_send` either fails or
-// goes nowhere, call `redeem_invite_inner` with a short timeout via env
-// var, and assert:
-//   1. the call returns Err (timeout fires when oneshot is never
-//      notified — or the unicast send fails closed);
+// Construct an invite-only invite from Alice (admin) and drive
+// `redeem_invite_inner` from Bob's side without ever populating an
+// `OwnerDeviceCache` entry for the inviter. The inner helper's
+// `resolve_destinations_for_owner` returns an empty Vec, which
+// short-circuits to a "no destinations" Err well before the 300ms
+// timeout fires (the test typically completes in ~10ms).
+//
+// We assert:
+//   1. the call returns Err (no-destinations rollback path);
 //   2. owner-state CRDT is byte-identical pre/post the failed call
 //      (ZEB-258 reorder invariant: Space row commit must NOT happen
-//      until after the oneshot resolves successfully).
+//      until after the oneshot resolves successfully — and on this
+//      rollback path it never resolves at all).
 //
 // The helper `redeem_invite_inner` accepts a closure for the
 // snapshot-then-commit fence (`F: Fn() -> Result<(), String>`); the
 // production wrapper passes a closure that re-locks `NodeState`'s std
 // Mutex and compares `generation`, while this test passes `|| Ok(())`.
 #[tokio::test]
-async fn redeem_invite_only_times_out_when_inviter_offline() {
+async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
     use harmony_app::community_state_sync::{
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
@@ -2546,7 +2550,6 @@ async fn redeem_invite_only_times_out_when_inviter_offline() {
         adapter_tx,
         unicast_tx,
         Arc::clone(&dm_outbox),
-        /* snapshot_generation */ 0,
         || Ok(()),
     )
     .await;

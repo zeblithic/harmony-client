@@ -6286,7 +6286,6 @@ pub async fn redeem_invite_inner<F>(
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
-    _snapshot_generation: u64, // captured by fence_check closure in production
     fence_check: F,
 ) -> Result<String, String>
 where
@@ -6764,7 +6763,6 @@ async fn redeem_invite(
         community_adapter_tx,
         unicast_send_tx,
         dm_outbox,
-        snapshot_generation,
         fence_check,
     )
     .await
