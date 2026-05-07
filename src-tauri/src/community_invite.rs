@@ -340,14 +340,79 @@ pub enum CommunityInviteDecodeError {
     Invalid(&'static str),
 }
 
-/// Receive-side rejection variants. Full enum + reject paths land in
-/// Task 6; this stub admits only `EnvelopeSigInvalid` so the encode/
-/// decode tests can exercise [`verify_envelope_sig`]. Task 6 EXTENDS
-/// this enum (additive — don't redefine, just append variants).
+/// ZEB-262 Phase 4 receive-side rejection variants. Each maps to a
+/// `community-state-sync-degraded` reason tag for the frontend banner.
+///
+/// Membership-state-dependent variants (`CommunityUnknown`,
+/// `SelfNotJoined`, `SelfPowerInsufficient`) are defined here but
+/// raised by `handle_unicast` in Task 9 — they require engine state
+/// that isn't in scope for `verify_packet_pure`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommunityInviteVerifyError {
+    /// Path B envelope sig didn't validate.
     #[error("envelope sig invalid")]
     EnvelopeSigInvalid,
+    /// signing_device_hash != SHA256(joiner_identity_pub)[..16]. Caught
+    /// at decode time but surfaced through this error type when the
+    /// caller wants the unified reason tag.
+    #[error("device hash mismatch")]
+    DeviceHashMismatch,
+    /// Inner Join event sig failed.
+    #[error("Join event sig invalid")]
+    JoinSigInvalid,
+    /// InviteToken sig failed.
+    #[error("InviteToken sig invalid")]
+    InviteTokenSigInvalid,
+    /// InviteToken.inviter != self_owner. v1 only counter-signs invites
+    /// we issued. ZEB-251 broadens this to any joined member with
+    /// power ≥ invite_threshold.
+    #[error("invite signer mismatch: token says {signer:?}, we are {self_owner:?}")]
+    InviteSignerMismatch {
+        signer: crate::owner_state_types::OwnerAddr,
+        self_owner: crate::owner_state_types::OwnerAddr,
+    },
+    /// community_id disagreement across envelope, Join, and token.
+    #[error("community_id mismatch across envelope/Join/token")]
+    CommunityIdMismatch,
+    /// created_at >= invite_token expires_at, OR created_at > now + 60s.
+    #[error("invite expired or clock-skew rejected")]
+    Expired,
+    /// invite_token.invitee_hint set and != join_event.actor.
+    #[error("invitee_hint mismatch")]
+    InviteeHintMismatch,
+    /// No engine for this community — packet was misrouted. Receiver
+    /// surface; not raised by `verify_packet_pure` (engine state isn't
+    /// in scope there).
+    #[error("community unknown: {community_id:?}")]
+    CommunityUnknown {
+        community_id: crate::owner_state_types::SpaceId,
+    },
+    /// Self isn't currently a Joined member. Receiver surface; engine-
+    /// coupled.
+    #[error("self not joined in community")]
+    SelfNotJoined,
+    /// Self power < invite_threshold (= 0 in v1, structural no-op).
+    #[error("self power insufficient: {self_power} < {threshold}")]
+    SelfPowerInsufficient { self_power: u8, threshold: u8 },
+}
+
+impl CommunityInviteVerifyError {
+    /// Reason tag for the `community-state-sync-degraded` Tauri event.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            Self::EnvelopeSigInvalid => "community_invite_envelope_sig_invalid",
+            Self::DeviceHashMismatch => "community_invite_device_hash_mismatch",
+            Self::JoinSigInvalid => "community_invite_join_sig_invalid",
+            Self::InviteTokenSigInvalid => "community_invite_token_sig_invalid",
+            Self::InviteSignerMismatch { .. } => "community_invite_signer_mismatch",
+            Self::CommunityIdMismatch => "community_invite_id_mismatch",
+            Self::Expired => "community_invite_expired",
+            Self::InviteeHintMismatch => "community_invitee_hint_mismatch",
+            Self::CommunityUnknown { .. } => "community_invite_unknown",
+            Self::SelfNotJoined => "community_invite_self_not_joined",
+            Self::SelfPowerInsufficient { .. } => "community_invite_self_power_insufficient",
+        }
+    }
 }
 
 /// Encode a [`CommunityInvitePacket`] to wire bytes.
@@ -483,6 +548,123 @@ pub fn build_signed_invite_packet(
         signature,
         signed_bytes,
     })
+}
+
+/// Pure verify helper: takes a [`CommunityInviteSigned`], the local self
+/// owner addr, a wall-clock function, and the local `PrivateIdentity` for
+/// the InviteToken sig check. Returns the joiner's signed Join event on
+/// success — caller is then responsible for the engine-coupled checks
+/// (community known, self joined, self power sufficient) before
+/// counter-signing.
+///
+/// Order of checks chosen so cheaper / more diagnostic rejections fire
+/// before expensive crypto:
+///   1. community_id agreement (cheap struct compare)
+///   2. invitee_hint match (cheap if hint is None)
+///   3. expiry / clock-skew (cheap arithmetic, 60s tolerance)
+///   4. InviteToken signer == self (cheap struct compare)
+///   5. Inner Join event sig (1× Ed25519 verify_strict via
+///      `community_membership::verify_signature`)
+///   6. InviteToken sig (1× Ed25519 verify_strict against the canonical
+///      token payload)
+///
+/// Membership-state-dependent checks (`SelfNotJoined`, `CommunityUnknown`,
+/// `SelfPowerInsufficient`) are NOT raised here — they require engine
+/// state and ship in Task 9's `handle_unicast`.
+pub fn verify_packet_pure<F>(
+    signed: &CommunityInviteSigned,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    now_fn: F,
+    self_identity: &harmony_identity::PrivateIdentity,
+) -> Result<crate::community_membership::SignedMembershipEvent, CommunityInviteVerifyError>
+where
+    F: FnOnce() -> u64,
+{
+    // 1. community_id agreement across envelope + Join.
+    if signed.community_id != signed.join_event.community_id {
+        return Err(CommunityInviteVerifyError::CommunityIdMismatch);
+    }
+    // (InviteToken doesn't carry community_id directly in v1 — the
+    // outer URL payload does. Skip a token vs envelope comparison
+    // here; the receive-side engine resolution catches misroutes.)
+
+    // 2. invitee_hint match.
+    if let Some(hint) = signed.invite_token.invitee_hint {
+        if signed.join_event.actor != hint {
+            return Err(CommunityInviteVerifyError::InviteeHintMismatch);
+        }
+    }
+
+    // 3. Expiry / clock-skew.
+    let now = now_fn();
+    if signed.created_at.wall_ms > now.saturating_add(60_000) {
+        return Err(CommunityInviteVerifyError::Expired);
+    }
+    // Outer URL's expires_at is not in CommunityInviteSigned — InviteToken
+    // doesn't carry it either in v1. This expires-comparison hook is
+    // future-proofing for ZEB-251; v1 only enforces the clock-skew arm.
+
+    // 4. InviteToken signer == self.
+    if signed.invite_token.inviter != self_owner {
+        return Err(CommunityInviteVerifyError::InviteSignerMismatch {
+            signer: signed.invite_token.inviter,
+            self_owner,
+        });
+    }
+
+    // 5. Inner Join event sig.
+    crate::community_membership::verify_signature(&signed.join_event, &signed.joiner_identity_pub)
+        .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
+
+    // 6. InviteToken sig.
+    let token_canonical = canonical_invite_token_bytes(&signed.invite_token)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    use ed25519_dalek::Signature;
+    let sig = Signature::from_bytes(&signed.invite_token.sig);
+    self_identity
+        .identity
+        .verifying_key
+        .verify_strict(&token_canonical, &sig)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+
+    Ok(signed.join_event.clone())
+}
+
+/// Canonical-CBOR-encode the InviteToken payload (excluding the sig).
+/// Both the IPC mint path (Phase 4 `generate_invite` for invite-only —
+/// not yet shipped) and the verify path encode through this so signature
+/// bytes cover bit-exact bytes.
+///
+/// Wire format: a 2- or 3-key map with field codes `iv`, `ih`, `mt`
+/// (mirrors `InviteToken`'s renames; same-length-keys CBOR invariant).
+/// `ih` is omitted when `invitee_hint = None` (open redemption form).
+/// Outer-URL `expires_at` is intentionally NOT bound here in v1 — the
+/// clock-skew arm in `verify_packet_pure` carries the freshness check.
+/// ZEB-251 will broaden the binding.
+///
+/// Public so the test harness can call it; mint path (Phase 4 IPC) will
+/// also call this when invite-only `generate_invite` ships, ensuring
+/// mint and verify never drift.
+pub fn canonical_invite_token_bytes(
+    token: &InviteToken,
+) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+    #[derive(serde::Serialize)]
+    struct InviteTokenPayload<'a> {
+        #[serde(rename = "iv")]
+        inviter: &'a crate::owner_state_types::OwnerAddr,
+        #[serde(rename = "ih", skip_serializing_if = "Option::is_none")]
+        invitee_hint: Option<&'a crate::owner_state_types::OwnerAddr>,
+        #[serde(rename = "mt")]
+        minted_at: &'a crate::owner_state_types::Hlc,
+    }
+    let payload = InviteTokenPayload {
+        inviter: &token.inviter,
+        invitee_hint: token.invitee_hint.as_ref(),
+        minted_at: &token.minted_at,
+    };
+    let mut out = Vec::new();
+    ciborium::into_writer(&payload, &mut out)?;
+    Ok(out)
 }
 
 /// Verify the Path B envelope signature over the captured `signed_bytes`.
