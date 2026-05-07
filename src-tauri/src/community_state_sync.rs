@@ -53,7 +53,9 @@ use crate::content_store::ContentStore;
 use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
-use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, MembershipKey, OwnerAddr, SpaceId,
+};
 
 /// Errors specific to community-state encryption + decryption.
 #[derive(thiserror::Error, Debug)]
@@ -192,32 +194,92 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
         .map_err(|_| CommunityCryptoError::AeadFailed)
 }
 
-/// State-root publish payload for a community. Sent over
-/// `harmony/community/{id_hex}/state-root-v1` after AEAD-encryption
-/// via `encrypt_root_publish`. Receivers fetch `root_cid` from CAS
-/// to retrieve the encrypted CommunityState blob, then decrypt with
-/// `decrypt_blob`.
+/// State-root publish wire envelope. ZEB-256: every publish is signed
+/// by the publisher's local Ed25519 device key. Receivers verify the
+/// signature, the publisher's current membership status, and the
+/// per-(addr, device) replay tracker before merging events.
 ///
-/// Wire format: 2-key CBOR map. Both field codes are 2 chars
-/// (`rc` + `at`) to satisfy the same-length-keys invariant at this
-/// nesting level. The HLC `at` is the publisher's monotonic counter
-/// — receivers' RootHlcTrackers reject anything not strictly newer
-/// per (publisher_device_id, hlc) (replay protection; mirrors
-/// `crate::owner_state_types::RootPublishPayload`).
+/// Wire format: 4-key CBOR map. All field codes are 2 chars
+/// (`rc`/`pa`/`at`/`ps`) to satisfy the same-length-keys invariant
+/// at this nesting level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityRootPublishPayload {
-    /// Content-ID of the encrypted CommunityState blob in the
-    /// shared ContentStore.
+    /// Content-ID of the encrypted CommunityState blob in the shared
+    /// ContentStore. Unchanged from Phase 2.
     #[serde(rename = "rc")]
     pub root_cid: ContentId,
-    /// Publisher's HLC at publish time. Monotonically increasing per
-    /// device_id; receivers track per-device latest-seen.
+
+    /// Owner address of the publishing member. Receivers use this to
+    /// (a) resolve identity_pub via IdentityResolver, (b) check
+    /// membership-at-publish-HLC, (c) namespace the replay tracker.
+    #[serde(rename = "pa")]
+    pub publisher_addr: OwnerAddr,
+
+    /// Publisher's HLC at publish time. Carries device_id; tracker
+    /// slot key is `(publisher_addr, at.device_id)`. Unchanged shape
+    /// from Phase 2 — only the tracker's interpretation changed.
     #[serde(rename = "at")]
     pub at: Hlc,
+
+    /// Ed25519 signature over canonical CBOR of
+    /// `CommunityRootSignedPayload { root_cid, publisher_addr, at }`.
+    #[serde(
+        rename = "ps",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub publisher_sig: [u8; 64],
 }
 
 impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
 impl CanonicalPayload for CommunityRootPublishPayload {}
+
+/// The unsigned portion of a `CommunityRootPublishPayload` — the
+/// canonical-CBOR bytes the publisher signs. Mirrors `EventPayload` vs
+/// `SignedMembershipEvent`: keeping the signed sub-payload as its own
+/// type means the signed bytes are unambiguous (no place to put "the
+/// actual sig went here" in the encoded form).
+///
+/// All 3 field keys are 2 chars to satisfy the same-length-keys
+/// invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRootSignedPayload {
+    #[serde(rename = "rc")]
+    pub root_cid: ContentId,
+    #[serde(rename = "pa")]
+    pub publisher_addr: OwnerAddr,
+    #[serde(rename = "at")]
+    pub at: Hlc,
+}
+
+impl CanonicalPayloadSealed for CommunityRootSignedPayload {}
+impl CanonicalPayload for CommunityRootSignedPayload {}
+
+impl CommunityRootSignedPayload {
+    /// Convert a signed sub-payload into its full wire envelope by
+    /// attaching the Ed25519 signature.
+    pub fn into_wire(self, publisher_sig: [u8; 64]) -> CommunityRootPublishPayload {
+        CommunityRootPublishPayload {
+            root_cid: self.root_cid,
+            publisher_addr: self.publisher_addr,
+            at: self.at,
+            publisher_sig,
+        }
+    }
+}
+
+/// Convenience: extract the signed sub-payload from a full wire
+/// envelope. Used by receive-side verify to reproduce the canonical
+/// CBOR bytes the publisher signed.
+impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
+    fn from(w: &CommunityRootPublishPayload) -> Self {
+        Self {
+            root_cid: w.root_cid,
+            publisher_addr: w.publisher_addr,
+            at: w.at.clone(),
+        }
+    }
+}
 
 /// Default debounce window between a `notify_dirty` and the resulting
 /// state-root publish. Mirrors `owner_state_sync::DEFAULT_DEBOUNCE_MS`
@@ -1008,7 +1070,16 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 
     // 5. Build state-root payload with a strictly-newer HLC.
     let now = next_hlc(ctx).await;
-    let payload = CommunityRootPublishPayload { root_cid, at: now };
+    // TEMP for Task 1 (ZEB-256): publisher_addr / publisher_sig are
+    // placeholders so the workspace continues to compile. Task 5 replaces
+    // both with real values (ctx.self_owner + Ed25519-sign of the
+    // CommunityRootSignedPayload canonical CBOR).
+    let payload = CommunityRootPublishPayload {
+        root_cid,
+        publisher_addr: OwnerAddr([0; 16]),
+        at: now,
+        publisher_sig: [0; 64],
+    };
     let payload_bytes = canonical_cbor_encode(&payload)
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
 

@@ -356,11 +356,17 @@ async fn forged_signature_event_is_rejected_on_receive() {
 
     let publish = CommunityRootPublishPayload {
         root_cid,
+        // TEMP for Task 1 (ZEB-256): publisher_addr / publisher_sig are
+        // placeholders so the integration test continues to compile.
+        // Task 6 replaces these with real values once the verify path
+        // enforces them.
+        publisher_addr: OwnerAddr([0; 16]),
         at: Hlc {
             wall_ms: 200,
             logical: 0,
             device_id: "attacker-dev".into(),
         },
+        publisher_sig: [0; 64],
     };
     let publish_bytes = canonical_cbor_encode(&publish).expect("encode publish");
     let wire = encrypt_root_publish(&mk, &publish_bytes).expect("encrypt root");
