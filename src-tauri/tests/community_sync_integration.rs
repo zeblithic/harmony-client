@@ -1369,7 +1369,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
 /// admits), at which point the surviving tracker entry from this
 /// test is what the censorship-defense argument relies on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn re_joined_member_publish_admitted_after_leave() {
+async fn leave_does_not_prune_per_device_tracker_entry() {
     let cas_tx = spawn_shared_cas();
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_tx,
@@ -1527,24 +1527,6 @@ async fn re_joined_member_publish_admitted_after_leave() {
         .await
         .expect("engine a");
 
-    // Helper: build + sign a fresh membership event from Alice with a
-    // synthetic wall_ms so the integration assertions can reason about
-    // event order without relying on real time.
-    let mk_event = |id: [u8; 16], kind: MembershipEventKind, wall: u64| {
-        let payload = EventPayload {
-            id,
-            community_id,
-            kind,
-            actor: alice_addr,
-            at: Hlc {
-                wall_ms: wall,
-                logical: 0,
-                device_id: "a-dev".into(),
-            },
-        };
-        sign_event_with_identity(&payload, &id_alice).expect("sign")
-    };
-
     // Step 1 — flush A's bootstrap CRDT to B. Alice's status is
     // `Joined` in both replicas, so B's membership gate admits the
     // publish. After it lands, B's tracker for `(alice_addr, "a-dev")`
@@ -1587,8 +1569,22 @@ async fn re_joined_member_publish_admitted_after_leave() {
     // `Joined` in B's local CRDT (the Leave hasn't merged yet), so the
     // gate admits the publish. After ingestion B has 2 events (Join,
     // Leave) and Alice's status flips to `Left`.
+    let alice_leave_event = {
+        let payload = EventPayload {
+            id: [2u8; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_alice).expect("sign alice leave")
+    };
     engine_a
-        .insert_local_event(mk_event([2u8; 16], MembershipEventKind::Leave, 200))
+        .insert_local_event(alice_leave_event)
         .await
         .expect("a leave");
     registry_a.flush_now(&community_id).await.expect("flush 2");
