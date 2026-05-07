@@ -5652,11 +5652,18 @@ pub fn mint_community_creation(
 }
 
 /// Internal helper for `create_community`. Takes already-snapshotted
-/// handles; pure of `tauri::State` aside from the final generation
-/// fence (which intentionally re-acquires the std `NodeState` lock to
-/// guard against a stop-during-await race). ZEB-258: owner-state Space
-/// commit is the LAST persistent step. Failures BEFORE the commit tear
-/// down the engine + return Err with crdt_state untouched.
+/// handles; pure of `tauri::State`. The final generation fence
+/// re-acquires the std `NodeState` lock (passed as `&Mutex<NodeState>`)
+/// to guard against a stop-during-await race. ZEB-258: owner-state
+/// Space commit is the LAST persistent step. Failures BEFORE the
+/// commit tear down the engine + return Err with crdt_state untouched.
+///
+/// Takes `&Mutex<NodeState>` rather than `tauri::State<'_, Mutex<NodeState>>`
+/// so integration tests can invoke the helper directly with a
+/// freshly-constructed `Mutex<NodeState>` (the regression test for the
+/// ZEB-258 reorder is load-bearing only when it actually drives the
+/// production code path). The wrapper passes `&state_lock` (Tauri's
+/// `State` auto-derefs to `&Mutex<NodeState>`).
 ///
 /// Argument shape mirrors what `redeem_invite_inner` will look like
 /// (Phase 4 Task 8 will extract it the same way) so the two IPCs share
@@ -5685,7 +5692,7 @@ pub async fn create_community_inner(
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     snapshot_generation: u64,
-    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    node_state: &std::sync::Mutex<NodeState>,
 ) -> Result<String, String> {
     if is_invite_only {
         return Err(
@@ -5822,7 +5829,7 @@ pub async fn create_community_inner(
         RegistryGone,
     }
     let verdict = {
-        let g = state_lock
+        let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
@@ -5984,7 +5991,7 @@ async fn create_community(
         community_registry,
         community_adapter_tx,
         snapshot_generation,
-        state_lock,
+        &state_lock,
     )
     .await
 }

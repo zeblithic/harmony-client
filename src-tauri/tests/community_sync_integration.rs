@@ -1835,7 +1835,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
 
 // ─── ZEB-258 atomic-rollback regression test ────────────────────────
 //
-// Pins the invariant that `create_community` does NOT mutate
+// Pins the invariant that `create_community_inner` does NOT mutate
 // owner-state CRDT when a downstream step (engine spawn or adapter
 // dispatch) fails. The pre-reorder body applied the Community Space
 // row to owner-state BEFORE spawning the engine + dispatching the
@@ -1844,25 +1844,15 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
 // reorder body commits the Space row LAST and tears the engine down
 // on any earlier failure.
 //
-// Test shape: structurally a fault-injection harness around the
-// invariant rather than an end-to-end IPC call (the IPC takes
-// `tauri::State<NodeState>`, which the integration test can't
-// construct). Exercises the same primitives in the same order as
-// `create_community_inner`:
-//
-//   1. mint Space + bootstrap_join via the public `mint_community_creation`
-//   2. spawn_engine
-//   3. adapter_tx.try_send → fails (channel closed)
-//   4. stop_engine
-//   5. assert crdt_state byte-identical to pre-step-1 snapshot
-//
-// Step 5 is the load-bearing assertion: the test never calls
-// apply_space, mirroring what the post-reorder body does on the
-// failure path. A regression that re-introduced the pre-reorder
-// shape (apply_space FIRST) would surface here as a test failure
-// in `create_community_inner` itself once that helper is exercised
-// from a future end-to-end IPC test (Phase 4 Task 8 ships it
-// alongside `redeem_invite_inner`).
+// Test shape: invokes `create_community_inner` DIRECTLY with a
+// closed adapter channel. The helper takes `&Mutex<NodeState>` (not
+// `tauri::State`), so the test constructs a fresh
+// `Mutex<NodeState>` and passes a borrow. The byte-identity
+// assertion is now load-bearing: a regression that re-introduced the
+// pre-reorder shape (apply_space FIRST) would mutate `crdt_state`
+// inside `create_community_inner` BEFORE the failing
+// `community_adapter_tx.try_send`, and the post-snapshot bytes would
+// differ.
 #[tokio::test]
 async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     use harmony_app::community_state_sync::{
@@ -1871,6 +1861,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
+    use std::collections::BTreeMap;
 
     struct NopResolver;
     #[async_trait::async_trait]
@@ -1880,8 +1871,9 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         }
     }
 
-    // Closed adapter receiver → the matching `try_send` returns Closed.
-    // This is the fault we inject to exercise the rollback path.
+    // Closed adapter receiver → the matching `try_send` inside
+    // `create_community_inner` returns Closed. This is the fault we
+    // inject to drive the rollback path.
     let (adapter_tx, adapter_rx) =
         mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(1);
     drop(adapter_rx);
@@ -1919,78 +1911,54 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     // CBOR encodes the spaces map, which Phase 1's `apply_space_with_
     // canonicalization` would non-trivially mutate).
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
     let pre_bytes: Vec<u8> = {
         let g = crdt_state.lock().await;
         canonicalize(&g).expect("encode pre-state")
     };
 
-    // Mirror `create_community_inner`'s post-reorder sequence. The IPC
-    // takes a `tauri::State` we can't construct here; the integration
-    // test instead drives the same primitives in the same order. The
-    // load-bearing invariant is that crdt_state is NEVER touched on
-    // the failure path — the IPC reaches the apply_space step only
-    // after every fallible step (mint, spawn_engine, adapter dispatch,
-    // bootstrap-Join insert, generation fence) has succeeded.
-    let wall_now_ms = 1_700_000_000_000u64;
-    let prev_hlc: Option<&Hlc> = None;
-    let minted = harmony_app::mint_community_creation(
-        "TestCommunity",
+    // Fence-state. The adapter-dispatch-failure path RETURNS BEFORE
+    // the helper's snapshot-then-commit fence is reached, so the
+    // contents of NodeState don't matter for THIS test (only the
+    // helper's signature requires the borrow). A bare default works.
+    let node_state = std::sync::Mutex::new(harmony_app::NodeState::default());
+
+    // Drive `create_community_inner` directly. With a closed adapter
+    // channel, the helper:
+    //   1. mints Space + bootstrap_join (no side effects)
+    //   2. spawns the engine (success)
+    //   3. `community_adapter_tx.try_send` → Closed → rollback branch:
+    //      `community_registry.stop_engine` then `return Err(...)`
+    // crdt_state is not touched on this branch. Phase 4 Task 7 will
+    // swap stop_engine for shutdown_engine_and_cleanup_persistence;
+    // for ZEB-258 the byte-identity invariant is on owner-state alone.
+    let result = harmony_app::create_community_inner(
+        "TestCommunity".into(),
         false,
+        Arc::clone(&crdt_state),
+        Arc::clone(&hlc_tracker),
+        "test-dev".into(),
         self_owner,
-        signing_key.as_ref(),
-        "test-dev",
-        wall_now_ms,
-        prev_hlc,
+        Arc::clone(&signing_key),
+        Arc::clone(&registry),
+        adapter_tx,
+        0, // snapshot_generation; fence not reached on this path
+        &node_state,
     )
-    .expect("mint");
-
-    let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(64);
-
-    registry
-        .spawn_engine(
-            minted.community_id,
-            minted.membership_key.clone(),
-            self_owner,
-            false,
-            pub_tx,
-            sub_rx,
-        )
-        .await
-        .expect("spawn ok");
-
-    // Adapter dispatch — should fail (channel closed). This is the
-    // synthetic fault that the post-reorder body catches BEFORE
-    // touching owner-state.
-    let dispatch_result = adapter_tx.try_send(harmony_app::event_loop::CommunityAdapterRequest {
-        id_hex: hex::encode(minted.community_id.0),
-        publisher_rx: pub_rx,
-        subscriber_tx: sub_tx,
-    });
+    .await;
     assert!(
-        dispatch_result.is_err(),
-        "test fixture: adapter channel must be closed"
+        result.is_err(),
+        "create_community_inner must return Err when the adapter channel is closed"
     );
 
-    // Production rollback: tear the engine down. Task 7 (ZEB-262 Phase
-    // 4) swaps `stop_engine` for `shutdown_engine_and_cleanup_persistence`,
-    // which ALSO removes the per-community persistence directory. For
-    // ZEB-258 the byte-identity assertion below is on owner-state
-    // alone, so `stop_engine` is sufficient to reflect the rollback
-    // shape.
-    registry
-        .stop_engine(&minted.community_id)
-        .await
-        .expect("stop ok");
-
     // ZEB-258 invariant: owner-state CRDT byte-identical to pre-call
-    // snapshot. The test never invokes `apply_space_with_canonicalization`,
-    // mirroring the post-reorder body which only reaches that step
-    // after every fallible step has succeeded. A regression that
-    // re-introduced the pre-reorder shape would mutate owner-state
-    // here (specifically: `state_g.apply_space_with_canonicalization`
-    // would commit `minted.space` and the post-snapshot bytes would
-    // differ).
+    // snapshot. The post-reorder body only reaches the apply_space
+    // step after every fallible step has succeeded; this test wedges
+    // a Closed adapter dispatch in BEFORE that step, so a correctly
+    // ordered helper leaves crdt_state untouched. A regression that
+    // re-introduced the pre-reorder shape (apply_space FIRST) would
+    // commit `minted.space` to crdt_state before the try_send error,
+    // and the post-snapshot bytes would diverge.
     let post_bytes: Vec<u8> = {
         let g = crdt_state.lock().await;
         canonicalize(&g).expect("encode post-state")
@@ -1998,8 +1966,8 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     assert_eq!(
         pre_bytes, post_bytes,
         "ZEB-258: owner-state CRDT must be byte-identical pre/post a \
-         failed create_community (orphan Space row would prove the \
-         reorder didn't land)"
+         failed create_community_inner (orphan Space row would prove \
+         the reorder didn't land)"
     );
 
     registry.shutdown_all().await.expect("shutdown");
