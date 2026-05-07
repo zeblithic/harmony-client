@@ -1431,6 +1431,17 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    trusted state, so there's no integrity risk in trusting it
     //    pre-sig.
     //
+    //    Gate-ordering note: this gate AND step 3 (resolver lookup)
+    //    intentionally consume the unauthenticated `publisher_addr`
+    //    before the authoritative sig-verify in step 4. This is by
+    //    design — they're cheapest-first DoS pre-filters that bound
+    //    work on adversarial inbound traffic, not security gates. The
+    //    *security* invariant is enforced at step 4: a forged
+    //    publisher_addr that happens to be a current member can pass
+    //    steps 2+3 but cannot survive step 4 unless the attacker also
+    //    forged a valid Ed25519 signature. The tracker never advances
+    //    on rejection at any step.
+    //
     //    Spec compliance: materialize the prefix of our local log
     //    strictly before `payload.at` via `prior_state_at_hlc` and
     //    check the publisher's status as of THAT HLC. This matches
@@ -1441,6 +1452,20 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    publish-HLC view shows the publisher as `Joined` for any
     //    publish strictly preceding the membership change in HLC
     //    order, so the gate admits it.
+    //
+    //    Bootstrap caveat (tracked as ZEB-260): the gate cannot
+    //    inspect events INSIDE the encrypted blob. A new joiner's
+    //    own first publish carries their Join in the blob; if our
+    //    local log doesn't already contain that Join (or an
+    //    admin-issued Invite that resolves to it post-merge), the
+    //    publisher will appear unknown and we will reject. Production
+    //    paves over this in two ways: (a) the redemption flow on the
+    //    joiner's own device inserts the Join locally before the
+    //    first publish; (b) Phase 4's invite-only flow re-Joins via
+    //    an admin-published Invite — admin is already Joined in our
+    //    view, so the gate admits and we learn the Join after merge.
+    //    Self-Re-Join after Leave hits the same bootstrap edge and
+    //    is also deferred under ZEB-260.
     {
         let state = ctx.state.lock().await;
         let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
@@ -1453,11 +1478,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         if !is_joined {
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
                 addr: payload.publisher_addr,
-                // None → `Left` for diagnostic — the publisher is not
-                // joined but the materialized map has no entry. Treating
-                // it as Left preserves "the publisher is no longer a
-                // member" semantics in the error string without
-                // inventing a new MemberStatus variant.
+                // `None` from `members.get` is the catch-all "not
+                // currently Joined per our prior-state-at-publish-HLC
+                // view": the publisher was never a member, has not
+                // yet had their Join propagate to us (cold cache /
+                // out-of-band-bootstrap path), or `publisher_addr`
+                // is fabricated. We collapse all three onto
+                // `MemberStatus::Left` rather than introduce a fourth
+                // variant — the error is diagnostic-only and the
+                // security invariant ("not Joined → reject") is
+                // unchanged. Frontend code that branches on this
+                // field MUST treat `Left` + `left_at: None` as the
+                // "never joined / unknown" case (genuine Leaves
+                // always carry a `left_at`).
                 status: status_now.unwrap_or(MemberStatus::Left),
                 left_at: member_state.and_then(|s| s.left_at),
             });
@@ -1484,10 +1517,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     };
 
     // 4. Verify Ed25519 signature over canonical CBOR of
-    //    `CommunityRootSignedPayload::from(&payload)`. `identity_pub`
-    //    is 64 bytes (X25519_pub(32) || Ed25519_pub(32)); the Ed25519
-    //    half is the second 32 bytes — the X25519 half is X3DH
-    //    territory and not used for state-root sigs.
+    //    `CommunityRootSignedPayload::from(&payload)`.
+    //
+    //    Key→address binding: before consuming the resolved key we
+    //    re-derive `address_hash` from the 64-byte identity public
+    //    bytes and reject if it does not equal `payload.publisher_addr`.
+    //    This is defense-in-depth against a buggy / stale resolver
+    //    handing us the wrong identity for `publisher_addr` — without
+    //    this check, a valid signature from key X would be accepted
+    //    under a falsely-claimed address Y. Mirrors the binding step
+    //    in `community_membership::verify_signature` (line 446) and
+    //    `verify_countersig` (line 522), which use the same
+    //    `harmony_identity::Identity::from_public_bytes` derivation.
     //
     //    Use `verify_strict` (not `verify`): strict mode rejects
     //    signatures with non-canonical S values and small-order R
@@ -1504,18 +1545,28 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 ));
             }
         };
-        let mut ed_pub_bytes = [0u8; 32];
-        ed_pub_bytes.copy_from_slice(&publisher_pub[32..64]);
-        let ed_pub = match ed25519_dalek::VerifyingKey::from_bytes(&ed_pub_bytes) {
-            Ok(k) => k,
-            Err(_) => {
+        let identity = match harmony_identity::Identity::from_public_bytes(&publisher_pub) {
+            Ok(i) if i.address_hash == payload.publisher_addr.0 => i,
+            // Either the identity bytes are malformed OR the resolver
+            // returned a key whose `address_hash` does not match the
+            // claimed publisher_addr. Both cases collapse to the same
+            // observable outcome: this publish is unauthenticated under
+            // the claimed addr. Surface as `PublisherSigInvalid` so the
+            // existing degraded-report path handles it (rather than
+            // adding a separate "key did not bind to addr" variant —
+            // the security invariant is identical).
+            _ => {
                 return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
                     addr: payload.publisher_addr,
                 });
             }
         };
         let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
-        if ed_pub.verify_strict(&signed_bytes, &sig).is_err() {
+        if identity
+            .verifying_key
+            .verify_strict(&signed_bytes, &sig)
+            .is_err()
+        {
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
                 addr: payload.publisher_addr,
             });

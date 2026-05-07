@@ -536,6 +536,42 @@ async fn forged_signature_event_is_rejected_on_receive() {
         );
     }
 
+    // The tracker must have advanced for `(admin, "attacker-dev")`
+    // to the publish HLC. The publisher gates passed (admin is the
+    // legitimate publisher and signed the wrapper correctly), so
+    // step 11's "single mutation point" runs — even though step 9's
+    // per-event verify rejected the malformed inner event. Pinning
+    // the tracker advance defends against a future regression that
+    // moves the per-event verify failure UP the pipeline (e.g.,
+    // turning verify_event_rejected into a pre-mutation rollback) —
+    // without this assertion that regression would silently hide
+    // the legitimate publisher's HLC behind a stale tracker slot.
+    let publish_hlc = Hlc {
+        wall_ms: 200,
+        logical: 0,
+        device_id: "attacker-dev".into(),
+    };
+    {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        let entry = snap
+            .per_device
+            .get(&(admin, "attacker-dev".to_string()))
+            .cloned()
+            .expect(
+                "tracker MUST record (admin, attacker-dev) — \
+                 publisher gates passed; only per-event verify \
+                 failed, so step 11 single-mutation-point ran",
+            );
+        assert_eq!(
+            entry, publish_hlc,
+            "tracker entry should be the publish HLC (200, 0); \
+             actual={entry:?}, expected={publish_hlc:?}"
+        );
+    }
+
     registry_b.shutdown_all().await.expect("shutdown b");
 }
 
@@ -1325,34 +1361,67 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         );
     }
 
-    // Step 3 — Alice publishes legitimately AGAIN. Her engine's
-    // `next_hlc` produces HLC₂ with `wall_ms ≈ now` (or a logical
-    // bump if same-millisecond) — strictly newer than HLC₁ but vastly
-    // less than `huge`. To force a non-empty publish (the engine
-    // skips publishing if the CRDT hasn't changed since last flush),
-    // we mint a fresh local Update via `insert_local_event` on A.
+    // Step 3 — Alice publishes legitimately AGAIN, this time
+    // carrying a REAL CRDT mutation. Her engine's `next_hlc` produces
+    // HLC₂ with `wall_ms ≈ now` (or a logical bump if same-
+    // millisecond) — strictly newer than HLC₁ but vastly less than
+    // `huge`.
     //
-    // We use a Leave event from Alice — the simplest event Alice can
-    // self-mint that will mutate the CRDT she already has. (A second
-    // Join is a no-op on the CRDT — the unique-id key would clash on
-    // re-insert; a Leave changes Alice's status to Left and is what
-    // production would call when Alice quits the community.)
+    // We mint a `SetPower { target: alice_addr, level: 100 }` event
+    // through `engine.insert_local_event(...)` rather than relying on
+    // `flush_now` to republish an unchanged CRDT. Alice is the
+    // community admin (implicit power 100, ≥ POWER_THRESHOLDS.set_power),
+    // and `target=alice` keeps the mutation a self-Update — it does
+    // NOT change Alice's membership status, so the membership-at-
+    // publish-HLC gate still sees her as `Joined` when the resulting
+    // publish lands at B.
     //
-    // NB: If Alice leaves, the membership-at-publish gate would then
-    // reject a SUBSEQUENT publish from her — but step 3 is only ONE
-    // publish, so the gate evaluates the publish HLC against
-    // Alice's status AT THE PUBLISH HLC. Membership status is
-    // computed from events with `at < publish_hlc` (look-back).
-    // Alice's Leave event lives at `wall_ms ≈ now`; her publish HLC
-    // also lives at `wall_ms ≈ now`. Whether the leave dominates the
-    // publish HLC is timing-sensitive, so we use a different mutation:
-    // a follow-up Join from a separate device for Alice would also
-    // not insert (duplicate id). Simplest path: do NOT insert a new
-    // event; instead, force a flush, which re-publishes the same
-    // CRDT with a new HLC. The engine doesn't actually skip "no-op"
-    // publishes — `flush_now` always advances next_hlc and emits a
-    // wire packet (see `publish_root_now` step 5), so the same
-    // single-event CRDT will produce a strictly-newer wire packet.
+    // Why not Leave: at HLC₂_publish > HLC₂_leave, B's
+    // `prior_state_at_hlc(HLC₂_publish)` would materialize the Leave
+    // and reject the publish with `PublisherNotJoined`. SetPower is
+    // status-neutral.
+    //
+    // Why not flush_now alone: `flush_now` republishes whatever CRDT
+    // already exists, and the engine today happens not to skip no-op
+    // publishes — but anchoring this regression test to a no-op
+    // republish couples the security guarantee to a publish-
+    // scheduling implementation detail. A real mutation makes the
+    // censorship-defense assertion durable across future engine
+    // changes (CodeRabbit PR #88 round 2 finding).
+    let alice_setpower_event = {
+        let payload = EventPayload {
+            id: [99u8; 16],
+            community_id,
+            kind: MembershipEventKind::SetPower {
+                target: alice_addr,
+                level: 100,
+            },
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_alice).expect("sign alice setpower")
+    };
+    {
+        let engine_a = registry_a
+            .engine_arc(&community_id)
+            .await
+            .expect("engine a spawned");
+        let outcome = engine_a
+            .insert_local_event(alice_setpower_event)
+            .await
+            .expect("insert_local_event setpower");
+        assert!(
+            matches!(
+                outcome,
+                harmony_app::community_state_crdt::InsertOutcome::Inserted
+            ),
+            "SetPower insert outcome must be Inserted, got {outcome:?}"
+        );
+    }
     registry_a
         .flush_now(&community_id)
         .await
@@ -1432,16 +1501,23 @@ async fn spoofed_publish_does_not_block_real_publisher() {
 ///      by `would_accept` against the surviving entry.
 ///
 /// Note on test shape — the original draft also tried to verify a
-/// re-Join publish being admitted end-to-end, but the receive-side
-/// membership-at-HLC gate (community_state_sync.rs:1454) rejects any
-/// publish from a publisher whose CURRENT materialized status is not
-/// `Joined`. After the Leave merges, Alice is `Left`, so her next
-/// publish (which would carry her own re-Join event) is rejected
-/// before the blob is ingested — the gate cannot peek inside the
-/// encrypted blob to see the re-Join. Phase 4's invite flow re-Joins
-/// Alice via an admin-issued Invite (separate publisher, gate
-/// admits), at which point the surviving tracker entry from this
-/// test is what the censorship-defense argument relies on.
+/// re-Join publish being admitted end-to-end. The receive-side
+/// membership gate uses `prior_state_at_hlc(payload.at)` (NOT
+/// the publisher's *current* materialized status) — this is the
+/// post-PR-88-bot-round-1 shape. The semantics are still wrong for
+/// self-Re-Join, just for a more subtle reason: after Alice's Leave
+/// at HLC₂ merges into B, any subsequent re-Join publish from Alice
+/// must use a HLC₃ > HLC₂ (HLC monotonicity is enforced engine-side
+/// via `next_hlc`). When B materializes the prior state at HLC₃, the
+/// Leave at HLC₂ is included, so Alice's status is `Left` and the
+/// gate rejects. The gate cannot peek inside the encrypted blob to
+/// see Alice's new Join event riding alongside the publish.
+///
+/// Phase 4's invite flow re-Joins Alice via an admin-issued Invite
+/// (separate publisher, gate admits), at which point the surviving
+/// tracker entry from this test is what the censorship-defense
+/// argument relies on. The same bootstrap edge applies to a brand-
+/// new joiner's first self-publish; both are deferred under ZEB-260.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leave_does_not_prune_per_device_tracker_entry() {
     let cas_tx = spawn_shared_cas();
