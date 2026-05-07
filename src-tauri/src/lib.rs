@@ -1115,7 +1115,7 @@ async fn start_node(
                             unicast_send_tx.clone(),
                             self_owner,
                             our_signing_device_hash,
-                            signing_key_arc,
+                            std::sync::Arc::clone(&signing_key_arc),
                         ));
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
@@ -1197,6 +1197,13 @@ async fn start_node(
                             debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
                             error_tx: Some(community_degraded_tx),
                             delta_tx: Some(community_delta_tx.clone()),
+                            // ZEB-256 Task 6: registry holds the local
+                            // identity once; every spawned engine
+                            // clones into its CommunitySyncEngineConfig.
+                            // Both values already exist above for the
+                            // DmOutbox plumbing.
+                            self_owner,
+                            signing_key: std::sync::Arc::clone(&signing_key_arc),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),

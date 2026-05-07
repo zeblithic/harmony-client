@@ -30,7 +30,7 @@ use harmony_app::community_membership::{
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
     encrypt_blob, encrypt_root_publish, CommunityDegradedReport, CommunityRegistryConfig,
-    CommunityRootPublishPayload, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
@@ -43,6 +43,19 @@ use tokio::sync::{mpsc, Mutex};
 // ---------------------------------------------------------------------
 // Shared test scaffolding
 // ---------------------------------------------------------------------
+
+/// Reach into `PrivateIdentity`'s ed25519 seed (canonical 32-byte seed
+/// at bytes [32..64] of `to_private_bytes()`) and return a matching
+/// `ed25519_dalek::SigningKey`. ZEB-256 Task 6: receive-side sig-verify
+/// requires the engine's signing key to match the publisher's
+/// `identity_pub`, so registry config + engine config can no longer
+/// hand-wave with a dummy `[0x42; 32]` seed.
+fn signing_key_from(identity: &PrivateIdentity) -> Arc<ed25519_dalek::SigningKey> {
+    let private_bytes = identity.to_private_bytes();
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&private_bytes[32..64]);
+    Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
+}
 
 /// Static `IdentityResolver` backed by an in-memory `HashMap`. The
 /// production `OwnerDeviceCacheResolver` walks Sub-A's owner-device
@@ -138,6 +151,14 @@ async fn two_members_dag_sync_full_event_log() {
     let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
+    let admin_signing = signing_key_from(&id_admin);
+
+    // For B to publish under its own identity, derive a separate
+    // PrivateIdentity. This test does not exercise B's publish path,
+    // but the registry needs a valid signing-key/self_owner pair.
+    let id_b = PrivateIdentity::from_seed(&[0xb1; 32]);
+    let b_owner = OwnerAddr(id_b.identity.address_hash);
+    let b_signing = signing_key_from(&id_b);
 
     let mut resolver_map = std::collections::HashMap::new();
     resolver_map.insert(admin, admin_pub);
@@ -164,6 +185,9 @@ async fn two_members_dag_sync_full_event_log() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: A's registry signs publishes as admin.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -173,6 +197,10 @@ async fn two_members_dag_sync_full_event_log() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: B doesn't publish in this one-way test;
+        // values just need to satisfy the type bound.
+        self_owner: b_owner,
+        signing_key: Arc::clone(&b_signing),
     });
 
     // B's publisher and A's subscriber are unused in this one-way
@@ -199,8 +227,7 @@ async fn two_members_dag_sync_full_event_log() {
         .state_for(&community_id)
         .await
         .expect("engine spawned");
-    {
-        let mut sa = state_a.lock().await;
+    let admin_join_event = {
         let payload = EventPayload {
             id: [9u8; 16],
             community_id,
@@ -212,9 +239,40 @@ async fn two_members_dag_sync_full_event_log() {
                 device_id: "a-dev".into(),
             },
         };
-        let event = sign_event_with_identity(&payload, &id_admin).expect("sign");
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    {
+        let mut sa = state_a.lock().await;
         let outcome = sa.insert_event(
-            event,
+            admin_join_event.clone(),
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    // ZEB-256 Task 6: pre-seed B's CRDT with admin's Join so the
+    // membership-at-HLC gate sees admin as `Joined` when A's publish
+    // arrives. Without this seed B would reject A's bootstrap publish
+    // with `publisher_not_joined`. (Production wires the Join via the
+    // redemption flow on B's side, which inserts the event locally
+    // before the first publish.)
+    let state_b = registry_b
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            admin_join_event,
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: admin,
@@ -230,17 +288,13 @@ async fn two_members_dag_sync_full_event_log() {
     }
 
     // Force-publish on A. Bypasses debounce so the test doesn't have
-    // to sleep through the full window.
+    // to sleep through the full window. After the publish lands B's
+    // tracker advances; the CRDT is byte-identical (admin's Join was
+    // pre-seeded above).
     registry_a.flush_now(&community_id).await.expect("flush a");
 
-    let state_b = registry_b
-        .state_for(&community_id)
-        .await
-        .expect("engine spawned");
-
-    // Wait deterministically for B's subscriber arm to receive, fetch,
-    // decrypt, verify, and merge the event. Bounded poll instead of a
-    // fixed sleep keeps CI runners with variable latency happy.
+    // Wait deterministically for B's tracker to advance — confirms
+    // the publish made it through receive's verify gates.
     let state_b_for_poll = Arc::clone(&state_b);
     wait_until(
         Duration::from_secs(2),
@@ -253,8 +307,14 @@ async fn two_members_dag_sync_full_event_log() {
     .await;
 
     {
-        let sb = state_b.lock().await;
-        assert_eq!(sb.events.len(), 1, "B should have merged A's event");
+        let sb = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine spawned")
+            .lock()
+            .await
+            .clone();
+        assert_eq!(sb.events.len(), 1, "B should hold the (pre-seeded) Join");
     }
 
     registry_a.shutdown_all().await.expect("shutdown a");
@@ -282,12 +342,16 @@ async fn forged_signature_event_is_rejected_on_receive() {
         Duration::from_millis(2000),
     ));
 
+    use ed25519_dalek::Signer;
+    use harmony_app::community_state_sync::CommunityRootSignedPayload;
+
     let community_id = SpaceId([2u8; 16]);
     let mk = MembershipKey::new([0x55; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xb1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
+    let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
     resolver_map.insert(admin, admin_pub);
@@ -306,6 +370,11 @@ async fn forged_signature_event_is_rejected_on_receive() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: Some(error_tx),
         delta_tx: None,
+        // ZEB-256 Task 6: B doesn't publish; we only inspect its
+        // receive-side rejection. Signing key is admin's so the
+        // engine matches what production would have.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
 
     // We need direct access to B's subscriber channel sender to
@@ -318,6 +387,45 @@ async fn forged_signature_event_is_rejected_on_receive() {
         .spawn_engine(community_id, mk.clone(), admin, false, b_pub_tx, b_sub_rx)
         .await
         .expect("spawn b");
+
+    // ZEB-256 Task 6: pre-seed B's CRDT with admin's valid Join so
+    // the membership-at-HLC gate admits the publish into the per-
+    // event verify path under test.
+    let valid_admin_join = {
+        let payload = EventPayload {
+            id: [9u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    {
+        let state_b = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine spawned");
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            valid_admin_join,
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
 
     // Build the malicious CommunityState: one valid Join, then flip
     // a byte in its signature so verify_event rejects it at receive.
@@ -354,20 +462,22 @@ async fn forged_signature_event_is_rejected_on_receive() {
     .expect("for_book");
     cs.put(root_cid, blob_ciphertext).await.expect("cas put");
 
-    let publish = CommunityRootPublishPayload {
+    // ZEB-256 Task 6: the publish-level gates require a real
+    // publisher_addr (in resolver) and a valid sig over the signed
+    // sub-payload — we sign with admin's key so all 3 gates pass and
+    // the per-event verify path receives the malformed inner event.
+    let signed = CommunityRootSignedPayload {
         root_cid,
-        // TEMP for Task 1 (ZEB-256): publisher_addr / publisher_sig are
-        // placeholders so the integration test continues to compile.
-        // Task 6 replaces these with real values once the verify path
-        // enforces them.
-        publisher_addr: OwnerAddr([0; 16]),
+        publisher_addr: admin,
         at: Hlc {
             wall_ms: 200,
             logical: 0,
             device_id: "attacker-dev".into(),
         },
-        publisher_sig: [0; 64],
     };
+    let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
+    let sig = admin_signing.sign(&signed_bytes).to_bytes();
+    let publish = signed.into_wire(sig);
     let publish_bytes = canonical_cbor_encode(&publish).expect("encode publish");
     let wire = encrypt_root_publish(&mk, &publish_bytes).expect("encrypt root");
 
@@ -384,10 +494,11 @@ async fn forged_signature_event_is_rejected_on_receive() {
     assert_eq!(report.reason_tag, "verify_event_rejected");
     assert_eq!(report.community_id, community_id);
 
-    // B's CRDT must remain empty — the event was rejected per-event
-    // even though the wire packet AEAD-decrypted cleanly. The
-    // tracker DID advance (single mutation point), but no event
-    // was inserted.
+    // B's CRDT must hold ONLY the pre-seeded admin Join — the
+    // forged-sig event in the inbound blob was rejected per-event
+    // even though the wire packet AEAD-decrypted cleanly AND passed
+    // the publish-level gates. The tracker DID advance (single
+    // mutation point), but the bad inner event did not insert.
     let state_b = registry_b
         .state_for(&community_id)
         .await
@@ -396,8 +507,9 @@ async fn forged_signature_event_is_rejected_on_receive() {
         let sb = state_b.lock().await;
         assert_eq!(
             sb.events.len(),
-            0,
-            "forged-sig event must not land in B's CRDT"
+            1,
+            "B should hold only the pre-seeded admin Join; \
+             the forged-sig event must not have inserted"
         );
     }
 
@@ -424,6 +536,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let id_admin = PrivateIdentity::from_seed(&[0xc1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
+    let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
     resolver_map.insert(admin, admin_pub);
@@ -443,6 +556,9 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: A publishes as admin.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -452,6 +568,10 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: B doesn't publish; admin's identity also
+        // works here for the type-bound.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -466,24 +586,12 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         .await
         .expect("spawn b");
 
-    // Inject 64 random bytes — long enough to pass MIN_WIRE_LEN
-    // (28 = nonce 12 + tag 16) but with no valid nonce / tag, so
-    // ChaCha20-Poly1305 AEAD verification fails and the engine
-    // drops the packet via IncomingOutcome::ErrPreMutation.
-    let garbage: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(31)).collect();
-    b_sub_tx.send(garbage).await.expect("send garbage");
-
-    // Brief settle so B's task has a chance to drain + log the
-    // malformed packet before we exercise the live-check path.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Inject a Join into A and trigger a valid publish.
-    let state_a = registry_a
-        .state_for(&community_id)
-        .await
-        .expect("engine spawned");
-    {
-        let mut sa = state_a.lock().await;
+    // ZEB-256 Task 6: pre-seed B's CRDT with admin's Join so the
+    // membership-at-HLC gate admits A's later publish. Without this
+    // seed, B would reject A's bootstrap publish on
+    // `publisher_not_joined` — independent of this test's intent
+    // (malformed-wire liveness).
+    let admin_join_event = {
         let payload = EventPayload {
             id: [11u8; 16],
             community_id,
@@ -495,9 +603,50 @@ async fn malformed_wire_packet_does_not_panic_engine() {
                 device_id: "a-dev".into(),
             },
         };
-        let event = sign_event_with_identity(&payload, &id_admin).expect("sign");
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    {
+        let state_b = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine spawned");
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            admin_join_event.clone(),
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    // Inject 64 random bytes — long enough to pass MIN_WIRE_LEN
+    // (28 = nonce 12 + tag 16) but with no valid nonce / tag, so
+    // ChaCha20-Poly1305 AEAD verification fails and the engine
+    // drops the packet via IncomingOutcome::ErrPreMutation.
+    let garbage: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(31)).collect();
+    b_sub_tx.send(garbage).await.expect("send garbage");
+
+    // Brief settle so B's task has a chance to drain + log the
+    // malformed packet before we exercise the live-check path.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Inject the same admin Join into A and trigger a valid publish.
+    let state_a = registry_a
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sa = state_a.lock().await;
         let outcome = sa.insert_event(
-            event,
+            admin_join_event,
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: admin,
@@ -576,6 +725,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
     let id_admin = PrivateIdentity::from_seed(&[0xd1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
     let admin_pub = id_admin.identity.to_public_bytes();
+    let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
     resolver_map.insert(admin, admin_pub);
@@ -595,6 +745,9 @@ async fn replay_of_same_root_publish_is_idempotent() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: A publishes as admin.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -604,6 +757,10 @@ async fn replay_of_same_root_publish_is_idempotent() {
         debounce_ms: DEFAULT_DEBOUNCE_MS,
         error_tx: None,
         delta_tx: None,
+        // ZEB-256 Task 6: B doesn't publish; admin's identity satisfies
+        // the type bound.
+        self_owner: admin,
+        signing_key: Arc::clone(&admin_signing),
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -618,13 +775,9 @@ async fn replay_of_same_root_publish_is_idempotent() {
         .await
         .expect("spawn b");
 
-    // Inject one Join into A.
-    let state_a = registry_a
-        .state_for(&community_id)
-        .await
-        .expect("engine spawned");
-    {
-        let mut sa = state_a.lock().await;
+    // ZEB-256 Task 6: pre-seed B's CRDT with admin's Join so the
+    // membership-at-HLC gate admits A's later publish.
+    let admin_join_event = {
         let payload = EventPayload {
             id: [13u8; 16],
             community_id,
@@ -636,9 +789,40 @@ async fn replay_of_same_root_publish_is_idempotent() {
                 device_id: "a-dev".into(),
             },
         };
-        let event = sign_event_with_identity(&payload, &id_admin).expect("sign");
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    {
+        let state_b = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine spawned");
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            admin_join_event.clone(),
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    // Inject the same Join into A so its publish carries non-empty
+    // state.
+    let state_a = registry_a
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sa = state_a.lock().await;
         let outcome = sa.insert_event(
-            event,
+            admin_join_event,
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: admin,
