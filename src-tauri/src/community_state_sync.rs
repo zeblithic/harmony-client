@@ -1854,17 +1854,48 @@ impl CommunitySyncRegistry {
 /// DeviceIdentityHash newtype boundary.
 pub struct OwnerDeviceCacheResolver {
     cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+    /// Self's owner address — when an incoming `resolve` call asks for
+    /// our own owner, return `self_identity_pub` directly without
+    /// hitting the cache. The cache lookup treats `OwnerAddr.0` as a
+    /// `DeviceIdentityHash`, which works for peers (the peer's device
+    /// is keyed by its address-as-hash in the cache layout) but fails
+    /// for self because our `address_hash != our local signing device
+    /// hash` in general — so own-authored events would otherwise
+    /// resolve to `None` and fail `LocalInsertError::UnknownActor`.
+    /// CodeRabbit MAJOR finding on PR #87 round 2 (and the
+    /// "Known production-path concern" callout from the PR body).
+    self_owner: OwnerAddr,
+    /// Self's 64-byte identity public bytes — what `insert_local_event`
+    /// needs to verify own-authored events. Same value the local
+    /// `PrivateIdentity` would surface via `to_public_bytes()`; in
+    /// production this is `NodeState.dm_identity_pub_64`.
+    self_identity_pub: [u8; 64],
 }
 
 impl OwnerDeviceCacheResolver {
-    pub fn new(cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>) -> Self {
-        Self { cache }
+    pub fn new(
+        cache: Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+        self_owner: OwnerAddr,
+        self_identity_pub: [u8; 64],
+    ) -> Self {
+        Self {
+            cache,
+            self_owner,
+            self_identity_pub,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl IdentityResolver for OwnerDeviceCacheResolver {
     async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        // Self short-circuit: own-authored events use the local
+        // identity_pub directly. We know who we are without consulting
+        // the cache — and the cache lookup wouldn't find us anyway
+        // (see struct doc).
+        if *addr == self.self_owner {
+            return Some(self.self_identity_pub);
+        }
         use crate::dm_outbox::lookup_pubkey_for_device;
         use crate::owner_state_types::DeviceIdentityHash;
         // Async trait fn — the resolver waits on the real Mutex rather

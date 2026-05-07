@@ -112,14 +112,20 @@ pub enum InviteUrlError {
     /// paste of a multi-MB body would otherwise burn allocator + decode
     /// time before failing. A real invite is ~120-180 bytes; the cap is
     /// generous enough to absorb future field growth without becoming
-    /// a DoS vector.
-    #[error("invite payload exceeds 4096 byte limit (got {0})")]
+    /// a DoS vector. Measured in base64 characters of the body
+    /// (post-`harmony://invite/` strip), NOT decoded bytes — 4096
+    /// base64 chars decode to ~3072 raw bytes.
+    #[error("invite payload exceeds 4096 base64-char limit (got {0} chars)")]
     TooLarge(usize),
 }
 
-/// Hard cap on the base64url body length (post-prefix-strip) we'll
-/// hand to the base64 + CBOR decoders. See `InviteUrlError::TooLarge`.
-const MAX_INVITE_BODY_BYTES: usize = 4096;
+/// Hard cap on the base64url body length (post-prefix-strip, in base64
+/// chars) we'll hand to the base64 + CBOR decoders. 4096 base64 chars
+/// decode to ≈3072 raw bytes — well above the expected ~180-byte
+/// payload (community_id + membership_key + admin_addr + name + flags).
+/// Greptile P2 on PR #87 round 2 flagged that the prior name "BYTES"
+/// misled. See `InviteUrlError::TooLarge`.
+const MAX_INVITE_BODY_B64_CHARS: usize = 4096;
 
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
@@ -138,14 +144,15 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
 /// whitespace, and `harmony://invite/...\n` would otherwise fail with
 /// `WrongScheme` for the trailing newline alone.
 ///
-/// Caps the post-prefix body length at `MAX_INVITE_BODY_BYTES` to
-/// bound the work the base64 + CBOR decoders do on untrusted input.
+/// Caps the post-prefix body length at `MAX_INVITE_BODY_B64_CHARS`
+/// (measured in base64 characters, not decoded bytes) to bound the work
+/// the base64 + CBOR decoders do on untrusted input.
 pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlError> {
     let url = url.trim();
     let body = url
         .strip_prefix(URL_PREFIX)
         .ok_or_else(|| InviteUrlError::WrongScheme(url.chars().take(URL_PREFIX.len()).collect()))?;
-    if body.len() > MAX_INVITE_BODY_BYTES {
+    if body.len() > MAX_INVITE_BODY_B64_CHARS {
         return Err(InviteUrlError::TooLarge(body.len()));
     }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD

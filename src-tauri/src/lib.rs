@@ -1185,6 +1185,8 @@ async fn start_node(
                         > = std::sync::Arc::new(
                             crate::community_state_sync::OwnerDeviceCacheResolver::new(
                                 std::sync::Arc::clone(&crdt_state),
+                                self_owner,
+                                identity_pub_64,
                             ),
                         );
                         let cfg = crate::community_state_sync::CommunityRegistryConfig {
@@ -5810,20 +5812,38 @@ async fn create_community(
         .await
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
-    community_adapter_tx
-        .try_send(crate::event_loop::CommunityAdapterRequest {
-            id_hex: hex::encode(minted.community_id.0),
-            publisher_rx: pub_rx,
-            subscriber_tx: sub_tx,
-        })
-        .map_err(|e| match e {
+    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+        id_hex: hex::encode(minted.community_id.0),
+        publisher_rx: pub_rx,
+        subscriber_tx: sub_tx,
+    }) {
+        // Engine is in the registry but adapter wiring failed. Tear the
+        // engine down before propagating the error so we don't accumulate
+        // a zombie engine that can never reach Zenoh: pub_rx / sub_tx
+        // were dropped inside the TrySendError variant, so the engine's
+        // publish loop has no receiver and its subscribe loop sees a
+        // closed channel — bootstrap Join would never reach a peer, and
+        // a retry would mint a fresh community_id while the zombie
+        // accumulates in the registry. Greptile P1 finding on PR #87
+        // round 2. Note: the Space row is already committed to
+        // owner-state at this point — separate concern tracked by ZEB-258
+        // (atomic rollback on failed create / redeem).
+        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "stop_engine failed while cleaning up after adapter try_send failure"
+            );
+        }
+        return Err(match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => {
                 "adapter request queue full; please retry".to_string()
             }
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                 "adapter request channel closed (event_loop stopped?)".to_string()
             }
-        })?;
+        });
+    }
 
     // Now bootstrap-Join via the engine. The engine's
     // `insert_local_event` runs verify_event (which authorizes the
@@ -6224,20 +6244,34 @@ async fn redeem_invite(
         .await
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
-    community_adapter_tx
-        .try_send(crate::event_loop::CommunityAdapterRequest {
-            id_hex: hex::encode(minted.community_id.0),
-            publisher_rx: pub_rx,
-            subscriber_tx: sub_tx,
-        })
-        .map_err(|e| match e {
+    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+        id_hex: hex::encode(minted.community_id.0),
+        publisher_rx: pub_rx,
+        subscriber_tx: sub_tx,
+    }) {
+        // Same zombie-engine cleanup as `create_community` on adapter
+        // try_send failure: the engine is in the registry but its
+        // adapter halves were dropped inside the TrySendError variant,
+        // so it can never reach Zenoh. Tear it down before propagating
+        // so a retry doesn't accumulate orphans. Greptile P1 finding on
+        // PR #87 round 2. (Space row already committed — separate
+        // concern tracked by ZEB-258.)
+        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "stop_engine failed while cleaning up after adapter try_send failure"
+            );
+        }
+        return Err(match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => {
                 "adapter request queue full; please retry".to_string()
             }
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                 "adapter request channel closed (event_loop stopped?)".to_string()
             }
-        })?;
+        });
+    }
 
     // Now self-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the open Join via signature
@@ -6494,11 +6528,16 @@ async fn leave_community(
         return Err(format!("Leave rejected by CRDT verify: {outcome:?}"));
     }
 
-    // Advance HLC tracker only after a successful (non-Rejected)
-    // insert. AlreadyKnown still warrants advancing because the event
-    // we minted is the event the engine accepted (or had); the
-    // next_hlc step is real either way.
-    {
+    // Advance HLC tracker only on `Inserted`. `AlreadyKnown` is benign
+    // (the event we minted matches one the engine already had, so the
+    // tracker is at-or-past `leave.at`), but advancing on it would
+    // diverge from the principle the rest of the IPCs follow:
+    // "advance HLC AFTER successful insert so failures don't bump
+    // tracker". Cursor Bugbot LOW finding on PR #87 round 2.
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
         let mut t = hlc_tracker.lock().await;
         t.insert(device_id.clone(), leave.at.clone());
     }
