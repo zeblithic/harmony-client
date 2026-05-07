@@ -5651,10 +5651,16 @@ pub fn mint_community_creation(
     })
 }
 
-/// Tauri IPC: create a fresh OPEN community.
+/// Internal helper for `create_community`. Takes already-snapshotted
+/// handles; pure of `tauri::State` aside from the final generation
+/// fence (which intentionally re-acquires the std `NodeState` lock to
+/// guard against a stop-during-await race). ZEB-258: owner-state Space
+/// commit is the LAST persistent step. Failures BEFORE the commit tear
+/// down the engine + return Err with crdt_state untouched.
 ///
-/// Phase 3 ships only OPEN communities; invite-only `create_community`
-/// returns `Err` until Phase 4 lands the invite-token signing.
+/// Argument shape mirrors what `redeem_invite_inner` will look like
+/// (Phase 4 Task 8 will extract it the same way) so the two IPCs share
+/// a code-review pattern.
 ///
 /// Lock-order discipline (load-bearing — flagged on PR #86 round 2):
 /// the `crdt_state` `tokio::sync::Mutex` guard MUST drop before
@@ -5662,16 +5668,254 @@ pub fn mint_community_creation(
 /// `tracker_g.lock().await` would (a) violate the project-wide "no
 /// `.await` while holding state mutex" rule, and (b) invert lock order
 /// vs callers that take `hlc_tracker` first — a deadlock risk under
-/// concurrent IPCs.
+/// concurrent IPCs. The post-reorder body acquires both locks only at
+/// the END (tracker before crdt_state, then commit), so the rule is
+/// preserved.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_community_inner(
+    name: String,
+    is_invite_only: bool,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    snapshot_generation: u64,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<String, String> {
+    if is_invite_only {
+        return Err(
+            "Phase 3 supports OPEN communities only; invite-only create_community ships in \
+             Phase 4 (ZEB-262)"
+                .to_string(),
+        );
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint the Space + signed bootstrap Join. Read prev_hlc under the
+    // tracker lock then drop the guard before signing (sign is sync;
+    // releasing eagerly keeps the tracker available to other tasks).
+    // ZEB-258: NO mutation of owner-state or hlc_tracker yet — the mint
+    // is pure / sync and produces values, not side effects.
+    let minted = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        mint_community_creation(
+            &name,
+            is_invite_only,
+            self_owner,
+            signing_key.as_ref(),
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // ZEB-258: spawn engine + dispatch adapter BEFORE the owner-state
+    // commit. Both can fail; both have rollback paths (engine teardown
+    // via `stop_engine` — Task 7 of the Phase 4 plan will swap in
+    // `shutdown_engine_and_cleanup_persistence` so the per-community
+    // persistence dir is also removed). At this point owner-state is
+    // unchanged.
+    //
+    // Channel pair shape mirrors start_node's per-community spawn
+    // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
+    // Zenoh adapter. The CommunityAdapterRequest carries the adapter
+    // halves into event_loop via the mpsc; the event loop spawns the
+    // adapter against its live session.
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    community_registry
+        .spawn_engine(
+            minted.community_id,
+            minted.membership_key.clone(),
+            self_owner,
+            is_invite_only,
+            pub_tx,
+            sub_rx,
+        )
+        .await
+        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
+
+    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+        id_hex: hex::encode(minted.community_id.0),
+        publisher_rx: pub_rx,
+        subscriber_tx: sub_tx,
+    }) {
+        // Engine is in the registry but adapter wiring failed. Tear it
+        // down so we don't accumulate a zombie engine. ZEB-258 win:
+        // owner-state is still untouched at this point. Task 7 of the
+        // Phase 4 plan swaps stop_engine for
+        // shutdown_engine_and_cleanup_persistence (which also removes
+        // the orphan per-community persistence dir).
+        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "stop_engine failed during create_community rollback (adapter dispatch)"
+            );
+        }
+        return Err(match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "adapter request queue full; please retry".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "adapter request channel closed (event_loop stopped?)".to_string()
+            }
+        });
+    }
+
+    // Bootstrap-Join via the engine. The engine's `insert_local_event`
+    // runs verify_event (which authorizes the admin self-Join via the
+    // bootstrap rule) and fires `notify_dirty` on success; the debounced
+    // publish picks up the event and writes to the per-community
+    // state-root topic. ZEB-258: still BEFORE the owner-state commit;
+    // a failure here tears the engine down with crdt_state untouched.
+    let engine_arc = community_registry
+        .engine_arc(&minted.community_id)
+        .await
+        .ok_or("engine vanished immediately after spawn — registry race")?;
+    let outcome = engine_arc
+        .insert_local_event(minted.bootstrap_join.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if !matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        // Bootstrap Join didn't insert — engine state is inconsistent
+        // with the user-visible "creator just made this community"
+        // expectation. Tear down + bail. Owner-state still untouched.
+        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "stop_engine failed during create_community rollback (bootstrap-Join not inserted)"
+            );
+        }
+        return Err(format!("bootstrap Join not inserted (got {outcome:?})"));
+    }
+
+    // ZEB-258: SNAPSHOT-THEN-COMMIT FENCE. If the node generation
+    // changed since we snapshotted, owner-state is on a different
+    // lifetime — abort. Mirrors add_space's post-stop guard. Done
+    // BEFORE the owner-state commit so a stop-during-await race is
+    // caught with crdt_state untouched. Capture the verdict + the
+    // current generation under the std lock then drop the guard
+    // BEFORE any `.await` (`std::sync::MutexGuard` is `!Send`, so a
+    // held guard across an .await would prevent the future from
+    // implementing Send — see tauri::command's Send bound).
+    enum FenceVerdict {
+        Ok,
+        GenerationChanged(u64),
+        RegistryGone,
+    }
+    let verdict = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            FenceVerdict::GenerationChanged(g.generation)
+        } else if g.community_registry.is_none() {
+            FenceVerdict::RegistryGone
+        } else {
+            FenceVerdict::Ok
+        }
+    }; // std lock guard dropped here before any .await.
+    match verdict {
+        FenceVerdict::Ok => {}
+        FenceVerdict::GenerationChanged(now_gen) => {
+            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "stop_engine failed during create_community fence-abort"
+                );
+            }
+            return Err(format!(
+                "node generation changed during create_community (was {}, now {}); \
+                 community minted on a detached crdt_state and won't be persisted — \
+                 engine spawn suppressed",
+                snapshot_generation, now_gen
+            ));
+        }
+        FenceVerdict::RegistryGone => {
+            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "stop_engine failed during create_community fence-abort"
+                );
+            }
+            return Err(
+                "community_registry was torn down during create_community — engine spawn \
+                 suppressed"
+                    .to_string(),
+            );
+        }
+    }
+
+    // ZEB-258: advance the HLC tracker, then COMMIT owner-state Space
+    // LAST. Tracker advance comes first so under the lock-order rule
+    // (tracker before crdt_state) we never hold the std `state_lock`
+    // while awaiting either; the tracker is also strictly-additive so
+    // a reserved-but-unused slot on a later commit failure is harmless
+    // (monotonicity only requires strictly-increasing HLCs).
+    {
+        let mut tracker_g = hlc_tracker.lock().await;
+        // Bootstrap creation: prev_hlc was either None or strictly
+        // older than `created_at` (next_hlc guarantees forward step),
+        // so unconditionally advancing the tracker is correct.
+        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+    }
+
+    {
+        let mut state_g = crdt_state.lock().await;
+        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
+        if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
+            // Owner-state rejected the Space (CRDT invariant). The
+            // engine is up and the bootstrap-Join is in its log, but
+            // owner-state has no Space row — tear the engine down so
+            // we don't leak a zombie. Drop the state_g guard FIRST so
+            // we don't hold a `tokio::sync::Mutex` guard across the
+            // `.await` of `stop_engine`. Task 7 of the Phase 4 plan
+            // swaps stop_engine for
+            // shutdown_engine_and_cleanup_persistence.
+            drop(state_g);
+            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "stop_engine failed during create_community rollback (apply_space rejected)"
+                );
+            }
+            return Err(format!("apply_space rejected new community: {outcome:?}"));
+        }
+    }
+
+    Ok(hex::encode(minted.community_id.0))
+}
+
+/// Tauri IPC: create a fresh OPEN community.
 ///
-/// Snapshot-then-spawn fence: after applying the Space + advancing the
-/// tracker but BEFORE spawning the engine, we re-acquire the std
-/// `NodeState` lock and check `generation` + `community_registry`. If
-/// the node was stopped (or a stop+restart raced our await chain),
-/// returning Err here suppresses the engine spawn — otherwise the
-/// engine would attach to a detached `crdt_state` that won't be
-/// persisted, leaving a phantom-state engine running in the
-/// background.
+/// Phase 3 ships only OPEN communities; invite-only `create_community`
+/// returns `Err` until Phase 4 lands the invite-token signing.
+///
+/// Snapshots the relevant `NodeState` handles under the std lock, then
+/// delegates to `create_community_inner`, which encodes the ZEB-258
+/// reorder (owner-state Space commit is the LAST persistent step;
+/// engine + adapter failures roll back with crdt_state untouched).
 ///
 /// Adapter wiring flows through `event_loop` (not directly through
 /// the Zenoh `Session` from this command's task) per spec
@@ -5685,14 +5929,11 @@ async fn create_community(
     name: String,
     is_invite_only: bool,
 ) -> Result<String, String> {
-    if is_invite_only {
-        return Err(
-            "Phase 3 supports OPEN communities only; invite-only create_community ships in \
-             Phase 4"
-                .to_string(),
-        );
-    }
-
+    // Snapshot NodeState handles in a single guard scope, then drop
+    // the std lock BEFORE any `.await`. The signing key lives inside
+    // dm_outbox under a tokio Mutex, so we acquire the dm_outbox
+    // handle under the std lock (Arc clone) and `.await` its lock
+    // afterward.
     let (
         crdt_state,
         hlc_tracker,
@@ -5724,155 +5965,28 @@ async fn create_community(
                 .ok_or("dm_outbox missing — no owner identity?")?,
             g.generation,
         )
-    };
+    }; // std `state_lock` guard dropped here.
 
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Mint the Space + signed bootstrap Join. Read prev_hlc under the
-    // tracker lock then drop the guard before signing — the sign step
-    // is sync, but releasing eagerly keeps the tracker available to
-    // other tasks. Borrow the SigningKey from `dm_outbox` (where
-    // start_node already wired the canonical local-device key) so we
-    // don't double-store identity-derived material on NodeState.
-    let minted = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
+    // Now safe to `.await` — the std lock has been released.
+    let signing_key = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        mint_community_creation(
-            &name,
-            is_invite_only,
-            self_owner,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        std::sync::Arc::clone(&outbox_g.signing_key)
     };
 
-    // Apply the Community Space under crdt_state, then DROP the guard
-    // BEFORE awaiting hlc_tracker. See doc comment above for the
-    // load-bearing rationale.
-    {
-        let mut state_g = crdt_state.lock().await;
-        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
-        if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
-            return Err(format!("apply_space rejected new community: {outcome:?}"));
-        }
-    } // state_g dropped here
-
-    {
-        let mut tracker_g = hlc_tracker.lock().await;
-        // Bootstrap creation: prev_hlc was either None or strictly
-        // older than `created_at` (next_hlc guarantees forward step),
-        // so unconditionally advancing the tracker is correct.
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
-    }
-
-    // Snapshot-then-spawn fence: ensure node generation hasn't changed
-    // and the registry is still wired. If either fails, the engine
-    // we'd spawn would be detached from a stopped node. Mirrors
-    // add_space's post-stop guard (lib.rs ~3141).
-    {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during create_community (was {}, now {}); \
-                 community minted on a detached crdt_state and won't be persisted — \
-                 engine spawn suppressed",
-                snapshot_generation, g.generation
-            ));
-        }
-        if g.community_registry.is_none() {
-            return Err(
-                "community_registry was torn down during create_community — engine spawn \
-                 suppressed"
-                    .to_string(),
-            );
-        }
-    }
-
-    // Channel pair shape mirrors start_node's per-community spawn
-    // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
-    // Zenoh adapter. The CommunityAdapterRequest carries the adapter
-    // halves into event_loop via the mpsc; the event loop spawns the
-    // adapter against its live session.
-    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    community_registry
-        .spawn_engine(
-            minted.community_id,
-            minted.membership_key.clone(),
-            self_owner,
-            is_invite_only,
-            pub_tx,
-            sub_rx,
-        )
-        .await
-        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
-
-    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
-        id_hex: hex::encode(minted.community_id.0),
-        publisher_rx: pub_rx,
-        subscriber_tx: sub_tx,
-    }) {
-        // Engine is in the registry but adapter wiring failed. Tear the
-        // engine down before propagating the error so we don't accumulate
-        // a zombie engine that can never reach Zenoh: pub_rx / sub_tx
-        // were dropped inside the TrySendError variant, so the engine's
-        // publish loop has no receiver and its subscribe loop sees a
-        // closed channel — bootstrap Join would never reach a peer, and
-        // a retry would mint a fresh community_id while the zombie
-        // accumulates in the registry. Greptile P1 finding on PR #87
-        // round 2. Note: the Space row is already committed to
-        // owner-state at this point — separate concern tracked by ZEB-258
-        // (atomic rollback on failed create / redeem).
-        if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "stop_engine failed while cleaning up after adapter try_send failure"
-            );
-        }
-        return Err(match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "adapter request queue full; please retry".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "adapter request channel closed (event_loop stopped?)".to_string()
-            }
-        });
-    }
-
-    // Now bootstrap-Join via the engine. The engine's
-    // `insert_local_event` runs verify_event (which authorizes the
-    // admin self-Join via the bootstrap rule) and fires `notify_dirty`
-    // on success; the debounced publish picks up the event and writes
-    // to the per-community state-root topic.
-    let engine_arc = community_registry
-        .engine_arc(&minted.community_id)
-        .await
-        .ok_or("engine vanished immediately after spawn — registry race")?;
-    let outcome = engine_arc
-        .insert_local_event(minted.bootstrap_join)
-        .await
-        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
-    if !matches!(
-        outcome,
-        crate::community_state_crdt::InsertOutcome::Inserted
-    ) {
-        return Err(format!("bootstrap Join not inserted (got {outcome:?})"));
-    }
-
-    Ok(hex::encode(minted.community_id.0))
+    create_community_inner(
+        name,
+        is_invite_only,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        snapshot_generation,
+        state_lock,
+    )
+    .await
 }
 
 #[cfg(test)]
