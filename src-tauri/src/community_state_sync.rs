@@ -598,6 +598,15 @@ pub struct CommunitySyncEngine {
     /// reaching into `InternalCtx`. Phase 3 ships the public IPC
     /// surface; this accessor stays `#[doc(hidden)]` until then.
     state: Arc<Mutex<CommunityState>>,
+    /// Shared replay-tracker handle. Retained on the engine alongside
+    /// `state` so the registry can expose a test-only snapshot accessor
+    /// without reaching into `InternalCtx`. ZEB-256 Task 8: the
+    /// `spoofed_publish_does_not_block_real_publisher` integration
+    /// test inspects per-(addr, device_id) tracker entries to assert
+    /// the receiver's tracker for the real publisher is NOT clobbered
+    /// by a forged publish. `#[doc(hidden)]` until production callers
+    /// need a public surface.
+    tracker: Arc<Mutex<CommunityRootHlcTracker>>,
     /// Community identity this engine was configured with. Bound at
     /// construction so `insert_local_event` can:
     ///   1. Reject mis-routed events (caller passed an event whose
@@ -647,6 +656,10 @@ impl CommunitySyncEngine {
         // into the InternalCtx — both the spawned task and the engine
         // accessor share the same underlying Mutex<CommunityState>.
         let state_for_engine = Arc::clone(&cfg.state);
+        // ZEB-256 Task 8: same pattern for the tracker — engine retains
+        // its own Arc so `tracker_arc()` (registry-side `tracker_snapshot`)
+        // can hand out a snapshot without reaching into InternalCtx.
+        let tracker_for_engine = Arc::clone(&cfg.tracker);
         let community_id_for_engine = cfg.community_id;
         let admin_addr = cfg.admin_addr;
         let identity_resolver_for_engine = cfg.identity_resolver.clone();
@@ -684,6 +697,7 @@ impl CommunitySyncEngine {
             shutdown_tx,
             task: Mutex::new(Some(task)),
             state: state_for_engine,
+            tracker: tracker_for_engine,
             community_id: community_id_for_engine,
             admin_addr,
             identity_resolver: identity_resolver_for_engine,
@@ -700,6 +714,18 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn state(&self) -> Arc<Mutex<CommunityState>> {
         Arc::clone(&self.state)
+    }
+
+    /// Returns a clone of the engine's `CommunityRootHlcTracker` Arc.
+    /// **Test-only** — production callers don't need to inspect the
+    /// per-publisher replay tracker; ZEB-256 Task 8's spoofing
+    /// integration test uses this to assert that a forged publish at
+    /// HLC `huge` does NOT advance the receiver's tracker for the
+    /// spoofed `publisher_addr`, so the real publisher's next legit
+    /// publish at HLC `Y` (with `huge > Y`) is still admitted.
+    #[doc(hidden)]
+    pub fn tracker_arc(&self) -> Arc<Mutex<CommunityRootHlcTracker>> {
+        Arc::clone(&self.tracker)
     }
 
     /// Returns the admin `OwnerAddr` this engine was configured with.
@@ -2109,6 +2135,25 @@ impl CommunitySyncRegistry {
             .await
             .get(community_id)
             .map(|e| e.state())
+    }
+
+    /// Returns a clone of the engine's `CommunityRootHlcTracker` for a
+    /// community, if an engine is spawned for it. **Test-only** —
+    /// gated as `#[doc(hidden)]` and exists so the ZEB-256 Task 8
+    /// `spoofed_publish_does_not_block_real_publisher` integration
+    /// test can inspect per-(addr, device_id) tracker entries without
+    /// reaching into private engine fields. Returns the snapshot
+    /// (cloned out from under the engine's mutex) rather than the live
+    /// Arc so callers don't accidentally hold the lock across awaits.
+    #[doc(hidden)]
+    pub async fn tracker_snapshot(
+        &self,
+        community_id: &SpaceId,
+    ) -> Option<CommunityRootHlcTracker> {
+        let engine = self.engines.lock().await.get(community_id).cloned()?;
+        let tracker = engine.tracker_arc();
+        let snap = tracker.lock().await.clone();
+        Some(snap)
     }
 
     /// Returns a clone of the `Arc<CommunitySyncEngine>` for

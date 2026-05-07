@@ -885,3 +885,456 @@ async fn replay_of_same_root_publish_is_idempotent() {
     registry_a.shutdown_all().await.expect("shutdown a");
     registry_b.shutdown_all().await.expect("shutdown b");
 }
+
+/// ZEB-256 § 11 acceptance: "Spoofing test demonstrates the censorship
+/// attack is no longer possible." Prior to publisher authentication,
+/// any member with the shared `MembershipKey` could publish a state-
+/// root payload claiming `publisher_addr = alice_addr` at HLC `huge`,
+/// advancing every receiver's `(alice_addr, alice_dev)` tracker slot
+/// past `huge`. Alice's subsequent legitimate publishes — at
+/// natural-clock HLCs strictly less than `huge` — would be silently
+/// rejected by `RootHlcTracker.would_accept`. Result: any single
+/// member could DoS-censor any other member's writes.
+///
+/// This test wires the censorship attack end-to-end on the two-
+/// registry bridge and asserts the receiver no longer admits the
+/// spoofed publish into its tracker. Concretely:
+///   1. Alice (engine A) publishes legitimately at HLC ≈ now. B's
+///      tracker for `(alice_addr, "a-dev")` advances; B's CRDT picks
+///      up the bootstrap Join.
+///   2. We craft a forged publish: `publisher_addr = alice_addr`,
+///      `at = Hlc { wall_ms: huge, device_id: "a-dev" }`,
+///      `publisher_sig = bob_sk.sign(...)`. This decrypts cleanly
+///      (Bob has the `MembershipKey`) AND passes the membership-at-
+///      HLC gate (Alice IS Joined), but FAILS the publisher-sig
+///      verify because `bob_sk` does not match `alice_pub`. B emits a
+///      `publisher_sig_invalid` degraded report and DOES NOT advance
+///      its tracker.
+///   3. Alice publishes legitimately again at HLC₂ (where
+///      HLC₁ < HLC₂ ≪ huge). B's tracker would reject HLC₂ if and
+///      only if it had advanced past HLC₂ — i.e. if step 2 had
+///      succeeded. We assert the second publish DOES land: B's
+///      tracker advances to `wall_ms ≈ now` (still `< huge`), proving
+///      the spoofer cannot squat Alice's HLC slot.
+///
+/// Test-only accessors used:
+///   - `CommunitySyncRegistry::tracker_snapshot` — clones B's
+///     `CommunityRootHlcTracker` out from under the engine's mutex.
+///   - `CommunitySyncEngine::tracker_arc` — internally backs
+///     `tracker_snapshot`.
+/// Both are gated `#[doc(hidden)]`; production callers don't inspect
+/// the per-publisher tracker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spoofed_publish_does_not_block_real_publisher() {
+    use ed25519_dalek::Signer;
+    use harmony_app::community_state_sync::CommunityRootSignedPayload;
+
+    let cas_tx = spawn_shared_cas();
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_tx,
+        Duration::from_millis(2000),
+    ));
+
+    let community_id = SpaceId([5u8; 16]);
+    let mk = MembershipKey::new([0xAA; 32]);
+
+    // Alice — the real, legitimate publisher. Engine A signs publishes
+    // with `alice_signing`; both registries' resolvers map
+    // `alice_addr → alice_pub` so receive-side sig-verify can rebuild
+    // the public key it checks the signature against.
+    let id_alice = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let alice_addr = OwnerAddr(id_alice.identity.address_hash);
+    let alice_pub = id_alice.identity.to_public_bytes();
+    let alice_signing = signing_key_from(&id_alice);
+
+    // Bob — the attacker. Bob is also a community member (so Bob has
+    // the `MembershipKey`), but Bob's signing key is NOT Alice's. The
+    // forged publish below is signed with `bob_signing` while claiming
+    // `publisher_addr = alice_addr`; verify-on-receive rejects it
+    // because `bob_signing` does not match Alice's resolver-resolved
+    // identity_pub. The pre-ZEB-256 receive pipeline checked only the
+    // shared MK + per-event sigs — Bob's spoof would have advanced B's
+    // tracker for `(alice_addr, "a-dev")` to HLC `huge`, censoring
+    // every subsequent legitimate Alice publish.
+    let id_bob = PrivateIdentity::from_seed(&[0xb1; 32]);
+    let bob_addr = OwnerAddr(id_bob.identity.address_hash);
+    let bob_pub = id_bob.identity.to_public_bytes();
+    let bob_signing = signing_key_from(&id_bob);
+
+    // Both Alice and Bob in the resolver. Alice is the publisher we're
+    // verifying against; Bob is here so a future variant that signs
+    // legitimately as bob_addr (rather than spoofing alice_addr) would
+    // also resolve. The spoof scenario doesn't actually need Bob in
+    // the resolver — the signature check fails regardless — but
+    // matching production cache shape (every member's identity_pub
+    // present) keeps the test honest about which gate is firing.
+    let mut resolver_map = std::collections::HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub);
+    resolver_map.insert(bob_addr, bob_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    // Wire: A's publisher → B's subscriber. We retain the explicit
+    // `b_sub_tx` so the test can also inject a forged wire packet
+    // directly on B's subscriber surface (bypassing A entirely),
+    // mirroring the production threat model where any keyed peer can
+    // ship arbitrary bytes to any other peer's Zenoh subscriber.
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let b_sub_tx_for_forward = b_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = a_pub_rx.recv().await {
+            let _ = b_sub_tx_for_forward.send(bytes).await;
+        }
+    });
+
+    // Plumb a degraded-path receiver on B so we can assert on the
+    // `publisher_sig_invalid` report the forged publish triggers.
+    let (b_error_tx, mut b_error_rx) = mpsc::channel::<CommunityDegradedReport>(8);
+
+    let dir_a = tempfile::tempdir().expect("tempdir A");
+    let dir_b = tempfile::tempdir().expect("tempdir B");
+
+    let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "a-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_a.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        // A's registry signs publishes as Alice — the legitimate
+        // publisher under attack.
+        self_owner: alice_addr,
+        signing_key: Arc::clone(&alice_signing),
+    });
+    let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "b-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_b.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: Some(b_error_tx),
+        delta_tx: None,
+        // B's registry would sign as Bob in production. B does not
+        // publish in this test (Bob's "publish" is the forged direct
+        // injection below, hand-crafted outside any registry), but the
+        // type bound requires real values. Using bob_signing keeps the
+        // engine config self-consistent: receiver-side sig-verify of
+        // B's own publishes (if it ever ran one) would also validate.
+        self_owner: bob_addr,
+        signing_key: Arc::clone(&bob_signing),
+    });
+
+    // B's publisher and A's subscriber are unused in this one-way sync
+    // test; we still need fresh handles to satisfy `spawn_engine`'s
+    // signature.
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
+
+    registry_a
+        .spawn_engine(
+            community_id,
+            mk.clone(),
+            alice_addr,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+        )
+        .await
+        .expect("spawn a");
+    registry_b
+        .spawn_engine(
+            community_id,
+            mk.clone(),
+            alice_addr,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+        )
+        .await
+        .expect("spawn b");
+
+    // Pre-seed Alice's bootstrap Join into BOTH engines' CRDTs. Without
+    // this, B's membership-at-HLC gate rejects A's first legit publish
+    // as `publisher_not_joined`. The unit tests in Task 6 use the same
+    // pattern: production wires the Join via the redemption flow on
+    // B's side (which inserts the event locally before the first
+    // publish lands), but here we bypass the Phase 3 IPC and seed
+    // both replicas directly.
+    let alice_join_event = {
+        let payload = EventPayload {
+            id: [21u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_alice).expect("sign alice join")
+    };
+    let verify_ctx = harmony_app::community_membership::VerifyContext {
+        expected_community_id: community_id,
+        admin_addr: alice_addr,
+        is_invite_only: false,
+        actor_identity_pub: &alice_pub,
+        countersigner_identity_pub: None,
+    };
+    {
+        let state_a = registry_a
+            .state_for(&community_id)
+            .await
+            .expect("engine a spawned");
+        let mut sa = state_a.lock().await;
+        let outcome = sa.insert_event(alice_join_event.clone(), &verify_ctx);
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+    {
+        let state_b = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine b spawned");
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(alice_join_event.clone(), &verify_ctx);
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    // Step 1 — Alice publishes legitimately. After this lands, B's
+    // tracker has `(alice_addr, "a-dev") → HLC₁` where HLC₁'s wall_ms
+    // ≈ now-in-ms (well below `huge` chosen below).
+    registry_a
+        .flush_now(&community_id)
+        .await
+        .expect("flush a 1");
+
+    // Wait for A's first publish to drain the forwarder into B and
+    // B's pipeline to advance the tracker. We poll the tracker
+    // directly: as soon as `(alice_addr, "a-dev")` appears, step 1
+    // has completed end-to-end.
+    {
+        let registry_b_for_poll = &registry_b;
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async move {
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine b spawned");
+                snap.per_device
+                    .contains_key(&(alice_addr, "a-dev".to_string()))
+            },
+        )
+        .await;
+    }
+
+    // Capture HLC₁ — Alice's first publish HLC as observed at B —
+    // so we can assert step 3's HLC₂ strictly dominates it.
+    let hlc1 = {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        snap.per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect("alice tracker entry after step 1")
+    };
+
+    // Step 2 — Build the forged publish OUTSIDE any registry.
+    //
+    // The attacker's threat model: Bob is a paid-up community member
+    // with the `MembershipKey`. Bob crafts a wire packet claiming
+    // `publisher_addr = alice_addr`, signs it with `bob_signing`, and
+    // ships it to B's Zenoh subscriber. The packet AEAD-decrypts
+    // cleanly (Bob has the MK), the publisher-membership gate passes
+    // (Alice IS Joined at any reasonable HLC), but the publisher-sig
+    // gate MUST fail because `bob_signing` does not match Alice's
+    // resolver-resolved identity_pub.
+    //
+    // `wall_ms` is far in the future — well past any natural
+    // `next_hlc` Alice's engine would produce. If B's tracker were
+    // (incorrectly) advanced to this value, Alice's step-3 publish
+    // would silently fail `would_accept`.
+    let forged_huge_hlc = Hlc {
+        wall_ms: 4_000_000_000_000, // ≈ year 2096
+        logical: 0,
+        device_id: "a-dev".into(),
+    };
+    // The forged blob's CRDT contents don't matter — verify-on-receive
+    // rejects the packet at the publisher-sig gate, before any blob
+    // fetch. We use Alice's already-published blob CID so the wire
+    // packet at least references a CAS slot the attacker could
+    // plausibly know about; nothing reads through to it.
+    let forged_blob = canonical_cbor_encode(
+        &harmony_app::community_state_crdt::CommunityState::new(community_id),
+    )
+    .expect("encode empty state");
+    let forged_blob_ct = harmony_app::community_state_sync::encrypt_blob(&mk, &forged_blob)
+        .expect("encrypt forged blob");
+    let forged_root_cid = harmony_content::cid::ContentId::for_book(
+        &forged_blob_ct,
+        harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+    )
+    .expect("for_book");
+    cs.put(forged_root_cid, forged_blob_ct)
+        .await
+        .expect("forged cas put");
+
+    let forged_signed = CommunityRootSignedPayload {
+        root_cid: forged_root_cid,
+        publisher_addr: alice_addr,
+        at: forged_huge_hlc.clone(),
+    };
+    let forged_signed_bytes = canonical_cbor_encode(&forged_signed).expect("encode signed");
+    // THE SPOOF: signature is from Bob, not Alice. This is the only
+    // line that distinguishes the forged packet from a legitimate
+    // Alice publish; everything else is byte-perfect imitation.
+    let forged_sig = bob_signing.sign(&forged_signed_bytes).to_bytes();
+    let forged_publish = forged_signed.into_wire(forged_sig);
+    let forged_publish_bytes =
+        canonical_cbor_encode(&forged_publish).expect("encode forged publish");
+    let forged_wire =
+        harmony_app::community_state_sync::encrypt_root_publish(&mk, &forged_publish_bytes)
+            .expect("encrypt forged root");
+
+    // Inject the forged wire directly on B's subscriber channel,
+    // bypassing the A→B forwarder. Production-equivalent: the
+    // attacker's Zenoh peer publishes on the same topic B subscribes
+    // to.
+    b_sub_tx.send(forged_wire).await.expect("send forged wire");
+
+    // Wait for B to surface the rejection. The `publisher_sig_invalid`
+    // degraded report is the load-bearing observable signal that the
+    // verify-on-receive gate fired correctly. Without this gate, B
+    // would silently advance its tracker to `huge` — and the only
+    // visible symptom would be Alice's later publishes going missing,
+    // a far harder failure mode to diagnose.
+    let report = tokio::time::timeout(Duration::from_secs(2), b_error_rx.recv())
+        .await
+        .expect("publisher_sig_invalid report timed out")
+        .expect("error_tx dropped");
+    assert_eq!(report.reason_tag, "publisher_sig_invalid");
+    assert_eq!(report.community_id, community_id);
+
+    // Confirm B's tracker for `(alice_addr, "a-dev")` is STILL at
+    // HLC₁ — the forged publish did not advance it.
+    {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        let entry = snap
+            .per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect("alice tracker entry should still exist");
+        assert_eq!(
+            entry, hlc1,
+            "tracker for (alice_addr, alice_dev) MUST NOT have advanced \
+             to the forged HLC; entry={entry:?}, expected={hlc1:?}"
+        );
+        assert!(
+            !forged_huge_hlc.is_strictly_newer_than(&entry) || entry == hlc1,
+            "tracker entry must remain at HLC1, not the spoof's huge HLC"
+        );
+    }
+
+    // Step 3 — Alice publishes legitimately AGAIN. Her engine's
+    // `next_hlc` produces HLC₂ with `wall_ms ≈ now` (or a logical
+    // bump if same-millisecond) — strictly newer than HLC₁ but vastly
+    // less than `huge`. To force a non-empty publish (the engine
+    // skips publishing if the CRDT hasn't changed since last flush),
+    // we mint a fresh local Update via `insert_local_event` on A.
+    //
+    // We use a Leave event from Alice — the simplest event Alice can
+    // self-mint that will mutate the CRDT she already has. (A second
+    // Join is a no-op on the CRDT — the unique-id key would clash on
+    // re-insert; a Leave changes Alice's status to Left and is what
+    // production would call when Alice quits the community.)
+    //
+    // NB: If Alice leaves, the membership-at-publish gate would then
+    // reject a SUBSEQUENT publish from her — but step 3 is only ONE
+    // publish, so the gate evaluates the publish HLC against
+    // Alice's status AT THE PUBLISH HLC. Membership status is
+    // computed from events with `at < publish_hlc` (look-back).
+    // Alice's Leave event lives at `wall_ms ≈ now`; her publish HLC
+    // also lives at `wall_ms ≈ now`. Whether the leave dominates the
+    // publish HLC is timing-sensitive, so we use a different mutation:
+    // a follow-up Join from a separate device for Alice would also
+    // not insert (duplicate id). Simplest path: do NOT insert a new
+    // event; instead, force a flush, which re-publishes the same
+    // CRDT with a new HLC. The engine doesn't actually skip "no-op"
+    // publishes — `flush_now` always advances next_hlc and emits a
+    // wire packet (see `publish_root_now` step 5), so the same
+    // single-event CRDT will produce a strictly-newer wire packet.
+    registry_a
+        .flush_now(&community_id)
+        .await
+        .expect("flush a 2");
+
+    // Wait for B's tracker for `(alice_addr, "a-dev")` to advance
+    // PAST hlc1. This is the censorship-defeated assertion: if the
+    // forged publish had advanced B's tracker to `huge`, this poll
+    // would time out (B would silently drop Alice's HLC₂ publish
+    // because `huge > HLC₂`).
+    {
+        let registry_b_for_poll = &registry_b;
+        let hlc1_for_poll = hlc1.clone();
+        wait_until(
+            Duration::from_secs(3),
+            Duration::from_millis(10),
+            || async {
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine b spawned");
+                match snap.per_device.get(&(alice_addr, "a-dev".to_string())) {
+                    Some(entry) => entry.is_strictly_newer_than(&hlc1_for_poll),
+                    None => false,
+                }
+            },
+        )
+        .await;
+    }
+
+    // Final invariants:
+    //   - HLC₁ < HLC₂ (real publisher advanced past her own first
+    //     publish).
+    //   - HLC₂ ≪ huge (the forged HLC is far in the future).
+    //   - Tracker is at HLC₂, not `huge`.
+    let hlc2 = {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        snap.per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect("alice tracker entry after step 3")
+    };
+    assert!(
+        hlc2.is_strictly_newer_than(&hlc1),
+        "HLC₂ ({hlc2:?}) must strictly dominate HLC₁ ({hlc1:?})"
+    );
+    assert!(
+        forged_huge_hlc.is_strictly_newer_than(&hlc2),
+        "huge ({forged_huge_hlc:?}) must dominate HLC₂ ({hlc2:?}) — \
+         otherwise the test isn't actually exercising the censorship \
+         scenario (Alice would naturally outpace the spoof regardless)"
+    );
+
+    registry_a.shutdown_all().await.expect("shutdown a");
+    registry_b.shutdown_all().await.expect("shutdown b");
+}
