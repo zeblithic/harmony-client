@@ -1972,3 +1972,405 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
 
     registry.shutdown_all().await.expect("shutdown");
 }
+
+// ── ZEB-262 Phase 4 Task 3: kick + set_power happy-path round-trips ───
+//
+// Two-engine CRDT round-trip tests for kick_from_community and
+// set_power_level. Mirrors the setup pattern of
+// `community_open_flow_integration.rs::open_community_create_redeem_leave_round_trip`:
+// shared in-memory CAS + Reticulum-style mpsc forwarders + two
+// `CommunitySyncEngine` instances + bootstrap-Join pre-seed for both
+// peers (covers cold-cache transient rejection per ZEB-256 §5).
+//
+// After both engines hold {admin Join, B's redemption Join} we mint the
+// kick/set_power event using the new `mint_kick_event` /
+// `mint_set_power_event` pure helpers, insert via engine_a, and assert
+// that B's local materialized state converges to the expected shape.
+
+mod task3_kick_setpower_round_trip {
+    use super::*;
+    use harmony_app::community_membership::{materialize, MaterializedMembership, MemberStatus};
+    use harmony_app::community_state_crdt::InsertOutcome;
+    use harmony_app::community_state_sync::{
+        CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
+        CommunitySyncEngineConfig, PersistPaths,
+    };
+    use harmony_app::{
+        mint_community_creation, mint_kick_event, mint_redemption, mint_set_power_event,
+    };
+    use std::collections::HashMap;
+
+    struct TwoIdentityResolver {
+        a: (OwnerAddr, [u8; 64]),
+        b: (OwnerAddr, [u8; 64]),
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityResolver for TwoIdentityResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.a.0 {
+                Some(self.a.1)
+            } else if *addr == self.b.0 {
+                Some(self.b.1)
+            } else {
+                None
+            }
+        }
+    }
+
+    async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Two-engine fixture: shared CAS, paired mpsc forwarders, A's
+    /// bootstrap Join + B's redemption Join converged on both peers.
+    /// Returns the engines, states, identity material, and minted-B
+    /// payload so callers can mint kick / set_power events with a
+    /// monotonic `prev_hlc` reference.
+    struct Fixture {
+        engine_a: CommunitySyncEngine,
+        engine_b: CommunitySyncEngine,
+        // state_a is held so the Arc clone passed to engine_a stays
+        // alive; the assertions only inspect state_b. Underscore-
+        // prefixed to silence dead_code without dropping the binding.
+        _state_a: Arc<Mutex<CommunityState>>,
+        state_b: Arc<Mutex<CommunityState>>,
+        owner_a: OwnerAddr,
+        owner_b: OwnerAddr,
+        signing_a: Arc<ed25519_dalek::SigningKey>,
+        community_id: SpaceId,
+        minted_b_join_hlc: Hlc,
+        // Hold the temp dirs for the lifetime of the fixture so the
+        // engines' persistence files don't disappear mid-test.
+        _tmp_a: tempfile::TempDir,
+        _tmp_b: tempfile::TempDir,
+    }
+
+    async fn build_fixture(seed_a: u8, seed_b: u8) -> Fixture {
+        let identity_a = PrivateIdentity::from_seed(&[seed_a; 32]);
+        let identity_b = PrivateIdentity::from_seed(&[seed_b; 32]);
+        let owner_a = OwnerAddr(identity_a.identity.address_hash);
+        let owner_b = OwnerAddr(identity_b.identity.address_hash);
+        let pub_a = identity_a.identity.to_public_bytes();
+        let pub_b = identity_b.identity.to_public_bytes();
+        let signing_a = signing_key_from(&identity_a);
+        let signing_b = signing_key_from(&identity_b);
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+            a: (owner_a, pub_a),
+            b: (owner_b, pub_b),
+        });
+
+        // Shared in-memory CAS servicer.
+        let cas: Arc<Mutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel(64);
+        let cas_for_servicer = Arc::clone(&cas);
+        tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        cas_for_servicer.lock().await.insert(cid, blob);
+                        if let Some(r) = reply {
+                            let _ = r.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch {
+                        cid,
+                        timeout: _,
+                        reply,
+                    } => {
+                        let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                        let _ = reply.send(Ok(v));
+                    }
+                }
+            }
+        });
+
+        // Wire: A↔B publish/subscribe forwarders.
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let a_in_for_fwd = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = b_out_rx.recv().await {
+                let _ = a_in_for_fwd.send(bytes).await;
+            }
+        });
+        let b_in_for_fwd = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = a_out_rx.recv().await {
+                let _ = b_in_for_fwd.send(bytes).await;
+            }
+        });
+
+        // A mints a fresh community + bootstrap Join.
+        let minted_a = mint_community_creation(
+            "TestCommunity",
+            false,
+            owner_a,
+            &signing_a,
+            "a-dev",
+            100_000,
+            None,
+        )
+        .expect("mint create");
+        let community_id = minted_a.community_id;
+
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            Duration::from_secs(2),
+        ));
+
+        let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+        let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+
+        let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+        let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+
+        let tmp_a = tempfile::tempdir().expect("tmp a");
+        let tmp_b = tempfile::tempdir().expect("tmp b");
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            is_invite_only: false,
+            device_id: "a-dev".into(),
+            self_owner: owner_a,
+            signing_key: Arc::clone(&signing_a),
+            state: Arc::clone(&state_a),
+            tracker: Arc::clone(&tracker_a),
+            content_store: cs_a,
+            publisher_tx: a_out_tx,
+            subscriber_rx: a_in_rx,
+            paths: PersistPaths {
+                crdt: tmp_a.path().join("crdt.cbor"),
+                replay: tmp_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: Some(delta_a_tx),
+        });
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            is_invite_only: false,
+            device_id: "b-dev".into(),
+            self_owner: owner_b,
+            signing_key: Arc::clone(&signing_b),
+            state: Arc::clone(&state_b),
+            tracker: Arc::clone(&tracker_b),
+            content_store: cs_b,
+            publisher_tx: b_out_tx,
+            subscriber_rx: b_in_rx,
+            paths: PersistPaths {
+                crdt: tmp_b.path().join("crdt.cbor"),
+                replay: tmp_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: Some(delta_b_tx),
+        });
+
+        // Step 1: A inserts its bootstrap Join.
+        let outcome = engine_a
+            .insert_local_event(minted_a.bootstrap_join.clone())
+            .await
+            .expect("A bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        let _ = tokio::time::timeout(Duration::from_secs(1), delta_a_rx.recv()).await;
+
+        // ZEB-256 Task 6 cold-cache simulation: B insert-locals A's
+        // bootstrap Join so B's membership-at-HLC gate admits A's
+        // first publish.
+        let _ = engine_b
+            .insert_local_event(minted_a.bootstrap_join.clone())
+            .await
+            .expect("B insert A's bootstrap Join (pre-seed)");
+        assert!(
+            wait_until(
+                || async { state_b.lock().await.events.len() == 1 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should hold A's bootstrap Join"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv()).await;
+
+        // Step 2: B redeems an open invite for the same community.
+        let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            community_name: "TestCommunity".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+        };
+        let minted_b =
+            mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
+                .expect("mint redeem");
+        let redemption_outcome = engine_b
+            .insert_local_event(minted_b.bootstrap_join.clone())
+            .await
+            .expect("B redemption insert");
+        assert_eq!(redemption_outcome, InsertOutcome::Inserted);
+        let _ = tokio::time::timeout(Duration::from_secs(1), delta_b_rx.recv()).await;
+
+        // ZEB-256 Task 6: A insert-locals B's redemption Join too.
+        let _ = engine_a
+            .insert_local_event(minted_b.bootstrap_join.clone())
+            .await
+            .expect("A insert B's redemption Join");
+        assert!(
+            wait_until(
+                || async { state_a.lock().await.events.len() == 2 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "A should hold its own Join + B's redemption Join"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv()).await;
+
+        Fixture {
+            engine_a,
+            engine_b,
+            _state_a: state_a,
+            state_b,
+            owner_a,
+            owner_b,
+            signing_a,
+            community_id,
+            minted_b_join_hlc: minted_b.bootstrap_join.at.clone(),
+            _tmp_a: tmp_a,
+            _tmp_b: tmp_b,
+        }
+    }
+
+    /// Two-engine kick happy path: admin (A) kicks Bob (B). The Kick
+    /// event materialises on both A and B as MemberStatus::Banned for B.
+    #[tokio::test]
+    async fn admin_kicks_member_round_trip() {
+        let f = build_fixture(0xa1, 0xb2).await;
+
+        // Admin mints a Kick(B) event with prev_hlc anchored to B's
+        // redemption Join (the most recent event A observed).
+        let kick = mint_kick_event(
+            f.community_id,
+            f.owner_a,
+            f.owner_b,
+            Some("test-kick".into()),
+            &f.signing_a,
+            "a-dev",
+            300_000,
+            Some(&f.minted_b_join_hlc),
+        )
+        .expect("mint kick");
+
+        let outcome = f
+            .engine_a
+            .insert_local_event(kick.clone())
+            .await
+            .expect("A insert kick");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // Wait for B to converge on 3 events (admin Join + B Join + Kick).
+        assert!(
+            wait_until(
+                || async { f.state_b.lock().await.events.len() == 3 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should receive the Kick"
+        );
+
+        // Both peers' materialized state should show B as Banned.
+        let events_b: Vec<_> = {
+            let s = f.state_b.lock().await;
+            s.events.values().cloned().collect()
+        };
+        let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
+        assert_eq!(
+            mat_b.members.get(&f.owner_b).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "B's local materialization must show Bob as Banned after Kick converges"
+        );
+
+        f.engine_a.shutdown().await.expect("shutdown a");
+        f.engine_b.shutdown().await.expect("shutdown b");
+    }
+
+    /// Two-engine set_power happy path: admin (A) promotes Bob (B) to
+    /// power 50. After convergence B's materialization shows
+    /// power_levels[Bob] == 50.
+    #[tokio::test]
+    async fn admin_sets_power_round_trip() {
+        let f = build_fixture(0xa3, 0xb4).await;
+
+        let promo = mint_set_power_event(
+            f.community_id,
+            f.owner_a,
+            f.owner_b,
+            50,
+            &f.signing_a,
+            "a-dev",
+            300_000,
+            Some(&f.minted_b_join_hlc),
+        )
+        .expect("mint set_power");
+
+        let outcome = f
+            .engine_a
+            .insert_local_event(promo.clone())
+            .await
+            .expect("A insert set_power");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        assert!(
+            wait_until(
+                || async { f.state_b.lock().await.events.len() == 3 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should receive the SetPower"
+        );
+
+        let events_b: Vec<_> = {
+            let s = f.state_b.lock().await;
+            s.events.values().cloned().collect()
+        };
+        let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
+        assert_eq!(
+            mat_b.power_levels.get(&f.owner_b),
+            Some(&50),
+            "B's local materialization must show power_levels[Bob] == 50 after SetPower converges"
+        );
+
+        f.engine_a.shutdown().await.expect("shutdown a");
+        f.engine_b.shutdown().await.expect("shutdown b");
+    }
+}

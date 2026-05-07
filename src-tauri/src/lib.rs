@@ -6790,6 +6790,310 @@ mod leave_community_inner_tests {
     }
 }
 
+// ── ZEB-262 Phase 4: kick_from_community ─────────────────────────────
+//
+// Mints a Kick SignedMembershipEvent and inserts it through the
+// per-community engine. Power-gate enforcement happens INSIDE
+// engine.insert_local_event (which calls verify_event) — actor must
+// have power ≥ kick_threshold (50) AND strictly greater than target's
+// power. The IPC trusts verify_event and translates VerifyError
+// discriminants to user-readable strings. Pre-validating here would
+// duplicate the rules and risk drift.
+
+/// Pure function: mint a self-signed Kick event for a community we
+/// belong to and have permission to moderate. Mirrors `mint_leave_event`.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_kick_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target: crate::owner_state_types::OwnerAddr,
+    reason: Option<String>,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let kick_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::Kick { target, reason },
+        actor: self_owner,
+        at: kick_hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign kick: {e}"))
+}
+
+/// Tauri IPC: kick a member from a community.
+///
+/// Power-gated by `verify_event`: actor must have power ≥ 50 (kick
+/// threshold) AND strictly greater than target's current power.
+/// Returns Err with the VerifyError discriminant on rejection.
+#[tauri::command]
+async fn kick_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let target_bytes: [u8; 16] = hex::decode(&target_addr)
+        .map_err(|e| format!("invalid target_addr hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target = crate::owner_state_types::OwnerAddr(target_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint under HLC tracker lock then drop the guard.
+    let kick = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_kick_event(
+            space_id,
+            self_owner,
+            target,
+            reason,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // Generation fence (mirrors leave_community).
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during kick_from_community (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(kick.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(format!("Kick rejected by CRDT verify: {outcome:?}"));
+    }
+
+    // Advance HLC tracker only on `Inserted` (mirrors leave_community).
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        let mut t = hlc_tracker.lock().await;
+        t.insert(device_id.clone(), kick.at.clone());
+    }
+
+    Ok(())
+}
+
+// ── ZEB-262 Phase 4: set_power_level ─────────────────────────────────
+//
+// Same shape as kick_from_community. Power-gate enforcement in
+// verify_event: actor must have power ≥ set_power_threshold (100), and
+// the proposed level must be in [0, POWER_THRESHOLDS.max]. Admin self-
+// demote is allowed (foot-gun, but consistent with the CRDT semantics);
+// any UI warning lives in Phase 5.
+
+#[allow(clippy::too_many_arguments)]
+pub fn mint_set_power_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target: crate::owner_state_types::OwnerAddr,
+    level: u8,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::SetPower { target, level },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign set_power: {e}"))
+}
+
+/// Tauri IPC: set a member's power level in a community.
+///
+/// Power-gated by `verify_event`: actor must have power ≥ 100 (the
+/// set_power threshold). Out-of-range levels are rejected by
+/// verify_event as `PowerLevelOutOfRange`. Returns Err with the
+/// VerifyError discriminant on rejection.
+#[tauri::command]
+async fn set_power_level(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    level: u8,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let target_bytes: [u8; 16] = hex::decode(&target_addr)
+        .map_err(|e| format!("invalid target_addr hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target = crate::owner_state_types::OwnerAddr(target_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let event = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_set_power_event(
+            space_id,
+            self_owner,
+            target,
+            level,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during set_power_level (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(event.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(format!("SetPower rejected by CRDT verify: {outcome:?}"));
+    }
+
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        let mut t = hlc_tracker.lock().await;
+        t.insert(device_id.clone(), event.at.clone());
+    }
+
+    Ok(())
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -7138,6 +7442,8 @@ pub fn run() {
             create_community,
             redeem_invite,
             leave_community,
+            kick_from_community,
+            set_power_level,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
