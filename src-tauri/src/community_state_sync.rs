@@ -196,8 +196,11 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
 
 /// State-root publish wire envelope. ZEB-256: every publish is signed
 /// by the publisher's local Ed25519 device key. Receivers verify the
-/// signature, the publisher's current membership status, and the
-/// per-(addr, device) replay tracker before merging events.
+/// signature, the publisher's membership status as of `payload.at`
+/// (via `prior_state_at_hlc(payload.at)` — NOT the publisher's
+/// current materialized status, which would be wrong for lagging-peer
+/// convergence), and the per-(addr, device) replay tracker before
+/// merging events.
 ///
 /// Wire format: 4-key CBOR map. All field codes are 2 chars
 /// (`rc`/`pa`/`at`/`ps`) to satisfy the same-length-keys invariant
@@ -1370,27 +1373,40 @@ impl IncomingOutcome {
 /// 8. Decrypt the blob (deterministic-nonce).
 /// 9. Decode `CommunityState`.
 /// 10. Misrouted-blob check: `remote.community_id == ctx.community_id`.
-/// 11. Advance `tracker` keyed on `payload.publisher_addr` — single
-///     mutation point. Subsequent failures are `ErrPostMutation` so the
-///     caller persists tracker advance.
-/// 12. For each event: skip-if-known; resolve actor + countersigner
-///     identity_pubs (skip-on-error); call `state.insert_event` with a
-///     fresh `VerifyContext`; surface `Rejected` outcomes as
-///     `CommunityDegradedReport` on `error_tx`.
+/// 11. Pre-resolve identity_pubs for every inner event OUTSIDE the
+///     state lock (Phase A — avoids the lock-order hazard with
+///     owner-state).
+/// 12. Lock state. RE-CHECK membership-at-HLC under the lock — closes
+///     the TOCTOU race where a concurrent `insert_local_event()` call
+///     lands a Leave/Kick between step 2's snapshot and the merge.
+///     If the publisher is no longer Joined per the current local
+///     state, drop the lock and return `ErrPreMutation::PublisherNotJoined`
+///     WITHOUT advancing the tracker.
+/// 13. Otherwise, merge each event under the same state lock
+///     (skip-if-known; call `state.insert_event` with a fresh
+///     `VerifyContext`; surface `Rejected` outcomes as
+///     `CommunityDegradedReport` on `error_tx`). Drop the state lock.
+/// 14. Advance `tracker` keyed on `payload.publisher_addr` — single
+///     mutation point. Happens AFTER the state merge so a TOCTOU-race
+///     rejection at step 12 leaves the tracker untouched.
 ///
-/// **Cheapest-first rejection order.** Membership-at-HLC is a local
-/// state lookup (free); identity resolution is an in-memory cache
-/// hit on the hot path; sig-verify is microseconds but unnecessary
-/// for a publisher we know is no longer Joined. Surfacing each class
-/// as a distinct error variant lets the frontend banner discriminate
-/// "this peer lost membership" (informational) from "someone forged
-/// a publish claiming to be this peer" (security-relevant).
+/// **Cheapest-first rejection order.** Membership-at-HLC at step 2 is
+/// a local state lookup (free) used as a DoS pre-filter; identity
+/// resolution is an in-memory cache hit; sig-verify is microseconds
+/// but unnecessary for a publisher we know is no longer Joined.
+/// Surfacing each class as a distinct error variant lets the frontend
+/// banner discriminate "this peer lost membership" (informational)
+/// from "someone forged a publish claiming to be this peer"
+/// (security-relevant). Step 12's re-check is the AUTHORITATIVE gate
+/// w.r.t. local state mutations — step 2's read-then-drop snapshot
+/// can race with `insert_local_event()`.
 ///
-/// **Censorship-defense invariant.** None of the three new gates
-/// advance the tracker — only the post-misrouted-blob `record`
-/// at step 11. A kicked-but-still-keyed member trying to squat
-/// HLC slots fails the membership gate before touching the
-/// tracker; per-publisher namespacing on the tracker key
+/// **Censorship-defense invariant.** None of the rejection gates
+/// advance the tracker — only the `record` at step 14, which runs
+/// only after the state merge succeeds. A kicked-but-still-keyed
+/// member trying to squat HLC slots fails either the cheap step-2
+/// gate or the authoritative step-12 re-check before tracker.record
+/// runs; per-publisher namespacing on the tracker key
 /// `(publisher_addr, device_id)` further isolates the per-addr
 /// HLC space so an attacker can't claim Alice's slot via shared
 /// `MembershipKey`.
@@ -1398,15 +1414,17 @@ impl IncomingOutcome {
 /// **Divergence from `owner_state_sync::handle_incoming_publish`:**
 /// owner-state advances the tracker IMMEDIATELY after the replay-check
 /// (so blob-fetch / decrypt / decode failures land as
-/// `ErrPostMutation`). We delay the advance until step 11 — AFTER the
-/// blob has been fetched, decrypted, decoded, AND passed the
-/// misrouted-blob check. The rationale is asymmetric trust: a
-/// misrouted blob (foreign community's state surfaced under our
-/// CID) means the publisher's HLC carries no useful information for
-/// OUR replay tracker, so advancing it would let a correctly-routed
-/// re-publish at the same HLC be silently dropped. owner-state
-/// doesn't have this concern because there's only one owner-CRDT
-/// per identity.
+/// `ErrPostMutation`). We delay the advance until step 14 — AFTER the
+/// blob has been fetched, decrypted, decoded, AND merged under the
+/// re-checked membership lock. Two reasons: (a) a misrouted blob
+/// (foreign community's state surfaced under our CID) means the
+/// publisher's HLC carries no useful information for OUR replay
+/// tracker, so advancing it would let a correctly-routed re-publish
+/// at the same HLC be silently dropped; (b) the post-merge tracker
+/// advance is required for TOCTOU defense — see step 12.
+/// owner-state has neither concern because there's only one owner-
+/// CRDT per identity AND no concurrent `insert_local_event` IPC
+/// path.
 async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
     use crate::community_membership::MemberStatus;
     use crate::owner_state_crypto::canonical_cbor_encode;
@@ -1423,9 +1441,10 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     };
 
-    // 2. Membership-at-HLC gate. Cheapest of the three new gates: a
-    //    local materialize over our trusted log + a single map lookup.
-    //    Run BEFORE sig-verify because a stale-membership rejection is
+    // 2. Membership-at-HLC gate (DoS pre-filter — NOT the authoritative
+    //    gate). Cheapest of the three new gates: a local materialize
+    //    over our trusted log + a single map lookup. Run BEFORE
+    //    sig-verify because a stale-membership rejection is
     //    informational and we shouldn't pay sig-verify cost for a
     //    publish we'll reject anyway. The check is over our locally-
     //    trusted state, so there's no integrity risk in trusting it
@@ -1441,6 +1460,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    steps 2+3 but cannot survive step 4 unless the attacker also
     //    forged a valid Ed25519 signature. The tracker never advances
     //    on rejection at any step.
+    //
+    //    TOCTOU note: this gate snapshots `state.events` then drops
+    //    the lock so subsequent async work doesn't block the engine.
+    //    A concurrent `insert_local_event()` may land a Leave/Kick
+    //    for `publisher_addr` in the window between this snapshot
+    //    and the merge phase. The authoritative re-check happens at
+    //    step 12 (under the state lock, immediately before the merge)
+    //    so a publish admitted here can still be rejected post-race
+    //    without advancing the tracker.
     //
     //    Spec compliance: materialize the prefix of our local log
     //    strictly before `payload.at` via `prior_state_at_hlc` and
@@ -1573,11 +1601,20 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     }
 
-    // 5. Replay-protect via per-(addr, device) RootHlcTracker. Read-only —
-    //    the `record` step happens after the rest of the receive
-    //    pipeline succeeds (single state-mutation point at step 8).
-    //    Now keyed on the trusted `payload.publisher_addr` (Task 2's
-    //    placeholder is gone — sig-verify above proved the addr).
+    // 5. Replay-protect via per-(addr, device) RootHlcTracker.
+    //    Read-only — the `record` step happens at step 14 (after the
+    //    state-merge under the TOCTOU re-check), so dedup and the
+    //    single-mutation-point are now decoupled into separate steps.
+    //    Keyed on the trusted `payload.publisher_addr` (sig-verify
+    //    above proved the addr).
+    //
+    //    Note: a publish that passes here can still be rejected at
+    //    step 12's re-check (concurrent local Leave/Kick) and
+    //    therefore NOT advance the tracker. That's the intended
+    //    semantic — re-receive of the same publish later will hit
+    //    the same step-12 rejection until either the publisher's
+    //    membership re-Joins (out-of-band) or the publisher republishes
+    //    at a strictly newer HLC.
     {
         let tracker = ctx.tracker.lock().await;
         if !tracker.would_accept(&payload.publisher_addr, &payload.at) {
@@ -1623,17 +1660,6 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             expected: ctx.community_id,
             found: remote.community_id,
         });
-    }
-
-    // 9. Advance the replay tracker BEFORE merging events. This is
-    //    the single state-mutation point — if any subsequent step
-    //    fails, we mark the outcome ErrPostMutation so the caller
-    //    persists tracker advance to disk (preventing replay on
-    //    next-boot). Keyed on `payload.publisher_addr` (Task 6's
-    //    sig-verify above proved the addr).
-    {
-        let mut tracker = ctx.tracker.lock().await;
-        tracker.record(payload.publisher_addr, payload.at.clone());
     }
 
     // Phase A: pre-resolve identity_pubs OUTSIDE the community state
@@ -1703,6 +1729,44 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
+
+        // 12. TOCTOU re-check: a concurrent `insert_local_event()`
+        //     call (the IPC path used by `redeem_invite`,
+        //     `leave_community`, Phase 4 `kick`, etc.) may have
+        //     landed an event between step 2's snapshot and now,
+        //     including a Leave/Kick that would have failed the
+        //     gate. Re-evaluate `prior_state_at_hlc(payload.at)` over
+        //     the CURRENT events (held under the state lock so no
+        //     further concurrent inserts can land before we merge).
+        //     A negative outcome here returns ErrPreMutation WITHOUT
+        //     advancing the tracker — the cheapest-first gate at
+        //     step 2 was a pre-filter; THIS is the authoritative
+        //     security check w.r.t. local state mutations.
+        //     CodeRabbit PR #88 round 3 finding.
+        {
+            let events_now: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
+            let mat_now = crate::community_membership::prior_state_at_hlc(
+                &events_now,
+                &payload.at,
+                ctx.admin_addr,
+            );
+            let pub_state = mat_now.members.get(&payload.publisher_addr).cloned();
+            let pub_status = pub_state.as_ref().map(|s| s.status);
+            if !matches!(pub_status, Some(MemberStatus::Joined)) {
+                // Drop the lock before returning so error reporting
+                // and the caller's persist machinery aren't serialized
+                // behind an unrelated state lock release.
+                drop(state);
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                    addr: payload.publisher_addr,
+                    // Same fallback semantics as step 2 — see the
+                    // longer comment there for the rationale.
+                    status: pub_status.unwrap_or(MemberStatus::Left),
+                    left_at: pub_state.and_then(|s| s.left_at),
+                });
+            }
+        }
+
         for (event, actor_pub, cs_pub_owned) in resolved {
             if state.events.contains_key(&event.id) {
                 continue;
@@ -1752,6 +1816,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     } // state lock released here
 
+    // 14. Advance the replay tracker — the SINGLE state-mutation
+    //     point for tracker progress. Happens AFTER Phase B's
+    //     state-merge (and AFTER the TOCTOU re-check inside Phase B)
+    //     so a concurrent local Leave/Kick that races the gate
+    //     leaves the tracker untouched, preserving the
+    //     "tracker NOT advanced on any rejection" invariant under
+    //     concurrent IPC mutations.
+    {
+        let mut tracker = ctx.tracker.lock().await;
+        tracker.record(payload.publisher_addr, payload.at.clone());
+    }
+
     // Phase C-pre: emit membership-delta for every inserted event
     // outside the state lock. `try_send` is fire-and-forget — a closed
     // or full channel drops the delta rather than back-pressuring the
@@ -1780,7 +1856,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         );
     }
 
-    // The tracker advanced (step 6) regardless of whether any event
+    // The tracker advanced (step 14) regardless of whether any event
     // was Inserted. Differentiate so Task 10 can persist the smaller
     // replay.cbor file alone when the CRDT is unchanged. See the
     // `IncomingOutcome` doc comments for the full rationale.
