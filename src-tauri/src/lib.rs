@@ -6239,65 +6239,445 @@ pub fn mint_redemption(
     })
 }
 
-/// Tauri IPC: redeem an OPEN community invite URL.
+/// ZEB-262 Phase 4: invite-only `redeem_invite` inner helper. Encodes
+/// the 10-step flow per spec §"Send path: redeem_invite":
 ///
-/// Phase 3 ships only OPEN redemption; invite-only redeem returns Err
-/// until Phase 4 lands the Reticulum counter-sig dance.
+///   1. decode URL (caller-supplied; we receive it as `url: String`)
+///   2. snapshot handles (done by caller — passed in as args)
+///   3. wall_now_ms
+///   4. RESERVE HLC under tracker lock
+///   5. mint_redemption (pure helper from Phase 3)
+///   6. spawn_engine + dispatch adapter
+///   7. branch on `payload.is_invite_only`:
+///      - OPEN — `engine.insert_local_event(bootstrap_join)`
+///      - INVITE-ONLY:
+///        - 7a. register oneshot keyed on `bootstrap_join.id` via
+///          `community_registry.register_pending_redemption`
+///        - 7b. build + sign `CommunityInviteSigned`
+///        - 7c. resolve inviter Reticulum dest(s); send packet via
+///          `unicast_send_tx`
+///        - 7d. await oneshot ≤ T (env
+///          `HARMONY_REDEEM_INVITE_TIMEOUT_MS`, default 15s)
+///   8. fence_check (generation guard via closure)
+///   9. COMMIT owner-state Space (LAST step — ZEB-258 reorder)
+///  10. return `Ok(hex(community_id))`
 ///
-/// Lock-order discipline (mirrors `create_community`): the `crdt_state`
-/// `tokio::sync::Mutex` guard MUST drop before `hlc_tracker.lock().await`
-/// is acquired. Holding `state_g` across `tracker_g.lock().await` would
-/// (a) violate the project-wide "no `.await` while holding state mutex"
-/// rule, and (b) invert lock order vs callers that take `hlc_tracker`
-/// first — a deadlock risk under concurrent IPCs.
+/// On any failure between steps 6-8, the engine is torn down via
+/// `community_registry.shutdown_engine_and_cleanup_persistence` (Task
+/// 7) and owner-state is byte-identical to pre-call.
 ///
-/// Snapshot-then-spawn fence: after applying the Space + advancing the
-/// tracker but BEFORE spawning the engine, we re-acquire the std
-/// `NodeState` lock and check `generation` + `community_registry`. If
-/// the node was stopped (or a stop+restart raced our await chain),
-/// returning Err here suppresses the engine spawn — otherwise the
-/// engine would attach to a detached `crdt_state` that won't be
-/// persisted, leaving a phantom-state engine running in the background.
+/// **Closure-pattern fence_check.** The IPC wrapper passes a closure
+/// that re-locks the std `NodeState` mutex and compares `generation`.
+/// Tests pass `|| Ok(())` since they don't drive the fence. Production
+/// passes a closure that captures `&Mutex<NodeState>` + the snapshot.
+/// `Fn` (not `FnOnce`) so future-proof retries can re-call without
+/// consuming.
+#[allow(clippy::too_many_arguments)]
+pub async fn redeem_invite_inner<F>(
+    url: String,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    _snapshot_generation: u64, // captured by fence_check closure in production
+    fence_check: F,
+) -> Result<String, String>
+where
+    F: Fn() -> Result<(), String>,
+{
+    // 1. Decode URL.
+    let payload = crate::community_invite::decode_invite_url(&url)
+        .map_err(|e| format!("decode invite URL: {e}"))?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // 4. Reserve HLC under tracker lock.
+    let prev_hlc = {
+        let t = hlc_tracker.lock().await;
+        t.get(&device_id).cloned()
+    };
+
+    // 5. Mint (pure helper — no side effects on owner-state yet).
+    let minted = mint_redemption(
+        &payload,
+        self_owner,
+        signing_key.as_ref(),
+        &device_id,
+        wall_now_ms,
+        prev_hlc.as_ref(),
+    )?;
+
+    // Advance the HLC tracker. Strictly-additive: a reserved-but-
+    // unused slot on a later commit failure is harmless (monotonicity
+    // only requires strictly-increasing HLCs).
+    {
+        let mut tracker_g = hlc_tracker.lock().await;
+        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+    }
+
+    // 6. Spawn engine + dispatch adapter. Both can fail; failure
+    //    rolls back via `shutdown_engine_and_cleanup_persistence`.
+    //    Owner-state is still untouched at this point.
+    //
+    //    spawn_engine takes `payload.admin_addr` (the original
+    //    community admin from the invite), NOT self_owner — the
+    //    engine's authority root is the creator's identity. Invite-
+    //    only engines spawn with `is_invite_only=true` so verify_event
+    //    applies the countersig rule.
+    //
+    //    Re-redemption guard: `engine_arc(...).is_some()` BEFORE
+    //    spawn_engine so the gating decision isn't subject to a race
+    //    against owner-state add events. spawn_engine is idempotent;
+    //    on a pre-existing engine, the freshly-built channels are
+    //    dropped (the engine already owns its live adapter pair).
+    let engine_already_existed = community_registry
+        .engine_arc(&minted.community_id)
+        .await
+        .is_some();
+
+    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    community_registry
+        .spawn_engine(
+            minted.community_id,
+            minted.membership_key.clone(),
+            payload.admin_addr,
+            payload.is_invite_only,
+            pub_tx,
+            sub_rx,
+        )
+        .await
+        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
+
+    if !engine_already_existed {
+        if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+            id_hex: hex::encode(minted.community_id.0),
+            publisher_rx: pub_rx,
+            subscriber_tx: sub_tx,
+        }) {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown_engine_and_cleanup_persistence failed during redeem_invite \
+                     adapter-dispatch rollback"
+                );
+            }
+            return Err(match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    "adapter request queue full; please retry".to_string()
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    "adapter request channel closed (event_loop stopped?)".to_string()
+                }
+            });
+        }
+    } else {
+        // Idempotent re-redemption: pre-existing engine already owns
+        // its live adapter pair from the original spawn. Drop the
+        // freshly-built halves we no longer need.
+        drop(pub_rx);
+        drop(sub_tx);
+    }
+
+    // 7. Branch on payload.is_invite_only.
+    if !payload.is_invite_only {
+        // OPEN: insert bootstrap_join via the engine. The engine's
+        // `insert_local_event` runs verify_event (which authorizes the
+        // open Join via signature alone) and fires `notify_dirty` on
+        // success.
+        let engine_arc = community_registry
+            .engine_arc(&minted.community_id)
+            .await
+            .ok_or("engine vanished immediately after spawn — registry race")?;
+        let outcome = engine_arc
+            .insert_local_event(minted.bootstrap_join.clone())
+            .await
+            .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+        if !matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Inserted
+        ) {
+            // Bootstrap Join didn't insert — tear down so we don't
+            // leak a zombie engine.
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite OPEN-branch insert-rejected rollback"
+                );
+            }
+            return Err(format!("self Join not inserted (got {outcome:?})"));
+        }
+    } else {
+        // INVITE-ONLY: 7a-d.
+        let invite_token = payload
+            .invite_token
+            .as_ref()
+            .ok_or("invite-only payload missing invite_token")?
+            .clone();
+
+        // 7a. Register oneshot keyed on bootstrap_join.id. Engine's
+        //     insert hook (Task 7's notify_pending_redemption_in_map)
+        //     fires it once the counter-signed Join lands.
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel::<()>();
+        community_registry
+            .register_pending_redemption(minted.bootstrap_join.id, notify_tx)
+            .await;
+
+        // 7b. Build + sign CommunityInviteSigned. Read the joiner's
+        //     identity (private_identity → identity_pub +
+        //     device_hash) and signing_key from the dm_outbox under
+        //     its lock. Drop the guard before any further `.await`
+        //     to keep the outbox available to drain ticks.
+        let (joiner_pub, joiner_device_hash, sign_key_arc) = {
+            let outbox_g = dm_outbox.lock().await;
+            let joiner_pub = outbox_g.private_identity.identity.to_public_bytes();
+            let joiner_device_hash = crate::owner_state_types::DeviceIdentityHash(
+                outbox_g.private_identity.identity.address_hash,
+            );
+            let sign_key_arc = std::sync::Arc::clone(&outbox_g.signing_key);
+            (joiner_pub, joiner_device_hash, sign_key_arc)
+        };
+
+        let signed = crate::community_invite::CommunityInviteSigned {
+            community_id: minted.community_id,
+            join_event: minted.bootstrap_join.clone(),
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: joiner_device_hash,
+            // CommunityInvitePacket.created_at carries the joiner's
+            // wall-clock at packet construction; reusing the bootstrap
+            // Join's HLC keeps the redeemer's outbound packet temporally
+            // bound to the event being counter-signed.
+            created_at: minted.bootstrap_join.at.clone(),
+        };
+
+        let packet =
+            crate::community_invite::build_signed_invite_packet(signed, sign_key_arc.as_ref())
+                .map_err(|e| format!("build_signed_invite_packet: {e}"))?;
+        let wire = crate::community_invite::encode_packet(&packet)
+            .map_err(|e| format!("encode_packet: {e}"))?;
+
+        // 7c. Resolve inviter's Reticulum destination(s) and send.
+        let inviter_addr = payload.admin_addr;
+        let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
+        if destinations.is_empty() {
+            // No known device for inviter → drop oneshot + tear down.
+            let _ = community_registry
+                .take_pending_redemption(&minted.bootstrap_join.id)
+                .await;
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite inviter-unknown rollback"
+                );
+            }
+            return Err(format!(
+                "no known device for inviter {} — invite cannot route",
+                hex::encode(inviter_addr.0)
+            ));
+        }
+        for destination_hash in &destinations {
+            if let Err(e) = unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
+                destination_hash: *destination_hash,
+                packet: wire.clone(),
+            }) {
+                let _ = community_registry
+                    .take_pending_redemption(&minted.bootstrap_join.id)
+                    .await;
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite unicast-send rollback"
+                    );
+                }
+                return Err(format!("unicast_send_tx try_send: {e}"));
+            }
+        }
+
+        // 7d. Await oneshot ≤ T (env-overridable for tests).
+        let timeout_ms: u64 = std::env::var("HARMONY_REDEEM_INVITE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15_000);
+
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), notify_rx).await {
+            Ok(Ok(())) => {
+                // Counter-signed Join landed — proceed to commit.
+            }
+            Ok(Err(_recv_err)) => {
+                // Sender dropped without sending — should be
+                // unreachable with the current pending_redemptions
+                // shape, but treat defensively as a failure.
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite oneshot-recv-err rollback"
+                    );
+                }
+                return Err("invite-only redemption oneshot closed unexpectedly".into());
+            }
+            Err(_elapsed) => {
+                let _ = community_registry
+                    .take_pending_redemption(&minted.bootstrap_join.id)
+                    .await;
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite timeout rollback"
+                    );
+                }
+                return Err(format!(
+                    "invite-only redemption timed out after {}ms",
+                    timeout_ms
+                ));
+            }
+        }
+    }
+
+    // 8. SNAPSHOT-THEN-COMMIT FENCE — production wrapper re-locks
+    //    the std `NodeState` mutex and compares `generation`. Tests
+    //    pass `|| Ok(())`. If the node was stopped (or stop+restart
+    //    raced our await chain), this returns Err with crdt_state
+    //    still untouched.
+    if let Err(fence_err) = fence_check() {
+        if let Err(stop_err) = community_registry
+            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+            .await
+        {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "shutdown failed during redeem_invite fence-check rollback"
+            );
+        }
+        return Err(fence_err);
+    }
+
+    // 9. COMMIT owner-state Space (LAST step — ZEB-258 reorder).
+    {
+        let mut state_g = crdt_state.lock().await;
+        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
+        if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
+            // Drop the tokio guard before awaiting the registry call
+            // (no `.await` while holding a tokio mutex guard).
+            drop(state_g);
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite apply-rejected rollback"
+                );
+            }
+            return Err(format!(
+                "apply_space rejected redemption Space: {outcome:?}"
+            ));
+        }
+    }
+
+    // 10. Return Ok.
+    Ok(hex::encode(minted.community_id.0))
+}
+
+/// Resolve `OwnerAddr` → `Vec<destination_hash>` via the joiner's
+/// `OwnerDeviceCache`. Mirrors `dm_outbox::resolve_destinations`'s
+/// shape; reproduced inline because the inviter-resolution path is
+/// community-specific (the inviter's OwnerAddr is plumbed straight
+/// from the invite payload, not from a Space row's recipient).
 ///
-/// Adapter wiring flows through `event_loop` (not directly through the
-/// Zenoh `Session` from this command's task) per spec §"Architecture /
+/// Returns an empty Vec when the cache has no entry for `owner` — the
+/// invite-only branch interprets that as "no known device → invite
+/// cannot route" and surfaces a deterministic Err. (`OwnerAddr` and
+/// `DeviceIdentityHash` are bytes-compatible 16-byte newtypes; the
+/// `.0` extraction below recovers the raw 16-byte destination hash.)
+async fn resolve_destinations_for_owner(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    owner: crate::owner_state_types::OwnerAddr,
+) -> Vec<[u8; 16]> {
+    let g = crdt_state.lock().await;
+    g.owner_device_cache
+        .devices
+        .get(&owner)
+        .map(|entry| entry.devices.iter().map(|h| h.0).collect())
+        .unwrap_or_default()
+}
+
+/// Tauri IPC: redeem a community invite URL (open or invite-only).
+///
+/// Snapshots the relevant `NodeState` handles under the std lock, then
+/// delegates to `redeem_invite_inner`, which encodes the ZEB-258
+/// reorder (owner-state Space commit is the LAST step; engine + adapter
+/// + invite-only oneshot failures roll back with crdt_state untouched).
+///
+/// Lock-order discipline (mirrors `create_community`): the std
+/// `state_lock` guard MUST drop before any `.await`. The signing key
+/// lives inside `dm_outbox` under a tokio Mutex, so we acquire the
+/// dm_outbox handle under the std lock (Arc clone) and `.await` its
+/// lock afterward.
+///
+/// Adapter wiring flows through `event_loop` per spec §"Architecture /
 /// Adapter wiring": this command sends a `CommunityAdapterRequest` over
 /// an mpsc; the event loop's `select!` drains it and calls
 /// `spawn_community_state_zenoh_adapter` against the live session.
 ///
-/// Note vs `create_community`: spawn_engine takes `payload.admin_addr`
-/// (the original community admin from the invite), NOT `self_owner`.
-/// The engine's bootstrap-Join authorization rule keys off the admin
-/// address, which must match the creator's identity — the joining
-/// peer is just a member.
+/// Note vs `create_community`: `spawn_engine` takes `payload.admin_addr`
+/// (the original community admin from the invite), NOT `self_owner` —
+/// the engine's authority root is the creator's identity, not the
+/// joining peer's.
 ///
-/// **NOT idempotent.** A second call with the same invite mints a fresh
-/// self-Join event with a new (random) event_id, which the CRDT accepts
-/// as a distinct event. The materialized state is unchanged (last Join
-/// still wins per LWW on `MemberState`), but the event log grows by one
-/// every retry. `registry.spawn_engine` IS idempotent on repeat calls
-/// for the same community_id (returns the existing engine handle), so
-/// the engine spawn itself is a no-op — the non-idempotence is purely
-/// in the minted event. On a re-redemption the body skips the adapter
-/// dispatch (the pre-existing engine already owns its live adapter
-/// pair); see the `engine_already_existed` branch below. The frontend
-/// should debounce or guard against repeated redemption clicks; a
-/// follow-up (ZEB-258 family) may add a pre-mint materialized-state
-/// lookup so already-Joined re-redemption short-circuits before minting.
+/// **NOT idempotent** for OPEN payloads. A second call with the same
+/// invite mints a fresh self-Join event with a new (random) event_id,
+/// which the CRDT accepts as a distinct event. Materialized state is
+/// unchanged (LWW on `MemberState`); the event log grows by one every
+/// retry. `registry.spawn_engine` IS idempotent. For invite-only the
+/// behavior depends on whether the inviter counter-signs again on a
+/// retry (a freshly-minted bootstrap_join.id forces a new countersig
+/// dance).
 #[tauri::command]
 async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
 ) -> Result<String, String> {
-    let payload = crate::community_invite::decode_invite_url(&url)
-        .map_err(|e| format!("decode invite URL: {e}"))?;
-    if payload.is_invite_only {
-        return Err(
-            "Phase 3 supports OPEN invite redemption only; invite-only ships in Phase 4"
-                .to_string(),
-        );
-    }
-
+    // Snapshot NodeState handles in a single guard scope, then drop
+    // the std lock BEFORE any `.await`. Mirrors `create_community`'s
+    // pattern.
     let (
         crdt_state,
         hlc_tracker,
@@ -6305,6 +6685,7 @@ async fn redeem_invite(
         self_owner,
         community_registry,
         community_adapter_tx,
+        unicast_send_tx,
         dm_outbox,
         snapshot_generation,
     ) = {
@@ -6324,196 +6705,69 @@ async fn redeem_invite(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            g.unicast_send_tx
+                .clone()
+                .ok_or("unicast_send_tx missing — no owner identity?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
             g.generation,
         )
-    };
+    }; // std lock dropped here.
 
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Mint the self-Join + derived Space. Read prev_hlc under the
-    // tracker lock then drop the guard before signing — sign is sync,
-    // but releasing eagerly keeps the tracker available to other tasks.
-    // Borrow the SigningKey from `dm_outbox` (where start_node already
-    // wired the canonical local-device key).
-    let minted = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
+    // Now safe to `.await` — the std lock has been released.
+    let signing_key = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        mint_redemption(
-            &payload,
-            self_owner,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        std::sync::Arc::clone(&outbox_g.signing_key)
     };
 
-    // Apply the derived Community Space row, then DROP the guard BEFORE
-    // awaiting hlc_tracker. See doc comment above for the lock-order
-    // rationale.
-    {
-        let mut state_g = crdt_state.lock().await;
-        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
-        if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
-            return Err(format!(
-                "apply_space rejected redemption Space: {outcome:?}"
-            ));
-        }
-    } // state_g dropped here
-
-    {
-        let mut tracker_g = hlc_tracker.lock().await;
-        // Bootstrap redemption: prev_hlc was either None or strictly
-        // older than `created_at` (next_hlc guarantees forward step),
-        // so unconditionally advancing the tracker is correct.
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
-    }
-
-    // Snapshot-then-spawn fence: ensure node generation hasn't changed
-    // and the registry is still wired. If either fails, the engine
-    // we'd spawn would be detached from a stopped node.
-    {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during redeem_invite (was {}, now {}); \
-                 redemption minted on a detached crdt_state and won't be persisted — \
-                 engine spawn suppressed",
-                snapshot_generation, g.generation
-            ));
-        }
-        if g.community_registry.is_none() {
-            return Err(
-                "community_registry was torn down during redeem_invite — engine spawn suppressed"
-                    .to_string(),
-            );
-        }
-    }
-
-    // Channel pair shape mirrors create_community / start_node's
-    // per-community spawn: pub_tx / sub_rx feed the engine, pub_rx /
-    // sub_tx feed the Zenoh adapter.
-    let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    // NOTE: spawn_engine takes payload.admin_addr (the original
-    // community admin from the invite), NOT self_owner. The engine's
-    // authority root is the creator's identity; the joining peer is
-    // just a member.
-    //
-    // Re-redemption guard: spawn_engine is idempotent — if an engine
-    // for this community is already in the registry, spawn_engine
-    // returns Ok(()) WITHOUT consuming the fresh `pub_tx`/`sub_rx` we
-    // built above (they are taken by-value and dropped at end of
-    // spawn_engine's body). Unlike `create_community`, redeem_invite's
-    // community_id is not freshly random — the user can legitimately
-    // redeem the same invite URL twice (double-click, retry after
-    // transient error, re-redeem after leaving). Without this guard,
-    // a re-redemption would dispatch a CommunityAdapterRequest with
-    // the orphaned pub_rx/sub_tx, spawning a zombie Zenoh adapter on
-    // dead channels; and on dispatch failure, the error path's
-    // stop_engine would tear down the pre-existing healthy engine
-    // shared with the original redemption. Take the engine_arc check
-    // BEFORE spawn_engine so the gating decision isn't subject to a
-    // race against owner-state add events. Cursor Bugbot finding on
-    // PR #87 round 3.
-    let engine_already_existed = community_registry
-        .engine_arc(&minted.community_id)
-        .await
-        .is_some();
-
-    community_registry
-        .spawn_engine(
-            minted.community_id,
-            minted.membership_key.clone(),
-            payload.admin_addr,
-            false, // is_invite_only — OPEN-only in Phase 3
-            pub_tx,
-            sub_rx,
-        )
-        .await
-        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
-
-    if !engine_already_existed {
-        // First-time spawn: wire the per-community Zenoh adapter. On
-        // dispatch failure, the engine we just spawned is a zombie
-        // (its adapter halves were dropped inside TrySendError), so
-        // tear it down before propagating. Mirrors the cleanup shape
-        // in `create_community`. The stop_engine call here is safe
-        // precisely because we just spawned this engine — it isn't
-        // shared with any prior redemption. (Space row already
-        // committed — separate concern tracked by ZEB-258.)
-        if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
-            id_hex: hex::encode(minted.community_id.0),
-            publisher_rx: pub_rx,
-            subscriber_tx: sub_tx,
-        }) {
-            if let Err(stop_err) = community_registry.stop_engine(&minted.community_id).await {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "stop_engine failed while cleaning up after adapter try_send failure"
+    // Fence-check closure: re-locks the std NodeState mutex and
+    // compares `generation`. If the node was stopped (or stop+restart
+    // raced), the closure returns Err and the inner helper rolls back.
+    // Captures `state_lock` (a clonable `tauri::State<'_, _>`) by move;
+    // `Fn` (not FnOnce) so the inner helper retains the option of
+    // re-checking on retries. The closure borrows `state_lock` through
+    // its `'r` lifetime, which the awaited inner future is bounded by.
+    let fence_check = {
+        let state_lock = state_lock.clone();
+        move || -> Result<(), String> {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during redeem_invite (was {}, now {}); \
+                     redemption minted on a detached crdt_state and won't be persisted — \
+                     engine spawn suppressed",
+                    snapshot_generation, g.generation
+                ));
+            }
+            if g.community_registry.is_none() {
+                return Err(
+                    "community_registry was torn down during redeem_invite — engine spawn \
+                     suppressed"
+                        .to_string(),
                 );
             }
-            return Err(match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    "adapter request queue full; please retry".to_string()
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    "adapter request channel closed (event_loop stopped?)".to_string()
-                }
-            });
+            Ok(())
         }
-    } else {
-        // Idempotent re-redemption: the pre-existing engine already
-        // owns its live adapter pair from the original spawn. The
-        // fresh `pub_tx`/`sub_rx` we built above were not consumed by
-        // spawn_engine (idempotent no-op) and have already dropped at
-        // end of spawn_engine's body. The matching `pub_rx`/`sub_tx`
-        // we still hold here would pair with dead halves if dispatched
-        // — drop them by NOT dispatching. The bootstrap_join insert
-        // below will append a fresh self-Join event to the existing
-        // engine's CRDT log; LWW materialization absorbs the duplicate
-        // (member list unchanged), but the event log grows by one.
-        // This non-idempotence at the event-log level is documented in
-        // the redeem_invite docstring above.
-        drop(pub_rx);
-        drop(sub_tx);
-    }
+    };
 
-    // Now self-Join via the engine. The engine's `insert_local_event`
-    // runs verify_event (which authorizes the open Join via signature
-    // alone) and fires `notify_dirty` on success; the debounced publish
-    // picks up the event and writes to the per-community state-root
-    // topic so the creator (and any other peer) sees the new member.
-    let engine_arc = community_registry
-        .engine_arc(&minted.community_id)
-        .await
-        .ok_or("engine vanished immediately after spawn — registry race")?;
-    let outcome = engine_arc
-        .insert_local_event(minted.bootstrap_join)
-        .await
-        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
-    if !matches!(
-        outcome,
-        crate::community_state_crdt::InsertOutcome::Inserted
-    ) {
-        return Err(format!("self Join not inserted (got {outcome:?})"));
-    }
-
-    Ok(hex::encode(minted.community_id.0))
+    redeem_invite_inner(
+        url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        snapshot_generation,
+        fence_check,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -2376,3 +2376,201 @@ mod task3_kick_setpower_round_trip {
         f.engine_b.shutdown().await.expect("shutdown b");
     }
 }
+
+// ── ZEB-262 Phase 4 Task 8: redeem_invite invite-only timeout regression ─
+//
+// Construct an invite-only invite from Alice (admin), drop the unicast
+// receiver so Bob's `CommunityInvitePacket` `try_send` either fails or
+// goes nowhere, call `redeem_invite_inner` with a short timeout via env
+// var, and assert:
+//   1. the call returns Err (timeout fires when oneshot is never
+//      notified — or the unicast send fails closed);
+//   2. owner-state CRDT is byte-identical pre/post the failed call
+//      (ZEB-258 reorder invariant: Space row commit must NOT happen
+//      until after the oneshot resolves successfully).
+//
+// The helper `redeem_invite_inner` accepts a closure for the
+// snapshot-then-commit fence (`F: Fn() -> Result<(), String>`); the
+// production wrapper passes a closure that re-locks `NodeState`'s std
+// Mutex and compares `generation`, while this test passes `|| Ok(())`.
+#[tokio::test]
+async fn redeem_invite_only_times_out_when_inviter_offline() {
+    use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_persist::canonicalize;
+    use harmony_app::owner_state_types::{DeviceIdentityHash, MembershipKey};
+    use std::collections::BTreeMap;
+
+    // Short timeout so the test runs fast.
+    std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
+
+    struct AliceResolver {
+        addr: OwnerAddr,
+        pubkey: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl IdentityResolver for AliceResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.addr {
+                Some(self.pubkey)
+            } else {
+                None
+            }
+        }
+    }
+
+    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let alice_addr = OwnerAddr(alice.identity.address_hash);
+    let alice_pub = alice.identity.to_public_bytes();
+
+    let bob = Arc::new(PrivateIdentity::from_seed(&[0xb2; 32]));
+    let bob_addr = OwnerAddr(bob.identity.address_hash);
+    let bob_device_hash = DeviceIdentityHash(bob.identity.address_hash);
+    let bob_signing_key = signing_key_from(&bob);
+
+    // Build an invite-only URL Alice would have generated for Bob. The
+    // InviteToken sig is computed via `PrivateIdentity::sign` over the
+    // canonical token-payload bytes (inviter, invitee_hint, minted_at).
+    // We construct a placeholder InviteToken to call
+    // `canonical_invite_token_bytes` (which only reads the payload
+    // fields, ignoring `sig`), then re-construct with the real sig.
+    let community_id = SpaceId([0x33; 16]);
+    let mk = MembershipKey::new([0xaa; 32]);
+    let minted_at = Hlc {
+        wall_ms: 1000,
+        logical: 0,
+        device_id: "alice-dev".into(),
+    };
+    let placeholder_token = InviteToken {
+        inviter: alice_addr,
+        invitee_hint: Some(bob_addr),
+        minted_at: minted_at.clone(),
+        sig: [0u8; 64],
+    };
+    let token_payload_bytes =
+        harmony_app::community_invite::canonical_invite_token_bytes(&placeholder_token)
+            .expect("canonical_invite_token_bytes");
+    let token_sig = alice.sign(&token_payload_bytes);
+    let invite_token = InviteToken {
+        inviter: alice_addr,
+        invitee_hint: Some(bob_addr),
+        minted_at,
+        sig: token_sig,
+    };
+    let url = encode_invite_url(&CommunityInvitePayload {
+        community_id,
+        membership_key: mk.clone(),
+        admin_addr: alice_addr,
+        community_name: "Test".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(invite_token),
+    })
+    .expect("encode URL");
+
+    // Bob's side: registry + crdt + tracker.
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "bob-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(AliceResolver {
+            addr: alice_addr,
+            pubkey: alice_pub,
+        }),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: bob_addr,
+        signing_key: Arc::clone(&bob_signing_key),
+    }));
+
+    let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+
+    // Unicast send channel — keep the receiver alive so try_send doesn't
+    // immediately fail Closed (we want the timeout path, not the
+    // unicast-error path). The receiver is unbuffered for this test;
+    // the packet sits there forever, the oneshot never fires, and the
+    // 300ms timeout drives us to the rollback branch.
+    let (unicast_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(64);
+
+    // Adapter request channel — kept alive so the spawn-side dispatch
+    // doesn't fail Closed. (We don't need the event_loop on the other
+    // side; the test never requires the adapter task to actually run.)
+    let (adapter_tx, _adapter_rx) =
+        mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(64);
+
+    // dm_outbox for the inner helper to read `private_identity` +
+    // `signing_key` under-lock. The DmOutbox::new signature matches
+    // production; we share `bob` via Arc.
+    let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
+        "bob-dev".into(),
+        bob_addr,
+        bob_device_hash,
+        Arc::clone(&bob_signing_key),
+        Arc::clone(&bob),
+    )));
+
+    // Pre-call snapshot of owner-state's canonical encoding. Any
+    // mutation between here and post-call would change the bytes.
+    let pre_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode pre-state")
+    };
+
+    // Drive `redeem_invite_inner` directly. The `fence_check` closure
+    // is a no-op for this test (production wraps a NodeState
+    // generation guard); inviter is unreachable (no
+    // OwnerDeviceCache entry for alice_addr → resolve_destinations
+    // returns empty → early Err). Either way the rollback path runs
+    // and owner-state must remain untouched.
+    let result = harmony_app::redeem_invite_inner(
+        url,
+        Arc::clone(&crdt_state),
+        Arc::clone(&hlc_tracker),
+        "bob-dev".into(),
+        bob_addr,
+        Arc::clone(&bob_signing_key),
+        Arc::clone(&registry),
+        adapter_tx,
+        unicast_tx,
+        Arc::clone(&dm_outbox),
+        /* snapshot_generation */ 0,
+        || Ok(()),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "invite-only redeem must Err when inviter is unreachable; got {:?}",
+        result
+    );
+
+    // ZEB-258 invariant: owner-state CRDT byte-identical pre/post the
+    // failed call. A regression that committed `minted.space` BEFORE
+    // the oneshot await would diverge here.
+    let post_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode post-state")
+    };
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "ZEB-258: owner-state CRDT must be byte-identical pre/post a \
+         failed redeem_invite (orphan Space row would prove the \
+         reorder didn't land)"
+    );
+
+    std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+    registry.shutdown_all().await.expect("shutdown");
+}
