@@ -1,14 +1,16 @@
 //! Unit tests for CommunityRootHlcTracker — replay protection +
-//! dedupe-merge monotonicity gates.
+//! per-(addr, device) monotonicity gates.
 //!
-//! Bug-class context: PR #81 round 3 fixed an HLC-tracker monotonicity
-//! regression where dedupe-merging two SpaceIds with the same dedupe
-//! key would clobber the per-device latest-seen HLC backward. Community
-//! state-root tracking has the same shape (per-device latest-accepted
-//! HLC) and would fail the same way without explicit testing.
+//! ZEB-256: tracker key changed from `device_id: String` to
+//! `(OwnerAddr, String)`. Cross-addr collisions are now structurally
+//! impossible — Alice cannot squat Bob's HLC slot even with the
+//! MembershipKey, because tracker entries are namespaced by addr.
 
 use harmony_app::community_state_sync::CommunityRootHlcTracker;
-use harmony_app::owner_state_types::Hlc;
+use harmony_app::owner_state_types::{Hlc, OwnerAddr};
+
+const ALICE: OwnerAddr = OwnerAddr([0xA1; 16]);
+const BOB: OwnerAddr = OwnerAddr([0xB1; 16]);
 
 fn h(wall: u64, log: u32, dev: &str) -> Hlc {
     Hlc {
@@ -19,60 +21,87 @@ fn h(wall: u64, log: u32, dev: &str) -> Hlc {
 }
 
 #[test]
-fn would_accept_returns_true_for_unseen_device() {
+fn would_accept_returns_true_for_unseen_addr_device() {
     let t = CommunityRootHlcTracker::default();
-    assert!(t.would_accept(&h(100, 0, "a")));
+    assert!(t.would_accept(&ALICE, &h(100, 0, "a")));
 }
 
 #[test]
-fn would_accept_rejects_equal_or_older() {
+fn would_accept_rejects_equal_or_older_per_addr_device() {
     let mut t = CommunityRootHlcTracker::default();
-    t.record(h(100, 0, "a"));
-    assert!(!t.would_accept(&h(100, 0, "a")), "exact replay rejected");
-    assert!(!t.would_accept(&h(99, 5, "a")), "older wall_ms rejected");
-    assert!(t.would_accept(&h(100, 1, "a")), "later logical accepted");
-    assert!(t.would_accept(&h(101, 0, "a")), "later wall_ms accepted");
-}
-
-#[test]
-fn would_accept_blocks_regression_at_caller() {
-    // The bug-class from PR #81 round 3: if two paths ever feed the
-    // tracker out of order and the caller skips `would_accept`, the
-    // next legitimate publish from that device could be rejected (it's
-    // "older than" the regressed value but we already saw a newer
-    // one). The new API surfaces that bug at the caller — record()
-    // debug_asserts the precondition — so this test pins that the
-    // caller-facing check correctly rejects the older input.
-    let mut t = CommunityRootHlcTracker::default();
-    t.record(h(200, 0, "a"));
+    t.record(ALICE, h(100, 0, "a"));
     assert!(
-        !t.would_accept(&h(100, 0, "a")),
-        "older HLC must be caller-rejected, never reach record()"
+        !t.would_accept(&ALICE, &h(100, 0, "a")),
+        "exact replay rejected"
     );
-    // The state remains pinned at 200 because record(100) was skipped.
-    assert!(!t.would_accept(&h(150, 0, "a")), "still bounded by 200");
-    assert!(t.would_accept(&h(201, 0, "a")), "201 > 200");
+    assert!(
+        !t.would_accept(&ALICE, &h(99, 5, "a")),
+        "older wall_ms rejected"
+    );
+    assert!(
+        t.would_accept(&ALICE, &h(100, 1, "a")),
+        "later logical accepted"
+    );
+    assert!(
+        t.would_accept(&ALICE, &h(101, 0, "a")),
+        "later wall_ms accepted"
+    );
 }
 
 #[test]
-fn record_per_device_isolates_clocks() {
+fn cross_addr_same_device_id_is_isolated() {
+    // ZEB-256 core defense: Alice publishes at (alice-dev, 200); Bob
+    // submits at (alice-dev, 100). The tracker must accept Bob's
+    // because his (BOB, "alice-dev") slot is unseen — the (ALICE,
+    // "alice-dev") slot is irrelevant to Bob's namespace. Phase 2's
+    // BTreeMap<String, Hlc> would reject Bob's because device_id
+    // collisions clobbered each other; this test pins the fix.
     let mut t = CommunityRootHlcTracker::default();
-    t.record(h(500, 0, "a"));
-    // device b is unseen; new HLC accepted regardless of a's clock
-    assert!(t.would_accept(&h(100, 0, "b")));
-    t.record(h(100, 0, "b"));
-    assert!(!t.would_accept(&h(99, 0, "b")));
+    t.record(ALICE, h(200, 0, "alice-dev"));
+    assert!(
+        t.would_accept(&BOB, &h(100, 0, "alice-dev")),
+        "Bob's slot must be independent of Alice's"
+    );
+    t.record(BOB, h(100, 0, "alice-dev"));
+    // Pinning both still leaves them isolated.
+    assert!(!t.would_accept(&ALICE, &h(199, 0, "alice-dev")));
+    assert!(!t.would_accept(&BOB, &h(99, 0, "alice-dev")));
+}
+
+#[test]
+fn would_accept_blocks_regression_at_caller_per_addr() {
+    let mut t = CommunityRootHlcTracker::default();
+    t.record(ALICE, h(200, 0, "a"));
+    assert!(
+        !t.would_accept(&ALICE, &h(100, 0, "a")),
+        "older HLC must be caller-rejected"
+    );
+    assert!(
+        !t.would_accept(&ALICE, &h(150, 0, "a")),
+        "still bounded by 200"
+    );
+    assert!(t.would_accept(&ALICE, &h(201, 0, "a")), "201 > 200");
+}
+
+#[test]
+fn record_per_addr_device_isolates_clocks() {
+    let mut t = CommunityRootHlcTracker::default();
+    t.record(ALICE, h(500, 0, "a"));
+    assert!(
+        t.would_accept(&ALICE, &h(100, 0, "b")),
+        "different device under same addr"
+    );
+    t.record(ALICE, h(100, 0, "b"));
+    assert!(!t.would_accept(&ALICE, &h(99, 0, "b")));
 }
 
 #[test]
 fn record_is_strictly_newer_per_lex_order() {
-    // Hlc::is_strictly_newer_than uses lex order over (wall_ms, logical):
-    // pin that this composes with the tracker's per-device map.
     let mut t = CommunityRootHlcTracker::default();
-    t.record(h(100, 5, "a"));
-    assert!(!t.would_accept(&h(100, 5, "a")), "exact equal rejected");
-    assert!(!t.would_accept(&h(100, 4, "a")), "lower logical rejected");
-    assert!(t.would_accept(&h(100, 6, "a")), "higher logical accepted");
-    assert!(t.would_accept(&h(101, 0, "a")), "higher wall accepted");
-    assert!(!t.would_accept(&h(99, 999, "a")), "lower wall rejected");
+    t.record(ALICE, h(100, 5, "a"));
+    assert!(!t.would_accept(&ALICE, &h(100, 5, "a")));
+    assert!(!t.would_accept(&ALICE, &h(100, 4, "a")));
+    assert!(t.would_accept(&ALICE, &h(100, 6, "a")));
+    assert!(t.would_accept(&ALICE, &h(101, 0, "a")));
+    assert!(!t.would_accept(&ALICE, &h(99, 999, "a")));
 }

@@ -349,43 +349,48 @@ pub enum LocalInsertError {
     WrongCommunity { expected: SpaceId, got: SpaceId },
 }
 
-/// Per-publisher-device latest-accepted HLC. Mirrors owner_state_sync's
-/// in-memory replay tracker shape, but keyed externally by community_id
-/// (one tracker instance per joined community).
+/// Per-publisher-device latest-accepted HLC, namespaced by publisher
+/// `OwnerAddr`. ZEB-256: re-keyed from `BTreeMap<String, Hlc>` so a
+/// member cannot squat another member's HLC slot via shared
+/// `MembershipKey`. Each publisher's address gets its own per-device
+/// namespace, so a malicious Alice cannot squat Bob's HLC slot even if
+/// she emits a publish carrying `at.device_id == bob_dev`.
 ///
-/// `Serialize` / `Deserialize` are derived so Task 10's
+/// `Serialize` / `Deserialize` are derived so
 /// `community_state_persist::save_replay` can canonical-CBOR-encode the
-/// tracker to `replay.cbor`. The single `per_device` field is a
-/// `BTreeMap<String, Hlc>` — both inner types already round-trip through
-/// canonical CBOR, so no custom field renames are needed.
+/// tracker to `replay.cbor`. The `(OwnerAddr, String)` tuple key
+/// serialises as a CBOR 2-array — `BTreeMap` iteration is by key order,
+/// so the encoded form is deterministic.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CommunityRootHlcTracker {
-    /// Per-publisher-device latest-accepted HLC. New incoming root
-    /// publishes are accepted only if STRICTLY NEWER per their
-    /// device_id key.
-    pub per_device: BTreeMap<String, Hlc>,
+    /// Per-(publisher_addr, device_id) latest-accepted HLC. New incoming
+    /// root publishes are accepted only if STRICTLY NEWER than the
+    /// recorded entry for the same `(addr, device_id)`.
+    pub per_device: BTreeMap<(OwnerAddr, String), Hlc>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootHlcTracker {}
 impl CanonicalPayload for CommunityRootHlcTracker {}
 
 impl CommunityRootHlcTracker {
-    /// Test the candidate HLC against the per-device latest. Returns
-    /// `true` if the candidate strictly dominates the recorded entry
-    /// (or there is none); `false` otherwise.
+    /// Test the candidate HLC against the per-(addr, device) latest.
+    /// Returns `true` if the candidate strictly dominates the recorded
+    /// entry (or there is none); `false` otherwise.
     ///
     /// Does NOT mutate — `record` is a separate step the caller invokes
     /// after the rest of the receive pipeline succeeds. The split
     /// implements the "advance-after-success" idiom that owner-state's
     /// call sites apply manually to a bare BTreeMap.
-    pub fn would_accept(&self, candidate: &Hlc) -> bool {
-        match self.per_device.get(&candidate.device_id) {
+    pub fn would_accept(&self, publisher_addr: &OwnerAddr, candidate: &Hlc) -> bool {
+        let key = (*publisher_addr, candidate.device_id.clone());
+        match self.per_device.get(&key) {
             None => true,
             Some(prev) => candidate.is_strictly_newer_than(prev),
         }
     }
 
-    /// Record `candidate` as the latest-accepted HLC for its device.
+    /// Record `candidate` as the latest-accepted HLC for
+    /// `(publisher_addr, candidate.device_id)`.
     ///
     /// Precondition: caller MUST have just verified `would_accept`
     /// returned `true`. We `debug_assert!` the precondition so a
@@ -394,14 +399,16 @@ impl CommunityRootHlcTracker {
     /// insert is unconditional — at this point the caller has
     /// committed to advancing and a backward-jump indicates upstream
     /// state corruption that no amount of guarding here can repair.
-    pub fn record(&mut self, candidate: Hlc) {
+    pub fn record(&mut self, publisher_addr: OwnerAddr, candidate: Hlc) {
         debug_assert!(
-            self.would_accept(&candidate),
-            "CommunityRootHlcTracker::record called without would_accept check; backward-jump for device {}",
+            self.would_accept(&publisher_addr, &candidate),
+            "CommunityRootHlcTracker::record called without would_accept check; \
+             backward-jump for ({:?}, {})",
+            publisher_addr,
             candidate.device_id
         );
-        let device_id = candidate.device_id.clone();
-        self.per_device.insert(device_id, candidate);
+        let key = (publisher_addr, candidate.device_id.clone());
+        self.per_device.insert(key, candidate);
     }
 }
 
@@ -1121,7 +1128,14 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    let prev = tracker.per_device.get(&ctx.device_id).cloned();
+    // TEMP for Task 2: tracker is keyed by (OwnerAddr, device_id) but
+    // InternalCtx doesn't yet carry self_owner — Task 5 plumbs it
+    // through and replaces this placeholder with the real value.
+    let placeholder_addr = OwnerAddr([0u8; 16]);
+    let prev = tracker
+        .per_device
+        .get(&(placeholder_addr, ctx.device_id.clone()))
+        .cloned();
     // Three branches:
     //   (a) No prev → first publish for this device.
     //   (b) Wall advanced past prev_wall → reset logical to 0.
@@ -1157,7 +1171,7 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
             device_id: ctx.device_id.clone(),
         },
     };
-    tracker.record(now.clone());
+    tracker.record(placeholder_addr, now.clone());
     now
 }
 
@@ -1277,9 +1291,16 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // 2. Replay-protect via per-community RootHlcTracker. Read-only —
     //    the `record` step happens after the rest of the receive
     //    pipeline succeeds (single state-mutation point at step 8).
+    //
+    // TEMP for Task 2: tracker key is (OwnerAddr, device_id) but the
+    // signed payload's `publisher_addr` isn't yet trusted (signature
+    // verification arrives in Task 6). Use a placeholder addr so all
+    // publishes collapse to a single namespace until Task 6 reads
+    // payload.publisher_addr after sig verify.
+    let placeholder_addr = OwnerAddr([0u8; 16]);
     {
         let tracker = ctx.tracker.lock().await;
-        if !tracker.would_accept(&payload.at) {
+        if !tracker.would_accept(&placeholder_addr, &payload.at) {
             return IncomingOutcome::Duplicate;
         }
     }
@@ -1331,7 +1352,9 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    next-boot).
     {
         let mut tracker = ctx.tracker.lock().await;
-        tracker.record(payload.at.clone());
+        // TEMP for Task 2: same placeholder as the would_accept check
+        // above; Task 6 plumbs payload.publisher_addr through.
+        tracker.record(placeholder_addr, payload.at.clone());
     }
 
     // 7. Merge events. Each event must re-verify against B's
