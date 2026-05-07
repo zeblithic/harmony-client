@@ -259,10 +259,11 @@ async fn open_community_create_redeem_leave_round_trip() {
 
     let minted_b = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
         .expect("mint redeem");
-    engine_b
+    let redemption_outcome = engine_b
         .insert_local_event(minted_b.bootstrap_join.clone())
         .await
         .expect("B redemption insert");
+    assert_eq!(redemption_outcome, InsertOutcome::Inserted);
     let _delta_b_own = tokio::time::timeout(Duration::from_secs(1), delta_b_rx.recv())
         .await
         .expect("B own delta")
@@ -311,10 +312,11 @@ async fn open_community_create_redeem_leave_round_trip() {
         Some(&minted_b.bootstrap_join.at),
     )
     .expect("mint leave");
-    engine_b
+    let leave_outcome = engine_b
         .insert_local_event(leave_b)
         .await
         .expect("B leave insert");
+    assert_eq!(leave_outcome, InsertOutcome::Inserted);
 
     assert!(
         wait_until(
