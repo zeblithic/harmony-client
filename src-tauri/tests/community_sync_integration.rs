@@ -1338,3 +1338,351 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     registry_a.shutdown_all().await.expect("shutdown a");
     registry_b.shutdown_all().await.expect("shutdown b");
 }
+
+/// ZEB-256 Task 9 — tracker entries are NOT pruned on Leave. Pins the
+/// invariant that defends against a future "fix" clearing tracker
+/// entries on Leave: such a fix would re-open the censorship gap
+/// because a malicious peer racing a re-Join could still spoof the
+/// slot. The natural strictly-newer publish HLC means we never need
+/// to prune to admit a hypothetical re-Join.
+///
+/// Sequence:
+///   1. Alice Joins + publishes (tracker[(alice, "a-dev")] = HLC₁).
+///   2. Alice Leaves + publishes (Leave merges into B; tracker
+///      advances to HLC₂; Alice's status flips to Left).
+///   3. Verify B's tracker STILL contains the per-device entry for
+///      `(alice, "a-dev")` after the Leave merges — i.e. the entry
+///      was NOT pruned. The HLC has advanced (HLC₂ > HLC₁) which is
+///      itself proof that any future re-Join publish (HLC₃ produced
+///      by `next_hlc`, strictly newer than HLC₂) would be admitted
+///      by `would_accept` against the surviving entry.
+///
+/// Note on test shape — the original draft also tried to verify a
+/// re-Join publish being admitted end-to-end, but the receive-side
+/// membership-at-HLC gate (community_state_sync.rs:1454) rejects any
+/// publish from a publisher whose CURRENT materialized status is not
+/// `Joined`. After the Leave merges, Alice is `Left`, so her next
+/// publish (which would carry her own re-Join event) is rejected
+/// before the blob is ingested — the gate cannot peek inside the
+/// encrypted blob to see the re-Join. Phase 4's invite flow re-Joins
+/// Alice via an admin-issued Invite (separate publisher, gate
+/// admits), at which point the surviving tracker entry from this
+/// test is what the censorship-defense argument relies on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_joined_member_publish_admitted_after_leave() {
+    let cas_tx = spawn_shared_cas();
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_tx,
+        Duration::from_millis(2000),
+    ));
+
+    let community_id = SpaceId([0x77; 16]);
+    let mk = MembershipKey::new([0x55; 32]);
+
+    // Alice is the admin AND the publisher under test. She'll Join then
+    // Leave — exercising the tracker's behavior across a Leave so we
+    // can verify her per-device entry survives the membership change.
+    let id_alice = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let alice_addr = OwnerAddr(id_alice.identity.address_hash);
+    let alice_pub = id_alice.identity.to_public_bytes();
+    let alice_signing = signing_key_from(&id_alice);
+
+    // B is a passive observer — receives Alice's publishes, surfaces
+    // tracker advances. B doesn't publish in this test, but the
+    // registry config requires a real signing key + self_owner, so we
+    // give B a distinct identity.
+    let id_b = PrivateIdentity::from_seed(&[0xb1; 32]);
+    let b_owner = OwnerAddr(id_b.identity.address_hash);
+    let b_signing = signing_key_from(&id_b);
+
+    // Resolver carries both Alice and B's identity_pubs. Receive-side
+    // sig-verify on B looks up `alice_addr → alice_pub` to validate
+    // every publish A signs.
+    let mut resolver_map = std::collections::HashMap::new();
+    resolver_map.insert(alice_addr, alice_pub);
+    resolver_map.insert(b_owner, id_b.identity.to_public_bytes());
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    // Wire: A's publisher → B's subscriber. One-way — B never publishes.
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let b_sub_tx_for_forward = b_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = a_pub_rx.recv().await {
+            let _ = b_sub_tx_for_forward.send(bytes).await;
+        }
+    });
+
+    let dir_a = tempfile::tempdir().expect("tempdir A");
+    let dir_b = tempfile::tempdir().expect("tempdir B");
+
+    let registry_a = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "a-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_a.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: alice_addr,
+        signing_key: Arc::clone(&alice_signing),
+    });
+    let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "b-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_b.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: b_owner,
+        signing_key: Arc::clone(&b_signing),
+    });
+
+    // B never publishes, A never receives — but spawn_engine requires
+    // both directions wired with real channels.
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
+
+    registry_a
+        .spawn_engine(
+            community_id,
+            mk.clone(),
+            alice_addr,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+        )
+        .await
+        .expect("spawn a");
+    registry_b
+        .spawn_engine(
+            community_id,
+            mk.clone(),
+            alice_addr,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+        )
+        .await
+        .expect("spawn b");
+
+    // Pre-seed Alice's bootstrap Join into BOTH engines' CRDTs. Without
+    // this, B's membership-at-HLC gate rejects A's first publish as
+    // `publisher_not_joined` because Alice isn't yet a member of B's
+    // (empty) materialized state. Mirrors the Task 8 test pattern: in
+    // production, the redemption flow inserts the Join on B's side
+    // before the first publish lands. The HLC₁ we capture from B's
+    // tracker reflects the publish HLC of A's first `flush_now` (which
+    // is strictly newer than the bootstrap Join's wall_ms=100 because
+    // `next_hlc` runs at real time).
+    let alice_join_event = {
+        let payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_alice).expect("sign alice join")
+    };
+    let verify_ctx = harmony_app::community_membership::VerifyContext {
+        expected_community_id: community_id,
+        admin_addr: alice_addr,
+        is_invite_only: false,
+        actor_identity_pub: &alice_pub,
+        countersigner_identity_pub: None,
+    };
+    {
+        let state_a = registry_a
+            .state_for(&community_id)
+            .await
+            .expect("engine a spawned");
+        let mut sa = state_a.lock().await;
+        let outcome = sa.insert_event(alice_join_event.clone(), &verify_ctx);
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+    {
+        let state_b = registry_b
+            .state_for(&community_id)
+            .await
+            .expect("engine b spawned");
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(alice_join_event.clone(), &verify_ctx);
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    let engine_a = registry_a
+        .engine_arc(&community_id)
+        .await
+        .expect("engine a");
+
+    // Helper: build + sign a fresh membership event from Alice with a
+    // synthetic wall_ms so the integration assertions can reason about
+    // event order without relying on real time.
+    let mk_event = |id: [u8; 16], kind: MembershipEventKind, wall: u64| {
+        let payload = EventPayload {
+            id,
+            community_id,
+            kind,
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_alice).expect("sign")
+    };
+
+    // Step 1 — flush A's bootstrap CRDT to B. Alice's status is
+    // `Joined` in both replicas, so B's membership gate admits the
+    // publish. After it lands, B's tracker for `(alice_addr, "a-dev")`
+    // records HLC₁ = the publish's `next_hlc`-derived HLC.
+    registry_a.flush_now(&community_id).await.expect("flush 1");
+
+    // Wait for B's tracker to record Alice's first slot, then snapshot
+    // the entry. The captured HLC₁ is the load-bearing baseline for
+    // step 3 (the post-Leave entry must still be present AND have
+    // advanced past HLC₁ — pruning would surface as a missing entry).
+    {
+        let registry_b_for_poll = &registry_b;
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async move {
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine b spawned");
+                snap.per_device
+                    .contains_key(&(alice_addr, "a-dev".to_string()))
+            },
+        )
+        .await;
+    }
+    let first_slot = {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        snap.per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect("alice tracker entry after step 1")
+    };
+
+    // Step 2 — Alice Leaves and publishes. The publish carries the
+    // Leave event; at the moment B's gate runs, Alice is still
+    // `Joined` in B's local CRDT (the Leave hasn't merged yet), so the
+    // gate admits the publish. After ingestion B has 2 events (Join,
+    // Leave) and Alice's status flips to `Left`.
+    engine_a
+        .insert_local_event(mk_event([2u8; 16], MembershipEventKind::Leave, 200))
+        .await
+        .expect("a leave");
+    registry_a.flush_now(&community_id).await.expect("flush 2");
+    {
+        let registry_b_for_poll = &registry_b;
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async move {
+                let s = registry_b_for_poll
+                    .state_for(&community_id)
+                    .await
+                    .expect("state b");
+                let g = s.lock().await;
+                g.events.len() == 2
+            },
+        )
+        .await;
+    }
+    // Capture HLC after Leave merge (HLC₂). Step 3's invariant check
+    // verifies the entry equals HLC₂ — i.e. the Leave-publish DID
+    // advance the tracker (defensive: catches a regression where
+    // Leave-publishes silently fail to advance per-device entries).
+    let post_leave_slot = {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        snap.per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect("alice tracker entry after step 2")
+    };
+    assert!(
+        post_leave_slot.is_strictly_newer_than(&first_slot),
+        "tracker should have advanced from step 2's flush (Leave)"
+    );
+
+    // Step 3 — pin the tracker-entry-survives invariant. After the
+    // Leave has merged, B's tracker MUST still contain the per-device
+    // entry for `(alice_addr, "a-dev")`. A future "fix" that clears
+    // tracker entries on Leave would surface here as a missing entry.
+    //
+    // The HLC has advanced (HLC₂ > HLC₁), and any subsequent publish
+    // from Alice's device (whether legitimate via Phase 4 invite-flow
+    // re-Join, or post-membership-gate-relaxation) would naturally
+    // produce HLC₃ > HLC₂ via `next_hlc`. So the surviving tracker
+    // entry never blocks legitimate re-publishes — it only blocks
+    // replays of old HLCs (which is the censorship-defense property).
+    let surviving_entry = {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine b spawned");
+        snap.per_device
+            .get(&(alice_addr, "a-dev".to_string()))
+            .cloned()
+            .expect(
+                "tracker entry for (alice, a-dev) MUST survive across Leave; \
+                 a missing entry indicates a regression in pruning behavior",
+            )
+    };
+    assert!(
+        surviving_entry.is_strictly_newer_than(&first_slot),
+        "surviving tracker entry ({surviving_entry:?}) must have advanced \
+         past HLC₁ ({first_slot:?}) — step 2's Leave-publish ingestion \
+         should have advanced it"
+    );
+    assert_eq!(
+        surviving_entry, post_leave_slot,
+        "surviving tracker entry must equal HLC₂ — no extra publishes \
+         after step 2"
+    );
+
+    // Step 3b — confirm Alice's status materialized on B is `Left`.
+    // Pins the other half of the regression-defense argument: the
+    // gate-vs-tracker split. The membership-at-HLC gate is the
+    // current line of defense against post-Leave publishes; the
+    // tracker entry survives independently as defense-in-depth for
+    // any future code path (Phase 4 re-Join via admin invite) that
+    // bypasses the gate.
+    let s = registry_b.state_for(&community_id).await.expect("state b");
+    let events: Vec<_> = s.lock().await.events.values().cloned().collect();
+    let materialized = harmony_app::community_membership::materialize(&events, alice_addr);
+    let alice_state = materialized
+        .members
+        .get(&alice_addr)
+        .expect("alice present in materialized state");
+    assert_eq!(
+        alice_state.status,
+        harmony_app::community_membership::MemberStatus::Left,
+        "alice should be Left after the Leave event merges on B"
+    );
+
+    registry_a.shutdown_all().await.expect("shutdown a");
+    registry_b.shutdown_all().await.expect("shutdown b");
+}
