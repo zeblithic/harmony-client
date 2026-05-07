@@ -494,7 +494,10 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await
         .expect("A bootstrap insert");
     assert_eq!(outcome, InsertOutcome::Inserted);
-    let _ = tokio::time::timeout(Duration::from_secs(1), delta_a_rx.recv()).await;
+    tokio::time::timeout(Duration::from_secs(1), delta_a_rx.recv())
+        .await
+        .expect("A own delta did not arrive within 1s")
+        .expect("A delta channel closed before own delta arrived");
     assert!(
         wait_until(
             || async { state_b.lock().await.events.len() == 1 },
@@ -503,7 +506,10 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await,
         "B should receive A's bootstrap Join"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv()).await;
+    tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv())
+        .await
+        .expect("B remote delta (A's bootstrap) did not arrive within 2s")
+        .expect("B delta channel closed before A's bootstrap delta arrived");
 
     // ── First redemption: B mints + inserts ───────────────────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
@@ -523,7 +529,10 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await
         .expect("B redemption #1 insert");
     assert_eq!(outcome1, InsertOutcome::Inserted);
-    let _ = tokio::time::timeout(Duration::from_secs(1), delta_b_rx.recv()).await;
+    tokio::time::timeout(Duration::from_secs(1), delta_b_rx.recv())
+        .await
+        .expect("B own delta (first redemption) did not arrive within 1s")
+        .expect("B delta channel closed before B's own redemption delta arrived");
     assert!(
         wait_until(
             || async { state_a.lock().await.events.len() == 2 },
@@ -532,7 +541,10 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         .await,
         "A should receive B's first redemption Join"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv()).await;
+    tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv())
+        .await
+        .expect("A remote delta (B's first redemption) did not arrive within 2s")
+        .expect("A delta channel closed before B's redemption delta arrived");
 
     // ── Second redemption: B mints + inserts AGAIN with the same URL.
     //     Distinct event_id (random) and HLC tick advance produce a
