@@ -789,6 +789,38 @@ pub fn prior_state_at_event(
     materialize(&prefix, admin_addr)
 }
 
+/// Compute the prior materialized state for a given HLC — the
+/// membership view as-of `target_hlc` (events strictly before).
+///
+/// Companion to `prior_state_at_event`. The difference is the input
+/// type: this helper takes a bare `Hlc` (used by the receive-side
+/// state-root verify path, where we have only the publish's HLC and
+/// not a full `SignedMembershipEvent`).
+///
+/// Strict prefix on `(wall_ms, logical, device_id)` — events with the
+/// same triple as `target_hlc` are excluded (consistent with
+/// `event_sort_key`'s ordering, but without the EventId/sig
+/// tie-breakers since we have no target event to compare against).
+pub fn prior_state_at_hlc(
+    all_events: &[SignedMembershipEvent],
+    target_hlc: &Hlc,
+    admin_addr: OwnerAddr,
+) -> MaterializedMembership {
+    let prefix: Vec<SignedMembershipEvent> = all_events
+        .iter()
+        .filter(|e| {
+            (e.at.wall_ms, e.at.logical, &e.at.device_id)
+                < (
+                    target_hlc.wall_ms,
+                    target_hlc.logical,
+                    &target_hlc.device_id,
+                )
+        })
+        .cloned()
+        .collect();
+    materialize(&prefix, admin_addr)
+}
+
 /// Caller-provided context for verify_event. Carries the expected
 /// community_id, the prior materialized state (so the function is pure
 /// — verify_event doesn't load state from anywhere), the policy bit,

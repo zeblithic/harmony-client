@@ -294,19 +294,37 @@ async fn two_members_dag_sync_full_event_log() {
     registry_a.flush_now(&community_id).await.expect("flush a");
 
     // Wait deterministically for B's tracker to advance — confirms
-    // the publish made it through receive's verify gates.
-    let state_b_for_poll = Arc::clone(&state_b);
-    wait_until(
-        Duration::from_secs(2),
-        Duration::from_millis(10),
-        move || {
-            let s = Arc::clone(&state_b_for_poll);
-            async move { s.lock().await.events.len() == 1 }
-        },
-    )
-    .await;
+    // the publish made it through receive's verify gates. Asserting on
+    // B's tracker (rather than `events.len()`) avoids pre-seed vacuity:
+    // the pre-seeded Join already gives B `events.len() == 1` BEFORE
+    // A's publish lands, so the count would pass even if the publish
+    // had been silently dropped. Tracker advancement, in contrast, only
+    // happens when the receive pipeline reaches step 11.
+    {
+        let registry_b_for_poll = &registry_b;
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async move {
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine spawned");
+                snap.per_device.contains_key(&(admin, "a-dev".to_string()))
+            },
+        )
+        .await;
+    }
 
     {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine spawned");
+        assert!(
+            snap.per_device.contains_key(&(admin, "a-dev".to_string())),
+            "B's tracker MUST have recorded admin's publish from a-dev"
+        );
         let sb = registry_b
             .state_for(&community_id)
             .await
@@ -314,7 +332,12 @@ async fn two_members_dag_sync_full_event_log() {
             .lock()
             .await
             .clone();
-        assert_eq!(sb.events.len(), 1, "B should hold the (pre-seeded) Join");
+        assert_eq!(
+            sb.events.len(),
+            1,
+            "B should hold the (pre-seeded) Join — A's publish carries \
+             the same event id, so the merge is a no-op on the CRDT"
+        );
     }
 
     registry_a.shutdown_all().await.expect("shutdown a");
@@ -672,27 +695,37 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     b_sub_tx.send(valid_wire).await.expect("send valid wire");
 
     // Liveness check: B's engine survived the malformed packet and
-    // processed the subsequent valid publish.
-    let state_b = registry_b
-        .state_for(&community_id)
-        .await
-        .expect("engine spawned");
-    let state_b_for_poll = Arc::clone(&state_b);
-    wait_until(
-        Duration::from_secs(2),
-        Duration::from_millis(10),
-        move || {
-            let s = Arc::clone(&state_b_for_poll);
-            async move { s.lock().await.events.len() == 1 }
-        },
-    )
-    .await;
+    // processed the subsequent valid publish. We poll B's tracker
+    // (NOT `events.len()`) — the pre-seeded admin Join already gives
+    // B `events.len() == 1` before A's publish arrives, so a count
+    // assertion would pass even if B silently dropped the publish.
+    // Tracker advancement is the load-bearing observable signal that
+    // the receive pipeline reached step 11 and wrote the publisher
+    // slot.
     {
-        let sb = state_b.lock().await;
-        assert_eq!(
-            sb.events.len(),
-            1,
-            "B should still process valid publish after malformed input"
+        let registry_b_for_poll = &registry_b;
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async move {
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine spawned");
+                snap.per_device.contains_key(&(admin, "a-dev".to_string()))
+            },
+        )
+        .await;
+    }
+    {
+        let snap = registry_b
+            .tracker_snapshot(&community_id)
+            .await
+            .expect("engine spawned");
+        assert!(
+            snap.per_device.contains_key(&(admin, "a-dev".to_string())),
+            "B's tracker MUST advance for admin's valid publish after \
+             the prior malformed-wire packet was dropped"
         );
     }
 
@@ -813,8 +846,12 @@ async fn replay_of_same_root_publish_is_idempotent() {
         ));
     }
 
-    // Inject the same Join into A so its publish carries non-empty
-    // state.
+    // Inject the same Join into A so admin's status is `Joined` in
+    // A's local state. Then mint a SECOND distinct event on A — a
+    // SetPower at a later HLC — so A's publish carries something B
+    // hasn't seen. This makes the post-replay event-count assertion
+    // meaningful (B should grow from 1 → 2, not stay at 1 due to
+    // pre-seed vacuity).
     let state_a = registry_a
         .state_for(&community_id)
         .await
@@ -823,6 +860,40 @@ async fn replay_of_same_root_publish_is_idempotent() {
         let mut sa = state_a.lock().await;
         let outcome = sa.insert_event(
             admin_join_event,
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+    let admin_set_power_event = {
+        let payload = EventPayload {
+            id: [42u8; 16],
+            community_id,
+            kind: MembershipEventKind::SetPower {
+                target: admin,
+                level: 50,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_admin).expect("sign set_power")
+    };
+    {
+        let mut sa = state_a.lock().await;
+        let outcome = sa.insert_event(
+            admin_set_power_event,
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: admin,
@@ -854,19 +925,19 @@ async fn replay_of_same_root_publish_is_idempotent() {
         .await
         .expect("engine spawned");
 
-    // Wait for at least one merge to land. The test's invariant is
-    // that exactly one event survives — but checking events.len() == 1
-    // immediately would race the second-delivery's tracker-only
-    // rejection. Poll until ≥ 1 event lands, then sleep briefly to
-    // give the second delivery a chance to NOT change anything, then
-    // assert.
+    // Wait for the second event (the SetPower) to merge — the test's
+    // invariant is that exactly TWO events survive (1 pre-seeded Join
+    // + 1 new SetPower). Without the SetPower the assertion would be
+    // vacuous against the pre-seeded Join. Poll until 2 events land,
+    // then sleep briefly to give the second delivery a chance to NOT
+    // change anything, then re-assert.
     let state_b_for_poll = Arc::clone(&state_b);
     wait_until(
         Duration::from_secs(2),
         Duration::from_millis(10),
         move || {
             let s = Arc::clone(&state_b_for_poll);
-            async move { !s.lock().await.events.is_empty() }
+            async move { s.lock().await.events.len() == 2 }
         },
     )
     .await;
@@ -877,8 +948,11 @@ async fn replay_of_same_root_publish_is_idempotent() {
         let sb = state_b.lock().await;
         assert_eq!(
             sb.events.len(),
-            1,
-            "B's CRDT should hold exactly one event after replay"
+            2,
+            "B's CRDT should hold exactly two events after replay \
+             (pre-seeded Join + the new SetPower); a third would mean \
+             the duplicate publish merged a second time, a count of 1 \
+             would mean the publish never landed"
         );
     }
 

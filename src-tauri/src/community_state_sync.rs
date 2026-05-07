@@ -1431,23 +1431,22 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    trusted state, so there's no integrity risk in trusting it
     //    pre-sig.
     //
-    //    Simplification vs. spec (approved): the spec describes calling
-    //    `prior_state_at_event(publish.at)` to materialise state strictly
-    //    before the publish. That helper takes a target
-    //    `SignedMembershipEvent` and we only have the publish HLC. The
-    //    approximation here — materialize the full local log, look at
-    //    current status — is correct for the kicked-member attack
-    //    (ZEB-256's threat model): a kicked member's status is
-    //    `Banned`/`Left` in the materialized state, so the gate rejects
-    //    regardless of when the publish was issued. Edge case: a Join
-    //    AND a Kick sharing the same `(wall_ms, logical, device_id)`
-    //    resolve via `event_sort_key` — same comparator
-    //    `prior_state_at_event` would use. Sufficient for ZEB-256.
+    //    Spec compliance: materialize the prefix of our local log
+    //    strictly before `payload.at` via `prior_state_at_hlc` and
+    //    check the publisher's status as of THAT HLC. This matches
+    //    ZEB-256 § 5 step 3 verbatim. Convergence safety: a lagging
+    //    peer that learned a later Leave/Kick before receiving an
+    //    earlier (valid) publish from the same publisher must not
+    //    permanently reject the earlier publish — the prior-state-at-
+    //    publish-HLC view shows the publisher as `Joined` for any
+    //    publish strictly preceding the membership change in HLC
+    //    order, so the gate admits it.
     {
         let state = ctx.state.lock().await;
         let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
         drop(state);
-        let materialized = crate::community_membership::materialize(&events, ctx.admin_addr);
+        let materialized =
+            crate::community_membership::prior_state_at_hlc(&events, &payload.at, ctx.admin_addr);
         let member_state = materialized.members.get(&payload.publisher_addr).cloned();
         let status_now = member_state.as_ref().map(|s| s.status);
         let is_joined = matches!(status_now, Some(MemberStatus::Joined));
@@ -1489,8 +1488,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    is 64 bytes (X25519_pub(32) || Ed25519_pub(32)); the Ed25519
     //    half is the second 32 bytes — the X25519 half is X3DH
     //    territory and not used for state-root sigs.
+    //
+    //    Use `verify_strict` (not `verify`): strict mode rejects
+    //    signatures with non-canonical S values and small-order R
+    //    points (RFC 8032 strict subset), matching
+    //    `community_membership::verify_signature` and
+    //    `dm_envelope`'s posture for signed wire payloads.
     {
-        use ed25519_dalek::Verifier;
         let signed_bytes = match canonical_cbor_encode(&CommunityRootSignedPayload::from(&payload))
         {
             Ok(b) => b,
@@ -1511,7 +1515,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         };
         let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
-        if ed_pub.verify(&signed_bytes, &sig).is_err() {
+        if ed_pub.verify_strict(&signed_bytes, &sig).is_err() {
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
                 addr: payload.publisher_addr,
             });
