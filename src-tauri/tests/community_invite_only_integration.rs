@@ -84,6 +84,30 @@ fn dup_identity(src: &PrivateIdentity) -> PrivateIdentity {
         .expect("PrivateIdentity round-trip via to/from_private_bytes")
 }
 
+/// RAII guard for the redeem-invite timeout env var. Captures the
+/// pre-existing value (if any) and restores or removes it on Drop, so a
+/// panicking test cannot leak the override into subsequent tests in
+/// this binary. (Cross-binary leakage is moot — each test binary is a
+/// separate OS process.)
+struct RedeemTimeoutGuard {
+    prior: Option<std::ffi::OsString>,
+}
+impl RedeemTimeoutGuard {
+    fn set(value: &str) -> Self {
+        let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+        std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", value);
+        Self { prior }
+    }
+}
+impl Drop for RedeemTimeoutGuard {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
+            None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
+        }
+    }
+}
+
 /// Full happy-path test: Bob redeems Alice's invite-only invite,
 /// counter-signed Join converges on both engines, Alice's CRDT shows
 /// Bob as Joined.
@@ -92,8 +116,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // Short timeout: the round-trip is bounded by debounce_ms + a few
     // mpsc hops; 5s is generous. (Bob's `redeem_invite_inner` reads
     // `HARMONY_REDEEM_INVITE_TIMEOUT_MS`; default 15s would mask a
-    // wedge under CI.)
-    std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "5000");
+    // wedge under CI.) Guard restores any prior value on Drop.
+    let _timeout_guard = RedeemTimeoutGuard::set("5000");
 
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
     let bob = PrivateIdentity::from_seed(&[0xb2; 32]);
@@ -287,6 +311,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         inviter: alice_addr,
         invitee_hint: Some(bob_addr),
         minted_at: token_minted_at.clone(),
+        expires_at: None,
         sig: [0u8; 64], // placeholder; canonical_invite_token_bytes excludes sig
     };
     let token_payload_bytes =
@@ -296,6 +321,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         inviter: alice_addr,
         invitee_hint: Some(bob_addr),
         minted_at: token_minted_at,
+        expires_at: None,
         sig: token_sig,
     };
 
@@ -457,6 +483,5 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         Some(MemberStatus::Joined),
         "Alice must remain Joined"
     );
-
-    std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+    // RedeemTimeoutGuard restores the prior env-var on Drop here.
 }

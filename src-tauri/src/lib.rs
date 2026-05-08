@@ -6494,11 +6494,51 @@ where
             created_at: minted.bootstrap_join.at.clone(),
         };
 
-        let packet =
-            crate::community_invite::build_signed_invite_packet(signed, sign_key_arc.as_ref())
-                .map_err(|e| format!("build_signed_invite_packet: {e}"))?;
-        let wire = crate::community_invite::encode_packet(&packet)
-            .map_err(|e| format!("encode_packet: {e}"))?;
+        // Both encode steps below run AFTER `register_pending_redemption`,
+        // so a `?` early-return would leak the registered oneshot AND
+        // leave the engine + persistence dir we spawned at step 4
+        // running. Roll back explicitly on either error.
+        let packet = match crate::community_invite::build_signed_invite_packet(
+            signed,
+            sign_key_arc.as_ref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = community_registry
+                    .take_pending_redemption(&minted.bootstrap_join.id)
+                    .await;
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite build-packet rollback"
+                    );
+                }
+                return Err(format!("build_signed_invite_packet: {e}"));
+            }
+        };
+        let wire = match crate::community_invite::encode_packet(&packet) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = community_registry
+                    .take_pending_redemption(&minted.bootstrap_join.id)
+                    .await;
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite encode-packet rollback"
+                    );
+                }
+                return Err(format!("encode_packet: {e}"));
+            }
+        };
 
         // 7c. Resolve inviter's Reticulum destination(s) and send.
         let inviter_addr = payload.admin_addr;
@@ -6523,26 +6563,57 @@ where
                 hex::encode(inviter_addr.0)
             ));
         }
+        // Per-destination fan-out with at-least-one-success semantics.
+        //
+        // The inviter may have multiple devices (any of which can
+        // counter-sign). Reticulum unicast is best-effort per
+        // destination — if even one queue-side `try_send` succeeds the
+        // packet is on its way and we cannot retract it, so a partial
+        // failure followed by local rollback would leave the receiver
+        // counter-signing while we tear down the engine here. Track
+        // success across the loop and ONLY roll back when all
+        // destinations failed.
+        let mut any_sent = false;
+        let mut last_err: Option<String> = None;
         for destination_hash in &destinations {
-            if let Err(e) = unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
+            match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
                 destination_hash: *destination_hash,
                 packet: wire.clone(),
             }) {
-                let _ = community_registry
-                    .take_pending_redemption(&minted.bootstrap_join.id)
-                    .await;
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
+                Ok(()) => any_sent = true,
+                Err(e) => {
                     tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite unicast-send rollback"
+                        error = %e,
+                        destination_hash = %hex::encode(destination_hash),
+                        "redeem_invite unicast try_send failed for destination — \
+                         continuing fan-out"
                     );
+                    last_err = Some(e.to_string());
                 }
-                return Err(format!("unicast_send_tx try_send: {e}"));
             }
+        }
+        if !any_sent {
+            let _ = community_registry
+                .take_pending_redemption(&minted.bootstrap_join.id)
+                .await;
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite unicast-send rollback"
+                );
+            }
+            return Err(format!(
+                "unicast_send_tx try_send failed for all {} destination(s){}",
+                destinations.len(),
+                last_err
+                    .as_deref()
+                    .map(|s| format!(" (last error: {s})"))
+                    .unwrap_or_default()
+            ));
         }
 
         // 7d. Await oneshot ≤ T (env-overridable for tests).
@@ -6648,9 +6719,15 @@ where
 ///
 /// Returns an empty Vec when the cache has no entry for `owner` — the
 /// invite-only branch interprets that as "no known device → invite
-/// cannot route" and surfaces a deterministic Err. (`OwnerAddr` and
-/// `DeviceIdentityHash` are bytes-compatible 16-byte newtypes; the
-/// `.0` extraction below recovers the raw 16-byte destination hash.)
+/// cannot route" and surfaces a deterministic Err.
+///
+/// Returns *DM destination hashes* (per `dm_signing::compute_dm_destination_hash`),
+/// NOT raw `DeviceIdentityHash` bytes. `UnicastSendRequest.destination_hash`
+/// is the Reticulum-layer destination keyed off the DM Destination's
+/// app/aspect derivation; the dm_outbox drain path computes this same
+/// derivation (`dm_outbox.rs::resolve_destinations` and the per-device
+/// path) before enqueueing. Returning raw `h.0` here would route invite-
+/// only packets to the wrong link-layer address.
 async fn resolve_destinations_for_owner(
     crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
     owner: crate::owner_state_types::OwnerAddr,
@@ -6659,7 +6736,13 @@ async fn resolve_destinations_for_owner(
     g.owner_device_cache
         .devices
         .get(&owner)
-        .map(|entry| entry.devices.iter().map(|h| h.0).collect())
+        .map(|entry| {
+            entry
+                .devices
+                .iter()
+                .map(|h| crate::dm_signing::compute_dm_destination_hash(h.0))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

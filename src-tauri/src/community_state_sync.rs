@@ -857,6 +857,49 @@ impl CommunitySyncEngine {
             None
         };
 
+        self.insert_event_with_resolved_pubs(event, actor_pub, countersigner_pub)
+            .await
+    }
+
+    /// Variant of `insert_local_event` that accepts already-verified
+    /// actor + countersigner identity pubs, bypassing `IdentityResolver`.
+    ///
+    /// ZEB-262 Phase 4: the invite-only receive path already proves the
+    /// joiner's identity_pub via the inline `joiner_identity_pub` field
+    /// (Path B app-sig binding) BEFORE this insert runs — but the joiner
+    /// is not yet in the receiver's `OwnerDeviceCache`, so the production
+    /// `OwnerDeviceCacheResolver` would return `None` and surface
+    /// `UnknownActor`. That's the bootstrap-by-design case the inline
+    /// pub is for. Pass it through directly here.
+    ///
+    /// The CRDT-layer verify (`VerifyContext.actor_identity_pub`) is
+    /// unchanged — same code path, same expected_community_id binding,
+    /// same admin / invite-only checks. Only resolver lookup is skipped.
+    pub async fn insert_local_event_with_pubs(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+        actor_identity_pub: [u8; 64],
+        countersigner_identity_pub: Option<[u8; 64]>,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+        self.insert_event_with_resolved_pubs(event, actor_identity_pub, countersigner_identity_pub)
+            .await
+    }
+
+    /// Shared body for `insert_local_event` and
+    /// `insert_local_event_with_pubs` — runs the verify + state mutate +
+    /// post-Inserted hook chain with already-resolved pubs.
+    async fn insert_event_with_resolved_pubs(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+        actor_pub: [u8; 64],
+        countersigner_pub: Option<[u8; 64]>,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
         // Bind expected_community_id to the engine's configured value,
         // NOT the (caller-controlled) event payload. Without this, a
         // malicious or buggy IPC could bypass the cross-community routing

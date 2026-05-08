@@ -164,6 +164,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: Some(OwnerAddr([0x22; 16])),
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let p = CommunityInvitePayload {
@@ -191,6 +192,7 @@ fn invite_token_targeted_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: Some(OwnerAddr([0x22; 16])),
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let bytes = canonical_cbor_encode(&t).expect("encode");
@@ -209,6 +211,7 @@ fn invite_token_open_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: None,
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let bytes = canonical_cbor_encode(&t).expect("encode");
@@ -270,6 +273,7 @@ fn community_invite_signed_wire_bytes_pinned() {
             logical: 0,
             device_id: "inviter-dev".into(),
         },
+        expires_at: None,
         sig: [0x55; 64],
     };
 

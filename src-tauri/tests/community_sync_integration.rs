@@ -2410,8 +2410,25 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::owner_state_types::{DeviceIdentityHash, MembershipKey};
     use std::collections::BTreeMap;
 
-    // Short timeout so the test runs fast.
-    std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
+    // Short timeout so the test runs fast. RAII guard restores any
+    // prior value on Drop (including on panic), keeping the binary's
+    // env-var state clean for subsequent tests.
+    struct RedeemTimeoutGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl Drop for RedeemTimeoutGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
+                None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
+            }
+        }
+    }
+    let _timeout_guard = {
+        let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+        std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
+        RedeemTimeoutGuard { prior }
+    };
 
     struct AliceResolver {
         addr: OwnerAddr,
@@ -2454,6 +2471,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         inviter: alice_addr,
         invitee_hint: Some(bob_addr),
         minted_at: minted_at.clone(),
+        expires_at: None,
         sig: [0u8; 64],
     };
     let token_payload_bytes =
@@ -2464,6 +2482,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         inviter: alice_addr,
         invitee_hint: Some(bob_addr),
         minted_at,
+        expires_at: None,
         sig: token_sig,
     };
     let url = encode_invite_url(&CommunityInvitePayload {
@@ -2574,6 +2593,6 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
          reorder didn't land)"
     );
 
-    std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+    // RedeemTimeoutGuard restores the prior env-var on Drop after this.
     registry.shutdown_all().await.expect("shutdown");
 }

@@ -62,8 +62,8 @@ pub struct CommunityInvitePayload {
 /// past its outer expiry. (Sig construction lives in Phase 3 with
 /// `generate_invite`.)
 ///
-/// Wire format: 4-key map. Field codes 2 chars per the same-length-
-/// keys rule.
+/// Wire format: up to 5-key map (`xa` and `ih` skipped when `None`).
+/// Field codes 2 chars per the same-length-keys rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteToken {
     #[serde(rename = "iv")]
@@ -77,6 +77,16 @@ pub struct InviteToken {
 
     #[serde(rename = "mt")]
     pub minted_at: Hlc,
+
+    /// Wall-clock ms past which the receiver MUST reject this token.
+    /// `None` = no expiry (open-ended). Bound into the InviteToken
+    /// signature via `canonical_invite_token_bytes` so the inviter's
+    /// signature commits to the expiry value — an attacker can't strip
+    /// `expires_at` post-mint to extend the redemption window.
+    /// (Spec §verify-step-h.) Per the spec, `verify_packet_pure` rejects
+    /// when `signed.created_at.wall_ms >= expires_at`.
+    #[serde(rename = "xa", skip_serializing_if = "Option::is_none", default)]
+    pub expires_at: Option<u64>,
 
     #[serde(
         rename = "sg",
@@ -394,6 +404,26 @@ pub enum CommunityInviteVerifyError {
     /// Self power < invite_threshold (= 0 in v1, structural no-op).
     #[error("self power insufficient: {self_power} < {threshold}")]
     SelfPowerInsufficient { self_power: u8, threshold: u8 },
+    /// `community_membership::attach_countersig_with_identity` failed
+    /// (canonical-CBOR encoder error). Vanishingly rare in practice;
+    /// distinct from JoinSigInvalid so degraded telemetry can
+    /// distinguish a malformed inner Join from a counter-sign encoder
+    /// regression on the receiver side.
+    #[error("counter-sign attach failed")]
+    CounterSignAttachFailed,
+    /// Engine-side CRDT verify rejected the counter-signed Join
+    /// (`InsertOutcome::Rejected`). Distinct from JoinSigInvalid: the
+    /// inner Join sig already validated in step 5 of `verify_packet_pure`,
+    /// but the engine's own VerifyContext (admin / invite-only /
+    /// expected_community_id) saw something unexpected.
+    #[error("engine rejected counter-signed Join")]
+    EngineRejected,
+    /// `insert_local_event_with_pubs` returned a `LocalInsertError`
+    /// (resolver missing, wrong community on the inner event, etc.).
+    /// Surfaced separately so the degraded reason tag points at the
+    /// engine's local-insert pipeline rather than at sig classes.
+    #[error("engine local-insert error")]
+    EngineLocalError,
 }
 
 impl CommunityInviteVerifyError {
@@ -411,6 +441,9 @@ impl CommunityInviteVerifyError {
             Self::CommunityUnknown { .. } => "community_invite_unknown",
             Self::SelfNotJoined => "community_invite_self_not_joined",
             Self::SelfPowerInsufficient { .. } => "community_invite_self_power_insufficient",
+            Self::CounterSignAttachFailed => "community_invite_counter_sign_attach_failed",
+            Self::EngineRejected => "community_invite_engine_rejected",
+            Self::EngineLocalError => "community_invite_engine_local_error",
         }
     }
 }
@@ -595,14 +628,24 @@ where
         }
     }
 
-    // 3. Expiry / clock-skew.
+    // 3. Expiry / clock-skew. Two arms:
+    //    (a) clock-skew: created_at can't be more than 60s in the
+    //        receiver's future (defense against a malicious mint that
+    //        backdates `now` to dodge expiry).
+    //    (b) expires_at (if the inviter set one): created_at must be
+    //        strictly before expires_at. The inviter's signature binds
+    //        `xa` via `canonical_invite_token_bytes`, so an attacker
+    //        cannot strip the field to extend the window — the
+    //        InviteToken sig check in step 6 would fail.
     let now = now_fn();
     if signed.created_at.wall_ms > now.saturating_add(60_000) {
         return Err(CommunityInviteVerifyError::Expired);
     }
-    // Outer URL's expires_at is not in CommunityInviteSigned — InviteToken
-    // doesn't carry it either in v1. This expires-comparison hook is
-    // future-proofing for ZEB-251; v1 only enforces the clock-skew arm.
+    if let Some(exp) = signed.invite_token.expires_at {
+        if signed.created_at.wall_ms >= exp {
+            return Err(CommunityInviteVerifyError::Expired);
+        }
+    }
 
     // 4. InviteToken signer == self.
     if signed.invite_token.inviter != self_owner {
@@ -635,12 +678,13 @@ where
 /// not yet shipped) and the verify path encode through this so signature
 /// bytes cover bit-exact bytes.
 ///
-/// Wire format: a 2- or 3-key map with field codes `iv`, `ih`, `mt`
-/// (mirrors `InviteToken`'s renames; same-length-keys CBOR invariant).
-/// `ih` is omitted when `invitee_hint = None` (open redemption form).
-/// Outer-URL `expires_at` is intentionally NOT bound here in v1 — the
-/// clock-skew arm in `verify_packet_pure` carries the freshness check.
-/// ZEB-251 will broaden the binding.
+/// Wire format: a 2- to 4-key map with field codes `iv`, `ih`, `mt`,
+/// `xa` (mirrors `InviteToken`'s renames; same-length-keys CBOR
+/// invariant). `ih` is omitted when `invitee_hint = None`; `xa` is
+/// omitted when `expires_at = None`. The InviteToken sig commits to
+/// these bytes — the inviter cannot strip `xa` post-sign without
+/// invalidating the signature, so the receiver's expiry enforcement
+/// in `verify_packet_pure` is bound to the inviter's authorization.
 ///
 /// Public so the test harness can call it; mint path (Phase 4 IPC) will
 /// also call this when invite-only `generate_invite` ships, ensuring
@@ -656,11 +700,14 @@ pub fn canonical_invite_token_bytes(
         invitee_hint: Option<&'a crate::owner_state_types::OwnerAddr>,
         #[serde(rename = "mt")]
         minted_at: &'a crate::owner_state_types::Hlc,
+        #[serde(rename = "xa", skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
     }
     let payload = InviteTokenPayload {
         inviter: &token.inviter,
         invitee_hint: token.invitee_hint.as_ref(),
         minted_at: &token.minted_at,
+        expires_at: token.expires_at,
     };
     let mut out = Vec::new();
     ciborium::into_writer(&payload, &mut out)?;
@@ -864,22 +911,41 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         Ok(e) => e,
         Err(err) => {
             tracing::warn!(error = %err, "attach_countersig_with_identity failed");
-            // Encoder error — vanishingly rare; map to JoinSigInvalid
-            // for the degraded reason (closest fit; counter-sig is part
-            // of the Join event's verification chain).
-            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            let e = CommunityInviteVerifyError::CounterSignAttachFailed;
             emit_degraded(app, &signed.community_id, e.reason_tag());
             return Err(e);
         }
     };
 
-    // 7. Insert via engine. The engine's post-Inserted hook (Task 7's
-    //    `notify_pending_redemption_in_map`) fires
+    // 7. Insert via engine using `insert_local_event_with_pubs` — the
+    //    joiner's `joiner_identity_pub` was already verified in
+    //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
+    //    receiver's own identity_pub is known locally. The production
+    //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
+    //    the bootstrap that would populate the cache), so we MUST
+    //    bypass it. Skipping the resolver here is the load-bearing fix
+    //    for the bootstrap-by-design case: a counter-signed Join lands
+    //    LOCALLY here regardless of whether the resolver knows the
+    //    joiner; the publish-back path then carries the full
+    //    counter-signed event to peers, who do their own membership-
+    //    state verify against their resolver caches as those caches
+    //    populate.
+    //
+    //    The engine's post-Inserted hook
+    //    (`notify_pending_redemption_in_map`) fires
     //    `pending_redemptions[event_id]` for the joiner side — this
     //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
     //    the counter-signed Join propagates back via Phase 2's
     //    state-root publish.
-    match engine_arc.insert_local_event(counter_signed).await {
+    let countersigner_pub = self_private_identity.identity.to_public_bytes();
+    match engine_arc
+        .insert_local_event_with_pubs(
+            counter_signed,
+            signed.joiner_identity_pub,
+            Some(countersigner_pub),
+        )
+        .await
+    {
         Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
         Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
             // Idempotent retransmit (Reticulum can deliver duplicates).
@@ -888,13 +954,13 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         }
         Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
             tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
-            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            let e = CommunityInviteVerifyError::EngineRejected;
             emit_degraded(app, &signed.community_id, e.reason_tag());
             Err(e)
         }
         Err(local_err) => {
-            tracing::warn!(error = %local_err, "engine.insert_local_event errored");
-            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
+            let e = CommunityInviteVerifyError::EngineLocalError;
             emit_degraded(app, &signed.community_id, e.reason_tag());
             Err(e)
         }
