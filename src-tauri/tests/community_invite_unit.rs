@@ -14,6 +14,8 @@ fn community_invite_payload_round_trips_open_form() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -51,6 +53,8 @@ fn community_invite_payload_round_trips_invite_only_form() {
             device_id: "d".into(),
         }),
         invite_token: Some(token.clone()),
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -112,6 +116,8 @@ fn invite_url_round_trips_open_payload() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let url = encode_invite_url(&payload).expect("encode");
@@ -174,11 +180,129 @@ fn decode_trims_whitespace() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
     let url = encode_invite_url(&payload).expect("encode");
     let padded = format!("  \n{url}\t  ");
     let decoded = decode_invite_url(&padded).expect("decode trimmed");
     assert_eq!(decoded, payload);
+}
+
+#[test]
+fn encode_rejects_invite_only_without_admin_bootstrap() {
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Build a known-valid invite-only payload, then mutate ONE field
+    // (admin_bootstrap → None). Isolating the failing invariant to a
+    // single field protects against assertion order-of-validation drift
+    // — if encode_invite_url's check sequence reordered, this test
+    // would still pin the InviteOnlyMissingBootstrap path.
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.admin_bootstrap = None;
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_invite_only_without_admin_identity_pub() {
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Symmetric to the missing-admin_bootstrap test above: mutate ONE
+    // field (admin_identity_pub → None) on top of a known-valid
+    // invite-only fixture. Both fields are required for invite-only
+    // encoding; this test pins the symmetric branch of the same
+    // InviteOnlyMissingBootstrap rejection.
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.admin_identity_pub = None;
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_open_community_with_admin_identity_pub_set() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+    };
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: Some([0xAB; 64]),
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::OpenCommunityHasBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_open_community_with_admin_bootstrap_set() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    // Synthesize a signed admin self-Join just so admin_bootstrap is
+    // structurally well-formed; the writer check fires before any
+    // signature inspection.
+    let admin_addr = OwnerAddr([0xcd; 16]);
+    let community_id = SpaceId([0xab; 16]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+    let bs = sign_event(
+        &EventPayload {
+            id: [0xCC; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        },
+        &signing_key,
+    )
+    .expect("sign");
+    let payload = CommunityInvitePayload {
+        community_id,
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr,
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: Some(bs),
+        admin_identity_pub: None,
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::OpenCommunityHasBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_invite_only_without_invite_token() {
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Mutate only invite_token → None on top of the good fixture so
+    // the assertion isolates that invariant from the bootstrap-fields
+    // and admin_addr checks. (Order-of-validation drift in
+    // encode_invite_url would otherwise let this test pass for the
+    // wrong reason.)
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.invite_token = None;
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingToken
+    ));
 }
 
 #[test]
@@ -895,5 +1019,260 @@ mod verify_rejection_tests {
         let err = verify_packet_pure(&signed, self_owner, now_after_expiry, &self_id)
             .expect_err("must reject — receive-time past expiry");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
+}
+
+// =====================================================================
+// ZEB-260 Phase 4 Task 3 — verify_admin_bootstrap unit tests
+// =====================================================================
+
+mod admin_bootstrap_helpers {
+    use harmony_app::community_invite::{CommunityInvitePayload, InviteToken};
+    use harmony_app::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+    };
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+
+    /// Deterministic keys: `seed` selects the identity (e.g., 0xAA for
+    /// admin in the test). Returns `(identity_pub_64, signing_key,
+    /// owner_addr)`.
+    pub fn identity_set(seed: u8) -> ([u8; 64], ed25519_dalek::SigningKey, OwnerAddr) {
+        let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let pub_bytes = private.identity.to_public_bytes();
+        let priv_bytes = private.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+        let addr = OwnerAddr(private.identity.address_hash);
+        (pub_bytes, signing_key, addr)
+    }
+
+    pub fn fixture_hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        }
+    }
+
+    /// Build a known-good admin self-Join (signed) for the given
+    /// community_id + admin identity.
+    pub fn admin_bootstrap_event(
+        community_id: SpaceId,
+        admin_addr: OwnerAddr,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [0xCC; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: fixture_hlc(),
+        };
+        sign_event(&payload, signing_key).expect("sign admin bootstrap")
+    }
+
+    /// Build a validly-signed admin Leave event. Used to trigger step 6
+    /// (kind check) without tripping step 5 (signature check) — the
+    /// signature is valid, but kind != Join.
+    pub fn admin_leave_event(
+        community_id: SpaceId,
+        admin_addr: OwnerAddr,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [0xCC; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: admin_addr,
+            at: fixture_hlc(),
+        };
+        sign_event(&payload, signing_key).expect("sign admin leave")
+    }
+
+    /// Build a known-good invite-only `CommunityInvitePayload` with
+    /// well-formed `admin_bootstrap` + `admin_identity_pub`. The 9
+    /// per-branch tests below mutate one field at a time.
+    pub fn good_invite_only_payload() -> CommunityInvitePayload {
+        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        let community_id = SpaceId([0x37; 16]);
+        let bootstrap = admin_bootstrap_event(community_id, admin_addr, &admin_sk);
+
+        CommunityInvitePayload {
+            community_id,
+            membership_key: MembershipKey::new([0xBB; 32]),
+            admin_addr,
+            community_name: "TestCom".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(InviteToken {
+                inviter: admin_addr,
+                invitee_hint: None,
+                minted_at: fixture_hlc(),
+                expires_at: None,
+                sig: [0xDD; 64],
+            }),
+            admin_bootstrap: Some(bootstrap),
+            admin_identity_pub: Some(admin_pub),
+        }
+    }
+}
+
+#[cfg(test)]
+mod verify_admin_bootstrap_tests {
+    use super::admin_bootstrap_helpers::*;
+    use harmony_app::community_invite::{verify_admin_bootstrap, RedeemBootstrapVerifyError};
+    use harmony_app::community_membership::CounterSignature;
+    use harmony_app::owner_state_types::{OwnerAddr, SpaceId};
+
+    #[test]
+    fn admits_well_formed_admin_bootstrap() {
+        let p = good_invite_only_payload();
+        let res = verify_admin_bootstrap(&p);
+        assert!(
+            res.is_ok(),
+            "well-formed bootstrap should pass; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invite_only_without_admin_bootstrap() {
+        let mut p = good_invite_only_payload();
+        p.admin_bootstrap = None;
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapMissing
+        );
+    }
+
+    #[test]
+    fn rejects_invite_only_without_admin_identity_pub() {
+        let mut p = good_invite_only_payload();
+        p.admin_identity_pub = None;
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapMissing
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_admin_pubkey() {
+        let mut p = good_invite_only_payload();
+        // Build a 64-byte pub where bytes 32-63 (the Ed25519 portion) are
+        // [0x7F; 32]. This compressed point does not decompress to a valid
+        // Ed25519 curve point under ed25519-dalek 2.x / curve25519-dalek 4.x
+        // (verified empirically: Identity::from_public_bytes returns Err for
+        // this input). The X25519 first half (all zeros) is always valid.
+        let mut bad_pub = [0u8; 64];
+        bad_pub[32..].copy_from_slice(&[0x7F; 32]);
+        p.admin_identity_pub = Some(bad_pub);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapInvalidPubkey
+        );
+    }
+
+    #[test]
+    fn rejects_admin_address_mismatch() {
+        let mut p = good_invite_only_payload();
+        // Use a different identity's pubkey but keep the original
+        // admin_addr → the pubkey.address_hash will mismatch.
+        let (other_pub, _other_sk, _other_addr) = identity_set(0xBB);
+        p.admin_identity_pub = Some(other_pub);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapAddressMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_admin_actor_mismatch() {
+        let mut p = good_invite_only_payload();
+        // Mutate the bootstrap's actor to a different address. Admin's
+        // signature was over the original actor field, so this would
+        // also fail step 5 (signature) — but step 3 fires first because
+        // the chain checks actor before sig.
+        let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
+        bs.actor = OwnerAddr([0xFF; 16]);
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapActorMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_admin_community_mismatch() {
+        let mut p = good_invite_only_payload();
+        let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
+        bs.community_id = SpaceId([0xFF; 16]);
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapCommunityMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_admin_signature() {
+        let mut p = good_invite_only_payload();
+        let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
+        // Flip a single bit in the signature.
+        bs.sig[0] ^= 0x01;
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapSignatureInvalid
+        );
+    }
+
+    #[test]
+    fn rejects_admin_bootstrap_with_countersig() {
+        let mut p = good_invite_only_payload();
+        let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
+        // Inject a synthetic countersig. The sig itself can be garbage —
+        // step 6 (kind/countersig sanity) fires before any crypto on the
+        // countersig itself.
+        bs.countersig = Some(CounterSignature {
+            signer: OwnerAddr([0xEE; 16]),
+            sig: [0x77; 64],
+        });
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapKindInvalid
+        );
+    }
+
+    #[test]
+    fn rejects_admin_bootstrap_non_join_kind() {
+        // Build from scratch with identity_set so we have the signing key.
+        // Replace the bootstrap with a validly-signed Leave event so that
+        // step 5 (sig verify) passes and step 6 (kind check) fires.
+        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        let community_id = SpaceId([0x37; 16]);
+        let leave_bootstrap = admin_leave_event(community_id, admin_addr, &admin_sk);
+
+        let p = harmony_app::community_invite::CommunityInvitePayload {
+            community_id,
+            membership_key: harmony_app::owner_state_types::MembershipKey::new([0xBB; 32]),
+            admin_addr,
+            community_name: "TestCom".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(harmony_app::community_invite::InviteToken {
+                inviter: admin_addr,
+                invitee_hint: None,
+                minted_at: fixture_hlc(),
+                expires_at: None,
+                sig: [0xDD; 64],
+            }),
+            admin_bootstrap: Some(leave_bootstrap),
+            admin_identity_pub: Some(admin_pub),
+        };
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapKindInvalid
+        );
     }
 }

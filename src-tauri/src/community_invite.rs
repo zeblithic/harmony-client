@@ -49,6 +49,37 @@ pub struct CommunityInvitePayload {
     /// still be present as an authenticity hint, but not required).
     #[serde(rename = "tk", skip_serializing_if = "Option::is_none", default)]
     pub invite_token: Option<InviteToken>,
+
+    /// Admin's signed self-Join (their bootstrap event). Required for
+    /// invite-only payloads (ZEB-260): without this the joiner's empty
+    /// CRDT cannot admit the admin's eventual publish-back, because the
+    /// receive-side membership-at-HLC gate evaluates publisher status
+    /// against the joiner's local prefix (which has no admin entry).
+    /// Joiner's `redeem_invite_inner` verifies this against
+    /// `admin_identity_pub` and inserts via
+    /// `engine.insert_local_event_with_pubs` before sending the unicast
+    /// packet — the publish-back is generated strictly later, so this
+    /// closes the race by construction. Open communities ignore this
+    /// field; encoding stays byte-identical via skip_serializing_if.
+    #[serde(rename = "ab", skip_serializing_if = "Option::is_none", default)]
+    pub admin_bootstrap: Option<crate::community_membership::SignedMembershipEvent>,
+
+    /// Admin's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
+    /// matching `harmony_identity::Identity::to_public_bytes()`). Required
+    /// for invite-only payloads (ZEB-260) — used to verify
+    /// `admin_bootstrap` and passed into
+    /// `engine.insert_local_event_with_pubs(_, admin_identity_pub, None)`.
+    /// Bound to `admin_addr` via
+    /// `Identity::from_public_bytes(admin_identity_pub).address_hash ==
+    /// admin_addr.0`.
+    #[serde(
+        rename = "ap",
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "serialize_admin_identity_pub_as_bstr",
+        deserialize_with = "deserialize_admin_identity_pub_from_bstr"
+    )]
+    pub admin_identity_pub: Option<[u8; 64]>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -234,6 +265,83 @@ where
     d.deserialize_bytes(BytesVisitor)
 }
 
+/// Serialize `Option<[u8; 64]>` as a CBOR bstr (Some) or absent (None,
+/// via `skip_serializing_if`). Mirrors the existing
+/// `serialize_identity_pub_as_bstr` shape; wraps it for the optional
+/// case used by `CommunityInvitePayload::admin_identity_pub`.
+fn serialize_admin_identity_pub_as_bstr<S>(
+    val: &Option<[u8; 64]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // skip_serializing_if = "Option::is_none" on the field guards None;
+    // serde calls this only with Some.
+    serializer.serialize_bytes(
+        val.as_ref()
+            .expect("skip_serializing_if guards None — unreachable"),
+    )
+}
+
+/// Deserialize `Option<[u8; 64]>` from CBOR. The field is wrapped in
+/// `Option` because invite-only payloads always set it but open-community
+/// payloads omit it entirely; serde routes the absent-key case to
+/// `default` (None) and the present-bstr case here. Uses
+/// `deserialize_option` so CBOR null is handled gracefully (mirrors
+/// `owner_state_types::OptPubVisitor`).
+fn deserialize_admin_identity_pub_from_bstr<'de, D>(
+    deserializer: D,
+) -> Result<Option<[u8; 64]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Visitor;
+    use std::fmt;
+
+    struct OptBytesVisitor;
+    impl<'de> Visitor<'de> for OptBytesVisitor {
+        type Value = Option<[u8; 64]>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a 64-byte CBOR byte string or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_bytes(self)
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Option<[u8; 64]>, E> {
+            if value.len() != 64 {
+                return Err(E::custom(format!(
+                    "admin_identity_pub must be 64 bytes, got {}",
+                    value.len()
+                )));
+            }
+            let mut out = [0u8; 64];
+            out.copy_from_slice(value);
+            Ok(Some(out))
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Option<[u8; 64]>, E> {
+            self.visit_bytes(&v)
+        }
+    }
+
+    deserializer.deserialize_option(OptBytesVisitor)
+}
+
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use base64::Engine;
 
@@ -260,6 +368,26 @@ pub enum InviteUrlError {
     /// base64 chars decode to ~3072 raw bytes.
     #[error("invite payload exceeds 4096 base64-char limit (got {0} chars)")]
     TooLarge(usize),
+    /// Caller passed an invite-only payload missing the admin bootstrap
+    /// fields (`admin_bootstrap` and/or `admin_identity_pub`). The reader
+    /// would reject the resulting URL via `verify_admin_bootstrap`; we
+    /// catch this at the writer to surface a clearer error and avoid
+    /// shipping un-redeemable URLs. ZEB-260.
+    #[error("invite-only payload missing admin_bootstrap or admin_identity_pub")]
+    InviteOnlyMissingBootstrap,
+    /// Caller populated `admin_bootstrap` or `admin_identity_pub` on an
+    /// open-community payload. These fields are scoped to invite-only
+    /// flows; encoding them on an open-community URL would leak admin's
+    /// signed bootstrap event over a URL that doesn't need it. ZEB-260.
+    #[error("open-community payload must not carry admin_bootstrap / admin_identity_pub")]
+    OpenCommunityHasBootstrap,
+    /// Caller passed an invite-only payload missing `invite_token`. The
+    /// reader-side `redeem_invite_inner` would tear down the spawned
+    /// engine and return `"invite-only payload missing invite_token"`;
+    /// catching this at the writer prevents the un-redeemable URL from
+    /// leaving the mint site. ZEB-260 PR #90 round-3 (CodeRabbit).
+    #[error("invite-only payload missing invite_token")]
+    InviteOnlyMissingToken,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -274,6 +402,19 @@ const MAX_INVITE_BODY_B64_CHARS: usize = 4096;
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
 /// chat / email / messaging clients that munge `+`, `/`, or `=`.
 pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, InviteUrlError> {
+    if payload.is_invite_only && payload.invite_token.is_none() {
+        return Err(InviteUrlError::InviteOnlyMissingToken);
+    }
+    if payload.is_invite_only
+        && (payload.admin_bootstrap.is_none() || payload.admin_identity_pub.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyMissingBootstrap);
+    }
+    if !payload.is_invite_only
+        && (payload.admin_bootstrap.is_some() || payload.admin_identity_pub.is_some())
+    {
+        return Err(InviteUrlError::OpenCommunityHasBootstrap);
+    }
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
     Ok(format!("{URL_PREFIX}{b64}"))
@@ -446,6 +587,183 @@ impl CommunityInviteVerifyError {
             Self::EngineLocalError => "community_invite_engine_local_error",
         }
     }
+}
+
+/// Errors from `verify_admin_bootstrap` — the six-step binding chain
+/// the joiner runs against the invite payload's `admin_bootstrap` +
+/// `admin_identity_pub` fields before inserting the bootstrap into the
+/// engine. ZEB-260: closing the cold-cache gap that prevents the new
+/// joiner's empty CRDT from admitting the admin's first publish-back.
+///
+/// Each variant maps to a stable IPC error string via Display (NOT
+/// Debug), matching the pattern established in PR #89 for IPC error
+/// surface stability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemBootstrapVerifyError {
+    /// Invite-only payload missing `admin_bootstrap` and/or
+    /// `admin_identity_pub`. Fires for old PR #89 invite URLs (which
+    /// never carried these fields). Stable IPC string:
+    /// "redeem_invite: invite-only payload missing admin bootstrap".
+    BootstrapMissing,
+
+    /// `admin_identity_pub` bytes are not a valid Ed25519 + X25519 pair
+    /// (rejected by `harmony_identity::Identity::from_public_bytes`).
+    BootstrapInvalidPubkey,
+
+    /// `Identity::from_public_bytes(admin_identity_pub).address_hash`
+    /// does not equal `payload.admin_addr.0`.
+    BootstrapAddressMismatch,
+
+    /// `admin_bootstrap.actor` does not equal `payload.admin_addr`.
+    BootstrapActorMismatch,
+
+    /// `admin_bootstrap.community_id` does not equal
+    /// `payload.community_id`.
+    BootstrapCommunityMismatch,
+
+    /// Ed25519 signature verification of `admin_bootstrap` failed under
+    /// `admin_identity_pub`.
+    BootstrapSignatureInvalid,
+
+    /// `admin_bootstrap.kind` is not `Join`, or `countersig` is `Some`.
+    /// Admin's bootstrap is always a self-Join with no countersig.
+    BootstrapKindInvalid,
+}
+
+impl std::fmt::Display for RedeemBootstrapVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BootstrapMissing => write!(
+                f,
+                "redeem_invite: invite-only payload missing admin bootstrap"
+            ),
+            Self::BootstrapInvalidPubkey => write!(
+                f,
+                "redeem_invite: admin_identity_pub is not a valid identity"
+            ),
+            Self::BootstrapAddressMismatch => write!(
+                f,
+                "redeem_invite: admin_identity_pub.address_hash != admin_addr"
+            ),
+            Self::BootstrapActorMismatch => write!(
+                f,
+                "redeem_invite: admin_bootstrap.actor != admin_addr"
+            ),
+            Self::BootstrapCommunityMismatch => write!(
+                f,
+                "redeem_invite: admin_bootstrap.community_id != payload.community_id"
+            ),
+            Self::BootstrapSignatureInvalid => write!(
+                f,
+                "redeem_invite: admin_bootstrap signature verify failed"
+            ),
+            Self::BootstrapKindInvalid => write!(
+                f,
+                "redeem_invite: admin_bootstrap is not a self-Join (countersig present or wrong kind)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RedeemBootstrapVerifyError {}
+
+impl RedeemBootstrapVerifyError {
+    /// Short telemetry tag for the existing `record_redeem_outcome`-
+    /// style logging path. Kept stable across builds — frontend-side
+    /// metrics dashboards key off these strings. Mirrors the
+    /// `CommunityInviteVerifyError::reason_tag` shape.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            Self::BootstrapMissing => "bootstrap_missing",
+            Self::BootstrapInvalidPubkey => "bootstrap_invalid_pubkey",
+            Self::BootstrapAddressMismatch => "bootstrap_address_mismatch",
+            Self::BootstrapActorMismatch => "bootstrap_actor_mismatch",
+            Self::BootstrapCommunityMismatch => "bootstrap_community_mismatch",
+            Self::BootstrapSignatureInvalid => "bootstrap_signature_invalid",
+            Self::BootstrapKindInvalid => "bootstrap_kind_invalid",
+        }
+    }
+}
+
+/// Run the six-step binding chain that admits the admin's signed
+/// bootstrap event into the joiner's engine (ZEB-260). Pure / sync.
+///
+/// Returns `Ok((&admin_bootstrap, &admin_identity_pub))` on success so
+/// the caller can pass them to `engine.insert_local_event_with_pubs`.
+/// Returns `Err(variant)` on the first failure.
+///
+/// The chain (each step's failure → distinct error variant):
+///   1. Required fields present (`admin_bootstrap` + `admin_identity_pub`
+///      both `Some`). [BootstrapMissing]
+///   2. `Identity::from_public_bytes(admin_identity_pub).address_hash ==
+///      payload.admin_addr.0`. [BootstrapInvalidPubkey or
+///      BootstrapAddressMismatch]
+///   3. `admin_bootstrap.actor == payload.admin_addr`.
+///      [BootstrapActorMismatch]
+///   4. `admin_bootstrap.community_id == payload.community_id`.
+///      [BootstrapCommunityMismatch]
+///   5. Ed25519 signature verify of `admin_bootstrap` under
+///      `admin_identity_pub` (delegates to
+///      `community_membership::verify_signature`). [BootstrapSignatureInvalid]
+///   6. Sanity: `admin_bootstrap.kind == Join` and `countersig is None`.
+///      [BootstrapKindInvalid]
+///
+/// Caller (`redeem_invite_inner` invite-only branch, Task 4) calls this
+/// AFTER `spawn_engine` and BEFORE the unicast send. On `Ok`, the caller
+/// proceeds to `engine.insert_local_event_with_pubs(admin_bootstrap,
+/// admin_identity_pub, None)`. On `Err`, the caller tears down the
+/// engine via `shutdown_engine_and_cleanup_persistence` and surfaces
+/// the error string.
+pub fn verify_admin_bootstrap(
+    payload: &CommunityInvitePayload,
+) -> Result<
+    (
+        &crate::community_membership::SignedMembershipEvent,
+        &[u8; 64],
+    ),
+    RedeemBootstrapVerifyError,
+> {
+    // 1. Required fields.
+    let admin_bootstrap = payload
+        .admin_bootstrap
+        .as_ref()
+        .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
+    let admin_identity_pub = payload
+        .admin_identity_pub
+        .as_ref()
+        .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
+
+    // 2. identity_pub ↔ admin_addr binding.
+    let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapInvalidPubkey)?;
+    if admin_identity.address_hash != payload.admin_addr.0 {
+        return Err(RedeemBootstrapVerifyError::BootstrapAddressMismatch);
+    }
+
+    // 3. bootstrap.actor ↔ admin_addr binding.
+    if admin_bootstrap.actor != payload.admin_addr {
+        return Err(RedeemBootstrapVerifyError::BootstrapActorMismatch);
+    }
+
+    // 4. bootstrap.community_id ↔ payload.community_id binding.
+    if admin_bootstrap.community_id != payload.community_id {
+        return Err(RedeemBootstrapVerifyError::BootstrapCommunityMismatch);
+    }
+
+    // 5. Ed25519 signature verify.
+    crate::community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
+
+    // 6. Sanity: self-Join with no countersig.
+    if !matches!(
+        admin_bootstrap.kind,
+        crate::community_membership::MembershipEventKind::Join
+    ) || admin_bootstrap.countersig.is_some()
+    {
+        return Err(RedeemBootstrapVerifyError::BootstrapKindInvalid);
+    }
+
+    Ok((admin_bootstrap, admin_identity_pub))
 }
 
 /// Encode a [`CommunityInvitePacket`] to wire bytes.

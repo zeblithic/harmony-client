@@ -278,6 +278,8 @@ async fn open_community_create_redeem_leave_round_trip() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let minted_b = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
@@ -572,6 +574,8 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let minted_b1 = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)

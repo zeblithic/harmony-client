@@ -293,12 +293,10 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         .await
         .expect("alice bootstrap insert");
 
-    // Drain bob_adapter_rx without using it: Bob's engine is
-    // pre-spawned below, so `redeem_invite_inner` will see
-    // `engine_already_existed=true` and skip the adapter dispatch.
-    // Keep the receiver alive (drained) so the channel doesn't
-    // close + surface errors elsewhere.
-    tokio::spawn(async move { while bob_adapter_rx.recv().await.is_some() {} });
+    // bob_adapter_rx is held here; redeem_invite_inner will dispatch a
+    // CommunityAdapterRequest when it spawns Bob's engine. The forwarder
+    // block below consumes that request to wire the publish/subscribe
+    // round-trip between Alice and Bob.
 
     // Build Alice's InviteToken (signed by Alice over the canonical
     // CBOR of (inviter, invitee_hint, minted_at)).
@@ -333,6 +331,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         is_invite_only: true,
         expires_at: None,
         invite_token: Some(invite_token),
+        admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
+        admin_identity_pub: Some(alice.identity.to_public_bytes()),
     })
     .expect("encode URL");
 
@@ -362,80 +362,52 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         }
     });
 
-    // ZEB-256 bootstrap caveat: Bob's engine is empty until
-    // `redeem_invite_inner` runs. Alice's eventual publish carries the
-    // counter-signed Join AND admin's bootstrap, but the receive-side
-    // membership-at-HLC gate (`handle_incoming_publish` step 2) keys
-    // off Bob's locally-trusted CRDT. With an empty CRDT, Alice's
-    // `publisher_addr` (alice_addr) doesn't materialize as Joined
-    // -> PublisherNotJoined rejection -> Bob's oneshot never fires.
+    // ZEB-260 (Case A FIXED): admin's signed bootstrap is now plumbed
+    // through the invite URL (CommunityInvitePayload.admin_bootstrap +
+    // admin_identity_pub). redeem_invite_inner verifies and inserts it
+    // into Bob's engine BEFORE sending the unicast packet, so by the
+    // time Alice's publish-back arrives, Bob's CRDT already has Alice
+    // as Joined and the membership-at-HLC gate admits.
     //
-    // Production paves this over via the redemption flow re-inserting
-    // the bootstrap from the invite payload's MembershipKey-derived
-    // proof; until ZEB-260 lands, the simplest test fixture is to
-    // pre-spawn Bob's engine + insert Alice's bootstrap (idempotent
-    // re-spawn inside `redeem_invite_inner` is a no-op). Mirrors the
-    // `community_open_flow_integration` round-trip's pre-seed pattern.
-    {
-        let (b_pub_tx_seed, b_pub_rx_seed) = mpsc::channel::<Vec<u8>>(64);
-        let (b_sub_tx_seed, b_sub_rx_seed) = mpsc::channel::<Vec<u8>>(64);
-        // Pre-spawn Bob's engine. The pre-spawn channels go into the
-        // engine; the `redeem_invite_inner` call will see
-        // `engine_already_existed=true` and skip its own adapter
-        // dispatch (so we must wire forwarders for THESE channels
-        // ourselves). The adapter forwarder above is a no-op then;
-        // we instead build the publish/subscribe forwarders inline.
-        registry_b
-            .spawn_engine(
-                community_id,
-                alice_minted.membership_key.clone(),
-                alice_addr,
-                true,
-                b_pub_tx_seed,
-                b_sub_rx_seed,
-            )
-            .await
-            .expect("pre-spawn bob engine");
-        let bob_engine = registry_b
-            .engine_arc(&community_id)
-            .await
-            .expect("bob engine post-pre-spawn");
-        bob_engine
-            .insert_local_event(alice_minted.bootstrap_join.clone())
-            .await
-            .expect("bob pre-seed Alice bootstrap (ZEB-260 OOB)");
-
-        // Wire Alice's pub channel → Bob's pre-spawned sub_tx, and
-        // Bob's pre-spawned pub_rx → Alice's sub channel. (The
-        // bob_adapter_tx forwarder above will see no request — Bob's
-        // engine is already spawned, so `engine_already_existed=true`
-        // skips the adapter dispatch.)
-        let alice_sub_tx_for_fwd = alice_sub_tx.clone();
-        let mut b_pub_rx_seed = b_pub_rx_seed;
-        tokio::spawn(async move {
-            while let Some(bytes) = b_pub_rx_seed.recv().await {
-                if alice_sub_tx_for_fwd.send(bytes).await.is_err() {
-                    break;
+    // The OOB pre-seed (pre-spawn Bob's engine + insert_local_event)
+    // has been removed — its presence would mask regressions in the
+    // production path. redeem_invite_inner now dispatches a
+    // CommunityAdapterRequest when it spawns Bob's engine; the
+    // forwarder below consumes that request and wires Bob's
+    // publisher_rx → Alice's sub_tx, and Alice's pub_rx → Bob's
+    // subscriber_tx, mirroring community_open_flow_integration.rs.
+    let alice_sub_tx_for_fwd = alice_sub_tx.clone();
+    tokio::spawn(async move {
+        // Wait for redeem_invite_inner's adapter dispatch.
+        if let Some(req) = bob_adapter_rx.recv().await {
+            // Bob → Alice: drain Bob's publisher_rx, send to Alice's sub_tx.
+            let mut bob_pub_rx = req.publisher_rx;
+            let alice_sub_tx = alice_sub_tx_for_fwd.clone();
+            tokio::spawn(async move {
+                while let Some(bytes) = bob_pub_rx.recv().await {
+                    if alice_sub_tx.send(bytes).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-        let bob_sub_tx_for_fwd = b_sub_tx_seed.clone();
-        tokio::spawn(async move {
-            while let Some(bytes) = alice_pub_rx.recv().await {
-                if bob_sub_tx_for_fwd.send(bytes).await.is_err() {
-                    break;
+            });
+            // Alice → Bob: drain alice_pub_rx, send to Bob's subscriber_tx.
+            let bob_sub_tx = req.subscriber_tx;
+            tokio::spawn(async move {
+                while let Some(bytes) = alice_pub_rx.recv().await {
+                    if bob_sub_tx.send(bytes).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
+    });
 
-    // Bob redeems. spawn_engine inside redeem_invite_inner is a no-op
-    // (engine already spawned above); the post-spawn adapter dispatch
-    // is also skipped (`engine_already_existed=true`). The unicast
-    // packet hits Alice via the unicast forwarder; Alice counter-signs
-    // + inserts; Alice's engine publishes the counter-signed Join;
-    // Bob's pre-spawned engine receives via the pre-wired forwarder,
-    // merges, fires the pending_redemptions oneshot.
+    // Bob redeems. redeem_invite_inner spawns Bob's engine (fresh, no
+    // pre-spawn), inserts alice's bootstrap_join from the invite URL
+    // into Bob's engine, sends the unicast packet to Alice, Alice
+    // counter-signs + inserts, Alice's engine publishes, Bob's engine
+    // receives via the forwarder wired above, merges, fires the
+    // pending_redemptions oneshot.
     let result = harmony_app::redeem_invite_inner(
         invite_url,
         Arc::clone(&crdt_b),
@@ -483,5 +455,106 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         Some(MemberStatus::Joined),
         "Alice must remain Joined"
     );
+    // ZEB-260: Bob's CRDT now holds admin's bootstrap (inserted by
+    // redeem_invite_inner from the invite URL's admin_bootstrap field)
+    // AND his own counter-signed Join (merged from Alice's publish-back).
+    let bob_state = registry_b
+        .state_for(&community_id)
+        .await
+        .expect("bob state");
+    let bob_events: Vec<_> = {
+        let g = bob_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    assert_eq!(
+        bob_events.len(),
+        2,
+        "bob should hold admin Join + his counter-signed Join after redeem"
+    );
+    let mat_b = materialize(&bob_events, alice_addr);
+    assert_eq!(
+        mat_b.members.get(&alice_addr).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "Alice must be Joined in Bob's view (admin bootstrap landed)"
+    );
+    assert_eq!(
+        mat_b.members.get(&bob_addr).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "Bob must be Joined in Bob's view (publish-back merged)"
+    );
     // RedeemTimeoutGuard restores the prior env-var on Drop here.
+}
+
+/// ZEB-260 tampering test: an invite URL whose admin_bootstrap has been
+/// modified post-mint (signature flipped) MUST fail at the verify chain
+/// before any engine spawn / unicast / commit. The error must surface as
+/// `BootstrapSignatureInvalid` (the chain-step → variant mapping is part
+/// of the security contract — frontend telemetry keys off these tags).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn community_invite_only_tampered_admin_bootstrap_rejects() {
+    use harmony_app::community_invite::{
+        decode_invite_url, encode_invite_url, verify_admin_bootstrap, CommunityInvitePayload,
+        InviteToken, RedeemBootstrapVerifyError,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+
+    let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
+    let alice_priv_bytes = alice_identity.to_private_bytes();
+    let alice_ed_seed: [u8; 32] = alice_priv_bytes[32..64]
+        .try_into()
+        .expect("ed25519 seed slice 32..64");
+    let alice_sk = ed25519_dalek::SigningKey::from_bytes(&alice_ed_seed);
+
+    let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
+
+    let community_id = SpaceId([0x37; 16]);
+    let bootstrap_payload = EventPayload {
+        id: [0xCC; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: alice_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        },
+    };
+    let mut alice_bootstrap = sign_event(&bootstrap_payload, &alice_sk).expect("sign");
+    // Tamper: flip a single bit in the signature.
+    alice_bootstrap.sig[0] ^= 0x01;
+
+    let invite_url = encode_invite_url(&CommunityInvitePayload {
+        community_id,
+        membership_key: MembershipKey::new([0xDD; 32]),
+        admin_addr: alice_addr,
+        community_name: "TamperedTest".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(InviteToken {
+            inviter: alice_addr,
+            invitee_hint: Some(bob_addr),
+            minted_at: bootstrap_payload.at.clone(),
+            expires_at: None,
+            sig: [0xEE; 64],
+        }),
+        admin_bootstrap: Some(alice_bootstrap),
+        admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
+    })
+    .expect("encode URL");
+
+    // Decode + verify directly. verify_admin_bootstrap is pure, so we
+    // can pin the error variant + telemetry tag without spinning up
+    // engines, channels, or CRDT state.
+    let decoded = decode_invite_url(&invite_url).expect("decode");
+    let err = verify_admin_bootstrap(&decoded).expect_err("tampered must reject");
+    assert_eq!(
+        err,
+        RedeemBootstrapVerifyError::BootstrapSignatureInvalid,
+        "tampered admin_bootstrap.sig must surface as BootstrapSignatureInvalid"
+    );
+    // Telemetry tag is part of the security contract — pin it.
+    assert_eq!(err.reason_tag(), "bootstrap_signature_invalid");
 }
