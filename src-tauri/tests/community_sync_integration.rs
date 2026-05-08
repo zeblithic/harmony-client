@@ -2487,6 +2487,24 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         expires_at: None,
         sig: token_sig,
     };
+    // Build Alice's signed self-Join (the admin bootstrap event). This
+    // is required for invite-only payloads since ZEB-260 Phase 4: without
+    // it, encode_invite_url rejects with InviteOnlyMissingBootstrap, and
+    // verify_admin_bootstrap would reject on the reader side.
+    let admin_bootstrap = {
+        let payload = harmony_app::community_membership::EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: harmony_app::community_membership::MembershipEventKind::Join,
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &alice).expect("sign admin bootstrap")
+    };
     let url = encode_invite_url(&CommunityInvitePayload {
         community_id,
         membership_key: mk.clone(),
@@ -2495,13 +2513,35 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         is_invite_only: true,
         expires_at: None,
         invite_token: Some(invite_token),
-        admin_bootstrap: None,
-        admin_identity_pub: None,
+        admin_bootstrap: Some(admin_bootstrap),
+        admin_identity_pub: Some(alice_pub),
     })
     .expect("encode URL");
 
     // Bob's side: registry + crdt + tracker.
-    let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
+    //
+    // ZEB-260: with the admin-bootstrap insert added in redeem_invite_inner,
+    // any insert path triggers `notify_dirty` → on shutdown the engine
+    // task tries to `publish_root_now` → `content_store.put().await` waits
+    // on a oneshot reply from the CAS event loop. Without a CAS servicer,
+    // that await blocks forever and the rollback hangs. Mirror the stub
+    // servicer pattern from `task6_admin_kicks_member_round_trip` (line
+    // 2083) — drain CasOps and reply success / None for the test fixture.
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(8);
+    tokio::spawn(async move {
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal { reply, .. } => {
+                    if let Some(r) = reply {
+                        let _ = r.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch { reply, .. } => {
+                    let _ = reply.send(Ok(None));
+                }
+            }
+        }
+    });
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         Duration::from_millis(1000),

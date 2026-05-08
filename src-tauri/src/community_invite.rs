@@ -368,6 +368,13 @@ pub enum InviteUrlError {
     /// base64 chars decode to ~3072 raw bytes.
     #[error("invite payload exceeds 4096 base64-char limit (got {0} chars)")]
     TooLarge(usize),
+    /// Caller passed an invite-only payload missing the admin bootstrap
+    /// fields (`admin_bootstrap` and/or `admin_identity_pub`). The reader
+    /// would reject the resulting URL via `verify_admin_bootstrap`; we
+    /// catch this at the writer to surface a clearer error and avoid
+    /// shipping un-redeemable URLs. ZEB-260.
+    #[error("invite-only payload missing admin_bootstrap or admin_identity_pub")]
+    InviteOnlyMissingBootstrap,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -382,6 +389,11 @@ const MAX_INVITE_BODY_B64_CHARS: usize = 4096;
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
 /// chat / email / messaging clients that munge `+`, `/`, or `=`.
 pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, InviteUrlError> {
+    if payload.is_invite_only
+        && (payload.admin_bootstrap.is_none() || payload.admin_identity_pub.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyMissingBootstrap);
+    }
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
     Ok(format!("{URL_PREFIX}{b64}"))

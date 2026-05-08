@@ -72,7 +72,7 @@ The test author had access to `alice_minted.bootstrap_join` (an in-process artif
 
 ## Architecture
 
-The fix adds **one side-channel field**: the invite URL carries Alice's signed self-Join event so Bob can insert it into his engine before sending the redemption unicast. By the time Alice's publish-back arrives, Bob's CRDT has Alice as `Joined`, so the gate admits.
+The fix adds **two side-channel fields**: the invite URL carries Alice's signed self-Join event (`admin_bootstrap`) and her identity public bytes (`admin_identity_pub`) so Bob can verify and insert her bootstrap into his engine before sending the redemption unicast. By the time Alice's publish-back arrives, Bob's CRDT has Alice as `Joined`, so the gate admits.
 
 ### What does NOT change
 

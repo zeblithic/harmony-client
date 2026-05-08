@@ -6540,16 +6540,21 @@ where
                 Err(verify_err) => {
                     // Engine + persistence dir were spawned at step 6;
                     // tear down before returning so we don't leak.
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            reason_tag = verify_err.reason_tag(),
-                            "shutdown failed during redeem_invite admin-bootstrap-verify rollback"
-                        );
+                    // Guard: if the engine pre-existed (re-redemption
+                    // retry), tearing it down would destroy state from
+                    // the prior successful path. ZEB-260 PR #90.
+                    if !engine_already_existed {
+                        if let Err(stop_err) = community_registry
+                            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %stop_err,
+                                community_id = %hex::encode(minted.community_id.0),
+                                reason_tag = verify_err.reason_tag(),
+                                "shutdown failed during redeem_invite admin-bootstrap-verify rollback"
+                            );
+                        }
                     }
                     return Err(verify_err.to_string());
                 }
@@ -6566,15 +6571,20 @@ where
                 // Engine vanished between spawn and lookup — registry
                 // race. Treated as a transient failure; tear down and
                 // surface a deterministic error.
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite engine-vanished rollback"
-                    );
+                // Guard: if the engine pre-existed (re-redemption
+                // retry), tearing it down would destroy state from
+                // the prior successful path. ZEB-260 PR #90.
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite engine-vanished rollback"
+                        );
+                    }
                 }
                 return Err(
                     "engine vanished immediately after spawn — registry race (invite-only branch)"
@@ -6589,15 +6599,20 @@ where
             // Bootstrap insert failed — should be effectively unreachable
             // given the verify chain just passed, but surface
             // deterministically and tear down.
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
-                );
+            // Guard: if the engine pre-existed (re-redemption retry),
+            // tearing it down would destroy state from the prior
+            // successful path. ZEB-260 PR #90.
+            if !engine_already_existed {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
+                    );
+                }
             }
             return Err(format!(
                 "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"

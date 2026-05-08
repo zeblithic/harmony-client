@@ -43,7 +43,7 @@ git log --oneline -3
 
 Expected output (the branch carries only the spec commit `da3f8a8` over `origin/main` at `7d32256`):
 
-```
+```text
 zeb-260-invite-only-cold-cache
 da3f8a8 docs(zeb-260): Phase 4 invite-only cold-cache bootstrap design spec
 7d32256 Merge pull request #89 from zeblithic/zeb-262-phase-4-invite-only-kick-set-power
@@ -878,7 +878,7 @@ cd src-tauri && cargo test --test community_invite_unit verify_admin_bootstrap_t
 
 Expected:
 
-```
+```text
 running 10 tests
 test verify_admin_bootstrap_tests::admits_well_formed_admin_bootstrap ... ok
 test verify_admin_bootstrap_tests::rejects_admin_actor_mismatch ... ok
