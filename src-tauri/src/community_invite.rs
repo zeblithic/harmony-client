@@ -276,23 +276,27 @@ fn serialize_admin_identity_pub_as_bstr<S>(
 where
     S: serde::Serializer,
 {
-    match val {
-        Some(bytes) => serializer.serialize_bytes(bytes),
-        None => serializer.serialize_none(),
-    }
+    // skip_serializing_if = "Option::is_none" on the field guards None;
+    // serde calls this only with Some.
+    serializer.serialize_bytes(
+        val.as_ref()
+            .expect("skip_serializing_if guards None — unreachable"),
+    )
 }
 
 /// Deserialize `Option<[u8; 64]>` from CBOR. The field is wrapped in
 /// `Option` because invite-only payloads always set it but open-community
 /// payloads omit it entirely; serde routes the absent-key case to
-/// `default` (None) and the present-bstr case here.
+/// `default` (None) and the present-bstr case here. Uses
+/// `deserialize_option` so CBOR null is handled gracefully (mirrors
+/// `owner_state_types::OptPubVisitor`).
 fn deserialize_admin_identity_pub_from_bstr<'de, D>(
     deserializer: D,
 ) -> Result<Option<[u8; 64]>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{Error, Visitor};
+    use serde::de::Visitor;
     use std::fmt;
 
     struct OptBytesVisitor;
@@ -300,10 +304,25 @@ where
         type Value = Option<[u8; 64]>;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "a 64-byte CBOR byte string")
+            write!(f, "a 64-byte CBOR byte string or null")
         }
 
-        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Option<[u8; 64]>, E> {
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_bytes(self)
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Option<[u8; 64]>, E> {
             if value.len() != 64 {
                 return Err(E::custom(format!(
                     "admin_identity_pub must be 64 bytes, got {}",
@@ -315,12 +334,12 @@ where
             Ok(Some(out))
         }
 
-        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Option<[u8; 64]>, E> {
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Option<[u8; 64]>, E> {
             self.visit_bytes(&v)
         }
     }
 
-    deserializer.deserialize_bytes(OptBytesVisitor)
+    deserializer.deserialize_option(OptBytesVisitor)
 }
 
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
