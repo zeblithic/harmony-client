@@ -174,6 +174,12 @@
   let myCommunityPower = $derived(
     communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
   );
+  // Count only currently-joined members so the overview matches the
+  // "X joined" line in CommunitySettingsPanel — invited/banned/left
+  // entries shouldn't be counted as members in either place.
+  let joinedCommunityCount = $derived(
+    communityMembers.filter((m) => m.status === 'joined').length,
+  );
 
   // Centralized switch helper. Clears the visible roster on a real
   // community change so the settings panel doesn't flash the previous
@@ -1129,7 +1135,7 @@
            inside a community arrive in a later phase. -->
       <div class="community-overview">
         <h2>{selectedCommunityNode.name}</h2>
-        <p class="member-line">{communityMembers.length} {communityMembers.length === 1 ? 'member' : 'members'}</p>
+        <p class="member-line">{joinedCommunityCount} {joinedCommunityCount === 1 ? 'member' : 'members'}</p>
         <p class="empty-line">No channels yet — channels arrive in a later phase.</p>
         <button class="manage-btn" onclick={() => (showCommunitySettings = true)}>Manage community</button>
       </div>

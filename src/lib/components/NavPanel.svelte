@@ -168,11 +168,14 @@
       }
     }
 
-    // Return matching nodes, with ancestor folders expanded
+    // Return matching nodes, with ancestor folders/communities expanded.
+    // Communities render their children (channels) like folders since
+    // ZEB-263, so they need the same auto-expand treatment to reveal
+    // search hits nested under a manually-collapsed community.
     return navNodes
       .filter((n) => matchIds.has(n.id))
       .map((n) =>
-        n.type === 'folder' && ancestorIds.has(n.id)
+        (n.type === 'folder' || n.type === 'community') && ancestorIds.has(n.id)
           ? { ...n, expanded: true }
           : n
       );
