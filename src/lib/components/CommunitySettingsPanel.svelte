@@ -41,8 +41,26 @@
 
   let joinedMembers = $derived(members.filter((m) => m.status === 'joined'));
   let adminCount = $derived(joinedMembers.filter((m) => m.power >= POWER_THRESHOLDS.setPower).length);
-  let amOnlyAdmin = $derived(myPower >= POWER_THRESHOLDS.setPower && adminCount === 1);
+  let amOnlyAdmin = $derived(
+    myPower >= POWER_THRESHOLDS.setPower &&
+    adminCount === 1 &&
+    joinedMembers.some((m) => m.address === myAddress && m.power >= POWER_THRESHOLDS.setPower)
+  );
   let myRole = $derived(powerToRole(myPower));
+
+  let search = $state('');
+  let filteredMembers = $derived(
+    search.trim() === ''
+      ? joinedMembers
+      : (() => {
+          const q = search.toLowerCase();
+          return joinedMembers.filter(
+            (m) =>
+              (m.displayName?.toLowerCase().includes(q) ?? false) ||
+              m.address.toLowerCase().includes(q)
+          );
+        })()
+  );
 
   function canKick(target: CommunityMember): boolean {
     return target.address !== myAddress
@@ -93,8 +111,17 @@
 
     <div class="section">
       <div class="section-label">Members ({joinedMembers.length})</div>
+      <div class="member-search">
+        <input
+          type="text"
+          placeholder="Search members..."
+          bind:value={search}
+          class="search-input"
+          aria-label="Search members"
+        />
+      </div>
       <div class="member-list">
-        {#each joinedMembers as m (m.address)}
+        {#each filteredMembers as m (m.address)}
           <div class="member-row">
             <div class="avatar">{(m.displayName ?? m.address).slice(0, 1).toUpperCase()}</div>
             <div class="member-name">
@@ -134,7 +161,7 @@
   <ConfirmationModal
     title={`Kick ${kickTarget.displayName ?? kickTarget.address.slice(0, 8)} from ${communityName}?`}
     description="They will be banned from rejoining. A future admin can re-invite them, but kick events can't be undone."
-    confirmLabel={`Kick ${kickTarget.displayName ?? 'member'}`}
+    confirmLabel={`Kick ${kickTarget.displayName ?? kickTarget.address.slice(0, 8)}`}
     danger={true}
     onConfirm={() => { onKick(kickTarget!.address); kickTarget = null; }}
     onCancel={() => (kickTarget = null)}
@@ -293,6 +320,21 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
     margin: 8px 0 0 0;
+  }
+  .member-search { margin-bottom: 12px; }
+  .search-input {
+    width: 100%;
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    box-sizing: border-box;
+  }
+  .search-input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
   }
   .close-btn:focus-visible,
   .leave-btn:focus-visible,

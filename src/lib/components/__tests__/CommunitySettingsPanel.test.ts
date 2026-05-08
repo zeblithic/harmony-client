@@ -112,4 +112,28 @@ describe('CommunitySettingsPanel', () => {
     await fireEvent.click(getByText(/Leave community/i));
     expect(getByPlaceholderText(/Type community name/i)).toBeTruthy();
   });
+
+  it('renders a search input in the Members section', () => {
+    const { getByPlaceholderText } = render(CommunitySettingsPanel, { props: baseProps });
+    expect(getByPlaceholderText('Search members...')).toBeTruthy();
+  });
+
+  it('filters members by displayName substring (case-insensitive)', async () => {
+    const { container, getByPlaceholderText } = render(CommunitySettingsPanel, { props: baseProps });
+    const input = getByPlaceholderText('Search members...') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'bob' } });
+    const visibleNames = Array.from(container.querySelectorAll('.member-row .name')).map((el) => el.textContent);
+    expect(visibleNames.some((n) => n?.includes('Bob'))).toBe(true);
+    expect(visibleNames.some((n) => n?.includes('Alice'))).toBe(false);
+    expect(visibleNames.some((n) => n?.includes('Charlie'))).toBe(false);
+  });
+
+  it('filters members by address substring', async () => {
+    const { container, getByPlaceholderText } = render(CommunitySettingsPanel, { props: baseProps });
+    const input = getByPlaceholderText('Search members...') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'cc99' } });
+    const visibleNames = Array.from(container.querySelectorAll('.member-row .name')).map((el) => el.textContent);
+    expect(visibleNames.some((n) => n?.includes('Charlie'))).toBe(true);
+    expect(visibleNames.some((n) => n?.includes('Alice'))).toBe(false);
+  });
 });
