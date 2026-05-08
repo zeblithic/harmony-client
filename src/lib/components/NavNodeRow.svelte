@@ -120,7 +120,7 @@
       {/if}
     {:else}
       <!-- Text or both mode -->
-      <span class="type-icon">{typeIcon(node)}</span>
+      <span class="type-icon" class:type-icon-wide={node.type === 'community'}>{typeIcon(node)}</span>
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
@@ -216,6 +216,15 @@
     width: 16px;
     text-align: center;
     color: var(--text-muted);
+  }
+
+  /* Communities render '▾ 🏛️' / '▸ 🏛️' — chevron + space + emoji
+     overflows the 16px width used for single-character chevrons /
+     hashes / @ signs. Widen only for community nodes. */
+  .type-icon-wide {
+    width: auto;
+    min-width: 32px;
+    padding: 0 2px;
   }
 
   .node-name {

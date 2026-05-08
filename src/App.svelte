@@ -1542,8 +1542,22 @@
     }}
     onLeave={async () => {
       if (!selectedCommunityId) return;
+      const leavingId = selectedCommunityId;
       try {
-        await communityService.leaveCommunity(selectedCommunityId);
+        await communityService.leaveCommunity(leavingId);
+        // Synthesize the nav removal — same backend gap as create
+        // and redeem (no nav-updated emit). Without this the
+        // community node would persist in the nav tree until reload
+        // even though the user has left it. ZEB-265 covers fixing
+        // this on the backend side.
+        navService.addOrUpdateNavSpace({
+          action: 'removed',
+          spaceId: leavingId,
+          kind: 'community',
+          name: '',
+          members: [],
+          parentId: null,
+        });
         changeSelectedCommunity(null);
         showCommunitySettings = false;
       } catch (e) {
