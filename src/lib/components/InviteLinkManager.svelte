@@ -28,7 +28,17 @@
 
   async function handleCopy() {
     if (!url) return;
-    await navigator.clipboard.writeText(url);
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch (e) {
+      // navigator.clipboard.writeText rejects with NotAllowedError in
+      // sandboxed webviews or when permission is revoked. Surface to
+      // the user via the existing error banner rather than producing
+      // an unhandled promise rejection (greptile P1).
+      const msg = e instanceof Error ? e.message : String(e);
+      error = `Couldn't copy to clipboard: ${msg}`;
+      return;
+    }
     copied = true;
     if (copyResetTimer) clearTimeout(copyResetTimer);
     copyResetTimer = setTimeout(() => {

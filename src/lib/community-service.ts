@@ -1,5 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
-import type { CommunityMember } from './types';
+import { POWER_THRESHOLDS, type CommunityMember } from './types';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -85,7 +85,12 @@ export class CommunityService {
   }
 
   async setPowerLevel(communityId: string, targetAddr: string, newPower: number): Promise<void> {
-    const level = Math.max(0, Math.min(255, Math.trunc(newPower)));
+    // Clamp to POWER_THRESHOLDS.max (100) — matches the UI slider's
+    // declared range and the backend's accepted range. Earlier
+    // revisions clamped to 255 (u8 max) which made the intent
+    // unambiguous to readers and would have allowed out-of-range
+    // values if this method ever got called outside SetPowerDialog.
+    const level = Math.max(0, Math.min(POWER_THRESHOLDS.max, Math.trunc(newPower)));
     await this.invoke<void>('set_power_level', { communityId, targetAddr, level });
   }
 

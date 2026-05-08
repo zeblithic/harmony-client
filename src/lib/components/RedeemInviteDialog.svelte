@@ -51,6 +51,7 @@
     class="url-input"
     rows="3"
     disabled={pending}
+    aria-label="Invite link URL"
   ></textarea>
 
   {#if pending}
