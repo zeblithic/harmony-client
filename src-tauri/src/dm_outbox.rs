@@ -1620,18 +1620,26 @@ mod tests {
     /// added in Phase 3b Task 10) construct keys + hashes from
     /// `harmony_identity::PrivateIdentity::from_seed` directly.
     fn make_outbox_synthetic(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
-        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
-        // Phase 4 (ZEB-262): DmOutbox::new now also takes an
-        // Arc<PrivateIdentity> for the receive-side counter-sign path.
-        // The synthetic outbox tests don't exercise handle_invite, so any
-        // valid PrivateIdentity suffices; build one deterministically from
-        // a fixed seed so test failures are reproducible.
-        let private_identity =
-            std::sync::Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+        // Derive all three identity-bound fields (signing_key,
+        // private_identity, DeviceIdentityHash) from a single
+        // PrivateIdentity seed so the synthetic outbox can never
+        // silently violate the same-identity invariant
+        // `dm_outbox_holds_private_identity_for_countersign` enforces
+        // for production callers. Even though current tests using this
+        // helper don't exercise the cross-binding paths, future tests
+        // that do would otherwise see Ed25519 sig/verify mismatches
+        // with no clear symptom.
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(private_identity);
         DmOutbox::new(
             device_id.into(),
             self_owner,
-            DeviceIdentityHash([0xaa; 16]),
+            device_hash,
             signing_key,
             private_identity,
         )

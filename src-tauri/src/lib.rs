@@ -5963,20 +5963,17 @@ pub async fn create_community_inner(
         }
     }
 
-    // ZEB-258: advance the HLC tracker, then COMMIT owner-state Space
-    // LAST. Tracker advance comes first so under the lock-order rule
-    // (tracker before crdt_state) we never hold the std `state_lock`
-    // while awaiting either; the tracker is also strictly-additive so
-    // a reserved-but-unused slot on a later commit failure is harmless
-    // (monotonicity only requires strictly-increasing HLCs).
-    {
-        let mut tracker_g = hlc_tracker.lock().await;
-        // Bootstrap creation: prev_hlc was either None or strictly
-        // older than `created_at` (next_hlc guarantees forward step),
-        // so unconditionally advancing the tracker is correct.
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
-    }
-
+    // ZEB-258: COMMIT owner-state Space FIRST, then advance the HLC
+    // tracker. Both are persisted via `persist_both`
+    // (owner_state_crdt.cbor + state_root_replay.cbor); advancing the
+    // tracker before the Space commit means a subsequent debounce
+    // could persist the tracker advance with NO matching Space row
+    // (a "phantom" tracker entry on rollback). Inverting the order
+    // keeps rollback byte-identical to pre-call across both files.
+    //
+    // The two locks (`crdt_state` and `hlc_tracker`) are independent
+    // tokio Mutexes; we drop the `state_g` guard before acquiring
+    // `tracker_g` so they're never held simultaneously.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -6002,6 +5999,15 @@ pub async fn create_community_inner(
             }
             return Err(format!("apply_space rejected new community: {outcome:?}"));
         }
+    }
+
+    // Space commit succeeded — advance the tracker. Bootstrap
+    // creation: prev_hlc was either None or strictly older than
+    // `created_at` (next_hlc guarantees forward step), so the insert
+    // is monotonic.
+    {
+        let mut tracker_g = hlc_tracker.lock().await;
+        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
     }
 
     Ok(hex::encode(minted.community_id.0))
@@ -6359,13 +6365,15 @@ where
         prev_hlc.as_ref(),
     )?;
 
-    // Advance the HLC tracker. Strictly-additive: a reserved-but-
-    // unused slot on a later commit failure is harmless (monotonicity
-    // only requires strictly-increasing HLCs).
-    {
-        let mut tracker_g = hlc_tracker.lock().await;
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
-    }
+    // ZEB-258 atomicity: the HLC tracker is persisted to
+    // `state_root_replay.cbor` alongside the CRDT — advancing it here
+    // (before engine spawn, adapter dispatch, the bootstrap-Join
+    // insert, the invite-only oneshot dance, the fence check, AND the
+    // final apply_space) would mean any rollback path leaves a
+    // phantom tracker entry on disk with no matching Space row. The
+    // advance is deferred until AFTER the Space commit succeeds at
+    // step 9 — see the matching `tracker_g.insert` immediately after
+    // the apply_space block.
 
     // 6. Spawn engine + dispatch adapter. Both can fail; failure
     //    rolls back via `shutdown_engine_and_cleanup_persistence`.
@@ -6758,6 +6766,18 @@ where
         }
     }
 
+    // 9b. Space commit succeeded — advance the HLC tracker. Doing
+    // this AFTER the Space commit (rather than before, with the
+    // earlier mint step) keeps rollback paths byte-identical across
+    // both persisted files: a failure between mint and Space commit
+    // never leaves a phantom tracker entry on disk. Bootstrap
+    // creation: prev_hlc was either None or strictly older than
+    // `created_at`, so the insert is monotonic.
+    {
+        let mut tracker_g = hlc_tracker.lock().await;
+        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+    }
+
     // 10. Return Ok.
     Ok(hex::encode(minted.community_id.0))
 }
@@ -7038,6 +7058,36 @@ pub fn mint_leave_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign leave: {e}"))
 }
 
+/// Convert a non-`Inserted` `InsertOutcome` into a user-facing error
+/// string for the membership-IPC surface (`leave_community`,
+/// `kick_from_community`, `set_power_level`). Uses the inner
+/// `VerifyError`'s `Display` impl (which gives stable, frontend-
+/// friendly messages) rather than the debug repr (which would leak
+/// internal enum variant names like `InsertOutcome::Rejected(VerifyError::KickTargetPowerNotLower)`).
+///
+/// `action` is the user-visible verb prefix ("leave_community", "kick",
+/// "set_power_level") so the caller knows which IPC the rejection came
+/// from when multiple flow through the same UI surface.
+fn membership_outcome_err(
+    action: &str,
+    outcome: &crate::community_state_crdt::InsertOutcome,
+) -> String {
+    match outcome {
+        crate::community_state_crdt::InsertOutcome::Rejected(verr) => {
+            format!("{action} rejected: {verr}")
+        }
+        // Inserted should never reach this helper (callers gate on it
+        // via `matches!`), but a stable fallback string is better than
+        // panicking on a future-added variant.
+        crate::community_state_crdt::InsertOutcome::Inserted => {
+            format!("{action} unexpected outcome: Inserted")
+        }
+        crate::community_state_crdt::InsertOutcome::AlreadyKnown => {
+            format!("{action} unexpected outcome: AlreadyKnown")
+        }
+    }
+}
+
 /// Tauri IPC: leave a community we currently belong to.
 ///
 /// Mints a self-Leave event, looks up the per-community engine via
@@ -7156,7 +7206,7 @@ async fn leave_community(
         outcome,
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
-        return Err(format!("Leave rejected by CRDT verify: {outcome:?}"));
+        return Err(membership_outcome_err("leave_community", &outcome));
     }
 
     // Advance HLC tracker only on `Inserted`. `AlreadyKnown` is benign
@@ -7377,7 +7427,7 @@ async fn kick_from_community(
         outcome,
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
-        return Err(format!("Kick rejected by CRDT verify: {outcome:?}"));
+        return Err(membership_outcome_err("kick_from_community", &outcome));
     }
 
     // Advance HLC tracker only on `Inserted` (mirrors leave_community).
@@ -7535,7 +7585,7 @@ async fn set_power_level(
         outcome,
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
-        return Err(format!("SetPower rejected by CRDT verify: {outcome:?}"));
+        return Err(membership_outcome_err("set_power_level", &outcome));
     }
 
     if matches!(
