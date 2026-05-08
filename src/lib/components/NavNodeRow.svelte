@@ -48,27 +48,24 @@
     e.stopPropagation();
     if (node.type === 'folder') {
       onToggle?.(node.id);
-    } else if (node.type === 'community') {
-      // ZEB-263: communities are folder-like containers (NavTree
-      // recurses into expanded community children) AND have an
-      // overview pane, so clicking does both — toggle the chevron
-      // AND select. Cursor flagged that without this dual action
-      // there's no UI affordance to collapse a community.
-      onToggle?.(node.id);
-      onClick?.(node.id);
     } else {
+      // Community click selects (opens overview); the chevron button
+      // (rendered separately for community type) handles toggle so
+      // every selection doesn't also flip expanded state.
       onClick?.(node.id);
     }
+  }
+
+  function toggleCommunity(e: MouseEvent | KeyboardEvent) {
+    e.stopPropagation();
+    onToggle?.(node.id);
   }
 
   function typeIcon(n: NavNode): string {
     if (n.type === 'channel') return '#';
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
-    // Community gets a chevron alongside the building icon so the
-    // expanded/collapsed state is visible at a glance, matching the
-    // folder pattern.
-    if (n.type === 'community') return n.expanded ? '▾ 🏛️' : '▸ 🏛️';
+    if (n.type === 'community') return '🏛️';
     return '';
   }
 
@@ -120,7 +117,15 @@
       {/if}
     {:else}
       <!-- Text or both mode -->
-      <span class="type-icon" class:type-icon-wide={node.type === 'community'}>{typeIcon(node)}</span>
+      {#if node.type === 'community'}
+        <button
+          class="community-chevron"
+          aria-label={node.expanded ? 'Collapse community' : 'Expand community'}
+          aria-expanded={node.expanded}
+          onclick={toggleCommunity}
+        >{node.expanded ? '▾' : '▸'}</button>
+      {/if}
+      <span class="type-icon">{typeIcon(node)}</span>
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
@@ -218,13 +223,30 @@
     color: var(--text-muted);
   }
 
-  /* Communities render '▾ 🏛️' / '▸ 🏛️' — chevron + space + emoji
-     overflows the 16px width used for single-character chevrons /
-     hashes / @ signs. Widen only for community nodes. */
-  .type-icon-wide {
-    width: auto;
-    min-width: 32px;
-    padding: 0 2px;
+  /* Chevron button for community expand/collapse. Stops propagation so
+     clicking it doesn't also fire the row's onClick (which selects the
+     community). Folder click toggles via the row body, but folders
+     don't have a separate select action so there's no ambiguity. */
+  .community-chevron {
+    flex-shrink: 0;
+    width: 16px;
+    text-align: center;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font-size: inherit;
+    line-height: 1;
+  }
+  .community-chevron:hover {
+    color: var(--text-primary);
+  }
+  .community-chevron:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
 
   .node-name {

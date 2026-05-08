@@ -449,17 +449,24 @@
   // the first roster-changed event (which may fire as soon as connectAdapter
   // resolves) is never dropped silently. Svelte 5 $state reads inside the
   // closure are always current at call time — no TDZ risk.
-  communityService.onChange = (changedId?: string) => {
-    if (selectedCommunityId && (!changedId || changedId === selectedCommunityId)) {
+  communityService.onMembersChanged = (changedId: string) => {
+    if (selectedCommunityId && changedId === selectedCommunityId) {
       // Route through refreshCommunityMembers so we get the same
       // try/catch + stale-response guard as the imperative caller.
-      // Don't await — onChange is fire-and-forget at the listener
-      // boundary; awaiting here would leak unhandled rejections.
+      // Don't await — onMembersChanged is fire-and-forget at the
+      // listener boundary; awaiting here would leak unhandled
+      // rejections.
       void refreshCommunityMembers(selectedCommunityId);
-      // Degraded events also fire onChange but don't change the
-      // member roster — re-read the flag so the UI updates even
-      // when listCommunityMembers returns the cached array.
-      isCurrentCommunityDegraded = communityService.isDegraded(selectedCommunityId);
+    }
+  };
+
+  communityService.onDegradedChanged = (changedId: string) => {
+    // Degraded transitions don't affect the member roster — only
+    // mirror the flag into local $state so the settings panel
+    // re-renders. Avoiding the roster fetch here was a deliberate
+    // split (cursor flagged the unnecessary reactive cascade).
+    if (selectedCommunityId && changedId === selectedCommunityId) {
+      isCurrentCommunityDegraded = communityService.isDegraded(changedId);
     }
   };
 
