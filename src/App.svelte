@@ -1420,6 +1420,19 @@
       createError = null;
       try {
         const id = await communityService.createCommunity(name, kind);
+        // Synthesize the NavNode locally — backend has no nav-updated
+        // emit yet (same gap as DM Fix B from PR #81), so without this
+        // the community would not appear in the nav tree and
+        // selectedCommunityNode (derived from navNodes) would stay
+        // null, sending the right pane to the TextFeed fallback.
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: id,
+          kind: 'community',
+          name,
+          members: [],
+          parentId: null,
+        });
         showCreateCommunity = false;
         changeSelectedCommunity(id);
         await refreshCommunityMembers(id);
@@ -1452,6 +1465,22 @@
       redeemUrl = url;
       try {
         const id = await communityService.redeemInvite(url);
+        // Synthesize the NavNode locally — same reason as create.
+        // The backend redeem_invite IPC currently returns only the
+        // community_id, not the name; rather than CBOR-decode the
+        // URL on the frontend (duplicating backend logic), use a
+        // placeholder name keyed off the id. A future backend
+        // change to return community metadata (or the eventual
+        // nav-updated emit) will replace this on next render.
+        const placeholderName = `Community ${id.slice(0, 8)}`;
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: id,
+          kind: 'community',
+          name: placeholderName,
+          members: [],
+          parentId: null,
+        });
         showRedeemInvite = false;
         redeemUrl = '';
         changeSelectedCommunity(id);

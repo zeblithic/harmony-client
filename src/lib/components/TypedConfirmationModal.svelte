@@ -18,7 +18,13 @@
   } = $props();
 
   let typed = $state('');
-  let matches = $derived(typed.trim() === requiredText);
+  // Spec (docs/specs/2026-05-08-zeb-263-community-frontend-design.md
+  // §"Tier 3"): "case-sensitive, trim-trailing-whitespace". Trailing
+  // whitespace is forgivable (autocomplete, keyboard quirks); leading
+  // whitespace is deliberate input that should fail the match. This
+  // is the highest-security confirmation tier, so we resist a more
+  // permissive trim() that an earlier review pass had suggested.
+  let matches = $derived(typed.trimEnd() === requiredText);
   const titleId = `typed-confirmation-title-${Math.random().toString(36).slice(2)}`;
 </script>
 
