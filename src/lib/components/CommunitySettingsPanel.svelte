@@ -78,7 +78,7 @@
       <div class="info-grid">
         <div class="key">Name</div><div>{communityName}</div>
         <div class="key">Type</div><div>{communityKind === 'invite-only' ? '🔒 Invite-only' : '🌐 Open'}</div>
-        <div class="key">Size</div><div>{joinedMembers.length} joined</div>
+        <div class="key">Members</div><div>{joinedMembers.length} joined</div>
         <div class="key">Your role</div>
         <div>
           <span class="role-badge" data-role={myRole}>{myRole.toUpperCase()}</span>
@@ -134,7 +134,7 @@
   <ConfirmationModal
     title={`Kick ${kickTarget.displayName ?? kickTarget.address.slice(0, 8)} from ${communityName}?`}
     description="They will be banned from rejoining. A future admin can re-invite them, but kick events can't be undone."
-    confirmLabel="Confirm kick"
+    confirmLabel={`Kick ${kickTarget.displayName ?? 'member'}`}
     danger={true}
     onConfirm={() => { onKick(kickTarget!.address); kickTarget = null; }}
     onCancel={() => (kickTarget = null)}

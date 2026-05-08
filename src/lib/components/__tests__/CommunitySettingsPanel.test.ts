@@ -26,7 +26,7 @@ describe('CommunitySettingsPanel', () => {
   it('renders Info / Members / Invites / Danger sections', () => {
     const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
     expect(getByText('Info')).toBeTruthy();
-    expect(getByText(/Members/)).toBeTruthy();
+    expect(getByText('Members (3)')).toBeTruthy();
     expect(getByText('Invites')).toBeTruthy();
     expect(getByText(/Danger/)).toBeTruthy();
   });
@@ -87,12 +87,14 @@ describe('CommunitySettingsPanel', () => {
   });
 
   it('Kick button opens tier-2 confirmation', async () => {
-    const { container, getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    const { container, getByRole } = render(CommunitySettingsPanel, { props: baseProps });
     const rows = container.querySelectorAll('.member-row');
     const bobRow = Array.from(rows).find((r) => r.textContent?.includes('Bob'))!;
     const kickBtn = bobRow.querySelector('button.kick') as HTMLButtonElement;
     await fireEvent.click(kickBtn);
-    expect(getByText(/Kick Bob/i)).toBeTruthy();
+    // Tighter query: get the destructive button by role + name (disambiguates
+    // from the title text which is in an <h3>, not a button).
+    expect(getByRole('button', { name: /Kick Bob/i })).toBeTruthy();
   });
 
   it('Leave with other admins opens tier-2 confirmation (not tier-3)', async () => {
