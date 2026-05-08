@@ -333,8 +333,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         is_invite_only: true,
         expires_at: None,
         invite_token: Some(invite_token),
-        admin_bootstrap: None,
-        admin_identity_pub: None,
+        admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
+        admin_identity_pub: Some(alice.identity.to_public_bytes()),
     })
     .expect("encode URL");
 

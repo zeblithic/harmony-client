@@ -6526,6 +6526,84 @@ where
             }
         };
 
+        // ZEB-260: verify admin's bootstrap from the invite payload AND
+        // insert it into the joiner's engine BEFORE sending the unicast.
+        // Closes the cold-cache gap: the joiner's empty CRDT cannot
+        // admit the admin's eventual publish-back unless admin is in
+        // the joiner's local prefix at the gate's `prior_state_at_hlc`
+        // evaluation. Order is critical — the publish-back is generated
+        // strictly later than the unicast arrives at admin, so the
+        // bootstrap insert here cannot be raced.
+        let (admin_bootstrap, admin_identity_pub) =
+            match crate::community_invite::verify_admin_bootstrap(&payload) {
+                Ok(pair) => pair,
+                Err(verify_err) => {
+                    // Engine + persistence dir were spawned at step 6;
+                    // tear down before returning so we don't leak.
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            reason_tag = verify_err.reason_tag(),
+                            "shutdown failed during redeem_invite admin-bootstrap-verify rollback"
+                        );
+                    }
+                    return Err(verify_err.to_string());
+                }
+            };
+        // Idempotent on retry: insert_local_event_with_pubs dedups on
+        // event-id. The clone is cheap (SignedMembershipEvent is a few
+        // hundred bytes) and required because the engine consumes by
+        // value.
+        let admin_bootstrap_owned = admin_bootstrap.clone();
+        let admin_identity_pub_owned = *admin_identity_pub;
+        let bootstrap_engine = match community_registry.engine_arc(&minted.community_id).await {
+            Some(e) => e,
+            None => {
+                // Engine vanished between spawn and lookup — registry
+                // race. Treated as a transient failure; tear down and
+                // surface a deterministic error.
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite engine-vanished rollback"
+                    );
+                }
+                return Err(
+                    "engine vanished immediately after spawn — registry race (invite-only branch)"
+                        .to_string(),
+                );
+            }
+        };
+        if let Err(insert_err) = bootstrap_engine
+            .insert_local_event_with_pubs(admin_bootstrap_owned, admin_identity_pub_owned, None)
+            .await
+        {
+            // Bootstrap insert failed — should be effectively unreachable
+            // given the verify chain just passed, but surface
+            // deterministically and tear down.
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
+                );
+            }
+            return Err(format!(
+                "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"
+            ));
+        }
+
         // 7a. Register oneshot keyed on bootstrap_join.id. Engine's
         //     insert hook (Task 7's notify_pending_redemption_in_map)
         //     fires it once the counter-signed Join lands.
