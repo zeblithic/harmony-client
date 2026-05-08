@@ -628,21 +628,30 @@ where
         }
     }
 
-    // 3. Expiry / clock-skew. Two arms:
+    // 3. Expiry / clock-skew. Three arms:
     //    (a) clock-skew: created_at can't be more than 60s in the
     //        receiver's future (defense against a malicious mint that
     //        backdates `now` to dodge expiry).
-    //    (b) expires_at (if the inviter set one): created_at must be
-    //        strictly before expires_at. The inviter's signature binds
-    //        `xa` via `canonical_invite_token_bytes`, so an attacker
-    //        cannot strip the field to extend the window — the
-    //        InviteToken sig check in step 6 would fail.
+    //    (b) expires_at vs created_at (if the inviter set one):
+    //        created_at must be strictly before expires_at. The
+    //        inviter's signature binds `xa` via
+    //        `canonical_invite_token_bytes`, so an attacker cannot
+    //        strip the field to extend the window — the InviteToken
+    //        sig check in step 6 would fail.
+    //    (c) expires_at vs now: a packet whose created_at predated
+    //        expires_at can still be replayed AFTER expires_at. Reject
+    //        when the receiver's wall clock is at-or-past the token's
+    //        expiry. (Greptile / CodeRabbit P1: replay window without
+    //        this check is unbounded.)
     let now = now_fn();
     if signed.created_at.wall_ms > now.saturating_add(60_000) {
         return Err(CommunityInviteVerifyError::Expired);
     }
     if let Some(exp) = signed.invite_token.expires_at {
         if signed.created_at.wall_ms >= exp {
+            return Err(CommunityInviteVerifyError::Expired);
+        }
+        if now >= exp {
             return Err(CommunityInviteVerifyError::Expired);
         }
     }

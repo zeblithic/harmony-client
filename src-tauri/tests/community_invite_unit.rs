@@ -743,4 +743,157 @@ mod verify_rejection_tests {
         .expect("must admit");
         assert_eq!(join_event.actor, OwnerAddr(joiner_id.identity.address_hash));
     }
+
+    /// Positive control for the `expires_at = Some(future)` admit path.
+    /// A regression that rejected EVERY token with `expires_at = Some(...)`
+    /// would still pass the rejection tests; this catches that.
+    #[test]
+    fn community_invite_valid_packet_with_future_expires_at_admits() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc5; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc6; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // expires_at = 1_000_000 (well after `now_ms` = 2000 and
+        // `created_at = 1100`). Both arms (created_at < expires_at and
+        // now < expires_at) admit.
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(1_000_000),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        let admitted = verify_packet_pure(&signed, self_owner, now_ms, &self_id)
+            .expect("future expires_at must admit");
+        assert_eq!(admitted.actor, joiner_owner);
+    }
+
+    /// Receive-time replay reject: a packet whose `created_at`
+    /// pre-dated `expires_at` (so it would have been valid at mint)
+    /// MUST be rejected if the receiver's wall clock is now at-or-past
+    /// `expires_at`. Without this arm, an attacker who captures a
+    /// freshly-minted invite-only packet can replay it indefinitely
+    /// after the inviter's intended expiry window closes.
+    #[test]
+    fn community_invite_replay_after_expires_at_rejected() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc7; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc8; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // expires_at = 1500. created_at = 1100 (< 1500, valid at mint).
+        // Receiver's now is supplied by a custom now_fn that returns
+        // 1500 — past expiry. Verify must reject.
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(1500),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100, // < 1500 — passes the created_at arm
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        // Bump now to 1500: now >= expires_at must reject.
+        fn now_after_expiry() -> u64 {
+            1500
+        }
+        let err = verify_packet_pure(&signed, self_owner, now_after_expiry, &self_id)
+            .expect_err("must reject — receive-time past expiry");
+        assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
 }

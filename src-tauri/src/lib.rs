@@ -5744,13 +5744,13 @@ pub async fn create_community_inner(
     snapshot_generation: u64,
     node_state: &std::sync::Mutex<NodeState>,
 ) -> Result<String, String> {
-    if is_invite_only {
-        return Err(
-            "Phase 3 supports OPEN communities only; invite-only create_community ships in \
-             Phase 4 (ZEB-262)"
-                .to_string(),
-        );
-    }
+    // Phase 4 unblocks invite-only minting. `is_invite_only` flows
+    // through `mint_community_creation` into the Space row + engine
+    // config; the verify chain enforces invite-only semantics on every
+    // Join from there. The receive-side counter-sign hop ships with
+    // this PR; share-side `generate_invite` for invite-only is still
+    // its own work item (the IPC handler still blocks it pending an
+    // InviteToken sign path).
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5847,10 +5847,28 @@ pub async fn create_community_inner(
         .engine_arc(&minted.community_id)
         .await
         .ok_or("engine vanished immediately after spawn — registry race")?;
-    let outcome = engine_arc
+    // CodeRabbit P0: a `?` early-return here would leave the spawned
+    // engine + persistence dir behind. Wrap the Result and tear down
+    // on Err before returning.
+    let outcome = match engine_arc
         .insert_local_event(minted.bootstrap_join.clone())
         .await
-        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during create_community_inner insert-err rollback"
+                );
+            }
+            return Err(format!("engine.insert_local_event: {e}"));
+        }
+    };
     if !matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
@@ -6428,10 +6446,28 @@ where
             .engine_arc(&minted.community_id)
             .await
             .ok_or("engine vanished immediately after spawn — registry race")?;
-        let outcome = engine_arc
+        // CodeRabbit P0: a `?` early-return here would leave the
+        // spawned engine + persistence dir behind. Wrap the Result and
+        // tear down on Err before returning.
+        let outcome = match engine_arc
             .insert_local_event(minted.bootstrap_join.clone())
             .await
-            .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite OPEN-branch insert-err rollback"
+                    );
+                }
+                return Err(format!("engine.insert_local_event: {e}"));
+            }
+        };
         if !matches!(
             outcome,
             crate::community_state_crdt::InsertOutcome::Inserted
@@ -6452,11 +6488,26 @@ where
         }
     } else {
         // INVITE-ONLY: 7a-d.
-        let invite_token = payload
-            .invite_token
-            .as_ref()
-            .ok_or("invite-only payload missing invite_token")?
-            .clone();
+        // The engine + persistence dir were spawned at step 6; a `?`
+        // early-return on a missing invite_token would leak both
+        // (Greptile P1: zombie engine on malformed URL). Tear down
+        // explicitly before returning.
+        let invite_token = match payload.invite_token.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite missing-invite-token rollback"
+                    );
+                }
+                return Err("invite-only payload missing invite_token".to_string());
+            }
+        };
 
         // 7a. Register oneshot keyed on bootstrap_join.id. Engine's
         //     insert hook (Task 7's notify_pending_redemption_in_map)
@@ -7285,7 +7336,12 @@ async fn kick_from_community(
         )?
     };
 
-    // Generation fence (mirrors leave_community).
+    // Generation + registry fence (mirrors leave_community + the
+    // create_community / redeem_invite shape). Plain generation check
+    // is insufficient: stop_node nullifies `community_registry` to
+    // None without bumping generation, so without the registry-presence
+    // check we'd happily insert into a detached engine that's about to
+    // be torn down.
     {
         let g = state_lock
             .lock()
@@ -7295,6 +7351,12 @@ async fn kick_from_community(
                 "node generation changed during kick_from_community (was {}, now {})",
                 snapshot_generation, g.generation
             ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during kick_from_community (node stopped?)"
+                    .to_string(),
+            );
         }
     }
 
@@ -7436,6 +7498,9 @@ async fn set_power_level(
         )?
     };
 
+    // Generation + registry fence (see kick_from_community for
+    // motivation; stop_node nullifies registry without bumping
+    // generation).
     {
         let g = state_lock
             .lock()
@@ -7445,6 +7510,11 @@ async fn set_power_level(
                 "node generation changed during set_power_level (was {}, now {})",
                 snapshot_generation, g.generation
             ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during set_power_level (node stopped?)".to_string(),
+            );
         }
     }
 

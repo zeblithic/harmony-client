@@ -387,22 +387,17 @@ pub struct DmOutbox {
     pub(crate) signing_key: Arc<ed25519_dalek::SigningKey>,
     /// Phase 4 (ZEB-262): full `PrivateIdentity` snapshot, parallel to
     /// `signing_key`. The receive-side counter-sign path
-    /// (`handle_invite` → `community_membership::attach_countersig_with_identity`)
-    /// requires a `&harmony_identity::PrivateIdentity`, not just an
+    /// (`community_invite::handle_unicast` →
+    /// `community_membership::attach_countersig_with_identity`) needs a
+    /// `&harmony_identity::PrivateIdentity`, not just an
     /// `Arc<SigningKey>`. Held alongside `signing_key` so the inbound
     /// CommunityInvite handler can grab a reference under the dm_outbox
-    /// lock without re-loading the on-disk identity. Both fields MUST be
-    /// derived from the same identity bytes — the new
+    /// lock without re-loading the on-disk identity. Both fields MUST
+    /// be derived from the same identity bytes — the
     /// `dm_outbox_holds_private_identity_for_countersign` test asserts
-    /// they produce identical signatures for the same message.
-    ///
-    /// `#[allow(dead_code)]`: only the new unit test reads this field in
-    /// this commit. The first production consumer is the receive-side
-    /// counter-sign handler (`handle_invite`) added in a subsequent
-    /// commit on this same `zeb-262-phase-4-invite-only-kick-set-power`
-    /// branch. Plumbing the field through now (own commit) keeps that
-    /// upcoming routing-logic diff focused.
-    #[allow(dead_code)]
+    /// they produce identical signatures for the same message, and
+    /// `redeem_invite_inner` snapshots both fields under the outbox
+    /// lock to feed `build_signed_invite_packet`.
     pub(crate) private_identity: Arc<harmony_identity::PrivateIdentity>,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
