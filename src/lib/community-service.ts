@@ -4,6 +4,25 @@ import type { CommunityMember } from './types';
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
 
+interface HlcDto { wallMs: number; logical: number; deviceId: string; }
+interface MemberInfoDto {
+  addr: string;
+  displayName?: string | null;
+  status: 'joined' | 'left' | 'invited' | 'banned';
+  power: number;
+  joinedAt: HlcDto;
+}
+
+function dtoToMember(d: MemberInfoDto): CommunityMember {
+  return {
+    address: d.addr,
+    displayName: d.displayName ?? undefined,
+    status: d.status,
+    power: d.power,
+    joinedAt: d.joinedAt?.wallMs,
+  };
+}
+
 export class CommunityService {
   /** Called whenever member rosters or degraded state changes.
    *  Receives the community whose data changed so callers can filter. */
@@ -40,7 +59,10 @@ export class CommunityService {
   }
 
   async createCommunity(name: string, kind: 'open' | 'invite-only'): Promise<string> {
-    return this.invoke<string>('create_community', { name, kind });
+    return this.invoke<string>('create_community', {
+      name,
+      isInviteOnly: kind === 'invite-only',
+    });
   }
 
   async redeemInvite(url: string): Promise<string> {
@@ -56,7 +78,8 @@ export class CommunityService {
   }
 
   async setPowerLevel(communityId: string, targetAddr: string, newPower: number): Promise<void> {
-    await this.invoke<void>('set_power_level', { communityId, targetAddr, newPower });
+    const level = Math.max(0, Math.min(255, Math.trunc(newPower)));
+    await this.invoke<void>('set_power_level', { communityId, targetAddr, level });
   }
 
   async generateInvite(communityId: string): Promise<string> {
@@ -70,7 +93,8 @@ export class CommunityService {
   async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
     const cached = this.memberCache.get(communityId);
     if (cached) return cached;
-    const fresh = await this.invoke<CommunityMember[]>('list_community_members', { communityId });
+    const dtos = await this.invoke<MemberInfoDto[]>('list_community_members', { communityId });
+    const fresh = dtos.map(dtoToMember);
     this.memberCache.set(communityId, fresh);
     return fresh;
   }

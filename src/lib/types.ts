@@ -299,7 +299,7 @@ export interface CommunityMember {
   address: string;
   displayName?: string;
   power: number;       // 0-100
-  status: 'joined' | 'invited' | 'banned';
+  status: 'joined' | 'left' | 'invited' | 'banned';
   joinedAt?: number;
 }
 

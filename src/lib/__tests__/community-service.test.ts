@@ -29,12 +29,48 @@ describe('CommunityService', () => {
     expect(adapter.listeners.has('community-state-sync-degraded')).toBe(true);
   });
 
-  it('createCommunity calls invoke with snake_case args', async () => {
+  it('createCommunity invokes the IPC with the boolean is_invite_only argument', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue('aabbccdd');
     const id = await service.createCommunity('Test', 'invite-only');
-    expect(adapter.invoke).toHaveBeenCalledWith('create_community', expect.objectContaining({ name: 'Test', kind: 'invite-only' }));
+    expect(adapter.invoke).toHaveBeenCalledWith('create_community', { name: 'Test', isInviteOnly: true });
     expect(id).toBe('aabbccdd');
+  });
+
+  it('createCommunity translates kind=open to isInviteOnly=false', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('aabbccdd');
+    await service.createCommunity('Open', 'open');
+    expect(adapter.invoke).toHaveBeenCalledWith('create_community', { name: 'Open', isInviteOnly: false });
+  });
+
+  it('setPowerLevel sends a clamped integer level (not newPower)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.setPowerLevel('aabb', 'cc11', 75);
+    expect(adapter.invoke).toHaveBeenCalledWith('set_power_level', {
+      communityId: 'aabb',
+      targetAddr: 'cc11',
+      level: 75,
+    });
+  });
+
+  it('listCommunityMembers maps backend MemberInfoDto.addr → CommunityMember.address', async () => {
+    await service.connectAdapter(adapter);
+    const dtoRoster = [
+      {
+        addr: 'a3f8c1d2',
+        displayName: 'Alice',
+        status: 'joined',
+        power: 100,
+        joinedAt: { wallMs: 1700000000, logical: 0, deviceId: 'dev1' },
+      },
+    ];
+    (adapter.invoke as any).mockResolvedValue(dtoRoster);
+    const r = await service.listCommunityMembers('aabbccdd');
+    expect(r).toEqual([
+      { address: 'a3f8c1d2', displayName: 'Alice', status: 'joined', power: 100, joinedAt: 1700000000 },
+    ]);
   });
 
   it('redeemInvite calls invoke with the URL string', async () => {
@@ -47,14 +83,22 @@ describe('CommunityService', () => {
 
   it('listCommunityMembers caches per-community result', async () => {
     await service.connectAdapter(adapter);
-    const fakeRoster = [{ address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' }];
-    (adapter.invoke as any).mockResolvedValue(fakeRoster);
+    const dtoRoster = [
+      {
+        addr: 'a3f8c1d2',
+        displayName: 'Alice',
+        status: 'joined',
+        power: 100,
+        joinedAt: { wallMs: 1700000000, logical: 0, deviceId: 'dev1' },
+      },
+    ];
+    (adapter.invoke as any).mockResolvedValue(dtoRoster);
 
     const r1 = await service.listCommunityMembers('aabbccdd');
     const r2 = await service.listCommunityMembers('aabbccdd');
 
-    expect(r1).toEqual(fakeRoster);
-    expect(r2).toEqual(fakeRoster);
+    expect(r1[0].address).toBe('a3f8c1d2');
+    expect(r2).toEqual(r1);
     // Cached: only one IPC call
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
   });
