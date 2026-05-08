@@ -5,8 +5,9 @@ interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
 
 export class CommunityService {
-  /** Called whenever member rosters or degraded state changes. */
-  onChange?: () => void;
+  /** Called whenever member rosters or degraded state changes.
+   *  Receives the community whose data changed so callers can filter. */
+  onChange?: (communityId?: string) => void;
 
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
@@ -22,7 +23,7 @@ export class CommunityService {
       (event) => {
         const p = event.payload as MembersChangedPayload;
         this.memberCache.delete(p.communityId);
-        this.onChange?.();
+        this.onChange?.(p.communityId);
       },
     );
     this.unlisteners.push(unlistenMembers);
@@ -32,7 +33,7 @@ export class CommunityService {
       (event) => {
         const p = event.payload as DegradedPayload;
         this.degraded.set(p.communityId, p.degraded);
-        this.onChange?.();
+        this.onChange?.(p.communityId);
       },
     );
     this.unlisteners.push(unlistenDegraded);

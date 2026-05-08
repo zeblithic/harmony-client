@@ -193,6 +193,8 @@
         type="button"
         class="fab-btn"
         aria-label="Create new"
+        aria-expanded={menuOpen}
+        aria-haspopup="menu"
         bind:this={menuButtonEl}
         onclick={() => (menuOpen ? closeMenu() : openMenu())}
       >+</button>

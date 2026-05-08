@@ -413,6 +413,18 @@
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
 
+  // ZEB-263: Wire communityService.onChange BEFORE the init IIFE so that
+  // the first roster-changed event (which may fire as soon as connectAdapter
+  // resolves) is never dropped silently. Svelte 5 $state reads inside the
+  // closure are always current at call time — no TDZ risk.
+  communityService.onChange = async (changedId?: string) => {
+    if (selectedCommunityId && (!changedId || changedId === selectedCommunityId)) {
+      communityMembers = await communityService.listCommunityMembers(selectedCommunityId);
+      const me = communityMembers.find((m) => m.address === myAddress);
+      myCommunityPower = me?.power ?? 0;
+    }
+  };
+
   // Keep the display name on both services in sync with profile edits.
   $effect(() => {
     const name = myProfile.displayName || 'You';
@@ -474,14 +486,6 @@
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
-      // ZEB-263: invalidate the cached member list when the backend
-      // reports a roster change — refetch only if the panel is currently
-      // pinned to that community so we don't burn IPC on background edits.
-      communityService.onChange = () => {
-        if (selectedCommunityId) {
-          void refreshCommunityMembers(selectedCommunityId);
-        }
-      };
       avatarResolver.connectAdapter(adapter);
       resolveVideoFn = async (cid: string) => {
         const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
@@ -1389,6 +1393,7 @@
     }}
     onCancel={() => {
       showCreateCommunity = false;
+      createPending = false;
       createError = null;
     }}
   />
