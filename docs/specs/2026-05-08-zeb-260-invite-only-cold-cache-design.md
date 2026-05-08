@@ -215,7 +215,7 @@ Steps 3+4 sit between `spawn_engine` and the unicast send. Reasons:
 - **AFTER `spawn_engine`:** the engine must exist to accept the event.
 - **BEFORE the unicast send:** the admin's publish-back is generated *strictly later* than the admin receives the unicast (admin counter-signs, inserts, then publishes). Therefore the publish-back cannot arrive at Bob before Bob has the bootstrap. **No race window.**
 
-If steps 3 or 4 fail, Bob aborts redemption and tears down the engine via `shutdown_engine_and_cleanup_persistence` — same rollback path as the existing partial-unicast-send / pending-redemption-timeout cases in ZEB-262.
+If steps 3 or 4 fail, Bob aborts redemption and tears down the engine via `shutdown_engine_and_cleanup_persistence` — same rollback path as the existing partial-unicast-send / pending-redemption-timeout cases in ZEB-262. **Re-redemption guard:** the teardown only runs when the engine was freshly spawned by *this* redemption (`engine_already_existed=false`). On a re-redeem retry where the engine was already running from a prior successful path, the rollback skips the teardown so the prior state survives. This mirrors how `spawn_engine` itself is idempotent on re-redemption: the freshly-built channels are dropped and the existing adapter pair stays live. The same guard is applied to every rollback site in `redeem_invite_inner`'s invite-only branch (verify-failure, engine-vanish, insert-failure, missing-invite-token, build-packet, encode-packet, no-destinations, all-sends-failed, oneshot-recv-err, timeout, fence-check, apply-rejected) and the OPEN-branch insert paths.
 
 ## Error taxonomy
 

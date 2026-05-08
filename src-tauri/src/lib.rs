@@ -6472,15 +6472,17 @@ where
         {
             Ok(o) => o,
             Err(e) => {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite OPEN-branch insert-err rollback"
-                    );
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite OPEN-branch insert-err rollback"
+                        );
+                    }
                 }
                 return Err(format!("engine.insert_local_event: {e}"));
             }
@@ -6491,15 +6493,17 @@ where
         ) {
             // Bootstrap Join didn't insert — tear down so we don't
             // leak a zombie engine.
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite OPEN-branch insert-rejected rollback"
-                );
+            if !engine_already_existed {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite OPEN-branch insert-rejected rollback"
+                    );
+                }
             }
             return Err(format!("self Join not inserted (got {outcome:?})"));
         }
@@ -6512,15 +6516,17 @@ where
         let invite_token = match payload.invite_token.as_ref() {
             Some(t) => t.clone(),
             None => {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite missing-invite-token rollback"
-                    );
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite missing-invite-token rollback"
+                        );
+                    }
                 }
                 return Err("invite-only payload missing invite_token".to_string());
             }
@@ -6668,15 +6674,17 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite build-packet rollback"
-                    );
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite build-packet rollback"
+                        );
+                    }
                 }
                 return Err(format!("build_signed_invite_packet: {e}"));
             }
@@ -6687,15 +6695,17 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite encode-packet rollback"
-                    );
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite encode-packet rollback"
+                        );
+                    }
                 }
                 return Err(format!("encode_packet: {e}"));
             }
@@ -6709,15 +6719,17 @@ where
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite inviter-unknown rollback"
-                );
+            if !engine_already_existed {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite inviter-unknown rollback"
+                    );
+                }
             }
             return Err(format!(
                 "no known device for inviter {} — invite cannot route",
@@ -6757,15 +6769,17 @@ where
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite unicast-send rollback"
-                );
+            if !engine_already_existed {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite unicast-send rollback"
+                    );
+                }
             }
             return Err(format!(
                 "unicast_send_tx try_send failed for all {} destination(s){}",
@@ -6791,15 +6805,17 @@ where
                 // Sender dropped without sending — should be
                 // unreachable with the current pending_redemptions
                 // shape, but treat defensively as a failure.
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite oneshot-recv-err rollback"
-                    );
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite oneshot-recv-err rollback"
+                        );
+                    }
                 }
                 return Err("invite-only redemption oneshot closed unexpectedly".into());
             }
@@ -6838,15 +6854,17 @@ where
                     .await
                 {
                     Some(_tx) => {
-                        if let Err(stop_err) = community_registry
-                            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %stop_err,
-                                community_id = %hex::encode(minted.community_id.0),
-                                "shutdown failed during redeem_invite timeout rollback"
-                            );
+                        if !engine_already_existed {
+                            if let Err(stop_err) = community_registry
+                                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %stop_err,
+                                    community_id = %hex::encode(minted.community_id.0),
+                                    "shutdown failed during redeem_invite timeout rollback"
+                                );
+                            }
                         }
                         return Err(format!(
                             "invite-only redemption timed out after {timeout_ms}ms"
@@ -6874,15 +6892,17 @@ where
     //    raced our await chain), this returns Err with crdt_state
     //    still untouched.
     if let Err(fence_err) = fence_check() {
-        if let Err(stop_err) = community_registry
-            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-            .await
-        {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "shutdown failed during redeem_invite fence-check rollback"
-            );
+        if !engine_already_existed {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown failed during redeem_invite fence-check rollback"
+                );
+            }
         }
         return Err(fence_err);
     }
@@ -6901,15 +6921,17 @@ where
             // Drop the state_g guard FIRST so the registry call's
             // .await isn't holding any state lock.
             drop(state_g);
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite apply-rejected rollback"
-                );
+            if !engine_already_existed {
+                if let Err(stop_err) = community_registry
+                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        community_id = %hex::encode(minted.community_id.0),
+                        "shutdown failed during redeem_invite apply-rejected rollback"
+                    );
+                }
             }
             return Err(format!(
                 "apply_space rejected redemption Space: {outcome:?}"

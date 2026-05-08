@@ -190,6 +190,62 @@ fn decode_trims_whitespace() {
 }
 
 #[test]
+fn encode_rejects_invite_only_without_admin_bootstrap() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteToken, InviteUrlError,
+    };
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(InviteToken {
+            inviter: OwnerAddr([0xcd; 16]),
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            expires_at: None,
+            sig: [0xDD; 64],
+        }),
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_open_community_with_admin_bootstrap_fields() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+    };
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: Some([0xAB; 64]),
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::OpenCommunityHasBootstrap
+    ));
+}
+
+#[test]
 fn community_invite_packet_roundtrip() {
     use harmony_app::community_invite::{
         build_signed_invite_packet, decode_packet, device_hash_from_identity_pub, encode_packet,

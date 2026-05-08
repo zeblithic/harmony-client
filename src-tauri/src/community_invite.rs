@@ -375,6 +375,12 @@ pub enum InviteUrlError {
     /// shipping un-redeemable URLs. ZEB-260.
     #[error("invite-only payload missing admin_bootstrap or admin_identity_pub")]
     InviteOnlyMissingBootstrap,
+    /// Caller populated `admin_bootstrap` or `admin_identity_pub` on an
+    /// open-community payload. These fields are scoped to invite-only
+    /// flows; encoding them on an open-community URL would leak admin's
+    /// signed bootstrap event over a URL that doesn't need it. ZEB-260.
+    #[error("open-community payload must not carry admin_bootstrap / admin_identity_pub")]
+    OpenCommunityHasBootstrap,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -393,6 +399,11 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
         && (payload.admin_bootstrap.is_none() || payload.admin_identity_pub.is_none())
     {
         return Err(InviteUrlError::InviteOnlyMissingBootstrap);
+    }
+    if !payload.is_invite_only
+        && (payload.admin_bootstrap.is_some() || payload.admin_identity_pub.is_some())
+    {
+        return Err(InviteUrlError::OpenCommunityHasBootstrap);
     }
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
