@@ -223,7 +223,7 @@ fn encode_rejects_invite_only_without_admin_bootstrap() {
 }
 
 #[test]
-fn encode_rejects_open_community_with_admin_bootstrap_fields() {
+fn encode_rejects_open_community_with_admin_identity_pub_set() {
     use harmony_app::community_invite::{
         encode_invite_url, CommunityInvitePayload, InviteUrlError,
     };
@@ -242,6 +242,74 @@ fn encode_rejects_open_community_with_admin_bootstrap_fields() {
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
         InviteUrlError::OpenCommunityHasBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_open_community_with_admin_bootstrap_set() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    // Synthesize a signed admin self-Join just so admin_bootstrap is
+    // structurally well-formed; the writer check fires before any
+    // signature inspection.
+    let admin_addr = OwnerAddr([0xcd; 16]);
+    let community_id = SpaceId([0xab; 16]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+    let bs = sign_event(
+        &EventPayload {
+            id: [0xCC; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        },
+        &signing_key,
+    )
+    .expect("sign");
+    let payload = CommunityInvitePayload {
+        community_id,
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr,
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: Some(bs),
+        admin_identity_pub: None,
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::OpenCommunityHasBootstrap
+    ));
+}
+
+#[test]
+fn encode_rejects_invite_only_without_invite_token() {
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+    };
+    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xab; 16]),
+        membership_key: MembershipKey::new([0x42; 32]),
+        admin_addr: OwnerAddr([0xcd; 16]),
+        community_name: "WriterCheck".to_string(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+    };
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingToken
     ));
 }
 

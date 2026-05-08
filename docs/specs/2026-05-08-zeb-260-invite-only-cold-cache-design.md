@@ -92,7 +92,7 @@ The fix adds **two side-channel fields**: the invite URL carries Alice's signed 
 
 ### `CommunityInvitePayload` extension
 
-Two new fields, both REQUIRED for invite-only payloads, IGNORED for open-community payloads:
+Two new fields, both REQUIRED for invite-only payloads, REJECTED on open-community payloads (`encode_invite_url` returns `OpenCommunityHasBootstrap` rather than allowing admin bootstrap material to leak over a URL that doesn't need it):
 
 ```rust
 pub struct CommunityInvitePayload {
@@ -266,7 +266,7 @@ PR #89 ships invite-only with no `admin_bootstrap` / `admin_identity_pub` fields
 
 **Reject old invite-only URLs as `BootstrapMissing`.** Phase 4 invite-only has never been used in production; there are no real users to break. Re-issued invite URLs from updated builds carry the new fields and work end-to-end.
 
-Open-community URLs (`is_invite_only == false`) are unchanged. The new fields are ignored. CBOR encoding stays byte-identical for open-community payloads thanks to `skip_serializing_if = "Option::is_none"`.
+Open-community URLs (`is_invite_only == false`) are unchanged. `encode_invite_url` rejects open-community payloads that populate either bootstrap field (`OpenCommunityHasBootstrap`); when both are `None`, CBOR encoding stays byte-identical for open-community payloads thanks to `skip_serializing_if = "Option::is_none"`.
 
 The existing `wire_format_community_fixtures.rs` open-community fixtures stay unchanged. Invite-only fixtures are updated to include the new fields.
 
@@ -296,7 +296,7 @@ These tests do not spawn an engine; they exercise the verification chain in isol
 
 ### New integration test
 
-`community_invite_only_tampered_admin_bootstrap_rejects` — verifies a forged invite URL fails at the chain check, not at the publish-back gate. Asserts the tampering is caught synchronously inside `redeem_invite_inner` (before `spawn_engine` cleanup), and that the resulting error variant is the expected `Bootstrap*` variant for each tampering target.
+`community_invite_only_tampered_admin_bootstrap_rejects` — exercises `verify_admin_bootstrap` directly on a decoded URL whose `admin_bootstrap.sig` has been bit-flipped. Asserts the rejection surfaces as `RedeemBootstrapVerifyError::BootstrapSignatureInvalid` with telemetry tag `bootstrap_signature_invalid` — the chain-step → variant mapping is part of the security contract; frontend metrics dashboards key off these tags. Other tampering targets (actor, community_id, etc.) are pinned by the unit-test suite in `community_invite_unit.rs::verify_admin_bootstrap_tests`.
 
 ### Wire-format fixtures (`wire_format_community_fixtures.rs`)
 

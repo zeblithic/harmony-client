@@ -381,6 +381,13 @@ pub enum InviteUrlError {
     /// signed bootstrap event over a URL that doesn't need it. ZEB-260.
     #[error("open-community payload must not carry admin_bootstrap / admin_identity_pub")]
     OpenCommunityHasBootstrap,
+    /// Caller passed an invite-only payload missing `invite_token`. The
+    /// reader-side `redeem_invite_inner` would tear down the spawned
+    /// engine and return `"invite-only payload missing invite_token"`;
+    /// catching this at the writer prevents the un-redeemable URL from
+    /// leaving the mint site. ZEB-260 PR #90 round-3 (CodeRabbit).
+    #[error("invite-only payload missing invite_token")]
+    InviteOnlyMissingToken,
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
@@ -395,6 +402,9 @@ const MAX_INVITE_BODY_B64_CHARS: usize = 4096;
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
 /// chat / email / messaging clients that munge `+`, `/`, or `=`.
 pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, InviteUrlError> {
+    if payload.is_invite_only && payload.invite_token.is_none() {
+        return Err(InviteUrlError::InviteOnlyMissingToken);
+    }
     if payload.is_invite_only
         && (payload.admin_bootstrap.is_none() || payload.admin_identity_pub.is_none())
     {

@@ -6598,31 +6598,60 @@ where
                 );
             }
         };
-        if let Err(insert_err) = bootstrap_engine
+        // ZEB-260 PR #90 round-3 (CodeRabbit): explicitly match on the
+        // InsertOutcome variant. Treating Ok(_) as success would silently
+        // proceed past Ok(InsertOutcome::Rejected(verify_err)), which
+        // means a bootstrap that failed the engine's own verify_event
+        // (e.g., signature mismatch — should be unreachable given our
+        // own verify_admin_bootstrap chain just passed, but the engine
+        // re-runs verify under its VerifyContext) would land us in the
+        // unicast-send-and-wait path with no admin-state in the engine,
+        // causing a publish-back rejection downstream. Surface
+        // explicitly and tear down on Rejected just like on Err.
+        match bootstrap_engine
             .insert_local_event_with_pubs(admin_bootstrap_owned, admin_identity_pub_owned, None)
             .await
         {
-            // Bootstrap insert failed — should be effectively unreachable
-            // given the verify chain just passed, but surface
-            // deterministically and tear down.
-            // Guard: if the engine pre-existed (re-redemption retry),
-            // tearing it down would destroy state from the prior
-            // successful path. ZEB-260 PR #90.
-            if !engine_already_existed {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
-                    );
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+            | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite admin-bootstrap-insert-rejected rollback"
+                        );
+                    }
                 }
+                return Err(format!("engine rejected admin bootstrap: {verify_err}"));
             }
-            return Err(format!(
-                "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"
-            ));
+            Err(insert_err) => {
+                // Bootstrap insert errored — should be effectively
+                // unreachable given the verify chain just passed, but
+                // surface deterministically and tear down.
+                // Guard: if the engine pre-existed (re-redemption retry),
+                // tearing it down would destroy state from the prior
+                // successful path. ZEB-260 PR #90.
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
+                        );
+                    }
+                }
+                return Err(format!(
+                    "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"
+                ));
+            }
         }
 
         // 7a. Register oneshot keyed on bootstrap_join.id. Engine's
