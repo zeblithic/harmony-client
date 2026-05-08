@@ -292,9 +292,10 @@ describe('NavPanel', () => {
       },
     ];
 
-    it('renders a community-kind node with its name', () => {
-      render(NavPanel, { props: { nodes: communityNodes, collapsed: false } });
+    it('renders a community-kind node with its name and 🏛️ icon', () => {
+      const { container } = render(NavPanel, { props: { nodes: communityNodes, collapsed: false } });
       expect(screen.getByText('IPFS Crew')).toBeTruthy();
+      expect(container.textContent).toContain('🏛️');
     });
 
     it('clicking a community node fires onNodeClick with the node id', async () => {

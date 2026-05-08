@@ -57,6 +57,7 @@
     if (n.type === 'channel') return '#';
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
+    if (n.type === 'community') return '🏛️';
     return '';
   }
 
