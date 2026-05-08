@@ -79,7 +79,10 @@
     search.trim() === ''
       ? joinedMembers
       : (() => {
-          const q = search.toLowerCase();
+          // Trim before lowercasing so a leading space doesn't bypass
+          // both the empty-check (which trims) AND the substring match
+          // (which would compare against the raw string with spaces).
+          const q = search.trim().toLowerCase();
           return joinedMembers.filter(
             (m) =>
               (m.displayName?.toLowerCase().includes(q) ?? false) ||

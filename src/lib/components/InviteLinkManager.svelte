@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
+
   let {
     kind,
     onGenerate,
@@ -12,6 +14,16 @@
   let copied = $state(false);
   let error = $state<string | null>(null);
   let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Clear any pending copy-feedback timer on unmount. Without this,
+  // the setTimeout callback can fire on a destroyed component and
+  // write to copied/$state, which Svelte 5 warns about.
+  onDestroy(() => {
+    if (copyResetTimer) {
+      clearTimeout(copyResetTimer);
+      copyResetTimer = null;
+    }
+  });
 
   async function handleGenerate() {
     pending = true;
