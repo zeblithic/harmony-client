@@ -556,6 +556,183 @@ impl CommunityInviteVerifyError {
     }
 }
 
+/// Errors from `verify_admin_bootstrap` — the six-step binding chain
+/// the joiner runs against the invite payload's `admin_bootstrap` +
+/// `admin_identity_pub` fields before inserting the bootstrap into the
+/// engine. ZEB-260: closing the cold-cache gap that prevents the new
+/// joiner's empty CRDT from admitting the admin's first publish-back.
+///
+/// Each variant maps to a stable IPC error string via Display (NOT
+/// Debug), matching the pattern established in PR #89 for IPC error
+/// surface stability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemBootstrapVerifyError {
+    /// Invite-only payload missing `admin_bootstrap` and/or
+    /// `admin_identity_pub`. Fires for old PR #89 invite URLs (which
+    /// never carried these fields). Stable IPC string:
+    /// "redeem_invite: invite-only payload missing admin bootstrap".
+    BootstrapMissing,
+
+    /// `admin_identity_pub` bytes are not a valid Ed25519 + X25519 pair
+    /// (rejected by `harmony_identity::Identity::from_public_bytes`).
+    BootstrapInvalidPubkey,
+
+    /// `Identity::from_public_bytes(admin_identity_pub).address_hash`
+    /// does not equal `payload.admin_addr.0`.
+    BootstrapAddressMismatch,
+
+    /// `admin_bootstrap.actor` does not equal `payload.admin_addr`.
+    BootstrapActorMismatch,
+
+    /// `admin_bootstrap.community_id` does not equal
+    /// `payload.community_id`.
+    BootstrapCommunityMismatch,
+
+    /// Ed25519 signature verification of `admin_bootstrap` failed under
+    /// `admin_identity_pub`.
+    BootstrapSignatureInvalid,
+
+    /// `admin_bootstrap.kind` is not `Join`, or `countersig` is `Some`.
+    /// Admin's bootstrap is always a self-Join with no countersig.
+    BootstrapKindInvalid,
+}
+
+impl std::fmt::Display for RedeemBootstrapVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BootstrapMissing => write!(
+                f,
+                "redeem_invite: invite-only payload missing admin bootstrap"
+            ),
+            Self::BootstrapInvalidPubkey => write!(
+                f,
+                "redeem_invite: admin_identity_pub is not a valid identity"
+            ),
+            Self::BootstrapAddressMismatch => write!(
+                f,
+                "redeem_invite: admin_identity_pub.address_hash != admin_addr"
+            ),
+            Self::BootstrapActorMismatch => write!(
+                f,
+                "redeem_invite: admin_bootstrap.actor != admin_addr"
+            ),
+            Self::BootstrapCommunityMismatch => write!(
+                f,
+                "redeem_invite: admin_bootstrap.community_id != payload.community_id"
+            ),
+            Self::BootstrapSignatureInvalid => write!(
+                f,
+                "redeem_invite: admin_bootstrap signature verify failed"
+            ),
+            Self::BootstrapKindInvalid => write!(
+                f,
+                "redeem_invite: admin_bootstrap is not a self-Join (countersig present or wrong kind)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RedeemBootstrapVerifyError {}
+
+impl RedeemBootstrapVerifyError {
+    /// Short telemetry tag for the existing `record_redeem_outcome`-
+    /// style logging path. Kept stable across builds — frontend-side
+    /// metrics dashboards key off these strings. Mirrors the
+    /// `CommunityInviteVerifyError::reason_tag` shape.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            Self::BootstrapMissing => "bootstrap_missing",
+            Self::BootstrapInvalidPubkey => "bootstrap_invalid_pubkey",
+            Self::BootstrapAddressMismatch => "bootstrap_address_mismatch",
+            Self::BootstrapActorMismatch => "bootstrap_actor_mismatch",
+            Self::BootstrapCommunityMismatch => "bootstrap_community_mismatch",
+            Self::BootstrapSignatureInvalid => "bootstrap_signature_invalid",
+            Self::BootstrapKindInvalid => "bootstrap_kind_invalid",
+        }
+    }
+}
+
+/// Run the six-step binding chain that admits the admin's signed
+/// bootstrap event into the joiner's engine (ZEB-260). Pure / sync.
+///
+/// Returns `Ok((&admin_bootstrap, &admin_identity_pub))` on success so
+/// the caller can pass them to `engine.insert_local_event_with_pubs`.
+/// Returns `Err(variant)` on the first failure.
+///
+/// The chain (each step's failure → distinct error variant):
+///   1. Required fields present (`admin_bootstrap` + `admin_identity_pub`
+///      both `Some`). [BootstrapMissing]
+///   2. `Identity::from_public_bytes(admin_identity_pub).address_hash ==
+///      payload.admin_addr.0`. [BootstrapInvalidPubkey or
+///      BootstrapAddressMismatch]
+///   3. `admin_bootstrap.actor == payload.admin_addr`.
+///      [BootstrapActorMismatch]
+///   4. `admin_bootstrap.community_id == payload.community_id`.
+///      [BootstrapCommunityMismatch]
+///   5. Ed25519 signature verify of `admin_bootstrap` under
+///      `admin_identity_pub` (delegates to
+///      `community_membership::verify_signature`). [BootstrapSignatureInvalid]
+///   6. Sanity: `admin_bootstrap.kind == Join` and `countersig is None`.
+///      [BootstrapKindInvalid]
+///
+/// Caller (`redeem_invite_inner` invite-only branch, Task 4) calls this
+/// AFTER `spawn_engine` and BEFORE the unicast send. On `Ok`, the caller
+/// proceeds to `engine.insert_local_event_with_pubs(admin_bootstrap,
+/// admin_identity_pub, None)`. On `Err`, the caller tears down the
+/// engine via `shutdown_engine_and_cleanup_persistence` and surfaces
+/// the error string.
+pub fn verify_admin_bootstrap(
+    payload: &CommunityInvitePayload,
+) -> Result<
+    (
+        &crate::community_membership::SignedMembershipEvent,
+        &[u8; 64],
+    ),
+    RedeemBootstrapVerifyError,
+> {
+    // 1. Required fields.
+    let admin_bootstrap = payload
+        .admin_bootstrap
+        .as_ref()
+        .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
+    let admin_identity_pub = payload
+        .admin_identity_pub
+        .as_ref()
+        .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
+
+    // 2. identity_pub ↔ admin_addr binding.
+    let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapInvalidPubkey)?;
+    if admin_identity.address_hash != payload.admin_addr.0 {
+        return Err(RedeemBootstrapVerifyError::BootstrapAddressMismatch);
+    }
+
+    // 3. bootstrap.actor ↔ admin_addr binding.
+    if admin_bootstrap.actor != payload.admin_addr {
+        return Err(RedeemBootstrapVerifyError::BootstrapActorMismatch);
+    }
+
+    // 4. bootstrap.community_id ↔ payload.community_id binding.
+    if admin_bootstrap.community_id != payload.community_id {
+        return Err(RedeemBootstrapVerifyError::BootstrapCommunityMismatch);
+    }
+
+    // 5. Ed25519 signature verify.
+    crate::community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
+
+    // 6. Sanity: self-Join with no countersig.
+    if !matches!(
+        admin_bootstrap.kind,
+        crate::community_membership::MembershipEventKind::Join
+    ) || admin_bootstrap.countersig.is_some()
+    {
+        return Err(RedeemBootstrapVerifyError::BootstrapKindInvalid);
+    }
+
+    Ok((admin_bootstrap, admin_identity_pub))
+}
+
 /// Encode a [`CommunityInvitePacket`] to wire bytes.
 ///
 /// **Mutation guard.** Re-encodes `signed` and asserts byte-equality
