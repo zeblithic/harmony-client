@@ -247,8 +247,8 @@ describe('CommunityService', () => {
     const fakeRoster = [{ address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' }];
     (adapter.invoke as any).mockResolvedValue(fakeRoster);
 
-    const r1 = await service.listMembers('aabbccdd');
-    const r2 = await service.listMembers('aabbccdd');
+    const r1 = await service.listCommunityMembers('aabbccdd');
+    const r2 = await service.listCommunityMembers('aabbccdd');
 
     expect(r1).toEqual(fakeRoster);
     expect(r2).toEqual(fakeRoster);
@@ -259,14 +259,14 @@ describe('CommunityService', () => {
   it('community-members-changed for a community invalidates its cache', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue([]);
-    await service.listMembers('aabbccdd');
+    await service.listCommunityMembers('aabbccdd');
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
 
     // Simulate event
     const handler = adapter.listeners.get('community-members-changed')!;
     handler({ payload: { communityId: 'aabbccdd' } });
 
-    await service.listMembers('aabbccdd');
+    await service.listCommunityMembers('aabbccdd');
     // Re-fetched after event
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
@@ -363,7 +363,7 @@ export class CommunityService {
     });
   }
 
-  async listMembers(communityId: string): Promise<CommunityMember[]> {
+  async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
     const cached = this.memberCache.get(communityId);
     if (cached) return cached;
     const fresh = await this.invoke<CommunityMember[]>('list_community_members', { communityId });
@@ -2475,7 +2475,7 @@ let communityMembers = $state<CommunityMember[]>([]);
 await communityService.connectAdapter(adapter);
 communityService.onChange = async () => {
   if (selectedCommunityId) {
-    communityMembers = await communityService.listMembers(selectedCommunityId);
+    communityMembers = await communityService.listCommunityMembers(selectedCommunityId);
   }
 };
 ```
@@ -2505,7 +2505,7 @@ communityService.onChange = async () => {
         const id = await communityService.createCommunity(name, kind);
         showCreateCommunity = false;
         selectedCommunityId = id;
-        communityMembers = await communityService.listMembers(id);
+        communityMembers = await communityService.listCommunityMembers(id);
       } catch (e) {
         createError = e instanceof Error ? e.message : String(e);
       } finally { createPending = false; }
@@ -2526,7 +2526,7 @@ communityService.onChange = async () => {
         showRedeemInvite = false;
         redeemUrl = '';
         selectedCommunityId = id;
-        communityMembers = await communityService.listMembers(id);
+        communityMembers = await communityService.listCommunityMembers(id);
       } catch (e) {
         redeemError = e instanceof Error ? e.message : String(e);
       } finally { redeemPending = false; }

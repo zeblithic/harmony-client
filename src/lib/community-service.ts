@@ -66,7 +66,7 @@ export class CommunityService {
     });
   }
 
-  async listMembers(communityId: string): Promise<CommunityMember[]> {
+  async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
     const cached = this.memberCache.get(communityId);
     if (cached) return cached;
     const fresh = await this.invoke<CommunityMember[]>('list_community_members', { communityId });

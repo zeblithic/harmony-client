@@ -33,7 +33,7 @@ describe('CommunityService', () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue('aabbccdd');
     const id = await service.createCommunity('Test', 'invite-only');
-    expect(adapter.invoke).toHaveBeenCalledWith('create_community', expect.objectContaining({ name: 'Test' }));
+    expect(adapter.invoke).toHaveBeenCalledWith('create_community', expect.objectContaining({ name: 'Test', kind: 'invite-only' }));
     expect(id).toBe('aabbccdd');
   });
 
@@ -50,8 +50,8 @@ describe('CommunityService', () => {
     const fakeRoster = [{ address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' }];
     (adapter.invoke as any).mockResolvedValue(fakeRoster);
 
-    const r1 = await service.listMembers('aabbccdd');
-    const r2 = await service.listMembers('aabbccdd');
+    const r1 = await service.listCommunityMembers('aabbccdd');
+    const r2 = await service.listCommunityMembers('aabbccdd');
 
     expect(r1).toEqual(fakeRoster);
     expect(r2).toEqual(fakeRoster);
@@ -62,14 +62,14 @@ describe('CommunityService', () => {
   it('community-members-changed for a community invalidates its cache', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue([]);
-    await service.listMembers('aabbccdd');
+    await service.listCommunityMembers('aabbccdd');
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
 
     // Simulate event
     const handler = adapter.listeners.get('community-members-changed')!;
     handler({ payload: { communityId: 'aabbccdd' } });
 
-    await service.listMembers('aabbccdd');
+    await service.listCommunityMembers('aabbccdd');
     // Re-fetched after event
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
