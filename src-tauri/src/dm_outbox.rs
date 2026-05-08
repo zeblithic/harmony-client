@@ -1677,7 +1677,15 @@ mod tests {
         seed.copy_from_slice(&priv_bytes[32..64]);
         let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed));
         let self_owner = OwnerAddr(identity.identity.address_hash);
-        let device_hash = DeviceIdentityHash([0xab; 16]);
+        // Derive the DeviceIdentityHash from the SAME identity that
+        // `signing_key` and `private_identity` came from, then assert
+        // it matches what the outbox surfaces. This pins the full
+        // 3-way invariant — without binding the device hash to the
+        // identity, a misplumbed call site could pair a mismatched
+        // hash with a correct sig pair and the receive-side
+        // signing_device_hash check would fail at decode time on
+        // production packets.
+        let device_hash = DeviceIdentityHash(identity.identity.address_hash);
 
         let outbox = DmOutbox::new(
             "dev".into(),
@@ -1693,6 +1701,11 @@ mod tests {
         assert_eq!(
             sig_via_outbox_signing_key, sig_via_private_identity,
             "DmOutbox.signing_key and DmOutbox.private_identity must produce identical signatures"
+        );
+        assert_eq!(
+            outbox.our_signing_device_hash.0, outbox.private_identity.identity.address_hash,
+            "DmOutbox.our_signing_device_hash must match private_identity.identity.address_hash \
+             (3-way invariant: signing_key, private_identity, device_hash all from one identity)"
         );
     }
 

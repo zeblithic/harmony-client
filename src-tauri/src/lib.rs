@@ -5963,17 +5963,23 @@ pub async fn create_community_inner(
         }
     }
 
-    // ZEB-258: COMMIT owner-state Space FIRST, then advance the HLC
-    // tracker. Both are persisted via `persist_both`
-    // (owner_state_crdt.cbor + state_root_replay.cbor); advancing the
-    // tracker before the Space commit means a subsequent debounce
-    // could persist the tracker advance with NO matching Space row
-    // (a "phantom" tracker entry on rollback). Inverting the order
-    // keeps rollback byte-identical to pre-call across both files.
+    // ZEB-258: COMMIT owner-state Space + advance HLC tracker as a
+    // single atomic critical section. Both are persisted via
+    // `persist_both` (owner_state_crdt.cbor + state_root_replay.cbor)
+    // which acquires `state` then `tracker` in that order; holding
+    // BOTH guards across the apply+insert pair prevents any
+    // concurrent task — including a `stop_node`-triggered final
+    // persist — from snapshotting state with the new Space but the
+    // old tracker (which would leave a Space row on disk with no
+    // matching tracker entry after restart).
     //
-    // The two locks (`crdt_state` and `hlc_tracker`) are independent
-    // tokio Mutexes; we drop the `state_g` guard before acquiring
-    // `tracker_g` so they're never held simultaneously.
+    // Lock order is `dm_outbox → crdt_state → hlc_tracker` per the
+    // documented invariant; we acquire `state_g` first, then
+    // `tracker_g` while still holding it. Tokio Mutex guards are
+    // safe to hold across `.await` (only `std::sync::Mutex` guards
+    // must not be); the Rejected branch drops `state_g` before
+    // awaiting the registry tear-down to keep the rollback path
+    // .await-clean.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -5981,10 +5987,10 @@ pub async fn create_community_inner(
             // Owner-state rejected the Space (CRDT invariant). The
             // engine is up and the bootstrap-Join is in its log, but
             // owner-state has no Space row — tear the engine down so
-            // we don't leak a zombie. Drop the state_g guard FIRST so
-            // we don't hold a `tokio::sync::Mutex` guard across the
-            // `.await` of the registry call. ZEB-262 Task 7: cleanup
-            // also removes the per-community persist dir.
+            // we don't leak a zombie. Drop the state_g guard FIRST
+            // so the registry call's .await isn't holding any state
+            // lock. ZEB-262 Task 7: cleanup also removes the
+            // per-community persist dir.
             drop(state_g);
             if let Err(stop_err) = community_registry
                 .shutdown_engine_and_cleanup_persistence(&minted.community_id)
@@ -5999,15 +6005,16 @@ pub async fn create_community_inner(
             }
             return Err(format!("apply_space rejected new community: {outcome:?}"));
         }
-    }
-
-    // Space commit succeeded — advance the tracker. Bootstrap
-    // creation: prev_hlc was either None or strictly older than
-    // `created_at` (next_hlc guarantees forward step), so the insert
-    // is monotonic.
-    {
+        // Success: acquire tracker WHILE still holding state_g, so
+        // any concurrent persist_both blocks at `state.lock()` until
+        // both writes are committed. Bootstrap creation: prev_hlc
+        // was either None or strictly older than `created_at`, so
+        // the insert is monotonic.
         let mut tracker_g = hlc_tracker.lock().await;
         tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+        // Both guards drop here at scope end, in reverse acquisition
+        // order (tracker, then state) — neutral wrt other call sites
+        // but consistent with Rust's drop semantics.
     }
 
     Ok(hex::encode(minted.community_id.0))
@@ -6742,13 +6749,19 @@ where
         return Err(fence_err);
     }
 
-    // 9. COMMIT owner-state Space (LAST step — ZEB-258 reorder).
+    // 9. COMMIT owner-state Space + advance HLC tracker as a single
+    // atomic critical section (LAST step — ZEB-258 reorder). See
+    // create_community_inner's matching block for the lock-order
+    // motivation: holding `state_g` across the `tracker_g`
+    // acquisition prevents a concurrent persist_both (e.g. from a
+    // stop_node-triggered final flush) from snapshotting the new
+    // Space without the matching tracker advance.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
-            // Drop the tokio guard before awaiting the registry call
-            // (no `.await` while holding a tokio mutex guard).
+            // Drop the state_g guard FIRST so the registry call's
+            // .await isn't holding any state lock.
             drop(state_g);
             if let Err(stop_err) = community_registry
                 .shutdown_engine_and_cleanup_persistence(&minted.community_id)
@@ -6764,18 +6777,12 @@ where
                 "apply_space rejected redemption Space: {outcome:?}"
             ));
         }
-    }
-
-    // 9b. Space commit succeeded — advance the HLC tracker. Doing
-    // this AFTER the Space commit (rather than before, with the
-    // earlier mint step) keeps rollback paths byte-identical across
-    // both persisted files: a failure between mint and Space commit
-    // never leaves a phantom tracker entry on disk. Bootstrap
-    // creation: prev_hlc was either None or strictly older than
-    // `created_at`, so the insert is monotonic.
-    {
+        // Success: acquire tracker WHILE still holding state_g.
+        // Bootstrap creation: prev_hlc was either None or strictly
+        // older than `created_at`, so the insert is monotonic.
         let mut tracker_g = hlc_tracker.lock().await;
         tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+        // Both guards drop here at scope end.
     }
 
     // 10. Return Ok.
