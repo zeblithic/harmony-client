@@ -36,8 +36,34 @@
 
   let kickTarget = $state<CommunityMember | null>(null);
   let setPowerTarget = $state<CommunityMember | null>(null);
+  // Holds an admin-threshold-crossing power change pending tier-2
+  // confirmation. Populated by SetPowerDialog onSubmit when the new
+  // power crosses POWER_THRESHOLDS.setPower in either direction; the
+  // ConfirmationModal it drives commits the change on accept (or
+  // discards on cancel). Promote-to-admin is effectively irreversible
+  // through the current UI — once two users are both at power 100,
+  // canSetPower's strict caller > target rule prevents either from
+  // demoting the other — so this confirmation is load-bearing rather
+  // than ceremonial.
+  let pendingAdminChange = $state<{ target: CommunityMember; newPower: number } | null>(null);
   let leaveOpen = $state(false);
   const titleId = `community-settings-title-${Math.random().toString(36).slice(2)}`;
+
+  function crossesAdminThreshold(currentPower: number, newPower: number): boolean {
+    const threshold = POWER_THRESHOLDS.setPower;
+    return (currentPower < threshold && newPower >= threshold)
+        || (currentPower >= threshold && newPower < threshold);
+  }
+
+  function handleSetPowerSubmit(newPower: number) {
+    const target = setPowerTarget!;
+    setPowerTarget = null;
+    if (crossesAdminThreshold(target.power, newPower)) {
+      pendingAdminChange = { target, newPower };
+    } else {
+      onSetPower(target.address, newPower);
+    }
+  }
 
   let joinedMembers = $derived(members.filter((m) => m.status === 'joined'));
   let adminCount = $derived(joinedMembers.filter((m) => m.power >= POWER_THRESHOLDS.setPower).length);
@@ -179,8 +205,28 @@
     targetAddress={setPowerTarget.address}
     currentPower={setPowerTarget.power}
     actorMaxPower={myPower}
-    onSubmit={(newPower) => { onSetPower(setPowerTarget!.address, newPower); setPowerTarget = null; }}
+    onSubmit={handleSetPowerSubmit}
     onCancel={() => (setPowerTarget = null)}
+  />
+{/if}
+
+{#if pendingAdminChange}
+  {@const promoting = pendingAdminChange.newPower >= POWER_THRESHOLDS.setPower}
+  {@const targetName = pendingAdminChange.target.displayName ?? pendingAdminChange.target.address.slice(0, 8)}
+  <ConfirmationModal
+    title={promoting
+      ? `Promote ${targetName} to admin?`
+      : `Demote ${targetName} from admin?`}
+    description={promoting
+      ? `${targetName} will gain admin powers — they'll be able to invite, kick, and set roles like you. Once two users are both admin, neither can demote the other through the UI; they would have to leave voluntarily.`
+      : `${targetName} will lose admin powers — they'll keep their place in the community but won't be able to moderate anymore.`}
+    confirmLabel={promoting ? `Promote to admin` : `Demote from admin`}
+    danger={!promoting}
+    onConfirm={() => {
+      onSetPower(pendingAdminChange!.target.address, pendingAdminChange!.newPower);
+      pendingAdminChange = null;
+    }}
+    onCancel={() => (pendingAdminChange = null)}
   />
 {/if}
 

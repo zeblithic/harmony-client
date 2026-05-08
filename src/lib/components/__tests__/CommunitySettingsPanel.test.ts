@@ -128,6 +128,89 @@ describe('CommunitySettingsPanel', () => {
     expect(visibleNames.some((n) => n?.includes('Charlie'))).toBe(false);
   });
 
+  it('Set role: Member↔Mod transition does NOT open a tier-2 confirmation (no admin threshold crossing)', async () => {
+    const onSetPower = vi.fn();
+    const { container, queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onSetPower },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const bobRow = Array.from(rows).find((r) => r.textContent?.includes('Bob'))!;
+    await fireEvent.click(bobRow.querySelector('button.set-role') as HTMLButtonElement);
+
+    // Set Bob (power 0) to power 50 — Member → Mod, no threshold crossing.
+    const numberInput = container.querySelector('input[type="number"]') as HTMLInputElement;
+    await fireEvent.input(numberInput, { target: { value: '50' } });
+    // Click the dialog's confirm button (.confirm-btn), not the row's
+    // "Set role" trigger which has the same accessible name.
+    await fireEvent.click(container.querySelector('.confirm-btn') as HTMLButtonElement);
+
+    // No admin-threshold confirmation modal should appear.
+    expect(queryByText(/Promote .* to admin\?/i)).toBeNull();
+    expect(queryByText(/Demote .* from admin\?/i)).toBeNull();
+    expect(onSetPower).toHaveBeenCalledWith('b1c4', 50);
+  });
+
+  it('Set role: promote-to-admin opens tier-2 confirmation before invoking onSetPower', async () => {
+    const onSetPower = vi.fn();
+    const { container, getByRole, queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onSetPower },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const charlieRow = Array.from(rows).find((r) => r.textContent?.includes('Charlie'))!;
+    await fireEvent.click(charlieRow.querySelector('button.set-role') as HTMLButtonElement);
+
+    // Promote Charlie (power 50) to admin (power 100) — crosses threshold up.
+    const numberInput = container.querySelector('input[type="number"]') as HTMLInputElement;
+    await fireEvent.input(numberInput, { target: { value: '100' } });
+    // Click the dialog's confirm button (.confirm-btn), not the row's
+    // "Set role" trigger which has the same accessible name.
+    await fireEvent.click(container.querySelector('.confirm-btn') as HTMLButtonElement);
+
+    // SetPowerDialog should close, ConfirmationModal should appear instead.
+    expect(queryByText(/Promote Charlie to admin\?/i)).toBeTruthy();
+    expect(onSetPower).not.toHaveBeenCalled();
+
+    // Accept the confirmation — only now should onSetPower fire.
+    await fireEvent.click(getByRole('button', { name: /Promote to admin/i }));
+    expect(onSetPower).toHaveBeenCalledWith('cc99', 100);
+  });
+
+  it('Set role: demote-from-admin opens tier-2 confirmation before invoking onSetPower', async () => {
+    const onSetPower = vi.fn();
+    const otherAdmin: CommunityMember = { address: 'dd99', displayName: 'Diana', power: 100, status: 'joined' };
+    const { container, queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, members: [...baseProps.members, otherAdmin], onSetPower },
+    });
+    // Diana is power 100 — but the caller is also 100 and canSetPower
+    // requires myPower > target.power, so Diana's row has no Set-role
+    // button. We can't demote a peer admin in v1. Verify that.
+    const rows = container.querySelectorAll('.member-row');
+    const dianaRow = Array.from(rows).find((r) => r.textContent?.includes('Diana'))!;
+    expect(dianaRow.querySelector('button.set-role')).toBeNull();
+    expect(queryByText(/Demote Diana from admin\?/i)).toBeNull();
+  });
+
+  it('Set role: cancelling the tier-2 admin confirmation does NOT invoke onSetPower', async () => {
+    const onSetPower = vi.fn();
+    const { container, getByRole, queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onSetPower },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const charlieRow = Array.from(rows).find((r) => r.textContent?.includes('Charlie'))!;
+    await fireEvent.click(charlieRow.querySelector('button.set-role') as HTMLButtonElement);
+
+    const numberInput = container.querySelector('input[type="number"]') as HTMLInputElement;
+    await fireEvent.input(numberInput, { target: { value: '100' } });
+    // Click the dialog's confirm button (.confirm-btn), not the row's
+    // "Set role" trigger which has the same accessible name.
+    await fireEvent.click(container.querySelector('.confirm-btn') as HTMLButtonElement);
+
+    // Cancel the admin-threshold confirmation.
+    await fireEvent.click(getByRole('button', { name: /Cancel/i }));
+    expect(onSetPower).not.toHaveBeenCalled();
+    expect(queryByText(/Promote Charlie to admin\?/i)).toBeNull();
+  });
+
   it('filters members by address substring', async () => {
     const { container, getByPlaceholderText } = render(CommunitySettingsPanel, { props: baseProps });
     const input = getByPlaceholderText('Search members...') as HTMLInputElement;

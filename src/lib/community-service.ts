@@ -129,6 +129,11 @@ export class CommunityService {
     this.memberCache.clear();
     this.degraded.clear();
     this.knownKinds.clear();
+    // Null the adapter too — without this, connectAdapter's
+    // duplicate-init guard (`if (this.adapter) return;`) would
+    // silently no-op on reconnect after destroy(), leaving the
+    // service alive-but-listenerless.
+    this.adapter = null;
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
