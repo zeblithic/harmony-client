@@ -206,6 +206,22 @@ fn encode_rejects_invite_only_without_admin_bootstrap() {
 }
 
 #[test]
+fn encode_rejects_invite_only_without_admin_identity_pub() {
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Symmetric to the missing-admin_bootstrap test above: mutate ONE
+    // field (admin_identity_pub → None) on top of a known-valid
+    // invite-only fixture. Both fields are required for invite-only
+    // encoding; this test pins the symmetric branch of the same
+    // InviteOnlyMissingBootstrap rejection.
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.admin_identity_pub = None;
+    assert!(matches!(
+        encode_invite_url(&payload).unwrap_err(),
+        InviteUrlError::InviteOnlyMissingBootstrap
+    ));
+}
+
+#[test]
 fn encode_rejects_open_community_with_admin_identity_pub_set() {
     use harmony_app::community_invite::{
         encode_invite_url, CommunityInvitePayload, InviteUrlError,

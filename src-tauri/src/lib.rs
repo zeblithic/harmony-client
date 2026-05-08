@@ -6394,20 +6394,24 @@ where
     //    only engines spawn with `is_invite_only=true` so verify_event
     //    applies the countersig rule.
     //
-    //    Re-redemption guard: `engine_arc(...).is_some()` BEFORE
-    //    spawn_engine so the gating decision isn't subject to a race
-    //    against owner-state add events. spawn_engine is idempotent;
-    //    on a pre-existing engine, the freshly-built channels are
-    //    dropped (the engine already owns its live adapter pair).
-    let engine_already_existed = community_registry
-        .engine_arc(&minted.community_id)
-        .await
-        .is_some();
-
+    //    Re-redemption guard: ZEB-260 PR #90 round-5 (CodeRabbit) —
+    //    we use the atomic `bool` returned by `spawn_engine` (true =
+    //    this call freshly created the engine) rather than a separate
+    //    pre-`spawn_engine` `engine_arc().is_some()` check. The pre-
+    //    check was racy: two concurrent `redeem_invite_inner` calls
+    //    for the same community could both observe `false`, then both
+    //    proceed past spawn_engine into a "fresh engine" path; if the
+    //    loser hit a rollback site it would tear down the engine the
+    //    winner created. Sourcing the flag directly from spawn_engine
+    //    closes that hole — the bool is set under the engines-map
+    //    lock, atomically with the contains_key check + insert.
+    //    spawn_engine is idempotent; on a pre-existing engine, the
+    //    freshly-built channels we passed in are dropped (the engine
+    //    already owns its live adapter pair).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    community_registry
+    let engine_freshly_created = community_registry
         .spawn_engine(
             minted.community_id,
             minted.membership_key.clone(),
@@ -6419,7 +6423,7 @@ where
         .await
         .map_err(|e| format!("registry.spawn_engine: {e}"))?;
 
-    if !engine_already_existed {
+    if engine_freshly_created {
         if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
             id_hex: hex::encode(minted.community_id.0),
             publisher_rx: pub_rx,
@@ -6463,12 +6467,12 @@ where
         // would leave the freshly-spawned engine + persistence dir
         // behind. Wrap in a match so the engine-vanished path tears
         // down via shutdown_engine_and_cleanup_persistence before
-        // returning. Guard with !engine_already_existed so a
+        // returning. Guard with engine_freshly_created so a
         // re-redemption retry doesn't tear down the prior engine.
         let engine_arc = match community_registry.engine_arc(&minted.community_id).await {
             Some(e) => e,
             None => {
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6492,7 +6496,7 @@ where
         {
             Ok(o) => o,
             Err(e) => {
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6513,7 +6517,7 @@ where
         ) {
             // Bootstrap Join didn't insert — tear down so we don't
             // leak a zombie engine.
-            if !engine_already_existed {
+            if engine_freshly_created {
                 if let Err(stop_err) = community_registry
                     .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                     .await
@@ -6536,7 +6540,7 @@ where
         let invite_token = match payload.invite_token.as_ref() {
             Some(t) => t.clone(),
             None => {
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6569,7 +6573,7 @@ where
                     // Guard: if the engine pre-existed (re-redemption
                     // retry), tearing it down would destroy state from
                     // the prior successful path. ZEB-260 PR #90.
-                    if !engine_already_existed {
+                    if engine_freshly_created {
                         if let Err(stop_err) = community_registry
                             .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                             .await
@@ -6600,7 +6604,7 @@ where
                 // Guard: if the engine pre-existed (re-redemption
                 // retry), tearing it down would destroy state from
                 // the prior successful path. ZEB-260 PR #90.
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6635,7 +6639,7 @@ where
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
             | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
             Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6656,7 +6660,7 @@ where
                 // Guard: if the engine pre-existed (re-redemption retry),
                 // tearing it down would destroy state from the prior
                 // successful path. ZEB-260 PR #90.
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6723,7 +6727,7 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6744,7 +6748,7 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6768,7 +6772,7 @@ where
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if !engine_already_existed {
+            if engine_freshly_created {
                 if let Err(stop_err) = community_registry
                     .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                     .await
@@ -6818,7 +6822,7 @@ where
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if !engine_already_existed {
+            if engine_freshly_created {
                 if let Err(stop_err) = community_registry
                     .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                     .await
@@ -6854,7 +6858,7 @@ where
                 // Sender dropped without sending — should be
                 // unreachable with the current pending_redemptions
                 // shape, but treat defensively as a failure.
-                if !engine_already_existed {
+                if engine_freshly_created {
                     if let Err(stop_err) = community_registry
                         .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                         .await
@@ -6903,7 +6907,7 @@ where
                     .await
                 {
                     Some(_tx) => {
-                        if !engine_already_existed {
+                        if engine_freshly_created {
                             if let Err(stop_err) = community_registry
                                 .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                                 .await
@@ -6941,7 +6945,7 @@ where
     //    raced our await chain), this returns Err with crdt_state
     //    still untouched.
     if let Err(fence_err) = fence_check() {
-        if !engine_already_existed {
+        if engine_freshly_created {
             if let Err(stop_err) = community_registry
                 .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                 .await
@@ -6970,7 +6974,7 @@ where
             // Drop the state_g guard FIRST so the registry call's
             // .await isn't holding any state lock.
             drop(state_g);
-            if !engine_already_existed {
+            if engine_freshly_created {
                 if let Err(stop_err) = community_registry
                     .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                     .await

@@ -2365,6 +2365,16 @@ impl CommunitySyncRegistry {
     /// call (which itself does a `tokio::spawn` for the internal task)
     /// stays under the lock so the insert + spawn pair is atomic vs
     /// other spawn races.
+    /// Returns `Ok(true)` when this call freshly created the engine,
+    /// `Ok(false)` when an engine for `community_id` was already present
+    /// (the no-op idempotent path). Callers that need the atomic
+    /// "did I create or did I find existing?" signal — particularly
+    /// `redeem_invite_inner`'s rollback guards (ZEB-260 PR #90 round-5,
+    /// CodeRabbit) — MUST use this return value rather than a separate
+    /// `engine_arc(...).is_some()` pre-check, which is racy under
+    /// concurrent redeems. The `bool` is set under the same engines-map
+    /// lock that performs the `contains_key` check + insert, so the
+    /// flag and the engine state are mutually consistent.
     pub async fn spawn_engine(
         &self,
         community_id: SpaceId,
@@ -2373,7 +2383,7 @@ impl CommunitySyncRegistry {
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
-    ) -> Result<(), CommunitySyncError> {
+    ) -> Result<bool, CommunitySyncError> {
         // Phase 1: blocking disk I/O off the runtime entirely. Both
         // load_crdt and load_replay call std::fs::read, so even with
         // the registry mutex released they'd block the tokio worker
@@ -2408,8 +2418,11 @@ impl CommunitySyncRegistry {
         if engines.contains_key(&community_id) {
             // Idempotent — re-spawn is a no-op rather than an error
             // so the registry tolerates duplicate add events from
-            // owner-state mutations.
-            return Ok(());
+            // owner-state mutations. ZEB-260 PR #90 round-5: returning
+            // `false` here gives concurrent callers an atomic signal
+            // distinguishing "I was the one who created the engine"
+            // from "I found one already running."
+            return Ok(false);
         }
 
         let state = Arc::new(Mutex::new(initial_state));
@@ -2449,7 +2462,10 @@ impl CommunitySyncRegistry {
         }));
 
         engines.insert(community_id, engine);
-        Ok(())
+        // ZEB-260 PR #90 round-5: `true` means "this call freshly
+        // created the engine" — the atomic create flag for
+        // redeem_invite_inner's rollback guards.
+        Ok(true)
     }
 
     /// `true` if an engine is currently spawned for `community_id`.
