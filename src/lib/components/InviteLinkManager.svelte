@@ -10,11 +10,17 @@
   let url = $state<string | null>(null);
   let pending = $state(false);
   let copied = $state(false);
+  let error = $state<string | null>(null);
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function handleGenerate() {
     pending = true;
+    error = null;
     try {
       url = await onGenerate();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      error = `Couldn't generate invite link: ${msg}`;
     } finally {
       pending = false;
     }
@@ -24,11 +30,18 @@
     if (!url) return;
     await navigator.clipboard.writeText(url);
     copied = true;
-    setTimeout(() => (copied = false), 2000);
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+      copied = false;
+      copyResetTimer = null;
+    }, 2000);
   }
 </script>
 
 <div class="invite-manager">
+  {#if error}
+    <p class="error" role="alert">{error}</p>
+  {/if}
   {#if !url}
     <p class="explanation">Generate a one-time invite link to share via DM, email, or any side channel.</p>
     <button class="generate-btn" onclick={handleGenerate} disabled={pending}>
@@ -60,6 +73,7 @@
   .invite-manager { font-size: 0.875rem; }
   .explanation { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 12px; }
   .warning { color: #ffb84a; font-size: 0.8rem; margin: 0 0 12px; }
+  .error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 12px; }
   .url-row {
     display: flex;
     align-items: center;

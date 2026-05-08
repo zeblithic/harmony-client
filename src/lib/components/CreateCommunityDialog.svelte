@@ -18,7 +18,8 @@
   let canSubmit = $derived(name.trim().length > 0 && !pending);
   const titleId = `create-community-title-${Math.random().toString(36).slice(2)}`;
 
-  function handleSubmit() {
+  function handleSubmit(e?: Event) {
+    e?.preventDefault();
     if (!canSubmit) return;
     onSubmit(name.trim(), kind);
   }
@@ -27,12 +28,16 @@
 <Modal {onCancel} canCancel={!pending} ariaLabelledby={titleId}>
   <h3 class="dialog-title" id={titleId}>New community</h3>
 
+  <form onsubmit={handleSubmit}>
+  <label for="community-name-input" class="sr-only">Community name</label>
   <input
+    id="community-name-input"
     type="text"
     placeholder="Community name"
     bind:value={name}
     class="name-input"
     disabled={pending}
+    autofocus
   />
 
   <div class="kind-row">
@@ -67,11 +72,12 @@
   {/if}
 
   <div class="dialog-actions">
-    <button class="cancel-btn" onclick={onCancel} disabled={pending}>Cancel</button>
-    <button class="confirm-btn" onclick={handleSubmit} disabled={!canSubmit}>
+    <button type="button" class="cancel-btn" onclick={onCancel} disabled={pending}>Cancel</button>
+    <button type="submit" class="confirm-btn" disabled={!canSubmit}>
       {pending ? 'Creating...' : 'Create'}
     </button>
   </div>
+  </form>
 </Modal>
 
 <style>
@@ -79,6 +85,17 @@
     color: var(--text-primary);
     font-size: 1.1rem;
     margin: 0 0 16px;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
   .name-input {
     width: 100%;

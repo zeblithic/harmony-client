@@ -18,7 +18,7 @@
   } = $props();
 
   let url = $state(untrack(() => initialUrl));
-  let canSubmit = $derived(url.includes('harmony://invite/') && !pending);
+  let canSubmit = $derived(url.trim().startsWith('harmony://invite/') && !pending);
   let mapped = $derived(error ? mapRedeemInviteError(error) : null);
   const titleId = `redeem-invite-title-${Math.random().toString(36).slice(2)}`;
 

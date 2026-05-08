@@ -18,7 +18,7 @@
   } = $props();
 
   let typed = $state('');
-  let matches = $derived(typed.trimEnd() === requiredText);
+  let matches = $derived(typed.trim() === requiredText);
   const titleId = `typed-confirmation-title-${Math.random().toString(36).slice(2)}`;
 </script>
 

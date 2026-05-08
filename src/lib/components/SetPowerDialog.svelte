@@ -7,23 +7,38 @@
     targetName,
     targetAddress,
     currentPower,
+    actorMaxPower = POWER_THRESHOLDS.max,
     onSubmit,
     onCancel,
   }: {
     targetName: string;
     targetAddress: string;
     currentPower: number;
+    /** Hard ceiling — admins can never set a target above their own
+     *  power. Defaults to POWER_THRESHOLDS.max for back-compat with
+     *  existing call sites; CommunitySettingsPanel passes myPower-1
+     *  so the slider can't even reach an out-of-range value. */
+    actorMaxPower?: number;
     onSubmit: (power: number) => void;
     onCancel: () => void;
   } = $props();
 
   let power = $state(untrack(() => currentPower));
   let role = $derived(powerToRole(power));
+  let safeMax = $derived(Math.max(0, Math.min(POWER_THRESHOLDS.max, actorMaxPower)));
+  let canSubmit = $derived(Number.isFinite(power) && power >= 0 && power <= safeMax);
   const titleId = `set-power-title-${Math.random().toString(36).slice(2)}`;
 
   function clampOnBlur() {
+    if (Number.isNaN(power) || !Number.isFinite(power)) power = 0;
     if (power < 0) power = 0;
-    if (power > POWER_THRESHOLDS.max) power = POWER_THRESHOLDS.max;
+    if (power > safeMax) power = safeMax;
+  }
+
+  function handleSubmit() {
+    clampOnBlur();
+    if (!canSubmit) return;
+    onSubmit(Math.trunc(power));
   }
 </script>
 
@@ -36,11 +51,11 @@
   </div>
 
   <div class="control-row">
-    <input type="range" min="0" max={POWER_THRESHOLDS.max} step="1" bind:value={power} class="slider" aria-label="Power level slider" />
+    <input type="range" min="0" max={safeMax} step="1" bind:value={power} class="slider" aria-label="Power level slider" />
     <input
       type="number"
       min="0"
-      max={POWER_THRESHOLDS.max}
+      max={safeMax}
       step="1"
       bind:value={power}
       onblur={clampOnBlur}
@@ -57,7 +72,7 @@
 
   <div class="dialog-actions">
     <button class="cancel-btn" onclick={onCancel}>Cancel</button>
-    <button class="confirm-btn" onclick={() => onSubmit(power)}>Set role</button>
+    <button class="confirm-btn" onclick={handleSubmit} disabled={!canSubmit}>Set role</button>
   </div>
 </Modal>
 

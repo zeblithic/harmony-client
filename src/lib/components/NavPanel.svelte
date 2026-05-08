@@ -64,7 +64,11 @@
   }
 
   function closeMenu() {
+    if (!menuOpen) return;
     menuOpen = false;
+    // Return focus to the FAB so keyboard users don't get stranded
+    // on a now-detached menu item.
+    menuButtonEl?.focus();
   }
 
   function handleMenuItem(cb: (() => void) | undefined) {
