@@ -163,12 +163,30 @@
   let showCommunitySettings = $state(false);
   let communityMembers = $state<CommunityMember[]>([]);
   let myAddress = $state('');
+  // Local mirror of communityService.isDegraded(selectedCommunityId).
+  // Direct method calls in the template aren't reactive — we need a
+  // $state field that the listener can update so the settings panel
+  // re-renders on degraded events.
+  let isCurrentCommunityDegraded = $state(false);
   // Derived from the live roster — recomputes when fetchOwnAddress
   // resolves later than the first roster load (race fixed in PR #91
   // review). Never assign to this directly.
   let myCommunityPower = $derived(
     communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
   );
+
+  // Centralized switch helper. Clears the visible roster on a real
+  // community change so the settings panel doesn't flash the previous
+  // community's members during the in-flight fetch (greptile P1).
+  // Also captures the current degraded flag so the UI doesn't lag
+  // behind the backend signal until the next members-changed event.
+  function changeSelectedCommunity(id: string | null) {
+    if (selectedCommunityId !== id) {
+      communityMembers = [];
+    }
+    selectedCommunityId = id;
+    isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
+  }
 
   async function refreshCommunityMembers(id: string) {
     try {
@@ -432,6 +450,10 @@
       // Don't await — onChange is fire-and-forget at the listener
       // boundary; awaiting here would leak unhandled rejections.
       void refreshCommunityMembers(selectedCommunityId);
+      // Degraded events also fire onChange but don't change the
+      // member roster — re-read the flag so the UI updates even
+      // when listCommunityMembers returns the cached array.
+      isCurrentCommunityDegraded = communityService.isDegraded(selectedCommunityId);
     }
   };
 
@@ -825,7 +847,7 @@
     // ZEB-263: community nodes route to the right-pane overview placeholder
     // instead of the message feed (no channels yet — that's a later phase).
     if (node.type === 'community') {
-      selectedCommunityId = id;
+      changeSelectedCommunity(id);
       void refreshCommunityMembers(id);
       if (appMode !== 'messages') {
         switchMode('messages');
@@ -834,7 +856,7 @@
     }
     // Clicking any non-community navigable node clears the community
     // overview so the message feed shows through.
-    selectedCommunityId = null;
+    changeSelectedCommunity(null);
     showCommunitySettings = false;
     const switched = id !== activeChannel;
     activeChannel = node.id;
@@ -1393,7 +1415,7 @@
       try {
         const id = await communityService.createCommunity(name, kind);
         showCreateCommunity = false;
-        selectedCommunityId = id;
+        changeSelectedCommunity(id);
         await refreshCommunityMembers(id);
       } catch (e) {
         createError = e instanceof Error ? e.message : String(e);
@@ -1426,7 +1448,7 @@
         const id = await communityService.redeemInvite(url);
         showRedeemInvite = false;
         redeemUrl = '';
-        selectedCommunityId = id;
+        changeSelectedCommunity(id);
         await refreshCommunityMembers(id);
       } catch (e) {
         redeemError = e instanceof Error ? e.message : String(e);
@@ -1456,7 +1478,7 @@
     members={communityMembers}
     {myAddress}
     myPower={myCommunityPower}
-    isDegraded={communityService.isDegraded(selectedCommunityNode.id)}
+    isDegraded={isCurrentCommunityDegraded}
     onClose={() => (showCommunitySettings = false)}
     onKick={async (target) => {
       if (!selectedCommunityId) return;
@@ -1480,7 +1502,7 @@
       if (!selectedCommunityId) return;
       try {
         await communityService.leaveCommunity(selectedCommunityId);
-        selectedCommunityId = null;
+        changeSelectedCommunity(null);
         showCommunitySettings = false;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
