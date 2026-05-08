@@ -157,7 +157,7 @@
       // navService — same logic the (still-wired) listener uses, so a
       // future backend emit won't double-insert (the duplicate-added
       // path preserves UI state via Fix G).
-      navService.addOrUpdateDmSpace({
+      navService.addOrUpdateNavSpace({
         action: 'added',
         spaceId,
         kind: args.kind,

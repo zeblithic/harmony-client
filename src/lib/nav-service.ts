@@ -99,7 +99,7 @@ export class NavService {
     this.unlisteners.push(unlistenProfile);
 
     const unlistenNav = await adapter.listen('nav-updated', (event) => {
-      this.addOrUpdateDmSpace(event.payload as NavUpdatedPayload);
+      this.addOrUpdateNavSpace(event.payload as NavUpdatedPayload);
     });
     this.unlisteners.push(unlistenNav);
   }
@@ -111,11 +111,60 @@ export class NavService {
    * synthesize the same NavNode without depending on a backend emit
    * (no `nav-updated` emit exists on the Rust side yet — Fix B from
    * PR #81 review).
+   *
+   * Phase 5 (ZEB-263) extends this to handle `community` kind.
    */
-  addOrUpdateDmSpace(payload: NavUpdatedPayload): void {
+  addOrUpdateNavSpace(payload: NavUpdatedPayload): void {
     const { action, spaceId, kind, name, members, parentId } = payload;
-    // Phase 4 only handles DM/GroupDm Spaces — channel/community/folder
-    // events are reserved for other phases.
+
+    if (kind === 'community') {
+      if (action === 'removed') {
+        const before = this.nodes.length;
+        this.nodes = this.nodes.filter((n) => n.id !== spaceId);
+        if (this.nodes.length !== before) this.onChange?.();
+        return;
+      }
+
+      const newNode: NavNode = {
+        id: spaceId,
+        type: 'community',
+        name,
+        parentId: parentId ?? null,
+        expanded: true, // default expanded; user can collapse
+        unreadCount: 0,
+        unreadLevel: 'none',
+        peer: undefined,
+      };
+
+      if (action === 'added') {
+        const existing = this.nodes.find((n) => n.id === spaceId);
+        if (existing) {
+          // Preserve user-applied state on duplicate add (cold-replay)
+          this.nodes = this.nodes.map((n) =>
+            n.id === spaceId
+              ? { ...newNode, parentId: existing.parentId, expanded: existing.expanded }
+              : n
+          );
+        } else {
+          this.nodes = [...this.nodes, newNode];
+        }
+      } else if (action === 'modified') {
+        let found = false;
+        this.nodes = this.nodes.map((n) => {
+          if (n.id !== spaceId) return n;
+          found = true;
+          return { ...n, name }; // preserve parentId/expanded
+        });
+        if (!found) this.nodes = [...this.nodes, newNode];
+      }
+
+      this.onChange?.();
+      return;
+    }
+
+    // Phase 5 (ZEB-263) handles dm/group-dm/community kinds.
+    // Channel kind is reserved for the channel-introduction phase
+    // and silently ignored here.
     if (kind !== 'dm' && kind !== 'group-dm') return;
 
     if (action === 'removed') {
