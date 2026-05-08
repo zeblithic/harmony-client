@@ -1602,19 +1602,25 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    publish strictly preceding the membership change in HLC
     //    order, so the gate admits it.
     //
-    //    Bootstrap caveat (tracked as ZEB-260): the gate cannot
-    //    inspect events INSIDE the encrypted blob. A new joiner's
-    //    own first publish carries their Join in the blob; if our
-    //    local log doesn't already contain that Join (or an
-    //    admin-issued Invite that resolves to it post-merge), the
-    //    publisher will appear unknown and we will reject. Production
-    //    paves over this in two ways: (a) the redemption flow on the
-    //    joiner's own device inserts the Join locally before the
-    //    first publish; (b) Phase 4's invite-only flow re-Joins via
-    //    an admin-published Invite — admin is already Joined in our
-    //    view, so the gate admits and we learn the Join after merge.
-    //    Self-Re-Join after Leave hits the same bootstrap edge and
-    //    is also deferred under ZEB-260.
+    //    Bootstrap caveat: the gate evaluates membership pre-decrypt,
+    //    so any membership change carrying the publisher's authorizing
+    //    Join INSIDE the encrypted blob is rejected. Three cases
+    //    historically tracked under ZEB-260:
+    //      Case A — invite-only joiner with empty CRDT receiving
+    //        admin's first publish-back. FIXED in 2026-05 by plumbing
+    //        admin's signed bootstrap through the invite URL
+    //        (CommunityInvitePayload.admin_bootstrap +
+    //        admin_identity_pub) and inserting it during
+    //        redeem_invite_inner before the unicast send.
+    //      Case B — open-community brand-new joiner whose self-Join
+    //        is only inside their own publish blob. DEFERRED.
+    //      Case C — self-Re-Join after Leave. DEFERRED.
+    //    Cases B+C share the same root cause but require a gate
+    //    redesign (blob pre-decrypt or self-publisher-bootstrap)
+    //    rather than a side-channel; deferred until a real production
+    //    blocker emerges. See
+    //    docs/specs/2026-05-08-zeb-260-invite-only-cold-cache-design.md
+    //    for the Case A fix design.
     {
         let state = ctx.state.lock().await;
         let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
