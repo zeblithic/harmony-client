@@ -6459,13 +6459,33 @@ where
         // `insert_local_event` runs verify_event (which authorizes the
         // open Join via signature alone) and fires `notify_dirty` on
         // success.
-        let engine_arc = community_registry
-            .engine_arc(&minted.community_id)
-            .await
-            .ok_or("engine vanished immediately after spawn — registry race")?;
-        // CodeRabbit P0: a `?` early-return here would leave the
-        // spawned engine + persistence dir behind. Wrap the Result and
-        // tear down on Err before returning.
+        // ZEB-260 PR #90 round-4 (CodeRabbit): a `?` early-return here
+        // would leave the freshly-spawned engine + persistence dir
+        // behind. Wrap in a match so the engine-vanished path tears
+        // down via shutdown_engine_and_cleanup_persistence before
+        // returning. Guard with !engine_already_existed so a
+        // re-redemption retry doesn't tear down the prior engine.
+        let engine_arc = match community_registry.engine_arc(&minted.community_id).await {
+            Some(e) => e,
+            None => {
+                if !engine_already_existed {
+                    if let Err(stop_err) = community_registry
+                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %stop_err,
+                            community_id = %hex::encode(minted.community_id.0),
+                            "shutdown failed during redeem_invite OPEN-branch engine-vanished rollback"
+                        );
+                    }
+                }
+                return Err("engine vanished immediately after spawn — registry race".to_string());
+            }
+        };
+        // CodeRabbit P0 (PR #89): a `?` early-return inside the match
+        // below would leave the spawned engine + persistence dir
+        // behind. Wrap the Result and tear down on Err before returning.
         let outcome = match engine_arc
             .insert_local_event(minted.bootstrap_join.clone())
             .await

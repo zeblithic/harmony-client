@@ -134,44 +134,44 @@ CBOR keys remain same-length-2 per project convention (`ci`, `mk`, `ad`, `nm`, `
 
 ## Verification chain
 
-In `redeem_invite_inner`, after URL decode and before sending the unicast, Bob runs six checks against `admin_bootstrap` and `admin_identity_pub`:
+In `redeem_invite_inner`, after URL decode and before sending the unicast, Bob calls the pure helper `community_invite::verify_admin_bootstrap`, which runs six checks against `admin_bootstrap` and `admin_identity_pub` and returns `Result<(&SignedMembershipEvent, &[u8; 64]), RedeemBootstrapVerifyError>`:
 
 ```rust
 // 1. Required-fields check (invite-only mode).
-if payload.is_invite_only {
-    let admin_bootstrap = payload.admin_bootstrap.as_ref()
-        .ok_or(RedeemInviteError::BootstrapMissing)?;
-    let admin_identity_pub = payload.admin_identity_pub.as_ref()
-        .ok_or(RedeemInviteError::BootstrapMissing)?;
+let admin_bootstrap = payload.admin_bootstrap.as_ref()
+    .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
+let admin_identity_pub = payload.admin_identity_pub.as_ref()
+    .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
 
-    // 2. identity_pub ↔ admin_addr binding.
-    let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
-        .map_err(|_| RedeemInviteError::BootstrapInvalidPubkey)?;
-    if admin_identity.address_hash != payload.admin_addr.0 {
-        return Err(RedeemInviteError::BootstrapAddressMismatch);
-    }
+// 2. identity_pub ↔ admin_addr binding.
+let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+    .map_err(|_| RedeemBootstrapVerifyError::BootstrapInvalidPubkey)?;
+if admin_identity.address_hash != payload.admin_addr.0 {
+    return Err(RedeemBootstrapVerifyError::BootstrapAddressMismatch);
+}
 
-    // 3. bootstrap.actor ↔ admin_addr binding.
-    if admin_bootstrap.actor != payload.admin_addr {
-        return Err(RedeemInviteError::BootstrapActorMismatch);
-    }
+// 3. bootstrap.actor ↔ admin_addr binding.
+if admin_bootstrap.actor != payload.admin_addr {
+    return Err(RedeemBootstrapVerifyError::BootstrapActorMismatch);
+}
 
-    // 4. bootstrap.community_id ↔ payload.community_id binding.
-    if admin_bootstrap.community_id != payload.community_id {
-        return Err(RedeemInviteError::BootstrapCommunityMismatch);
-    }
+// 4. bootstrap.community_id ↔ payload.community_id binding.
+if admin_bootstrap.community_id != payload.community_id {
+    return Err(RedeemBootstrapVerifyError::BootstrapCommunityMismatch);
+}
 
-    // 5. Ed25519 signature verification.
-    community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
-        .map_err(|_| RedeemInviteError::BootstrapSignatureInvalid)?;
+// 5. Ed25519 signature verification.
+community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
+    .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
 
-    // 6. Sanity: bootstrap is a self-Join with no countersig.
-    if !matches!(admin_bootstrap.kind, MembershipEventKind::Join { .. })
-        || admin_bootstrap.countersig.is_some() {
-        return Err(RedeemInviteError::BootstrapKindInvalid);
-    }
+// 6. Sanity: bootstrap is a self-Join with no countersig.
+if !matches!(admin_bootstrap.kind, MembershipEventKind::Join)
+    || admin_bootstrap.countersig.is_some() {
+    return Err(RedeemBootstrapVerifyError::BootstrapKindInvalid);
 }
 ```
+
+`redeem_invite_inner` calls `verify_admin_bootstrap(&payload)` and converts any `Err(verify_err)` into the IPC `Result<String, String>` shape via `verify_err.to_string()` (Display impls produce stable IPC strings, per the existing `redeem_invite_inner` error convention from PR #89).
 
 If all six pass, Bob calls:
 
@@ -180,8 +180,10 @@ engine.insert_local_event_with_pubs(
     admin_bootstrap.clone(),
     *admin_identity_pub,
     None,  // bootstrap has no countersig
-).await.map_err(RedeemInviteError::BootstrapInsertFailed)?;
+).await
 ```
+
+The result is matched explicitly against `InsertOutcome::Inserted | AlreadyKnown` (success) vs. `InsertOutcome::Rejected(verify_err)` (engine rejected — surface as `format!("engine rejected admin bootstrap: {verify_err}")`) vs. `Err(insert_err)` (engine errored). All three failure paths tear down via `shutdown_engine_and_cleanup_persistence` only when `!engine_already_existed`.
 
 `insert_local_event_with_pubs` is the API added in PR #89 specifically for cold-cache bypass of `IdentityResolver`. It runs the engine's standard verify_event + state-mutate + post-Inserted hook chain with explicitly-provided pubkeys. Idempotent: if Bob has already inserted the bootstrap (rare — only if a prior aborted redemption to the same admin reached this step), the engine deduplicates by event id and returns `InsertOutcome::AlreadyPresent`.
 
@@ -219,12 +221,12 @@ If steps 3 or 4 fail, Bob aborts redemption and tears down the engine via `shutd
 
 ## Error taxonomy
 
-Extend the redeem-side error enum with seven new variants:
+The verify helper returns `RedeemBootstrapVerifyError` (seven variants). `redeem_invite_inner` itself keeps its existing `Result<String, String>` IPC shape (matching the PR #89 contract for `redeem_invite_inner`); verify failures are converted to inline strings via the enum's `Display` impl. Engine-side `insert_local_event_with_pubs` failures are surfaced as inline strings the same way (no separate `BootstrapInsertFailed` enum variant — the engine path lives in `lib.rs` and predates the verify helper).
 
 ```rust
-pub enum RedeemInviteError {
-    // ... existing variants ...
-
+// In community_invite.rs:
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemBootstrapVerifyError {
     /// Invite-only payload missing `admin_bootstrap` or `admin_identity_pub`.
     /// Fires for old PR #89 invite URLs, which lack these fields. Stable IPC
     /// error string: "redeem_invite: invite-only payload missing admin bootstrap".
@@ -248,17 +250,12 @@ pub enum RedeemInviteError {
 
     /// `admin_bootstrap.kind` is not `Join`, or `countersig` is `Some`.
     BootstrapKindInvalid,
-
-    /// `engine.insert_local_event_with_pubs` returned an error. Should be
-    /// effectively unreachable if the chain checks pass; surfaced for
-    /// telemetry. Wraps the underlying `LocalInsertError` for debugging.
-    BootstrapInsertFailed(LocalInsertError),
 }
 ```
 
 Each variant has a `Display` impl producing a stable IPC error string (NOT `Debug` repr, per the project's IPC discipline established in ZEB-262). Frontend rejection strings are stable across builds.
 
-A `reason_tag()` method on the enum returns a short telemetry tag (`"bootstrap_missing"`, `"bootstrap_address_mismatch"`, etc.) for the existing `record_redeem_outcome` telemetry helper.
+A `reason_tag()` method on the enum returns a short telemetry tag (`"bootstrap_missing"`, `"bootstrap_address_mismatch"`, etc.) for the existing `record_redeem_outcome` telemetry helper. Engine-side insert failures (`InsertOutcome::Rejected(verify_err)` and `Err(insert_err)`) surface as `format!("engine rejected admin bootstrap: {}")` and `format!("engine.insert_local_event_with_pubs (admin bootstrap): {}")` respectively — matching the existing inline-string discipline of `redeem_invite_inner`.
 
 ## Backward compatibility
 

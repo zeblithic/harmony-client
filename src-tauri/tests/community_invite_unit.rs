@@ -191,31 +191,14 @@ fn decode_trims_whitespace() {
 
 #[test]
 fn encode_rejects_invite_only_without_admin_bootstrap() {
-    use harmony_app::community_invite::{
-        encode_invite_url, CommunityInvitePayload, InviteToken, InviteUrlError,
-    };
-    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
-    let payload = CommunityInvitePayload {
-        community_id: SpaceId([0xab; 16]),
-        membership_key: MembershipKey::new([0x42; 32]),
-        admin_addr: OwnerAddr([0xcd; 16]),
-        community_name: "WriterCheck".to_string(),
-        is_invite_only: true,
-        expires_at: None,
-        invite_token: Some(InviteToken {
-            inviter: OwnerAddr([0xcd; 16]),
-            invitee_hint: None,
-            minted_at: Hlc {
-                wall_ms: 1_700_000_000_000,
-                logical: 0,
-                device_id: "alice-dev".into(),
-            },
-            expires_at: None,
-            sig: [0xDD; 64],
-        }),
-        admin_bootstrap: None,
-        admin_identity_pub: None,
-    };
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Build a known-valid invite-only payload, then mutate ONE field
+    // (admin_bootstrap → None). Isolating the failing invariant to a
+    // single field protects against assertion order-of-validation drift
+    // — if encode_invite_url's check sequence reordered, this test
+    // would still pin the InviteOnlyMissingBootstrap path.
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.admin_bootstrap = None;
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
         InviteUrlError::InviteOnlyMissingBootstrap
@@ -292,21 +275,14 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
 
 #[test]
 fn encode_rejects_invite_only_without_invite_token() {
-    use harmony_app::community_invite::{
-        encode_invite_url, CommunityInvitePayload, InviteUrlError,
-    };
-    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
-    let payload = CommunityInvitePayload {
-        community_id: SpaceId([0xab; 16]),
-        membership_key: MembershipKey::new([0x42; 32]),
-        admin_addr: OwnerAddr([0xcd; 16]),
-        community_name: "WriterCheck".to_string(),
-        is_invite_only: true,
-        expires_at: None,
-        invite_token: None,
-        admin_bootstrap: None,
-        admin_identity_pub: None,
-    };
+    use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
+    // Mutate only invite_token → None on top of the good fixture so
+    // the assertion isolates that invariant from the bootstrap-fields
+    // and admin_addr checks. (Order-of-validation drift in
+    // encode_invite_url would otherwise let this test pass for the
+    // wrong reason.)
+    let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
+    payload.invite_token = None;
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
         InviteUrlError::InviteOnlyMissingToken
