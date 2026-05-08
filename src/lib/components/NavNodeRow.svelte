@@ -48,6 +48,14 @@
     e.stopPropagation();
     if (node.type === 'folder') {
       onToggle?.(node.id);
+    } else if (node.type === 'community') {
+      // ZEB-263: communities are folder-like containers (NavTree
+      // recurses into expanded community children) AND have an
+      // overview pane, so clicking does both — toggle the chevron
+      // AND select. Cursor flagged that without this dual action
+      // there's no UI affordance to collapse a community.
+      onToggle?.(node.id);
+      onClick?.(node.id);
     } else {
       onClick?.(node.id);
     }
@@ -57,7 +65,10 @@
     if (n.type === 'channel') return '#';
     if (n.type === 'dm' || n.type === 'group-chat') return '@';
     if (n.type === 'folder') return n.expanded ? '\u25BE' : '\u25B8';
-    if (n.type === 'community') return '🏛️';
+    // Community gets a chevron alongside the building icon so the
+    // expanded/collapsed state is visible at a glance, matching the
+    // folder pattern.
+    if (n.type === 'community') return n.expanded ? '▾ 🏛️' : '▸ 🏛️';
     return '';
   }
 

@@ -835,6 +835,13 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // The nav row to render with active styling. When a community is
+  // selected, highlight the community node; otherwise fall back to
+  // the active channel/DM. Keeping these in separate $state fields
+  // avoids reusing activeChannel for community ids — activeChannel
+  // is consumed by message-send paths that only make sense for
+  // channels/DMs.
+  let navActiveNodeId = $derived(selectedCommunityId ?? activeChannel);
 
   function switchMode(mode: AppMode) {
     appMode = mode;
@@ -1096,7 +1103,7 @@
       <NavPanel
         nodes={navNodes}
         {collapsed}
-        activeNodeId={activeChannel}
+        activeNodeId={navActiveNodeId}
         onNodeClick={handleNodeClick}
         onSettingsClick={() => { showSettings = !showSettings; }}
         profileLookup={(addr) => navService.profileLookup(addr)}
