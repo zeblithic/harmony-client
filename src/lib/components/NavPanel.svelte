@@ -24,6 +24,10 @@
     onFilterChange,
     filters,
     onManageBuddies,
+    onNewDm,
+    onNewGroupDm,
+    onNewCommunity,
+    onRedeemInvite,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -41,7 +45,48 @@
     onFilterChange?: (filters: Record<string, unknown>) => void;
     filters?: Record<string, unknown>;
     onManageBuddies?: () => void;
+    /** ZEB-263: FAB fan-out menu callbacks. */
+    onNewDm?: () => void;
+    onNewGroupDm?: () => void;
+    onNewCommunity?: () => void;
+    onRedeemInvite?: () => void;
   } = $props();
+
+  // ── ZEB-263 FAB + fan-out menu ──────────────────────────────────────
+  // Click "+" → opens a 4-item popover (DM / Group DM / Community /
+  // Redeem invite). Dismisses on Escape, click-outside, or item-click.
+  let menuOpen = $state(false);
+  let menuButtonEl = $state<HTMLButtonElement | null>(null);
+  let menuPopoverEl = $state<HTMLDivElement | null>(null);
+
+  function openMenu() {
+    menuOpen = true;
+  }
+
+  function closeMenu() {
+    menuOpen = false;
+  }
+
+  function handleMenuItem(cb: (() => void) | undefined) {
+    closeMenu();
+    cb?.();
+  }
+
+  function handleWindowKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && menuOpen) {
+      closeMenu();
+    }
+  }
+
+  function handleWindowMouseDown(e: MouseEvent) {
+    if (!menuOpen) return;
+    const target = e.target as Node | null;
+    if (!target) return;
+    // Don't dismiss when the click is on the FAB itself (its onclick will toggle).
+    if (menuButtonEl && menuButtonEl.contains(target)) return;
+    if (menuPopoverEl && menuPopoverEl.contains(target)) return;
+    closeMenu();
+  }
 
   // Local mirror of the nodes prop: user interactions (toggle/display/sort)
   // mutate navNodes directly, so we can't use $derived here. $effect.pre runs
@@ -132,6 +177,8 @@
   let topLevelNodes = $derived(getChildNodes(navNodes, null));
 </script>
 
+<svelte:window onkeydown={handleWindowKeyDown} onmousedown={handleWindowMouseDown} />
+
 <div class="nav-panel">
   {#if !collapsed}
     <div class="nav-header">
@@ -141,6 +188,23 @@
         placeholder="Search"
         bind:value={searchQuery}
       />
+      <span class="divider"></span>
+      <button
+        type="button"
+        class="fab-btn"
+        aria-label="Create new"
+        bind:this={menuButtonEl}
+        onclick={() => (menuOpen ? closeMenu() : openMenu())}
+      >+</button>
+      {#if menuOpen}
+        <div class="fab-popover" role="menu" bind:this={menuPopoverEl}>
+          <button type="button" role="menuitem" onclick={() => handleMenuItem(onNewDm)}>💬 New direct message</button>
+          <button type="button" role="menuitem" onclick={() => handleMenuItem(onNewGroupDm)}>👥 New group DM</button>
+          <hr />
+          <button type="button" role="menuitem" onclick={() => handleMenuItem(onNewCommunity)}>🏛️ New community</button>
+          <button type="button" role="menuitem" onclick={() => handleMenuItem(onRedeemInvite)}>🔗 Redeem invite link</button>
+        </div>
+      {/if}
       <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>
     </div>
     <nav class="nav-tree-container">
@@ -316,5 +380,63 @@
   .mode-toggle.active {
     background: var(--accent);
     color: var(--text-primary);
+  }
+
+  /* ── ZEB-263: FAB + fan-out menu ──────────────────────────────────── */
+  .nav-header {
+    position: relative;
+  }
+  .divider {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+    margin: 0 4px;
+    flex-shrink: 0;
+  }
+  .fab-btn {
+    font-size: 0.9rem;
+    padding: 4px 10px;
+    background: var(--accent);
+    color: var(--text-primary);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .fab-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+  .fab-popover {
+    position: absolute;
+    right: 12px;
+    top: 42px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 4px;
+    min-width: 200px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+  }
+  .fab-popover button {
+    padding: 8px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 0.875rem;
+  }
+  .fab-popover button:hover {
+    background: var(--bg-tertiary);
+  }
+  .fab-popover hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 4px 0;
   }
 </style>
