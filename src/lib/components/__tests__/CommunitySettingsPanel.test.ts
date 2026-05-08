@@ -128,6 +128,22 @@ describe('CommunitySettingsPanel', () => {
     expect(visibleNames.some((n) => n?.includes('Charlie'))).toBe(false);
   });
 
+  it('clicking the panel backdrop dismisses the panel', async () => {
+    const onClose = vi.fn();
+    const { container } = render(CommunitySettingsPanel, { props: { ...baseProps, onClose } });
+    const overlay = container.querySelector('.panel-overlay') as HTMLElement;
+    await fireEvent.click(overlay);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('clicking inside the panel does NOT dismiss', async () => {
+    const onClose = vi.fn();
+    const { container } = render(CommunitySettingsPanel, { props: { ...baseProps, onClose } });
+    const panel = container.querySelector('.panel') as HTMLElement;
+    await fireEvent.click(panel);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('Set role: Member↔Mod transition does NOT open a tier-2 confirmation (no admin threshold crossing)', async () => {
     const onSetPower = vi.fn();
     const { container, queryByText } = render(CommunitySettingsPanel, {

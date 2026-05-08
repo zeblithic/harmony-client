@@ -102,9 +102,29 @@
       && myPower >= POWER_THRESHOLDS.setPower
       && myPower > target.power;
   }
+
+  function handleOverlayClick(e: MouseEvent) {
+    // Backdrop-click-to-dismiss for consistency with every other
+    // modal in the PR. Guard against clicks bubbling from inside
+    // the panel — those should NOT dismiss (we don't want a stray
+    // click on a member row to close the whole panel).
+    if (e.target === e.currentTarget) onClose();
+  }
+
+  function handleOverlayKeydown(e: KeyboardEvent) {
+    // Mirror the click semantics for keyboard users on the backdrop.
+    // The panel itself has trapFocus + Escape via the action, so this
+    // only fires when focus is somehow on the overlay element.
+    if (e.key === 'Escape') onClose();
+  }
 </script>
 
-<div class="panel-overlay">
+<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+<div
+  class="panel-overlay"
+  onclick={handleOverlayClick}
+  onkeydown={handleOverlayKeydown}
+>
   <div
     class="panel"
     role="dialog"

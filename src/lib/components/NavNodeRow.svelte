@@ -117,6 +117,19 @@
       {/if}
     {:else}
       <!-- Text or both mode -->
+      <!--
+        Communities render BOTH the chevron button (▾/▸) and the type
+        icon (🏛️). They encode different things: chevron is the
+        expand/collapse affordance, 🏛️ is the type identifier
+        (community vs folder vs channel). VSCode and macOS Finder
+        use the same `[chevron] [type-icon] [name]` pattern. Folders
+        elide the type icon because the chevron itself signals
+        folder-ness — but if we did that here, communities would
+        be visually indistinguishable from folders in the nav tree.
+        Cursor flagged this as "redundant" on commit 502056e — it's
+        not, but the comment is here so future review passes don't
+        re-flag the design.
+      -->
       {#if node.type === 'community'}
         <button
           class="community-chevron"
