@@ -46,7 +46,8 @@ describe('ConfirmationModal', () => {
   it('Escape key cancels', async () => {
     const onCancel = vi.fn();
     const { container } = render(ConfirmationModal, { props: { ...baseProps, onCancel } });
-    await fireEvent.keyDown(container, { key: 'Escape' });
+    const dialog = container.querySelector('[role="dialog"]') as HTMLElement;
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(onCancel).toHaveBeenCalled();
   });
 });

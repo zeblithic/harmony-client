@@ -1,53 +1,76 @@
 <script lang="ts">
-  interface Props {
+  import Modal from './Modal.svelte';
+
+  let {
+    title,
+    description,
+    confirmLabel,
+    danger = false,
+    onConfirm,
+    onCancel,
+  }: {
     title: string;
     description: string;
     confirmLabel: string;
     danger?: boolean;
     onConfirm: () => void;
     onCancel: () => void;
-  }
+  } = $props();
 
-  let { title, description, confirmLabel, danger = false, onConfirm, onCancel }: Props = $props();
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') onCancel();
-  }
+  const titleId = `confirmation-modal-title-${Math.random().toString(36).slice(2)}`;
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<Modal {onCancel} ariaLabelledby={titleId}>
+  <h3 class="modal-title" id={titleId}>{title}</h3>
+  <p class="modal-description">{description}</p>
 
-<div class="modal-backdrop" onclick={onCancel} role="presentation">
-  <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
-    <h3 class="modal-title">{title}</h3>
-    <p class="modal-description">{description}</p>
-
-    <div class="action-row">
-      <button class="confirm" class:danger onclick={onConfirm}>{confirmLabel}</button>
-      <div class="spacer"></div>
-      <button class="cancel" onclick={onCancel}>Cancel</button>
-    </div>
+  <div class="action-row">
+    <button class="confirm-btn" class:danger onclick={onConfirm}>{confirmLabel}</button>
+    <div class="spacer"></div>
+    <button class="cancel-btn" onclick={onCancel}>Cancel</button>
   </div>
-</div>
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex; align-items: center; justify-content: center;
-    z-index: 1000;
+  .modal-title {
+    color: var(--text-primary);
+    font-size: 1rem;
+    margin: 0 0 12px;
   }
-  .modal {
-    background: var(--surface, #1e1e1e);
-    border-radius: 8px;
-    padding: 20px;
-    max-width: 420px;
-    width: 90%;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  .modal-description {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    margin: 0 0 20px;
   }
-  .modal-title { margin: 0 0 10px 0; font-size: 15px; }
-  .modal-description { margin: 0 0 20px 0; font-size: 13px; color: var(--text-muted, #ccc); }
-  .action-row { display: flex; gap: 8px; align-items: center; }
+  .action-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
   .spacer { flex: 1; }
-  .confirm.danger { background: #cc4a4a; color: white; border-color: #cc4a4a; }
+  .confirm-btn {
+    background: var(--accent);
+    color: var(--text-primary);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .confirm-btn.danger { background: #d83c3e; }
+  .cancel-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .cancel-btn:focus-visible,
+  .confirm-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
 </style>
