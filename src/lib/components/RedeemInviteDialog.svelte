@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Modal from './Modal.svelte';
   import { mapRedeemInviteError } from '../redeem-invite-errors';
 
@@ -16,7 +17,7 @@
     initialUrl?: string;
   } = $props();
 
-  let url = $state(initialUrl);
+  let url = $state(untrack(() => initialUrl));
   let canSubmit = $derived(url.includes('harmony://invite/') && !pending);
   let mapped = $derived(error ? mapRedeemInviteError(error) : null);
   const titleId = `redeem-invite-title-${Math.random().toString(36).slice(2)}`;
@@ -54,7 +55,7 @@
 
   {#if pending}
     <div class="pending-row">
-      <div class="spinner"></div>
+      <div class="spinner" role="status" aria-label="Verifying invite"></div>
       <span>Verifying invite...</span>
     </div>
   {/if}

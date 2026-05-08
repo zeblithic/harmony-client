@@ -38,10 +38,10 @@ describe('RedeemInviteDialog', () => {
   });
 
   it('shows pending spinner when pending=true', () => {
-    const { container } = render(RedeemInviteDialog, {
+    const { getByRole } = render(RedeemInviteDialog, {
       props: { onSubmit: vi.fn(), onCancel: vi.fn(), pending: true },
     });
-    expect(container.querySelector('.spinner')).toBeTruthy();
+    expect(getByRole('status')).toBeTruthy();
   });
 
   it('renders friendly summary when error provided', () => {

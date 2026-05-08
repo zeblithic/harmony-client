@@ -68,4 +68,14 @@ describe('CreateCommunityDialog', () => {
     await fireEvent.click(getByText('Cancel'));
     expect(onCancel).toHaveBeenCalled();
   });
+
+  it('disables both buttons and shows "Creating..." label when pending=true', () => {
+    const { getByText } = render(CreateCommunityDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn(), pending: true },
+    });
+    const cancel = getByText('Cancel').closest('button') as HTMLButtonElement;
+    const create = getByText('Creating...').closest('button') as HTMLButtonElement;
+    expect(cancel.disabled).toBe(true);
+    expect(create.disabled).toBe(true);
+  });
 });
