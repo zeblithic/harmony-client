@@ -421,4 +421,45 @@ describe('NavService — community kind (ZEB-263)', () => {
     expect(svc.nodes).toHaveLength(1);
     expect(svc.nodes[0].type).toBe('dm');
   });
+
+  it('Fix-G analog: duplicate added preserves parentId/expanded/unread state for community', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    const spaceId = 'aabbccdd' + 'ee'.repeat(28);
+
+    // First insert with parentId='folder-1'.
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId,
+      kind: 'community',
+      name: 'Original Name',
+      parentId: 'folder-1',
+    });
+
+    // Simulate user-applied UI state: collapse the node and give it unread counts.
+    svc.nodes = svc.nodes.map((n) =>
+      n.id === spaceId
+        ? { ...n, expanded: false, unreadCount: 3 }
+        : n,
+    );
+
+    // Cold-replay re-emits added with parentId=null (backend has no concept of
+    // user-applied folder placement or unread state).
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId,
+      kind: 'community',
+      name: 'New Name',
+      parentId: null,
+    });
+
+    const node = svc.nodes.find((n) => n.id === spaceId);
+    expect(node).toBeDefined();
+    // Preserved from existing user state.
+    expect(node!.parentId).toBe('folder-1');
+    expect(node!.expanded).toBe(false);
+    expect(node!.unreadCount).toBe(3);
+    // Name updated from the replay payload.
+    expect(node!.name).toBe('New Name');
+  });
 });

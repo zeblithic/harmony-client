@@ -139,10 +139,17 @@ export class NavService {
       if (action === 'added') {
         const existing = this.nodes.find((n) => n.id === spaceId);
         if (existing) {
-          // Preserve user-applied state on duplicate add (cold-replay)
+          // Preserve user-applied state on duplicate add (cold-replay):
+          // parentId (folder placement), expanded, and unread counters.
           this.nodes = this.nodes.map((n) =>
             n.id === spaceId
-              ? { ...newNode, parentId: existing.parentId, expanded: existing.expanded }
+              ? {
+                  ...newNode,
+                  parentId: existing.parentId,
+                  expanded: existing.expanded,
+                  unreadCount: existing.unreadCount,
+                  unreadLevel: existing.unreadLevel,
+                }
               : n
           );
         } else {
@@ -153,7 +160,7 @@ export class NavService {
         this.nodes = this.nodes.map((n) => {
           if (n.id !== spaceId) return n;
           found = true;
-          return { ...n, name }; // preserve parentId/expanded
+          return { ...n, name }; // preserve existing parentId/expanded/unread state
         });
         if (!found) this.nodes = [...this.nodes, newNode];
       }
