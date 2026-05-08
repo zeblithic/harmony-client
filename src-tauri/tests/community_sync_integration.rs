@@ -1738,18 +1738,42 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         .await
         .expect("a leave");
     registry_a.flush_now(&community_id).await.expect("flush 2");
+    // Wait for BOTH (a) the Leave event to merge into B's CRDT AND
+    // (b) B's tracker entry for (alice, "a-dev") to advance past
+    // first_slot. Polling only `events.len() == 2` was racy under
+    // CI: handle_incoming_publish merges events under the state
+    // lock and records the tracker advance under a separate
+    // tracker lock; the test could observe events.len() == 2
+    // BEFORE the tracker record landed, then trip line 1771's
+    // strictly-newer assertion. (This was an intermittent flake
+    // that fired ~10% on the GitHub Linux runners and never
+    // locally on M-series Macs.)
     {
         let registry_b_for_poll = &registry_b;
+        let first_slot_for_poll = first_slot.clone();
         wait_until(
             Duration::from_secs(2),
             Duration::from_millis(10),
-            || async move {
+            || async {
                 let s = registry_b_for_poll
                     .state_for(&community_id)
                     .await
                     .expect("state b");
-                let g = s.lock().await;
-                g.events.len() == 2
+                let events_len = {
+                    let g = s.lock().await;
+                    g.events.len()
+                };
+                if events_len != 2 {
+                    return false;
+                }
+                let snap = registry_b_for_poll
+                    .tracker_snapshot(&community_id)
+                    .await
+                    .expect("engine b spawned");
+                snap.per_device
+                    .get(&(alice_addr, "a-dev".to_string()))
+                    .map(|slot| slot.is_strictly_newer_than(&first_slot_for_poll))
+                    .unwrap_or(false)
             },
         )
         .await;
