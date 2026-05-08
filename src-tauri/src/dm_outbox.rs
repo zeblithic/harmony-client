@@ -385,6 +385,20 @@ pub struct DmOutbox {
     /// can outlive any single owning context — `RuntimeUnicastTransport`
     /// holds it the same way.
     pub(crate) signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// Phase 4 (ZEB-262): full `PrivateIdentity` snapshot, parallel to
+    /// `signing_key`. The receive-side counter-sign path
+    /// (`community_invite::handle_unicast` →
+    /// `community_membership::attach_countersig_with_identity`) needs a
+    /// `&harmony_identity::PrivateIdentity`, not just an
+    /// `Arc<SigningKey>`. Held alongside `signing_key` so the inbound
+    /// CommunityInvite handler can grab a reference under the dm_outbox
+    /// lock without re-loading the on-disk identity. Both fields MUST
+    /// be derived from the same identity bytes — the
+    /// `dm_outbox_holds_private_identity_for_countersign` test asserts
+    /// they produce identical signatures for the same message, and
+    /// `redeem_invite_inner` snapshots both fields under the outbox
+    /// lock to feed `build_signed_invite_packet`.
+    pub(crate) private_identity: Arc<harmony_identity::PrivateIdentity>,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
 }
@@ -395,12 +409,14 @@ impl DmOutbox {
         self_owner: OwnerAddr,
         our_signing_device_hash: DeviceIdentityHash,
         signing_key: Arc<ed25519_dalek::SigningKey>,
+        private_identity: Arc<harmony_identity::PrivateIdentity>,
     ) -> Self {
         Self {
             device_id,
             self_owner,
             our_signing_device_hash,
             signing_key,
+            private_identity,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
         }
@@ -1604,13 +1620,93 @@ mod tests {
     /// added in Phase 3b Task 10) construct keys + hashes from
     /// `harmony_identity::PrivateIdentity::from_seed` directly.
     fn make_outbox_synthetic(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
-        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
+        // Derive all three identity-bound fields (signing_key,
+        // private_identity, DeviceIdentityHash) from a single
+        // PrivateIdentity seed so the synthetic outbox can never
+        // silently violate the same-identity invariant
+        // `dm_outbox_holds_private_identity_for_countersign` enforces
+        // for production callers. Even though current tests using this
+        // helper don't exercise the cross-binding paths, future tests
+        // that do would otherwise see Ed25519 sig/verify mismatches
+        // with no clear symptom.
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(private_identity);
         DmOutbox::new(
             device_id.into(),
             self_owner,
-            DeviceIdentityHash([0xaa; 16]),
+            device_hash,
             signing_key,
+            private_identity,
         )
+    }
+
+    /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
+    /// `DmOutbox.private_identity` are derived from the same identity
+    /// material — they MUST produce identical Ed25519 signatures over the
+    /// same bytes. A misplumbed field (e.g. signing_key from identity A
+    /// paired with private_identity from identity B) would silently break
+    /// receive-side counter-signing in `handle_invite` without surfacing
+    /// any obvious symptom; this test fails loud at construction time.
+    ///
+    /// Uses `PrivateIdentity::from_private_bytes` round-trip rather than
+    /// `clone()` because `PrivateIdentity` deliberately does NOT implement
+    /// `Clone` (it carries `ZeroizeOnDrop` to discourage accidental copies
+    /// of secret material). Both the `Arc<PrivateIdentity>` stored in the
+    /// outbox AND the local `signing_key` derived for comparison are built
+    /// from the same 64-byte private-bytes blob, so they MUST sign
+    /// identically.
+    #[test]
+    fn dm_outbox_holds_private_identity_for_countersign() {
+        use ed25519_dalek::Signer;
+        use harmony_identity::PrivateIdentity;
+
+        let identity = PrivateIdentity::from_seed(&[0xc7; 32]);
+        let priv_bytes = identity.to_private_bytes();
+        // Round-trip a second instance from the same private bytes — gives
+        // us an Arc<PrivateIdentity> while leaving `identity` available for
+        // seed extraction below.
+        let private_identity = std::sync::Arc::new(
+            PrivateIdentity::from_private_bytes(&priv_bytes).expect("private bytes round-trip"),
+        );
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed));
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        // Derive the DeviceIdentityHash from the SAME identity that
+        // `signing_key` and `private_identity` came from, then assert
+        // it matches what the outbox surfaces. This pins the full
+        // 3-way invariant — without binding the device hash to the
+        // identity, a misplumbed call site could pair a mismatched
+        // hash with a correct sig pair and the receive-side
+        // signing_device_hash check would fail at decode time on
+        // production packets.
+        let device_hash = DeviceIdentityHash(identity.identity.address_hash);
+
+        let outbox = DmOutbox::new(
+            "dev".into(),
+            self_owner,
+            device_hash,
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::clone(&private_identity),
+        );
+
+        let msg = b"countersig harness";
+        let sig_via_outbox_signing_key = outbox.signing_key.sign(msg).to_bytes();
+        let sig_via_private_identity = outbox.private_identity.sign(msg);
+        assert_eq!(
+            sig_via_outbox_signing_key, sig_via_private_identity,
+            "DmOutbox.signing_key and DmOutbox.private_identity must produce identical signatures"
+        );
+        assert_eq!(
+            outbox.our_signing_device_hash.0, outbox.private_identity.identity.address_hash,
+            "DmOutbox.our_signing_device_hash must match private_identity.identity.address_hash \
+             (3-way invariant: signing_key, private_identity, device_hash all from one identity)"
+        );
     }
 
     fn entry(id: u8) -> OutboxEntry {

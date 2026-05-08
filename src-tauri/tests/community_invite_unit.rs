@@ -35,6 +35,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
             logical: 0,
             device_id: "d".into(),
         },
+        expires_at: None,
         sig: [0xCC; 64],
     };
 
@@ -85,6 +86,7 @@ fn invite_token_round_trips_with_hint_none() {
             logical: 0,
             device_id: "d".into(),
         },
+        expires_at: None,
         sig: [0u8; 64],
     };
 
@@ -177,4 +179,721 @@ fn decode_trims_whitespace() {
     let padded = format!("  \n{url}\t  ");
     let decoded = decode_invite_url(&padded).expect("decode trimmed");
     assert_eq!(decoded, payload);
+}
+
+#[test]
+fn community_invite_packet_roundtrip() {
+    use harmony_app::community_invite::{
+        build_signed_invite_packet, decode_packet, device_hash_from_identity_pub, encode_packet,
+        CommunityInvitePacket, CommunityInviteSigned, InviteToken,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+    let community_id = SpaceId([0x10; 16]);
+    let joiner = OwnerAddr([0x22; 16]);
+    let inviter = OwnerAddr([0x11; 16]);
+
+    let join_event = sign_event(
+        &EventPayload {
+            id: [0x44; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    // signing_device_hash MUST equal SHA256(joiner_identity_pub)[..16] —
+    // decode_packet's structural defense-in-depth check enforces this.
+    let joiner_identity_pub = [0x66u8; 64];
+    let signing_device_hash =
+        DeviceIdentityHash(device_hash_from_identity_pub(&joiner_identity_pub));
+
+    let signed = CommunityInviteSigned {
+        community_id,
+        join_event,
+        invite_token: InviteToken {
+            inviter,
+            invitee_hint: Some(joiner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: None,
+            sig: [0x55; 64],
+        },
+        joiner_identity_pub,
+        signing_device_hash,
+        created_at: Hlc {
+            wall_ms: 1100,
+            logical: 0,
+            device_id: "j".into(),
+        },
+    };
+
+    let packet = build_signed_invite_packet(signed.clone(), &signing_key)
+        .expect("build_signed_invite_packet");
+    let wire = encode_packet(&packet).expect("encode");
+
+    // Discriminant byte is 0x10.
+    assert_eq!(wire[0], 0x10, "discriminant byte must be 0x10");
+
+    let decoded = decode_packet(&wire).expect("decode");
+    match (&packet, &decoded) {
+        (
+            CommunityInvitePacket::Invite {
+                signed: s1,
+                signature: sig1,
+                ..
+            },
+            CommunityInvitePacket::Invite {
+                signed: s2,
+                signature: sig2,
+                ..
+            },
+        ) => {
+            assert_eq!(s1, s2);
+            assert_eq!(sig1, sig2);
+        }
+    }
+}
+
+#[test]
+fn community_invite_packet_envelope_sig_rejected_on_tampered_body() {
+    use harmony_app::community_invite::{
+        build_signed_invite_packet, decode_packet, encode_packet, verify_envelope_sig,
+        CommunityInvitePacket, CommunityInviteSigned, InviteToken,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    let identity = harmony_identity::PrivateIdentity::from_seed(&[0xcd; 32]);
+    let identity_pub = identity.identity.to_public_bytes();
+    let joiner_signing_key = {
+        let priv_bytes = identity.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    };
+    let joiner = harmony_app::owner_state_types::OwnerAddr(identity.identity.address_hash);
+
+    let community_id = SpaceId([0x10; 16]);
+    let join_event = sign_event(
+        &EventPayload {
+            id: [0x44; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        },
+        &joiner_signing_key,
+    )
+    .unwrap();
+
+    let signed = CommunityInviteSigned {
+        community_id,
+        join_event,
+        invite_token: InviteToken {
+            inviter: OwnerAddr([0x11; 16]),
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: None,
+            sig: [0x55; 64],
+        },
+        joiner_identity_pub: identity_pub,
+        signing_device_hash: harmony_app::owner_state_types::DeviceIdentityHash(
+            identity.identity.address_hash,
+        ),
+        created_at: Hlc {
+            wall_ms: 1100,
+            logical: 0,
+            device_id: "j".into(),
+        },
+    };
+
+    let packet = build_signed_invite_packet(signed.clone(), &joiner_signing_key).expect("build");
+    let mut wire = encode_packet(&packet).expect("encode");
+
+    // Flip a byte in the signed body region (skip discriminant +
+    // signature trailer). Targets a byte that's part of the CBOR map.
+    let target = 5;
+    assert!(target < wire.len() - 64, "bound check");
+    wire[target] ^= 0xff;
+
+    // Decode still succeeds (CBOR remained syntactically valid for our
+    // chosen byte flip; if the flip lands on a length-prefix it could
+    // fail decode — choose a target byte that's a value, not a
+    // length. Index 5 is inside a map key bstr; fine).
+    let decoded = decode_packet(&wire);
+    if let Ok(CommunityInvitePacket::Invite {
+        signature,
+        signed_bytes,
+        ..
+    }) = decoded
+    {
+        // Envelope-sig verification MUST reject the tampered body.
+        let result = verify_envelope_sig(&signed_bytes, &signature, &identity_pub);
+        assert!(result.is_err(), "envelope sig must reject tampered body");
+    } else {
+        // The byte flip happened to break CBOR decode itself — that's
+        // also an acceptable rejection. The test is satisfied.
+    }
+}
+
+mod verify_rejection_tests {
+    use harmony_app::community_invite::{
+        canonical_invite_token_bytes, verify_packet_pure, CommunityInviteSigned,
+        CommunityInviteVerifyError, InviteToken,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    /// Common harness: build a fully valid CommunityInviteSigned + a
+    /// matching InviteToken signed by `self_identity`. Tests then mutate
+    /// one field and assert the right reject discriminant.
+    fn make_valid_packet(
+        self_identity: &harmony_identity::PrivateIdentity,
+        joiner_identity: &harmony_identity::PrivateIdentity,
+        community_id: SpaceId,
+    ) -> CommunityInviteSigned {
+        let self_owner = OwnerAddr(self_identity.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
+        let joiner_pub = joiner_identity.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_identity.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // Build an InviteToken signed by self over the same canonical bytes
+        // verify_packet_pure reconstructs (mirrors the v1 single-shot
+        // inviter-must-be-self contract).
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_identity.sign(&token_payload_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_identity.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        }
+    }
+
+    fn now_ms() -> u64 {
+        2000
+    }
+
+    #[test]
+    fn community_invite_join_sig_invalid_rejected() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa1; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb2; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        // Flip a byte in the inner Join sig.
+        signed.join_event.sig[0] ^= 0xff;
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(err, CommunityInviteVerifyError::JoinSigInvalid));
+    }
+
+    #[test]
+    fn community_invite_token_sig_invalid_rejected() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa3; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb4; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        signed.invite_token.sig[0] ^= 0xff;
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::InviteTokenSigInvalid
+        ));
+    }
+
+    #[test]
+    fn community_invite_signer_mismatch_rejected() {
+        // InviteToken.signer is some other OwnerAddr (not self).
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb6; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        signed.invite_token.inviter = OwnerAddr([0xaa; 16]); // not self
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::InviteSignerMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn community_invite_id_mismatch_rejected() {
+        // signed.community_id != signed.join_event.community_id.
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa7; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb8; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        signed.community_id = SpaceId([0xff; 16]); // mismatch
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::CommunityIdMismatch
+        ));
+    }
+
+    #[test]
+    fn community_invite_invitee_hint_mismatch_rejected() {
+        // join_event.actor != invite_token.invitee_hint.
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa9; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xba; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        signed.invite_token.invitee_hint = Some(OwnerAddr([0xcc; 16]));
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::InviteeHintMismatch
+        ));
+    }
+
+    #[test]
+    fn community_invite_expired_clock_skew_rejected() {
+        // created_at.wall_ms is way in the future relative to now.
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xab; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xbc; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        // Now is 2000 ms; created_at is set to 999_999_999 ms — way past
+        // the 60_000 ms clock-skew tolerance.
+        signed.created_at.wall_ms = 999_999_999;
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect_err("must reject");
+        assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
+
+    #[test]
+    fn community_invite_expired_token_rejected() {
+        // InviteToken.expires_at is set; created_at is at-or-after that
+        // value, so verify must reject. Spec: signed.created_at.wall_ms
+        // >= signed.invite_token.expires_at → Expired.
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc1; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc2; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // expires_at = 1100 (= packet's created_at). Spec rejects on
+        // created_at >= expires_at.
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(1100),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100, // == expires_at — must reject (>=)
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        let err =
+            verify_packet_pure(&signed, self_owner, now_ms, &self_id).expect_err("must reject");
+        assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
+
+    #[test]
+    fn community_invite_stripped_expires_at_breaks_token_sig() {
+        // Defense-in-depth: an attacker who strips `expires_at` from a
+        // signed token to extend the redemption window MUST trigger an
+        // InviteTokenSigInvalid (the inviter's sig binds the canonical
+        // bytes including `xa`).
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc3; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc4; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // Sign with expires_at = Some(...).
+        let unsigned_with_expiry = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(5_000_000_000),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_with_expiry).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+
+        // Attacker swaps to expires_at = None but keeps the sig.
+        let stripped_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: None,
+            sig: token_sig,
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token: stripped_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        let err = verify_packet_pure(&signed, self_owner, now_ms, &self_id)
+            .expect_err("must reject — sig binds expires_at");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::InviteTokenSigInvalid
+        ));
+    }
+
+    #[test]
+    fn community_invite_valid_packet_admits() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xad; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xbe; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let signed = make_valid_packet(&self_id, &joiner_id, community_id);
+
+        let join_event = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_id,
+        )
+        .expect("must admit");
+        assert_eq!(join_event.actor, OwnerAddr(joiner_id.identity.address_hash));
+    }
+
+    /// Positive control for the `expires_at = Some(future)` admit path.
+    /// A regression that rejected EVERY token with `expires_at = Some(...)`
+    /// would still pass the rejection tests; this catches that.
+    #[test]
+    fn community_invite_valid_packet_with_future_expires_at_admits() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc5; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc6; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // expires_at = 1_000_000 (well after `now_ms` = 2000 and
+        // `created_at = 1100`). Both arms (created_at < expires_at and
+        // now < expires_at) admit.
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(1_000_000),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100,
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        let admitted = verify_packet_pure(&signed, self_owner, now_ms, &self_id)
+            .expect("future expires_at must admit");
+        assert_eq!(admitted.actor, joiner_owner);
+    }
+
+    /// Receive-time replay reject: a packet whose `created_at`
+    /// pre-dated `expires_at` (so it would have been valid at mint)
+    /// MUST be rejected if the receiver's wall clock is now at-or-past
+    /// `expires_at`. Without this arm, an attacker who captures a
+    /// freshly-minted invite-only packet can replay it indefinitely
+    /// after the inviter's intended expiry window closes.
+    #[test]
+    fn community_invite_replay_after_expires_at_rejected() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc7; 32]);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc8; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let self_owner = OwnerAddr(self_id.identity.address_hash);
+        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
+        let joiner_pub = joiner_id.identity.to_public_bytes();
+        let joiner_sk = {
+            let priv_bytes = joiner_id.to_private_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&priv_bytes[32..64]);
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+        };
+        let join_event = sign_event(
+            &EventPayload {
+                id: [0x44; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: joiner_owner,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "j".into(),
+                },
+            },
+            &joiner_sk,
+        )
+        .expect("sign Join");
+
+        // expires_at = 1500. created_at = 1100 (< 1500, valid at mint).
+        // Receiver's now is supplied by a custom now_fn that returns
+        // 1500 — past expiry. Verify must reject.
+        let unsigned_token = InviteToken {
+            inviter: self_owner,
+            invitee_hint: Some(joiner_owner),
+            minted_at: Hlc {
+                wall_ms: 900,
+                logical: 0,
+                device_id: "i".into(),
+            },
+            expires_at: Some(1500),
+            sig: [0u8; 64],
+        };
+        let token_bytes =
+            canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
+        let token_sig = self_id.sign(&token_bytes);
+        let invite_token = InviteToken {
+            sig: token_sig,
+            ..unsigned_token
+        };
+
+        let signed = CommunityInviteSigned {
+            community_id,
+            join_event,
+            invite_token,
+            joiner_identity_pub: joiner_pub,
+            signing_device_hash: DeviceIdentityHash(joiner_id.identity.address_hash),
+            created_at: Hlc {
+                wall_ms: 1100, // < 1500 — passes the created_at arm
+                logical: 0,
+                device_id: "j".into(),
+            },
+        };
+
+        // Bump now to 1500: now >= expires_at must reject.
+        fn now_after_expiry() -> u64 {
+            1500
+        }
+        let err = verify_packet_pure(&signed, self_owner, now_after_expiry, &self_id)
+            .expect_err("must reject — receive-time past expiry");
+        assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
 }

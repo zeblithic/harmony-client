@@ -1832,3 +1832,767 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     registry_a.shutdown_all().await.expect("shutdown a");
     registry_b.shutdown_all().await.expect("shutdown b");
 }
+
+// ─── ZEB-258 atomic-rollback regression test ────────────────────────
+//
+// Pins the invariant that `create_community_inner` does NOT mutate
+// owner-state CRDT when a downstream step (engine spawn or adapter
+// dispatch) fails. The pre-reorder body applied the Community Space
+// row to owner-state BEFORE spawning the engine + dispatching the
+// adapter, so an adapter-Closed dispatch left an orphan Space row
+// committed to owner-state with no engine to publish it. The post-
+// reorder body commits the Space row LAST and tears the engine down
+// on any earlier failure.
+//
+// Test shape: invokes `create_community_inner` DIRECTLY with a
+// closed adapter channel. The helper takes `&Mutex<NodeState>` (not
+// `tauri::State`), so the test constructs a fresh
+// `Mutex<NodeState>` and passes a borrow. The byte-identity
+// assertion is now load-bearing: a regression that re-introduced the
+// pre-reorder shape (apply_space FIRST) would mutate `crdt_state`
+// inside `create_community_inner` BEFORE the failing
+// `community_adapter_tx.try_send`, and the post-snapshot bytes would
+// differ.
+#[tokio::test]
+async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_persist::canonicalize;
+    use std::collections::BTreeMap;
+
+    struct NopResolver;
+    #[async_trait::async_trait]
+    impl IdentityResolver for NopResolver {
+        async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+            None
+        }
+    }
+
+    // Closed adapter receiver → the matching `try_send` inside
+    // `create_community_inner` returns Closed. This is the fault we
+    // inject to drive the rollback path.
+    let (adapter_tx, adapter_rx) =
+        mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(1);
+    drop(adapter_rx);
+
+    // Minimal CAS wiring — the rollback path never reaches the engine's
+    // publish loop, so no real CAS traffic is exchanged. Keep the
+    // receiver alive for clarity even though nothing should be sent on
+    // it.
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        Duration::from_millis(1000),
+    ));
+
+    let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+    let self_owner = OwnerAddr(identity.identity.address_hash);
+    let signing_key = signing_key_from(&identity);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "test-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(NopResolver),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner,
+        signing_key: Arc::clone(&signing_key),
+    }));
+
+    // Pre-call snapshot of owner-state's canonical byte encoding. Any
+    // mutation between here and the post-call snapshot would change at
+    // least one byte (the schema version byte stays put, but the body
+    // CBOR encodes the spaces map, which Phase 1's `apply_space_with_
+    // canonicalization` would non-trivially mutate).
+    let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+    let pre_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode pre-state")
+    };
+
+    // Fence-state. The adapter-dispatch-failure path RETURNS BEFORE
+    // the helper's snapshot-then-commit fence is reached, so the
+    // contents of NodeState don't matter for THIS test (only the
+    // helper's signature requires the borrow). A bare default works.
+    let node_state = std::sync::Mutex::new(harmony_app::NodeState::default());
+
+    // Drive `create_community_inner` directly. With a closed adapter
+    // channel, the helper:
+    //   1. mints Space + bootstrap_join (no side effects)
+    //   2. spawns the engine (success)
+    //   3. `community_adapter_tx.try_send` → Closed → rollback branch:
+    //      `community_registry.stop_engine` then `return Err(...)`
+    // crdt_state is not touched on this branch. Phase 4 Task 7 will
+    // swap stop_engine for shutdown_engine_and_cleanup_persistence;
+    // for ZEB-258 the byte-identity invariant is on owner-state alone.
+    let result = harmony_app::create_community_inner(
+        "TestCommunity".into(),
+        false,
+        Arc::clone(&crdt_state),
+        Arc::clone(&hlc_tracker),
+        "test-dev".into(),
+        self_owner,
+        Arc::clone(&signing_key),
+        Arc::clone(&registry),
+        adapter_tx,
+        0, // snapshot_generation; fence not reached on this path
+        &node_state,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "create_community_inner must return Err when the adapter channel is closed"
+    );
+
+    // ZEB-258 invariant: owner-state CRDT byte-identical to pre-call
+    // snapshot. The post-reorder body only reaches the apply_space
+    // step after every fallible step has succeeded; this test wedges
+    // a Closed adapter dispatch in BEFORE that step, so a correctly
+    // ordered helper leaves crdt_state untouched. A regression that
+    // re-introduced the pre-reorder shape (apply_space FIRST) would
+    // commit `minted.space` to crdt_state before the try_send error,
+    // and the post-snapshot bytes would diverge.
+    let post_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode post-state")
+    };
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "ZEB-258: owner-state CRDT must be byte-identical pre/post a \
+         failed create_community_inner (orphan Space row would prove \
+         the reorder didn't land)"
+    );
+
+    registry.shutdown_all().await.expect("shutdown");
+}
+
+// ── ZEB-262 Phase 4 Task 3: kick + set_power happy-path round-trips ───
+//
+// Two-engine CRDT round-trip tests for kick_from_community and
+// set_power_level. Mirrors the setup pattern of
+// `community_open_flow_integration.rs::open_community_create_redeem_leave_round_trip`:
+// shared in-memory CAS + Reticulum-style mpsc forwarders + two
+// `CommunitySyncEngine` instances + bootstrap-Join pre-seed for both
+// peers (covers cold-cache transient rejection per ZEB-256 §5).
+//
+// After both engines hold {admin Join, B's redemption Join} we mint the
+// kick/set_power event using the new `mint_kick_event` /
+// `mint_set_power_event` pure helpers, insert via engine_a, and assert
+// that B's local materialized state converges to the expected shape.
+
+mod task3_kick_setpower_round_trip {
+    use super::*;
+    use harmony_app::community_membership::{materialize, MaterializedMembership, MemberStatus};
+    use harmony_app::community_state_crdt::InsertOutcome;
+    use harmony_app::community_state_sync::{
+        CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
+        CommunitySyncEngineConfig, PersistPaths,
+    };
+    use harmony_app::{
+        mint_community_creation, mint_kick_event, mint_redemption, mint_set_power_event,
+    };
+    use std::collections::HashMap;
+
+    struct TwoIdentityResolver {
+        a: (OwnerAddr, [u8; 64]),
+        b: (OwnerAddr, [u8; 64]),
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityResolver for TwoIdentityResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.a.0 {
+                Some(self.a.1)
+            } else if *addr == self.b.0 {
+                Some(self.b.1)
+            } else {
+                None
+            }
+        }
+    }
+
+    async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Two-engine fixture: shared CAS, paired mpsc forwarders, A's
+    /// bootstrap Join + B's redemption Join converged on both peers.
+    /// Returns the engines, states, identity material, and minted-B
+    /// payload so callers can mint kick / set_power events with a
+    /// monotonic `prev_hlc` reference.
+    struct Fixture {
+        engine_a: CommunitySyncEngine,
+        engine_b: CommunitySyncEngine,
+        // state_a is held so the Arc clone passed to engine_a stays
+        // alive; the assertions only inspect state_b. Underscore-
+        // prefixed to silence dead_code without dropping the binding.
+        _state_a: Arc<Mutex<CommunityState>>,
+        state_b: Arc<Mutex<CommunityState>>,
+        owner_a: OwnerAddr,
+        owner_b: OwnerAddr,
+        signing_a: Arc<ed25519_dalek::SigningKey>,
+        community_id: SpaceId,
+        minted_b_join_hlc: Hlc,
+        // Hold the temp dirs for the lifetime of the fixture so the
+        // engines' persistence files don't disappear mid-test.
+        _tmp_a: tempfile::TempDir,
+        _tmp_b: tempfile::TempDir,
+    }
+
+    async fn build_fixture(seed_a: u8, seed_b: u8) -> Fixture {
+        let identity_a = PrivateIdentity::from_seed(&[seed_a; 32]);
+        let identity_b = PrivateIdentity::from_seed(&[seed_b; 32]);
+        let owner_a = OwnerAddr(identity_a.identity.address_hash);
+        let owner_b = OwnerAddr(identity_b.identity.address_hash);
+        let pub_a = identity_a.identity.to_public_bytes();
+        let pub_b = identity_b.identity.to_public_bytes();
+        let signing_a = signing_key_from(&identity_a);
+        let signing_b = signing_key_from(&identity_b);
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
+            a: (owner_a, pub_a),
+            b: (owner_b, pub_b),
+        });
+
+        // Shared in-memory CAS servicer.
+        let cas: Arc<Mutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel(64);
+        let cas_for_servicer = Arc::clone(&cas);
+        tokio::spawn(async move {
+            while let Some(op) = cas_op_rx.recv().await {
+                match op {
+                    CasOp::PutLocal { cid, blob, reply } => {
+                        cas_for_servicer.lock().await.insert(cid, blob);
+                        if let Some(r) = reply {
+                            let _ = r.send(Ok(()));
+                        }
+                    }
+                    CasOp::GetOrFetch {
+                        cid,
+                        timeout: _,
+                        reply,
+                    } => {
+                        let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                        let _ = reply.send(Ok(v));
+                    }
+                }
+            }
+        });
+
+        // Wire: A↔B publish/subscribe forwarders.
+        let (a_out_tx, mut a_out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (a_in_tx, a_in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_out_tx, mut b_out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_in_tx, b_in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let a_in_for_fwd = a_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = b_out_rx.recv().await {
+                let _ = a_in_for_fwd.send(bytes).await;
+            }
+        });
+        let b_in_for_fwd = b_in_tx.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = a_out_rx.recv().await {
+                let _ = b_in_for_fwd.send(bytes).await;
+            }
+        });
+
+        // A mints a fresh community + bootstrap Join.
+        let minted_a = mint_community_creation(
+            "TestCommunity",
+            false,
+            owner_a,
+            &signing_a,
+            "a-dev",
+            100_000,
+            None,
+        )
+        .expect("mint create");
+        let community_id = minted_a.community_id;
+
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            Duration::from_secs(2),
+        ));
+
+        let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+        let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+
+        let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+        let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
+
+        let tmp_a = tempfile::tempdir().expect("tmp a");
+        let tmp_b = tempfile::tempdir().expect("tmp b");
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            is_invite_only: false,
+            device_id: "a-dev".into(),
+            self_owner: owner_a,
+            signing_key: Arc::clone(&signing_a),
+            state: Arc::clone(&state_a),
+            tracker: Arc::clone(&tracker_a),
+            content_store: cs_a,
+            publisher_tx: a_out_tx,
+            subscriber_rx: a_in_rx,
+            paths: PersistPaths {
+                crdt: tmp_a.path().join("crdt.cbor"),
+                replay: tmp_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: Some(delta_a_tx),
+            pending_redemptions: None,
+        });
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            is_invite_only: false,
+            device_id: "b-dev".into(),
+            self_owner: owner_b,
+            signing_key: Arc::clone(&signing_b),
+            state: Arc::clone(&state_b),
+            tracker: Arc::clone(&tracker_b),
+            content_store: cs_b,
+            publisher_tx: b_out_tx,
+            subscriber_rx: b_in_rx,
+            paths: PersistPaths {
+                crdt: tmp_b.path().join("crdt.cbor"),
+                replay: tmp_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: Some(delta_b_tx),
+            pending_redemptions: None,
+        });
+
+        // Step 1: A inserts its bootstrap Join.
+        let outcome = engine_a
+            .insert_local_event(minted_a.bootstrap_join.clone())
+            .await
+            .expect("A bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        let _ = tokio::time::timeout(Duration::from_secs(1), delta_a_rx.recv()).await;
+
+        // ZEB-256 Task 6 cold-cache simulation: B insert-locals A's
+        // bootstrap Join so B's membership-at-HLC gate admits A's
+        // first publish.
+        let _ = engine_b
+            .insert_local_event(minted_a.bootstrap_join.clone())
+            .await
+            .expect("B insert A's bootstrap Join (pre-seed)");
+        assert!(
+            wait_until(
+                || async { state_b.lock().await.events.len() == 1 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should hold A's bootstrap Join"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), delta_b_rx.recv()).await;
+
+        // Step 2: B redeems an open invite for the same community.
+        let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
+            community_id,
+            membership_key: minted_a.membership_key.clone(),
+            admin_addr: owner_a,
+            community_name: "TestCommunity".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+        };
+        let minted_b =
+            mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
+                .expect("mint redeem");
+        let redemption_outcome = engine_b
+            .insert_local_event(minted_b.bootstrap_join.clone())
+            .await
+            .expect("B redemption insert");
+        assert_eq!(redemption_outcome, InsertOutcome::Inserted);
+        let _ = tokio::time::timeout(Duration::from_secs(1), delta_b_rx.recv()).await;
+
+        // ZEB-256 Task 6: A insert-locals B's redemption Join too.
+        let _ = engine_a
+            .insert_local_event(minted_b.bootstrap_join.clone())
+            .await
+            .expect("A insert B's redemption Join");
+        assert!(
+            wait_until(
+                || async { state_a.lock().await.events.len() == 2 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "A should hold its own Join + B's redemption Join"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), delta_a_rx.recv()).await;
+
+        Fixture {
+            engine_a,
+            engine_b,
+            _state_a: state_a,
+            state_b,
+            owner_a,
+            owner_b,
+            signing_a,
+            community_id,
+            minted_b_join_hlc: minted_b.bootstrap_join.at.clone(),
+            _tmp_a: tmp_a,
+            _tmp_b: tmp_b,
+        }
+    }
+
+    /// Two-engine kick happy path: admin (A) kicks Bob (B). The Kick
+    /// event materialises on both A and B as MemberStatus::Banned for B.
+    #[tokio::test]
+    async fn admin_kicks_member_round_trip() {
+        let f = build_fixture(0xa1, 0xb2).await;
+
+        // Admin mints a Kick(B) event with prev_hlc anchored to B's
+        // redemption Join (the most recent event A observed).
+        let kick = mint_kick_event(
+            f.community_id,
+            f.owner_a,
+            f.owner_b,
+            Some("test-kick".into()),
+            &f.signing_a,
+            "a-dev",
+            300_000,
+            Some(&f.minted_b_join_hlc),
+        )
+        .expect("mint kick");
+
+        let outcome = f
+            .engine_a
+            .insert_local_event(kick.clone())
+            .await
+            .expect("A insert kick");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // Wait for B to converge on 3 events (admin Join + B Join + Kick).
+        assert!(
+            wait_until(
+                || async { f.state_b.lock().await.events.len() == 3 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should receive the Kick"
+        );
+
+        // Both peers' materialized state should show B as Banned.
+        let events_b: Vec<_> = {
+            let s = f.state_b.lock().await;
+            s.events.values().cloned().collect()
+        };
+        let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
+        assert_eq!(
+            mat_b.members.get(&f.owner_b).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "B's local materialization must show Bob as Banned after Kick converges"
+        );
+
+        f.engine_a.shutdown().await.expect("shutdown a");
+        f.engine_b.shutdown().await.expect("shutdown b");
+    }
+
+    /// Two-engine set_power happy path: admin (A) promotes Bob (B) to
+    /// power 50. After convergence B's materialization shows
+    /// power_levels[Bob] == 50.
+    #[tokio::test]
+    async fn admin_sets_power_round_trip() {
+        let f = build_fixture(0xa3, 0xb4).await;
+
+        let promo = mint_set_power_event(
+            f.community_id,
+            f.owner_a,
+            f.owner_b,
+            50,
+            &f.signing_a,
+            "a-dev",
+            300_000,
+            Some(&f.minted_b_join_hlc),
+        )
+        .expect("mint set_power");
+
+        let outcome = f
+            .engine_a
+            .insert_local_event(promo.clone())
+            .await
+            .expect("A insert set_power");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        assert!(
+            wait_until(
+                || async { f.state_b.lock().await.events.len() == 3 },
+                Duration::from_secs(10),
+            )
+            .await,
+            "B should receive the SetPower"
+        );
+
+        let events_b: Vec<_> = {
+            let s = f.state_b.lock().await;
+            s.events.values().cloned().collect()
+        };
+        let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
+        assert_eq!(
+            mat_b.power_levels.get(&f.owner_b),
+            Some(&50),
+            "B's local materialization must show power_levels[Bob] == 50 after SetPower converges"
+        );
+
+        f.engine_a.shutdown().await.expect("shutdown a");
+        f.engine_b.shutdown().await.expect("shutdown b");
+    }
+}
+
+// ── ZEB-262 Phase 4 Task 8: redeem_invite invite-only rollback regression ─
+//
+// Construct an invite-only invite from Alice (admin) and drive
+// `redeem_invite_inner` from Bob's side without ever populating an
+// `OwnerDeviceCache` entry for the inviter. The inner helper's
+// `resolve_destinations_for_owner` returns an empty Vec, which
+// short-circuits to a "no destinations" Err well before the 300ms
+// timeout fires (the test typically completes in ~10ms).
+//
+// We assert:
+//   1. the call returns Err (no-destinations rollback path);
+//   2. owner-state CRDT is byte-identical pre/post the failed call
+//      (ZEB-258 reorder invariant: Space row commit must NOT happen
+//      until after the oneshot resolves successfully — and on this
+//      rollback path it never resolves at all).
+//
+// The helper `redeem_invite_inner` accepts a closure for the
+// snapshot-then-commit fence (`F: Fn() -> Result<(), String>`); the
+// production wrapper passes a closure that re-locks `NodeState`'s std
+// Mutex and compares `generation`, while this test passes `|| Ok(())`.
+#[tokio::test]
+async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
+    use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_persist::canonicalize;
+    use harmony_app::owner_state_types::{DeviceIdentityHash, MembershipKey};
+    use std::collections::BTreeMap;
+
+    // Short timeout so the test runs fast. RAII guard restores any
+    // prior value on Drop (including on panic), keeping the binary's
+    // env-var state clean for subsequent tests.
+    struct RedeemTimeoutGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl Drop for RedeemTimeoutGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
+                None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
+            }
+        }
+    }
+    let _timeout_guard = {
+        let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+        std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "300");
+        RedeemTimeoutGuard { prior }
+    };
+
+    struct AliceResolver {
+        addr: OwnerAddr,
+        pubkey: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl IdentityResolver for AliceResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.addr {
+                Some(self.pubkey)
+            } else {
+                None
+            }
+        }
+    }
+
+    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
+    let alice_addr = OwnerAddr(alice.identity.address_hash);
+    let alice_pub = alice.identity.to_public_bytes();
+
+    let bob = Arc::new(PrivateIdentity::from_seed(&[0xb2; 32]));
+    let bob_addr = OwnerAddr(bob.identity.address_hash);
+    let bob_device_hash = DeviceIdentityHash(bob.identity.address_hash);
+    let bob_signing_key = signing_key_from(&bob);
+
+    // Build an invite-only URL Alice would have generated for Bob. The
+    // InviteToken sig is computed via `PrivateIdentity::sign` over the
+    // canonical token-payload bytes (inviter, invitee_hint, minted_at).
+    // We construct a placeholder InviteToken to call
+    // `canonical_invite_token_bytes` (which only reads the payload
+    // fields, ignoring `sig`), then re-construct with the real sig.
+    let community_id = SpaceId([0x33; 16]);
+    let mk = MembershipKey::new([0xaa; 32]);
+    let minted_at = Hlc {
+        wall_ms: 1000,
+        logical: 0,
+        device_id: "alice-dev".into(),
+    };
+    let placeholder_token = InviteToken {
+        inviter: alice_addr,
+        invitee_hint: Some(bob_addr),
+        minted_at: minted_at.clone(),
+        expires_at: None,
+        sig: [0u8; 64],
+    };
+    let token_payload_bytes =
+        harmony_app::community_invite::canonical_invite_token_bytes(&placeholder_token)
+            .expect("canonical_invite_token_bytes");
+    let token_sig = alice.sign(&token_payload_bytes);
+    let invite_token = InviteToken {
+        inviter: alice_addr,
+        invitee_hint: Some(bob_addr),
+        minted_at,
+        expires_at: None,
+        sig: token_sig,
+    };
+    let url = encode_invite_url(&CommunityInvitePayload {
+        community_id,
+        membership_key: mk.clone(),
+        admin_addr: alice_addr,
+        community_name: "Test".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(invite_token),
+    })
+    .expect("encode URL");
+
+    // Bob's side: registry + crdt + tracker.
+    let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "bob-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(AliceResolver {
+            addr: alice_addr,
+            pubkey: alice_pub,
+        }),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: bob_addr,
+        signing_key: Arc::clone(&bob_signing_key),
+    }));
+
+    let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+
+    // Unicast send channel — keep the receiver alive so try_send doesn't
+    // immediately fail Closed (we want the timeout path, not the
+    // unicast-error path). The receiver is unbuffered for this test;
+    // the packet sits there forever, the oneshot never fires, and the
+    // 300ms timeout drives us to the rollback branch.
+    let (unicast_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(64);
+
+    // Adapter request channel — kept alive so the spawn-side dispatch
+    // doesn't fail Closed. (We don't need the event_loop on the other
+    // side; the test never requires the adapter task to actually run.)
+    let (adapter_tx, _adapter_rx) =
+        mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(64);
+
+    // dm_outbox for the inner helper to read `private_identity` +
+    // `signing_key` under-lock. The DmOutbox::new signature matches
+    // production; we share `bob` via Arc.
+    let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
+        "bob-dev".into(),
+        bob_addr,
+        bob_device_hash,
+        Arc::clone(&bob_signing_key),
+        Arc::clone(&bob),
+    )));
+
+    // Pre-call snapshot of owner-state's canonical encoding. Any
+    // mutation between here and post-call would change the bytes.
+    let pre_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode pre-state")
+    };
+
+    // Drive `redeem_invite_inner` directly. The `fence_check` closure
+    // is a no-op for this test (production wraps a NodeState
+    // generation guard); inviter is unreachable (no
+    // OwnerDeviceCache entry for alice_addr → resolve_destinations
+    // returns empty → early Err). Either way the rollback path runs
+    // and owner-state must remain untouched.
+    let result = harmony_app::redeem_invite_inner(
+        url,
+        Arc::clone(&crdt_state),
+        Arc::clone(&hlc_tracker),
+        "bob-dev".into(),
+        bob_addr,
+        Arc::clone(&bob_signing_key),
+        Arc::clone(&registry),
+        adapter_tx,
+        unicast_tx,
+        Arc::clone(&dm_outbox),
+        || Ok(()),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "invite-only redeem must Err when inviter is unreachable; got {:?}",
+        result
+    );
+
+    // ZEB-258 invariant: owner-state CRDT byte-identical pre/post the
+    // failed call. A regression that committed `minted.space` BEFORE
+    // the oneshot await would diverge here.
+    let post_bytes: Vec<u8> = {
+        let g = crdt_state.lock().await;
+        canonicalize(&g).expect("encode post-state")
+    };
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "ZEB-258: owner-state CRDT must be byte-identical pre/post a \
+         failed redeem_invite (orphan Space row would prove the \
+         reorder didn't land)"
+    );
+
+    // RedeemTimeoutGuard restores the prior env-var on Drop after this.
+    registry.shutdown_all().await.expect("shutdown");
+}

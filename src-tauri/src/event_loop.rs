@@ -234,6 +234,15 @@ pub async fn run<R: Runtime>(
     // adapter spawn is fire-and-forget so two requests on the same
     // tick fan out concurrently rather than serializing.
     mut community_adapter_request_rx: mpsc::Receiver<CommunityAdapterRequest>,
+    // ZEB-262 Phase 4 Task 9: community sync registry. Threaded into
+    // `handle_runtime_action_or_dispatch` so the new
+    // `inbound_packet::try_dispatch_community` discriminant pre-fork
+    // can route 0x10 community packets to
+    // `community_invite::handle_unicast`. `None` until the owner
+    // identity is loaded — same gating shape as `dm_outbox` /
+    // `crdt_state`. The handler drops the packet (with a warn-log) if
+    // the registry isn't set yet.
+    community_registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1003,6 +1012,7 @@ pub async fn run<R: Runtime>(
                             &broadcast_addr, &app, &closing, &own_zid,
                             dm_outbox.as_ref(), crdt_state.as_ref(),
                             cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                            community_registry.as_ref(),
                             &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                         ).await;
                     }
@@ -1033,6 +1043,7 @@ pub async fn run<R: Runtime>(
                                 &broadcast_addr, &app, &closing, &own_zid,
                                 dm_outbox.as_ref(), crdt_state.as_ref(),
                                 cas_handle.as_ref(), unicast_send_tx.as_ref(),
+                                community_registry.as_ref(),
                                 &mut runtime_action_retry, RUNTIME_ACTION_RETRY_CAP,
                             ).await;
                         }
@@ -1325,6 +1336,7 @@ pub async fn run<R: Runtime>(
                     crdt_state.as_ref(),
                     cas_handle.as_ref(),
                     unicast_send_tx.as_ref(),
+                    community_registry.as_ref(),
                     &mut runtime_action_retry,
                     RUNTIME_ACTION_RETRY_CAP,
                 )
@@ -1352,6 +1364,7 @@ pub async fn run<R: Runtime>(
                 crdt_state.as_ref(),
                 cas_handle.as_ref(),
                 unicast_send_tx.as_ref(),
+                community_registry.as_ref(),
                 &mut runtime_action_retry,
                 RUNTIME_ACTION_RETRY_CAP,
             )
@@ -1408,10 +1421,38 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
     crdt_state: Option<&std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
     cas_handle: Option<&std::sync::Arc<dyn crate::content_store::ContentStore>>,
     unicast_send_tx: Option<&mpsc::Sender<crate::dm_outbox::UnicastSendRequest>>,
+    // ZEB-262 Phase 4 Task 9: registry handle for the community-packet
+    // discriminant pre-fork (`inbound_packet::try_dispatch_community`).
+    // None until owner identity is loaded; same gating as `dm_outbox`.
+    community_registry: Option<&std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
     retry_buffer: &mut std::collections::VecDeque<RuntimeAction>,
     retry_buffer_cap: usize,
 ) {
     if matches!(action, RuntimeAction::UnicastReceived { .. }) {
+        // ZEB-262 Phase 4 Task 9: discriminant pre-fork. Peek
+        // `packet[0]`; if `0x10` (community packet), route to
+        // `inbound_packet::try_dispatch_community` and short-circuit.
+        // Otherwise fall through to the existing DM dispatch
+        // (preserves Path B 0x01-0x03 + unknown-discriminant logging).
+        if let RuntimeAction::UnicastReceived { packet, .. } = &action {
+            if packet.first() == Some(&0x10) {
+                if let (Some(outbox), Some(state)) = (dm_outbox, crdt_state) {
+                    crate::inbound_packet::try_dispatch_community(
+                        community_registry,
+                        outbox,
+                        state,
+                        packet,
+                        Some(app),
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(
+                        "received community packet (0x10) but DM runtime not initialized (no owner identity?); dropping"
+                    );
+                }
+                return;
+            }
+        }
         if let (Some(outbox), Some(state), Some(cas), Some(tx)) =
             (dm_outbox, crdt_state, cas_handle, unicast_send_tx)
         {

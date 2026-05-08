@@ -290,6 +290,51 @@ impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
 /// enough to collapse keystroke-rate mutations into one publish.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
 
+/// ZEB-262 Phase 4: shared per-EventId oneshot map. The
+/// `CommunitySyncRegistry` owns the `Arc` and exposes
+/// `register_pending_redemption` / `take_pending_redemption` /
+/// `notify_pending_redemption` for the IPC side; spawned engines
+/// receive a clone of the same `Arc` so their post-`Inserted` hooks
+/// (`insert_local_event`, `handle_incoming_publish`) can fire any
+/// matching oneshot WITHOUT needing a back-reference to the registry
+/// (avoids the `Arc<Self>` / `Weak<Self>` cycle dance and the async-
+/// callback-typing problem — `oneshot::Sender::send` is sync, so the
+/// engine takes the lock, removes, drops the guard, then sends).
+///
+/// **Lock-discipline:** the map is held under a `tokio::sync::Mutex`.
+/// Callers MUST drop the guard before any `.await` on the recovered
+/// `Sender`. The `send(())` call is itself sync; the helpers below
+/// (and the engine call sites) consistently take-then-drop-then-send
+/// to keep this invariant local to the lookup-and-fire pattern.
+pub type PendingRedemptionMap = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<
+            crate::community_membership::EventId,
+            tokio::sync::oneshot::Sender<()>,
+        >,
+    >,
+>;
+
+/// Fire any oneshot registered against `event_id` in `pending`.
+/// No-op if no registration exists. Lock is held only across `remove`;
+/// the `send(())` happens after the guard is dropped.
+async fn notify_pending_redemption_in_map(
+    pending: &PendingRedemptionMap,
+    event_id: &crate::community_membership::EventId,
+) {
+    let sender = {
+        let mut g = pending.lock().await;
+        g.remove(event_id)
+    };
+    if let Some(tx) = sender {
+        // tx.send(()) returns Result<(), ()> — error means the
+        // receiver was dropped (timeout fired before us). Either way
+        // the oneshot is consumed; we've satisfied our notify
+        // contract.
+        let _ = tx.send(());
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum CommunitySyncError {
     #[error("crypto: {0}")]
@@ -576,6 +621,13 @@ pub struct CommunitySyncEngineConfig {
     /// (the IPC consumer is purely informational, so back-pressuring
     /// the engine on a stuck consumer is wrong).
     pub delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+    /// ZEB-262 Phase 4: shared map of pending `redeem_invite` oneshots,
+    /// keyed by the joiner's bootstrap_join `EventId`. The registry's
+    /// `spawn_engine` clones its own `Arc` into this field so the
+    /// engine's post-`Inserted` hooks can fire matching oneshots
+    /// without a back-reference to the registry. `None` for tests /
+    /// pre-Phase-4 callers that don't exercise the redeem path.
+    pub pending_redemptions: Option<PendingRedemptionMap>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -640,6 +692,13 @@ pub struct CommunitySyncEngine {
     /// `insert_local_event` can emit a delta on `Inserted` outcomes,
     /// matching the receive pipeline's behaviour.
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+    /// ZEB-262 Phase 4: shared pending-redemption map. Cloned from the
+    /// config so `insert_local_event` can fire any matching oneshot on
+    /// `Inserted` outcomes (mirroring the receive pipeline's
+    /// `handle_incoming_publish` hook — the spawned task carries its
+    /// own clone via `InternalCtx`). `None` for engines spawned
+    /// without a registry, e.g. legacy unit tests.
+    pending_redemptions: Option<PendingRedemptionMap>,
 }
 
 impl CommunitySyncEngine {
@@ -668,6 +727,7 @@ impl CommunitySyncEngine {
         let identity_resolver_for_engine = cfg.identity_resolver.clone();
         let is_invite_only_for_engine = cfg.is_invite_only;
         let delta_tx_for_engine = cfg.delta_tx.clone();
+        let pending_redemptions_for_engine = cfg.pending_redemptions.clone();
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -691,6 +751,7 @@ impl CommunitySyncEngine {
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
             delta_tx: cfg.delta_tx,
+            pending_redemptions: cfg.pending_redemptions,
         }));
 
         Self {
@@ -706,6 +767,7 @@ impl CommunitySyncEngine {
             identity_resolver: identity_resolver_for_engine,
             is_invite_only: is_invite_only_for_engine,
             delta_tx: delta_tx_for_engine,
+            pending_redemptions: pending_redemptions_for_engine,
         }
     }
 
@@ -795,6 +857,49 @@ impl CommunitySyncEngine {
             None
         };
 
+        self.insert_event_with_resolved_pubs(event, actor_pub, countersigner_pub)
+            .await
+    }
+
+    /// Variant of `insert_local_event` that accepts already-verified
+    /// actor + countersigner identity pubs, bypassing `IdentityResolver`.
+    ///
+    /// ZEB-262 Phase 4: the invite-only receive path already proves the
+    /// joiner's identity_pub via the inline `joiner_identity_pub` field
+    /// (Path B app-sig binding) BEFORE this insert runs — but the joiner
+    /// is not yet in the receiver's `OwnerDeviceCache`, so the production
+    /// `OwnerDeviceCacheResolver` would return `None` and surface
+    /// `UnknownActor`. That's the bootstrap-by-design case the inline
+    /// pub is for. Pass it through directly here.
+    ///
+    /// The CRDT-layer verify (`VerifyContext.actor_identity_pub`) is
+    /// unchanged — same code path, same expected_community_id binding,
+    /// same admin / invite-only checks. Only resolver lookup is skipped.
+    pub async fn insert_local_event_with_pubs(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+        actor_identity_pub: [u8; 64],
+        countersigner_identity_pub: Option<[u8; 64]>,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+        self.insert_event_with_resolved_pubs(event, actor_identity_pub, countersigner_identity_pub)
+            .await
+    }
+
+    /// Shared body for `insert_local_event` and
+    /// `insert_local_event_with_pubs` — runs the verify + state mutate +
+    /// post-Inserted hook chain with already-resolved pubs.
+    async fn insert_event_with_resolved_pubs(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+        actor_pub: [u8; 64],
+        countersigner_pub: Option<[u8; 64]>,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
         // Bind expected_community_id to the engine's configured value,
         // NOT the (caller-controlled) event payload. Without this, a
         // malicious or buggy IPC could bypass the cross-community routing
@@ -818,6 +923,17 @@ impl CommunitySyncEngine {
             outcome,
             crate::community_state_crdt::InsertOutcome::Inserted
         ) {
+            // ZEB-262 Phase 4: fire any redeem_invite oneshot waiting
+            // on this event id BEFORE the delta-emit / notify_dirty
+            // hooks. The send is sync; the lock is released before
+            // we touch any other channel. Order doesn't affect
+            // correctness — the oneshot, the delta channel, and the
+            // publish-debounce all observe the same Inserted event —
+            // but firing the oneshot first keeps the redeem_invite
+            // IPC's wait-then-decode latency minimal.
+            if let Some(pending) = self.pending_redemptions.as_ref() {
+                notify_pending_redemption_in_map(pending, &event.id).await;
+            }
             if let Some(tx) = self.delta_tx.as_ref() {
                 let _ = tx.try_send(CommunityMembershipDelta {
                     community_id: event.community_id,
@@ -900,6 +1016,11 @@ struct InternalCtx {
     identity_resolver: Option<Arc<dyn IdentityResolver>>,
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+    /// ZEB-262 Phase 4: shared pending-redemption map. Used by
+    /// `handle_incoming_publish` to fire any oneshot registered
+    /// against an Inserted event's id. `None` skips the notify path —
+    /// safe for non-redeem callers.
+    pending_redemptions: Option<PendingRedemptionMap>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -1828,6 +1949,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         tracker.record(payload.publisher_addr, payload.at.clone());
     }
 
+    // ZEB-262 Phase 4: fire any redeem_invite oneshots waiting on
+    // events that were Inserted in this merge cycle. The notify path
+    // shares the lock-and-fire helper with `insert_local_event`; the
+    // map lock is taken once per inserted id (each call is independent)
+    // and dropped before any `.await` (the helper's send is sync). We
+    // borrow `&event.id` here so the subsequent delta-emit loop can
+    // still consume `inserted_events` by value.
+    if let Some(pending) = ctx.pending_redemptions.as_ref() {
+        for event in &inserted_events {
+            notify_pending_redemption_in_map(pending, &event.id).await;
+        }
+    }
+
     // Phase C-pre: emit membership-delta for every inserted event
     // outside the state lock. `try_send` is fire-and-forget — a closed
     // or full channel drops the delta rather than back-pressuring the
@@ -2066,6 +2200,30 @@ pub struct CommunityRegistryConfig {
 pub struct CommunitySyncRegistry {
     cfg: Arc<CommunityRegistryConfig>,
     engines: tokio::sync::Mutex<BTreeMap<SpaceId, Arc<CommunitySyncEngine>>>,
+    /// ZEB-262 Phase 4: per-`EventId` oneshots that fire when the
+    /// matching `SignedMembershipEvent` is Inserted into ANY engine in
+    /// this registry. The `redeem_invite` IPC registers a oneshot
+    /// keyed on its minted `bootstrap_join.id` BEFORE sending the
+    /// `CommunityInvitePacket`, then awaits the oneshot with timeout.
+    /// The engine's post-Inserted hook (`insert_local_event` for the
+    /// local-mint path, `handle_incoming_publish` for the receive
+    /// path) calls into the shared map and fires any matching
+    /// oneshot.
+    ///
+    /// **Plumb shape:** the engine doesn't hold a back-reference to
+    /// the registry. Instead, the registry shares this `Arc<Mutex<…>>`
+    /// directly with each spawned engine via
+    /// `CommunitySyncEngineConfig.pending_redemptions`. This avoids
+    /// an `Arc<Self>`/`Weak<Self>` cycle and keeps the notify path
+    /// sync (`oneshot::Sender::send` is sync — the map lock is held
+    /// only across the `remove`).
+    ///
+    /// **Lock-discipline:** the map is held under a `tokio::sync::Mutex`.
+    /// The helpers below (and the engine call sites) ALL take the lock,
+    /// extract / mutate, drop the guard, then operate on the recovered
+    /// `Sender`. Never hold the guard across an `.await` of the
+    /// recovered sender.
+    pending_redemptions: PendingRedemptionMap,
 }
 
 impl CommunitySyncRegistry {
@@ -2073,7 +2231,92 @@ impl CommunitySyncRegistry {
         Self {
             cfg: Arc::new(cfg),
             engines: tokio::sync::Mutex::new(BTreeMap::new()),
+            pending_redemptions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
+    }
+
+    /// Register a oneshot to fire when the `SignedMembershipEvent` with
+    /// `event_id` is Inserted into any engine in this registry. Replaces
+    /// any existing oneshot for the same `event_id` (the prior sender is
+    /// dropped, which the prior caller's `.await` on the receiver
+    /// surfaces as `Err(RecvError)` — interpret as "redemption
+    /// superseded"). v1 doesn't deduplicate registrations because the
+    /// caller pattern (one `redeem_invite` IPC = one fresh `event_id`)
+    /// keeps the map naturally sparse.
+    pub async fn register_pending_redemption(
+        &self,
+        event_id: crate::community_membership::EventId,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut g = self.pending_redemptions.lock().await;
+        g.insert(event_id, sender);
+        // guard dropped at end of scope
+    }
+
+    /// Remove the oneshot for `event_id` without firing it. Called by
+    /// the IPC's timeout path so a late-arriving counter-signed Join
+    /// doesn't try to send to a dead receiver.
+    pub async fn take_pending_redemption(
+        &self,
+        event_id: &crate::community_membership::EventId,
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+        let mut g = self.pending_redemptions.lock().await;
+        g.remove(event_id)
+    }
+
+    /// If a oneshot is registered for `event_id`, take it out of the
+    /// map and fire it. No-op if no registration exists. The engine's
+    /// insert hooks call this directly via the shared `Arc` (see
+    /// `notify_pending_redemption_in_map`); this method exists for
+    /// IPC-side / direct callers (and is the symmetric companion to
+    /// `register_pending_redemption` / `take_pending_redemption`).
+    ///
+    /// **Lock-discipline:** the map lock is held only across the
+    /// `remove` call. The `send(())` on `oneshot::Sender` is sync, so
+    /// no `.await` happens with the guard alive.
+    pub async fn notify_pending_redemption(&self, event_id: &crate::community_membership::EventId) {
+        notify_pending_redemption_in_map(&self.pending_redemptions, event_id).await;
+    }
+
+    /// ZEB-258 rollback primitive: stop the engine task for
+    /// `community_id` (drops adapter + Zenoh subscriber), then remove
+    /// its per-community persistence directory.
+    ///
+    /// **Idempotent:** unknown `community_id` returns `Ok(())` — both
+    /// `stop_engine` (no-op on missing) and the `if dir.exists()` guard
+    /// flow through cleanly. Used by `create_community_inner` /
+    /// `redeem_invite` rollback paths so the per-community
+    /// `crdt.cbor` + `replay.cbor` don't accumulate on the disk after
+    /// a partially-failed creation.
+    ///
+    /// **Caller responsibility:** ensure no other thread holds an
+    /// `Arc<CommunitySyncEngine>` from this registry. Typical use is
+    /// "I just spawned this; no one else has a handle yet." If a
+    /// handle has leaked elsewhere, those holders see `TransportClosed`
+    /// once teardown completes.
+    pub async fn shutdown_engine_and_cleanup_persistence(
+        &self,
+        community_id: &SpaceId,
+    ) -> Result<(), CommunitySyncError> {
+        // Phase 1: stop the engine task (idempotent on missing).
+        self.stop_engine(community_id).await?;
+
+        // Phase 2: remove the per-community persistence directory.
+        // `tokio::fs::remove_dir_all` so we don't park a worker thread
+        // on the synchronous `std::fs::remove_dir_all`.
+        let dir = self
+            .cfg
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        if dir.exists() {
+            tokio::fs::remove_dir_all(&dir)
+                .await
+                .map_err(|e| CommunitySyncError::Persist(format!("remove_dir_all {dir:?}: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Derive per-community persist paths under
@@ -2190,6 +2433,13 @@ impl CommunitySyncRegistry {
             identity_resolver: Some(Arc::clone(&self.cfg.identity_resolver)),
             error_tx: self.cfg.error_tx.clone(),
             delta_tx: self.cfg.delta_tx.clone(),
+            // ZEB-262 Phase 4: hand the engine a clone of the shared
+            // pending-redemption map. The engine's post-Inserted hooks
+            // (`insert_local_event`, `handle_incoming_publish`) fire
+            // any matching oneshot. The registry retains its own
+            // `Arc` for IPC-side `register_pending_redemption` /
+            // `take_pending_redemption` / `notify_pending_redemption`.
+            pending_redemptions: Some(std::sync::Arc::clone(&self.pending_redemptions)),
         }));
 
         engines.insert(community_id, engine);

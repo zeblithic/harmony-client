@@ -265,6 +265,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                         >(1);
                         rx
                     },
+                    None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                 )
                 .await;
             });

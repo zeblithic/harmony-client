@@ -197,6 +197,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         identity_resolver: Some(Arc::clone(&resolver)),
         error_tx: None,
         delta_tx: Some(delta_a_tx),
+        pending_redemptions: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
@@ -219,6 +220,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         identity_resolver: Some(Arc::clone(&resolver)),
         error_tx: None,
         delta_tx: Some(delta_b_tx),
+        pending_redemptions: None,
     });
 
     // ── Step 1: A inserts its bootstrap Join. ─────────────────────────
@@ -503,6 +505,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         identity_resolver: Some(Arc::clone(&resolver)),
         error_tx: None,
         delta_tx: Some(delta_a_tx),
+        pending_redemptions: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
@@ -525,6 +528,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         identity_resolver: Some(Arc::clone(&resolver)),
         error_tx: None,
         delta_tx: Some(delta_b_tx),
+        pending_redemptions: None,
     });
 
     // ── A bootstrap → B converges ─────────────────────────────────────

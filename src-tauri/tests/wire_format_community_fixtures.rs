@@ -164,6 +164,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: Some(OwnerAddr([0x22; 16])),
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let p = CommunityInvitePayload {
@@ -191,6 +192,7 @@ fn invite_token_targeted_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: Some(OwnerAddr([0x22; 16])),
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let bytes = canonical_cbor_encode(&t).expect("encode");
@@ -209,6 +211,7 @@ fn invite_token_open_wire_bytes_pinned() {
         inviter: OwnerAddr([0x11; 16]),
         invitee_hint: None,
         minted_at: fixture_hlc(),
+        expires_at: None,
         sig: [0xDD; 64],
     };
     let bytes = canonical_cbor_encode(&t).expect("encode");
@@ -218,5 +221,114 @@ fn invite_token_open_wire_bytes_pinned() {
         hex,
         "a36269765011111111111111111111111111111111626d74a361771b0000018bcfe56800616c006164636669786273675840dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "InviteToken (open) wire format changed"
+    );
+}
+
+/// ZEB-262 Phase 4: pin the CommunityInviteSigned canonical CBOR bytes.
+/// Mirrors community_membership_signed_event_canonical_roundtrip — the
+/// fixture catches encoder drift across phases.
+///
+/// Re-run with `cargo test community_invite_signed_wire_bytes_pinned`
+/// and update the pinned bytes IFF a deliberate wire-format change is
+/// shipping. Pinned bytes diverging from the encoder output is a
+/// regression — debug before regen.
+#[test]
+fn community_invite_signed_wire_bytes_pinned() {
+    use harmony_app::community_invite::CommunityInviteSigned;
+    use harmony_app::community_invite::InviteToken;
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    let community_id = SpaceId([0x10; 16]);
+    let inviter = OwnerAddr([0x11; 16]);
+    let joiner = OwnerAddr([0x22; 16]);
+
+    // Build a Join event; sign with a deterministic test key so the
+    // pinned bytes are stable.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+    let join_event = sign_event(
+        &EventPayload {
+            id: [0x44; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    // Build an InviteToken (sig is just deterministic test bytes —
+    // wire-format pin doesn't validate the sig).
+    let invite_token = InviteToken {
+        inviter,
+        invitee_hint: Some(joiner),
+        minted_at: Hlc {
+            wall_ms: 1_699_000_000_000,
+            logical: 0,
+            device_id: "inviter-dev".into(),
+        },
+        expires_at: None,
+        sig: [0x55; 64],
+    };
+
+    let signed = CommunityInviteSigned {
+        community_id,
+        join_event,
+        invite_token,
+        joiner_identity_pub: [0x66; 64],
+        signing_device_hash: DeviceIdentityHash([0x77; 16]),
+        created_at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+
+    let bytes = canonical_cbor_encode(&signed).expect("encode");
+    let decoded: CommunityInviteSigned = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, signed, "roundtrip identity");
+
+    // Pin the canonical bytes byte-for-byte. If this assertion fires
+    // with a deliberate wire-format change, regenerate by adding a
+    // temporary `println!("{:?}", bytes);`, running with --nocapture,
+    // pasting the slice into PINNED, and removing the println. Pinned
+    // bytes diverging from the encoder output otherwise is a regression
+    // — debug before regen.
+    const PINNED: &[u8] = &[
+        166, 98, 99, 105, 80, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 98,
+        106, 101, 166, 98, 105, 100, 80, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
+        68, 68, 98, 99, 105, 80, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+        98, 107, 110, 161, 98, 116, 103, 97, 106, 98, 97, 99, 80, 34, 34, 34, 34, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 34, 98, 97, 116, 163, 97, 119, 27, 0, 0, 1, 139, 207, 229, 104,
+        0, 97, 108, 0, 97, 100, 106, 106, 111, 105, 110, 101, 114, 45, 100, 101, 118, 98, 115, 103,
+        88, 64, 14, 26, 113, 163, 63, 49, 134, 165, 15, 179, 35, 97, 75, 104, 25, 74, 178, 43, 40,
+        178, 205, 237, 93, 226, 3, 122, 184, 228, 142, 66, 248, 35, 91, 25, 143, 165, 197, 90, 27,
+        214, 35, 204, 226, 37, 197, 253, 62, 181, 184, 129, 20, 132, 91, 114, 131, 79, 78, 184,
+        186, 211, 111, 179, 33, 9, 98, 105, 116, 164, 98, 105, 118, 80, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 17, 17, 17, 17, 17, 17, 17, 98, 105, 104, 80, 34, 34, 34, 34, 34, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 98, 109, 116, 163, 97, 119, 27, 0, 0, 1, 139, 148, 74, 158, 0,
+        97, 108, 0, 97, 100, 107, 105, 110, 118, 105, 116, 101, 114, 45, 100, 101, 118, 98, 115,
+        103, 88, 64, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85,
+        85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85,
+        85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 85, 98,
+        105, 112, 88, 64, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 98, 100, 104, 80,
+        119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 98, 99, 97,
+        163, 97, 119, 27, 0, 0, 1, 139, 207, 229, 107, 232, 97, 108, 0, 97, 100, 106, 106, 111,
+        105, 110, 101, 114, 45, 100, 101, 118,
+    ];
+    assert_eq!(
+        bytes.as_slice(),
+        PINNED,
+        "CommunityInviteSigned wire format drifted from pinned bytes — \
+         debug encoder drift, regen the pin only on a deliberate wire-format change"
     );
 }

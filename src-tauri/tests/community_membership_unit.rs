@@ -2474,3 +2474,129 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
     assert_eq!(err, VerifyError::ActorPubkeyMismatch);
 }
+
+// ── ZEB-262 Phase 4 Task 3: kick + set_power edge regression-pins ─────
+//
+// These three tests pin existing Phase 1 invariants (KickTargetPowerNotLower,
+// PowerLevelOutOfRange, admin-self-demote happy path). They exist as a
+// regression harness so the kick_from_community / set_power_level IPCs
+// land on a guaranteed-stable verify_event. Adapted from the plan to use
+// the existing `make_test_identity` + `sign_event_with_identity` helpers
+// (the canonical PrivateIdentity-driven path the rest of this file uses).
+
+#[test]
+fn kick_self_rejected_with_kick_target_power_not_lower() {
+    // Admin kicks self — admin power 100, target (self) power 100, so
+    // target.power not strictly less than actor.power → reject.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa1);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 1000)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [2u8; 16],
+        community_id: SpaceId([0x77; 16]),
+        kind: MembershipEventKind::Kick {
+            target: admin,
+            reason: None,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([0x77; 16]),
+        admin_addr: admin,
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::KickTargetPowerNotLower);
+}
+
+#[test]
+fn set_power_out_of_range_rejected() {
+    // SetPower with level=200 — exceeds POWER_THRESHOLDS.max (100). Even
+    // an admin can't bypass this; it's a wire-format range check.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa2);
+    let target = OwnerAddr([0xbb; 16]);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 1000)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [3u8; 16],
+        community_id: SpaceId([0x88; 16]),
+        kind: MembershipEventKind::SetPower { target, level: 200 },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([0x88; 16]),
+        admin_addr: admin,
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+
+    let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
+    assert_eq!(err, VerifyError::PowerLevelOutOfRange);
+}
+
+#[test]
+fn set_power_admin_self_demote_inserts() {
+    // Admin demotes self to power 50. Foot-gun, but verify_event MUST
+    // accept (admin power 100 ≥ set_power_threshold 100; level 50 in
+    // range; no power-level transition rule rejects it). The user-
+    // visible warning lives in the future Phase 5 UI, not in
+    // verify_event.
+    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa3);
+
+    let prior_state = materialize(
+        &[make_signed(1, MembershipEventKind::Join, admin, 1000)],
+        admin,
+    );
+
+    let payload = EventPayload {
+        id: [4u8; 16],
+        community_id: SpaceId([0x99; 16]),
+        kind: MembershipEventKind::SetPower {
+            target: admin,
+            level: 50,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: SpaceId([0x99; 16]),
+        admin_addr: admin,
+        is_invite_only: false,
+        actor_identity_pub: &admin_id_pub,
+        countersigner_identity_pub: None,
+    };
+    verify_event(&event, &prior_state, &ctx)
+        .expect("admin self-demote must verify (foot-gun is allowed)");
+}

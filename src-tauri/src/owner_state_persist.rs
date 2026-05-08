@@ -127,10 +127,23 @@ impl From<CrdtFileV2> for OwnerState {
 }
 
 pub fn save_crdt(path: &Path, state: &OwnerState) -> Result<(), PersistError> {
+    let bytes = canonicalize(state)?;
+    save_atomically(path, &bytes)
+}
+
+/// Encode `OwnerState` to its on-disk canonical byte representation
+/// without touching the filesystem. Identical bytes to what `save_crdt`
+/// would write (same V2 schema header + ciborium CBOR body), so two
+/// snapshots produced from byte-equal states are byte-equal here.
+///
+/// Used by ZEB-258 atomic-rollback regression tests to assert
+/// owner-state is byte-identical pre/post a failed mutation IPC. Pure
+/// — no I/O, no allocations beyond the returned `Vec<u8>`.
+pub fn canonicalize(state: &OwnerState) -> Result<Vec<u8>, PersistError> {
     let file = CrdtFileV2::from(state);
     let mut bytes = vec![CRDT_FILE_SCHEMA_V2];
     into_writer(&file, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
-    save_atomically(path, &bytes)
+    Ok(bytes)
 }
 
 pub fn load_crdt(path: &Path) -> Result<OwnerState, PersistError> {

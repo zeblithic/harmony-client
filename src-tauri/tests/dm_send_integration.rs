@@ -72,9 +72,21 @@ async fn send_dm_round_trip_through_dm_outbox() {
     // ack fan-out in handle_cidnotify. This Phase-2 test only exercises the
     // sender-side path (send_dm + drain + mark_ack_delivered) so the values
     // are inert — synthetic SigningKey + arbitrary DeviceIdentityHash.
+    //
+    // ZEB-262 Phase 4 Task 2: DmOutbox::new also takes Arc<PrivateIdentity>
+    // for the receive-side counter-sign path (not exercised here) — pass
+    // a deterministic from_seed instance.
     let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
     let our_device_hash = DeviceIdentityHash([0xaa; 16]);
-    let mut outbox = DmOutbox::new("dev".into(), alice, our_device_hash, signing_key);
+    let private_identity =
+        std::sync::Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+    let mut outbox = DmOutbox::new(
+        "dev".into(),
+        alice,
+        our_device_hash,
+        signing_key,
+        private_identity,
+    );
     let transport = StubTransport::new();
 
     // 1. send_dm
