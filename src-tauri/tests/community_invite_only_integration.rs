@@ -484,3 +484,77 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     );
     // RedeemTimeoutGuard restores the prior env-var on Drop here.
 }
+
+/// ZEB-260 tampering test: an invite URL whose admin_bootstrap has been
+/// modified post-mint (signature flipped) MUST fail at the verify chain
+/// before any engine spawn / unicast / commit. The error must surface as
+/// `BootstrapSignatureInvalid` (the chain-step → variant mapping is part
+/// of the security contract — frontend telemetry keys off these tags).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn community_invite_only_tampered_admin_bootstrap_rejects() {
+    use harmony_app::community_invite::{
+        decode_invite_url, encode_invite_url, verify_admin_bootstrap, CommunityInvitePayload,
+        InviteToken, RedeemBootstrapVerifyError,
+    };
+    use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+
+    let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
+    let alice_priv_bytes = alice_identity.to_private_bytes();
+    let alice_ed_seed: [u8; 32] = alice_priv_bytes[32..64]
+        .try_into()
+        .expect("ed25519 seed slice 32..64");
+    let alice_sk = ed25519_dalek::SigningKey::from_bytes(&alice_ed_seed);
+
+    let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
+
+    let community_id = SpaceId([0x37; 16]);
+    let bootstrap_payload = EventPayload {
+        id: [0xCC; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: alice_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        },
+    };
+    let mut alice_bootstrap = sign_event(&bootstrap_payload, &alice_sk).expect("sign");
+    // Tamper: flip a single bit in the signature.
+    alice_bootstrap.sig[0] ^= 0x01;
+
+    let invite_url = encode_invite_url(&CommunityInvitePayload {
+        community_id,
+        membership_key: MembershipKey::new([0xDD; 32]),
+        admin_addr: alice_addr,
+        community_name: "TamperedTest".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(InviteToken {
+            inviter: alice_addr,
+            invitee_hint: Some(bob_addr),
+            minted_at: bootstrap_payload.at.clone(),
+            expires_at: None,
+            sig: [0xEE; 64],
+        }),
+        admin_bootstrap: Some(alice_bootstrap),
+        admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
+    })
+    .expect("encode URL");
+
+    // Decode + verify directly. verify_admin_bootstrap is pure, so we
+    // can pin the error variant + telemetry tag without spinning up
+    // engines, channels, or CRDT state.
+    let decoded = decode_invite_url(&invite_url).expect("decode");
+    let err = verify_admin_bootstrap(&decoded).expect_err("tampered must reject");
+    assert_eq!(
+        err,
+        RedeemBootstrapVerifyError::BootstrapSignatureInvalid,
+        "tampered admin_bootstrap.sig must surface as BootstrapSignatureInvalid"
+    );
+    // Telemetry tag is part of the security contract — pin it.
+    assert_eq!(err.reason_tag(), "bootstrap_signature_invalid");
+}
