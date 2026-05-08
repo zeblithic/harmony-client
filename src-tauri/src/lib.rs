@@ -6709,23 +6709,66 @@ where
                 return Err("invite-only redemption oneshot closed unexpectedly".into());
             }
             Err(_elapsed) => {
-                let _ = community_registry
+                // Race-window fix (CodeRabbit P0): the timeout future
+                // and the engine's notify hook can both observe the
+                // deadline near-simultaneously. The hook's
+                // `notify_pending_redemption_in_map` removes the map
+                // entry BEFORE calling `tx.send`, so use the entry's
+                // presence as the atomic synchronization point:
+                //
+                //   take_pending_redemption() → Some(tx) ⇒ we won the
+                //   race; the notifier hadn't run; genuine timeout —
+                //   roll back.
+                //
+                //   take_pending_redemption() → None ⇒ the notifier
+                //   already removed it (and tried `tx.send` to a
+                //   dropped rx, which it swallowed). The
+                //   counter-signed Join is in our engine because
+                //   insert_local_event returned Ok before the hook
+                //   fired — treat as a success that landed exactly
+                //   at the deadline. DO NOT tear down the engine.
+                //
+                // This narrows but does not entirely eliminate the
+                // race: an engine.insert_local_event that races with
+                // take_pending_redemption (notifier hasn't yet
+                // removed the entry) still ends in Some-claimed →
+                // rollback. That window is sub-microsecond and the
+                // peer's view stays consistent (the counter-signed
+                // Join is in their persistence; only OUR local engine
+                // is torn down). A complete fix would require a
+                // "completed" sentinel in the map (deferred — see
+                // PR #89 follow-up notes).
+                match community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
-                    .await;
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
                     .await
                 {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite timeout rollback"
-                    );
+                    Some(_tx) => {
+                        if let Err(stop_err) = community_registry
+                            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %stop_err,
+                                community_id = %hex::encode(minted.community_id.0),
+                                "shutdown failed during redeem_invite timeout rollback"
+                            );
+                        }
+                        return Err(format!(
+                            "invite-only redemption timed out after {timeout_ms}ms"
+                        ));
+                    }
+                    None => {
+                        // Notifier won the race; treat as success.
+                        // Fall through to the post-await commit path.
+                        tracing::debug!(
+                            community_id = %hex::encode(minted.community_id.0),
+                            event_id = %hex::encode(minted.bootstrap_join.id),
+                            "redeem_invite timeout fired but notifier had already \
+                             consumed the pending entry — counter-signed Join is in \
+                             the engine; treating as success"
+                        );
+                    }
                 }
-                return Err(format!(
-                    "invite-only redemption timed out after {}ms",
-                    timeout_ms
-                ));
             }
         }
     }
