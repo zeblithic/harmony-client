@@ -178,7 +178,7 @@
     targetName={setPowerTarget.displayName ?? setPowerTarget.address.slice(0, 8)}
     targetAddress={setPowerTarget.address}
     currentPower={setPowerTarget.power}
-    actorMaxPower={Math.max(0, myPower - 1)}
+    actorMaxPower={myPower}
     onSubmit={(newPower) => { onSetPower(setPowerTarget!.address, newPower); setPowerTarget = null; }}
     onCancel={() => (setPowerTarget = null)}
   />

@@ -14,10 +14,10 @@
     targetName: string;
     targetAddress: string;
     currentPower: number;
-    /** Hard ceiling — admins can never set a target above their own
-     *  power. Defaults to POWER_THRESHOLDS.max for back-compat with
-     *  existing call sites; CommunitySettingsPanel passes myPower-1
-     *  so the slider can't even reach an out-of-range value. */
+    /** Hard ceiling — admins can match (but never exceed) their own
+     *  power. Backend permits any level 0..=POWER_THRESHOLDS.max for
+     *  any admin, but the conventional UX is "promote up to but not
+     *  above yourself", so CommunitySettingsPanel passes myPower. */
     actorMaxPower?: number;
     onSubmit: (power: number) => void;
     onCancel: () => void;
