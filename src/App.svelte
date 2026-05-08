@@ -162,23 +162,31 @@
   let selectedCommunityId = $state<string | null>(null);
   let showCommunitySettings = $state(false);
   let communityMembers = $state<CommunityMember[]>([]);
-  let myCommunityPower = $state(0);
   let myAddress = $state('');
+  // Derived from the live roster — recomputes when fetchOwnAddress
+  // resolves later than the first roster load (race fixed in PR #91
+  // review). Never assign to this directly.
+  let myCommunityPower = $derived(
+    communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
+  );
 
   async function refreshCommunityMembers(id: string) {
     try {
-      communityMembers = await communityService.listCommunityMembers(id);
-      const me = communityMembers.find((m) => m.address === myAddress);
-      myCommunityPower = me?.power ?? 0;
+      const fresh = await communityService.listCommunityMembers(id);
+      // Stale-response guard: if the user switched communities while
+      // we were awaiting, drop the result rather than overwriting the
+      // newly-selected community's roster with the previous one's.
+      if (selectedCommunityId !== id) return;
+      communityMembers = fresh;
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
       // (mock-data mode) or when the backend isn't ready. Surface the
       // failure to the console rather than crash the app — the panel
       // simply renders with an empty member list.
+      if (selectedCommunityId !== id) return;
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('[harmony-client] listCommunityMembers failed:', msg);
       communityMembers = [];
-      myCommunityPower = 0;
     }
   }
 
@@ -417,11 +425,13 @@
   // the first roster-changed event (which may fire as soon as connectAdapter
   // resolves) is never dropped silently. Svelte 5 $state reads inside the
   // closure are always current at call time — no TDZ risk.
-  communityService.onChange = async (changedId?: string) => {
+  communityService.onChange = (changedId?: string) => {
     if (selectedCommunityId && (!changedId || changedId === selectedCommunityId)) {
-      communityMembers = await communityService.listCommunityMembers(selectedCommunityId);
-      const me = communityMembers.find((m) => m.address === myAddress);
-      myCommunityPower = me?.power ?? 0;
+      // Route through refreshCommunityMembers so we get the same
+      // try/catch + stale-response guard as the imperative caller.
+      // Don't await — onChange is fire-and-forget at the listener
+      // boundary; awaiting here would leak unhandled rejections.
+      void refreshCommunityMembers(selectedCommunityId);
     }
   };
 
