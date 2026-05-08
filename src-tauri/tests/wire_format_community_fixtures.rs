@@ -147,6 +147,8 @@ fn community_invite_payload_open_wire_bytes_pinned() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -167,6 +169,20 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         expires_at: None,
         sig: [0xDD; 64],
     };
+
+    // Synthetic admin bootstrap with all-deterministic bytes so the
+    // encoded payload is reproducible. NOT a real signature — this test
+    // pins canonical wire bytes only.
+    let admin_bootstrap = SignedMembershipEvent {
+        id: [0xCC; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: OwnerAddr([0x11; 16]),
+        at: fixture_hlc(),
+        sig: [0xEE; 64],
+        countersig: None,
+    };
+
     let p = CommunityInvitePayload {
         community_id: SpaceId([0x37; 16]),
         membership_key: MembershipKey::new([0xAA; 32]),
@@ -175,13 +191,16 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         is_invite_only: true,
         expires_at: Some(fixture_hlc()),
         invite_token: Some(token),
+        admin_bootstrap: Some(admin_bootstrap),
+        admin_identity_pub: Some([0xAB; 64]),
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("community_invite_payload_invite_only hex: {hex}");
+
     assert_eq!(
         hex,
-        "a76263695037373737373737373737373737373737626d6b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6261645011111111111111111111111111111111626e6d6366697862696ff5626578a361771b0000018bcfe56800616c0061646366697862746ba462697650111111111111111111111111111111116269685022222222222222222222222222222222626d74a361771b0000018bcfe56800616c006164636669786273675840dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "a96263695037373737373737373737373737373737626d6b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6261645011111111111111111111111111111111626e6d6366697862696ff5626578a361771b0000018bcfe56800616c0061646366697862746ba462697650111111111111111111111111111111116269685022222222222222222222222222222222626d74a361771b0000018bcfe56800616c006164636669786273675840dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd626162a662696450cccccccccccccccccccccccccccccccc6263695037373737373737373737373737373737626b6ea1627467616a6261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6261705840abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
         "CommunityInvitePayload (invite-only) wire format changed"
     );
 }

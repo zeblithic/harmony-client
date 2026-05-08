@@ -5596,6 +5596,8 @@ async fn generate_invite(
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
     build_open_invite_url(&payload)
 }
@@ -7026,6 +7028,8 @@ mod redeem_invite_inner_tests {
             is_invite_only: false,
             expires_at: None,
             invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
         };
 
         let device_id = "joiner-dev";
@@ -8721,6 +8725,8 @@ mod generate_invite_helper_tests {
             is_invite_only: false,
             expires_at: None,
             invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");

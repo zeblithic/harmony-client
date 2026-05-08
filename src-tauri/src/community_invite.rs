@@ -49,6 +49,37 @@ pub struct CommunityInvitePayload {
     /// still be present as an authenticity hint, but not required).
     #[serde(rename = "tk", skip_serializing_if = "Option::is_none", default)]
     pub invite_token: Option<InviteToken>,
+
+    /// Admin's signed self-Join (their bootstrap event). Required for
+    /// invite-only payloads (ZEB-260): without this the joiner's empty
+    /// CRDT cannot admit the admin's eventual publish-back, because the
+    /// receive-side membership-at-HLC gate evaluates publisher status
+    /// against the joiner's local prefix (which has no admin entry).
+    /// Joiner's `redeem_invite_inner` verifies this against
+    /// `admin_identity_pub` and inserts via
+    /// `engine.insert_local_event_with_pubs` before sending the unicast
+    /// packet — the publish-back is generated strictly later, so this
+    /// closes the race by construction. Open communities ignore this
+    /// field; encoding stays byte-identical via skip_serializing_if.
+    #[serde(rename = "ab", skip_serializing_if = "Option::is_none", default)]
+    pub admin_bootstrap: Option<crate::community_membership::SignedMembershipEvent>,
+
+    /// Admin's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
+    /// matching `harmony_identity::Identity::to_public_bytes()`). Required
+    /// for invite-only payloads (ZEB-260) — used to verify
+    /// `admin_bootstrap` and passed into
+    /// `engine.insert_local_event_with_pubs(_, admin_identity_pub, None)`.
+    /// Bound to `admin_addr` via
+    /// `Identity::from_public_bytes(admin_identity_pub).address_hash ==
+    /// admin_addr.0`.
+    #[serde(
+        rename = "ap",
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "serialize_admin_identity_pub_as_bstr",
+        deserialize_with = "deserialize_admin_identity_pub_from_bstr"
+    )]
+    pub admin_identity_pub: Option<[u8; 64]>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -232,6 +263,64 @@ where
     }
 
     d.deserialize_bytes(BytesVisitor)
+}
+
+/// Serialize `Option<[u8; 64]>` as a CBOR bstr (Some) or absent (None,
+/// via `skip_serializing_if`). Mirrors the existing
+/// `serialize_identity_pub_as_bstr` shape; wraps it for the optional
+/// case used by `CommunityInvitePayload::admin_identity_pub`.
+fn serialize_admin_identity_pub_as_bstr<S>(
+    val: &Option<[u8; 64]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match val {
+        Some(bytes) => serializer.serialize_bytes(bytes),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Deserialize `Option<[u8; 64]>` from CBOR. The field is wrapped in
+/// `Option` because invite-only payloads always set it but open-community
+/// payloads omit it entirely; serde routes the absent-key case to
+/// `default` (None) and the present-bstr case here.
+fn deserialize_admin_identity_pub_from_bstr<'de, D>(
+    deserializer: D,
+) -> Result<Option<[u8; 64]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Visitor};
+    use std::fmt;
+
+    struct OptBytesVisitor;
+    impl<'de> Visitor<'de> for OptBytesVisitor {
+        type Value = Option<[u8; 64]>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a 64-byte CBOR byte string")
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Option<[u8; 64]>, E> {
+            if value.len() != 64 {
+                return Err(E::custom(format!(
+                    "admin_identity_pub must be 64 bytes, got {}",
+                    value.len()
+                )));
+            }
+            let mut out = [0u8; 64];
+            out.copy_from_slice(value);
+            Ok(Some(out))
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Option<[u8; 64]>, E> {
+            self.visit_bytes(&v)
+        }
+    }
+
+    deserializer.deserialize_bytes(OptBytesVisitor)
 }
 
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};

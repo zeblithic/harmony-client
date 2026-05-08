@@ -14,6 +14,8 @@ fn community_invite_payload_round_trips_open_form() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -51,6 +53,8 @@ fn community_invite_payload_round_trips_invite_only_form() {
             device_id: "d".into(),
         }),
         invite_token: Some(token.clone()),
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -112,6 +116,8 @@ fn invite_url_round_trips_open_payload() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
 
     let url = encode_invite_url(&payload).expect("encode");
@@ -174,6 +180,8 @@ fn decode_trims_whitespace() {
         is_invite_only: false,
         expires_at: None,
         invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     };
     let url = encode_invite_url(&payload).expect("encode");
     let padded = format!("  \n{url}\t  ");

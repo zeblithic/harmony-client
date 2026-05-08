@@ -2232,6 +2232,8 @@ mod task3_kick_setpower_round_trip {
             is_invite_only: false,
             expires_at: None,
             invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
         };
         let minted_b =
             mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
@@ -2493,6 +2495,8 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         is_invite_only: true,
         expires_at: None,
         invite_token: Some(invite_token),
+        admin_bootstrap: None,
+        admin_identity_pub: None,
     })
     .expect("encode URL");
 
