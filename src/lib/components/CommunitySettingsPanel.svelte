@@ -22,7 +22,7 @@
   }: {
     communityId: string;
     communityName: string;
-    communityKind: 'open' | 'invite-only';
+    communityKind: 'open' | 'invite-only' | 'unknown';
     members: CommunityMember[];
     myAddress: string;
     myPower: number;
@@ -95,7 +95,12 @@
       <div class="section-label">Info</div>
       <div class="info-grid">
         <div class="key">Name</div><div>{communityName}</div>
-        <div class="key">Type</div><div>{communityKind === 'invite-only' ? '🔒 Invite-only' : '🌐 Open'}</div>
+        <div class="key">Type</div>
+        <div>
+          {#if communityKind === 'invite-only'}🔒 Invite-only
+          {:else if communityKind === 'open'}🌐 Open
+          {:else}<span class="muted">— (unknown)</span>{/if}
+        </div>
         <div class="key">Members</div><div>{joinedMembers.length} joined</div>
         <div class="key">Your role</div>
         <div>
@@ -266,6 +271,7 @@
   .role-badge[data-role="admin"] { background: var(--accent); color: var(--text-primary); }
   .healthy { color: #7acc7a; }
   .degraded { color: #ffb84a; }
+  .muted { color: var(--text-secondary); }
   .member-list { display: flex; flex-direction: column; }
   .member-row {
     display: flex;

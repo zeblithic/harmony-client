@@ -31,6 +31,11 @@ export class CommunityService {
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
   private degraded: Map<string, boolean> = new Map();
+  // Per-community kind, recorded locally for communities the user
+  // creates this session. Backend doesn't yet expose kind on the wire
+  // (open follow-up), so for redeemed/foreign communities we return
+  // 'unknown' rather than fabricating a value.
+  private knownKinds: Map<string, 'open' | 'invite-only'> = new Map();
   private unlisteners: Array<() => void> = [];
 
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
@@ -59,10 +64,12 @@ export class CommunityService {
   }
 
   async createCommunity(name: string, kind: 'open' | 'invite-only'): Promise<string> {
-    return this.invoke<string>('create_community', {
+    const id = await this.invoke<string>('create_community', {
       name,
       isInviteOnly: kind === 'invite-only',
     });
+    this.knownKinds.set(id, kind);
+    return id;
   }
 
   async redeemInvite(url: string): Promise<string> {
@@ -103,11 +110,20 @@ export class CommunityService {
     return this.degraded.get(communityId) ?? false;
   }
 
+  /** Returns the locally-known kind for a community, or 'unknown' for
+   *  redeemed/foreign communities (until backend exposes kind on the
+   *  wire). Callers should render kind-specific UI conditionally on
+   *  this not being 'unknown' rather than assuming a default. */
+  getKind(communityId: string): 'open' | 'invite-only' | 'unknown' {
+    return this.knownKinds.get(communityId) ?? 'unknown';
+  }
+
   destroy(): void {
     for (const fn of this.unlisteners) fn();
     this.unlisteners = [];
     this.memberCache.clear();
     this.degraded.clear();
+    this.knownKinds.clear();
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {

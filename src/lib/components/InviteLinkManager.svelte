@@ -3,7 +3,7 @@
     kind,
     onGenerate,
   }: {
-    kind: 'open' | 'invite-only';
+    kind: 'open' | 'invite-only' | 'unknown';
     onGenerate: () => Promise<string>;
   } = $props();
 
@@ -37,8 +37,10 @@
   {:else}
     {#if kind === 'invite-only'}
       <p class="warning">Don't post publicly — it embeds your admin bootstrap signature. Each link can only be redeemed once.</p>
-    {:else}
+    {:else if kind === 'open'}
       <p class="warning">Anyone with this URL can join. The same link works indefinitely.</p>
+    {:else}
+      <p class="warning">Treat this link as sensitive — share only via a private channel.</p>
     {/if}
 
     <div class="url-row">

@@ -118,6 +118,14 @@ describe('CommunityService', () => {
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
 
+  it('getKind records the chosen kind for created communities and returns unknown otherwise', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('aabbccdd');
+    await service.createCommunity('Test', 'invite-only');
+    expect(service.getKind('aabbccdd')).toBe('invite-only');
+    expect(service.getKind('11223344')).toBe('unknown');
+  });
+
   it('community-state-sync-degraded sets degraded flag', async () => {
     await service.connectAdapter(adapter);
     expect(service.isDegraded('aabbccdd')).toBe(false);

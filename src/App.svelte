@@ -1443,17 +1443,16 @@
 {/if}
 
 {#if showCommunitySettings && selectedCommunityNode}
-  <!-- ZEB-263 Phase 5 Task 7: CommunitySettingsPanel renders as a modal
-       on top of whatever's in the right pane. communityKind is hardcoded
-       to 'invite-only' until per-community kind is exposed via the
-       CommunityService cache (open implementation question, spec
-       Appendix A #2). TODO: derive from CommunityService once kind
-       lands on the wire payload — `kind` is not yet in the NavNode
-       shape nor the list_community_members response. -->
+  <!-- ZEB-263 Phase 5: communityKind is sourced from
+       CommunityService.getKind(), which knows the kind for communities
+       this session created and returns 'unknown' for redeemed/foreign
+       communities. Once the backend exposes kind on the wire (open
+       follow-up — spec Appendix A #2), getKind() should fall back to
+       the wire value rather than 'unknown'. -->
   <CommunitySettingsPanel
     communityId={selectedCommunityNode.id}
     communityName={selectedCommunityNode.name}
-    communityKind={'invite-only'}
+    communityKind={communityService.getKind(selectedCommunityNode.id)}
     members={communityMembers}
     {myAddress}
     myPower={myCommunityPower}
