@@ -36,11 +36,11 @@
   </div>
 
   <div class="control-row">
-    <input type="range" min="0" max="100" step="1" bind:value={power} class="slider" aria-label="Power level slider" />
+    <input type="range" min="0" max={POWER_THRESHOLDS.max} step="1" bind:value={power} class="slider" aria-label="Power level slider" />
     <input
       type="number"
       min="0"
-      max="100"
+      max={POWER_THRESHOLDS.max}
       step="1"
       bind:value={power}
       onblur={clampOnBlur}
