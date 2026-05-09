@@ -108,14 +108,10 @@
     // modal in the PR. Guard against clicks bubbling from inside
     // the panel — those should NOT dismiss (we don't want a stray
     // click on a member row to close the whole panel).
+    // Escape key handling lives on the .panel div via the trapFocus
+    // action's onCancel; no need to duplicate it on the overlay
+    // (focus is always trapped inside the panel anyway).
     if (e.target === e.currentTarget) onClose();
-  }
-
-  function handleOverlayKeydown(e: KeyboardEvent) {
-    // Mirror the click semantics for keyboard users on the backdrop.
-    // The panel itself has trapFocus + Escape via the action, so this
-    // only fires when focus is somehow on the overlay element.
-    if (e.key === 'Escape') onClose();
   }
 </script>
 
@@ -123,7 +119,6 @@
 <div
   class="panel-overlay"
   onclick={handleOverlayClick}
-  onkeydown={handleOverlayKeydown}
 >
   <div
     class="panel"
