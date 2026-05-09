@@ -6703,15 +6703,20 @@ pub async fn create_community_inner(
         rand::thread_rng().fill_bytes(&mut buf);
         buf
     };
-    // ZEB-267: reserve a SECOND HLC atomically. The tracker was just
-    // bumped to `bootstrap_join.at` by the first reservation above,
-    // so this reservation reads tracker == bootstrap_join.at and
-    // returns a strictly-greater HLC. next_hlc's wall-clock
-    // regression handling means the result is
-    // `(bootstrap.wall_ms, bootstrap.logical+1, bootstrap.device_id)`
-    // when wall_now_ms == bootstrap_join.at.wall_ms (the typical
-    // case — same `wall_now_ms` value from the caller's snapshot),
-    // bit-identical to the chained next_hlc call this replaces.
+    // ZEB-267: reserve a SECOND HLC atomically. The first reservation
+    // above bumped tracker[device_id] to `bootstrap_join.at`, BUT
+    // there are .await points between the two reservations (engine
+    // spawn, adapter dispatch), and the only ordering guarantee on
+    // `hlc_tracker` is its own internal mutex — a concurrent same-
+    // device IPC could slot into one of those gaps and advance
+    // tracker[device_id] past bootstrap_join.at before this
+    // reservation reads it. So the only invariant we can rely on is:
+    //   default_channel_at > bootstrap_join.at  (strictly greater)
+    // Adjacency (bootstrap.logical+1) and bit-equality with the
+    // pre-ZEB-267 chained `next_hlc(Some(&bootstrap_join.at), …)`
+    // call held only in the uncontended single-IPC case; under
+    // concurrency it does NOT, and that's fine — the engine's
+    // event_sort_key only requires strict ordering, not adjacency.
     // Burn semantics: same as the first reservation — if a downstream
     // step fails, the burned HLC is fine.
     let default_channel_at =
