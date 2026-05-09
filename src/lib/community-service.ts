@@ -4,6 +4,17 @@ import { POWER_THRESHOLDS, type CommunityMember } from './types';
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
 
+/**
+ * Mirrors `RedeemInviteResultDto` in src-tauri/src/lib.rs (ZEB-265).
+ * Returned from `redeem_invite` so the caller can render a real
+ * community name + record the kind without re-decoding the invite URL.
+ */
+export interface RedeemInviteResultDto {
+  communityId: string;
+  communityName: string;
+  isInviteOnly: boolean;
+}
+
 interface HlcDto { wallMs: number; logical: number; deviceId: string; }
 interface MemberInfoDto {
   addr: string;
@@ -79,8 +90,13 @@ export class CommunityService {
     return id;
   }
 
-  async redeemInvite(url: string): Promise<string> {
-    return this.invoke<string>('redeem_invite', { url });
+  async redeemInvite(url: string): Promise<RedeemInviteResultDto> {
+    const dto = await this.invoke<RedeemInviteResultDto>('redeem_invite', { url });
+    // Now that the backend hands back the kind, redeemed/foreign
+    // communities can populate `getKind()` correctly instead of
+    // returning 'unknown'. ZEB-265.
+    this.knownKinds.set(dto.communityId, dto.isInviteOnly ? 'invite-only' : 'open');
+    return dto;
   }
 
   async leaveCommunity(communityId: string): Promise<void> {

@@ -1484,27 +1484,26 @@
       redeemError = null;
       redeemUrl = url;
       try {
-        const id = await communityService.redeemInvite(url);
-        // Synthesize the NavNode locally — same reason as create.
-        // The backend redeem_invite IPC currently returns only the
-        // community_id, not the name; rather than CBOR-decode the
-        // URL on the frontend (duplicating backend logic), use a
-        // placeholder name keyed off the id. A future backend
-        // change to return community metadata (or the eventual
-        // nav-updated emit) will replace this on next render.
-        const placeholderName = `Community ${id.slice(0, 8)}`;
+        // ZEB-265: redeem_invite now returns RedeemInviteResultDto, so
+        // the synthesized NavNode carries the real community name
+        // (replacing the prior `Community ${id.slice(0,8)}` placeholder).
+        // Step 3 of ZEB-265 will drop this synthesis once the backend
+        // emits nav-updated; until then the listener path stays a
+        // no-op (no emit) and synthesis is the only thing keeping the
+        // node visible synchronously after redeem.
+        const dto = await communityService.redeemInvite(url);
         navService.addOrUpdateNavSpace({
           action: 'added',
-          spaceId: id,
+          spaceId: dto.communityId,
           kind: 'community',
-          name: placeholderName,
+          name: dto.communityName,
           members: [],
           parentId: null,
         });
         showRedeemInvite = false;
         redeemUrl = '';
-        changeSelectedCommunity(id);
-        await refreshCommunityMembers(id);
+        changeSelectedCommunity(dto.communityId);
+        await refreshCommunityMembers(dto.communityId);
       } catch (e) {
         redeemError = e instanceof Error ? e.message : String(e);
       } finally {

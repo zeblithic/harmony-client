@@ -73,12 +73,34 @@ describe('CommunityService', () => {
     ]);
   });
 
-  it('redeemInvite calls invoke with the URL string', async () => {
+  it('redeemInvite returns the DTO and learns the community kind', async () => {
     await service.connectAdapter(adapter);
-    (adapter.invoke as any).mockResolvedValue('eeff0011');
-    const id = await service.redeemInvite('harmony://invite/v1?ci=...');
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'eeff0011',
+      communityName: 'Real Name',
+      isInviteOnly: true,
+    });
+    const dto = await service.redeemInvite('harmony://invite/v1?ci=...');
     expect(adapter.invoke).toHaveBeenCalledWith('redeem_invite', { url: 'harmony://invite/v1?ci=...' });
-    expect(id).toBe('eeff0011');
+    expect(dto).toEqual({
+      communityId: 'eeff0011',
+      communityName: 'Real Name',
+      isInviteOnly: true,
+    });
+    // ZEB-265: redeem now records kind so getKind() doesn't return 'unknown'
+    // for redeemed communities.
+    expect(service.getKind('eeff0011')).toBe('invite-only');
+  });
+
+  it('redeemInvite records open kind when isInviteOnly is false', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: '00112233',
+      communityName: 'Open Community',
+      isInviteOnly: false,
+    });
+    await service.redeemInvite('harmony://invite/v1?ci=...');
+    expect(service.getKind('00112233')).toBe('open');
   });
 
   it('listCommunityMembers caches per-community result', async () => {

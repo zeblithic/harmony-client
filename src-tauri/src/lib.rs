@@ -6219,6 +6219,19 @@ mod create_community_inner_tests {
 // is_invite_only) defends against malicious or stale invites trying
 // to drift the canonical row out from under the original creator.
 
+/// IPC result for `redeem_invite`. Carries the invite payload's
+/// human-readable fields (community name, kind) alongside the
+/// community id so the frontend can build a correct NavNode + populate
+/// the settings panel without re-decoding the URL or round-tripping
+/// for a name lookup. ZEB-265.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemInviteResultDto {
+    pub community_id: String,
+    pub community_name: String,
+    pub is_invite_only: bool,
+}
+
 /// Pure function: mint a joiner-side self-Join + derived Community
 /// Space row from an invite payload.
 ///
@@ -6345,7 +6358,7 @@ pub async fn redeem_invite_inner<F>(
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     fence_check: F,
-) -> Result<String, String>
+) -> Result<RedeemInviteResultDto, String>
 where
     F: Fn() -> Result<(), String>,
 {
@@ -6998,8 +7011,14 @@ where
         // Both guards drop here at scope end.
     }
 
-    // 10. Return Ok.
-    Ok(hex::encode(minted.community_id.0))
+    // 10. Return DTO with the invite's name + kind so the caller can
+    // render the new community without re-decoding the URL or
+    // round-tripping. ZEB-265.
+    Ok(RedeemInviteResultDto {
+        community_id: hex::encode(minted.community_id.0),
+        community_name: payload.community_name.clone(),
+        is_invite_only: payload.is_invite_only,
+    })
 }
 
 /// Resolve `OwnerAddr` → `Vec<destination_hash>` via the joiner's
@@ -7072,7 +7091,7 @@ async fn resolve_destinations_for_owner(
 async fn redeem_invite(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
-) -> Result<String, String> {
+) -> Result<RedeemInviteResultDto, String> {
     // Snapshot NodeState handles in a single guard scope, then drop
     // the std lock BEFORE any `.await`. Mirrors `create_community`'s
     // pattern.
