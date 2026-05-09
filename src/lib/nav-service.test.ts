@@ -463,3 +463,87 @@ describe('NavService — community kind (ZEB-263)', () => {
     expect(node!.name).toBe('New Name');
   });
 });
+
+describe('NavService — community kind via nav-updated listener (ZEB-265)', () => {
+  // ZEB-265 wires backend emits from create_community / redeem_invite /
+  // leave_community. Once the listener path is live, App.svelte stops
+  // synthesizing community NavNodes locally — these tests cover the
+  // listener path that replaces the synthesis.
+  let nav: NavService;
+  let mock: ReturnType<typeof createMockAdapter>;
+
+  beforeEach(async () => {
+    nav = new NavService();
+    nav.nodes = [];
+    mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+  });
+
+  afterEach(() => {
+    nav.destroy();
+  });
+
+  it('create_community emit: listener inserts a community NavNode', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: 'aabbccdd' + 'ee'.repeat(28),
+      kind: 'community',
+      name: 'Created via emit',
+      parentId: null,
+    });
+
+    expect(nav.nodes).toContainEqual(expect.objectContaining({
+      id: 'aabbccdd' + 'ee'.repeat(28),
+      type: 'community',
+      name: 'Created via emit',
+      parentId: null,
+    }));
+  });
+
+  it('redeem_invite emit: listener inserts a community NavNode with the invite name', () => {
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: '11'.repeat(16),
+      kind: 'community',
+      name: 'Redeemed Crew',
+      parentId: null,
+    });
+
+    const node = nav.nodes.find((n) => n.id === '11'.repeat(16));
+    expect(node?.type).toBe('community');
+    expect(node?.name).toBe('Redeemed Crew');
+  });
+
+  it('leave_community emit: listener removes the community NavNode', () => {
+    const id = '22'.repeat(16);
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: id,
+      kind: 'community',
+      name: 'Doomed Community',
+      parentId: null,
+    });
+    expect(nav.nodes.some((n) => n.id === id)).toBe(true);
+
+    mock.emit('nav-updated', {
+      action: 'removed',
+      spaceId: id,
+      kind: 'community',
+      name: '',
+    });
+    expect(nav.nodes.some((n) => n.id === id)).toBe(false);
+  });
+
+  it('community emit fires onChange so the UI re-renders', () => {
+    const onChange = vi.fn();
+    nav.onChange = onChange;
+    mock.emit('nav-updated', {
+      action: 'added',
+      spaceId: '33'.repeat(16),
+      kind: 'community',
+      name: 'Re-render check',
+      parentId: null,
+    });
+    expect(onChange).toHaveBeenCalled();
+  });
+});
