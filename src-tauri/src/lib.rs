@@ -7980,8 +7980,10 @@ pub enum MembershipChangeDetail {
 /// `CommunityMembersChangedPayload { community_id, changes: vec![change] }`
 /// and emits the Tauri event.
 ///
-/// Returns `None` for kinds we can't yet represent (none today; reserved
-/// for forward-compat if `MembershipEventKind` grows).
+/// Returns `None` for channel-config kinds (`ChannelCreate`/
+/// `ChannelModify`/`ChannelDelete` — ZEB-248). Channel-config events
+/// are projected to `ChannelConfigChangedPayload` by the (Task 5)
+/// `delta_to_channel_config_change` projector instead.
 pub fn delta_to_change(
     delta: &crate::community_state_sync::CommunityMembershipDelta,
 ) -> Option<(String, MembershipChange)> {

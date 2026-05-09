@@ -1,7 +1,7 @@
 //! Unit-style integration tests for community_membership.rs.
 //! Phase 1 (ZEB-217 Sub-C) — types, materialization, verification.
 
-use harmony_app::community_membership::MembershipEventKind;
+use harmony_app::community_membership::{ChannelId, MembershipEventKind};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::OwnerAddr;
 
@@ -22,6 +22,11 @@ fn membership_event_kind_round_trips_all_variants() {
             reason: None,
         },
         MembershipEventKind::SetPower { target, level: 50 },
+        MembershipEventKind::ChannelCreate {
+            channel_id: [0xAB; 16],
+            name: "general".to_string(),
+            write_power: 0,
+        },
     ];
 
     for k in kinds {
@@ -2601,21 +2606,6 @@ fn set_power_admin_self_demote_inserts() {
         .expect("admin self-demote must verify (foot-gun is allowed)");
 }
 
-use harmony_app::community_membership::ChannelId;
-
-#[test]
-fn channel_create_event_kind_round_trips() {
-    let ch: ChannelId = [0xAB; 16];
-    let kind = MembershipEventKind::ChannelCreate {
-        ch,
-        nm: "general".to_string(),
-        wp: 0,
-    };
-    let encoded = canonical_cbor_encode(&kind).expect("encode");
-    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
-    assert_eq!(decoded, kind);
-}
-
 #[test]
 fn materialize_channel_create_adds_to_map() {
     // Build admin's bootstrap Join + a ChannelCreate by admin.
@@ -2638,9 +2628,9 @@ fn materialize_channel_create_adds_to_map() {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelCreate {
-            ch: ch_id,
-            nm: "general".to_string(),
-            wp: 0,
+            channel_id: ch_id,
+            name: "general".to_string(),
+            write_power: 0,
         },
         actor: admin,
         at: Hlc {
@@ -2659,4 +2649,70 @@ fn materialize_channel_create_adds_to_map() {
     assert_eq!(info.write_power, 0);
     assert_eq!(info.created_at.wall_ms, 2_000);
     assert!(info.deleted_at.is_none());
+}
+
+#[test]
+fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
+    // Same channel_id appears twice with different name/write_power; the
+    // second event must NOT mutate the existing entry — first-create-wins.
+    // Locks the invariant that the materialize branch's doc comment
+    // emphasises (preventing duplicate-emit from refreshing created_at).
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_id: ChannelId = [0xAB; 16];
+    let ch_first = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "first".to_string(),
+            write_power: 0,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_second = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id, // same channel_id
+            name: "second".to_string(),
+            write_power: 50,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let m = materialize(&[admin_join, ch_first, ch_second], admin);
+    let info = m.channels.get(&ch_id).expect("channel materialized");
+    assert_eq!(info.name, "first", "first ChannelCreate must win");
+    assert_eq!(info.write_power, 0, "first ChannelCreate's wp must win");
+    assert_eq!(
+        info.created_at.wall_ms, 2_000,
+        "first ChannelCreate's HLC must win"
+    );
 }

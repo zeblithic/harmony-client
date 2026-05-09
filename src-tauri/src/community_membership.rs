@@ -54,11 +54,11 @@ pub enum MembershipEventKind {
     #[serde(rename = "c")]
     ChannelCreate {
         #[serde(rename = "ch")]
-        ch: ChannelId,
+        channel_id: ChannelId,
         #[serde(rename = "nm")]
-        nm: String,
+        name: String,
         #[serde(rename = "wp")]
-        wp: u8,
+        write_power: u8,
     },
 }
 
@@ -569,9 +569,11 @@ pub struct MaterializedMembership {
     pub power_levels: BTreeMap<OwnerAddr, u8>,
     /// Per-channel materialized state. Built by `materialize` from
     /// `ChannelCreate`/`ChannelModify`/`ChannelDelete` event replay
-    /// (ZEB-248 Phase 1). `BTreeMap` (not `HashMap`) so iteration order
-    /// is deterministic — needed by callers that hash the materialized
-    /// view (e.g., a future test fixture pinning a multi-channel state).
+    /// (ZEB-248 Phase 1). `BTreeMap` (not `HashMap`) is load-bearing:
+    /// `MaterializedMembership` impls `CanonicalPayload`, and canonical
+    /// CBOR requires deterministic key order at every map-typed nesting
+    /// level — `HashMap` iteration is non-deterministic and would
+    /// break byte-equality across replicas.
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
 }
 
@@ -669,6 +671,7 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
 ///    - Invite { target }: members[target] = Invited / joined_at: at
 ///    - Kick { target }: members[target].status = Banned, .left_at = at
 ///    - SetPower { target, level }: power_levels[target] = level
+///    - ChannelCreate { channel_id, name, write_power }: channels[channel_id] = ChannelInfo { ... } if absent (first-create-wins; duplicate is no-op so a replayed event can't refresh created_at)
 ///
 /// Pure function — does NOT verify signatures or power rules. That's
 /// `verify_event`. Materialization assumes pre-verified events; the
@@ -796,7 +799,11 @@ pub fn materialize(
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
             }
-            MembershipEventKind::ChannelCreate { ch, nm, wp } => {
+            MembershipEventKind::ChannelCreate {
+                channel_id,
+                name,
+                write_power,
+            } => {
                 // Idempotent on duplicate channel_id: first create wins
                 // (replays + reorderings under DAG-sync may deliver the
                 // same ChannelCreate twice; the second one must NOT
@@ -804,12 +811,14 @@ pub fn materialize(
                 // a duplicate-emit refresh created_at and reset history
                 // markers). A subsequent ChannelModify is the right path
                 // to update fields; a duplicate ChannelCreate is a no-op.
-                m.channels.entry(*ch).or_insert_with(|| ChannelInfo {
-                    name: nm.clone(),
-                    write_power: *wp,
-                    created_at: event.at.clone(),
-                    deleted_at: None,
-                });
+                m.channels
+                    .entry(*channel_id)
+                    .or_insert_with(|| ChannelInfo {
+                        name: name.clone(),
+                        write_power: *write_power,
+                        created_at: event.at.clone(),
+                        deleted_at: None,
+                    });
             }
         }
     }
