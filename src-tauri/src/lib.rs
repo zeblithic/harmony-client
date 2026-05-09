@@ -8028,6 +8028,13 @@ pub fn delta_to_change(
                 at_wall_ms,
             }
         }
+        // Channel-config events (ZEB-248 Phase 1) don't map to a
+        // MembershipChange — they are channel state, not membership
+        // state. Return None per the function's documented forward-
+        // compat contract; the channel-config consumer (separate IPC
+        // event, ships later in Phase 1) will receive these via its
+        // own delta projection.
+        crate::community_membership::MembershipEventKind::ChannelCreate { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -8157,6 +8164,7 @@ mod community_member_dto_tests {
         let materialized = MaterializedMembership {
             members,
             power_levels,
+            channels: BTreeMap::new(),
         };
         let dto = member_info_for(&materialized);
 
@@ -8195,6 +8203,7 @@ mod community_member_dto_tests {
         let materialized = MaterializedMembership {
             members,
             power_levels: BTreeMap::new(),
+            channels: BTreeMap::new(),
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);

@@ -43,6 +43,23 @@ pub enum MembershipEventKind {
         #[serde(rename = "lv")]
         level: u8,
     },
+    /// Channel-config event: a mod-tier+ actor creates a new channel
+    /// in this community. `ch` is a fresh ChannelId (ULID); `nm` is
+    /// the display name; `wp` is the per-channel write_power threshold
+    /// (Phase 1 frontend always submits 0 = anyone-Joined posts; v2
+    /// reserves the field so v3 announcement-channel UI is wire-stable).
+    /// Variant code "c" (1-char value, not a key — keeps the same-
+    /// length-keys invariant intact). Inner field keys are 2-char.
+    /// See `docs/specs/2026-05-09-zeb-248-channels-within-communities-design.md` §5.1.
+    #[serde(rename = "c")]
+    ChannelCreate {
+        #[serde(rename = "ch")]
+        ch: ChannelId,
+        #[serde(rename = "nm")]
+        nm: String,
+        #[serde(rename = "wp")]
+        wp: u8,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -54,6 +71,12 @@ use crate::owner_state_types::{Hlc, SpaceId};
 /// 16-byte ULID identifying a single signed membership event within
 /// a community's CRDT log. Generated client-side at event creation.
 pub type EventId = [u8; 16];
+
+/// 16-byte ULID identifying a single channel within a community.
+/// Generated client-side at `ChannelCreate` time. Same shape as
+/// `EventId` but a distinct type so the type system catches accidental
+/// substitution between event-IDs and channel-IDs at IPC boundaries.
+pub type ChannelId = [u8; 16];
 
 /// One signed event in a community's membership CRDT.
 ///
@@ -544,6 +567,12 @@ pub struct MaterializedMembership {
     /// bootstrap rule — see `materialize` (Task 9). SetPower events
     /// override.
     pub power_levels: BTreeMap<OwnerAddr, u8>,
+    /// Per-channel materialized state. Built by `materialize` from
+    /// `ChannelCreate`/`ChannelModify`/`ChannelDelete` event replay
+    /// (ZEB-248 Phase 1). `BTreeMap` (not `HashMap`) so iteration order
+    /// is deterministic — needed by callers that hash the materialized
+    /// view (e.g., a future test fixture pinning a multi-channel state).
+    pub channels: BTreeMap<ChannelId, ChannelInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +596,28 @@ pub enum MemberStatus {
     #[serde(rename = "b")]
     Banned,
 }
+
+/// Materialized state for one channel in a community. Built by
+/// `materialize` from `ChannelCreate`/`ChannelModify`/`ChannelDelete`
+/// event replay. `deleted_at` is `Some` once a `ChannelDelete` has been
+/// processed for this channel — the channel stays in the map after
+/// deletion (tombstone semantics) so historical messages with this
+/// `channel_id` can still render their breadcrumb. v3+ may garbage-
+/// collect old tombstones; Phase 1 retains them indefinitely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelInfo {
+    #[serde(rename = "nm")]
+    pub name: String,
+    #[serde(rename = "wp")]
+    pub write_power: u8,
+    #[serde(rename = "ca")]
+    pub created_at: Hlc,
+    #[serde(rename = "da", skip_serializing_if = "Option::is_none", default)]
+    pub deleted_at: Option<Hlc>,
+}
+
+impl CanonicalPayloadSealed for ChannelInfo {}
+impl CanonicalPayload for ChannelInfo {}
 
 impl CanonicalPayloadSealed for MaterializedMembership {}
 impl CanonicalPayload for MaterializedMembership {}
@@ -744,6 +795,21 @@ pub fn materialize(
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
+            }
+            MembershipEventKind::ChannelCreate { ch, nm, wp } => {
+                // Idempotent on duplicate channel_id: first create wins
+                // (replays + reorderings under DAG-sync may deliver the
+                // same ChannelCreate twice; the second one must NOT
+                // overwrite name/write_power/created_at — that would let
+                // a duplicate-emit refresh created_at and reset history
+                // markers). A subsequent ChannelModify is the right path
+                // to update fields; a duplicate ChannelCreate is a no-op.
+                m.channels.entry(*ch).or_insert_with(|| ChannelInfo {
+                    name: nm.clone(),
+                    write_power: *wp,
+                    created_at: event.at.clone(),
+                    deleted_at: None,
+                });
             }
         }
     }
@@ -1025,6 +1091,11 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
+        MembershipEventKind::ChannelCreate { .. } => {
+            // Verify gate ships in Task 3. Placeholder allow-all keeps
+            // the match exhaustive; Task 3 replaces with the
+            // mod-tier power check.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1077,6 +1148,9 @@ pub fn verify_event(
             if *level > POWER_THRESHOLDS.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
+        }
+        MembershipEventKind::ChannelCreate { .. } => {
+            // Per-kind power gate ships in Task 3.
         }
     }
 

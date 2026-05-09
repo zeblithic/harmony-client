@@ -2600,3 +2600,63 @@ fn set_power_admin_self_demote_inserts() {
     verify_event(&event, &prior_state, &ctx)
         .expect("admin self-demote must verify (foot-gun is allowed)");
 }
+
+use harmony_app::community_membership::ChannelId;
+
+#[test]
+fn channel_create_event_kind_round_trips() {
+    let ch: ChannelId = [0xAB; 16];
+    let kind = MembershipEventKind::ChannelCreate {
+        ch,
+        nm: "general".to_string(),
+        wp: 0,
+    };
+    let encoded = canonical_cbor_encode(&kind).expect("encode");
+    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
+    assert_eq!(decoded, kind);
+}
+
+#[test]
+fn materialize_channel_create_adds_to_map() {
+    // Build admin's bootstrap Join + a ChannelCreate by admin.
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_id: ChannelId = [0xAB; 16];
+    let ch_create = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            ch: ch_id,
+            nm: "general".to_string(),
+            wp: 0,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let m: MaterializedMembership = materialize(&[admin_join, ch_create.clone()], admin);
+
+    let info = m.channels.get(&ch_id).expect("channel materialized");
+    assert_eq!(info.name, "general");
+    assert_eq!(info.write_power, 0);
+    assert_eq!(info.created_at.wall_ms, 2_000);
+    assert!(info.deleted_at.is_none());
+}
