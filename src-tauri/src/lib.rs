@@ -5735,7 +5735,6 @@ async fn create_channel(
 // Mirrors the `create_channel` shape exactly.
 
 /// Pure function: mint a self-signed ChannelModify event for a community
-/// Pure function: mint a self-signed ChannelModify event for a community
 /// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
 /// for ensuring at least one of `name`/`write_power` is `Some` (the IPC
 /// boundary rejects all-None before this is reached).
