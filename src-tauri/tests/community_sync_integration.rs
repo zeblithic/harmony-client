@@ -2077,7 +2077,7 @@ mod task3_kick_setpower_round_trip {
         owner_b: OwnerAddr,
         signing_a: Arc<ed25519_dalek::SigningKey>,
         community_id: SpaceId,
-        minted_b_join_hlc: Hlc,
+        minted_a_join_hlc: Hlc,
         // Hold the temp dirs for the lifetime of the fixture so the
         // engines' persistence files don't disappear mid-test.
         _tmp_a: tempfile::TempDir,
@@ -2304,7 +2304,7 @@ mod task3_kick_setpower_round_trip {
             owner_b,
             signing_a,
             community_id,
-            minted_b_join_hlc: minted_b.bootstrap_join.at.clone(),
+            minted_a_join_hlc: minted_a.bootstrap_join.at.clone(),
             _tmp_a: tmp_a,
             _tmp_b: tmp_b,
         }
@@ -2317,12 +2317,16 @@ mod task3_kick_setpower_round_trip {
         let f = build_fixture(0xa1, 0xb2).await;
 
         // ZEB-267: derive the kick's HLC via the same helper production
-        // uses, with a local tracker pre-seeded to B's most-recent
-        // observed event. Avoids hand-rolling next_hlc's wall-regression
-        // and logical-bump logic at the test boundary (Greptile review).
+        // uses, with a local tracker pre-seeded to A's bootstrap join
+        // (A is signing the kick, so "a-dev" must track A-authored
+        // HLCs). The wall-clock advance to 300_000 dominates anyway,
+        // so the resulting kick HLC sorts strictly after both A's
+        // bootstrap (100_000) and B's redemption (200_000). Avoids
+        // hand-rolling next_hlc's wall-regression / logical-bump logic
+        // at the test boundary (Greptile + CodeRabbit review).
         let kick_tracker = Arc::new(Mutex::new({
             let mut m = BTreeMap::<String, Hlc>::new();
-            m.insert("a-dev".to_string(), f.minted_b_join_hlc.clone());
+            m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
             m
         }));
         let kick_hlc = reserve_next_hlc_for_device(&kick_tracker, "a-dev", 300_000).await;
@@ -2376,10 +2380,12 @@ mod task3_kick_setpower_round_trip {
     async fn admin_sets_power_round_trip() {
         let f = build_fixture(0xa3, 0xb4).await;
 
-        // ZEB-267: same HLC derivation as the kick test above.
+        // ZEB-267: same HLC derivation as the kick test above —
+        // pre-seed "a-dev" with A's bootstrap join, not B's, so the
+        // tracker entry tracks the correct device's authored HLCs.
         let promo_tracker = Arc::new(Mutex::new({
             let mut m = BTreeMap::<String, Hlc>::new();
-            m.insert("a-dev".to_string(), f.minted_b_join_hlc.clone());
+            m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
             m
         }));
         let promo_hlc = reserve_next_hlc_for_device(&promo_tracker, "a-dev", 300_000).await;

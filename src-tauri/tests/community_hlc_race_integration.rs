@@ -211,7 +211,9 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         // Alice's tracker for events she didn't author, leaving
         // it misaligned with her actual event history (Greptile
         // PR #94 review).
-        let target_dev_id = format!("{}-dev", hex::encode(&target_addr.0[..4]));
+        // Full owner bytes (not just the 4-byte prefix) so the
+        // per-target tracker key is collision-free (CodeRabbit review).
+        let target_dev_id = format!("{}-dev", hex::encode(target_addr.0));
         let target_join_hlc =
             reserve_next_hlc_for_device(&hlc_tracker, &target_dev_id, 100_000).await;
         let minted_join = mint_redemption(
