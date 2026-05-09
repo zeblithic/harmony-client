@@ -5591,6 +5591,19 @@ async fn create_channel(
     name: String,
     write_power: u8,
 ) -> Result<String, String> {
+    // IPC-boundary validation. Rejecting here surfaces fast to the JS
+    // caller without minting+inserting an invalid event. verify_event
+    // also validates these (defense-in-depth for remote events).
+    if name.trim().is_empty() || name.chars().count() > 32 {
+        return Err("channel name is empty or exceeds 32 chars".to_string());
+    }
+    if write_power > crate::community_membership::POWER_THRESHOLDS.max {
+        return Err(format!(
+            "write_power {write_power} exceeds POWER_THRESHOLDS.max ({})",
+            crate::community_membership::POWER_THRESHOLDS.max
+        ));
+    }
+
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -5823,6 +5836,22 @@ async fn modify_channel(
     // Boundary validation: reject all-None up-front (no-op event spam).
     if name.is_none() && write_power.is_none() {
         return Err("modify_channel: must provide name and/or write_power".to_string());
+    }
+    // IPC-boundary validation matching verify_event so JS callers fail
+    // fast without minting an event that would be rejected at insert
+    // time.
+    if let Some(n) = &name {
+        if n.trim().is_empty() || n.chars().count() > 32 {
+            return Err("channel name is empty or exceeds 32 chars".to_string());
+        }
+    }
+    if let Some(wp) = write_power {
+        if wp > crate::community_membership::POWER_THRESHOLDS.max {
+            return Err(format!(
+                "write_power {wp} exceeds POWER_THRESHOLDS.max ({})",
+                crate::community_membership::POWER_THRESHOLDS.max
+            ));
+        }
     }
 
     let id_bytes: [u8; 16] = hex::decode(&community_id)
@@ -6660,9 +6689,11 @@ pub async fn create_community_inner(
     // ZEB-248 Phase 1: atomically auto-create the default #general channel.
     // Same engine-transaction window as the bootstrap_join — if this insert
     // fails, the same shutdown_engine_and_cleanup_persistence rollback runs.
-    // The HLC for the default-channel event is bootstrap_join.at with
-    // logical+1 — keeps Join < ChannelCreate ordering deterministic without
-    // depending on system-clock progression between the two signs.
+    // The HLC for the default-channel event is computed via the canonical
+    // `next_hlc` helper anchored on `minted.bootstrap_join.at` — keeps
+    // Join < ChannelCreate ordering deterministic without manually adding
+    // logical+1 (which would risk u32 overflow on a wedge-in path) and
+    // matches the helper used by every other mint site.
     let default_channel_id: crate::community_membership::ChannelId = {
         use rand::RngCore;
         let mut buf = [0u8; 16];
@@ -6675,11 +6706,15 @@ pub async fn create_community_inner(
         rand::thread_rng().fill_bytes(&mut buf);
         buf
     };
-    let default_channel_at = crate::owner_state_types::Hlc {
-        wall_ms: minted.bootstrap_join.at.wall_ms,
-        logical: minted.bootstrap_join.at.logical + 1,
-        device_id: minted.bootstrap_join.at.device_id.clone(),
-    };
+    // Use `bootstrap_join.at.wall_ms` as the wall input so the helper
+    // returns `(bootstrap.wall_ms, bootstrap.logical+1, bootstrap.device_id)`
+    // — the same deterministic ordering as before, but via the shared
+    // `next_hlc` path (consistent with all other mint sites in lib.rs).
+    let default_channel_at = crate::dm_outbox::next_hlc(
+        Some(&minted.bootstrap_join.at),
+        minted.bootstrap_join.at.wall_ms,
+        &minted.bootstrap_join.at.device_id,
+    );
     let default_channel_payload = crate::community_membership::EventPayload {
         id: default_channel_event_id,
         community_id: minted.community_id,
@@ -6689,7 +6724,7 @@ pub async fn create_community_inner(
             write_power: 0,
         },
         actor: self_owner,
-        at: default_channel_at,
+        at: default_channel_at.clone(),
     };
     let default_channel_signed = match crate::community_membership::sign_event(
         &default_channel_payload,
@@ -6866,10 +6901,18 @@ pub async fn create_community_inner(
         // Success: acquire tracker WHILE still holding state_g, so
         // any concurrent persist_both blocks at `state.lock()` until
         // both writes are committed. Bootstrap creation: prev_hlc
-        // was either None or strictly older than `created_at`, so
-        // the insert is monotonic.
+        // was either None or strictly older than the latest event,
+        // so the insert is monotonic.
+        //
+        // Persist the HIGHER of the two HLCs we minted in this
+        // transaction (default-channel at `bootstrap.logical+1`),
+        // not `minted.space.created_at` (= bootstrap_join.at, with
+        // `logical=0`). Otherwise the tracker regresses below the
+        // last-minted event and the next locally-minted event could
+        // collide with the default-channel HLC at the same
+        // (wall_ms, device_id).
         let mut tracker_g = hlc_tracker.lock().await;
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
+        tracker_g.insert(device_id.clone(), default_channel_at.clone());
         // Both guards drop here at scope end, in reverse acquisition
         // order (tracker, then state) — neutral wrt other call sites
         // but consistent with Rust's drop semantics.

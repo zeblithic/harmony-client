@@ -92,7 +92,10 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 /// the per-recv timeout elapses with no further events. Returns the
 /// matching delta. Each `recv` waits up to 5s — generous because the
 /// CI box can be slow under load and a tight timeout would mask a
-/// real wedge as a flake.
+/// real wedge as a flake. The loop is unbounded — the per-recv timeout
+/// is the safety net (an arbitrary iteration cap would be brittle
+/// against harmless extra emissions e.g. a delta for an unrelated
+/// pre-seed event).
 async fn drain_until<F>(
     rx: &mut mpsc::Receiver<CommunityMembershipDelta>,
     mut pred: F,
@@ -101,7 +104,7 @@ async fn drain_until<F>(
 where
     F: FnMut(&CommunityMembershipDelta) -> bool,
 {
-    for _ in 0..8 {
+    loop {
         let next = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap_or_else(|_| panic!("{label}: timed out waiting for matching delta"))
@@ -110,7 +113,6 @@ where
             return next;
         }
     }
-    panic!("{label}: drained 8 deltas without seeing the expected event");
 }
 
 /// Wire alice_pub_rx → bob_sub_tx and bob_pub_rx → alice_sub_tx, the
@@ -365,20 +367,26 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     assert!(info.deleted_at.is_none());
 }
 
-/// Test 2 — sub-mod gating: Bob (no Join, sub-mod actor) attempts a
-/// ChannelCreate. `verify_event` returns `ActorNotJoined` because the
-/// Joined check fires before the per-kind power gate (see
-/// `community_membership::verify_event` step 4 vs step 5). Single-engine
-/// test — no forwarder — verifies the local-reject contract before
-/// any publish hits the wire.
+/// Test 2 — sub-mod power gating: Bob is a Joined member with default
+/// power 0 (well below `POWER_THRESHOLDS.kick = 50`). He attempts a
+/// `ChannelCreate`. `verify_event`'s membership check (step 4) passes
+/// because Bob IS Joined; the per-kind power gate (step 5) fires and
+/// returns `ChannelAdminInsufficientPower`. This is the actual semantics
+/// the test name implies — distinct from the membership-gate rejection
+/// (`ActorNotJoined`) that an unjoined actor would hit.
+///
+/// Single-engine test — no forwarder. Bob's engine is OOB-pre-seeded
+/// with Alice's bootstrap Join + Bob's own Join so `prior_state` has
+/// Bob as Joined with power 0.
 #[tokio::test]
-async fn sub_mod_actor_channel_create_locally_rejected() {
+async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insufficient_power() {
     let alice = PrivateIdentity::from_seed(&[0xAA; 32]);
     let bob = PrivateIdentity::from_seed(&[0xBB; 32]);
     let alice_addr = OwnerAddr(alice.identity.address_hash);
     let bob_addr = OwnerAddr(bob.identity.address_hash);
     let alice_pub = alice.identity.to_public_bytes();
     let bob_pub = bob.identity.to_public_bytes();
+    let alice_sk = Arc::new(signing_key_from(&alice));
     let bob_sk = Arc::new(signing_key_from(&bob));
 
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
@@ -430,9 +438,55 @@ async fn sub_mod_actor_channel_create_locally_rejected() {
         .await
         .expect("bob engine");
 
-    // Bob signs a ChannelCreate even though he hasn't Joined the
-    // community. verify_event step 4 checks `is_joined_member` for
-    // channel-config event kinds and rejects with ActorNotJoined.
+    // Pre-seed Bob's engine with Alice's bootstrap Join (admin → power 100)
+    // — same OOB pattern as test 1's cold-cache simulation. Without this,
+    // Bob's prior_state has no admin and his own Join below would fail
+    // verify (admin's pubkey is required for Join sig binding via
+    // identity_resolver, but more importantly Bob's verify_event needs
+    // an admin in the community context).
+    let alice_join_at = Hlc {
+        wall_ms: 100_000,
+        logical: 0,
+        device_id: "alice-dev".into(),
+    };
+    let alice_join_payload = EventPayload {
+        id: [0x10; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: alice_addr,
+        at: alice_join_at,
+    };
+    let alice_join = sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join");
+    let outcome = bob_engine
+        .insert_local_event(alice_join)
+        .await
+        .expect("bob OOB-seeds Alice's bootstrap Join");
+    assert_eq!(outcome, InsertOutcome::Inserted);
+
+    // Bob signs + inserts his own Join. Open community → no countersig
+    // required. After this, Bob's prior_state has Bob as Joined with
+    // default power 0 (well below POWER_THRESHOLDS.kick = 50).
+    let bob_join_payload = EventPayload {
+        id: [0x20; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: bob_addr,
+        at: Hlc {
+            wall_ms: 150_000,
+            logical: 0,
+            device_id: "bob-dev".into(),
+        },
+    };
+    let bob_join = sign_event(&bob_join_payload, bob_sk.as_ref()).expect("sign bob join");
+    let outcome = bob_engine
+        .insert_local_event(bob_join)
+        .await
+        .expect("bob join insert");
+    assert_eq!(outcome, InsertOutcome::Inserted);
+
+    // Bob (Joined, power 0) attempts ChannelCreate. verify_event step 4
+    // passes (he IS Joined); step 5's power gate fires:
+    // ChannelAdminInsufficientPower (NOT ActorNotJoined).
     let bob_create_payload = EventPayload {
         id: [0x21; 16],
         community_id,
@@ -457,9 +511,9 @@ async fn sub_mod_actor_channel_create_locally_rejected() {
     assert!(
         matches!(
             outcome,
-            InsertOutcome::Rejected(VerifyError::ActorNotJoined)
+            InsertOutcome::Rejected(VerifyError::ChannelAdminInsufficientPower)
         ),
-        "expected ActorNotJoined rejection, got {outcome:?}"
+        "expected ChannelAdminInsufficientPower rejection (mod-power gate), got {outcome:?}"
     );
 }
 

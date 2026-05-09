@@ -401,6 +401,43 @@ pub enum VerifyError {
     /// can emit a clean "you don't have permission to manage channels"
     /// error string without overloading the membership-level diagnostic.
     ChannelAdminInsufficientPower,
+    /// `ChannelCreate` event references a `channel_id` that already
+    /// exists in `prior_state.channels` (with or without `deleted_at`
+    /// set). Duplicate channel-ids violate create semantics — the IPC
+    /// layer's first call returns InsertOutcome::Inserted for the first
+    /// event and (without this gate) silently no-ops the second in
+    /// materialize, leaving the caller thinking creation succeeded.
+    /// Reject at verify time so the IPC surfaces a clean "channel
+    /// already exists" error.
+    ChannelIdAlreadyExists,
+
+    /// `ChannelDelete` event references a `channel_id` that has no
+    /// entry in `prior_state.channels`. Channels are tombstoned (not
+    /// removed), so a missing entry means the channel was never
+    /// created. Surfaces a clean "no such channel" error at IPC level.
+    /// Note: `ChannelModify` on unknown channel is intentionally NOT
+    /// rejected (DAG-sync may reorder Modify before Create — materialize
+    /// safely no-ops).
+    ChannelNotFound,
+
+    /// `ChannelDelete` event references a channel whose `deleted_at` is
+    /// already set. Closes the TOCTOU between `delete_channel` IPC's
+    /// preflight check and the engine insert; surfaces a clean "already
+    /// deleted" error.
+    ChannelAlreadyDeleted,
+
+    /// `ChannelModify` event has both `name: None` and `write_power: None`
+    /// — a no-op the IPC layer would normally reject before signing, but
+    /// remote peers can still submit signed no-ops. Reject at verify
+    /// time to avoid bloating the CRDT log with effectless events.
+    ChannelModifyNoOp,
+
+    /// `ChannelCreate` or `ChannelModify` carries a `name` that is
+    /// empty/whitespace-only or exceeds 32 chars (per spec §12.3).
+    /// Receive-side enforcement so a malicious peer can't replicate
+    /// invalid names that would break the UI.
+    ChannelNameInvalid,
+
     EncodeError(String),
 }
 
@@ -476,6 +513,18 @@ impl std::fmt::Display for VerifyError {
             VerifyError::ChannelAdminInsufficientPower => write!(
                 f,
                 "channel-config events require power >= POWER_THRESHOLDS.kick (mod-tier)"
+            ),
+            VerifyError::ChannelIdAlreadyExists => {
+                write!(f, "ChannelCreate channel_id already exists in materialized state")
+            }
+            VerifyError::ChannelNotFound => write!(f, "ChannelDelete channel_id not in materialized state"),
+            VerifyError::ChannelAlreadyDeleted => write!(f, "ChannelDelete on already-tombstoned channel"),
+            VerifyError::ChannelModifyNoOp => {
+                write!(f, "ChannelModify with both name and write_power None (no-op rejected at verify)")
+            }
+            VerifyError::ChannelNameInvalid => write!(
+                f,
+                "channel name is empty or exceeds 32 chars (spec §12.3 limit)"
             ),
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
@@ -1252,11 +1301,68 @@ pub fn verify_event(
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
         }
-        MembershipEventKind::ChannelCreate { .. }
-        | MembershipEventKind::ChannelModify { .. }
-        | MembershipEventKind::ChannelDelete { .. } => {
+        MembershipEventKind::ChannelCreate {
+            channel_id,
+            name,
+            write_power,
+        } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Reject duplicate channel_id (CodeAnt #1).
+            if prior_state.channels.contains_key(channel_id) {
+                return Err(VerifyError::ChannelIdAlreadyExists);
+            }
+            // Validate name length (1-32 chars per spec §12.3).
+            if name.trim().is_empty() || name.chars().count() > 32 {
+                return Err(VerifyError::ChannelNameInvalid);
+            }
+            // Validate write_power range.
+            if *write_power > POWER_THRESHOLDS.max {
+                return Err(VerifyError::PowerLevelOutOfRange);
+            }
+        }
+        MembershipEventKind::ChannelModify {
+            channel_id: _,
+            name,
+            write_power,
+        } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Reject all-None ChannelModify (no-op signal, malformed).
+            if name.is_none() && write_power.is_none() {
+                return Err(VerifyError::ChannelModifyNoOp);
+            }
+            // Validate name length when Some.
+            if let Some(n) = name {
+                if n.trim().is_empty() || n.chars().count() > 32 {
+                    return Err(VerifyError::ChannelNameInvalid);
+                }
+            }
+            // Validate write_power range when Some.
+            if let Some(wp) = write_power {
+                if *wp > POWER_THRESHOLDS.max {
+                    return Err(VerifyError::PowerLevelOutOfRange);
+                }
+            }
+            // Note: ChannelModify on unknown channel_id is intentionally
+            // ALLOWED — DAG-sync may deliver Modify before Create;
+            // materialize safely no-ops on unknown.
+        }
+        MembershipEventKind::ChannelDelete { channel_id } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Reject delete on unknown channel (clean error).
+            let channel = prior_state
+                .channels
+                .get(channel_id)
+                .ok_or(VerifyError::ChannelNotFound)?;
+            // Reject delete on already-tombstoned (closes TOCTOU between
+            // delete_channel IPC preflight and the engine insert).
+            if channel.deleted_at.is_some() {
+                return Err(VerifyError::ChannelAlreadyDeleted);
             }
         }
     }
