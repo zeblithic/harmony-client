@@ -21,6 +21,8 @@ use crate::owner_state_types::Hlc;
 use crate::owner_state_types::MembershipKey;
 use crate::owner_state_types::OwnerAddr;
 use crate::owner_state_types::SpaceId;
+use chacha20poly1305::aead::{Aead, OsRng, Payload};
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -96,6 +98,15 @@ pub struct MessageId(
 /// v3 may extend with per-event AAD; for now this is a constant across
 /// every packet on every channel.
 pub const CHANNEL_PACKET_AAD: &[u8] = b"harmony-channel-msg-v1";
+
+/// ChaCha20-Poly1305 nonce length per packet. Per spec §5.3.
+const NONCE_LEN: usize = 12;
+/// Poly1305 authentication-tag length appended by ChaCha20-Poly1305.
+const TAG_LEN: usize = 16;
+/// Minimum valid wire-packet length: nonce + (empty plaintext) + tag.
+/// Anything shorter cannot structurally contain both, and we reject
+/// before invoking the AEAD layer for a cleaner error split.
+const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 
 /// One signed channel event. Phase 2 ships only the `Post` variant.
 /// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
@@ -295,9 +306,6 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
     Ok(canon)
 }
 
-use chacha20poly1305::aead::{Aead, OsRng, Payload};
-use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
-
 /// Encrypt a SignedChannelEvent into the wire-format packet:
 ///   [12B random nonce][ChaCha20-Poly1305(key=ChannelKey,
 ///                                        plaintext=canonical_cbor(event),
@@ -324,7 +332,7 @@ pub fn encrypt_channel_packet(
             },
         )
         .map_err(|e| ChannelEventError::AeadEncrypt(e.to_string()))?;
-    let mut packet = Vec::with_capacity(12 + ciphertext.len());
+    let mut packet = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     packet.extend_from_slice(nonce.as_slice());
     packet.extend_from_slice(&ciphertext);
     Ok(packet)
@@ -340,10 +348,10 @@ pub fn decrypt_channel_packet(
     key: &ChannelKey,
     packet: &[u8],
 ) -> Result<SignedChannelEvent, ChannelEventError> {
-    if packet.len() < 12 {
+    if packet.len() < MIN_PACKET_LEN {
         return Err(ChannelEventError::MalformedPacket(packet.len()));
     }
-    let (nonce_bytes, ciphertext) = packet.split_at(12);
+    let (nonce_bytes, ciphertext) = packet.split_at(NONCE_LEN);
     let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
     let plaintext = cipher
         .decrypt(
@@ -567,7 +575,16 @@ mod tests {
     fn aead_decrypt_rejects_short_packet() {
         let mk = fixture_mk();
         let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
-        let err = decrypt_channel_packet(&key, &[0u8; 5]).expect_err("must reject short packet");
-        assert!(matches!(err, ChannelEventError::MalformedPacket(5)));
+        // Anything shorter than NONCE_LEN + TAG_LEN (28) cannot
+        // structurally contain both — reject before invoking AEAD.
+        for len in [0usize, 5, 11, 12, 27] {
+            let buf = vec![0u8; len];
+            let err = decrypt_channel_packet(&key, &buf)
+                .expect_err(&format!("len {len} must be rejected as MalformedPacket"));
+            assert!(
+                matches!(err, ChannelEventError::MalformedPacket(actual) if actual == len),
+                "len {len} should produce MalformedPacket({len}), got {err:?}"
+            );
+        }
     }
 }
