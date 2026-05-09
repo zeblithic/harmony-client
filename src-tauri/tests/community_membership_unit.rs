@@ -2716,3 +2716,213 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         "first ChannelCreate's HLC must win"
     );
 }
+
+#[test]
+fn channel_modify_event_kind_round_trips_full() {
+    let kind = MembershipEventKind::ChannelModify {
+        channel_id: [0xAB; 16],
+        name: Some("general-renamed".to_string()),
+        write_power: Some(50),
+    };
+    let encoded = canonical_cbor_encode(&kind).expect("encode");
+    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
+    assert_eq!(decoded, kind);
+}
+
+#[test]
+fn channel_modify_event_kind_round_trips_name_only() {
+    let kind = MembershipEventKind::ChannelModify {
+        channel_id: [0xAB; 16],
+        name: Some("renamed".to_string()),
+        write_power: None,
+    };
+    let encoded = canonical_cbor_encode(&kind).expect("encode");
+    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
+    assert_eq!(decoded, kind);
+}
+
+#[test]
+fn channel_modify_event_kind_round_trips_power_only() {
+    let kind = MembershipEventKind::ChannelModify {
+        channel_id: [0xAB; 16],
+        name: None,
+        write_power: Some(50),
+    };
+    let encoded = canonical_cbor_encode(&kind).expect("encode");
+    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
+    assert_eq!(decoded, kind);
+}
+
+#[test]
+fn channel_delete_event_kind_round_trips() {
+    let kind = MembershipEventKind::ChannelDelete {
+        channel_id: [0xAB; 16],
+    };
+    let encoded = canonical_cbor_encode(&kind).expect("encode");
+    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
+    assert_eq!(decoded, kind);
+}
+
+#[test]
+fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_id: ChannelId = [0xAB; 16];
+    let ch_create = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    // Only modify name — write_power should stay at 0.
+    let ch_modify = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelModify {
+            channel_id: ch_id,
+            name: Some("renamed".to_string()),
+            write_power: None,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let m = materialize(&[admin_join, ch_create, ch_modify], admin);
+    let info = m.channels.get(&ch_id).expect("channel still present");
+    assert_eq!(info.name, "renamed");
+    assert_eq!(info.write_power, 0); // preserved
+    assert_eq!(info.created_at.wall_ms, 2_000); // preserved
+    assert!(info.deleted_at.is_none());
+}
+
+#[test]
+fn materialize_channel_delete_tombstones_in_place() {
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_id: ChannelId = [0xAB; 16];
+    let ch_create = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_delete = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 4_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let m = materialize(&[admin_join, ch_create, ch_delete], admin);
+    let info = m
+        .channels
+        .get(&ch_id)
+        .expect("channel still in map (tombstone, not removed)");
+    assert_eq!(info.name, "general");
+    assert_eq!(info.deleted_at.as_ref().map(|h| h.wall_ms), Some(4_000));
+}
+
+#[test]
+fn materialize_channel_modify_on_unknown_channel_is_noop() {
+    // ChannelModify referencing a channel that doesn't exist is silently
+    // ignored — defense-in-depth against an event arriving before its
+    // ChannelCreate (DAG-sync may reorder; verify_event will reject this
+    // case in Task 3 anyway, but materialize must be safe even if a
+    // malformed event slips past).
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let ch_modify = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelModify {
+            channel_id: [0xCC; 16], // never created
+            name: Some("ghost".into()),
+            write_power: None,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let m = materialize(&[admin_join, ch_modify], admin);
+    assert!(
+        m.channels.is_empty(),
+        "modify on unknown channel must not synthesize a ghost entry"
+    );
+}

@@ -60,6 +60,33 @@ pub enum MembershipEventKind {
         #[serde(rename = "wp")]
         write_power: u8,
     },
+
+    /// Channel-config event: a mod-tier+ actor modifies an existing
+    /// channel's name and/or write_power. Either field may be `None` to
+    /// leave that field unchanged. If both are `None` the IPC layer
+    /// rejects the call before signing (no-op). Variant code "m".
+    /// See spec `docs/specs/2026-05-09-zeb-248-channels-within-communities-design.md` §5.1.
+    #[serde(rename = "m")]
+    ChannelModify {
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "nm", skip_serializing_if = "Option::is_none", default)]
+        name: Option<String>,
+        #[serde(rename = "wp", skip_serializing_if = "Option::is_none", default)]
+        write_power: Option<u8>,
+    },
+
+    /// Channel-config event: a mod-tier+ actor deletes a channel.
+    /// Tombstone semantics — the channel is NOT removed from the
+    /// materialized `channels` map; instead `deleted_at` is set. Future
+    /// posts to this channel are rejected by Phase 2's verify_channel_event;
+    /// historical messages still render with their breadcrumb intact.
+    /// Variant code "d". See spec §5.1.
+    #[serde(rename = "d")]
+    ChannelDelete {
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -672,6 +699,8 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
 ///    - Kick { target }: members[target].status = Banned, .left_at = at
 ///    - SetPower { target, level }: power_levels[target] = level
 ///    - ChannelCreate { channel_id, name, write_power }: channels[channel_id] = ChannelInfo { ... } if absent (first-create-wins; duplicate is no-op so a replayed event can't refresh created_at)
+///    - ChannelModify { channel_id, name, write_power }: partial update — only Some fields applied; unknown channel_id silently ignored
+///    - ChannelDelete { channel_id }: tombstone — sets deleted_at, never removes (so historical messages can render breadcrumb); idempotent first-delete-wins
 ///
 /// Pure function — does NOT verify signatures or power rules. That's
 /// `verify_event`. Materialization assumes pre-verified events; the
@@ -819,6 +848,43 @@ pub fn materialize(
                         created_at: event.at.clone(),
                         deleted_at: None,
                     });
+            }
+            MembershipEventKind::ChannelModify {
+                channel_id,
+                name,
+                write_power,
+            } => {
+                // Partial update: only apply fields that are Some.
+                // Unknown ChannelId is silently ignored — verify_event
+                // (Task 3) does NOT gate Modify on the channel existing
+                // (a malicious actor could otherwise pre-trigger a verify
+                // failure to leak existence info), so materialize stays
+                // safe by default. A reordered Modify-before-Create
+                // would be discarded here; the eventual sort means the
+                // re-replay after the missing Create arrives still does
+                // the right thing.
+                if let Some(info) = m.channels.get_mut(channel_id) {
+                    if let Some(new_name) = name {
+                        info.name = new_name.clone();
+                    }
+                    if let Some(new_wp) = write_power {
+                        info.write_power = *new_wp;
+                    }
+                }
+            }
+            MembershipEventKind::ChannelDelete { channel_id } => {
+                // Tombstone: set deleted_at, do NOT remove. Idempotent
+                // on duplicate: first delete wins (preserves the original
+                // deleted_at HLC). Subsequent ChannelModify can still
+                // mutate name/write_power on a tombstoned channel —
+                // intentional, so admins can correct the name of an
+                // accidentally-deleted-then-renamed channel without an
+                // un-delete primitive (deferred to v3).
+                if let Some(info) = m.channels.get_mut(channel_id) {
+                    if info.deleted_at.is_none() {
+                        info.deleted_at = Some(event.at.clone());
+                    }
+                }
             }
         }
     }
@@ -1100,7 +1166,9 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
-        MembershipEventKind::ChannelCreate { .. } => {
+        MembershipEventKind::ChannelCreate { .. }
+        | MembershipEventKind::ChannelModify { .. }
+        | MembershipEventKind::ChannelDelete { .. } => {
             // Verify gate ships in Task 3. Placeholder allow-all keeps
             // the match exhaustive; Task 3 replaces with the
             // mod-tier power check.
@@ -1158,7 +1226,9 @@ pub fn verify_event(
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
         }
-        MembershipEventKind::ChannelCreate { .. } => {
+        MembershipEventKind::ChannelCreate { .. }
+        | MembershipEventKind::ChannelModify { .. }
+        | MembershipEventKind::ChannelDelete { .. } => {
             // Per-kind power gate ships in Task 3.
         }
     }
