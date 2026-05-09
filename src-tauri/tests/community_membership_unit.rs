@@ -3099,10 +3099,17 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
 
 // ── ZEB-248 Phase 1 review fixup: per-variant verify_event validation ───
 //
-// Tests for the new VerifyError branches added in PR #93 review fixup:
-// ChannelIdAlreadyExists, ChannelNotFound, ChannelAlreadyDeleted,
-// ChannelModifyNoOp, ChannelNameInvalid, plus PowerLevelOutOfRange
-// reuse for channel write_power.
+// Tests for the VerifyError branches covering channel-config events:
+// ChannelAlreadyDeleted, ChannelModifyNoOp, ChannelNameInvalid, plus
+// PowerLevelOutOfRange reuse for channel write_power.
+//
+// Round 3 fixup (CodeRabbit, CRDT-safety): verify_event MUST NOT reject
+// ChannelCreate-with-duplicate-id or ChannelDelete-on-unknown-channel —
+// cross-blob ordering can deliver these before their predecessors, so
+// rejecting at verify time would permanently drop the event from a
+// replica's log and break CRDT-log convergence. materialize handles
+// both cases idempotently (or_insert_with for Create, get_mut→None
+// no-op for Delete). Tests below assert the new ALLOW-paths.
 
 /// Helper: build admin's bootstrap-Join → ChannelCreate prior state.
 fn admin_with_channel_prior_state(
@@ -3141,45 +3148,6 @@ fn admin_with_channel_prior_state(
     };
     let ch_create = sign_event_with_identity(&ch_create_payload, admin_priv).expect("sign create");
     materialize(&[admin_join, ch_create], admin_addr)
-}
-
-#[test]
-fn verify_event_channel_create_rejects_duplicate_channel_id() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
-    let community_id = SpaceId([0x37; 16]);
-    let ch_id = ChannelId([0xAB; 16]);
-    let prior_state =
-        admin_with_channel_prior_state(&admin_priv, admin_addr, community_id, ch_id, "general");
-
-    // Attempt second ChannelCreate with the SAME channel_id.
-    let payload = EventPayload {
-        id: [0x03; 16],
-        community_id,
-        kind: MembershipEventKind::ChannelCreate {
-            channel_id: ch_id,
-            name: "duplicate".to_string(),
-            write_power: 0,
-        },
-        actor: admin_addr,
-        at: Hlc {
-            wall_ms: 3_000,
-            logical: 0,
-            device_id: "a".into(),
-        },
-    };
-    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
-    let ctx = VerifyContext {
-        expected_community_id: community_id,
-        admin_addr,
-        is_invite_only: false,
-        actor_identity_pub: &admin_pub,
-        countersigner_identity_pub: None,
-    };
-
-    assert_eq!(
-        verify_event(&event, &prior_state, &ctx),
-        Err(VerifyError::ChannelIdAlreadyExists)
-    );
 }
 
 #[test]
@@ -3418,53 +3386,6 @@ fn verify_event_channel_modify_allows_unknown_channel_id() {
 }
 
 #[test]
-fn verify_event_channel_delete_rejects_unknown_channel() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
-    let community_id = SpaceId([0x37; 16]);
-    let admin_join_payload = EventPayload {
-        id: [0x01; 16],
-        community_id,
-        kind: MembershipEventKind::Join,
-        actor: admin_addr,
-        at: Hlc {
-            wall_ms: 1_000,
-            logical: 0,
-            device_id: "a".into(),
-        },
-    };
-    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
-    let prior_state = materialize(&[admin_join], admin_addr);
-
-    // ChannelDelete on a channel that was never created.
-    let payload = EventPayload {
-        id: [0x02; 16],
-        community_id,
-        kind: MembershipEventKind::ChannelDelete {
-            channel_id: ChannelId([0xCC; 16]),
-        },
-        actor: admin_addr,
-        at: Hlc {
-            wall_ms: 2_000,
-            logical: 0,
-            device_id: "a".into(),
-        },
-    };
-    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
-    let ctx = VerifyContext {
-        expected_community_id: community_id,
-        admin_addr,
-        is_invite_only: false,
-        actor_identity_pub: &admin_pub,
-        countersigner_identity_pub: None,
-    };
-
-    assert_eq!(
-        verify_event(&event, &prior_state, &ctx),
-        Err(VerifyError::ChannelNotFound)
-    );
-}
-
-#[test]
 fn verify_event_channel_delete_rejects_already_tombstoned() {
     let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
@@ -3539,4 +3460,265 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
         verify_event(&event, &prior_state, &ctx),
         Err(VerifyError::ChannelAlreadyDeleted)
     );
+}
+
+#[test]
+fn verify_event_channel_modify_rejects_value_matching_noop() {
+    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+
+    let ch_id = ChannelId([0xAB; 16]);
+    let create_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let create = sign_event_with_identity(&create_payload, &admin_priv).expect("sign");
+
+    let prior_state = materialize(&[admin_join, create], admin_addr);
+
+    // Modify with values that exactly match current state.
+    let modify_payload = EventPayload {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelModify {
+            channel_id: ch_id,
+            name: Some("general".to_string()), // same as current
+            write_power: Some(0),              // same as current
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let modify = sign_event_with_identity(&modify_payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &admin_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(
+        verify_event(&modify, &prior_state, &ctx),
+        Err(VerifyError::ChannelModifyNoOp)
+    );
+}
+
+#[test]
+fn verify_event_channel_modify_accepts_partial_change() {
+    // Only one of (name, write_power) changes — should still be accepted.
+    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+
+    let ch_id = ChannelId([0xAB; 16]);
+    let create_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let create = sign_event_with_identity(&create_payload, &admin_priv).expect("sign");
+
+    let prior_state = materialize(&[admin_join, create], admin_addr);
+
+    // Modify with name change only.
+    let modify_payload = EventPayload {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelModify {
+            channel_id: ch_id,
+            name: Some("renamed".to_string()), // different from "general"
+            write_power: None,                 // unchanged
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let modify = sign_event_with_identity(&modify_payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &admin_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(verify_event(&modify, &prior_state, &ctx), Ok(()));
+}
+
+#[test]
+fn verify_event_channel_delete_allows_unknown_channel_for_dag_sync_safety() {
+    // ChannelDelete on unknown channel must NOT reject at verify_event —
+    // cross-blob ordering can deliver Delete before its corresponding
+    // Create. materialize handles unknown delete as no-op; the eventual
+    // arrival of Create + replay converges correctly.
+    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+    let prior_state = materialize(&[admin_join], admin_addr);
+
+    let delete_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelDelete {
+            channel_id: ChannelId([0xCC; 16]), // never created
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let delete = sign_event_with_identity(&delete_payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &admin_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(verify_event(&delete, &prior_state, &ctx), Ok(()));
+}
+
+#[test]
+fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergence() {
+    // ChannelCreate with a channel_id already in prior_state must NOT
+    // reject at verify_event. Materialize's or_insert_with idempotency
+    // ensures convergence (first-create-wins). Verify-time rejection
+    // would cause log divergence (some replicas store both, some only
+    // one) without changing the materialized view.
+    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+
+    let ch_id = ChannelId([0xAB; 16]);
+    let first_create_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "first".to_string(),
+            write_power: 0,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let first_create = sign_event_with_identity(&first_create_payload, &admin_priv).expect("sign");
+
+    let prior_state = materialize(&[admin_join, first_create], admin_addr);
+    // prior_state.channels now has ch_id → "first"
+
+    // Second ChannelCreate with same channel_id (different EventId, different name).
+    let second_create_payload = EventPayload {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "second".to_string(),
+            write_power: 50,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let second_create =
+        sign_event_with_identity(&second_create_payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &admin_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(verify_event(&second_create, &prior_state, &ctx), Ok(()));
 }
