@@ -5527,7 +5527,10 @@ async fn list_community_members(
 /// `mint_kick_event` / `mint_set_power_event`. The fresh `channel_id`
 /// (16 random bytes) and event id are sourced from the supplied RNG
 /// (via `rand::thread_rng` in production).
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`. This helper is now pure
+/// on the HLC — it does not call `next_hlc` internally.
 pub fn mint_channel_create_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -5535,9 +5538,7 @@ pub fn mint_channel_create_event(
     name: String,
     write_power: u8,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5546,7 +5547,6 @@ pub fn mint_channel_create_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -5642,12 +5642,10 @@ async fn create_channel(
         crate::community_membership::ChannelId(buf)
     };
 
-    // Mint under HLC tracker + dm_outbox locks then drop the guards.
+    // ZEB-267: atomic HLC reservation.
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         mint_channel_create_event(
@@ -5657,9 +5655,7 @@ async fn create_channel(
             name,
             write_power,
             signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            hlc,
         )?
     };
 
@@ -5703,21 +5699,16 @@ async fn create_channel(
         return Err(membership_outcome_err("create_channel", &outcome));
     }
 
-    // Advance HLC tracker only on `Inserted` (mirrors the other Phase 4
-    // mod-tier IPCs). `AlreadyKnown` is a 16-byte-event-id collision —
+    // ZEB-267: tracker is bumped at reservation time, so no post-Inserted
+    // advance here. AlreadyKnown is a 16-byte-event-id collision —
     // vanishingly unlikely; surface as Err so the caller knows the
     // channel wasn't created (the new channel_id we generated is gone).
     if matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id, event.at);
         Ok(hex::encode(channel_id.0))
     } else {
-        // Outcome is AlreadyKnown — the engine already knows this exact
-        // event (event_id collision). Vanishingly unlikely, but surface
-        // it so the caller doesn't think the channel was created.
         Err(format!(
             "create_channel unexpected outcome: AlreadyKnown (event_id collision: {})",
             hex::encode(event.id)
@@ -5738,7 +5729,9 @@ async fn create_channel(
 /// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
 /// for ensuring at least one of `name`/`write_power` is `Some` (the IPC
 /// boundary rejects all-None before this is reached).
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_channel_modify_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -5746,9 +5739,7 @@ pub fn mint_channel_modify_event(
     name: Option<String>,
     write_power: Option<u8>,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5757,7 +5748,6 @@ pub fn mint_channel_modify_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -5776,15 +5766,15 @@ pub fn mint_channel_modify_event(
 /// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
 /// for the metadata-before-write check (channel exists + not already
 /// tombstoned) — this helper does NOT validate; it only mints.
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_channel_delete_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     channel_id: crate::community_membership::ChannelId,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5793,7 +5783,6 @@ pub fn mint_channel_delete_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -5891,12 +5880,10 @@ async fn modify_channel(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint under HLC tracker + dm_outbox locks then drop the guards.
+    // ZEB-267: atomic HLC reservation.
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
         mint_channel_modify_event(
@@ -5906,9 +5893,7 @@ async fn modify_channel(
             name,
             write_power,
             signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            hlc,
         )?
     };
 
@@ -5951,15 +5936,13 @@ async fn modify_channel(
         return Err(membership_outcome_err("modify_channel", &outcome));
     }
 
-    // Advance HLC tracker only on `Inserted` (mirrors create_channel).
-    // `AlreadyKnown` is a 16-byte-event-id collision — vanishingly
-    // unlikely; surface as Err so the caller knows the modify didn't apply.
+    // ZEB-267: tracker is bumped at reservation time. AlreadyKnown is
+    // a 16-byte-event-id collision — vanishingly unlikely; surface as
+    // Err so the caller knows the modify didn't apply.
     if matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id, event.at);
         Ok(())
     } else {
         Err(format!(
@@ -6122,23 +6105,18 @@ async fn delete_channel(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint under HLC tracker + dm_outbox locks then drop the guards.
+    // ZEB-267: atomic HLC reservation. Note that the reservation
+    // happens AFTER the metadata-before-irreversible-write read at
+    // step 6 above (the channel-exists / not-tombstoned check) per
+    // user memory rule — burning an HLC on a stale read-side rejection
+    // is fine, but burning an HLC inside an actually-no-op event is
+    // worse UX (caller pays for an HLC tick they can't see).
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        mint_channel_delete_event(
-            space_id,
-            self_owner,
-            channel_id,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        mint_channel_delete_event(space_id, self_owner, channel_id, signing_key, hlc)?
     };
 
     // Generation + registry fence.
@@ -6179,12 +6157,13 @@ async fn delete_channel(
         return Err(membership_outcome_err("delete_channel", &outcome));
     }
 
+    // ZEB-267: tracker bumped at reservation time. AlreadyKnown is a
+    // 16-byte-event-id collision — vanishingly unlikely; surface as
+    // Err so the caller knows the delete didn't apply.
     if matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id, event.at);
         Ok(())
     } else {
         Err(format!(
@@ -6421,24 +6400,25 @@ pub struct MintedCommunity {
 /// Pure function: mint a fresh community + signed bootstrap Join.
 ///
 /// Generates random `community_id` (16 bytes) and `MembershipKey`
-/// (32 bytes), advances HLC from `prev_hlc`, builds the Community
-/// Space row, signs a self-Join `SignedMembershipEvent` with the
-/// caller's ed25519 key. Returns all four artefacts so the IPC layer
-/// can apply the Space, send the Join through the engine, and return
-/// the hex id to the frontend.
+/// (32 bytes), builds the Community Space row, signs a self-Join
+/// `SignedMembershipEvent` with the caller's ed25519 key. Returns
+/// all four artefacts so the IPC layer can apply the Space, send
+/// the Join through the engine, and return the hex id to the frontend.
 ///
-/// Pure / sync / no I/O — every random byte and HLC tick is sourced
-/// from the args. This lets the test (`create_community_inner_tests`)
-/// cover the full mint without spawning channels, mutexes, or a Tauri
-/// runtime.
+/// Sync / no I/O / no async — caller supplies `creation_hlc`
+/// (pre-reserved via `dm_outbox::reserve_next_hlc_for_device` per
+/// ZEB-267); `community_id`, `MembershipKey`, and the bootstrap-Join
+/// `event_id` are drawn from `rand::thread_rng()`. Not deterministic,
+/// but "pure" w.r.t. HLC ordering — concurrent callers with distinct
+/// reserved HLCs always produce monotone outputs. Free of channels,
+/// mutexes, and Tauri runtime, so `create_community_inner_tests` can
+/// cover the full mint in isolation.
 pub fn mint_community_creation(
     name: &str,
     is_invite_only: bool,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    creation_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use crate::owner_state_types::{MembershipKey, Space, SpaceId, SpaceKind};
@@ -6452,8 +6432,6 @@ pub fn mint_community_creation(
     let mut mk_bytes = [0u8; 32];
     rng.fill_bytes(&mut mk_bytes);
     let membership_key = MembershipKey::new(mk_bytes);
-
-    let creation_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
 
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
@@ -6513,15 +6491,24 @@ pub fn mint_community_creation(
 /// (Phase 4 Task 8 will extract it the same way) so the two IPCs share
 /// a code-review pattern.
 ///
-/// Lock-order discipline (load-bearing — flagged on PR #86 round 2):
+/// Lock-order discipline (load-bearing — flagged on PR #86 round 2,
+/// updated for ZEB-267 reservation-time tracker bump):
 /// the `crdt_state` `tokio::sync::Mutex` guard MUST drop before
 /// `hlc_tracker.lock().await` is acquired. Holding `state_g` across
 /// `tracker_g.lock().await` would (a) violate the project-wide "no
 /// `.await` while holding state mutex" rule, and (b) invert lock order
 /// vs callers that take `hlc_tracker` first — a deadlock risk under
-/// concurrent IPCs. The post-reorder body acquires both locks only at
-/// the END (tracker before crdt_state, then commit), so the rule is
-/// preserved.
+/// concurrent IPCs.
+///
+/// Post-ZEB-267 shape: `hlc_tracker` is locked EARLY via
+/// `reserve_next_hlc_for_device` (atomic read-bump-write under one
+/// lock) and the guard is dropped before any owner-state work. The
+/// later `apply_space` block takes `crdt_state` alone — the two locks
+/// are never held simultaneously, and `crdt_state` is never held
+/// across an `.await`. Tracker advance is reservation-time (burn
+/// semantics on rollback), no longer co-located with the apply_space
+/// commit. See spec at `docs/specs/2026-05-09-zeb-267-...md` for the
+/// rationale behind moving the bump out of the apply critical section.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_community_inner(
     name: String,
@@ -6551,26 +6538,36 @@ pub async fn create_community_inner(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint the Space + signed bootstrap Join. Read prev_hlc under the
-    // tracker lock then drop the guard before signing (sign is sync;
-    // releasing eagerly keeps the tracker available to other tasks).
-    // ZEB-258: NO mutation of owner-state or hlc_tracker yet — the mint
-    // is pure / sync and produces values, not side effects.
-    let minted = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
-        mint_community_creation(
-            &name,
-            is_invite_only,
-            self_owner,
-            signing_key.as_ref(),
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
-    };
+    // ZEB-267: atomic HLC reservation. The tracker is bumped here
+    // (reservation time), not at the post-commit `tracker_g.insert`
+    // line that ZEB-258 originally placed inside the apply_space
+    // critical section. Burn semantics: if owner-state apply_space
+    // rejects later, the reserved HLC is "burned" — fine, since
+    // HLCs are 64-bit logical and the burn-on-rollback shape is
+    // already implicit on the engine-spawn / adapter-dispatch
+    // failure paths above. ZEB-258's atomicity property (Space row
+    // commit is the LAST persistent step) is preserved — the
+    // tracker advance is no longer co-located with the apply_space
+    // call, but tracker advance was always orthogonal to the
+    // owner-state Space-row write (they both persist via
+    // persist_both, but the tracker is a per-device monotone
+    // counter, not a Space-row field).
+    //
+    // BREAKING WITH ZEB-258 NOTE: the commented invariant at the
+    // matching tracker_g.insert site below ("hold both guards
+    // across the apply+insert pair") is no longer load-bearing for
+    // tracker monotonicity since the reservation is atomic. We
+    // still hold state_g across the apply for owner-state rollback
+    // semantics, but tracker_g is gone from that block.
+    let creation_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let minted = mint_community_creation(
+        &name,
+        is_invite_only,
+        self_owner,
+        signing_key.as_ref(),
+        creation_hlc,
+    )?;
 
     // ZEB-258: spawn engine + dispatch adapter BEFORE the owner-state
     // commit. Both can fail; both have rollback paths (engine teardown
@@ -6706,15 +6703,24 @@ pub async fn create_community_inner(
         rand::thread_rng().fill_bytes(&mut buf);
         buf
     };
-    // Use `bootstrap_join.at.wall_ms` as the wall input so the helper
-    // returns `(bootstrap.wall_ms, bootstrap.logical+1, bootstrap.device_id)`
-    // — the same deterministic ordering as before, but via the shared
-    // `next_hlc` path (consistent with all other mint sites in lib.rs).
-    let default_channel_at = crate::dm_outbox::next_hlc(
-        Some(&minted.bootstrap_join.at),
-        minted.bootstrap_join.at.wall_ms,
-        &minted.bootstrap_join.at.device_id,
-    );
+    // ZEB-267: reserve a SECOND HLC atomically. The first reservation
+    // above bumped tracker[device_id] to `bootstrap_join.at`, BUT
+    // there are .await points between the two reservations (engine
+    // spawn, adapter dispatch), and the only ordering guarantee on
+    // `hlc_tracker` is its own internal mutex — a concurrent same-
+    // device IPC could slot into one of those gaps and advance
+    // tracker[device_id] past bootstrap_join.at before this
+    // reservation reads it. So the only invariant we can rely on is:
+    //   default_channel_at > bootstrap_join.at  (strictly greater)
+    // Adjacency (bootstrap.logical+1) and bit-equality with the
+    // pre-ZEB-267 chained `next_hlc(Some(&bootstrap_join.at), …)`
+    // call held only in the uncontended single-IPC case; under
+    // concurrency it does NOT, and that's fine — the engine's
+    // event_sort_key only requires strict ordering, not adjacency.
+    // Burn semantics: same as the first reservation — if a downstream
+    // step fails, the burned HLC is fine.
+    let default_channel_at =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let default_channel_payload = crate::community_membership::EventPayload {
         id: default_channel_event_id,
         community_id: minted.community_id,
@@ -6856,23 +6862,16 @@ pub async fn create_community_inner(
         }
     }
 
-    // ZEB-258: COMMIT owner-state Space + advance HLC tracker as a
-    // single atomic critical section. Both are persisted via
-    // `persist_both` (owner_state_crdt.cbor + state_root_replay.cbor)
-    // which acquires `state` then `tracker` in that order; holding
-    // BOTH guards across the apply+insert pair prevents any
-    // concurrent task — including a `stop_node`-triggered final
-    // persist — from snapshotting state with the new Space but the
-    // old tracker (which would leave a Space row on disk with no
-    // matching tracker entry after restart).
+    // ZEB-258 / ZEB-267: COMMIT owner-state Space as the LAST
+    // persistent step. Tokio Mutex guards are safe to hold across
+    // `.await` (only `std::sync::Mutex` guards must not be); the
+    // Rejected branch drops `state_g` before awaiting the registry
+    // tear-down to keep the rollback path .await-clean.
     //
-    // Lock order is `dm_outbox → crdt_state → hlc_tracker` per the
-    // documented invariant; we acquire `state_g` first, then
-    // `tracker_g` while still holding it. Tokio Mutex guards are
-    // safe to hold across `.await` (only `std::sync::Mutex` guards
-    // must not be); the Rejected branch drops `state_g` before
-    // awaiting the registry tear-down to keep the rollback path
-    // .await-clean.
+    // Pre-ZEB-267 this block ALSO held `tracker_g` across an insert
+    // to keep the tracker advance atomic with the Space commit. With
+    // the atomic reservation pattern, the tracker is bumped at
+    // reservation time (above) and this block is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -6898,24 +6897,12 @@ pub async fn create_community_inner(
             }
             return Err(format!("apply_space rejected new community: {outcome:?}"));
         }
-        // Success: acquire tracker WHILE still holding state_g, so
-        // any concurrent persist_both blocks at `state.lock()` until
-        // both writes are committed. Bootstrap creation: prev_hlc
-        // was either None or strictly older than the latest event,
-        // so the insert is monotonic.
-        //
-        // Persist the HIGHER of the two HLCs we minted in this
-        // transaction (default-channel at `bootstrap.logical+1`),
-        // not `minted.space.created_at` (= bootstrap_join.at, with
-        // `logical=0`). Otherwise the tracker regresses below the
-        // last-minted event and the next locally-minted event could
-        // collide with the default-channel HLC at the same
-        // (wall_ms, device_id).
-        let mut tracker_g = hlc_tracker.lock().await;
-        tracker_g.insert(device_id.clone(), default_channel_at.clone());
-        // Both guards drop here at scope end, in reverse acquisition
-        // order (tracker, then state) — neutral wrt other call sites
-        // but consistent with Rust's drop semantics.
+        // ZEB-267: tracker advance no longer needed here — the two
+        // reservations above (bootstrap_join + default-channel)
+        // already bumped the tracker atomically. state_g drops at
+        // scope end. Burn semantics (if apply_space had rejected
+        // earlier in this block): the reserved HLCs are fine to
+        // "burn" — HLCs are 64-bit logical, not finite.
     }
 
     Ok(hex::encode(minted.community_id.0))
@@ -7048,17 +7035,22 @@ mod create_community_inner_tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
 
         let device_id = "creator-dev";
-        let prev_hlc: Option<Hlc> = None;
         let wall_now_ms = 1_700_000_000_000u64;
+        // ZEB-267: caller pre-reserves the HLC; in production this
+        // comes from `reserve_next_hlc_for_device`. The test constructs
+        // it inline to keep the mint helper purely synchronous.
+        let creation_hlc = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
         let minted = mint_community_creation(
             "Hackers United",
             false,
             self_owner,
             &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            creation_hlc.clone(),
         )
         .expect("mint");
 
@@ -7097,9 +7089,7 @@ mod create_community_inner_tests {
             false,
             self_owner,
             &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            creation_hlc.clone(),
         )
         .expect("mint2");
         assert_ne!(minted.community_id, minted2.community_id);
@@ -7171,26 +7161,22 @@ pub struct NavUpdatedPayload {
     pub parent_id: Option<String>,
 }
 
-/// Pure function: mint a joiner-side self-Join + derived Community
-/// Space row from an invite payload.
-///
-/// Generates a random 16-byte event id, advances HLC from `prev_hlc`,
-/// constructs the Community Space row using the invite's
-/// `community_id` / `membership_key` / `admin_addr` / `community_name`
+/// Pure function: builds the joiner-side `MintedCommunity` from an
+/// invite payload — derives a Community Space row from `payload.name`
 /// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
 /// (actor = `self_owner`, community_id = `payload.community_id`).
 ///
-/// Pure / sync / no I/O — every random byte and HLC tick is sourced
-/// from the args, so the test (`redeem_invite_inner_tests`) can cover
-/// the full mint without spawning channels, mutexes, or a Tauri
-/// runtime.
+/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
+/// the test (`redeem_invite_inner_tests`) cover the full mint without
+/// spawning channels, mutexes, or a Tauri runtime.
+///
+/// ZEB-267: Caller pre-reserves `join_hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_redemption(
     payload: &crate::community_invite::CommunityInvitePayload,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    join_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use crate::owner_state_types::{Space, SpaceKind};
@@ -7199,8 +7185,6 @@ pub fn mint_redemption(
     let mut rng = rand::thread_rng();
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
-
-    let join_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
 
     let join_payload = EventPayload {
         id: event_id_bytes,
@@ -7233,11 +7217,6 @@ pub fn mint_redemption(
         // Space row matches the creator's row (Phase 1's CRDT same-
         // SpaceId rejection of community-creation field changes would
         // silently reject the redemption Space if these disagreed).
-        // In Phase 3 the IPC guard rejects invite-only payloads before
-        // we ever reach mint_redemption, so this currently equals
-        // Some(false) at runtime — but pinning to payload.is_invite_only
-        // unblocks Phase 4 invite-only redemption with no further mint
-        // edits.
         is_invite_only: Some(payload.is_invite_only),
     };
 
@@ -7310,31 +7289,26 @@ where
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // 4. Reserve HLC under tracker lock.
-    let prev_hlc = {
-        let t = hlc_tracker.lock().await;
-        t.get(&device_id).cloned()
-    };
+    // 4. ZEB-267: atomic HLC reservation. Replaces the
+    //    snapshot-then-release pattern + post-commit advance.
+    let join_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     // 5. Mint (pure helper — no side effects on owner-state yet).
-    let minted = mint_redemption(
-        &payload,
-        self_owner,
-        signing_key.as_ref(),
-        &device_id,
-        wall_now_ms,
-        prev_hlc.as_ref(),
-    )?;
+    let minted = mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?;
 
-    // ZEB-258 atomicity: the HLC tracker is persisted to
-    // `state_root_replay.cbor` alongside the CRDT — advancing it here
-    // (before engine spawn, adapter dispatch, the bootstrap-Join
-    // insert, the invite-only oneshot dance, the fence check, AND the
-    // final apply_space) would mean any rollback path leaves a
-    // phantom tracker entry on disk with no matching Space row. The
-    // advance is deferred until AFTER the Space commit succeeds at
-    // step 9 — see the matching `tracker_g.insert` immediately after
-    // the apply_space block.
+    // ZEB-267 (replaces the prior ZEB-258 comment): the HLC tracker
+    // is bumped at reservation time (step 4) regardless of whether
+    // owner-state apply_space succeeds at step 9. Burn semantics:
+    // a reserved HLC on a rollback path is "burned" — fine, since
+    // HLCs are 64-bit logical and burn-on-rollback is already the
+    // implicit behavior on the engine-spawn / adapter-dispatch
+    // failure paths above. The original ZEB-258 concern (phantom
+    // tracker entry without matching Space row) was about
+    // persistence atomicity; advancing the tracker without persisting
+    // the Space leaves a stale tracker entry, but that's a benign
+    // consistency drift — the tracker is a per-device monotone
+    // counter, not a constraint on the Space-row map.
 
     // 6. Spawn engine + dispatch adapter. Both can fail; failure
     //    rolls back via `shutdown_engine_and_cleanup_persistence`.
@@ -7912,13 +7886,12 @@ where
         return Err(fence_err);
     }
 
-    // 9. COMMIT owner-state Space + advance HLC tracker as a single
-    // atomic critical section (LAST step — ZEB-258 reorder). See
-    // create_community_inner's matching block for the lock-order
-    // motivation: holding `state_g` across the `tracker_g`
-    // acquisition prevents a concurrent persist_both (e.g. from a
-    // stop_node-triggered final flush) from snapshotting the new
-    // Space without the matching tracker advance.
+    // 9. COMMIT owner-state Space as the LAST persistent step
+    //    (ZEB-258 reorder). Pre-ZEB-267 this block also held the
+    //    tracker_g guard to advance the tracker atomically with the
+    //    Space commit; with the ZEB-267 atomic reservation pattern
+    //    the tracker is bumped at step 4 instead, and this block
+    //    is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -7942,12 +7915,9 @@ where
                 "apply_space rejected redemption Space: {outcome:?}"
             ));
         }
-        // Success: acquire tracker WHILE still holding state_g.
-        // Bootstrap creation: prev_hlc was either None or strictly
-        // older than `created_at`, so the insert is monotonic.
-        let mut tracker_g = hlc_tracker.lock().await;
-        tracker_g.insert(device_id.clone(), minted.space.created_at.clone());
-        // Both guards drop here at scope end.
+        // ZEB-267: tracker advance no longer needed here — the
+        // reservation at step 4 already bumped the tracker atomically.
+        // state_g drops at scope end.
     }
 
     // 10. Return DTO with the invite's name + kind so the caller can
@@ -8179,18 +8149,15 @@ mod redeem_invite_inner_tests {
         };
 
         let device_id = "joiner-dev";
-        let wall_now_ms = 1_700_000_999_000u64;
-        let prev_hlc: Option<Hlc> = None;
+        // ZEB-267: caller pre-reserves the HLC; constructed inline here
+        // since the test isn't driving an actual tracker.
+        let join_hlc = Hlc {
+            wall_ms: 1_700_000_999_000u64,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
-        let minted = mint_redemption(
-            &payload,
-            self_owner,
-            &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )
-        .expect("mint");
+        let minted = mint_redemption(&payload, self_owner, &signing_key, join_hlc).expect("mint");
 
         assert_eq!(minted.community_id, payload.community_id);
         assert_eq!(minted.space.id, payload.community_id);
@@ -8232,13 +8199,14 @@ mod redeem_invite_inner_tests {
 /// `mint_redemption` / `mint_community_creation` shape — pure / sync /
 /// no I/O so the canonical-CBOR / signing path is unit-testable
 /// without standing up a Tauri test harness.
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_leave_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8247,13 +8215,12 @@ pub fn mint_leave_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let leave_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
         kind: MembershipEventKind::Leave,
         actor: self_owner,
-        at: leave_hlc,
+        at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign leave: {e}"))
 }
@@ -8351,26 +8318,15 @@ async fn leave_community(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint the self-Leave. Read prev_hlc under the tracker lock then
-    // drop the guard before signing (sign is sync; releasing eagerly
-    // keeps the tracker available to other tasks). Borrow the
-    // SigningKey from `dm_outbox` — same canonical local-device key
+    // ZEB-267: atomic HLC reservation. Borrow the SigningKey from
+    // `dm_outbox` under its lock — same canonical local-device key
     // create_community / redeem_invite use.
+    let leave_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let leave = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        mint_leave_event(
-            space_id,
-            self_owner,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        mint_leave_event(space_id, self_owner, signing_key, leave_hlc)?
     };
 
     // Snapshot-then-spawn-equivalent fence: ensure node generation
@@ -8408,20 +8364,6 @@ async fn leave_community(
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
         return Err(membership_outcome_err("leave_community", &outcome));
-    }
-
-    // Advance HLC tracker only on `Inserted`. `AlreadyKnown` is benign
-    // (the event we minted matches one the engine already had, so the
-    // tracker is at-or-past `leave.at`), but advancing on it would
-    // diverge from the principle the rest of the IPCs follow:
-    // "advance HLC AFTER successful insert so failures don't bump
-    // tracker". Cursor Bugbot LOW finding on PR #87 round 2.
-    if matches!(
-        outcome,
-        crate::community_state_crdt::InsertOutcome::Inserted
-    ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id.clone(), leave.at.clone());
     }
 
     // ZEB-265: notify the nav layer so the community node disappears
@@ -8470,18 +8412,16 @@ mod leave_community_inner_tests {
 
         let community_id = SpaceId([0x77; 16]);
         let device_id = "leaver-dev";
-        let prev_hlc: Option<Hlc> = None;
         let wall_now_ms = 1_700_000_500_000u64;
+        // ZEB-267: caller pre-reserves the HLC.
+        let leave_hlc = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
-        let event = mint_leave_event(
-            community_id,
-            self_owner,
-            &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )
-        .expect("mint");
+        let event =
+            mint_leave_event(community_id, self_owner, &signing_key, leave_hlc).expect("mint");
 
         assert_eq!(event.actor, self_owner);
         assert_eq!(event.community_id, community_id);
@@ -8510,16 +8450,16 @@ mod leave_community_inner_tests {
 
 /// Pure function: mint a self-signed Kick event for a community we
 /// belong to and have permission to moderate. Mirrors `mint_leave_event`.
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_kick_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     target: crate::owner_state_types::OwnerAddr,
     reason: Option<String>,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8528,13 +8468,12 @@ pub fn mint_kick_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let kick_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
         kind: MembershipEventKind::Kick { target, reason },
         actor: self_owner,
-        at: kick_hlc,
+        at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign kick: {e}"))
 }
@@ -8588,24 +8527,16 @@ async fn kick_from_community(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint under HLC tracker lock then drop the guard.
+    // ZEB-267: reserve the HLC atomically (read-bump-write under
+    // tracker lock) BEFORE minting. Replaces the prior
+    // snapshot-then-release pattern that had a race window between
+    // the prev_hlc read and the post-Inserted advance.
+    let kick_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let kick = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        mint_kick_event(
-            space_id,
-            self_owner,
-            target,
-            reason,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        mint_kick_event(space_id, self_owner, target, reason, signing_key, kick_hlc)?
     };
 
     // Generation + registry fence (mirrors leave_community + the
@@ -8652,15 +8583,6 @@ async fn kick_from_community(
         return Err(membership_outcome_err("kick_from_community", &outcome));
     }
 
-    // Advance HLC tracker only on `Inserted` (mirrors leave_community).
-    if matches!(
-        outcome,
-        crate::community_state_crdt::InsertOutcome::Inserted
-    ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id.clone(), kick.at.clone());
-    }
-
     Ok(())
 }
 
@@ -8672,16 +8594,18 @@ async fn kick_from_community(
 // demote is allowed (foot-gun, but consistent with the CRDT semantics);
 // any UI warning lives in Phase 5.
 
-#[allow(clippy::too_many_arguments)]
+/// Pure function: mint a self-signed SetPower event for a community we
+/// moderate (verify_event power-gates at level ≥ 100).
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_set_power_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     target: crate::owner_state_types::OwnerAddr,
     level: u8,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8690,7 +8614,6 @@ pub fn mint_set_power_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -8751,23 +8674,13 @@ async fn set_power_level(
         .unwrap_or_default()
         .as_millis() as u64;
 
+    // ZEB-267: atomic HLC reservation.
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
-        let prev_hlc = {
-            let t = hlc_tracker.lock().await;
-            t.get(&device_id).cloned()
-        };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        mint_set_power_event(
-            space_id,
-            self_owner,
-            target,
-            level,
-            signing_key,
-            &device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )?
+        mint_set_power_event(space_id, self_owner, target, level, signing_key, hlc)?
     };
 
     // Generation + registry fence (see kick_from_community for
@@ -8808,14 +8721,6 @@ async fn set_power_level(
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
         return Err(membership_outcome_err("set_power_level", &outcome));
-    }
-
-    if matches!(
-        outcome,
-        crate::community_state_crdt::InsertOutcome::Inserted
-    ) {
-        let mut t = hlc_tracker.lock().await;
-        t.insert(device_id.clone(), event.at.clone());
     }
 
     Ok(())

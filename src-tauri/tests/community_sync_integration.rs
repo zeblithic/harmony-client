@@ -2019,10 +2019,11 @@ mod task3_kick_setpower_round_trip {
         CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
         CommunitySyncEngineConfig, PersistPaths,
     };
+    use harmony_app::dm_outbox::reserve_next_hlc_for_device;
     use harmony_app::{
         mint_community_creation, mint_kick_event, mint_redemption, mint_set_power_event,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     struct TwoIdentityResolver {
         a: (OwnerAddr, [u8; 64]),
@@ -2076,7 +2077,7 @@ mod task3_kick_setpower_round_trip {
         owner_b: OwnerAddr,
         signing_a: Arc<ed25519_dalek::SigningKey>,
         community_id: SpaceId,
-        minted_b_join_hlc: Hlc,
+        minted_a_join_hlc: Hlc,
         // Hold the temp dirs for the lifetime of the fixture so the
         // engines' persistence files don't disappear mid-test.
         _tmp_a: tempfile::TempDir,
@@ -2148,9 +2149,11 @@ mod task3_kick_setpower_round_trip {
             false,
             owner_a,
             &signing_a,
-            "a-dev",
-            100_000,
-            None,
+            Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a-dev".to_string(),
+            },
         )
         .expect("mint create");
         let community_id = minted_a.community_id;
@@ -2259,9 +2262,17 @@ mod task3_kick_setpower_round_trip {
             admin_bootstrap: None,
             admin_identity_pub: None,
         };
-        let minted_b =
-            mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
-                .expect("mint redeem");
+        let minted_b = mint_redemption(
+            &invite_payload,
+            owner_b,
+            &signing_b,
+            Hlc {
+                wall_ms: 200_000,
+                logical: 0,
+                device_id: "b-dev".to_string(),
+            },
+        )
+        .expect("mint redeem");
         let redemption_outcome = engine_b
             .insert_local_event(minted_b.bootstrap_join.clone())
             .await
@@ -2293,7 +2304,7 @@ mod task3_kick_setpower_round_trip {
             owner_b,
             signing_a,
             community_id,
-            minted_b_join_hlc: minted_b.bootstrap_join.at.clone(),
+            minted_a_join_hlc: minted_a.bootstrap_join.at.clone(),
             _tmp_a: tmp_a,
             _tmp_b: tmp_b,
         }
@@ -2305,17 +2316,27 @@ mod task3_kick_setpower_round_trip {
     async fn admin_kicks_member_round_trip() {
         let f = build_fixture(0xa1, 0xb2).await;
 
-        // Admin mints a Kick(B) event with prev_hlc anchored to B's
-        // redemption Join (the most recent event A observed).
+        // ZEB-267: derive the kick's HLC via the same helper production
+        // uses, with a local tracker pre-seeded to A's bootstrap join
+        // (A is signing the kick, so "a-dev" must track A-authored
+        // HLCs). The wall-clock advance to 300_000 dominates anyway,
+        // so the resulting kick HLC sorts strictly after both A's
+        // bootstrap (100_000) and B's redemption (200_000). Avoids
+        // hand-rolling next_hlc's wall-regression / logical-bump logic
+        // at the test boundary (Greptile + CodeRabbit review).
+        let kick_tracker = Arc::new(Mutex::new({
+            let mut m = BTreeMap::<String, Hlc>::new();
+            m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
+            m
+        }));
+        let kick_hlc = reserve_next_hlc_for_device(&kick_tracker, "a-dev", 300_000).await;
         let kick = mint_kick_event(
             f.community_id,
             f.owner_a,
             f.owner_b,
             Some("test-kick".into()),
             &f.signing_a,
-            "a-dev",
-            300_000,
-            Some(&f.minted_b_join_hlc),
+            kick_hlc,
         )
         .expect("mint kick");
 
@@ -2359,15 +2380,22 @@ mod task3_kick_setpower_round_trip {
     async fn admin_sets_power_round_trip() {
         let f = build_fixture(0xa3, 0xb4).await;
 
+        // ZEB-267: same HLC derivation as the kick test above —
+        // pre-seed "a-dev" with A's bootstrap join, not B's, so the
+        // tracker entry tracks the correct device's authored HLCs.
+        let promo_tracker = Arc::new(Mutex::new({
+            let mut m = BTreeMap::<String, Hlc>::new();
+            m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
+            m
+        }));
+        let promo_hlc = reserve_next_hlc_for_device(&promo_tracker, "a-dev", 300_000).await;
         let promo = mint_set_power_event(
             f.community_id,
             f.owner_a,
             f.owner_b,
             50,
             &f.signing_a,
-            "a-dev",
-            300_000,
-            Some(&f.minted_b_join_hlc),
+            promo_hlc,
         )
         .expect("mint set_power");
 

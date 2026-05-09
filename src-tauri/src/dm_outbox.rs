@@ -1535,6 +1535,36 @@ pub(crate) fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) ->
     }
 }
 
+/// Atomically reserve the next HLC for a device.
+///
+/// Acquires `tracker`, reads the device's last-known HLC, computes
+/// the successor via `next_hlc`, writes it back, and returns it —
+/// all under a single lock acquisition. Replaces the
+/// snapshot-then-release pattern at all power-gated community-event
+/// IPCs (kick / leave / set_power / channel_* / redeem /
+/// create_community).
+///
+/// Tracker is bumped at reservation time, regardless of whether the
+/// caller's downstream `engine.insert_local_event` succeeds. A
+/// rejected insert "burns" the reserved HLC — fine, since HLCs are
+/// 64-bit logical and burning is already implicit on signature- or
+/// verify-failure paths today.
+///
+/// ZEB-267 — replaces the snapshot-then-release pattern that had a
+/// race window between the `prev_hlc` read and the post-`Inserted`
+/// advance. See `docs/specs/2026-05-09-zeb-267-atomic-hlc-reservation-design.md`.
+pub async fn reserve_next_hlc_for_device(
+    tracker: &std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    device_id: &str,
+    wall_now_ms: u64,
+) -> Hlc {
+    let mut t = tracker.lock().await;
+    let prev = t.get(device_id).cloned();
+    let next = next_hlc(prev.as_ref(), wall_now_ms, device_id);
+    t.insert(device_id.to_string(), next.clone());
+    next
+}
+
 /// Resolve a verified signing device → owner. MUST match exactly one OwnerAddr.
 ///
 /// Pre-condition: the caller has already verified the signature against
@@ -4223,5 +4253,155 @@ mod tests {
             state.inbox.contains_key(&inbox_key),
             "self-InboxEntry must remain — delivered history is preserved"
         );
+    }
+
+    // ── ZEB-267: reserve_next_hlc_for_device tests ─────────────────────
+    //
+    // Helper is the atomic read-bump-write primitive that replaces the
+    // snapshot-then-release pattern at every membership-event IPC site.
+    // These tests pin its three load-bearing properties:
+    //
+    //   1. Sequential reservations advance monotonically (sanity check).
+    //   2. Concurrent reservations on the same tracker produce N distinct
+    //      strictly-monotone HLCs (the actual bug fix — old pattern would
+    //      collide here).
+    //   3. Wall-clock regression (wall_now_ms < prev.wall_ms) still
+    //      produces a strictly-greater HLC by clamping to prev.wall_ms +
+    //      bumping logical (preserves monotonicity under clock skew).
+
+    #[tokio::test]
+    async fn reserve_next_hlc_for_device_advances_tracker_atomically() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let device_id = "test-dev-A";
+        let wall_now_ms = 1_700_000_000_000u64;
+
+        let first = reserve_next_hlc_for_device(&tracker, device_id, wall_now_ms).await;
+        let second = reserve_next_hlc_for_device(&tracker, device_id, wall_now_ms).await;
+
+        // Sort key is (wall_ms, logical, device_id) — strictly-greater
+        // ordering is what the receive side expects for per-device events.
+        assert!(
+            (second.wall_ms, &second.logical, &second.device_id)
+                > (first.wall_ms, &first.logical, &first.device_id),
+            "second reservation must be strictly greater than first under sort key"
+        );
+        // Tracker must hold the SECOND (just-bumped) value, not the first.
+        let stored = tracker
+            .lock()
+            .await
+            .get(device_id)
+            .cloned()
+            .expect("tracker has entry");
+        assert_eq!(
+            stored, second,
+            "tracker must hold the most-recently-reserved HLC"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_next_hlc_for_device_concurrent_reservations_distinct() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tokio::task::JoinSet;
+
+        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let device_id = "test-dev-conc";
+        let wall_now_ms = 1_700_000_111_222u64;
+
+        // Spawn 64 concurrent reservations. Without the atomic helper,
+        // the snapshot-then-release pattern would produce duplicate
+        // (wall_ms, logical, device_id) tuples across these tasks.
+        let mut set: JoinSet<Hlc> = JoinSet::new();
+        for _ in 0..64 {
+            let tracker = Arc::clone(&tracker);
+            let device_id = device_id.to_string();
+            set.spawn(async move {
+                reserve_next_hlc_for_device(&tracker, &device_id, wall_now_ms).await
+            });
+        }
+
+        let mut hlcs: Vec<Hlc> = Vec::with_capacity(64);
+        while let Some(joined) = set.join_next().await {
+            hlcs.push(joined.expect("task panic"));
+        }
+
+        // Use sort-key tuples as the dedupe key (Hlc itself is Eq, but
+        // BTreeSet<(u64, u32, String)> makes the failure message clearer
+        // by surfacing the colliding tuple directly).
+        let unique: BTreeSet<(u64, u32, String)> = hlcs
+            .iter()
+            .map(|h| (h.wall_ms, h.logical, h.device_id.clone()))
+            .collect();
+        assert_eq!(
+            unique.len(),
+            64,
+            "all 64 concurrent reservations must yield distinct sort keys; got {} unique out of 64",
+            unique.len()
+        );
+
+        // Tracker's final value must equal the max-by-sort-key of all
+        // reservations (last-write-wins under the helper's atomic
+        // critical section).
+        let max_observed = hlcs
+            .iter()
+            .max_by_key(|h| (h.wall_ms, h.logical, h.device_id.clone()))
+            .expect("at least one reservation");
+        let stored = tracker
+            .lock()
+            .await
+            .get(device_id)
+            .cloned()
+            .expect("tracker has entry");
+        assert_eq!(
+            &stored, max_observed,
+            "tracker's final value must equal the max-by-sort-key reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_next_hlc_for_device_handles_wall_regression() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let device_id = "test-dev-regress";
+
+        // Pre-seed the tracker with an HLC at wall_ms=1000, logical=5.
+        {
+            let mut t = tracker.lock().await;
+            t.insert(
+                device_id.to_string(),
+                Hlc {
+                    wall_ms: 1000,
+                    logical: 5,
+                    device_id: device_id.to_string(),
+                },
+            );
+        }
+
+        // Reserve with wall_now_ms=500 — strictly less than the prior
+        // wall_ms. next_hlc clamps to prev.wall_ms and bumps logical.
+        let reserved = reserve_next_hlc_for_device(&tracker, device_id, 500).await;
+        assert_eq!(
+            reserved.wall_ms, 1000,
+            "wall_ms must clamp to prev.wall_ms under regression"
+        );
+        assert_eq!(reserved.logical, 6, "logical must bump prev.logical + 1");
+        assert_eq!(reserved.device_id, device_id);
+
+        // Tracker must hold the new value.
+        let stored = tracker
+            .lock()
+            .await
+            .get(device_id)
+            .cloned()
+            .expect("tracker has entry");
+        assert_eq!(stored, reserved);
     }
 }

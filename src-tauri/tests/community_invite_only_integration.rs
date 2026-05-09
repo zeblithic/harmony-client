@@ -264,9 +264,11 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         true,
         alice_addr,
         alice_sk.as_ref(),
-        "alice-dev",
-        100_000,
-        None,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".to_string(),
+        },
     )
     .expect("alice mint");
     let community_id = alice_minted.community_id;

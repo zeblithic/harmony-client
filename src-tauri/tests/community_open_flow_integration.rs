@@ -20,13 +20,14 @@ use harmony_app::community_state_sync::{
     CommunitySyncEngineConfig, IdentityResolver, PersistPaths, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::OwnerAddr;
+use harmony_app::dm_outbox::reserve_next_hlc_for_device;
+use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_app::{
     delta_to_change, member_info_for, mint_community_creation, mint_leave_event, mint_redemption,
     MemberStatusDto, MembershipChangeType,
 };
 use harmony_identity::PrivateIdentity;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -149,9 +150,11 @@ async fn open_community_create_redeem_leave_round_trip() {
         false,
         owner_a,
         &signing_a,
-        "a-dev",
-        100_000,
-        None,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
     )
     .expect("mint create");
     let community_id = minted_a.community_id;
@@ -282,8 +285,17 @@ async fn open_community_create_redeem_leave_round_trip() {
         admin_identity_pub: None,
     };
 
-    let minted_b = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
-        .expect("mint redeem");
+    let minted_b = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        Hlc {
+            wall_ms: 200_000,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem");
     let redemption_outcome = engine_b
         .insert_local_event(minted_b.bootstrap_join.clone())
         .await
@@ -340,15 +352,17 @@ async fn open_community_create_redeem_leave_round_trip() {
     assert_eq!(dto_a, dto_b);
 
     // ── Step 4: B leaves; A should observe B's status flip to Left. ───
-    let leave_b = mint_leave_event(
-        community_id,
-        owner_b,
-        &signing_b,
-        "b-dev",
-        300_000,
-        Some(&minted_b.bootstrap_join.at),
-    )
-    .expect("mint leave");
+    // ZEB-267: reserve HLC via the production helper against a local
+    // tracker pre-seeded with B's redemption join (Greptile review:
+    // avoid hand-rolling next_hlc internals at the test boundary).
+    let leave_tracker = Arc::new(Mutex::new({
+        let mut m = BTreeMap::<String, Hlc>::new();
+        m.insert("b-dev".to_string(), minted_b.bootstrap_join.at.clone());
+        m
+    }));
+    let leave_hlc = reserve_next_hlc_for_device(&leave_tracker, "b-dev", 300_000).await;
+    let leave_b =
+        mint_leave_event(community_id, owner_b, &signing_b, leave_hlc).expect("mint leave");
     let leave_outcome = engine_b
         .insert_local_event(leave_b)
         .await
@@ -459,9 +473,11 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         false,
         owner_a,
         &signing_a,
-        "a-dev",
-        100_000,
-        None,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
     )
     .expect("mint create");
     let community_id = minted_a.community_id;
@@ -578,8 +594,17 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         admin_identity_pub: None,
     };
 
-    let minted_b1 = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
-        .expect("mint redeem #1");
+    let minted_b1 = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        Hlc {
+            wall_ms: 200_000,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem #1");
     let outcome1 = engine_b
         .insert_local_event(minted_b1.bootstrap_join.clone())
         .await
@@ -614,15 +639,16 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     // ── Second redemption: B mints + inserts AGAIN with the same URL.
     //     Distinct event_id (random) and HLC tick advance produce a
     //     CRDT-distinct event, so InsertOutcome::Inserted again. ──────
-    let minted_b2 = mint_redemption(
-        &invite_payload,
-        owner_b,
-        &signing_b,
-        "b-dev",
-        300_000,
-        Some(&minted_b1.bootstrap_join.at),
-    )
-    .expect("mint redeem #2");
+    // ZEB-267: reserve HLC via the production helper against a local
+    // tracker pre-seeded with B's first redemption (Greptile review).
+    let redeem2_tracker = Arc::new(Mutex::new({
+        let mut m = BTreeMap::<String, Hlc>::new();
+        m.insert("b-dev".to_string(), minted_b1.bootstrap_join.at.clone());
+        m
+    }));
+    let redeem2_hlc = reserve_next_hlc_for_device(&redeem2_tracker, "b-dev", 300_000).await;
+    let minted_b2 =
+        mint_redemption(&invite_payload, owner_b, &signing_b, redeem2_hlc).expect("mint redeem #2");
     assert_ne!(
         minted_b2.bootstrap_join.id, minted_b1.bootstrap_join.id,
         "second redemption must mint a fresh event_id"
