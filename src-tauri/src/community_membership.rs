@@ -401,20 +401,16 @@ pub enum VerifyError {
     /// can emit a clean "you don't have permission to manage channels"
     /// error string without overloading the membership-level diagnostic.
     ChannelAdminInsufficientPower,
-    /// `ChannelDelete` event references a channel whose `deleted_at` is
-    /// already set. Closes the TOCTOU between `delete_channel` IPC's
-    /// preflight check and the engine insert; surfaces a clean "already
-    /// deleted" error.
-    ChannelAlreadyDeleted,
 
-    /// `ChannelModify` event is a no-op: either both `name: None` and
-    /// `write_power: None` (malformed signal), OR every `Some` field
-    /// exactly matches the channel's current materialized values
-    /// (effectless update). Reject at verify time so the CRDT log
-    /// doesn't accumulate effectless events and so no `channel-config-
-    /// updated` notification fires for an unchanged config. The IPC
-    /// layer would normally reject these before signing, but remote
-    /// peers can still submit signed no-ops.
+    /// `ChannelModify` event is a no-op: both `name: None` and
+    /// `write_power: None` (malformed signal). Content-intrinsic
+    /// rejection — no prior_state dependency, so safe under cross-blob
+    /// ordering. A signed Modify with both fields None has no
+    /// meaningful payload; reject as malformed. Value-matching no-ops
+    /// (proposed Some values exactly match prior materialized state)
+    /// are NOT rejected here: two mods independently making the same
+    /// rename would otherwise cause CRDT log divergence based on
+    /// receive order.
     ChannelModifyNoOp,
 
     /// `ChannelCreate` or `ChannelModify` carries a `name` that is
@@ -499,13 +495,8 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "channel-config events require power >= POWER_THRESHOLDS.kick (mod-tier)"
             ),
-            VerifyError::ChannelAlreadyDeleted => write!(f, "ChannelDelete on already-tombstoned channel"),
             VerifyError::ChannelModifyNoOp => {
-                write!(
-                    f,
-                    "ChannelModify is a no-op (either all fields None, or proposed Some values \
-                     exactly match prior materialized state)"
-                )
+                write!(f, "ChannelModify is a no-op (all fields None)")
             }
             VerifyError::ChannelNameInvalid => write!(
                 f,
@@ -1311,76 +1302,64 @@ pub fn verify_event(
             // gaining materialized-view convergence.
         }
         MembershipEventKind::ChannelModify {
-            channel_id,
+            channel_id: _,
             name,
             write_power,
         } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
             }
-            // Reject all-None ChannelModify (no-op signal, malformed).
+            // Reject all-None ChannelModify — content-intrinsic, no
+            // prior_state dependency. A signed Modify with both fields
+            // None has no meaningful payload; reject as malformed.
             if name.is_none() && write_power.is_none() {
                 return Err(VerifyError::ChannelModifyNoOp);
             }
-            // Validate name length when Some.
+            // Validate name length when Some — content-intrinsic.
             if let Some(n) = name {
                 if n.trim().is_empty() || n.chars().count() > 32 {
                     return Err(VerifyError::ChannelNameInvalid);
                 }
             }
-            // Validate write_power range when Some.
+            // Validate write_power range when Some — content-intrinsic.
             if let Some(wp) = write_power {
                 if *wp > POWER_THRESHOLDS.max {
                     return Err(VerifyError::PowerLevelOutOfRange);
                 }
             }
-            // Reject value-matching no-op: if the channel exists in
-            // prior_state and the proposed values exactly match the
-            // current ones, the event has no material effect. Don't
-            // grow the CRDT log or emit a no-op channel-config-updated
-            // event for it.
+            // Note: NO value-matching check against prior_state. Two
+            // mods independently renaming a channel to the same name
+            // would otherwise cause CRDT log divergence based on
+            // receive order. materialize handles redundant modifies
+            // idempotently (the get_mut + only-Some-applies pattern
+            // is no-op when values match). The slight log bloat (one
+            // extra event per redundant modify) is the cost of cross-
+            // blob safety.
             //
             // Note: ChannelModify on unknown channel_id is intentionally
             // ALLOWED — DAG-sync may deliver Modify before Create;
             // materialize safely no-ops on unknown.
-            if let Some(channel) = prior_state.channels.get(channel_id) {
-                let name_changes = match name {
-                    Some(n) => n != &channel.name,
-                    None => false,
-                };
-                let power_changes = match write_power {
-                    Some(wp) => *wp != channel.write_power,
-                    None => false,
-                };
-                if !name_changes && !power_changes {
-                    return Err(VerifyError::ChannelModifyNoOp);
-                }
-            }
         }
-        MembershipEventKind::ChannelDelete { channel_id } => {
+        MembershipEventKind::ChannelDelete { channel_id: _ } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
             }
-            // Note: ChannelDelete on unknown channel_id is intentionally
-            // ALLOWED on the receive path. Cross-blob ordering can
-            // deliver a Delete from publisher B before the Create from
-            // publisher A; verify-time rejection would permanently drop
-            // the Delete, breaking CRDT-log convergence.
-            // materialize() handles unknown deletes as a safe no-op
-            // (the get_mut returns None and the branch falls through).
-            // Once the missing Create arrives, replay re-sorts by HLC
-            // and the Delete tombstones correctly.
+            // Note: NO prior_state-dependent rejection on the receive
+            // path. Cross-blob ordering can deliver Delete before its
+            // corresponding Create, OR can deliver two Deletes in
+            // reverse order at different replicas. Verify-time rejection
+            // would cause CRDT log divergence between replicas without
+            // gaining materialized-view convergence (materialize handles
+            // unknown deletes as a safe no-op, and tombstone updates
+            // are first-delete-wins idempotent).
             //
-            // The local IPC preflight check in `delete_channel` still
-            // rejects "no such channel" for cleaner local UX.
-            if let Some(channel) = prior_state.channels.get(channel_id) {
-                // Already-deleted check is safe — only fires when
-                // channel IS in prior_state AND IS tombstoned. No
-                // cross-blob divergence risk.
-                if channel.deleted_at.is_some() {
-                    return Err(VerifyError::ChannelAlreadyDeleted);
-                }
-            }
+            // Local UX safeguards live in the IPC preflight checks:
+            // delete_channel rejects "no such channel" / "already
+            // deleted" against the local materialized view before
+            // signing, catching the common-case user error. The race
+            // window between IPC preflight and engine insert produces
+            // at most a redundant tombstone event in the log; UX-wise
+            // both delete attempts return Ok.
         }
     }
 

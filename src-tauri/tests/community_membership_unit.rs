@@ -3100,7 +3100,7 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
 // ── ZEB-248 Phase 1 review fixup: per-variant verify_event validation ───
 //
 // Tests for the VerifyError branches covering channel-config events:
-// ChannelAlreadyDeleted, ChannelModifyNoOp, ChannelNameInvalid, plus
+// ChannelModifyNoOp (all-None), ChannelNameInvalid, plus
 // PowerLevelOutOfRange reuse for channel write_power.
 //
 // Round 3 fixup (CodeRabbit, CRDT-safety): verify_event MUST NOT reject
@@ -3110,6 +3110,13 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
 // replica's log and break CRDT-log convergence. materialize handles
 // both cases idempotently (or_insert_with for Create, get_mut→None
 // no-op for Delete). Tests below assert the new ALLOW-paths.
+//
+// Round 4 fixup (Cursor Bugbot, same CRDT-safety argument extended):
+// verify_event MUST NOT reject ChannelDelete-on-already-tombstoned or
+// value-matching ChannelModify either — same cross-blob divergence
+// concern (replicas with first event reject the second; replicas in
+// reverse order accept both). Only the all-None ChannelModifyNoOp
+// rejection (content-intrinsic, no prior_state dependency) remains.
 
 /// Helper: build admin's bootstrap-Join → ChannelCreate prior state.
 fn admin_with_channel_prior_state(
@@ -3386,13 +3393,15 @@ fn verify_event_channel_modify_allows_unknown_channel_id() {
 }
 
 #[test]
-fn verify_event_channel_delete_rejects_already_tombstoned() {
+fn verify_event_channel_delete_allows_already_tombstoned_for_replica_convergence() {
+    // ChannelDelete on already-tombstoned channel must NOT reject at
+    // verify_event. Two mods concurrently deleting the same channel
+    // would otherwise diverge across replicas based on receive order;
+    // materialize handles redundant deletes via first-delete-wins
+    // idempotency.
     let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
-    let ch_id = ChannelId([0xAB; 16]);
 
-    // Build prior_state with admin Join + ChannelCreate + ChannelDelete
-    // so the channel is already tombstoned.
     let admin_join_payload = EventPayload {
         id: [0x01; 16],
         community_id,
@@ -3405,7 +3414,9 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
         },
     };
     let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
-    let ch_create_payload = EventPayload {
+
+    let ch_id = ChannelId([0xAB; 16]);
+    let create_payload = EventPayload {
         id: [0x02; 16],
         community_id,
         kind: MembershipEventKind::ChannelCreate {
@@ -3420,8 +3431,9 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
             device_id: "a".into(),
         },
     };
-    let ch_create = sign_event_with_identity(&ch_create_payload, &admin_priv).expect("sign");
-    let ch_delete_payload = EventPayload {
+    let create = sign_event_with_identity(&create_payload, &admin_priv).expect("sign");
+
+    let first_delete_payload = EventPayload {
         id: [0x03; 16],
         community_id,
         kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
@@ -3432,11 +3444,12 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
             device_id: "a".into(),
         },
     };
-    let ch_delete = sign_event_with_identity(&ch_delete_payload, &admin_priv).expect("sign");
-    let prior_state = materialize(&[admin_join, ch_create, ch_delete], admin_addr);
+    let first_delete = sign_event_with_identity(&first_delete_payload, &admin_priv).expect("sign");
 
-    // Second ChannelDelete on an already-tombstoned channel.
-    let payload = EventPayload {
+    let prior_state = materialize(&[admin_join, create, first_delete], admin_addr);
+    // Channel is now tombstoned in prior_state.
+
+    let second_delete_payload = EventPayload {
         id: [0x04; 16],
         community_id,
         kind: MembershipEventKind::ChannelDelete { channel_id: ch_id },
@@ -3447,7 +3460,9 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
             device_id: "a".into(),
         },
     };
-    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+    let second_delete =
+        sign_event_with_identity(&second_delete_payload, &admin_priv).expect("sign");
+
     let ctx = VerifyContext {
         expected_community_id: community_id,
         admin_addr,
@@ -3456,14 +3471,16 @@ fn verify_event_channel_delete_rejects_already_tombstoned() {
         countersigner_identity_pub: None,
     };
 
-    assert_eq!(
-        verify_event(&event, &prior_state, &ctx),
-        Err(VerifyError::ChannelAlreadyDeleted)
-    );
+    assert_eq!(verify_event(&second_delete, &prior_state, &ctx), Ok(()));
 }
 
 #[test]
-fn verify_event_channel_modify_rejects_value_matching_noop() {
+fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
+    // ChannelModify with values exactly matching prior state must NOT
+    // reject at verify_event. Two mods independently making the same
+    // rename would otherwise diverge across replicas based on receive
+    // order; materialize handles redundant modifies via the
+    // get_mut + only-Some-applies pattern (no-op when values match).
     let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
@@ -3500,14 +3517,16 @@ fn verify_event_channel_modify_rejects_value_matching_noop() {
 
     let prior_state = materialize(&[admin_join, create], admin_addr);
 
-    // Modify with values that exactly match current state.
+    // Modify with values that exactly match current state — would
+    // previously have been rejected with ChannelModifyNoOp; now accepted
+    // for replica convergence.
     let modify_payload = EventPayload {
         id: [0x03; 16],
         community_id,
         kind: MembershipEventKind::ChannelModify {
             channel_id: ch_id,
-            name: Some("general".to_string()), // same as current
-            write_power: Some(0),              // same as current
+            name: Some("general".to_string()),
+            write_power: Some(0),
         },
         actor: admin_addr,
         at: Hlc {
@@ -3526,10 +3545,7 @@ fn verify_event_channel_modify_rejects_value_matching_noop() {
         countersigner_identity_pub: None,
     };
 
-    assert_eq!(
-        verify_event(&modify, &prior_state, &ctx),
-        Err(VerifyError::ChannelModifyNoOp)
-    );
+    assert_eq!(verify_event(&modify, &prior_state, &ctx), Ok(()));
 }
 
 #[test]
