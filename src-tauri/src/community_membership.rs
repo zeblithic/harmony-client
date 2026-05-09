@@ -100,10 +100,19 @@ use crate::owner_state_types::{Hlc, SpaceId};
 pub type EventId = [u8; 16];
 
 /// 16-byte ULID identifying a single channel within a community.
-/// Generated client-side at `ChannelCreate` time. Same shape as
-/// `EventId` but a distinct type so the type system catches accidental
-/// substitution between event-IDs and channel-IDs at IPC boundaries.
-pub type ChannelId = [u8; 16];
+/// Generated client-side at `ChannelCreate` time. Tuple-struct newtype
+/// (not type alias) so the type system catches accidental substitution
+/// between event-IDs and channel-IDs at IPC boundaries; bstr serde
+/// keeps wire encoding compact (17 bytes vs CBOR array-of-u8 33 bytes).
+/// Mirrors the shape of `OwnerAddr` / `SpaceId` in `owner_state_types.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChannelId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 /// One signed event in a community's membership CRDT.
 ///

@@ -287,7 +287,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     // Step 2: Alice signs + inserts ChannelCreate { name: "general", wp: 0 }
     // with logical+1 HLC after the bootstrap Join — same deterministic
     // ordering Task 7's `create_community_inner` uses.
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let alice_create_at = Hlc {
         wall_ms: alice_join_at.wall_ms,
         logical: alice_join_at.logical + 1,
@@ -437,7 +437,7 @@ async fn sub_mod_actor_channel_create_locally_rejected() {
         id: [0x21; 16],
         community_id,
         kind: MembershipEventKind::ChannelCreate {
-            channel_id: [0x77; 16],
+            channel_id: ChannelId([0x77; 16]),
             name: "spam".into(),
             write_power: 0,
         },
@@ -582,7 +582,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         .await
         .expect("alice bootstrap insert");
     assert_eq!(outcome, InsertOutcome::Inserted);
-    let _ = drain_until(
+    let _alice_own_join_delta = drain_until(
         &mut delta_a_rx,
         |d| matches!(d.event.kind, MembershipEventKind::Join),
         "alice own Join delta",
@@ -597,7 +597,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         .insert_local_event(alice_join)
         .await
         .expect("bob OOB-seeds Alice's bootstrap Join");
-    let _ = drain_until(
+    let _bob_seeded_alice_join_delta = drain_until(
         &mut delta_b_rx,
         |d| matches!(d.event.kind, MembershipEventKind::Join) && d.event.actor == alice_addr,
         "bob delta from OOB-seeded Alice Join",
@@ -607,7 +607,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
     // Default-#general ChannelCreate, mirroring Task 7's HLC ordering:
     // `at = (bootstrap.wall_ms, bootstrap.logical + 1, bootstrap.device_id)`
     // — keeps Join < ChannelCreate deterministic without a wall-clock tick.
-    let default_ch_id: ChannelId = [0x55; 16];
+    let default_ch_id = ChannelId([0x55; 16]);
     let default_create_at = Hlc {
         wall_ms: alice_join_at.wall_ms,
         logical: alice_join_at.logical + 1,
@@ -631,7 +631,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         .await
         .expect("alice default-channel insert");
     assert_eq!(outcome, InsertOutcome::Inserted);
-    let _ = drain_until(
+    let _alice_own_channel_create_delta = drain_until(
         &mut delta_a_rx,
         |d| matches!(d.event.kind, MembershipEventKind::ChannelCreate { .. }),
         "alice own ChannelCreate delta",
@@ -640,7 +640,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
 
     // Bob receives the ChannelCreate via the forwarder. (Alice's Join
     // was OOB-seeded earlier to satisfy the membership-at-HLC gate.)
-    let _ = drain_until(
+    let _bob_received_alice_channel_create_delta = drain_until(
         &mut delta_b_rx,
         |d| matches!(d.event.kind, MembershipEventKind::ChannelCreate { .. }),
         "bob received Alice's default ChannelCreate",

@@ -23,27 +23,27 @@ fn membership_event_kind_round_trips_all_variants() {
         },
         MembershipEventKind::SetPower { target, level: 50 },
         MembershipEventKind::ChannelCreate {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: "general".to_string(),
             write_power: 0,
         },
         MembershipEventKind::ChannelModify {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: Some("renamed".to_string()),
             write_power: Some(50),
         },
         MembershipEventKind::ChannelModify {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: Some("renamed".to_string()),
             write_power: None,
         },
         MembershipEventKind::ChannelModify {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: None,
             write_power: Some(50),
         },
         MembershipEventKind::ChannelDelete {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
         },
     ];
 
@@ -2641,7 +2641,7 @@ fn materialize_channel_create_adds_to_map() {
         sig: [0; 64],
         countersig: None,
     };
-    let ch_id: ChannelId = [0xAB; 16];
+    let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
@@ -2689,7 +2689,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         sig: [0; 64],
         countersig: None,
     };
-    let ch_id: ChannelId = [0xAB; 16];
+    let ch_id = ChannelId([0xAB; 16]);
     let ch_first = SignedMembershipEvent {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
@@ -2751,7 +2751,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
         sig: [0; 64],
         countersig: None,
     };
-    let ch_id: ChannelId = [0xAB; 16];
+    let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
@@ -2812,7 +2812,7 @@ fn materialize_channel_delete_tombstones_in_place() {
         sig: [0; 64],
         countersig: None,
     };
-    let ch_id: ChannelId = [0xAB; 16];
+    let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
@@ -2878,7 +2878,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
         id: [0x02; 16],
         community_id: SpaceId([0x37; 16]),
         kind: MembershipEventKind::ChannelModify {
-            channel_id: [0xCC; 16], // never created
+            channel_id: ChannelId([0xCC; 16]), // never created
             name: Some("ghost".into()),
             write_power: None,
         },
@@ -2925,7 +2925,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
         id: [0x02; 16],
         community_id,
         kind: MembershipEventKind::ChannelCreate {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: "general".to_string(),
             write_power: 0,
         },
@@ -2990,7 +2990,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
         id: [0x03; 16],
         community_id,
         kind: MembershipEventKind::ChannelCreate {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: "spam-channel".to_string(),
             write_power: 0,
         },
@@ -3073,7 +3073,7 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
         id: [0x04; 16],
         community_id,
         kind: MembershipEventKind::ChannelCreate {
-            channel_id: [0xAB; 16],
+            channel_id: ChannelId([0xAB; 16]),
             name: "mods-channel".to_string(),
             write_power: 0,
         },

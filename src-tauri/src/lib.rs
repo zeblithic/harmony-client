@@ -5626,7 +5626,7 @@ async fn create_channel(
         use rand::RngCore;
         let mut buf = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut buf);
-        buf
+        crate::community_membership::ChannelId(buf)
     };
 
     // Mint under HLC tracker + dm_outbox locks then drop the guards.
@@ -5700,7 +5700,7 @@ async fn create_channel(
     ) {
         let mut t = hlc_tracker.lock().await;
         t.insert(device_id, event.at);
-        Ok(hex::encode(channel_id))
+        Ok(hex::encode(channel_id.0))
     } else {
         // Outcome is AlreadyKnown — the engine already knows this exact
         // event (event_id collision). Vanishingly unlikely, but surface
@@ -5837,6 +5837,7 @@ async fn modify_channel(
         .as_slice()
         .try_into()
         .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let channel_id = crate::community_membership::ChannelId(channel_id_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
         let g = state_lock
@@ -5872,7 +5873,7 @@ async fn modify_channel(
         mint_channel_modify_event(
             space_id,
             self_owner,
-            channel_id_bytes,
+            channel_id,
             name,
             write_power,
             signing_key,
@@ -5995,6 +5996,7 @@ async fn delete_channel(
         .as_slice()
         .try_into()
         .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let channel_id = crate::community_membership::ChannelId(channel_id_bytes);
 
     let (
         hlc_tracker,
@@ -6068,18 +6070,18 @@ async fn delete_channel(
             let g = engine_state.lock().await;
             g.materialize_now(admin_addr)
         };
-        match materialized.channels.get(&channel_id_bytes) {
+        match materialized.channels.get(&channel_id) {
             None => {
                 return Err(format!(
                     "no channel {} in community {}",
-                    hex::encode(channel_id_bytes),
+                    hex::encode(channel_id.0),
                     hex::encode(space_id.0)
                 ));
             }
             Some(info) if info.deleted_at.is_some() => {
                 return Err(format!(
                     "channel {} is already deleted",
-                    hex::encode(channel_id_bytes)
+                    hex::encode(channel_id.0)
                 ));
             }
             Some(_) => {}
@@ -6102,7 +6104,7 @@ async fn delete_channel(
         mint_channel_delete_event(
             space_id,
             self_owner,
-            channel_id_bytes,
+            channel_id,
             signing_key,
             &device_id,
             wall_now_ms,
@@ -6240,7 +6242,7 @@ async fn list_channels(
         .channels
         .iter()
         .map(|(channel_id, info)| ChannelInfoDto {
-            channel_id: hex::encode(channel_id),
+            channel_id: hex::encode(channel_id.0),
             name: info.name.clone(),
             write_power: info.write_power,
             created_at: info.created_at.clone(),
@@ -6665,7 +6667,7 @@ pub async fn create_community_inner(
         use rand::RngCore;
         let mut buf = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut buf);
-        buf
+        crate::community_membership::ChannelId(buf)
     };
     let default_channel_event_id: crate::community_membership::EventId = {
         use rand::RngCore;
@@ -8936,9 +8938,10 @@ pub fn delta_to_change(
         // Channel-config events (ZEB-248 Phase 1) don't map to a
         // MembershipChange — they are channel state, not membership
         // state. Return None per the function's documented forward-
-        // compat contract; the channel-config consumer (separate IPC
-        // event, ships later in Phase 1) will receive these via its
-        // own delta projection.
+        // compat contract; channel-config kinds project to
+        // ChannelConfigChangedPayload via delta_to_channel_config_change
+        // instead — the consumer fan-out fires the channel-config-updated
+        // Tauri event.
         crate::community_membership::MembershipEventKind::ChannelCreate { .. }
         | crate::community_membership::MembershipEventKind::ChannelModify { .. }
         | crate::community_membership::MembershipEventKind::ChannelDelete { .. } => return None,
@@ -8961,7 +8964,7 @@ pub fn delta_to_channel_config_change(
             name,
             write_power,
         } => (
-            hex::encode(channel_id),
+            hex::encode(channel_id.0),
             ChannelConfigChangeAction::Created,
             Some(name.clone()),
             Some(*write_power),
@@ -8971,13 +8974,13 @@ pub fn delta_to_channel_config_change(
             name,
             write_power,
         } => (
-            hex::encode(channel_id),
+            hex::encode(channel_id.0),
             ChannelConfigChangeAction::Modified,
             name.clone(),
             *write_power,
         ),
         crate::community_membership::MembershipEventKind::ChannelDelete { channel_id } => (
-            hex::encode(channel_id),
+            hex::encode(channel_id.0),
             ChannelConfigChangeAction::Deleted,
             None,
             None,
@@ -10164,7 +10167,7 @@ mod create_channel_delta_tests {
     async fn delta_to_channel_config_change_projects_create_modify_delete() {
         let community_id = SpaceId([0x37; 16]);
         let actor = OwnerAddr([0x10; 16]);
-        let ch_id: ChannelId = [0xAB; 16];
+        let ch_id = ChannelId([0xAB; 16]);
 
         // Create.
         let create_event = SignedMembershipEvent {
@@ -10190,7 +10193,7 @@ mod create_channel_delta_tests {
         })
         .expect("create");
         assert_eq!(payload.action, ChannelConfigChangeAction::Created);
-        assert_eq!(payload.channel_id, hex::encode(ch_id));
+        assert_eq!(payload.channel_id, hex::encode(ch_id.0));
         assert_eq!(payload.community_id, hex::encode(community_id.0));
         assert_eq!(payload.name.as_deref(), Some("general"));
         assert_eq!(payload.write_power, Some(0));
@@ -10258,7 +10261,7 @@ mod create_channel_delta_tests {
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
-                channel_id: [0xAB; 16],
+                channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
             },
@@ -10313,7 +10316,7 @@ mod create_channel_delta_tests {
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::ChannelCreate {
-                channel_id: [0xAB; 16],
+                channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
             },

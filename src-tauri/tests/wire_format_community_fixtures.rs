@@ -354,7 +354,7 @@ fn community_invite_signed_wire_bytes_pinned() {
 
 #[test]
 fn signed_event_channel_create_wire_bytes_pinned() {
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let event = fixture_signed_event(MembershipEventKind::ChannelCreate {
         channel_id: ch_id,
         name: "general".to_string(),
@@ -365,14 +365,14 @@ fn signed_event_channel_create_wire_bytes_pinned() {
     eprintln!("signed_event_channel_create hex: {hex}");
     assert_eq!(
         hex,
-        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca3626368901842184218421842184218421842184218421842184218421842184218421842626e6d6767656e6572616c627770006261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca36263685042424242424242424242424242424242626e6d6767656e6572616c627770006261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelCreate wire format changed"
     );
 }
 
 #[test]
 fn signed_event_channel_modify_full_wire_bytes_pinned() {
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let event = fixture_signed_event(MembershipEventKind::ChannelModify {
         channel_id: ch_id,
         name: Some("renamed".to_string()),
@@ -383,14 +383,14 @@ fn signed_event_channel_modify_full_wire_bytes_pinned() {
     eprintln!("signed_event_channel_modify_full hex: {hex}");
     assert_eq!(
         hex,
-        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca3626368901842184218421842184218421842184218421842184218421842184218421842626e6d6772656e616d656462777018326261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca36263685042424242424242424242424242424242626e6d6772656e616d656462777018326261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelModify (full) wire format changed"
     );
 }
 
 #[test]
 fn signed_event_channel_modify_name_only_wire_bytes_pinned() {
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let event = fixture_signed_event(MembershipEventKind::ChannelModify {
         channel_id: ch_id,
         name: Some("renamed".to_string()),
@@ -401,14 +401,14 @@ fn signed_event_channel_modify_name_only_wire_bytes_pinned() {
     eprintln!("signed_event_channel_modify_name_only hex: {hex}");
     assert_eq!(
         hex,
-        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca2626368901842184218421842184218421842184218421842184218421842184218421842626e6d6772656e616d65646261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca26263685042424242424242424242424242424242626e6d6772656e616d65646261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelModify (name-only) wire format changed"
     );
 }
 
 #[test]
 fn signed_event_channel_modify_power_only_wire_bytes_pinned() {
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let event = fixture_signed_event(MembershipEventKind::ChannelModify {
         channel_id: ch_id,
         name: None,
@@ -419,21 +419,21 @@ fn signed_event_channel_modify_power_only_wire_bytes_pinned() {
     eprintln!("signed_event_channel_modify_power_only hex: {hex}");
     assert_eq!(
         hex,
-        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca262636890184218421842184218421842184218421842184218421842184218421842184262777018326261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616d62766ca2626368504242424242424242424242424242424262777018326261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelModify (power-only) wire format changed"
     );
 }
 
 #[test]
 fn signed_event_channel_delete_wire_bytes_pinned() {
-    let ch_id: ChannelId = [0x42; 16];
+    let ch_id = ChannelId([0x42; 16]);
     let event = fixture_signed_event(MembershipEventKind::ChannelDelete { channel_id: ch_id });
     let bytes = canonical_cbor_encode(&event).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("signed_event_channel_delete hex: {hex}");
     assert_eq!(
         hex,
-        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616462766ca16263689018421842184218421842184218421842184218421842184218421842184218426261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616462766ca162636850424242424242424242424242424242426261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelDelete wire format changed"
     );
 }
