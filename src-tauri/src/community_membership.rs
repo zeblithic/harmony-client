@@ -479,7 +479,7 @@ impl std::fmt::Display for VerifyError {
                 )
             }
             VerifyError::PowerLevelOutOfRange => {
-                write!(f, "SetPower level exceeds POWER_THRESHOLDS.max")
+                write!(f, "power level exceeds POWER_THRESHOLDS.max")
             }
             VerifyError::BannedActorJoin => {
                 write!(f, "Join rejected: actor's prior status is Banned")
