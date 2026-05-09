@@ -32,12 +32,11 @@ use sha2::Sha256;
 /// add private channels (distribute the ChannelKey to a subset of
 /// members) without a wire-format break.
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
-pub struct ChannelKey(#[cfg_attr(not(test), allow(dead_code))] [u8; 32]);
+pub struct ChannelKey([u8; 32]);
 
 impl ChannelKey {
     /// Borrow the raw 32 bytes for AEAD initialization. Not `pub` —
     /// callers go through `encrypt_channel_packet` / `decrypt_channel_packet`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -296,6 +295,69 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
     Ok(canon)
 }
 
+use chacha20poly1305::aead::{Aead, OsRng, Payload};
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
+
+/// Encrypt a SignedChannelEvent into the wire-format packet:
+///   [12B random nonce][ChaCha20-Poly1305(key=ChannelKey,
+///                                        plaintext=canonical_cbor(event),
+///                                        AAD=CHANNEL_PACKET_AAD)]
+///
+/// Per spec §5.3. Random per-packet nonce is correct here — every packet
+/// is distinct on the wire. Replay protection is at the ChannelLogReplayTracker
+/// layer, not at the AEAD layer.
+pub fn encrypt_channel_packet(
+    key: &ChannelKey,
+    event: &SignedChannelEvent,
+) -> Result<Vec<u8>, ChannelEventError> {
+    let mut plaintext = Vec::with_capacity(256);
+    ciborium::into_writer(event, &mut plaintext)
+        .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &plaintext,
+                aad: CHANNEL_PACKET_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadEncrypt(e.to_string()))?;
+    let mut packet = Vec::with_capacity(12 + ciphertext.len());
+    packet.extend_from_slice(nonce.as_slice());
+    packet.extend_from_slice(&ciphertext);
+    Ok(packet)
+}
+
+/// Decrypt a wire packet back to a SignedChannelEvent. Splits off the
+/// 12-byte nonce, AEAD-decrypts under ChannelKey + CHANNEL_PACKET_AAD,
+/// canonical-CBOR decodes the result.
+///
+/// Caller is responsible for the §7 chain steps 3-7 (verify_channel_event)
+/// once a SignedChannelEvent is in hand.
+pub fn decrypt_channel_packet(
+    key: &ChannelKey,
+    packet: &[u8],
+) -> Result<SignedChannelEvent, ChannelEventError> {
+    if packet.len() < 12 {
+        return Err(ChannelEventError::MalformedPacket(packet.len()));
+    }
+    let (nonce_bytes, ciphertext) = packet.split_at(12);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let plaintext = cipher
+        .decrypt(
+            nonce_bytes.into(),
+            Payload {
+                msg: ciphertext,
+                aad: CHANNEL_PACKET_AAD,
+            },
+        )
+        .map_err(|e| ChannelEventError::AeadDecrypt(e.to_string()))?;
+    ciborium::from_reader(plaintext.as_slice())
+        .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +517,57 @@ mod tests {
         let canon_a = signed_set_canonical_cbor(&signed).expect("canon a");
         let canon_b = signed_set_canonical_cbor(&signed).expect("canon b");
         assert_eq!(canon_a, canon_b);
+    }
+
+    #[test]
+    fn aead_round_trip() {
+        let mk = fixture_mk();
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let key = derive_channel_key(&mk, &cid, &chid);
+        let (payload, signing_key) = fixture_payload("encrypted hello");
+        let event = sign_channel_event(&payload, &signing_key).expect("sign");
+        let packet = encrypt_channel_packet(&key, &event).expect("encrypt");
+        // Wire packet is at least 12 (nonce) + 16 (Poly1305 tag) + body bytes.
+        assert!(
+            packet.len() > 12 + 16,
+            "packet must include nonce + tag + body"
+        );
+        let decrypted = decrypt_channel_packet(&key, &packet).expect("decrypt");
+        assert_eq!(decrypted, event);
+    }
+
+    #[test]
+    fn aead_decrypt_rejects_wrong_key() {
+        let mk = fixture_mk();
+        let key_a = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let key_b = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x02));
+        let (payload, signing_key) = fixture_payload("body");
+        let event = sign_channel_event(&payload, &signing_key).expect("sign");
+        let packet = encrypt_channel_packet(&key_a, &event).expect("encrypt");
+        let err = decrypt_channel_packet(&key_b, &packet).expect_err("must fail under wrong key");
+        assert!(matches!(err, ChannelEventError::AeadDecrypt(_)));
+    }
+
+    #[test]
+    fn aead_decrypt_rejects_tampered_ciphertext() {
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let (payload, signing_key) = fixture_payload("body");
+        let event = sign_channel_event(&payload, &signing_key).expect("sign");
+        let mut packet = encrypt_channel_packet(&key, &event).expect("encrypt");
+        // Flip a bit deep in the ciphertext (past the nonce).
+        let last = packet.len() - 1;
+        packet[last] ^= 0x01;
+        let err = decrypt_channel_packet(&key, &packet).expect_err("tampered must fail");
+        assert!(matches!(err, ChannelEventError::AeadDecrypt(_)));
+    }
+
+    #[test]
+    fn aead_decrypt_rejects_short_packet() {
+        let mk = fixture_mk();
+        let key = derive_channel_key(&mk, &fixture_community(0xc0), &fixture_channel(0x01));
+        let err = decrypt_channel_packet(&key, &[0u8; 5]).expect_err("must reject short packet");
+        assert!(matches!(err, ChannelEventError::MalformedPacket(5)));
     }
 }
