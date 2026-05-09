@@ -27,6 +27,24 @@ fn membership_event_kind_round_trips_all_variants() {
             name: "general".to_string(),
             write_power: 0,
         },
+        MembershipEventKind::ChannelModify {
+            channel_id: [0xAB; 16],
+            name: Some("renamed".to_string()),
+            write_power: Some(50),
+        },
+        MembershipEventKind::ChannelModify {
+            channel_id: [0xAB; 16],
+            name: Some("renamed".to_string()),
+            write_power: None,
+        },
+        MembershipEventKind::ChannelModify {
+            channel_id: [0xAB; 16],
+            name: None,
+            write_power: Some(50),
+        },
+        MembershipEventKind::ChannelDelete {
+            channel_id: [0xAB; 16],
+        },
     ];
 
     for k in kinds {
@@ -2715,52 +2733,6 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         info.created_at.wall_ms, 2_000,
         "first ChannelCreate's HLC must win"
     );
-}
-
-#[test]
-fn channel_modify_event_kind_round_trips_full() {
-    let kind = MembershipEventKind::ChannelModify {
-        channel_id: [0xAB; 16],
-        name: Some("general-renamed".to_string()),
-        write_power: Some(50),
-    };
-    let encoded = canonical_cbor_encode(&kind).expect("encode");
-    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
-    assert_eq!(decoded, kind);
-}
-
-#[test]
-fn channel_modify_event_kind_round_trips_name_only() {
-    let kind = MembershipEventKind::ChannelModify {
-        channel_id: [0xAB; 16],
-        name: Some("renamed".to_string()),
-        write_power: None,
-    };
-    let encoded = canonical_cbor_encode(&kind).expect("encode");
-    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
-    assert_eq!(decoded, kind);
-}
-
-#[test]
-fn channel_modify_event_kind_round_trips_power_only() {
-    let kind = MembershipEventKind::ChannelModify {
-        channel_id: [0xAB; 16],
-        name: None,
-        write_power: Some(50),
-    };
-    let encoded = canonical_cbor_encode(&kind).expect("encode");
-    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
-    assert_eq!(decoded, kind);
-}
-
-#[test]
-fn channel_delete_event_kind_round_trips() {
-    let kind = MembershipEventKind::ChannelDelete {
-        channel_id: [0xAB; 16],
-    };
-    let encoded = canonical_cbor_encode(&kind).expect("encode");
-    let decoded: MembershipEventKind = canonical_cbor_decode(&encoded).expect("decode");
-    assert_eq!(decoded, kind);
 }
 
 #[test]
