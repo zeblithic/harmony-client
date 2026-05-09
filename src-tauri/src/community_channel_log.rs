@@ -227,7 +227,9 @@ pub enum ChannelEventError {
     AeadEncrypt(String),
     #[error("AEAD decrypt: {0}")]
     AeadDecrypt(String),
-    #[error("malformed packet (length {0} bytes — need at least 12 for nonce)")]
+    #[error(
+        "malformed packet (length {0} bytes — need at least 28: NONCE_LEN=12 + TAG_LEN=16 for an empty-plaintext AEAD packet)"
+    )]
     MalformedPacket(usize),
     #[error("identity-pubkey-to-author binding mismatch")]
     AuthorPubkeyMismatch,
@@ -270,27 +272,19 @@ pub fn sign_channel_event(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<SignedChannelEvent, ChannelEventError> {
     use ed25519_dalek::Signer;
-    // Field order in both struct constructions matches the RFC 8949
-    // §4.2.1 canonical-CBOR declaration order: at, au, bd, ch, ci,
-    // id, kd, rt (and sg last on Post). Named-field syntax doesn't
-    // affect CBOR output order — only the type definition's declaration
-    // order does — but we keep construction order aligned for
-    // grep-ability against the wire format.
-    let signed_set = ChannelPostSignedSet {
-        at: &payload.at,
-        author: &payload.author,
-        body: payload.body,
-        channel_id: &payload.channel_id,
-        community_id: &payload.community_id,
-        id: &payload.id,
-        content_kind: payload.content_kind,
-        reply_to: &payload.reply_to,
-    };
-    let mut canon = Vec::with_capacity(256);
-    ciborium::into_writer(&signed_set, &mut canon)
-        .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
-    let sig = signing_key.sign(&canon).to_bytes();
-    Ok(SignedChannelEvent::Post {
+    // Build the event with a placeholder sig so we can route the
+    // canonical-CBOR computation through `signed_set_canonical_cbor` —
+    // the single source of truth for what bytes the signature covers.
+    // `signed_set_canonical_cbor`'s destructure uses `sig: _,` so the
+    // placeholder is excluded from the signed-set bytes.
+    //
+    // Field order in the construction matches the RFC 8949 §4.2.1
+    // canonical-CBOR declaration order on `ChannelPostSignedSet`:
+    // at, au, bd, ch, ci, id, kd, rt (and sg last on Post). Named-
+    // field syntax doesn't affect CBOR output order — only the type
+    // definition's declaration order does — but we keep construction
+    // order aligned for grep-ability against the wire format.
+    let mut event = SignedChannelEvent::Post {
         at: payload.at.clone(),
         author: payload.author,
         body: payload.body.to_string(),
@@ -299,14 +293,27 @@ pub fn sign_channel_event(
         id: payload.id,
         content_kind: payload.content_kind,
         reply_to: payload.reply_to,
-        sig,
-    })
+        sig: [0u8; 64], // placeholder — overwritten below
+    };
+    let canon = signed_set_canonical_cbor(&event)?;
+    let new_sig = signing_key.sign(&canon).to_bytes();
+    // SignedChannelEvent::Post is the only variant in v2; v3 adds
+    // Edit/Delete/React. When those variants land, this destructure
+    // becomes refutable and must be rewritten as `if let` (or this
+    // function gains a per-variant signing path).
+    let SignedChannelEvent::Post { sig, .. } = &mut event;
+    *sig = new_sig;
+    Ok(event)
 }
 
 /// Recompute the signed-set canonical CBOR for a SignedChannelEvent::Post.
-/// Used by both `sign_channel_event` (above, via the borrowed payload
-/// path) and `verify_channel_event` (via this borrowed path on the
-/// deserialized event).
+/// The single source of truth for what bytes the signature covers — used
+/// by both `sign_channel_event` (above, via a placeholder-sig event) and
+/// `verify_channel_event` (on the deserialized event). Routing both
+/// callers through this function means a future field added to
+/// `ChannelPostSignedSet` automatically affects sign and verify together;
+/// inlining either side risks producing different bytes and silent
+/// signature-verification failures.
 fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
     let SignedChannelEvent::Post {
         at,
@@ -567,6 +574,21 @@ where
         });
     }
 
+    // Step 3b (precondition — moved earlier per cheapest-first ordering):
+    // cheap replay-rejection check. Read-only — does NOT advance the
+    // tracker. Authorization could still reject below; we only `record`
+    // after the full chain succeeds. Mirrors `community_state_sync::
+    // CommunityRootHlcTracker`'s would_accept/record split — failed-auth
+    // events MUST NOT bump `last_seen` or they permanently block valid
+    // future events on the same (channel, author, device) lane.
+    //
+    // Order trade-off: a message that's both a replay AND has an
+    // unresolvable author now returns Replay (was UnknownAuthor pre-
+    // round-4). This is fine — replay-rejection is a stronger signal
+    // than unknown-author and the cheap O(log N) BTreeMap lookup must
+    // run before any async resolver I/O.
+    replay_tracker.would_accept(event)?;
+
     // Step 4: identity resolution.
     let identity_pub = resolver
         .resolve(author)
@@ -592,15 +614,6 @@ where
         .verifying_key
         .verify_strict(&canon, &ed25519_dalek::Signature::from_bytes(sig))
         .map_err(|_| ChannelEventError::BadSignature)?;
-
-    // Step 6 (precondition): cheap replay-rejection check. Read-only —
-    // does NOT advance the tracker. Authorization could still reject
-    // below; we only `record` after the full chain succeeds. Mirrors
-    // `community_state_sync::CommunityRootHlcTracker`'s would_accept/
-    // record split — failed-auth events MUST NOT bump `last_seen` or
-    // they permanently block valid future events on the same
-    // (channel, author, device) lane.
-    replay_tracker.would_accept(event)?;
 
     // Step 7: membership-at-HLC gate. Both `write_power` and the
     // tombstone (`deleted_at`) are evaluated AS OF event.at, not as
@@ -1077,9 +1090,20 @@ impl ChannelLog {
                         v, CHANNEL_LOG_TAIL_V1
                     )));
                 }
-                None => Vec::new(),
+                // Empty tail.cbor is corruption (a normal sealed log
+                // writes at least the schema-version byte + an empty
+                // CBOR array). Symmetric with the empty-manifest.cbor
+                // arm above — both surface as CborDecode rather than
+                // silently returning Vec::new() and losing events.
+                None => {
+                    return Err(ChannelLogPersistError::CborDecode(
+                        "tail file is empty".into(),
+                    ));
+                }
             }
         } else {
+            // Distinct from "file exists but is zero bytes": a missing
+            // tail.cbor is a legitimate fresh-log state.
             Vec::new()
         };
         let total = segment_count + tail.len();
@@ -1902,18 +1926,18 @@ mod tests {
     #[tokio::test]
     async fn verify_channel_event_chain_returns_earliest_failure() {
         // Construct a request that fails:
-        //   - Step 3 (misroute) — wrong community_id passed to verify
-        //   - Step 4 (unknown author) — empty resolver
-        //   - Step 6 (replay) — pre-bumped tracker
+        //   - Step 3  (misroute) — wrong community_id passed to verify
+        //   - Step 3b (replay)   — pre-bumped tracker
+        //   - Step 4  (unknown author) — empty resolver
         // The chain runs cheapest-first; expect Misroute (step 3) to win,
-        // not UnknownAuthor or Replay.
+        // not Replay or UnknownAuthor.
         let (state, _) = fixture_state_with_alice_joined();
         let resolver = MockResolver {
             entries: HashMap::new(),
         };
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
-        // Pre-bump the tracker so step 6 would fail too.
+        // Pre-bump the tracker so step 3b would fail too.
         tracker.check_and_advance(&event).expect("seed");
         let err = verify_channel_event(
             &event,
@@ -1928,6 +1952,37 @@ mod tests {
         assert!(
             matches!(err, ChannelEventError::Misroute { .. }),
             "earliest failure (step 3 misroute) must win, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_chain_replay_check_runs_before_identity_resolve() {
+        // Round 4 fix: would_accept (cheap sync) must run BEFORE
+        // identity resolve (async I/O) to honor cheapest-first
+        // ordering. An event that's BOTH a replay AND has an
+        // unresolvable author should now return Replay, not
+        // UnknownAuthor.
+        let (state, _) = fixture_state_with_alice_joined();
+        let resolver = MockResolver {
+            entries: HashMap::new(), // empty — author won't resolve
+        };
+        let mut tracker = ChannelLogReplayTracker::new();
+        let event = fixture_signed_event(100_000, 0, "a-dev");
+        // Pre-bump the tracker so step 3b would_accept fails.
+        tracker.check_and_advance(&event).expect("seed");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &resolver,
+            &mut tracker,
+        )
+        .await
+        .expect_err("must reject");
+        assert!(
+            matches!(err, ChannelEventError::Replay { .. }),
+            "Replay (cheap sync step 3b) must win over UnknownAuthor (async step 4); got {err:?}"
         );
     }
 
