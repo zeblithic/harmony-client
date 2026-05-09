@@ -5712,6 +5712,554 @@ async fn create_channel(
     }
 }
 
+// ── ZEB-248 Phase 1: modify_channel ──────────────────────────────────
+//
+// Mints a ChannelModify event for a channel that already exists. The
+// IPC boundary rejects all-None calls (no name + no write_power) up
+// front so we don't pollute the CRDT log with no-op events. Power-gate
+// enforcement happens INSIDE engine.insert_local_event (verify_event
+// surfaces ChannelAdminInsufficientPower for under-powered callers).
+// Mirrors the `create_channel` shape exactly.
+
+/// Pure function: mint a self-signed ChannelModify event for a community
+/// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
+/// for ensuring at least one of `name`/`write_power` is `Some` (the IPC
+/// boundary rejects all-None before this is reached).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_channel_modify_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    channel_id: crate::community_membership::ChannelId,
+    name: Option<String>,
+    write_power: Option<u8>,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::ChannelModify {
+            channel_id,
+            name,
+            write_power,
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign channel_modify: {e}"))
+}
+
+/// Pure function: mint a self-signed ChannelDelete event for a community
+/// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
+/// for the metadata-before-write check (channel exists + not already
+/// tombstoned) — this helper does NOT validate; it only mints.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_channel_delete_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    channel_id: crate::community_membership::ChannelId,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    wall_now_ms: u64,
+    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::ChannelDelete { channel_id },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign channel_delete: {e}"))
+}
+
+/// Tauri IPC: modify a channel's name and/or write_power. Power-gated
+/// at mod-tier (verify_event returns ChannelAdminInsufficientPower for
+/// underpowered callers). At least ONE of `name` or `write_power` must
+/// be Some; all-None is rejected at the IPC boundary as a no-op error
+/// before any signing.
+///
+/// Errors:
+/// - `Err("modify_channel: must provide name and/or write_power")` —
+///   both args were None.
+/// - `Err("invalid community_id hex: ...")` / `Err("invalid channel_id hex: ...")`
+///   — couldn't parse hex.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` / same for channel_id.
+/// - `Err("hlc_tracker missing" / "dm_device_id missing" / ...)` — node
+///   not running or owner identity not loaded.
+/// - `Err("node generation changed during modify_channel ...")` — a
+///   `stop_node` raced with this call.
+/// - `Err("community_registry detached during modify_channel ...")`.
+/// - `Err("no engine for community {hex} — not currently joined")`.
+/// - `Err("modify_channel rejected: ...")` — `verify_event` rejected
+///   the event (e.g. caller below mod-tier →
+///   `ChannelAdminInsufficientPower`).
+#[tauri::command]
+async fn modify_channel(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    name: Option<String>,
+    write_power: Option<u8>,
+) -> Result<(), String> {
+    // Boundary validation: reject all-None up-front (no-op event spam).
+    if name.is_none() && write_power.is_none() {
+        return Err("modify_channel: must provide name and/or write_power".to_string());
+    }
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let channel_id_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint under HLC tracker + dm_outbox locks then drop the guards.
+    let event = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_channel_modify_event(
+            space_id,
+            self_owner,
+            channel_id_bytes,
+            name,
+            write_power,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // Generation + registry fence (mirrors create_channel /
+    // kick_from_community / set_power_level).
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during modify_channel (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during modify_channel (node stopped?)".to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(event.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err("modify_channel", &outcome));
+    }
+
+    // Advance HLC tracker only on `Inserted` (mirrors create_channel).
+    // `AlreadyKnown` is a 16-byte-event-id collision — vanishingly
+    // unlikely; surface as Err so the caller knows the modify didn't apply.
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        let mut t = hlc_tracker.lock().await;
+        t.insert(device_id, event.at);
+        Ok(())
+    } else {
+        Err(format!(
+            "modify_channel unexpected outcome: AlreadyKnown (event_id collision: {})",
+            hex::encode(event.id)
+        ))
+    }
+}
+
+// ── ZEB-248 Phase 1: delete_channel ──────────────────────────────────
+//
+// Tombstones a channel by signing a ChannelDelete event. Power-gated
+// at mod-tier (engine.insert_local_event → verify_event chain).
+//
+// HARD MEMORY RULE — metadata-before-irreversible-write: read-only
+// "channel exists / not already tombstoned" verification MUST precede
+// the irreversible engine.insert_local_event call. Without this check,
+// calling delete_channel with a stale or invalid channel_id would still
+// pollute the CRDT log with a no-op event — bad telemetry, bad UX, and
+// the user would see "success" for a non-existent channel.
+
+/// Tauri IPC: delete (tombstone) a channel. Power-gated at mod-tier.
+/// Tombstone semantics: the channel stays in the materialized map with
+/// `deleted_at` set so historical messages with this channel_id still
+/// resolve their breadcrumb.
+///
+/// Reads materialized state and verifies the channel exists AND is not
+/// already deleted BEFORE signing the irreversible ChannelDelete event
+/// (per the metadata-before-irreversible-write HARD memory rule).
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` / `Err("invalid channel_id hex: ...")`.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` / same for channel_id.
+/// - `Err("hlc_tracker missing" / "dm_device_id missing" / ...)`.
+/// - `Err("crdt_state missing — node not running?")`.
+/// - `Err("community_registry missing — node not running?")`.
+/// - `Err("no Space for community {hex} in owner-state")` / kind check.
+/// - `Err("community Space missing admin_addr (corrupt row?)")`.
+/// - `Err("no engine for community {hex} — ...")`.
+/// - `Err("no channel {hex} in community {hex}")` — channel never existed
+///   (read-side metadata check).
+/// - `Err("channel {hex} is already deleted")` — already tombstoned
+///   (idempotent rejection; read-side metadata check).
+/// - `Err("node generation changed during delete_channel ...")`.
+/// - `Err("community_registry detached during delete_channel ...")`.
+/// - `Err("delete_channel rejected: ...")` — verify_event rejected
+///   (e.g. ChannelAdminInsufficientPower).
+#[tauri::command]
+async fn delete_channel(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let channel_id_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        snapshot_generation,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.generation,
+        )
+    };
+
+    // Look up admin_addr from owner-state (needed for materialize_now).
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
+    };
+
+    // METADATA-BEFORE-IRREVERSIBLE-WRITE: read-only verify the channel
+    // exists (and isn't already deleted) BEFORE signing. Without this,
+    // a stale or invalid channel_id would pollute the CRDT log with a
+    // no-op event — the engine would happily accept the ChannelDelete
+    // and surface success, but the user's intent ("delete X") was
+    // unrelated to any real channel.
+    {
+        let engine_state = community_registry
+            .state_for(&space_id)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "no engine for community {} — not joined or not yet started",
+                    hex::encode(space_id.0)
+                )
+            })?;
+        let materialized = {
+            let g = engine_state.lock().await;
+            g.materialize_now(admin_addr)
+        };
+        match materialized.channels.get(&channel_id_bytes) {
+            None => {
+                return Err(format!(
+                    "no channel {} in community {}",
+                    hex::encode(channel_id_bytes),
+                    hex::encode(space_id.0)
+                ));
+            }
+            Some(info) if info.deleted_at.is_some() => {
+                return Err(format!(
+                    "channel {} is already deleted",
+                    hex::encode(channel_id_bytes)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Mint under HLC tracker + dm_outbox locks then drop the guards.
+    let event = {
+        let prev_hlc = {
+            let t = hlc_tracker.lock().await;
+            t.get(&device_id).cloned()
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_channel_delete_event(
+            space_id,
+            self_owner,
+            channel_id_bytes,
+            signing_key,
+            &device_id,
+            wall_now_ms,
+            prev_hlc.as_ref(),
+        )?
+    };
+
+    // Generation + registry fence.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during delete_channel (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during delete_channel (node stopped?)".to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(event.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err("delete_channel", &outcome));
+    }
+
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        let mut t = hlc_tracker.lock().await;
+        t.insert(device_id, event.at);
+        Ok(())
+    } else {
+        Err(format!(
+            "delete_channel unexpected outcome: AlreadyKnown (event_id collision: {})",
+            hex::encode(event.id)
+        ))
+    }
+}
+
+// ── ZEB-248 Phase 1: list_channels ───────────────────────────────────
+//
+// Read-only IPC; mirrors `list_community_members`. Returns ALL channels
+// (including tombstoned ones — frontend filters for default view; admin
+// UI surfaces them as deletable-only). Sorted by created_at ascending
+// so #general (auto-created first in Task 7) is always at the top.
+
+/// Tauri IPC: list all channels in a community (including tombstoned
+/// ones). Read-only; does not require power beyond the Joined membership
+/// gate enforced by the engine. Sorted by `created_at` ascending so the
+/// auto-created `#general` channel is always at the top of the list.
+///
+/// Errors: same hex/registry/Space-row error path as `list_community_members`.
+#[tauri::command]
+async fn list_channels(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<ChannelInfoDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+        )
+    };
+
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let materialized = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+
+    let mut rows: Vec<ChannelInfoDto> = materialized
+        .channels
+        .iter()
+        .map(|(channel_id, info)| ChannelInfoDto {
+            channel_id: hex::encode(channel_id),
+            name: info.name.clone(),
+            write_power: info.write_power,
+            created_at: info.created_at.clone(),
+            deleted_at: info.deleted_at.clone(),
+        })
+        .collect();
+    // Sort by created_at ascending so #general (auto-created first in
+    // Task 7's create_community extension) is always at the top of the
+    // list. Tie-break on logical, then channel_id, for determinism.
+    rows.sort_by(|a, b| {
+        a.created_at
+            .wall_ms
+            .cmp(&b.created_at.wall_ms)
+            .then_with(|| a.created_at.logical.cmp(&b.created_at.logical))
+            .then_with(|| a.channel_id.cmp(&b.channel_id))
+    });
+    Ok(rows)
+}
+
 /// Encode a CommunityInvitePayload into the harmony://invite/ URL form.
 /// Thin wrapper over `community_invite::encode_invite_url` so call sites
 /// don't need to import the lower-level error type — surfaces failures
@@ -8606,6 +9154,9 @@ pub fn run() {
             kick_from_community,
             set_power_level,
             create_channel,
+            modify_channel,
+            delete_channel,
+            list_channels,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
