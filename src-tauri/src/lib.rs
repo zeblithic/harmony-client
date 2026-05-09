@@ -6040,6 +6040,7 @@ pub async fn create_community_inner(
 /// the live session.
 #[tauri::command]
 async fn create_community(
+    app: tauri::AppHandle,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     name: String,
     is_invite_only: bool,
@@ -6088,7 +6089,8 @@ async fn create_community(
         std::sync::Arc::clone(&outbox_g.signing_key)
     };
 
-    create_community_inner(
+    let name_for_emit = name.clone();
+    let community_id = create_community_inner(
         name,
         is_invite_only,
         crdt_state,
@@ -6101,7 +6103,27 @@ async fn create_community(
         snapshot_generation,
         &state_lock,
     )
-    .await
+    .await?;
+
+    // ZEB-265: surface the new community to the nav listener. emit
+    // failure is non-fatal — the create already committed, and the
+    // frontend's synthesis fallback (App.svelte) keeps the node visible
+    // either way.
+    if let Err(e) = app.emit(
+        "nav-updated",
+        &NavUpdatedPayload {
+            action: "added",
+            space_id: community_id.clone(),
+            kind: "community",
+            name: name_for_emit,
+            members: None,
+            parent_id: None,
+        },
+    ) {
+        tracing::warn!(error = %e, "create_community: nav-updated emit failed");
+    }
+
+    Ok(community_id)
 }
 
 #[cfg(test)]
@@ -6230,6 +6252,24 @@ pub struct RedeemInviteResultDto {
     pub community_id: String,
     pub community_name: String,
     pub is_invite_only: bool,
+}
+
+/// Wire shape of the `nav-updated` IPC event. Mirrors the frontend
+/// `NavUpdatedPayload` interface in `src/lib/nav-service.ts`. `action`
+/// values are `"added" | "removed" | "modified"`; `kind` values are
+/// `"dm" | "group-dm" | "channel" | "community" | "folder"` —
+/// validated by the listener at receive time. ZEB-265.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NavUpdatedPayload {
+    pub action: &'static str,
+    pub space_id: String,
+    pub kind: &'static str,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 /// Pure function: mint a joiner-side self-Join + derived Community
@@ -7089,6 +7129,7 @@ async fn resolve_destinations_for_owner(
 /// dance).
 #[tauri::command]
 async fn redeem_invite(
+    app: tauri::AppHandle,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
 ) -> Result<RedeemInviteResultDto, String> {
@@ -7170,7 +7211,7 @@ async fn redeem_invite(
         }
     };
 
-    redeem_invite_inner(
+    let dto = redeem_invite_inner(
         url,
         crdt_state,
         hlc_tracker,
@@ -7183,7 +7224,26 @@ async fn redeem_invite(
         dm_outbox,
         fence_check,
     )
-    .await
+    .await?;
+
+    // ZEB-265: surface the redeemed community to the nav listener.
+    // emit failure is non-fatal — the join already committed, and
+    // App.svelte still synthesizes from the DTO until step 3 lands.
+    if let Err(e) = app.emit(
+        "nav-updated",
+        &NavUpdatedPayload {
+            action: "added",
+            space_id: dto.community_id.clone(),
+            kind: "community",
+            name: dto.community_name.clone(),
+            members: None,
+            parent_id: None,
+        },
+    ) {
+        tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
+    }
+
+    Ok(dto)
 }
 
 #[cfg(test)]
@@ -7358,6 +7418,7 @@ fn membership_outcome_err(
 /// next outgoing event to skip a tick.
 #[tauri::command]
 async fn leave_community(
+    app: tauri::AppHandle,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
 ) -> Result<(), String> {
@@ -7462,6 +7523,24 @@ async fn leave_community(
     ) {
         let mut t = hlc_tracker.lock().await;
         t.insert(device_id.clone(), leave.at.clone());
+    }
+
+    // ZEB-265: notify the nav layer so the community node disappears
+    // from the tree without the frontend having to synthesize a
+    // `removed` payload locally. emit failure is non-fatal — the leave
+    // already committed, and worst case the node lingers until reload.
+    if let Err(e) = app.emit(
+        "nav-updated",
+        &NavUpdatedPayload {
+            action: "removed",
+            space_id: community_id,
+            kind: "community",
+            name: String::new(),
+            members: None,
+            parent_id: None,
+        },
+    ) {
+        tracing::warn!(error = %e, "leave_community: nav-updated emit failed");
     }
 
     Ok(())
