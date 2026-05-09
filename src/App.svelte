@@ -146,6 +146,11 @@
   // will trigger NavService to insert the new NavNode. We switch to it
   // after a short tick so NavService has time to receive the event.
   let dmCreateDialogOpen = $state(false);
+  // Tracks which FAB menu item opened the DM dialog so the dialog
+  // can change its framing (title, search placeholder, hint) — the
+  // actual kind is still derived from selected.length inside the
+  // dialog, so this is purely UX, not load-bearing.
+  let dmCreateInitialKind = $state<'dm' | 'group-dm'>('dm');
 
   // ── Community dialogs / panel state (ZEB-263 Phase 5 Task 7) ───────
   // Three modals + a right-pane overview gate on the selected community
@@ -1123,8 +1128,8 @@
         onFolderSelect={handleNavigateFolder}
         filters={fileFilters}
         onFilterChange={(filters) => { fileFilters = filters; }}
-        onNewDm={() => { dmCreateDialogOpen = true; }}
-        onNewGroupDm={() => { dmCreateDialogOpen = true; }}
+        onNewDm={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
+        onNewGroupDm={() => { dmCreateInitialKind = 'group-dm'; dmCreateDialogOpen = true; }}
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
       />
@@ -1132,7 +1137,7 @@
         <button
           type="button"
           class="new-dm-button"
-          onclick={() => { dmCreateDialogOpen = true; }}
+          onclick={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
           title="New direct message"
         >
           <span aria-hidden="true">+</span> New DM
@@ -1398,6 +1403,7 @@
     >
       <DmCreateDialog
         profiles={navService.profiles}
+        initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}
       />

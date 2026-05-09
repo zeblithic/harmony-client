@@ -287,14 +287,6 @@ export interface FileManagerSettings {
 
 // ── Community types (ZEB-263) ─────────────────────────────────────
 
-export interface Community {
-  id: string;          // hex-encoded community_id (32 chars)
-  name: string;
-  kind: 'open' | 'invite-only';
-  myPower: number;     // 0-100
-  memberCount: number;
-}
-
 export interface CommunityMember {
   address: string;
   displayName?: string;
