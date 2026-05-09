@@ -206,4 +206,103 @@ describe('NavPanel', () => {
     await fireEvent.click(screen.getByRole('button', { name: /spellbook/i }));
     expect(onModeChange).toHaveBeenCalledWith('spellbook');
   });
+
+  describe('FAB + fan-out menu (ZEB-263)', () => {
+    const fabBaseProps = {
+      nodes: testNodes,
+      collapsed: false,
+    };
+
+    it('renders the "+" FAB button', () => {
+      render(NavPanel, { props: fabBaseProps });
+      expect(screen.getByLabelText(/Create new/i)).toBeTruthy();
+    });
+
+    it('clicking "+" opens the fan-out menu with 4 items', async () => {
+      render(NavPanel, { props: fabBaseProps });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      expect(screen.getByText(/New direct message/i)).toBeTruthy();
+      expect(screen.getByText(/New group DM/i)).toBeTruthy();
+      expect(screen.getByText(/New community/i)).toBeTruthy();
+      expect(screen.getByText(/Redeem invite/i)).toBeTruthy();
+    });
+
+    it('clicking "New direct message" calls onNewDm and closes the popover', async () => {
+      const onNewDm = vi.fn();
+      render(NavPanel, { props: { ...fabBaseProps, onNewDm } });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      await fireEvent.click(screen.getByText(/New direct message/i));
+      expect(onNewDm).toHaveBeenCalled();
+      expect(screen.queryByText(/New direct message/i)).toBeNull();
+    });
+
+    it('clicking "New group DM" calls onNewGroupDm', async () => {
+      const onNewGroupDm = vi.fn();
+      render(NavPanel, { props: { ...fabBaseProps, onNewGroupDm } });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      await fireEvent.click(screen.getByText(/New group DM/i));
+      expect(onNewGroupDm).toHaveBeenCalled();
+    });
+
+    it('clicking "New community" calls onNewCommunity', async () => {
+      const onNewCommunity = vi.fn();
+      render(NavPanel, { props: { ...fabBaseProps, onNewCommunity } });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      await fireEvent.click(screen.getByText(/New community/i));
+      expect(onNewCommunity).toHaveBeenCalled();
+    });
+
+    it('clicking "Redeem invite" calls onRedeemInvite', async () => {
+      const onRedeemInvite = vi.fn();
+      render(NavPanel, { props: { ...fabBaseProps, onRedeemInvite } });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      await fireEvent.click(screen.getByText(/Redeem invite/i));
+      expect(onRedeemInvite).toHaveBeenCalled();
+    });
+
+    it('Escape closes the popover', async () => {
+      render(NavPanel, { props: fabBaseProps });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      expect(screen.queryByText(/New community/i)).toBeTruthy();
+      await fireEvent.keyDown(window, { key: 'Escape' });
+      expect(screen.queryByText(/New community/i)).toBeNull();
+    });
+
+    it('clicking outside the popover closes it', async () => {
+      render(NavPanel, { props: fabBaseProps });
+      await fireEvent.click(screen.getByLabelText(/Create new/i));
+      expect(screen.queryByText(/New community/i)).toBeTruthy();
+      // Click on document.body — outside the popover and outside the FAB
+      await fireEvent.mouseDown(document.body);
+      expect(screen.queryByText(/New community/i)).toBeNull();
+    });
+  });
+
+  describe('Community node rendering (ZEB-263)', () => {
+    const communityNodes: NavNode[] = [
+      {
+        id: 'comm-1',
+        parentId: null,
+        type: 'community',
+        name: 'IPFS Crew',
+        expanded: true,
+        unreadCount: 0,
+        unreadLevel: 'none',
+        lastActivity: 1000,
+      },
+    ];
+
+    it('renders a community-kind node with its name and 🏛️ icon', () => {
+      const { container } = render(NavPanel, { props: { nodes: communityNodes, collapsed: false } });
+      expect(screen.getByText('IPFS Crew')).toBeTruthy();
+      expect(container.textContent).toContain('🏛️');
+    });
+
+    it('clicking a community node fires onNodeClick with the node id', async () => {
+      const onNodeClick = vi.fn();
+      render(NavPanel, { props: { nodes: communityNodes, collapsed: false, onNodeClick } });
+      await fireEvent.click(screen.getByText('IPFS Crew'));
+      expect(onNodeClick).toHaveBeenCalledWith('comm-1');
+    });
+  });
 });

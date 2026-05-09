@@ -49,7 +49,7 @@
     {onSortOrderChange}
   />
 
-  {#if child.type === 'folder' && child.expanded}
+  {#if (child.type === 'folder' || child.type === 'community') && child.expanded}
     <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} />
   {/if}
 {/each}

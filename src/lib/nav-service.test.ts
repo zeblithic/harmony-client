@@ -289,9 +289,9 @@ describe('NavService DM handling', () => {
   });
 });
 
-describe('NavService addOrUpdateDmSpace (direct call)', () => {
+describe('NavService addOrUpdateNavSpace (direct call)', () => {
   // Fix B from PR #81 review: there's no Rust-side `nav-updated` emit
-  // yet, so App.svelte's handleDmCreate calls addOrUpdateDmSpace
+  // yet, so App.svelte's handleDmCreate calls addOrUpdateNavSpace
   // directly after add_space returns. The behavior must match the
   // listener's path (since a future backend emit could double-fire).
   let nav: NavService;
@@ -306,7 +306,7 @@ describe('NavService addOrUpdateDmSpace (direct call)', () => {
   });
 
   it('synthesizes a NavNode without an IPC emit', () => {
-    nav.addOrUpdateDmSpace({
+    nav.addOrUpdateNavSpace({
       action: 'added',
       spaceId: 'direct-space',
       kind: 'dm',
@@ -325,7 +325,7 @@ describe('NavService addOrUpdateDmSpace (direct call)', () => {
 
   it('fires onChange for direct-call additions', () => {
     nav.onChange = vi.fn();
-    nav.addOrUpdateDmSpace({
+    nav.addOrUpdateNavSpace({
       action: 'added',
       spaceId: 'direct-space',
       kind: 'dm',
@@ -337,7 +337,7 @@ describe('NavService addOrUpdateDmSpace (direct call)', () => {
   });
 
   it('ignores non-DM kinds when called directly', () => {
-    nav.addOrUpdateDmSpace({
+    nav.addOrUpdateNavSpace({
       action: 'added',
       spaceId: 'channel-id',
       kind: 'channel',
@@ -345,5 +345,121 @@ describe('NavService addOrUpdateDmSpace (direct call)', () => {
       parentId: null,
     });
     expect(nav.nodes).toHaveLength(0);
+  });
+});
+
+describe('NavService — community kind (ZEB-263)', () => {
+  it('addOrUpdateNavSpace creates a community NavNode for kind: "community"', () => {
+    const svc = new NavService();
+    svc.nodes = []; // clear seeded mock data
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'aabbccdd' + 'ee'.repeat(28),
+      kind: 'community',
+      name: 'Test Crew',
+      parentId: null,
+    });
+
+    expect(svc.nodes).toHaveLength(1);
+    const node = svc.nodes[0];
+    expect(node.type).toBe('community');
+    expect(node.name).toBe('Test Crew');
+    expect(node.parentId).toBeNull();
+    expect(node.expanded).toBe(true);
+    expect(node.peer).toBeUndefined();
+  });
+
+  it('addOrUpdateNavSpace silently ignores kind: "channel"', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'cc'.repeat(32),
+      kind: 'channel',
+      name: 'general',
+      parentId: 'aabb' + 'cc'.repeat(28),
+    });
+
+    expect(svc.nodes).toHaveLength(0);
+  });
+
+  it('community node can have parentId set (placement inside user folder)', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'aabbccdd' + 'ee'.repeat(28),
+      kind: 'community',
+      name: 'Crew',
+      parentId: 'folder-1',
+    });
+
+    expect(svc.nodes[0].parentId).toBe('folder-1');
+  });
+
+  it('removed action drops community node', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    const id = 'aabbccdd' + 'ee'.repeat(28);
+    svc.addOrUpdateNavSpace({ action: 'added', spaceId: id, kind: 'community', name: 'Crew' });
+    expect(svc.nodes).toHaveLength(1);
+    svc.addOrUpdateNavSpace({ action: 'removed', spaceId: id, kind: 'community', name: 'Crew' });
+    expect(svc.nodes).toHaveLength(0);
+  });
+
+  it('existing dm/group-dm path still works unchanged (regression)', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'dd'.repeat(32),
+      kind: 'dm',
+      name: 'Bob',
+      members: ['bob_addr', 'self_addr'],
+    });
+
+    expect(svc.nodes).toHaveLength(1);
+    expect(svc.nodes[0].type).toBe('dm');
+  });
+
+  it('Fix-G analog: duplicate added preserves parentId/expanded/unread state for community', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    const spaceId = 'aabbccdd' + 'ee'.repeat(28);
+
+    // First insert with parentId='folder-1'.
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId,
+      kind: 'community',
+      name: 'Original Name',
+      parentId: 'folder-1',
+    });
+
+    // Simulate user-applied UI state: collapse the node and give it unread counts.
+    svc.nodes = svc.nodes.map((n) =>
+      n.id === spaceId
+        ? { ...n, expanded: false, unreadCount: 3 }
+        : n,
+    );
+
+    // Cold-replay re-emits added with parentId=null (backend has no concept of
+    // user-applied folder placement or unread state).
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId,
+      kind: 'community',
+      name: 'New Name',
+      parentId: null,
+    });
+
+    const node = svc.nodes.find((n) => n.id === spaceId);
+    expect(node).toBeDefined();
+    // Preserved from existing user state.
+    expect(node!.parentId).toBe('folder-1');
+    expect(node!.expanded).toBe(false);
+    expect(node!.unreadCount).toBe(3);
+    // Name updated from the replay payload.
+    expect(node!.name).toBe('New Name');
   });
 });

@@ -20,6 +20,11 @@
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
+  import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
+  import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
+  import CommunitySettingsPanel from './lib/components/CommunitySettingsPanel.svelte';
+  import { CommunityService } from './lib/community-service';
+  import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
   import { Stq8Service } from './lib/stq8-service';
@@ -141,6 +146,78 @@
   // will trigger NavService to insert the new NavNode. We switch to it
   // after a short tick so NavService has time to receive the event.
   let dmCreateDialogOpen = $state(false);
+  // Tracks which FAB menu item opened the DM dialog so the dialog
+  // can change its framing (title, search placeholder, hint) — the
+  // actual kind is still derived from selected.length inside the
+  // dialog, so this is purely UX, not load-bearing.
+  let dmCreateInitialKind = $state<'dm' | 'group-dm'>('dm');
+
+  // ── Community dialogs / panel state (ZEB-263 Phase 5 Task 7) ───────
+  // Three modals + a right-pane overview gate on the selected community
+  // id. The dialog `pending`/`error` state stays in App.svelte rather
+  // than the dialog component so a re-open after an error gets a fresh
+  // state without remounting (and so multiple dialogs can be cycled).
+  let showCreateCommunity = $state(false);
+  let showRedeemInvite = $state(false);
+  let createPending = $state(false);
+  let createError = $state<string | null>(null);
+  let redeemPending = $state(false);
+  let redeemError = $state<string | null>(null);
+  let redeemUrl = $state('');
+  let selectedCommunityId = $state<string | null>(null);
+  let showCommunitySettings = $state(false);
+  let communityMembers = $state<CommunityMember[]>([]);
+  let myAddress = $state('');
+  // Local mirror of communityService.isDegraded(selectedCommunityId).
+  // Direct method calls in the template aren't reactive — we need a
+  // $state field that the listener can update so the settings panel
+  // re-renders on degraded events.
+  let isCurrentCommunityDegraded = $state(false);
+  // Derived from the live roster — recomputes when fetchOwnAddress
+  // resolves later than the first roster load (race fixed in PR #91
+  // review). Never assign to this directly.
+  let myCommunityPower = $derived(
+    communityMembers.find((m) => m.address === myAddress)?.power ?? 0,
+  );
+  // Count only currently-joined members so the overview matches the
+  // "X joined" line in CommunitySettingsPanel — invited/banned/left
+  // entries shouldn't be counted as members in either place.
+  let joinedCommunityCount = $derived(
+    communityMembers.filter((m) => m.status === 'joined').length,
+  );
+
+  // Centralized switch helper. Clears the visible roster on a real
+  // community change so the settings panel doesn't flash the previous
+  // community's members during the in-flight fetch (greptile P1).
+  // Also captures the current degraded flag so the UI doesn't lag
+  // behind the backend signal until the next members-changed event.
+  function changeSelectedCommunity(id: string | null) {
+    if (selectedCommunityId !== id) {
+      communityMembers = [];
+    }
+    selectedCommunityId = id;
+    isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
+  }
+
+  async function refreshCommunityMembers(id: string) {
+    try {
+      const fresh = await communityService.listCommunityMembers(id);
+      // Stale-response guard: if the user switched communities while
+      // we were awaiting, drop the result rather than overwriting the
+      // newly-selected community's roster with the previous one's.
+      if (selectedCommunityId !== id) return;
+      communityMembers = fresh;
+    } catch (e) {
+      // listCommunityMembers throws when the adapter isn't connected
+      // (mock-data mode) or when the backend isn't ready. Surface the
+      // failure to the console rather than crash the app — the panel
+      // simply renders with an empty member list.
+      if (selectedCommunityId !== id) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[harmony-client] listCommunityMembers failed:', msg);
+      communityMembers = [];
+    }
+  }
 
   async function handleDmCreate(args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) {
     try {
@@ -157,7 +234,7 @@
       // navService — same logic the (still-wired) listener uses, so a
       // future backend emit won't double-insert (the duplicate-added
       // path preserves UI state via Fix G).
-      navService.addOrUpdateDmSpace({
+      navService.addOrUpdateNavSpace({
         action: 'added',
         spaceId,
         kind: args.kind,
@@ -236,6 +313,13 @@
   const navService = new NavService();
   navService.setAvatarResolver(avatarResolver);
   $effect(() => () => navService.destroy());
+
+  // ── Community service (ZEB-263) ────────────────────────────────────
+  // Mirrors the MessageService / NavService pattern: constructed eagerly,
+  // adapter wired up inside the Tauri-init IIFE below, destroy() ran on
+  // unmount via $effect cleanup.
+  const communityService = new CommunityService();
+  $effect(() => () => communityService.destroy());
 
   let navNodes = $state([...navService.nodes]);
 
@@ -366,6 +450,31 @@
   // paths update the reactive allMessages state.
   messageService.onChange = () => { allMessages = [...messageService.messages]; };
 
+  // ZEB-263: Wire communityService.onChange BEFORE the init IIFE so that
+  // the first roster-changed event (which may fire as soon as connectAdapter
+  // resolves) is never dropped silently. Svelte 5 $state reads inside the
+  // closure are always current at call time — no TDZ risk.
+  communityService.onMembersChanged = (changedId: string) => {
+    if (selectedCommunityId && changedId === selectedCommunityId) {
+      // Route through refreshCommunityMembers so we get the same
+      // try/catch + stale-response guard as the imperative caller.
+      // Don't await — onMembersChanged is fire-and-forget at the
+      // listener boundary; awaiting here would leak unhandled
+      // rejections.
+      void refreshCommunityMembers(selectedCommunityId);
+    }
+  };
+
+  communityService.onDegradedChanged = (changedId: string) => {
+    // Degraded transitions don't affect the member roster — only
+    // mirror the flag into local $state so the settings panel
+    // re-renders. Avoiding the roster fetch here was a deliberate
+    // split (cursor flagged the unnecessary reactive cascade).
+    if (selectedCommunityId && changedId === selectedCommunityId) {
+      isCurrentCommunityDegraded = communityService.isDegraded(changedId);
+    }
+  };
+
   // Keep the display name on both services in sync with profile edits.
   $effect(() => {
     const name = myProfile.displayName || 'You';
@@ -426,6 +535,7 @@
       await tryConnect('vine', vineService.connectAdapter(adapter));
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
+      await tryConnect('community', communityService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       resolveVideoFn = async (cid: string) => {
         const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
@@ -445,6 +555,9 @@
           messageService.ownAddress = addr;
           vineService.ownAddress = addr;
           navService.ownAddress = addr;
+          // ZEB-263: keep our reactive copy in sync so CommunitySettingsPanel
+          // can identify "you" + gate kick/setPower self-actions.
+          myAddress = addr;
         } catch (err) {
           // Expected while start_node is still racing with boot; the
           // zenoh-status listener below retries on 'connected'. Logged at
@@ -734,6 +847,13 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // The nav row to render with active styling. When a community is
+  // selected, highlight the community node; otherwise fall back to
+  // the active channel/DM. Keeping these in separate $state fields
+  // avoids reusing activeChannel for community ids — activeChannel
+  // is consumed by message-send paths that only make sense for
+  // channels/DMs.
+  let navActiveNodeId = $derived(selectedCommunityId ?? activeChannel);
 
   function switchMode(mode: AppMode) {
     appMode = mode;
@@ -749,6 +869,20 @@
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    // ZEB-263: community nodes route to the right-pane overview placeholder
+    // instead of the message feed (no channels yet — that's a later phase).
+    if (node.type === 'community') {
+      changeSelectedCommunity(id);
+      void refreshCommunityMembers(id);
+      if (appMode !== 'messages') {
+        switchMode('messages');
+      }
+      return;
+    }
+    // Clicking any non-community navigable node clears the community
+    // overview so the message feed shows through.
+    changeSelectedCommunity(null);
+    showCommunitySettings = false;
     const switched = id !== activeChannel;
     activeChannel = node.id;
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
@@ -948,6 +1082,15 @@
   // Extract community nodes (folders) for settings panel
   let communities = $derived(navNodes.filter((n) => n.type === 'folder'));
 
+  // ZEB-263: derive the selected community NavNode (if any) so the
+  // right-pane overview placeholder + the settings panel can read its
+  // name without the redundant `find` lookup at every render site.
+  let selectedCommunityNode = $derived(
+    selectedCommunityId
+      ? navNodes.find((n) => n.id === selectedCommunityId && n.type === 'community') ?? null
+      : null
+  );
+
   // Collect known peers from messages and nav nodes (DMs)
   let knownPeers = $derived.by(() => {
     const peerMap = new Map(
@@ -972,7 +1115,7 @@
       <NavPanel
         nodes={navNodes}
         {collapsed}
-        activeNodeId={activeChannel}
+        activeNodeId={navActiveNodeId}
         onNodeClick={handleNodeClick}
         onSettingsClick={() => { showSettings = !showSettings; }}
         profileLookup={(addr) => navService.profileLookup(addr)}
@@ -985,12 +1128,16 @@
         onFolderSelect={handleNavigateFolder}
         filters={fileFilters}
         onFilterChange={(filters) => { fileFilters = filters; }}
+        onNewDm={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
+        onNewGroupDm={() => { dmCreateInitialKind = 'group-dm'; dmCreateDialogOpen = true; }}
+        onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
+        onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
       />
       {#if !collapsed && appMode === 'messages'}
         <button
           type="button"
           class="new-dm-button"
-          onclick={() => { dmCreateDialogOpen = true; }}
+          onclick={() => { dmCreateInitialKind = 'dm'; dmCreateDialogOpen = true; }}
           title="New direct message"
         >
           <span aria-hidden="true">+</span> New DM
@@ -999,28 +1146,42 @@
     </div>
   {/snippet}
   {#snippet textFeed()}
-    <TextFeed
-      messages={mainFeedMessages}
-      {collapsed}
-      channelName={activeChannelName}
-      channelType={activeChannelType}
-      onMediaClick={scrollToMedia}
-      onSend={handleSend}
-      onAvatarClick={handleAvatarClick}
-      {trustService}
-      {trustVersion}
-      {threadRoot}
-      {threadReplies}
-      {threadMeta}
-      {openThreadId}
-      onThreadOpen={handleThreadOpen}
-      onThreadClose={handleThreadClose}
-      onThreadSend={handleThreadSend}
-      onScrollToMessage={scrollToMessage}
-      {pinnedThreadIds}
-      onMessageDelete={requestDeleteMessage}
-      ownAddress={messageService.ownAddress ?? ''}
-    />
+    {#if selectedCommunityNode}
+      <!-- ZEB-263 Phase 5 Task 7: community-overview placeholder. The
+           right-pane shows community metadata + a Manage button while
+           selectedCommunityId is set; clicking any DM/channel in the nav
+           clears it and the message feed shows through again. Channels
+           inside a community arrive in a later phase. -->
+      <div class="community-overview">
+        <h2>{selectedCommunityNode.name}</h2>
+        <p class="member-line">{joinedCommunityCount} {joinedCommunityCount === 1 ? 'member' : 'members'}</p>
+        <p class="empty-line">No channels yet — channels arrive in a later phase.</p>
+        <button class="manage-btn" onclick={() => (showCommunitySettings = true)}>Manage community</button>
+      </div>
+    {:else}
+      <TextFeed
+        messages={mainFeedMessages}
+        {collapsed}
+        channelName={activeChannelName}
+        channelType={activeChannelType}
+        onMediaClick={scrollToMedia}
+        onSend={handleSend}
+        onAvatarClick={handleAvatarClick}
+        {trustService}
+        {trustVersion}
+        {threadRoot}
+        {threadReplies}
+        {threadMeta}
+        {openThreadId}
+        onThreadOpen={handleThreadOpen}
+        onThreadClose={handleThreadClose}
+        onThreadSend={handleThreadSend}
+        onScrollToMessage={scrollToMessage}
+        {pinnedThreadIds}
+        onMessageDelete={requestDeleteMessage}
+        ownAddress={messageService.ownAddress ?? ''}
+      />
+    {/if}
   {/snippet}
   {#snippet mediaFeed()}
     <MediaFeed
@@ -1242,6 +1403,7 @@
     >
       <DmCreateDialog
         profiles={navService.profiles}
+        initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}
       />
@@ -1263,6 +1425,163 @@
     destructive={true}
     onConfirm={confirmDeleteMessage}
     onCancel={cancelDeleteMessage}
+  />
+{/if}
+
+{#if showCreateCommunity}
+  <!-- ZEB-263 Phase 5 Task 7: Create-community modal. Successful create
+       returns the new community_id which we adopt as the selection so
+       the user lands on the new community's overview placeholder. -->
+  <CreateCommunityDialog
+    pending={createPending}
+    error={createError}
+    onSubmit={async (name, kind) => {
+      createPending = true;
+      createError = null;
+      try {
+        const id = await communityService.createCommunity(name, kind);
+        // Synthesize the NavNode locally — backend has no nav-updated
+        // emit yet (same gap as DM Fix B from PR #81), so without this
+        // the community would not appear in the nav tree and
+        // selectedCommunityNode (derived from navNodes) would stay
+        // null, sending the right pane to the TextFeed fallback.
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: id,
+          kind: 'community',
+          name,
+          members: [],
+          parentId: null,
+        });
+        showCreateCommunity = false;
+        changeSelectedCommunity(id);
+        await refreshCommunityMembers(id);
+      } catch (e) {
+        createError = e instanceof Error ? e.message : String(e);
+      } finally {
+        createPending = false;
+      }
+    }}
+    onCancel={() => {
+      showCreateCommunity = false;
+      createPending = false;
+      createError = null;
+    }}
+  />
+{/if}
+
+{#if showRedeemInvite}
+  <!-- ZEB-263 Phase 5 Task 7: Redeem-invite modal. The dialog keeps the
+       URL value across re-opens via initialUrl so a transient backend
+       error doesn't force re-paste; we clear it explicitly on cancel /
+       success. -->
+  <RedeemInviteDialog
+    pending={redeemPending}
+    error={redeemError}
+    initialUrl={redeemUrl}
+    onSubmit={async (url) => {
+      redeemPending = true;
+      redeemError = null;
+      redeemUrl = url;
+      try {
+        const id = await communityService.redeemInvite(url);
+        // Synthesize the NavNode locally — same reason as create.
+        // The backend redeem_invite IPC currently returns only the
+        // community_id, not the name; rather than CBOR-decode the
+        // URL on the frontend (duplicating backend logic), use a
+        // placeholder name keyed off the id. A future backend
+        // change to return community metadata (or the eventual
+        // nav-updated emit) will replace this on next render.
+        const placeholderName = `Community ${id.slice(0, 8)}`;
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: id,
+          kind: 'community',
+          name: placeholderName,
+          members: [],
+          parentId: null,
+        });
+        showRedeemInvite = false;
+        redeemUrl = '';
+        changeSelectedCommunity(id);
+        await refreshCommunityMembers(id);
+      } catch (e) {
+        redeemError = e instanceof Error ? e.message : String(e);
+      } finally {
+        redeemPending = false;
+      }
+    }}
+    onCancel={() => {
+      showRedeemInvite = false;
+      redeemUrl = '';
+      redeemError = null;
+    }}
+  />
+{/if}
+
+{#if showCommunitySettings && selectedCommunityNode}
+  <!-- ZEB-263 Phase 5: communityKind is sourced from
+       CommunityService.getKind(), which knows the kind for communities
+       this session created and returns 'unknown' for redeemed/foreign
+       communities. Once the backend exposes kind on the wire (open
+       follow-up — spec Appendix A #2), getKind() should fall back to
+       the wire value rather than 'unknown'. -->
+  <CommunitySettingsPanel
+    communityId={selectedCommunityNode.id}
+    communityName={selectedCommunityNode.name}
+    communityKind={communityService.getKind(selectedCommunityNode.id)}
+    members={communityMembers}
+    {myAddress}
+    myPower={myCommunityPower}
+    isDegraded={isCurrentCommunityDegraded}
+    onClose={() => (showCommunitySettings = false)}
+    onKick={async (target) => {
+      if (!selectedCommunityId) return;
+      try {
+        await communityService.kickMember(selectedCommunityId, target);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('kickMember failed:', msg);
+      }
+    }}
+    onSetPower={async (target, power) => {
+      if (!selectedCommunityId) return;
+      try {
+        await communityService.setPowerLevel(selectedCommunityId, target, power);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('setPowerLevel failed:', msg);
+      }
+    }}
+    onLeave={async () => {
+      if (!selectedCommunityId) return;
+      const leavingId = selectedCommunityId;
+      try {
+        await communityService.leaveCommunity(leavingId);
+        // Synthesize the nav removal — same backend gap as create
+        // and redeem (no nav-updated emit). Without this the
+        // community node would persist in the nav tree until reload
+        // even though the user has left it. ZEB-265 covers fixing
+        // this on the backend side.
+        navService.addOrUpdateNavSpace({
+          action: 'removed',
+          spaceId: leavingId,
+          kind: 'community',
+          name: '',
+          members: [],
+          parentId: null,
+        });
+        changeSelectedCommunity(null);
+        showCommunitySettings = false;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('leaveCommunity failed:', msg);
+      }
+    }}
+    onGenerateInvite={async () => {
+      if (!selectedCommunityId) throw new Error('no community selected');
+      return communityService.generateInvite(selectedCommunityId);
+    }}
   />
 {/if}
 
@@ -1328,5 +1647,42 @@
     background: var(--bg-secondary, #222);
     border-radius: 8px;
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+
+  /* ── ZEB-263: community right-pane overview placeholder ───────────── */
+  .community-overview {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 32px 28px;
+    color: var(--text-primary, #e8eaed);
+  }
+  .community-overview h2 {
+    margin: 0;
+    font-size: 1.25rem;
+  }
+  .community-overview .member-line {
+    margin: 0;
+    color: var(--text-secondary, #b8bcc4);
+    font-size: 0.85rem;
+  }
+  .community-overview .empty-line {
+    margin: 0 0 8px 0;
+    color: var(--text-muted, #949ba4);
+    font-size: 0.8rem;
+  }
+  .community-overview .manage-btn {
+    background: var(--accent, #5865f2);
+    color: var(--text-primary, #e8eaed);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .community-overview .manage-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 2px;
   }
 </style>

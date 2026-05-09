@@ -5,10 +5,17 @@
     profiles,
     onSubmit,
     onCancel,
+    initialKind = 'dm',
   }: {
     profiles: Map<string, Profile>;
     onSubmit: (args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) => void;
     onCancel: () => void;
+    /** Which entry-point opened the dialog. Affects framing only —
+     *  the actual `kind` is still derived from selected.length. The
+     *  FAB menu has two separate items ("New direct message" vs
+     *  "New group DM") that must produce visibly distinct UX,
+     *  per cursor's PR-91 review. */
+    initialKind?: 'dm' | 'group-dm';
   } = $props();
 
   const MAX_RECIPIENTS = 15;
@@ -57,11 +64,16 @@
 </script>
 
 <div class="dm-create-dialog" role="dialog" aria-modal="true" aria-labelledby="dm-create-title">
-  <h2 id="dm-create-title">New direct message</h2>
+  <h2 id="dm-create-title">
+    {initialKind === 'group-dm' ? 'New group DM' : 'New direct message'}
+  </h2>
+  {#if initialKind === 'group-dm'}
+    <p class="subtitle">Add multiple recipients to start a group conversation.</p>
+  {/if}
 
   <input
     type="text"
-    placeholder="Search contacts…"
+    placeholder={initialKind === 'group-dm' ? 'Search contacts to add…' : 'Search contacts…'}
     aria-label="Search contacts"
     bind:value={searchQuery}
     class="search-input"
@@ -129,6 +141,11 @@
   .dm-create-dialog {
     padding: 16px;
     max-width: 360px;
+  }
+  .subtitle {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin: -8px 0 12px;
   }
   .search-input {
     width: 100%;

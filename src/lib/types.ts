@@ -84,7 +84,7 @@ export interface Message {
 
 export type ThreadDisplayMode = 'panel' | 'inline' | 'muted';
 
-export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat';
+export type NavNodeType = 'folder' | 'channel' | 'dm' | 'group-chat' | 'community';
 export type DisplayMode = 'text' | 'icon' | 'both';
 export type SortOrder = 'activity' | 'pinned' | 'alphabetical';
 export type UnreadLevel = 'none' | 'quiet' | 'standard' | 'loud';
@@ -283,4 +283,30 @@ export interface FileManagerSettings {
   quotaBytes: number;
   defaultViewMode: FileViewMode;
   confirmationOverrides: Partial<Record<ContentSensitivity, number>>;
+}
+
+// ── Community types (ZEB-263) ─────────────────────────────────────
+
+export interface CommunityMember {
+  address: string;
+  displayName?: string;
+  power: number;       // 0-100
+  status: 'joined' | 'left' | 'invited' | 'banned';
+  joinedAt?: number;
+}
+
+// Mirrors backend POWER_THRESHOLDS in src-tauri/src/community_membership.rs:1108.
+export const POWER_THRESHOLDS = {
+  invite: 0,
+  kick: 50,
+  setPower: 100,
+  max: 100,
+} as const;
+
+export type PowerRole = 'member' | 'mod' | 'admin';
+
+export function powerToRole(power: number): PowerRole {
+  if (power >= POWER_THRESHOLDS.setPower) return 'admin';
+  if (power >= POWER_THRESHOLDS.kick) return 'mod';
+  return 'member';
 }
