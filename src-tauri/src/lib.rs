@@ -6405,12 +6405,14 @@ pub struct MintedCommunity {
 /// all four artefacts so the IPC layer can apply the Space, send
 /// the Join through the engine, and return the hex id to the frontend.
 ///
-/// Pure / sync / no I/O — every random byte is sourced from the args.
-/// This lets the test (`create_community_inner_tests`) cover the full
-/// mint without spawning channels, mutexes, or a Tauri runtime.
-///
-/// ZEB-267: Caller pre-reserves `creation_hlc` via
-/// `dm_outbox::reserve_next_hlc_for_device`.
+/// Sync / no I/O / no async — caller supplies `creation_hlc`
+/// (pre-reserved via `dm_outbox::reserve_next_hlc_for_device` per
+/// ZEB-267); `community_id`, `MembershipKey`, and the bootstrap-Join
+/// `event_id` are drawn from `rand::thread_rng()`. Not deterministic,
+/// but "pure" w.r.t. HLC ordering — concurrent callers with distinct
+/// reserved HLCs always produce monotone outputs. Free of channels,
+/// mutexes, and Tauri runtime, so `create_community_inner_tests` can
+/// cover the full mint in isolation.
 pub fn mint_community_creation(
     name: &str,
     is_invite_only: bool,
@@ -6489,15 +6491,24 @@ pub fn mint_community_creation(
 /// (Phase 4 Task 8 will extract it the same way) so the two IPCs share
 /// a code-review pattern.
 ///
-/// Lock-order discipline (load-bearing — flagged on PR #86 round 2):
+/// Lock-order discipline (load-bearing — flagged on PR #86 round 2,
+/// updated for ZEB-267 reservation-time tracker bump):
 /// the `crdt_state` `tokio::sync::Mutex` guard MUST drop before
 /// `hlc_tracker.lock().await` is acquired. Holding `state_g` across
 /// `tracker_g.lock().await` would (a) violate the project-wide "no
 /// `.await` while holding state mutex" rule, and (b) invert lock order
 /// vs callers that take `hlc_tracker` first — a deadlock risk under
-/// concurrent IPCs. The post-reorder body acquires both locks only at
-/// the END (tracker before crdt_state, then commit), so the rule is
-/// preserved.
+/// concurrent IPCs.
+///
+/// Post-ZEB-267 shape: `hlc_tracker` is locked EARLY via
+/// `reserve_next_hlc_for_device` (atomic read-bump-write under one
+/// lock) and the guard is dropped before any owner-state work. The
+/// later `apply_space` block takes `crdt_state` alone — the two locks
+/// are never held simultaneously, and `crdt_state` is never held
+/// across an `.await`. Tracker advance is reservation-time (burn
+/// semantics on rollback), no longer co-located with the apply_space
+/// commit. See spec at `docs/specs/2026-05-09-zeb-267-...md` for the
+/// rationale behind moving the bump out of the apply critical section.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_community_inner(
     name: String,
