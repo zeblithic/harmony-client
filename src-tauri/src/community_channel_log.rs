@@ -17,9 +17,12 @@
 //! (commit 5145484), sections §5.2, §6, §7, §8, §13.1.
 
 use crate::community_membership::ChannelId;
+use crate::owner_state_types::Hlc;
 use crate::owner_state_types::MembershipKey;
+use crate::owner_state_types::OwnerAddr;
 use crate::owner_state_types::SpaceId;
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 /// Symmetric key for one channel's wire encryption. Derived
@@ -70,6 +73,199 @@ pub fn derive_channel_key(
         .expand(&info, out.as_mut())
         .expect("32 ≤ 8160");
     ChannelKey(*out)
+}
+
+/// 16-byte ULID identifying a single message within a channel.
+/// Generated client-side at post time. Stable identity for v3
+/// references (Edit/Delete/React variants will target this id).
+pub type MessageId = [u8; 16];
+
+/// Static AAD bytes for ChaCha20-Poly1305 wrapping of channel events.
+/// v3 may extend with per-event AAD; for now this is a constant across
+/// every packet on every channel.
+pub const CHANNEL_PACKET_AAD: &[u8] = b"harmony-channel-msg-v1";
+
+/// One signed channel event. Phase 2 ships only the `Post` variant.
+/// Wire format: 2-key adjacently-tagged outer (`tg` + `vl`); inner
+/// fields all 2-char keys to satisfy the same-length-keys invariant.
+///
+/// `sg` covers canonical CBOR of `(id, community_id, channel_id, author,
+/// at, content_kind, body, reply_to)` — every field minus the signature
+/// itself. v3 Edit/Delete/React variants will sign their own typed
+/// payloads with no field reuse across variants.
+///
+/// Per spec §5.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tg", content = "vl")]
+pub enum SignedChannelEvent {
+    #[serde(rename = "p")]
+    Post {
+        #[serde(rename = "id")]
+        id: MessageId,
+        #[serde(rename = "ci")]
+        community_id: SpaceId,
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "au")]
+        author: OwnerAddr,
+        #[serde(rename = "at")]
+        at: Hlc,
+        #[serde(rename = "kd")]
+        content_kind: u8,
+        #[serde(rename = "bd")]
+        body: String,
+        #[serde(rename = "rt", skip_serializing_if = "Option::is_none", default)]
+        reply_to: Option<MessageId>,
+        #[serde(
+            rename = "sg",
+            serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+            deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+        )]
+        sig: [u8; 64],
+    },
+    // v3 reserved (additive — no v2 wire-format break):
+    // Edit { id, ci, ch, au, at, kd, bd, sg }
+    // Delete { id, ci, ch, au, at, sg }
+    // React { id, ci, ch, au, at, em, sg }
+}
+
+/// Pre-signature payload used to derive `event_id` and the signed-set
+/// canonical-CBOR digest. Caller fills these fields, hands to
+/// `sign_channel_event`, gets back a `SignedChannelEvent::Post`.
+pub struct ChannelPostPayload<'a> {
+    pub id: MessageId,
+    pub community_id: SpaceId,
+    pub channel_id: ChannelId,
+    pub author: OwnerAddr,
+    pub at: Hlc,
+    pub content_kind: u8,
+    pub body: &'a str,
+    pub reply_to: Option<MessageId>,
+}
+
+/// The signed-set tuple. Canonical CBOR of this is what `sg` covers
+/// AND what the SHA-256 (event_id derivation) hashes.
+#[derive(Serialize)]
+struct ChannelPostSignedSet<'a> {
+    id: &'a MessageId,
+    community_id: &'a SpaceId,
+    channel_id: &'a ChannelId,
+    author: &'a OwnerAddr,
+    at: &'a Hlc,
+    content_kind: u8,
+    body: &'a str,
+    reply_to: &'a Option<MessageId>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ChannelEventError {
+    #[error("CBOR encode: {0}")]
+    CborEncode(String),
+    #[error("CBOR decode: {0}")]
+    CborDecode(String),
+    #[error("AEAD encrypt: {0}")]
+    AeadEncrypt(String),
+    #[error("AEAD decrypt: {0}")]
+    AeadDecrypt(String),
+    #[error("malformed packet (length {0} bytes — need at least 12 for nonce)")]
+    MalformedPacket(usize),
+    #[error("signature verify failed")]
+    BadSignature,
+    #[error("misroute: expected community {expected_community:?} channel {expected_channel:?}, got {got_community:?}/{got_channel:?}")]
+    Misroute {
+        expected_community: SpaceId,
+        expected_channel: ChannelId,
+        got_community: SpaceId,
+        got_channel: ChannelId,
+    },
+    #[error("identity not resolvable for author {0:?}")]
+    UnknownAuthor(OwnerAddr),
+    #[error("replay: event {event_id:?} from author {author:?} on device {device_id} at {at:?} not strictly greater than last seen")]
+    Replay {
+        event_id: MessageId,
+        author: OwnerAddr,
+        device_id: String,
+        at: Hlc,
+    },
+    #[error("not authorized: {0}")]
+    NotAuthorized(String),
+}
+
+/// Sign a channel post payload with the author's identity key. Returns
+/// the wire-ready `SignedChannelEvent::Post`. Pure / sync / no I/O.
+///
+/// `event_id` is supplied by the caller (typically a freshly-generated
+/// ULID); same-length-keys invariant means we can't derive event_id
+/// from the canonical CBOR digest the way community membership events
+/// do, because the digest would include `at` (which contains a String
+/// device_id of variable length).
+///
+/// Per spec §5.2. The signed-set tuple is `(id, community_id, channel_id,
+/// author, at, content_kind, body, reply_to)` — every field minus the
+/// signature itself.
+pub fn sign_channel_event(
+    payload: &ChannelPostPayload,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedChannelEvent, ChannelEventError> {
+    use ed25519_dalek::Signer;
+    let signed_set = ChannelPostSignedSet {
+        id: &payload.id,
+        community_id: &payload.community_id,
+        channel_id: &payload.channel_id,
+        author: &payload.author,
+        at: &payload.at,
+        content_kind: payload.content_kind,
+        body: payload.body,
+        reply_to: &payload.reply_to,
+    };
+    let mut canon = Vec::with_capacity(256);
+    ciborium::into_writer(&signed_set, &mut canon)
+        .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+    let sig = signing_key.sign(&canon).to_bytes();
+    Ok(SignedChannelEvent::Post {
+        id: payload.id,
+        community_id: payload.community_id,
+        channel_id: payload.channel_id,
+        author: payload.author,
+        at: payload.at.clone(),
+        content_kind: payload.content_kind,
+        body: payload.body.to_string(),
+        reply_to: payload.reply_to,
+        sig,
+    })
+}
+
+/// Recompute the signed-set canonical CBOR for a SignedChannelEvent::Post.
+/// Used by both `sign_channel_event` (above, via the borrowed payload
+/// path) and `verify_channel_event` (Task 5, via this borrowed path on
+/// the deserialized event).
+#[cfg_attr(not(test), allow(dead_code))]
+fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
+    let SignedChannelEvent::Post {
+        id,
+        community_id,
+        channel_id,
+        author,
+        at,
+        content_kind,
+        body,
+        reply_to,
+        ..
+    } = event;
+    let signed_set = ChannelPostSignedSet {
+        id,
+        community_id,
+        channel_id,
+        author,
+        at,
+        content_kind: *content_kind,
+        body,
+        reply_to,
+    };
+    let mut canon = Vec::with_capacity(256);
+    ciborium::into_writer(&signed_set, &mut canon)
+        .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
+    Ok(canon)
 }
 
 #[cfg(test)]
@@ -145,5 +341,91 @@ mod tests {
         // generic function.
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<ChannelKey>();
+    }
+
+    fn fixture_owner_addr(byte: u8) -> OwnerAddr {
+        OwnerAddr([byte; 16])
+    }
+
+    fn fixture_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn fixture_hlc(wall_ms: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    fn fixture_payload(
+        body: &'static str,
+    ) -> (ChannelPostPayload<'static>, ed25519_dalek::SigningKey) {
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: [0x11; 16],
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100_000, "a-dev"),
+            content_kind: 0,
+            body,
+            reply_to: None,
+        };
+        (payload, key)
+    }
+
+    #[test]
+    fn sign_channel_event_round_trip() {
+        let (payload, key) = fixture_payload("hello, world!");
+        let signed = sign_channel_event(&payload, &key).expect("sign");
+        let SignedChannelEvent::Post {
+            id,
+            community_id,
+            channel_id,
+            author,
+            at,
+            content_kind,
+            body,
+            reply_to,
+            sig,
+        } = signed;
+        assert_eq!(id, payload.id);
+        assert_eq!(community_id, payload.community_id);
+        assert_eq!(channel_id, payload.channel_id);
+        assert_eq!(author, payload.author);
+        assert_eq!(at, payload.at);
+        assert_eq!(content_kind, payload.content_kind);
+        assert_eq!(body, payload.body);
+        assert_eq!(reply_to, payload.reply_to);
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn sign_channel_event_signature_verifies_against_canonical_cbor() {
+        use ed25519_dalek::Verifier;
+        let (payload, key) = fixture_payload("verify me");
+        let signed = sign_channel_event(&payload, &key).expect("sign");
+        let canon = signed_set_canonical_cbor(&signed).expect("canon");
+        let SignedChannelEvent::Post { sig, author, .. } = &signed;
+        let pubkey = key.verifying_key();
+        // Author addr should be derivable from pubkey in production; here
+        // we just verify the signature against the explicit pubkey.
+        let _ = author;
+        pubkey
+            .verify(&canon, &ed25519_dalek::Signature::from_bytes(sig))
+            .expect("ed25519 verify");
+    }
+
+    #[test]
+    fn signed_set_canonical_cbor_is_stable() {
+        // Re-encoding the same event must produce byte-identical canonical
+        // CBOR (deterministic for replay-protection + signature-stability).
+        let (payload, key) = fixture_payload("stable");
+        let signed = sign_channel_event(&payload, &key).expect("sign");
+        let canon_a = signed_set_canonical_cbor(&signed).expect("canon a");
+        let canon_b = signed_set_canonical_cbor(&signed).expect("canon b");
+        assert_eq!(canon_a, canon_b);
     }
 }
