@@ -6846,23 +6846,16 @@ pub async fn create_community_inner(
         }
     }
 
-    // ZEB-258: COMMIT owner-state Space + advance HLC tracker as a
-    // single atomic critical section. Both are persisted via
-    // `persist_both` (owner_state_crdt.cbor + state_root_replay.cbor)
-    // which acquires `state` then `tracker` in that order; holding
-    // BOTH guards across the apply+insert pair prevents any
-    // concurrent task — including a `stop_node`-triggered final
-    // persist — from snapshotting state with the new Space but the
-    // old tracker (which would leave a Space row on disk with no
-    // matching tracker entry after restart).
+    // ZEB-258 / ZEB-267: COMMIT owner-state Space as the LAST
+    // persistent step. Tokio Mutex guards are safe to hold across
+    // `.await` (only `std::sync::Mutex` guards must not be); the
+    // Rejected branch drops `state_g` before awaiting the registry
+    // tear-down to keep the rollback path .await-clean.
     //
-    // Lock order is `dm_outbox → crdt_state → hlc_tracker` per the
-    // documented invariant; we acquire `state_g` first, then
-    // `tracker_g` while still holding it. Tokio Mutex guards are
-    // safe to hold across `.await` (only `std::sync::Mutex` guards
-    // must not be); the Rejected branch drops `state_g` before
-    // awaiting the registry tear-down to keep the rollback path
-    // .await-clean.
+    // Pre-ZEB-267 this block ALSO held `tracker_g` across an insert
+    // to keep the tracker advance atomic with the Space commit. With
+    // the atomic reservation pattern, the tracker is bumped at
+    // reservation time (above) and this block is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -7877,13 +7870,12 @@ where
         return Err(fence_err);
     }
 
-    // 9. COMMIT owner-state Space + advance HLC tracker as a single
-    // atomic critical section (LAST step — ZEB-258 reorder). See
-    // create_community_inner's matching block for the lock-order
-    // motivation: holding `state_g` across the `tracker_g`
-    // acquisition prevents a concurrent persist_both (e.g. from a
-    // stop_node-triggered final flush) from snapshotting the new
-    // Space without the matching tracker advance.
+    // 9. COMMIT owner-state Space as the LAST persistent step
+    //    (ZEB-258 reorder). Pre-ZEB-267 this block also held the
+    //    tracker_g guard to advance the tracker atomically with the
+    //    Space commit; with the ZEB-267 atomic reservation pattern
+    //    the tracker is bumped at step 4 instead, and this block
+    //    is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
@@ -8310,13 +8302,9 @@ async fn leave_community(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Mint the self-Leave. Read prev_hlc under the tracker lock then
-    // drop the guard before signing (sign is sync; releasing eagerly
-    // keeps the tracker available to other tasks). Borrow the
-    // SigningKey from `dm_outbox` — same canonical local-device key
+    // ZEB-267: atomic HLC reservation. Borrow the SigningKey from
+    // `dm_outbox` under its lock — same canonical local-device key
     // create_community / redeem_invite use.
-
-    // ZEB-267: atomic HLC reservation.
     let leave_hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let leave = {
