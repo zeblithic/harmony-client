@@ -589,6 +589,17 @@ pub struct ChannelLogConfig {
 /// to a small value (e.g., 8) via `ChannelLogConfig`.
 pub const DEFAULT_SEAL_THRESHOLD_EVENTS: usize = 1024;
 
+/// Schema version byte prefixed to `manifest.cbor`. v3 will widen
+/// to handle CasBook segment handles, additional manifest fields,
+/// etc. — this byte lets reload dispatch on format version.
+const CHANNEL_LOG_MANIFEST_V1: u8 = 1;
+/// Schema version byte prefixed to `tail.cbor`. v3 may add per-tail
+/// metadata (e.g., last_sealed_through HLC for crash-safety).
+const CHANNEL_LOG_TAIL_V1: u8 = 1;
+/// Schema version byte prefixed to each `segments/{N:08x}.cbor`.
+/// v3 may add per-segment metadata or compression.
+const CHANNEL_LOG_SEGMENT_V1: u8 = 1;
+
 impl Default for ChannelLogConfig {
     fn default() -> Self {
         Self {
@@ -695,18 +706,24 @@ impl ChannelLog {
     /// Also persists `root/manifest.cbor` if it doesn't already exist
     /// on disk. This preserves the invariant that any persisted tail is
     /// recoverable on reload (which requires a manifest to validate
-    /// community/channel binding before loading the tail).
+    /// community/channel binding before loading the tail). The stub
+    /// manifest written here has `segments` empty; `seal_and_persist`
+    /// unconditionally rewrites `manifest.cbor` with the real segment
+    /// list, so the stub is genuinely transient and never observably
+    /// escapes its first-flush window.
     pub fn flush_tail(&self) -> Result<(), ChannelLogPersistError> {
         std::fs::create_dir_all(&self.root)?;
         let manifest_path = self.root.join("manifest.cbor");
         if !manifest_path.exists() {
             let mut man_bytes = Vec::with_capacity(256);
+            man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
             ciborium::into_writer(&self.manifest, &mut man_bytes)
                 .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
             crate::owner_state_persist::save_atomically(&manifest_path, &man_bytes)
                 .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
         }
         let mut bytes = Vec::with_capacity(1024);
+        bytes.push(CHANNEL_LOG_TAIL_V1);
         ciborium::into_writer(&self.tail, &mut bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
         let tail_path = self.root.join("tail.cbor");
@@ -720,10 +737,26 @@ impl ChannelLog {
     /// to empty and re-persists both manifest and (now-empty) tail.
     /// Atomic per-file via `save_atomically`.
     ///
-    /// Idempotent at the manifest level — a crash between segment
-    /// write and manifest update will leave an orphaned segment file
-    /// that the next startup can rediscover (Phase 3 may add explicit
-    /// orphan recovery; v2 reload tolerates extra files in segments/).
+    /// Crash semantics. The on-disk write order is:
+    /// 1. Write segment file (atomic).
+    /// 2. Clear in-memory tail and flush empty `tail.cbor` (atomic).
+    /// 3. Write manifest with the new descriptor appended (atomic).
+    ///
+    /// Crash points:
+    /// - After (1): orphan segment file, manifest unchanged, tail
+    ///   unchanged on disk. Reload sees the old N-1 segments + the
+    ///   original tail; orphan segment is ignored (not in manifest)
+    ///   and is overwritten by the next seal at the same index.
+    /// - After (2): orphan segment file, `tail.cbor` empty, manifest
+    ///   unchanged. The events that were in the tail are LOST — they
+    ///   exist only in the orphan segment, which reload doesn't
+    ///   discover. This is the worst-case crash window: at-most-one-
+    ///   segment's worth of pending events vanish. Acceptable per
+    ///   spec §8 over the alternative failure mode (writing the
+    ///   manifest first would let reload re-import those events as
+    ///   duplicates against the now-sealed segment).
+    /// - After (3): clean state. Manifest has N segments, tail empty,
+    ///   no orphans.
     pub fn seal_and_persist(&mut self) -> Result<(), ChannelLogPersistError> {
         if self.tail.is_empty() {
             // Nothing to seal. No-op.
@@ -733,11 +766,16 @@ impl ChannelLog {
         let next_index = self.manifest.segments.len() as u32;
         let rel_path = format!("segments/{:08x}.cbor", next_index);
         let abs_path = self.root.join(&rel_path);
+
+        // Step 1: write segment file (segment-level atomic via save_atomically).
         let mut seg_bytes = Vec::with_capacity(64 * self.tail.len());
+        seg_bytes.push(CHANNEL_LOG_SEGMENT_V1);
         ciborium::into_writer(&self.tail, &mut seg_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
         crate::owner_state_persist::save_atomically(&abs_path, &seg_bytes)
             .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+
+        // Build the descriptor AHEAD of mutating state.
         let first = self.tail.first().expect("tail non-empty checked above");
         let last = self.tail.last().expect("tail non-empty checked above");
         let (first_at, last_at) = match (first, last) {
@@ -745,21 +783,32 @@ impl ChannelLog {
                 (a.clone(), b.clone())
             }
         };
-        self.manifest.segments.push(SegmentDescriptor {
+        let descriptor = SegmentDescriptor {
             range: (first_at, last_at),
             count: self.tail.len() as u32,
             handle: SegmentHandle::LocalFile { rel_path },
-        });
-        // Persist manifest BEFORE clearing tail. If we crash after
-        // segment + manifest writes, the cleared tail is recovered as
-        // empty on reload — fine, the events are now in the segment.
+        };
+
+        // Step 2: clear in-memory tail and persist the empty tail to disk
+        // BEFORE writing the manifest. If we crash between this and the
+        // manifest write, reload will see (old manifest, empty tail, orphan
+        // segment file). The orphan segment is ignored by reload (not in
+        // manifest) and the at-most-one-segment-worth of events that were
+        // in the tail are lost — acceptable per spec §8 (better than
+        // re-emitting them as duplicates against the now-sealed segment).
+        self.tail.clear();
+        self.flush_tail()?;
+
+        // Step 3: now write the manifest with the new descriptor. After
+        // this completes, the segment is durably committed and the tail
+        // is durably empty — clean state.
+        self.manifest.segments.push(descriptor);
         let mut man_bytes = Vec::with_capacity(256);
+        man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
         ciborium::into_writer(&self.manifest, &mut man_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
         crate::owner_state_persist::save_atomically(&self.root.join("manifest.cbor"), &man_bytes)
             .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
-        self.tail.clear();
-        self.flush_tail()?;
         Ok(())
     }
 
@@ -779,8 +828,21 @@ impl ChannelLog {
             return Ok((Self::new(community_id, channel_id, root, config), 0));
         }
         let manifest_bytes = std::fs::read(&manifest_path)?;
-        let manifest: ChannelLogManifest = ciborium::from_reader(manifest_bytes.as_slice())
-            .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?;
+        let manifest: ChannelLogManifest = match manifest_bytes.split_first() {
+            Some((&CHANNEL_LOG_MANIFEST_V1, rest)) => ciborium::from_reader(rest)
+                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?,
+            Some((v, _)) => {
+                return Err(ChannelLogPersistError::CborDecode(format!(
+                    "manifest schema version {} not supported (expected {})",
+                    v, CHANNEL_LOG_MANIFEST_V1
+                )));
+            }
+            None => {
+                return Err(ChannelLogPersistError::CborDecode(
+                    "manifest file is empty".into(),
+                ));
+            }
+        };
         if manifest.community_id != community_id {
             return Err(ChannelLogPersistError::Manifest {
                 expected: format!("{:?}", community_id),
@@ -800,8 +862,17 @@ impl ChannelLog {
         let tail_path = root.join("tail.cbor");
         let tail: Vec<SignedChannelEvent> = if tail_path.exists() {
             let bytes = std::fs::read(&tail_path)?;
-            ciborium::from_reader(bytes.as_slice())
-                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?
+            match bytes.split_first() {
+                Some((&CHANNEL_LOG_TAIL_V1, rest)) => ciborium::from_reader(rest)
+                    .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?,
+                Some((v, _)) => {
+                    return Err(ChannelLogPersistError::CborDecode(format!(
+                        "tail schema version {} not supported (expected {})",
+                        v, CHANNEL_LOG_TAIL_V1
+                    )));
+                }
+                None => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -826,8 +897,17 @@ impl ChannelLog {
         let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
         let abs_path = self.root.join(rel_path);
         let bytes = std::fs::read(&abs_path)?;
-        ciborium::from_reader(bytes.as_slice())
-            .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))
+        match bytes.split_first() {
+            Some((&CHANNEL_LOG_SEGMENT_V1, rest)) => ciborium::from_reader(rest)
+                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string())),
+            Some((v, _)) => Err(ChannelLogPersistError::CborDecode(format!(
+                "segment schema version {} not supported (expected {})",
+                v, CHANNEL_LOG_SEGMENT_V1
+            ))),
+            None => Err(ChannelLogPersistError::CborDecode(
+                "segment file is empty".into(),
+            )),
+        }
     }
 }
 
@@ -1669,6 +1749,24 @@ mod tests {
         assert!(root.join("segments/00000000.cbor").exists());
         assert!(root.join("manifest.cbor").exists());
         assert!(root.join("tail.cbor").exists());
+        // Assert the manifest descriptor fields are correctly populated —
+        // Phase 3's backfill walks segments by these range bounds so any
+        // regression here would silently break backfill filtering.
+        let descriptor = &log.manifest.segments[0];
+        assert_eq!(
+            descriptor.count, 4,
+            "descriptor count must equal seal batch"
+        );
+        let SignedChannelEvent::Post { at: first_at, .. } = &originals[0];
+        let SignedChannelEvent::Post { at: last_at, .. } = &originals[3];
+        assert_eq!(
+            &descriptor.range.0, first_at,
+            "range.0 must equal first event HLC"
+        );
+        assert_eq!(
+            &descriptor.range.1, last_at,
+            "range.1 must equal last event HLC"
+        );
         // Reload: byte-identical events recovered.
         let (reloaded, total) = ChannelLog::reload(
             cid,
