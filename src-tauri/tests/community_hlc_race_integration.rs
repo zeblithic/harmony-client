@@ -1,9 +1,15 @@
 //! ZEB-267: concurrent-IPC HLC race regression test.
 //!
 //! Stands up a single community on one engine with one admin device
-//! (power 100). Spawns two parallel `tokio::join!` futures, each
-//! reserving an HLC via `reserve_next_hlc_for_device` then minting +
-//! inserting a Kick event for a DIFFERENT target. Asserts:
+//! (power 100). Spawns two `tokio::spawn` tasks on a multi-thread
+//! runtime, gated through a `tokio::sync::Barrier`, each reserving an
+//! HLC via `reserve_next_hlc_for_device` then minting + inserting a
+//! Kick event for a DIFFERENT target. The barrier forces both tasks
+//! to be at the tracker `lock().await` boundary simultaneously, so
+//! the tracker mutex is the actual contention point — a non-atomic
+//! snapshot-then-release implementation would deterministically
+//! collide under this shape rather than hide behind sequential
+//! polling on a single task. Asserts:
 //!
 //!   1. Both engine inserts succeed (`InsertOutcome::Inserted`).
 //!   2. The two events' HLCs are distinct under `event_sort_key`
@@ -25,7 +31,6 @@
 //! runtime; the helper-level test is a tighter, faster regression
 //! gate that covers the same race surface.
 
-use harmony_app::community_membership::SignedMembershipEvent;
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
     CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
@@ -39,7 +44,7 @@ use harmony_identity::PrivateIdentity;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Barrier, Mutex};
 
 // Implements the in-test IdentityResolver: maps owner addresses to
 // identity public keys for the three participants (admin + two targets).
@@ -64,7 +69,7 @@ fn signing_key_from(identity: &PrivateIdentity) -> Arc<ed25519_dalek::SigningKey
     Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     // ── Setup: admin Alice (power 100), two kick targets Bob/Carol ──
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
@@ -233,47 +238,65 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     // with identical (wall_ms, logical, device_id) tuples. With
     // reserve_next_hlc_for_device, the read-bump-write is atomic
     // and the two reservations are guaranteed strictly-monotone.
+    //
+    // Spawning each path on its OWN task (via `tokio::spawn` on the
+    // multi-thread runtime configured at the test attribute above)
+    // and gating both on a `Barrier::new(2)` makes the tracker mutex
+    // the actual contention point. The barrier wait completes only
+    // when both tasks reach the rendezvous — they then race into
+    // `tracker.lock().await` simultaneously. A non-atomic helper
+    // (snapshot, drop guard, return; bump elsewhere) would
+    // deterministically collide under this shape; the atomic helper
+    // serializes the two reservations into strictly-monotone HLCs.
     let wall_now_ms = 200_000u64;
-    let tracker_a = Arc::clone(&hlc_tracker);
-    let tracker_b = Arc::clone(&hlc_tracker);
-    let device_a = device_id.clone();
-    let device_b = device_id.clone();
-    let signing_a = Arc::clone(&alice_signing);
-    let signing_b = Arc::clone(&alice_signing);
+    let barrier = Arc::new(Barrier::new(2));
 
-    // tokio::join!: both futures run concurrently on the same task,
-    // contending for the tracker mutex. The helper serializes them
-    // under one read-bump-write critical section each.
-    let (kick_bob, kick_carol): (
-        Result<SignedMembershipEvent, String>,
-        Result<SignedMembershipEvent, String>,
-    ) = tokio::join!(
-        async {
-            let hlc = reserve_next_hlc_for_device(&tracker_a, &device_a, wall_now_ms).await;
+    let task_bob = {
+        let tracker = Arc::clone(&hlc_tracker);
+        let device = device_id.clone();
+        let signing = Arc::clone(&alice_signing);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            let hlc = reserve_next_hlc_for_device(&tracker, &device, wall_now_ms).await;
             mint_kick_event(
                 community_id,
                 alice_addr,
                 bob_addr,
                 Some("race-test bob".into()),
-                &signing_a,
+                &signing,
                 hlc,
             )
-        },
-        async {
-            let hlc = reserve_next_hlc_for_device(&tracker_b, &device_b, wall_now_ms).await;
+        })
+    };
+
+    let task_carol = {
+        let tracker = Arc::clone(&hlc_tracker);
+        let device = device_id.clone();
+        let signing = Arc::clone(&alice_signing);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            let hlc = reserve_next_hlc_for_device(&tracker, &device, wall_now_ms).await;
             mint_kick_event(
                 community_id,
                 alice_addr,
                 carol_addr,
                 Some("race-test carol".into()),
-                &signing_b,
+                &signing,
                 hlc,
             )
-        },
-    );
+        })
+    };
 
-    let kick_bob = kick_bob.expect("mint kick(bob)");
-    let kick_carol = kick_carol.expect("mint kick(carol)");
+    let kick_bob = task_bob
+        .await
+        .expect("kick(bob) task panicked")
+        .expect("mint kick(bob)");
+    let kick_carol = task_carol
+        .await
+        .expect("kick(carol) task panicked")
+        .expect("mint kick(carol)");
 
     // ── Assertion 1: HLCs distinct under sort-key ordering ─────────
     let bob_key = (
