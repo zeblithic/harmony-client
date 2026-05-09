@@ -384,6 +384,14 @@ pub enum VerifyError {
     /// x25519 keypair (e.g., bad point encoding on either curve).
     /// Treat as a signature failure with extra context.
     InvalidIdentityPub,
+    /// Channel-config event (`ChannelCreate`/`ChannelModify`/`ChannelDelete`)
+    /// was signed by an actor whose power is below
+    /// `POWER_THRESHOLDS.kick` (mod-tier). v2 hardcodes mod-tier as the
+    /// channel-admin gate; per-community customization is deferred to
+    /// ZEB-251. Distinct from `ActorPowerInsufficient` so the IPC layer
+    /// can emit a clean "you don't have permission to manage channels"
+    /// error string without overloading the membership-level diagnostic.
+    ChannelAdminInsufficientPower,
     EncodeError(String),
 }
 
@@ -456,6 +464,10 @@ impl std::fmt::Display for VerifyError {
             VerifyError::InvalidIdentityPub => {
                 write!(f, "identity_pub bytes are not a valid (X25519, Ed25519) public-key pair")
             }
+            VerifyError::ChannelAdminInsufficientPower => write!(
+                f,
+                "channel-config events require power >= POWER_THRESHOLDS.kick (mod-tier)"
+            ),
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
     }
@@ -1169,9 +1181,14 @@ pub fn verify_event(
         MembershipEventKind::ChannelCreate { .. }
         | MembershipEventKind::ChannelModify { .. }
         | MembershipEventKind::ChannelDelete { .. } => {
-            // Verify gate ships in Task 3. Placeholder allow-all keeps
-            // the match exhaustive; Task 3 replaces with the
-            // mod-tier power check.
+            // Channel-config requires actor to be Joined AND power >=
+            // kick. Joined-check first so a non-member with high power
+            // (e.g. former admin after Kick) can't create channels.
+            // The power check fires in the per-kind power-rules block
+            // below; this block establishes membership.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ActorNotJoined);
+            }
         }
     }
 
@@ -1229,7 +1246,9 @@ pub fn verify_event(
         MembershipEventKind::ChannelCreate { .. }
         | MembershipEventKind::ChannelModify { .. }
         | MembershipEventKind::ChannelDelete { .. } => {
-            // Per-kind power gate ships in Task 3.
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
         }
     }
 

@@ -2898,3 +2898,201 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
         "modify on unknown channel must not synthesize a ghost entry"
     );
 }
+
+#[test]
+fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
+    // Admin's bootstrap power is 100 (set in materialize). prior_state
+    // built from just the admin's Join.
+    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+    };
+    let prior_state = materialize(&[admin_join], admin_addr);
+
+    let payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: [0xAB; 16],
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &admin_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(verify_event(&event, &prior_state, &ctx), Ok(()));
+}
+
+#[test]
+fn verify_event_channel_create_rejects_below_mod_power() {
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (sub_priv, sub_pub, sub_addr) = make_test_identity(0xBB);
+    let community_id = SpaceId([0x37; 16]);
+
+    // Admin Joins via signed payload to populate prior_state correctly.
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+
+    // Sub-actor Joins (default power = 0).
+    let sub_join_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: sub_addr,
+        at: Hlc {
+            wall_ms: 1_500,
+            logical: 0,
+            device_id: "b".into(),
+        },
+    };
+    let sub_join = sign_event_with_identity(&sub_join_payload, &sub_priv).expect("sign");
+
+    let prior_state = materialize(&[admin_join, sub_join], admin_addr);
+
+    // Sub tries to ChannelCreate with power 0 (well below kick=50).
+    let payload = EventPayload {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: [0xAB; 16],
+            name: "spam-channel".to_string(),
+            write_power: 0,
+        },
+        actor: sub_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "b".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &sub_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &sub_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(
+        verify_event(&event, &prior_state, &ctx),
+        Err(VerifyError::ChannelAdminInsufficientPower)
+    );
+}
+
+#[test]
+fn verify_event_channel_modify_accepts_at_kick_threshold() {
+    // A mod (power exactly 50, the kick threshold) is allowed to modify channels.
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (mod_priv, mod_pub, mod_addr) = make_test_identity(0xBB);
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_join_payload = EventPayload {
+        id: [0x01; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let admin_join = sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign");
+
+    let mod_join_payload = EventPayload {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: mod_addr,
+        at: Hlc {
+            wall_ms: 1_500,
+            logical: 0,
+            device_id: "b".into(),
+        },
+    };
+    let mod_join = sign_event_with_identity(&mod_join_payload, &mod_priv).expect("sign");
+
+    // Admin SetPower to bring mod_addr to power 50 (kick threshold).
+    let setpower_payload = EventPayload {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::SetPower {
+            target: mod_addr,
+            level: 50,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+    };
+    let setpower = sign_event_with_identity(&setpower_payload, &admin_priv).expect("sign");
+
+    let prior_state = materialize(&[admin_join, mod_join, setpower], admin_addr);
+
+    let payload = EventPayload {
+        id: [0x04; 16],
+        community_id,
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: [0xAB; 16],
+            name: "mods-channel".to_string(),
+            write_power: 0,
+        },
+        actor: mod_addr,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "b".into(),
+        },
+    };
+    let event = sign_event_with_identity(&payload, &mod_priv).expect("sign");
+
+    let ctx = VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only: false,
+        actor_identity_pub: &mod_pub,
+        countersigner_identity_pub: None,
+    };
+
+    assert_eq!(verify_event(&event, &prior_state, &ctx), Ok(()));
+}
