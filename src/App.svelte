@@ -1440,10 +1440,19 @@
       createError = null;
       try {
         const id = await communityService.createCommunity(name, kind);
-        // ZEB-265: backend now emits nav-updated from create_community,
-        // so the NavNode appears via the listener (nav-service.ts:101).
-        // selectedCommunityNode derived from navNodes resolves on the
-        // next tick once the listener has run.
+        // ZEB-265: backend emits nav-updated, but Tauri events are not
+        // buffered for not-yet-connected listeners and dispatch
+        // ordering vs IPC response is timing-sensitive. Mirror the
+        // listener payload locally as defense-in-depth — if the
+        // listener also fires, addOrUpdateNavSpace's Fix G dedupes.
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: id,
+          kind: 'community',
+          name,
+          members: [],
+          parentId: null,
+        });
         showCreateCommunity = false;
         changeSelectedCommunity(id);
         await refreshCommunityMembers(id);
@@ -1475,11 +1484,19 @@
       redeemError = null;
       redeemUrl = url;
       try {
-        // ZEB-265: backend emits nav-updated from redeem_invite with
-        // the invite's community_name, so the NavNode appears via the
-        // listener (nav-service.ts:101). The DTO return is still used
-        // to record the community kind in CommunityService.knownKinds.
         const dto = await communityService.redeemInvite(url);
+        // ZEB-265: same defense-in-depth as create_community —
+        // backend emits nav-updated but events aren't buffered for
+        // late listeners. dto.communityName carries the real name so
+        // there's no placeholder regression vs the listener path.
+        navService.addOrUpdateNavSpace({
+          action: 'added',
+          spaceId: dto.communityId,
+          kind: 'community',
+          name: dto.communityName,
+          members: [],
+          parentId: null,
+        });
         showRedeemInvite = false;
         redeemUrl = '';
         changeSelectedCommunity(dto.communityId);
@@ -1537,9 +1554,17 @@
       const leavingId = selectedCommunityId;
       try {
         await communityService.leaveCommunity(leavingId);
-        // ZEB-265: backend emits nav-updated { action: "removed" } from
-        // leave_community, so the NavNode disappears via the listener
-        // (nav-service.ts:101).
+        // ZEB-265: backend emits nav-updated { action: "removed" }, but
+        // events aren't buffered for late listeners. Mirror locally so
+        // the node disappears even if the listener missed the emit.
+        navService.addOrUpdateNavSpace({
+          action: 'removed',
+          spaceId: leavingId,
+          kind: 'community',
+          name: '',
+          members: [],
+          parentId: null,
+        });
         changeSelectedCommunity(null);
         showCommunitySettings = false;
       } catch (e) {

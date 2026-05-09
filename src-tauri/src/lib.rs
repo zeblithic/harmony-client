@@ -7526,14 +7526,17 @@ async fn leave_community(
     }
 
     // ZEB-265: notify the nav layer so the community node disappears
-    // from the tree without the frontend having to synthesize a
-    // `removed` payload locally. emit failure is non-fatal — the leave
-    // already committed, and worst case the node lingers until reload.
+    // from the tree. emit failure is non-fatal — the leave already
+    // committed, and worst case the node lingers until reload.
+    // Use `hex::encode(space_id.0)` rather than the raw IPC `community_id`
+    // String: hex::decode accepts mixed case but the canonical form is
+    // lowercase, so the emitted spaceId matches the lowercase ids
+    // emitted from create/redeem (CodeRabbit minor — PR #92 round 1).
     if let Err(e) = app.emit(
         "nav-updated",
         &NavUpdatedPayload {
             action: "removed",
-            space_id: community_id,
+            space_id: hex::encode(space_id.0),
             kind: "community",
             name: String::new(),
             members: None,

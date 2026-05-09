@@ -4,11 +4,12 @@ import type { AvatarResolver } from './avatar-resolver';
 import { navNodes as mockNavNodes, profileStore as mockProfileStore } from './mock-data';
 
 /**
- * Phase 4 (ZEB-228) — wire shape of the `nav-updated` IPC event.
+ * Wire shape of the `nav-updated` IPC event.
  *
  * Emitted by the backend when a Space CRDT entry is added, modified,
- * or removed. Phase 4 only acts on `dm` and `group-dm` kinds; channel,
- * community, and folder kinds are reserved for later phases and
+ * or removed. Currently handled kinds: `dm`, `group-dm` (Phase 4 /
+ * ZEB-228), `community` (Phase 5 / ZEB-263 + emit-side ZEB-265).
+ * `channel` and `folder` kinds are reserved for later phases and
  * silently ignored here.
  */
 export interface NavUpdatedPayload {
