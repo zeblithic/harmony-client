@@ -1440,19 +1440,10 @@
       createError = null;
       try {
         const id = await communityService.createCommunity(name, kind);
-        // Synthesize the NavNode locally — backend has no nav-updated
-        // emit yet (same gap as DM Fix B from PR #81), so without this
-        // the community would not appear in the nav tree and
-        // selectedCommunityNode (derived from navNodes) would stay
-        // null, sending the right pane to the TextFeed fallback.
-        navService.addOrUpdateNavSpace({
-          action: 'added',
-          spaceId: id,
-          kind: 'community',
-          name,
-          members: [],
-          parentId: null,
-        });
+        // ZEB-265: backend now emits nav-updated from create_community,
+        // so the NavNode appears via the listener (nav-service.ts:101).
+        // selectedCommunityNode derived from navNodes resolves on the
+        // next tick once the listener has run.
         showCreateCommunity = false;
         changeSelectedCommunity(id);
         await refreshCommunityMembers(id);
@@ -1484,22 +1475,11 @@
       redeemError = null;
       redeemUrl = url;
       try {
-        // ZEB-265: redeem_invite now returns RedeemInviteResultDto, so
-        // the synthesized NavNode carries the real community name
-        // (replacing the prior `Community ${id.slice(0,8)}` placeholder).
-        // Step 3 of ZEB-265 will drop this synthesis once the backend
-        // emits nav-updated; until then the listener path stays a
-        // no-op (no emit) and synthesis is the only thing keeping the
-        // node visible synchronously after redeem.
+        // ZEB-265: backend emits nav-updated from redeem_invite with
+        // the invite's community_name, so the NavNode appears via the
+        // listener (nav-service.ts:101). The DTO return is still used
+        // to record the community kind in CommunityService.knownKinds.
         const dto = await communityService.redeemInvite(url);
-        navService.addOrUpdateNavSpace({
-          action: 'added',
-          spaceId: dto.communityId,
-          kind: 'community',
-          name: dto.communityName,
-          members: [],
-          parentId: null,
-        });
         showRedeemInvite = false;
         redeemUrl = '';
         changeSelectedCommunity(dto.communityId);
@@ -1557,19 +1537,9 @@
       const leavingId = selectedCommunityId;
       try {
         await communityService.leaveCommunity(leavingId);
-        // Synthesize the nav removal — same backend gap as create
-        // and redeem (no nav-updated emit). Without this the
-        // community node would persist in the nav tree until reload
-        // even though the user has left it. ZEB-265 covers fixing
-        // this on the backend side.
-        navService.addOrUpdateNavSpace({
-          action: 'removed',
-          spaceId: leavingId,
-          kind: 'community',
-          name: '',
-          members: [],
-          parentId: null,
-        });
+        // ZEB-265: backend emits nav-updated { action: "removed" } from
+        // leave_community, so the NavNode disappears via the listener
+        // (nav-service.ts:101).
         changeSelectedCommunity(null);
         showCommunitySettings = false;
       } catch (e) {
