@@ -204,13 +204,16 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         admin_identity_pub: None,
     };
     for (target_addr, target_signing) in [(bob_addr, &bob_signing), (carol_addr, &carol_signing)] {
-        let join_hlc = reserve_next_hlc_for_device(&hlc_tracker, &device_id, 100_000).await;
-        // Use target's own HLC device so the join is self-authored.
-        let target_join_hlc = Hlc {
-            wall_ms: join_hlc.wall_ms,
-            logical: join_hlc.logical,
-            device_id: format!("{}-dev", hex::encode(&target_addr.0[..4])),
-        };
+        // Reserve against the TARGET's own device id, not Alice's
+        // device id — the resulting Join is self-authored by the
+        // target, so the tracker entry that should advance is
+        // target_dev_id. Reserving against alice-dev would bump
+        // Alice's tracker for events she didn't author, leaving
+        // it misaligned with her actual event history (Greptile
+        // PR #94 review).
+        let target_dev_id = format!("{}-dev", hex::encode(&target_addr.0[..4]));
+        let target_join_hlc =
+            reserve_next_hlc_for_device(&hlc_tracker, &target_dev_id, 100_000).await;
         let minted_join = mint_redemption(
             &invite_payload,
             target_addr,

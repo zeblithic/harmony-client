@@ -2019,10 +2019,11 @@ mod task3_kick_setpower_round_trip {
         CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
         CommunitySyncEngineConfig, PersistPaths,
     };
+    use harmony_app::dm_outbox::reserve_next_hlc_for_device;
     use harmony_app::{
         mint_community_creation, mint_kick_event, mint_redemption, mint_set_power_event,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     struct TwoIdentityResolver {
         a: (OwnerAddr, [u8; 64]),
@@ -2315,20 +2316,16 @@ mod task3_kick_setpower_round_trip {
     async fn admin_kicks_member_round_trip() {
         let f = build_fixture(0xa1, 0xb2).await;
 
-        // ZEB-267: derive the kick's HLC from the most-recent observed
-        // event (B's redemption Join), bumping logical to preserve
-        // strict ordering. Production goes through
-        // reserve_next_hlc_for_device against a tracker; this test mints
-        // directly at engine level.
-        let kick_hlc = Hlc {
-            wall_ms: f.minted_b_join_hlc.wall_ms.max(300_000),
-            logical: if f.minted_b_join_hlc.wall_ms >= 300_000 {
-                f.minted_b_join_hlc.logical + 1
-            } else {
-                0
-            },
-            device_id: "a-dev".to_string(),
-        };
+        // ZEB-267: derive the kick's HLC via the same helper production
+        // uses, with a local tracker pre-seeded to B's most-recent
+        // observed event. Avoids hand-rolling next_hlc's wall-regression
+        // and logical-bump logic at the test boundary (Greptile review).
+        let kick_tracker = Arc::new(Mutex::new({
+            let mut m = BTreeMap::<String, Hlc>::new();
+            m.insert("a-dev".to_string(), f.minted_b_join_hlc.clone());
+            m
+        }));
+        let kick_hlc = reserve_next_hlc_for_device(&kick_tracker, "a-dev", 300_000).await;
         let kick = mint_kick_event(
             f.community_id,
             f.owner_a,
@@ -2380,15 +2377,12 @@ mod task3_kick_setpower_round_trip {
         let f = build_fixture(0xa3, 0xb4).await;
 
         // ZEB-267: same HLC derivation as the kick test above.
-        let promo_hlc = Hlc {
-            wall_ms: f.minted_b_join_hlc.wall_ms.max(300_000),
-            logical: if f.minted_b_join_hlc.wall_ms >= 300_000 {
-                f.minted_b_join_hlc.logical + 1
-            } else {
-                0
-            },
-            device_id: "a-dev".to_string(),
-        };
+        let promo_tracker = Arc::new(Mutex::new({
+            let mut m = BTreeMap::<String, Hlc>::new();
+            m.insert("a-dev".to_string(), f.minted_b_join_hlc.clone());
+            m
+        }));
+        let promo_hlc = reserve_next_hlc_for_device(&promo_tracker, "a-dev", 300_000).await;
         let promo = mint_set_power_event(
             f.community_id,
             f.owner_a,
