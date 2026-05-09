@@ -17,6 +17,7 @@
 //! (commit 5145484), sections §5.2, §6, §7, §8, §13.1.
 
 use crate::community_membership::ChannelId;
+use crate::community_membership::ChannelInfo;
 use crate::owner_state_types::Hlc;
 use crate::owner_state_types::MembershipKey;
 use crate::owner_state_types::OwnerAddr;
@@ -208,6 +209,8 @@ pub enum ChannelEventError {
     AeadDecrypt(String),
     #[error("malformed packet (length {0} bytes — need at least 12 for nonce)")]
     MalformedPacket(usize),
+    #[error("identity-pubkey-to-author binding mismatch")]
+    AuthorPubkeyMismatch,
     #[error("signature verify failed")]
     BadSignature,
     #[error("misroute: expected community {expected_community:?} channel {expected_channel:?}, got {got_community:?}/{got_channel:?}")]
@@ -435,8 +438,6 @@ impl ChannelLogReplayTracker {
     }
 }
 
-use crate::community_membership::ChannelInfo;
-
 /// Snapshot of community state at a particular HLC, exposing just
 /// what `verify_channel_event` needs. Phase 3's engine will produce
 /// this by materializing the community-state CRDT to `event.at`;
@@ -455,14 +456,15 @@ pub trait CommunityStateAtHlc {
 /// Identity-resolution trait. Mirrors the existing
 /// `CommunitySyncEngineConfig::identity_resolver` shape so the Phase 3
 /// engine can pass through its existing IdentityResolver impl.
-///
-/// Note: returns the 32-byte Ed25519 verifying key directly (channel
-/// events sign with a single Ed25519 key, unlike DM envelopes which
-/// concat X25519 || Ed25519 into a 64-byte identity_pub).
 #[async_trait::async_trait]
 pub trait ChannelIdentityResolver: Send + Sync {
-    /// Resolve OwnerAddr → identity-public-key bytes (Ed25519 verifying key).
-    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 32]>;
+    /// Resolve OwnerAddr → 64-byte identity public bytes (X25519 || Ed25519).
+    /// Same shape as `community_state_sync::IdentityResolver` so Phase 3 can
+    /// pass through the existing `OwnerDeviceCacheResolver` directly.
+    /// `verify_channel_event` re-derives `address_hash` from these bytes
+    /// and rejects if it doesn't match `event.author.0` — defends against
+    /// resolver bugs that could attribute valid signatures to wrong owners.
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]>;
 }
 
 /// Run the §7 chain steps 3-7 on a pre-decrypted SignedChannelEvent.
@@ -514,13 +516,24 @@ where
         .await
         .ok_or(ChannelEventError::UnknownAuthor(*author))?;
 
-    // Step 5: signature verify.
+    // Step 4b: identity-pubkey-to-author binding check. Defends against
+    // a buggy or compromised resolver that pairs an OwnerAddr with the
+    // wrong key (cache lookup bug, malicious peer substitution, etc.).
+    // Mirrors community_membership::verify_signature's defense (see
+    // its doc comment for the same threat model).
+    let identity = harmony_identity::Identity::from_public_bytes(&identity_pub)
+        .map_err(|_| ChannelEventError::AuthorPubkeyMismatch)?;
+    if identity.address_hash != author.0 {
+        return Err(ChannelEventError::AuthorPubkeyMismatch);
+    }
+
+    // Step 5: signature verify (strict — RFC 8032 strict subset, rejects
+    // non-canonical S values + small-order R points). Same posture as
+    // community_membership::verify_signature and dm_envelope verifies.
     let canon = signed_set_canonical_cbor(event)?;
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&identity_pub)
-        .map_err(|_| ChannelEventError::BadSignature)?;
-    use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(&canon, &ed25519_dalek::Signature::from_bytes(sig))
+    identity
+        .verifying_key
+        .verify_strict(&canon, &ed25519_dalek::Signature::from_bytes(sig))
         .map_err(|_| ChannelEventError::BadSignature)?;
 
     // Step 6: replay-tracker check + advance. Bumps tracker on Ok.
@@ -537,14 +550,9 @@ where
         ))
     })?;
     if let Some(deleted_at) = &channel_info.deleted_at {
-        // `at > deleted_at` means the post happened after deletion.
-        if (at.wall_ms, at.logical, &at.device_id)
-            > (
-                deleted_at.wall_ms,
-                deleted_at.logical,
-                &deleted_at.device_id,
-            )
-        {
+        // Strictly-newer-than: post happened AFTER deletion is rejected.
+        // Posts at exactly deleted_at or earlier are still valid.
+        if at.is_strictly_newer_than(deleted_at) {
             return Err(ChannelEventError::NotAuthorized(format!(
                 "channel deleted at {:?}, post at {:?}",
                 deleted_at, at
@@ -645,6 +653,30 @@ mod tests {
 
     fn fixture_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build a (signing_key, owner_addr, identity_pub_64) triple from
+    /// a seed where address_hash binds correctly. Use this in any test
+    /// that hits `verify_channel_event`'s signature/binding chain
+    /// (Phase 2 binding check requires the resolver-returned 64-byte
+    /// composite's `address_hash` to equal the event's `OwnerAddr`).
+    ///
+    /// Replay-tracker-only tests can keep using the simpler
+    /// `fixture_owner_addr` + `fixture_signing_key` helpers since
+    /// `check_and_advance` doesn't touch the binding chain.
+    fn fixture_identity(seed: u8) -> (ed25519_dalek::SigningKey, OwnerAddr, [u8; 64]) {
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let owner = OwnerAddr(priv_id.identity.address_hash);
+        let pub_64 = priv_id.identity.to_public_bytes();
+        // PrivateIdentity::signing_key is private; round-trip through
+        // to_private_bytes (X25519_secret(32) || Ed25519_secret(32))
+        // to recover a SigningKey we can pass to sign_channel_event.
+        // Same pattern as tests/community_open_flow_integration.rs.
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+        (signing, owner, pub_64)
     }
 
     fn fixture_hlc(wall_ms: u64, dev: &str) -> Hlc {
@@ -787,12 +819,16 @@ mod tests {
     }
 
     fn fixture_signed_event(at_wall: u64, at_logical: u32, device: &str) -> SignedChannelEvent {
-        let key = fixture_signing_key(0xa1);
+        // Use fixture_identity (PrivateIdentity::from_seed) so the
+        // event's author OwnerAddr matches the address_hash the
+        // resolver-returned 64-byte identity_pub will derive.
+        // verify_channel_event's binding check requires this.
+        let (key, author, _pub64) = fixture_identity(0xa1);
         let payload = ChannelPostPayload {
             id: MessageId([0x11; 16]),
             community_id: fixture_community(0xc0),
             channel_id: fixture_channel(0x01),
-            author: fixture_owner_addr(0xa1),
+            author,
             at: Hlc {
                 wall_ms: at_wall,
                 logical: at_logical,
@@ -999,19 +1035,22 @@ mod tests {
     }
 
     struct MockResolver {
-        entries: HashMap<OwnerAddr, [u8; 32]>,
+        entries: HashMap<OwnerAddr, [u8; 64]>,
     }
 
     #[async_trait::async_trait]
     impl ChannelIdentityResolver for MockResolver {
-        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 32]> {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
             self.entries.get(addr).copied()
         }
     }
 
     fn fixture_state_with_alice_joined() -> (MockState, MockResolver) {
-        let alice = fixture_owner_addr(0xa1);
-        let alice_signing = fixture_signing_key(0xa1);
+        // Use fixture_identity so the resolver-returned 64-byte
+        // composite's address_hash matches the OwnerAddr used in the
+        // members map and event author. Required for the verify chain
+        // binding check (Step 4b in verify_channel_event).
+        let (_signing, alice, alice_pub64) = fixture_identity(0xa1);
         let mut channels = HashMap::new();
         let creator_hlc = Hlc {
             wall_ms: 50_000,
@@ -1038,7 +1077,7 @@ mod tests {
             left_at: HashMap::new(),
         };
         let mut entries = HashMap::new();
-        entries.insert(alice, alice_signing.verifying_key().to_bytes());
+        entries.insert(alice, alice_pub64);
         let resolver = MockResolver { entries };
         (state, resolver)
     }
@@ -1172,7 +1211,7 @@ mod tests {
     async fn verify_channel_event_rejects_below_write_power() {
         // Build a state where the channel requires write_power=50 but
         // alice is power=0 (not promoted).
-        let alice = fixture_owner_addr(0xa1);
+        let (_signing, alice, alice_pub64) = fixture_identity(0xa1);
         let mut channels = HashMap::new();
         let creator_hlc = Hlc {
             wall_ms: 50_000,
@@ -1199,7 +1238,7 @@ mod tests {
             left_at: HashMap::new(),
         };
         let mut entries = HashMap::new();
-        entries.insert(alice, fixture_signing_key(0xa1).verifying_key().to_bytes());
+        entries.insert(alice, alice_pub64);
         let resolver = MockResolver { entries };
         let mut tracker = ChannelLogReplayTracker::new();
         let event = fixture_signed_event(100_000, 0, "a-dev");
@@ -1218,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_channel_event_rejects_post_after_delete() {
-        let alice = fixture_owner_addr(0xa1);
+        let (_signing, alice, alice_pub64) = fixture_identity(0xa1);
         let mut channels = HashMap::new();
         let creator_hlc = Hlc {
             wall_ms: 50_000,
@@ -1250,7 +1289,7 @@ mod tests {
             left_at: HashMap::new(),
         };
         let mut entries = HashMap::new();
-        entries.insert(alice, fixture_signing_key(0xa1).verifying_key().to_bytes());
+        entries.insert(alice, alice_pub64);
         let resolver = MockResolver { entries };
         let mut tracker = ChannelLogReplayTracker::new();
         // Post at wall=100_000 — after delete (80_000).
@@ -1266,5 +1305,37 @@ mod tests {
         .await
         .expect_err("post-delete must reject");
         assert!(matches!(err, ChannelEventError::NotAuthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn verify_channel_event_chain_returns_earliest_failure() {
+        // Construct a request that fails:
+        //   - Step 3 (misroute) — wrong community_id passed to verify
+        //   - Step 4 (unknown author) — empty resolver
+        //   - Step 6 (replay) — pre-bumped tracker
+        // The chain runs cheapest-first; expect Misroute (step 3) to win,
+        // not UnknownAuthor or Replay.
+        let (state, _) = fixture_state_with_alice_joined();
+        let resolver = MockResolver {
+            entries: HashMap::new(),
+        };
+        let mut tracker = ChannelLogReplayTracker::new();
+        let event = fixture_signed_event(100_000, 0, "a-dev");
+        // Pre-bump the tracker so step 6 would fail too.
+        tracker.check_and_advance(&event).expect("seed");
+        let err = verify_channel_event(
+            &event,
+            &fixture_community(0xff), // wrong — triggers step 3
+            &fixture_channel(0x01),
+            &state,
+            &resolver,
+            &mut tracker,
+        )
+        .await
+        .expect_err("must reject");
+        assert!(
+            matches!(err, ChannelEventError::Misroute { .. }),
+            "earliest failure (step 3 misroute) must win, got {err:?}"
+        );
     }
 }
