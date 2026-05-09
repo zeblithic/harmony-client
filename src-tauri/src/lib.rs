@@ -6655,6 +6655,99 @@ pub async fn create_community_inner(
         return Err(format!("bootstrap Join not inserted (got {outcome:?})"));
     }
 
+    // ZEB-248 Phase 1: atomically auto-create the default #general channel.
+    // Same engine-transaction window as the bootstrap_join — if this insert
+    // fails, the same shutdown_engine_and_cleanup_persistence rollback runs.
+    // The HLC for the default-channel event is bootstrap_join.at with
+    // logical+1 — keeps Join < ChannelCreate ordering deterministic without
+    // depending on system-clock progression between the two signs.
+    let default_channel_id: crate::community_membership::ChannelId = {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut buf);
+        buf
+    };
+    let default_channel_event_id: crate::community_membership::EventId = {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut buf);
+        buf
+    };
+    let default_channel_at = crate::owner_state_types::Hlc {
+        wall_ms: minted.bootstrap_join.at.wall_ms,
+        logical: minted.bootstrap_join.at.logical + 1,
+        device_id: minted.bootstrap_join.at.device_id.clone(),
+    };
+    let default_channel_payload = crate::community_membership::EventPayload {
+        id: default_channel_event_id,
+        community_id: minted.community_id,
+        kind: crate::community_membership::MembershipEventKind::ChannelCreate {
+            channel_id: default_channel_id,
+            name: "general".to_string(),
+            write_power: 0,
+        },
+        actor: self_owner,
+        at: default_channel_at,
+    };
+    let default_channel_signed = match crate::community_membership::sign_event(
+        &default_channel_payload,
+        signing_key.as_ref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown_engine_and_cleanup_persistence failed during create_community \
+                     rollback (default-channel sign error)"
+                );
+            }
+            return Err(format!("sign default-channel ChannelCreate: {e}"));
+        }
+    };
+
+    let default_channel_outcome = match engine_arc.insert_local_event(default_channel_signed).await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            if let Err(stop_err) = community_registry
+                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+                .await
+            {
+                tracing::warn!(
+                    error = %stop_err,
+                    community_id = %hex::encode(minted.community_id.0),
+                    "shutdown_engine_and_cleanup_persistence failed during create_community \
+                     rollback (default-channel insert error)"
+                );
+            }
+            return Err(format!("engine.insert_local_event (default channel): {e}"));
+        }
+    };
+    if !matches!(
+        default_channel_outcome,
+        crate::community_state_crdt::InsertOutcome::Inserted
+    ) {
+        if let Err(stop_err) = community_registry
+            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
+            .await
+        {
+            tracing::warn!(
+                error = %stop_err,
+                community_id = %hex::encode(minted.community_id.0),
+                "shutdown_engine_and_cleanup_persistence failed during create_community \
+                 rollback (default-channel not inserted)"
+            );
+        }
+        return Err(format!(
+            "default-channel ChannelCreate not inserted (got {default_channel_outcome:?})"
+        ));
+    }
+
     // ZEB-258: SNAPSHOT-THEN-COMMIT FENCE. If the node generation
     // changed since we snapshotted, owner-state is on a different
     // lifetime — abort. Mirrors add_space's post-stop guard. Done
