@@ -28,6 +28,7 @@ use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Symmetric key for one channel's wire encryption. Derived
 /// deterministically from `(MembershipKey, community_id, channel_id)`
@@ -197,6 +198,10 @@ struct ChannelPostSignedSet<'a> {
     reply_to: &'a Option<MessageId>,
 }
 
+/// Errors produced by the channel-event chain (sign, encrypt/decrypt,
+/// verify, replay-tracker check). Each variant maps to a distinct
+/// failure step so callers can distinguish wire-truncation from
+/// auth-failure from membership-rejection without parsing strings.
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelEventError {
     #[error("CBOR encode: {0}")]
@@ -572,8 +577,6 @@ where
     Ok(())
 }
 
-use std::path::PathBuf;
-
 /// Configuration for `ChannelLog::new`. Production passes
 /// `DEFAULT_SEAL_THRESHOLD_EVENTS`; tests pass a smaller value to
 /// exercise seal/reload paths in reasonable time.
@@ -633,6 +636,10 @@ pub struct ChannelLogManifest {
     pub segments: Vec<SegmentDescriptor>,
 }
 
+/// Manifest entry for one sealed segment. Stores the HLC range covered
+/// (for backfill filtering), the event count, and the storage handle
+/// that locates the segment data (currently only on-disk files;
+/// `SegmentHandle::CasBook` is reserved for v3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentDescriptor {
     /// `(first_event.at, last_event.at)` inclusive. Used by Phase 3
@@ -642,6 +649,11 @@ pub struct SegmentDescriptor {
     pub handle: SegmentHandle,
 }
 
+/// Storage location of a sealed segment. v2 ships only `LocalFile`;
+/// `CasBook { cid }` is reserved for v3 to allow content-addressable
+/// dedupe of segments across replicas. The tagged-enum encoding keeps
+/// old `LocalFile` segments and new `CasBook` segments coexistent in
+/// a single manifest indefinitely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SegmentHandle {
     /// v2: local-disk segment, path relative to the channel's root dir.
@@ -651,6 +663,9 @@ pub enum SegmentHandle {
     // #[serde(rename = "c")] CasBook { cid: ContentId },
 }
 
+/// Errors produced by `ChannelLog`'s persistence layer. Distinct from
+/// `ChannelEventError` (which covers the wire/verify chain) so callers
+/// can reason about disk failures vs cryptographic failures separately.
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelLogPersistError {
     #[error("io: {0}")]
