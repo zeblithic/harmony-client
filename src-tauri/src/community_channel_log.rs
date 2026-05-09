@@ -771,13 +771,31 @@ impl ChannelLog {
         }
     }
 
-    /// Push an already-verified event onto the tail. Returns `true`
-    /// if the seal threshold was reached after this push (caller should
-    /// then call `seal_and_persist` to flush). Returns `false`
-    /// otherwise. Pure / sync / no I/O.
-    pub fn append(&mut self, event: SignedChannelEvent) -> bool {
+    /// Push a verified event onto the in-memory tail. Validates that
+    /// the event is bound to this log's `(community_id, channel_id)`
+    /// — a caller bug or hostile feed that mixes events from
+    /// different channels would otherwise silently corrupt the log
+    /// (the per-stored-event binding isn't re-checked on reload —
+    /// only the manifest is). Returns `Ok(true)` if the seal
+    /// threshold has now been reached (caller should call
+    /// `seal_and_persist`); `Ok(false)` otherwise.
+    pub fn append(&mut self, event: SignedChannelEvent) -> Result<bool, ChannelLogPersistError> {
+        let SignedChannelEvent::Post {
+            community_id,
+            channel_id,
+            ..
+        } = &event;
+        if *community_id != self.manifest.community_id || *channel_id != self.manifest.channel_id {
+            return Err(ChannelLogPersistError::Manifest {
+                expected: format!(
+                    "{:?}/{:?}",
+                    self.manifest.community_id, self.manifest.channel_id
+                ),
+                got: format!("{:?}/{:?}", community_id, channel_id),
+            });
+        }
         self.tail.push(event);
-        self.tail.len() >= self.config.seal_threshold_events
+        Ok(self.tail.len() >= self.config.seal_threshold_events)
     }
 
     /// Persist the active tail to `root/tail.cbor`. Atomic-rename via
@@ -1002,7 +1020,7 @@ impl ChannelLog {
             return Ok((Self::new(community_id, channel_id, root, config), 0));
         }
         let manifest_bytes = std::fs::read(&manifest_path)?;
-        let manifest: ChannelLogManifest = match manifest_bytes.split_first() {
+        let mut manifest: ChannelLogManifest = match manifest_bytes.split_first() {
             Some((&CHANNEL_LOG_MANIFEST_V1, rest)) => ciborium::from_reader(rest)
                 .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?,
             Some((v, _)) => {
@@ -1029,6 +1047,20 @@ impl ChannelLog {
                 got: format!("{:?}", manifest.channel_id),
             });
         }
+        // Restore the "ascending by range.0" invariant defensively.
+        // seal_and_persist sorts before writing, but a corrupted/
+        // hand-edited manifest or one written before the late-seal-
+        // sort fix could still be unsorted. Phase 3 backfill depends
+        // on this ordering for correct "since N" filtering.
+        manifest.segments.sort_by(|a, b| {
+            if a.range.0.is_strictly_newer_than(&b.range.0) {
+                std::cmp::Ordering::Greater
+            } else if b.range.0.is_strictly_newer_than(&a.range.0) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
         // Count segment events. Segments themselves are read on demand
         // by the Phase 3 backfill code; reload doesn't materialize
         // them all into memory (could be megabytes per segment).
@@ -1914,7 +1946,10 @@ mod tests {
         );
         for i in 0..7 {
             let event = fixture_signed_event(100_000 + i, 0, "a-dev");
-            assert!(!log.append(event), "below threshold must not signal seal");
+            assert!(
+                !log.append(event).expect("append"),
+                "below threshold must not signal seal"
+            );
         }
         assert_eq!(log.tail.len(), 7);
         assert!(log.manifest.segments.is_empty());
@@ -1934,10 +1969,13 @@ mod tests {
             },
         );
         for i in 0..3 {
-            assert!(!log.append(fixture_signed_event(100_000 + i, 0, "a-dev")));
+            assert!(!log
+                .append(fixture_signed_event(100_000 + i, 0, "a-dev"))
+                .expect("append"));
         }
         assert!(
-            log.append(fixture_signed_event(103_000, 0, "a-dev")),
+            log.append(fixture_signed_event(103_000, 0, "a-dev"))
+                .expect("append"),
             "fourth event must signal seal at threshold=4"
         );
     }
@@ -1961,7 +1999,7 @@ mod tests {
             .map(|i| fixture_signed_event(100_000 + (i as u64) * 1000, 0, "a-dev"))
             .collect();
         for ev in &originals {
-            log.append(ev.clone());
+            log.append(ev.clone()).expect("append");
         }
         log.seal_and_persist().expect("seal");
         // After seal: tail empty, manifest grew by one, segment file exists.
@@ -2025,7 +2063,7 @@ mod tests {
             .map(|i| fixture_signed_event(100_000 + (i as u64) * 1000, 0, "a-dev"))
             .collect();
         for ev in &originals {
-            log.append(ev.clone());
+            log.append(ev.clone()).expect("append");
         }
         log.flush_tail().expect("flush");
         let (reloaded, total) = ChannelLog::reload(
@@ -2067,7 +2105,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().to_path_buf();
         let mut log = ChannelLog::new(cid, chid, root.clone(), ChannelLogConfig::default());
-        log.append(fixture_signed_event(100_000, 0, "a-dev"));
+        log.append(fixture_signed_event(100_000, 0, "a-dev"))
+            .expect("append");
         log.flush_tail().expect("flush");
         log.seal_and_persist().expect("seal");
         let err = ChannelLog::reload(other, chid, root, ChannelLogConfig::default())
@@ -2120,9 +2159,12 @@ mod tests {
         // append-only ChannelLog::append (no replay-tracker check),
         // but tests should still construct events that could
         // legitimately arrive in this order from distinct devices.
-        log.append(fixture_signed_event(200, 0, "dev-a"));
-        log.append(fixture_signed_event(100, 0, "dev-b"));
-        log.append(fixture_signed_event(300, 0, "dev-c"));
+        log.append(fixture_signed_event(200, 0, "dev-a"))
+            .expect("append");
+        log.append(fixture_signed_event(100, 0, "dev-b"))
+            .expect("append");
+        log.append(fixture_signed_event(300, 0, "dev-c"))
+            .expect("append");
         log.seal_and_persist().expect("seal");
         let descriptor = &log.manifest.segments[0];
         assert_eq!(descriptor.count, 3);
@@ -2152,7 +2194,8 @@ mod tests {
         );
         // Two seals × 2 events each = 4 total.
         for i in 0..4u64 {
-            log.append(fixture_signed_event(100_000 + i * 1000, 0, "a-dev"));
+            log.append(fixture_signed_event(100_000 + i * 1000, 0, "a-dev"))
+                .expect("append");
             if log.tail.len() >= 2 {
                 log.seal_and_persist().expect("seal");
             }
@@ -2194,14 +2237,18 @@ mod tests {
             },
         );
         // First seal: lane "a-dev" at wall=200.
-        log.append(fixture_signed_event(200, 0, "a-dev"));
-        log.append(fixture_signed_event(200, 1, "a-dev"));
+        log.append(fixture_signed_event(200, 0, "a-dev"))
+            .expect("append");
+        log.append(fixture_signed_event(200, 1, "a-dev"))
+            .expect("append");
         log.seal_and_persist().expect("seal 1");
         assert_eq!(log.manifest.segments.len(), 1);
         // Second seal: lane "b-dev" at wall=100 (EARLIER than first
         // seal — legitimate per per-lane monotonicity).
-        log.append(fixture_signed_event(100, 0, "b-dev"));
-        log.append(fixture_signed_event(100, 1, "b-dev"));
+        log.append(fixture_signed_event(100, 0, "b-dev"))
+            .expect("append");
+        log.append(fixture_signed_event(100, 1, "b-dev"))
+            .expect("append");
         log.seal_and_persist().expect("seal 2");
         assert_eq!(log.manifest.segments.len(), 2);
         // Manifest must be sorted ascending by range.0 — the b-dev
@@ -2268,5 +2315,149 @@ mod tests {
                 "hostile rel_path {hostile:?} must produce Io error, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn channel_log_append_rejects_event_bound_to_different_community() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        // Build an event bound to a DIFFERENT community.
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0xff; 16]),
+            community_id: fixture_community(0xff), // wrong community!
+            channel_id: chid,
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100, "a-dev"),
+            content_kind: 0,
+            body: "wrong community",
+            reply_to: None,
+        };
+        let foreign_event = sign_channel_event(&payload, &key).expect("sign");
+        let err = log
+            .append(foreign_event)
+            .expect_err("foreign-community event must reject");
+        assert!(
+            matches!(err, ChannelLogPersistError::Manifest { .. }),
+            "expected Manifest error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn channel_log_append_rejects_event_bound_to_different_channel() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        // Build an event bound to a DIFFERENT channel in the same community.
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0xff; 16]),
+            community_id: cid,
+            channel_id: fixture_channel(0xff), // wrong channel!
+            author: fixture_owner_addr(0xa1),
+            at: fixture_hlc(100, "a-dev"),
+            content_kind: 0,
+            body: "wrong channel",
+            reply_to: None,
+        };
+        let foreign_event = sign_channel_event(&payload, &key).expect("sign");
+        let err = log
+            .append(foreign_event)
+            .expect_err("foreign-channel event must reject");
+        assert!(
+            matches!(err, ChannelLogPersistError::Manifest { .. }),
+            "expected Manifest error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn channel_log_reload_sorts_unsorted_manifest_defensively() {
+        // A corrupted, hand-edited, or pre-fix manifest may have
+        // segments in seal-arrival order rather than ascending
+        // range.0 order. reload must restore the invariant
+        // defensively so Phase 3 backfill's "since N" filtering
+        // doesn't silently skip segments.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("segments")).expect("mkdir segments");
+        // Hand-craft a manifest with segments in WRONG order
+        // (range.0 wall=200 first, range.0 wall=100 second).
+        let manifest = ChannelLogManifest {
+            community_id: cid,
+            channel_id: chid,
+            segments: vec![
+                SegmentDescriptor {
+                    range: (
+                        Hlc {
+                            wall_ms: 200,
+                            logical: 0,
+                            device_id: "a-dev".into(),
+                        },
+                        Hlc {
+                            wall_ms: 200,
+                            logical: 1,
+                            device_id: "a-dev".into(),
+                        },
+                    ),
+                    count: 2,
+                    handle: SegmentHandle::LocalFile {
+                        rel_path: "segments/00000000.cbor".into(),
+                    },
+                },
+                SegmentDescriptor {
+                    range: (
+                        Hlc {
+                            wall_ms: 100,
+                            logical: 0,
+                            device_id: "b-dev".into(),
+                        },
+                        Hlc {
+                            wall_ms: 100,
+                            logical: 1,
+                            device_id: "b-dev".into(),
+                        },
+                    ),
+                    count: 2,
+                    handle: SegmentHandle::LocalFile {
+                        rel_path: "segments/00000001.cbor".into(),
+                    },
+                },
+            ],
+        };
+        // Persist with the schema version byte prefix.
+        let mut bytes = vec![CHANNEL_LOG_MANIFEST_V1];
+        ciborium::into_writer(&manifest, &mut bytes).expect("encode");
+        crate::owner_state_persist::save_atomically(&root.join("manifest.cbor"), &bytes)
+            .expect("save");
+        // Also need a stub tail.cbor for reload (or none — reload
+        // tolerates missing tail.cbor by returning empty).
+        let (reloaded, _) =
+            ChannelLog::reload(cid, chid, root, ChannelLogConfig::default()).expect("reload");
+        assert_eq!(reloaded.manifest.segments.len(), 2);
+        // After reload's defensive sort, b-dev (wall=100) must come
+        // before a-dev (wall=200) regardless of on-disk order.
+        assert_eq!(
+            reloaded.manifest.segments[0].range.0.wall_ms, 100,
+            "reload must sort segments ascending by range.0"
+        );
+        assert_eq!(
+            reloaded.manifest.segments[1].range.0.wall_ms, 200,
+            "reload must sort segments ascending by range.0"
+        );
     }
 }
