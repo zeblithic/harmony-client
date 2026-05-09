@@ -126,20 +126,26 @@ const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN;
 pub enum SignedChannelEvent {
     #[serde(rename = "p")]
     Post {
-        #[serde(rename = "id")]
-        id: MessageId,
-        #[serde(rename = "ci")]
-        community_id: SpaceId,
-        #[serde(rename = "ch")]
-        channel_id: ChannelId,
-        #[serde(rename = "au")]
-        author: OwnerAddr,
+        // Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
+        // for our 2-char keys: bytewise lexicographic sort of
+        // at, au, bd, ch, ci, id, kd, rt, sg. ciborium emits map keys
+        // in declaration order, so this declaration is what a strict
+        // RFC 8949 reader would produce. See ChannelPostSignedSet's
+        // doc comment for the full rationale.
         #[serde(rename = "at")]
         at: Hlc,
-        #[serde(rename = "kd")]
-        content_kind: u8,
+        #[serde(rename = "au")]
+        author: OwnerAddr,
         #[serde(rename = "bd")]
         body: String,
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "ci")]
+        community_id: SpaceId,
+        #[serde(rename = "id")]
+        id: MessageId,
+        #[serde(rename = "kd")]
+        content_kind: u8,
         #[serde(rename = "rt", skip_serializing_if = "Option::is_none", default)]
         reply_to: Option<MessageId>,
         #[serde(
@@ -169,31 +175,40 @@ pub struct ChannelPostPayload<'a> {
     pub reply_to: Option<MessageId>,
 }
 
-/// The signed-set tuple. Canonical CBOR of this is what `sg` covers
-/// AND what the SHA-256 (event_id derivation) hashes.
+/// Pre-signature payload (everything except the signature itself).
+/// Canonical CBOR of this is what `sg` covers AND what the SHA-256
+/// (event_id derivation) hashes.
 ///
 /// Same-length-keys invariant: all field renames are 2-char codes
 /// matching the corresponding wire codes on `SignedChannelEvent::Post`.
-/// This makes the canonical CBOR of the signed-set field-by-field
-/// identical to `Post` minus the `sg` field — so cross-language
-/// re-implementations using strict RFC 8949 §4.2.1 ordering compute
-/// the same hash bytes for the signature.
+///
+/// Field order matches RFC 8949 §4.2.1 canonical CBOR ordering
+/// (length-first, then bytewise lexicographic — for same-length keys
+/// this reduces to bytewise sort): at, au, bd, ch, ci, id, kd, rt.
+/// ciborium emits map keys in declaration order, so this declaration
+/// matches what a strict RFC 8949 reader would produce, ensuring
+/// cross-language signature compatibility.
+///
+/// The same field order is mirrored in `SignedChannelEvent::Post`
+/// (plus `sg` last; sg sorts after rt because 0x73 > 0x72), so
+/// canonical CBOR of the wire-format event minus `sg` is byte-
+/// identical to canonical CBOR of this signed-set.
 #[derive(Serialize)]
 struct ChannelPostSignedSet<'a> {
-    #[serde(rename = "id")]
-    id: &'a MessageId,
-    #[serde(rename = "ci")]
-    community_id: &'a SpaceId,
-    #[serde(rename = "ch")]
-    channel_id: &'a ChannelId,
-    #[serde(rename = "au")]
-    author: &'a OwnerAddr,
     #[serde(rename = "at")]
     at: &'a Hlc,
-    #[serde(rename = "kd")]
-    content_kind: u8,
+    #[serde(rename = "au")]
+    author: &'a OwnerAddr,
     #[serde(rename = "bd")]
     body: &'a str,
+    #[serde(rename = "ch")]
+    channel_id: &'a ChannelId,
+    #[serde(rename = "ci")]
+    community_id: &'a SpaceId,
+    #[serde(rename = "id")]
+    id: &'a MessageId,
+    #[serde(rename = "kd")]
+    content_kind: u8,
     #[serde(rename = "rt", skip_serializing_if = "Option::is_none")]
     reply_to: &'a Option<MessageId>,
 }
@@ -255,14 +270,20 @@ pub fn sign_channel_event(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<SignedChannelEvent, ChannelEventError> {
     use ed25519_dalek::Signer;
+    // Field order in both struct constructions matches the RFC 8949
+    // §4.2.1 canonical-CBOR declaration order: at, au, bd, ch, ci,
+    // id, kd, rt (and sg last on Post). Named-field syntax doesn't
+    // affect CBOR output order — only the type definition's declaration
+    // order does — but we keep construction order aligned for
+    // grep-ability against the wire format.
     let signed_set = ChannelPostSignedSet {
-        id: &payload.id,
-        community_id: &payload.community_id,
-        channel_id: &payload.channel_id,
-        author: &payload.author,
         at: &payload.at,
-        content_kind: payload.content_kind,
+        author: &payload.author,
         body: payload.body,
+        channel_id: &payload.channel_id,
+        community_id: &payload.community_id,
+        id: &payload.id,
+        content_kind: payload.content_kind,
         reply_to: &payload.reply_to,
     };
     let mut canon = Vec::with_capacity(256);
@@ -270,13 +291,13 @@ pub fn sign_channel_event(
         .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
     let sig = signing_key.sign(&canon).to_bytes();
     Ok(SignedChannelEvent::Post {
-        id: payload.id,
-        community_id: payload.community_id,
-        channel_id: payload.channel_id,
-        author: payload.author,
         at: payload.at.clone(),
-        content_kind: payload.content_kind,
+        author: payload.author,
         body: payload.body.to_string(),
+        channel_id: payload.channel_id,
+        community_id: payload.community_id,
+        id: payload.id,
+        content_kind: payload.content_kind,
         reply_to: payload.reply_to,
         sig,
     })
@@ -288,24 +309,24 @@ pub fn sign_channel_event(
 /// deserialized event).
 fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, ChannelEventError> {
     let SignedChannelEvent::Post {
-        id,
-        community_id,
-        channel_id,
-        author,
         at,
-        content_kind,
+        author,
         body,
+        channel_id,
+        community_id,
+        id,
+        content_kind,
         reply_to,
         sig: _,
     } = event;
     let signed_set = ChannelPostSignedSet {
-        id,
-        community_id,
-        channel_id,
-        author,
         at,
-        content_kind: *content_kind,
+        author,
         body,
+        channel_id,
+        community_id,
+        id,
+        content_kind: *content_kind,
         reply_to,
     };
     let mut canon = Vec::with_capacity(256);
@@ -394,18 +415,16 @@ impl ChannelLogReplayTracker {
         Self::default()
     }
 
-    /// Check + advance the tracker for an incoming event. Returns Ok
-    /// if the event is strictly newer than the last seen for this
-    /// (channel, author, device) triple, or never-seen. Returns
-    /// `Err(Replay)` otherwise.
+    /// Read-only check: would this event be accepted by the replay
+    /// tracker without mutating state? Use BEFORE running expensive
+    /// authorization checks so failed-auth events don't bump
+    /// `last_seen` and block valid future events on the same lane.
+    /// Pair with `record` after authorization succeeds.
     ///
-    /// On Ok, the tracker is bumped to this event's HLC. Concurrent
-    /// callers must serialize externally — the tracker holds
-    /// `&mut self` and is not internally locked.
-    pub fn check_and_advance(
-        &mut self,
-        event: &SignedChannelEvent,
-    ) -> Result<(), ChannelEventError> {
+    /// Mirrors `community_state_sync::CommunityRootHlcTracker`'s
+    /// `would_accept` / `record` split — same rationale (advance only
+    /// after the full chain succeeds).
+    pub fn would_accept(&self, event: &SignedChannelEvent) -> Result<(), ChannelEventError> {
         let SignedChannelEvent::Post {
             channel_id,
             author,
@@ -429,7 +448,40 @@ impl ChannelLogReplayTracker {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Advance the tracker to record an accepted event. Caller must
+    /// have already validated via `would_accept` (and authorization
+    /// checks). Idempotent for the same (key, hlc) pair only — calling
+    /// twice with the same event will overwrite with an identical
+    /// value but doesn't error.
+    pub fn record(&mut self, event: &SignedChannelEvent) {
+        let SignedChannelEvent::Post {
+            channel_id,
+            author,
+            at,
+            ..
+        } = event;
+        let key = (*channel_id, *author, at.device_id.clone());
         self.last_seen.insert(key, at.clone());
+    }
+
+    /// Combined check + advance for callers that already serialize
+    /// the two operations (e.g., the replay-tracker unit tests where
+    /// no authorization gate runs between them). Production callers
+    /// inside `verify_channel_event` use the split form so failed-
+    /// auth events don't poison the lane.
+    ///
+    /// On Ok, the tracker is bumped to this event's HLC. Concurrent
+    /// callers must serialize externally — the tracker holds
+    /// `&mut self` and is not internally locked.
+    pub fn check_and_advance(
+        &mut self,
+        event: &SignedChannelEvent,
+    ) -> Result<(), ChannelEventError> {
+        self.would_accept(event)?;
+        self.record(event);
         Ok(())
     }
 
@@ -541,8 +593,14 @@ where
         .verify_strict(&canon, &ed25519_dalek::Signature::from_bytes(sig))
         .map_err(|_| ChannelEventError::BadSignature)?;
 
-    // Step 6: replay-tracker check + advance. Bumps tracker on Ok.
-    replay_tracker.check_and_advance(event)?;
+    // Step 6 (precondition): cheap replay-rejection check. Read-only —
+    // does NOT advance the tracker. Authorization could still reject
+    // below; we only `record` after the full chain succeeds. Mirrors
+    // `community_state_sync::CommunityRootHlcTracker`'s would_accept/
+    // record split — failed-auth events MUST NOT bump `last_seen` or
+    // they permanently block valid future events on the same
+    // (channel, author, device) lane.
+    replay_tracker.would_accept(event)?;
 
     // Step 7: membership-at-HLC gate. Both `write_power` and the
     // tombstone (`deleted_at`) are evaluated AS OF event.at, not as
@@ -573,6 +631,13 @@ where
             author_power, channel_info.write_power
         )));
     }
+
+    // Step 8: now that authorization succeeded, commit the tracker
+    // advance. Failed-auth events do NOT mutate replay state — this
+    // prevents an attacker who can produce a syntactically-valid but
+    // unauthorized event from poisoning the (channel, author, device)
+    // lane against the legitimate device.
+    replay_tracker.record(event);
 
     Ok(())
 }
@@ -754,24 +819,41 @@ impl ChannelLog {
     ///
     /// Crash semantics. The on-disk write order is:
     /// 1. Write segment file (atomic).
-    /// 2. Clear in-memory tail and flush empty `tail.cbor` (atomic).
+    /// 2. Persist empty `tail.cbor` (atomic).
     /// 3. Write manifest with the new descriptor appended (atomic).
+    /// 4. Commit in-memory state (clear tail + adopt new manifest).
+    ///
+    /// In-memory state is mutated ONLY after all three disk writes
+    /// succeed — failure at any step preserves the in-memory tail and
+    /// manifest so the caller can retry. The previous shape cleared
+    /// the in-memory tail before the empty-tail flush, which dropped
+    /// the only in-memory copy on a flush I/O error (recovery
+    /// impossible — events were neither in memory nor in any
+    /// reload-discoverable on-disk location).
     ///
     /// Crash points:
     /// - After (1): orphan segment file, manifest unchanged, tail
     ///   unchanged on disk. Reload sees the old N-1 segments + the
     ///   original tail; orphan segment is ignored (not in manifest)
     ///   and is overwritten by the next seal at the same index.
-    /// - After (2): orphan segment file, `tail.cbor` empty, manifest
-    ///   unchanged. The events that were in the tail are LOST — they
-    ///   exist only in the orphan segment, which reload doesn't
-    ///   discover. This is the worst-case crash window: at-most-one-
-    ///   segment's worth of pending events vanish. Acceptable per
-    ///   spec §8 over the alternative failure mode (writing the
-    ///   manifest first would let reload re-import those events as
-    ///   duplicates against the now-sealed segment).
-    /// - After (3): clean state. Manifest has N segments, tail empty,
-    ///   no orphans.
+    /// - After (2): orphan segment file, `tail.cbor` empty on disk,
+    ///   manifest unchanged. In-memory tail still holds the events.
+    ///   On clean retry of `seal_and_persist`, the segment is
+    ///   re-written at the same index (overwrite-safe) and the
+    ///   manifest write completes. On crash + reload before retry,
+    ///   the at-most-one-segment-worth of events that were in the
+    ///   tail are lost — they exist only in the orphan segment which
+    ///   reload doesn't discover. Acceptable per spec §8 (better
+    ///   than re-emitting them as duplicates against the now-sealed
+    ///   segment).
+    /// - After (3): orphan segment file, tail empty on disk, manifest
+    ///   updated. In-memory state still holds the (now stale) tail
+    ///   contents and the (now stale) old manifest. On clean retry,
+    ///   step 4 commits in-memory state. On crash, reload picks up
+    ///   the new manifest + empty tail — same outcome as the
+    ///   successful path. No data loss.
+    /// - After (4): clean state. In-memory and on-disk both reflect
+    ///   the new manifest with N+1 segments and empty tail.
     pub fn seal_and_persist(&mut self) -> Result<(), ChannelLogPersistError> {
         if self.tail.is_empty() {
             // Nothing to seal. No-op.
@@ -790,40 +872,102 @@ impl ChannelLog {
         crate::owner_state_persist::save_atomically(&abs_path, &seg_bytes)
             .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
 
-        // Build the descriptor AHEAD of mutating state.
-        let first = self.tail.first().expect("tail non-empty checked above");
-        let last = self.tail.last().expect("tail non-empty checked above");
-        let (first_at, last_at) = match (first, last) {
-            (SignedChannelEvent::Post { at: a, .. }, SignedChannelEvent::Post { at: b, .. }) => {
-                (a.clone(), b.clone())
-            }
-        };
+        // Compute true min/max HLC across the segment. Events aren't
+        // globally HLC-monotonic across authors/devices (only per-lane
+        // via ChannelLogReplayTracker), so first()/last() in append
+        // order can give wrong bounds. Phase 3 backfill uses
+        // SegmentDescriptor.range to filter which segments overlap a
+        // `since` query — wrong bounds would silently skip segments
+        // containing matching events. Hlc has no `Ord` derive (the
+        // device_id String tuple position would force allocation in
+        // any Ord impl), so use is_strictly_newer_than directly via
+        // min_by/max_by.
+        let first_at = self
+            .tail
+            .iter()
+            .map(|e| {
+                let SignedChannelEvent::Post { at, .. } = e;
+                at
+            })
+            .min_by(|a, b| {
+                if a.is_strictly_newer_than(b) {
+                    std::cmp::Ordering::Greater
+                } else if b.is_strictly_newer_than(a) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .expect("tail non-empty checked above")
+            .clone();
+        let last_at = self
+            .tail
+            .iter()
+            .map(|e| {
+                let SignedChannelEvent::Post { at, .. } = e;
+                at
+            })
+            .max_by(|a, b| {
+                if a.is_strictly_newer_than(b) {
+                    std::cmp::Ordering::Greater
+                } else if b.is_strictly_newer_than(a) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .expect("tail non-empty checked above")
+            .clone();
         let descriptor = SegmentDescriptor {
             range: (first_at, last_at),
             count: self.tail.len() as u32,
             handle: SegmentHandle::LocalFile { rel_path },
         };
 
-        // Step 2: clear in-memory tail and persist the empty tail to disk
-        // BEFORE writing the manifest. If we crash between this and the
-        // manifest write, reload will see (old manifest, empty tail, orphan
-        // segment file). The orphan segment is ignored by reload (not in
-        // manifest) and the at-most-one-segment-worth of events that were
-        // in the tail are lost — acceptable per spec §8 (better than
-        // re-emitting them as duplicates against the now-sealed segment).
-        self.tail.clear();
-        self.flush_tail()?;
+        // Step 2: persist empty tail to disk (writes a fresh tail.cbor
+        // containing the empty-vec marker). Do this BEFORE mutating
+        // self.tail in memory — if save_atomically fails, the in-memory
+        // tail is preserved and the error propagates. Worst case on
+        // success: orphan segment file is on disk; reload ignores
+        // segments not in the manifest. We bypass `flush_tail()` here
+        // because that helper would also write a stub manifest if the
+        // manifest doesn't yet exist on disk — at this point we're
+        // about to write the real manifest in step 3, so the stub
+        // would just be overwritten.
+        let empty_tail: Vec<SignedChannelEvent> = Vec::new();
+        let mut empty_tail_bytes = Vec::with_capacity(8);
+        empty_tail_bytes.push(CHANNEL_LOG_TAIL_V1);
+        ciborium::into_writer(&empty_tail, &mut empty_tail_bytes)
+            .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+        crate::owner_state_persist::save_atomically(
+            &self.root.join("tail.cbor"),
+            &empty_tail_bytes,
+        )
+        .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
 
-        // Step 3: now write the manifest with the new descriptor. After
-        // this completes, the segment is durably committed and the tail
-        // is durably empty — clean state.
-        self.manifest.segments.push(descriptor);
+        // Step 3: build and persist the new manifest (with the
+        // descriptor appended). Build on a CLONED + extended segment
+        // list — if save_atomically fails, neither in-memory manifest
+        // nor in-memory tail is mutated, so we can safely retry.
+        let mut new_segments = self.manifest.segments.clone();
+        new_segments.push(descriptor);
+        let new_manifest = ChannelLogManifest {
+            community_id: self.manifest.community_id,
+            channel_id: self.manifest.channel_id,
+            segments: new_segments,
+        };
         let mut man_bytes = Vec::with_capacity(256);
         man_bytes.push(CHANNEL_LOG_MANIFEST_V1);
-        ciborium::into_writer(&self.manifest, &mut man_bytes)
+        ciborium::into_writer(&new_manifest, &mut man_bytes)
             .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
         crate::owner_state_persist::save_atomically(&self.root.join("manifest.cbor"), &man_bytes)
             .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+
+        // Step 4: ALL persistence succeeded — now safe to commit
+        // in-memory state. After this point the in-memory and on-disk
+        // states are consistent.
+        self.manifest = new_manifest;
+        self.tail.clear();
         Ok(())
     }
 
@@ -1607,6 +1751,21 @@ mod tests {
         .await
         .expect_err("below threshold must reject");
         assert!(matches!(err, ChannelEventError::NotAuthorized(_)));
+        // After the failed verify, the replay tracker MUST NOT have
+        // advanced — otherwise a future legitimate event on the same
+        // lane would be wrongly rejected as a replay. (Regression
+        // guard for the advance-before-auth bug.)
+        let SignedChannelEvent::Post {
+            at,
+            channel_id,
+            author,
+            ..
+        } = &event;
+        let key = (*channel_id, *author, at.device_id.clone());
+        assert!(
+            !tracker.last_seen().contains_key(&key),
+            "tracker must NOT advance on failed authorization (was advance-before-auth bug)"
+        );
     }
 
     #[tokio::test]
@@ -1659,6 +1818,21 @@ mod tests {
         .await
         .expect_err("post-delete must reject");
         assert!(matches!(err, ChannelEventError::NotAuthorized(_)));
+        // After the failed verify, the replay tracker MUST NOT have
+        // advanced — otherwise a future legitimate event on the same
+        // lane would be wrongly rejected as a replay. (Regression
+        // guard for the advance-before-auth bug.)
+        let SignedChannelEvent::Post {
+            at,
+            channel_id,
+            author,
+            ..
+        } = &event;
+        let key = (*channel_id, *author, at.device_id.clone());
+        assert!(
+            !tracker.last_seen().contains_key(&key),
+            "tracker must NOT advance on failed authorization (was advance-before-auth bug)"
+        );
     }
 
     #[tokio::test]
@@ -1884,6 +2058,50 @@ mod tests {
         assert!(log.manifest.segments.is_empty());
         log.seal_and_persist().expect("seal empty again");
         assert!(log.manifest.segments.is_empty());
+    }
+
+    #[test]
+    fn channel_log_seal_range_uses_min_max_not_first_last() {
+        // Regression for the Fix 2 bug: SegmentDescriptor.range used
+        // tail.first()/last() in append order, but events aren't
+        // globally HLC-monotonic across authors/devices (only per-lane).
+        // Phase 3 backfill filters segments by range — wrong bounds
+        // silently skip segments containing matching events.
+        //
+        // Construct a tail in non-monotonic append order:
+        // [wall=200, wall=100, wall=300]. Old code would record
+        // range=(200, 300); correct min/max scan records (100, 300).
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 16,
+            },
+        );
+        // Use distinct device_ids so the non-monotonic order doesn't
+        // violate the per-lane invariant — the producer side is
+        // append-only ChannelLog::append (no replay-tracker check),
+        // but tests should still construct events that could
+        // legitimately arrive in this order from distinct devices.
+        log.append(fixture_signed_event(200, 0, "dev-a"));
+        log.append(fixture_signed_event(100, 0, "dev-b"));
+        log.append(fixture_signed_event(300, 0, "dev-c"));
+        log.seal_and_persist().expect("seal");
+        let descriptor = &log.manifest.segments[0];
+        assert_eq!(descriptor.count, 3);
+        assert_eq!(
+            descriptor.range.0.wall_ms, 100,
+            "range.0 must be true min HLC across the segment, not first()"
+        );
+        assert_eq!(
+            descriptor.range.1.wall_ms, 300,
+            "range.1 must be true max HLC across the segment, not last()"
+        );
     }
 
     #[test]

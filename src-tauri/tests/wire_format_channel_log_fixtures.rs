@@ -38,6 +38,12 @@ fn signed_channel_event_post_wire_bytes_pinned() {
     ciborium::into_writer(&event, &mut bytes).expect("encode");
     // Pin the byte sequence. If this fails after intentional schema
     // change, regenerate via temporary `eprintln!("{}", hex::encode(&bytes));`.
-    let expected_hex = "a2627467617062766ca8626964501111111111111111111111111111111162636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626368500101010101010101010101010101010162617550a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1626174a361771a000186a0616c00616465612d646576626b64006262646568656c6c6f62736758406a2f97e5164048e73e12d962d5a40a48db08b27d822cda7f2f32f150eb3879c02cddb2028a453acca58aee6d68fc0040d60f673b0cd11de183fe7cccb2a07304";
+    //
+    // Field order in this hex matches RFC 8949 §4.2.1 canonical CBOR
+    // ordering for our 2-char keys (bytewise lexicographic):
+    // at, au, bd, ch, ci, id, kd, (rt skipped because None), sg.
+    // ciborium emits in declaration order, so the SignedChannelEvent::Post
+    // and ChannelPostSignedSet declarations are arranged to match.
+    let expected_hex = "a2627467617062766ca8626174a361771a000186a0616c00616465612d64657662617550a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16262646568656c6c6f626368500101010101010101010101010101010162636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c06269645011111111111111111111111111111111626b64006273675840f5744983df7ff9ca05b964fd16cb63a253267e2c56eb59fd0b4ec3326492441d1085686b783c437b12df404bceb47f1e012257ac9aba780399d3add6cb8b200a";
     assert_eq!(hex::encode(&bytes), expected_hex);
 }
