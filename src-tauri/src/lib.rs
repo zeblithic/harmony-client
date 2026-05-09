@@ -5527,7 +5527,10 @@ async fn list_community_members(
 /// `mint_kick_event` / `mint_set_power_event`. The fresh `channel_id`
 /// (16 random bytes) and event id are sourced from the supplied RNG
 /// (via `rand::thread_rng` in production).
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`. This helper is now pure
+/// on the HLC — it does not call `next_hlc` internally.
 pub fn mint_channel_create_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -5535,9 +5538,7 @@ pub fn mint_channel_create_event(
     name: String,
     write_power: u8,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5546,7 +5547,6 @@ pub fn mint_channel_create_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -5735,10 +5735,13 @@ async fn create_channel(
 // Mirrors the `create_channel` shape exactly.
 
 /// Pure function: mint a self-signed ChannelModify event for a community
+/// Pure function: mint a self-signed ChannelModify event for a community
 /// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
 /// for ensuring at least one of `name`/`write_power` is `Some` (the IPC
 /// boundary rejects all-None before this is reached).
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_channel_modify_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -5746,9 +5749,7 @@ pub fn mint_channel_modify_event(
     name: Option<String>,
     write_power: Option<u8>,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5757,7 +5758,6 @@ pub fn mint_channel_modify_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -5776,15 +5776,15 @@ pub fn mint_channel_modify_event(
 /// we moderate. Mirrors `mint_channel_create_event`. Caller is responsible
 /// for the metadata-before-write check (channel exists + not already
 /// tombstoned) — this helper does NOT validate; it only mints.
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_channel_delete_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     channel_id: crate::community_membership::ChannelId,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -5793,7 +5793,6 @@ pub fn mint_channel_delete_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
@@ -6421,24 +6420,23 @@ pub struct MintedCommunity {
 /// Pure function: mint a fresh community + signed bootstrap Join.
 ///
 /// Generates random `community_id` (16 bytes) and `MembershipKey`
-/// (32 bytes), advances HLC from `prev_hlc`, builds the Community
-/// Space row, signs a self-Join `SignedMembershipEvent` with the
-/// caller's ed25519 key. Returns all four artefacts so the IPC layer
-/// can apply the Space, send the Join through the engine, and return
-/// the hex id to the frontend.
+/// (32 bytes), builds the Community Space row, signs a self-Join
+/// `SignedMembershipEvent` with the caller's ed25519 key. Returns
+/// all four artefacts so the IPC layer can apply the Space, send
+/// the Join through the engine, and return the hex id to the frontend.
 ///
-/// Pure / sync / no I/O — every random byte and HLC tick is sourced
-/// from the args. This lets the test (`create_community_inner_tests`)
-/// cover the full mint without spawning channels, mutexes, or a Tauri
-/// runtime.
+/// Pure / sync / no I/O — every random byte is sourced from the args.
+/// This lets the test (`create_community_inner_tests`) cover the full
+/// mint without spawning channels, mutexes, or a Tauri runtime.
+///
+/// ZEB-267: Caller pre-reserves `creation_hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_community_creation(
     name: &str,
     is_invite_only: bool,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    creation_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use crate::owner_state_types::{MembershipKey, Space, SpaceId, SpaceKind};
@@ -6452,8 +6450,6 @@ pub fn mint_community_creation(
     let mut mk_bytes = [0u8; 32];
     rng.fill_bytes(&mut mk_bytes);
     let membership_key = MembershipKey::new(mk_bytes);
-
-    let creation_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
 
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
@@ -7048,17 +7044,22 @@ mod create_community_inner_tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
 
         let device_id = "creator-dev";
-        let prev_hlc: Option<Hlc> = None;
         let wall_now_ms = 1_700_000_000_000u64;
+        // ZEB-267: caller pre-reserves the HLC; in production this
+        // comes from `reserve_next_hlc_for_device`. The test constructs
+        // it inline to keep the mint helper purely synchronous.
+        let creation_hlc = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
         let minted = mint_community_creation(
             "Hackers United",
             false,
             self_owner,
             &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            creation_hlc.clone(),
         )
         .expect("mint");
 
@@ -7097,9 +7098,7 @@ mod create_community_inner_tests {
             false,
             self_owner,
             &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
+            creation_hlc.clone(),
         )
         .expect("mint2");
         assert_ne!(minted.community_id, minted2.community_id);
@@ -7171,26 +7170,22 @@ pub struct NavUpdatedPayload {
     pub parent_id: Option<String>,
 }
 
-/// Pure function: mint a joiner-side self-Join + derived Community
-/// Space row from an invite payload.
-///
-/// Generates a random 16-byte event id, advances HLC from `prev_hlc`,
-/// constructs the Community Space row using the invite's
-/// `community_id` / `membership_key` / `admin_addr` / `community_name`
+/// Pure function: builds the joiner-side `MintedCommunity` from an
+/// invite payload — derives a Community Space row from `payload.name`
 /// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
 /// (actor = `self_owner`, community_id = `payload.community_id`).
 ///
-/// Pure / sync / no I/O — every random byte and HLC tick is sourced
-/// from the args, so the test (`redeem_invite_inner_tests`) can cover
-/// the full mint without spawning channels, mutexes, or a Tauri
-/// runtime.
+/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
+/// the test (`redeem_invite_inner_tests`) cover the full mint without
+/// spawning channels, mutexes, or a Tauri runtime.
+///
+/// ZEB-267: Caller pre-reserves `join_hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_redemption(
     payload: &crate::community_invite::CommunityInvitePayload,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    join_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use crate::owner_state_types::{Space, SpaceKind};
@@ -7199,8 +7194,6 @@ pub fn mint_redemption(
     let mut rng = rand::thread_rng();
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
-
-    let join_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
 
     let join_payload = EventPayload {
         id: event_id_bytes,
@@ -7233,11 +7226,6 @@ pub fn mint_redemption(
         // Space row matches the creator's row (Phase 1's CRDT same-
         // SpaceId rejection of community-creation field changes would
         // silently reject the redemption Space if these disagreed).
-        // In Phase 3 the IPC guard rejects invite-only payloads before
-        // we ever reach mint_redemption, so this currently equals
-        // Some(false) at runtime — but pinning to payload.is_invite_only
-        // unblocks Phase 4 invite-only redemption with no further mint
-        // edits.
         is_invite_only: Some(payload.is_invite_only),
     };
 
@@ -8179,18 +8167,15 @@ mod redeem_invite_inner_tests {
         };
 
         let device_id = "joiner-dev";
-        let wall_now_ms = 1_700_000_999_000u64;
-        let prev_hlc: Option<Hlc> = None;
+        // ZEB-267: caller pre-reserves the HLC; constructed inline here
+        // since the test isn't driving an actual tracker.
+        let join_hlc = Hlc {
+            wall_ms: 1_700_000_999_000u64,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
-        let minted = mint_redemption(
-            &payload,
-            self_owner,
-            &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )
-        .expect("mint");
+        let minted = mint_redemption(&payload, self_owner, &signing_key, join_hlc).expect("mint");
 
         assert_eq!(minted.community_id, payload.community_id);
         assert_eq!(minted.space.id, payload.community_id);
@@ -8232,13 +8217,14 @@ mod redeem_invite_inner_tests {
 /// `mint_redemption` / `mint_community_creation` shape — pure / sync /
 /// no I/O so the canonical-CBOR / signing path is unit-testable
 /// without standing up a Tauri test harness.
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_leave_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8247,13 +8233,12 @@ pub fn mint_leave_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let leave_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
         kind: MembershipEventKind::Leave,
         actor: self_owner,
-        at: leave_hlc,
+        at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign leave: {e}"))
 }
@@ -8470,18 +8455,16 @@ mod leave_community_inner_tests {
 
         let community_id = SpaceId([0x77; 16]);
         let device_id = "leaver-dev";
-        let prev_hlc: Option<Hlc> = None;
         let wall_now_ms = 1_700_000_500_000u64;
+        // ZEB-267: caller pre-reserves the HLC.
+        let leave_hlc = Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        };
 
-        let event = mint_leave_event(
-            community_id,
-            self_owner,
-            &signing_key,
-            device_id,
-            wall_now_ms,
-            prev_hlc.as_ref(),
-        )
-        .expect("mint");
+        let event =
+            mint_leave_event(community_id, self_owner, &signing_key, leave_hlc).expect("mint");
 
         assert_eq!(event.actor, self_owner);
         assert_eq!(event.community_id, community_id);
@@ -8510,16 +8493,16 @@ mod leave_community_inner_tests {
 
 /// Pure function: mint a self-signed Kick event for a community we
 /// belong to and have permission to moderate. Mirrors `mint_leave_event`.
-#[allow(clippy::too_many_arguments)]
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_kick_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     target: crate::owner_state_types::OwnerAddr,
     reason: Option<String>,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8528,13 +8511,12 @@ pub fn mint_kick_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let kick_hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
         kind: MembershipEventKind::Kick { target, reason },
         actor: self_owner,
-        at: kick_hlc,
+        at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign kick: {e}"))
 }
@@ -8672,16 +8654,18 @@ async fn kick_from_community(
 // demote is allowed (foot-gun, but consistent with the CRDT semantics);
 // any UI warning lives in Phase 5.
 
-#[allow(clippy::too_many_arguments)]
+/// Pure function: mint a self-signed SetPower event for a community we
+/// moderate (verify_event power-gates at level ≥ 100).
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
 pub fn mint_set_power_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
     target: crate::owner_state_types::OwnerAddr,
     level: u8,
     signing_key: &ed25519_dalek::SigningKey,
-    device_id: &str,
-    wall_now_ms: u64,
-    prev_hlc: Option<&crate::owner_state_types::Hlc>,
+    hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -8690,7 +8674,6 @@ pub fn mint_set_power_event(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
-    let hlc = crate::dm_outbox::next_hlc(prev_hlc, wall_now_ms, device_id);
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,

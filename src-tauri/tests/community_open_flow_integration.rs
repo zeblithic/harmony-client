@@ -20,7 +20,7 @@ use harmony_app::community_state_sync::{
     CommunitySyncEngineConfig, IdentityResolver, PersistPaths, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::OwnerAddr;
+use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_app::{
     delta_to_change, member_info_for, mint_community_creation, mint_leave_event, mint_redemption,
     MemberStatusDto, MembershipChangeType,
@@ -149,9 +149,11 @@ async fn open_community_create_redeem_leave_round_trip() {
         false,
         owner_a,
         &signing_a,
-        "a-dev",
-        100_000,
-        None,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
     )
     .expect("mint create");
     let community_id = minted_a.community_id;
@@ -282,8 +284,17 @@ async fn open_community_create_redeem_leave_round_trip() {
         admin_identity_pub: None,
     };
 
-    let minted_b = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
-        .expect("mint redeem");
+    let minted_b = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        Hlc {
+            wall_ms: 200_000,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem");
     let redemption_outcome = engine_b
         .insert_local_event(minted_b.bootstrap_join.clone())
         .await
@@ -340,13 +351,20 @@ async fn open_community_create_redeem_leave_round_trip() {
     assert_eq!(dto_a, dto_b);
 
     // ── Step 4: B leaves; A should observe B's status flip to Left. ───
+    // ZEB-267: derive HLC from B's redemption join, bumping logical.
     let leave_b = mint_leave_event(
         community_id,
         owner_b,
         &signing_b,
-        "b-dev",
-        300_000,
-        Some(&minted_b.bootstrap_join.at),
+        Hlc {
+            wall_ms: minted_b.bootstrap_join.at.wall_ms.max(300_000),
+            logical: if minted_b.bootstrap_join.at.wall_ms >= 300_000 {
+                minted_b.bootstrap_join.at.logical + 1
+            } else {
+                0
+            },
+            device_id: "b-dev".to_string(),
+        },
     )
     .expect("mint leave");
     let leave_outcome = engine_b
@@ -459,9 +477,11 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         false,
         owner_a,
         &signing_a,
-        "a-dev",
-        100_000,
-        None,
+        Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "a-dev".to_string(),
+        },
     )
     .expect("mint create");
     let community_id = minted_a.community_id;
@@ -578,8 +598,17 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         admin_identity_pub: None,
     };
 
-    let minted_b1 = mint_redemption(&invite_payload, owner_b, &signing_b, "b-dev", 200_000, None)
-        .expect("mint redeem #1");
+    let minted_b1 = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        Hlc {
+            wall_ms: 200_000,
+            logical: 0,
+            device_id: "b-dev".to_string(),
+        },
+    )
+    .expect("mint redeem #1");
     let outcome1 = engine_b
         .insert_local_event(minted_b1.bootstrap_join.clone())
         .await
@@ -614,13 +643,20 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     // ── Second redemption: B mints + inserts AGAIN with the same URL.
     //     Distinct event_id (random) and HLC tick advance produce a
     //     CRDT-distinct event, so InsertOutcome::Inserted again. ──────
+    // ZEB-267: derive HLC from B's first redemption join, bumping logical.
     let minted_b2 = mint_redemption(
         &invite_payload,
         owner_b,
         &signing_b,
-        "b-dev",
-        300_000,
-        Some(&minted_b1.bootstrap_join.at),
+        Hlc {
+            wall_ms: minted_b1.bootstrap_join.at.wall_ms.max(300_000),
+            logical: if minted_b1.bootstrap_join.at.wall_ms >= 300_000 {
+                minted_b1.bootstrap_join.at.logical + 1
+            } else {
+                0
+            },
+            device_id: "b-dev".to_string(),
+        },
     )
     .expect("mint redeem #2");
     assert_ne!(
