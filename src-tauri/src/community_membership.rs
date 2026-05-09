@@ -43,6 +43,50 @@ pub enum MembershipEventKind {
         #[serde(rename = "lv")]
         level: u8,
     },
+    /// Channel-config event: a mod-tier+ actor creates a new channel
+    /// in this community. `ch` is a fresh ChannelId (ULID); `nm` is
+    /// the display name; `wp` is the per-channel write_power threshold
+    /// (Phase 1 frontend always submits 0 = anyone-Joined posts; v2
+    /// reserves the field so v3 announcement-channel UI is wire-stable).
+    /// Variant code "c" (1-char value, not a key — keeps the same-
+    /// length-keys invariant intact). Inner field keys are 2-char.
+    /// See `docs/specs/2026-05-09-zeb-248-channels-within-communities-design.md` §5.1.
+    #[serde(rename = "c")]
+    ChannelCreate {
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "nm")]
+        name: String,
+        #[serde(rename = "wp")]
+        write_power: u8,
+    },
+
+    /// Channel-config event: a mod-tier+ actor modifies an existing
+    /// channel's name and/or write_power. Either field may be `None` to
+    /// leave that field unchanged. If both are `None` the IPC layer
+    /// rejects the call before signing (no-op). Variant code "m".
+    /// See spec `docs/specs/2026-05-09-zeb-248-channels-within-communities-design.md` §5.1.
+    #[serde(rename = "m")]
+    ChannelModify {
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+        #[serde(rename = "nm", skip_serializing_if = "Option::is_none", default)]
+        name: Option<String>,
+        #[serde(rename = "wp", skip_serializing_if = "Option::is_none", default)]
+        write_power: Option<u8>,
+    },
+
+    /// Channel-config event: a mod-tier+ actor deletes a channel.
+    /// Tombstone semantics — the channel is NOT removed from the
+    /// materialized `channels` map; instead `deleted_at` is set. Future
+    /// posts to this channel are rejected by Phase 2's verify_channel_event;
+    /// historical messages still render with their breadcrumb intact.
+    /// Variant code "d". See spec §5.1.
+    #[serde(rename = "d")]
+    ChannelDelete {
+        #[serde(rename = "ch")]
+        channel_id: ChannelId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -54,6 +98,21 @@ use crate::owner_state_types::{Hlc, SpaceId};
 /// 16-byte ULID identifying a single signed membership event within
 /// a community's CRDT log. Generated client-side at event creation.
 pub type EventId = [u8; 16];
+
+/// 16-byte ULID identifying a single channel within a community.
+/// Generated client-side at `ChannelCreate` time. Tuple-struct newtype
+/// (not type alias) so the type system catches accidental substitution
+/// between event-IDs and channel-IDs at IPC boundaries; bstr serde
+/// keeps wire encoding compact (17 bytes vs CBOR array-of-u8 33 bytes).
+/// Mirrors the shape of `OwnerAddr` / `SpaceId` in `owner_state_types.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChannelId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 /// One signed event in a community's membership CRDT.
 ///
@@ -334,6 +393,32 @@ pub enum VerifyError {
     /// x25519 keypair (e.g., bad point encoding on either curve).
     /// Treat as a signature failure with extra context.
     InvalidIdentityPub,
+    /// Channel-config event (`ChannelCreate`/`ChannelModify`/`ChannelDelete`)
+    /// was signed by an actor whose power is below
+    /// `POWER_THRESHOLDS.kick` (mod-tier). v2 hardcodes mod-tier as the
+    /// channel-admin gate; per-community customization is deferred to
+    /// ZEB-251. Distinct from `ActorPowerInsufficient` so the IPC layer
+    /// can emit a clean "you don't have permission to manage channels"
+    /// error string without overloading the membership-level diagnostic.
+    ChannelAdminInsufficientPower,
+
+    /// `ChannelModify` event is a no-op: both `name: None` and
+    /// `write_power: None` (malformed signal). Content-intrinsic
+    /// rejection — no prior_state dependency, so safe under cross-blob
+    /// ordering. A signed Modify with both fields None has no
+    /// meaningful payload; reject as malformed. Value-matching no-ops
+    /// (proposed Some values exactly match prior materialized state)
+    /// are NOT rejected here: two mods independently making the same
+    /// rename would otherwise cause CRDT log divergence based on
+    /// receive order.
+    ChannelModifyNoOp,
+
+    /// `ChannelCreate` or `ChannelModify` carries a `name` that is
+    /// empty/whitespace-only or exceeds 32 chars (per spec §12.3).
+    /// Receive-side enforcement so a malicious peer can't replicate
+    /// invalid names that would break the UI.
+    ChannelNameInvalid,
+
     EncodeError(String),
 }
 
@@ -375,7 +460,7 @@ impl std::fmt::Display for VerifyError {
                 )
             }
             VerifyError::PowerLevelOutOfRange => {
-                write!(f, "SetPower level exceeds POWER_THRESHOLDS.max")
+                write!(f, "power level exceeds POWER_THRESHOLDS.max")
             }
             VerifyError::BannedActorJoin => {
                 write!(f, "Join rejected: actor's prior status is Banned")
@@ -406,6 +491,17 @@ impl std::fmt::Display for VerifyError {
             VerifyError::InvalidIdentityPub => {
                 write!(f, "identity_pub bytes are not a valid (X25519, Ed25519) public-key pair")
             }
+            VerifyError::ChannelAdminInsufficientPower => write!(
+                f,
+                "channel-config events require power >= POWER_THRESHOLDS.kick (mod-tier)"
+            ),
+            VerifyError::ChannelModifyNoOp => {
+                write!(f, "ChannelModify is a no-op (all fields None)")
+            }
+            VerifyError::ChannelNameInvalid => write!(
+                f,
+                "channel name is empty or exceeds 32 chars (spec §12.3 limit)"
+            ),
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
         }
     }
@@ -544,6 +640,23 @@ pub struct MaterializedMembership {
     /// bootstrap rule — see `materialize` (Task 9). SetPower events
     /// override.
     pub power_levels: BTreeMap<OwnerAddr, u8>,
+    /// Per-channel materialized state. Built by `materialize` from
+    /// `ChannelCreate`/`ChannelModify`/`ChannelDelete` event replay
+    /// (ZEB-248 Phase 1). `BTreeMap` (not `HashMap`) is load-bearing:
+    /// `MaterializedMembership` impls `CanonicalPayload`, and canonical
+    /// CBOR requires deterministic key order at every map-typed nesting
+    /// level — `HashMap` iteration is non-deterministic and would
+    /// break byte-equality across replicas.
+    ///
+    /// `#[serde(default)]` for forward/backward compat: any cached or
+    /// persisted `MaterializedMembership` from before the channels
+    /// field existed (Sub-C v1) deserializes with an empty channels
+    /// map rather than failing decode. v2-and-beyond persists channel
+    /// state via the underlying event log — `materialize` rebuilds
+    /// the channels map from events on each call — so the wire form
+    /// is functionally a derived view; the default is harmless.
+    #[serde(default)]
+    pub channels: BTreeMap<ChannelId, ChannelInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +680,28 @@ pub enum MemberStatus {
     #[serde(rename = "b")]
     Banned,
 }
+
+/// Materialized state for one channel in a community. Built by
+/// `materialize` from `ChannelCreate`/`ChannelModify`/`ChannelDelete`
+/// event replay. `deleted_at` is `Some` once a `ChannelDelete` has been
+/// processed for this channel — the channel stays in the map after
+/// deletion (tombstone semantics) so historical messages with this
+/// `channel_id` can still render their breadcrumb. v3+ may garbage-
+/// collect old tombstones; Phase 1 retains them indefinitely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelInfo {
+    #[serde(rename = "nm")]
+    pub name: String,
+    #[serde(rename = "wp")]
+    pub write_power: u8,
+    #[serde(rename = "ca")]
+    pub created_at: Hlc,
+    #[serde(rename = "da", skip_serializing_if = "Option::is_none", default)]
+    pub deleted_at: Option<Hlc>,
+}
+
+impl CanonicalPayloadSealed for ChannelInfo {}
+impl CanonicalPayload for ChannelInfo {}
 
 impl CanonicalPayloadSealed for MaterializedMembership {}
 impl CanonicalPayload for MaterializedMembership {}
@@ -618,6 +753,9 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
 ///    - Invite { target }: members[target] = Invited / joined_at: at
 ///    - Kick { target }: members[target].status = Banned, .left_at = at
 ///    - SetPower { target, level }: power_levels[target] = level
+///    - ChannelCreate { channel_id, name, write_power }: channels[channel_id] = ChannelInfo { ... } if absent (first-create-wins; duplicate is no-op so a replayed event can't refresh created_at)
+///    - ChannelModify { channel_id, name, write_power }: partial update — only Some fields applied; unknown channel_id silently ignored
+///    - ChannelDelete { channel_id }: tombstone — sets deleted_at, never removes (so historical messages can render breadcrumb); idempotent first-delete-wins
 ///
 /// Pure function — does NOT verify signatures or power rules. That's
 /// `verify_event`. Materialization assumes pre-verified events; the
@@ -744,6 +882,64 @@ pub fn materialize(
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
+            }
+            MembershipEventKind::ChannelCreate {
+                channel_id,
+                name,
+                write_power,
+            } => {
+                // Idempotent on duplicate channel_id: first create wins
+                // (replays + reorderings under DAG-sync may deliver the
+                // same ChannelCreate twice; the second one must NOT
+                // overwrite name/write_power/created_at — that would let
+                // a duplicate-emit refresh created_at and reset history
+                // markers). A subsequent ChannelModify is the right path
+                // to update fields; a duplicate ChannelCreate is a no-op.
+                m.channels
+                    .entry(*channel_id)
+                    .or_insert_with(|| ChannelInfo {
+                        name: name.clone(),
+                        write_power: *write_power,
+                        created_at: event.at.clone(),
+                        deleted_at: None,
+                    });
+            }
+            MembershipEventKind::ChannelModify {
+                channel_id,
+                name,
+                write_power,
+            } => {
+                // Partial update: only apply fields that are Some.
+                // Unknown ChannelId is silently ignored — verify_event
+                // (Task 3) does NOT gate Modify on the channel existing
+                // (a malicious actor could otherwise pre-trigger a verify
+                // failure to leak existence info), so materialize stays
+                // safe by default. A reordered Modify-before-Create
+                // would be discarded here; the eventual sort means the
+                // re-replay after the missing Create arrives still does
+                // the right thing.
+                if let Some(info) = m.channels.get_mut(channel_id) {
+                    if let Some(new_name) = name {
+                        info.name = new_name.clone();
+                    }
+                    if let Some(new_wp) = write_power {
+                        info.write_power = *new_wp;
+                    }
+                }
+            }
+            MembershipEventKind::ChannelDelete { channel_id } => {
+                // Tombstone: set deleted_at, do NOT remove. Idempotent
+                // on duplicate: first delete wins (preserves the original
+                // deleted_at HLC). Subsequent ChannelModify can still
+                // mutate name/write_power on a tombstoned channel —
+                // intentional, so admins can correct the name of an
+                // accidentally-deleted-then-renamed channel without an
+                // un-delete primitive (deferred to v3).
+                if let Some(info) = m.channels.get_mut(channel_id) {
+                    if info.deleted_at.is_none() {
+                        info.deleted_at = Some(event.at.clone());
+                    }
+                }
             }
         }
     }
@@ -1025,6 +1221,18 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
+        MembershipEventKind::ChannelCreate { .. }
+        | MembershipEventKind::ChannelModify { .. }
+        | MembershipEventKind::ChannelDelete { .. } => {
+            // Channel-config requires actor to be Joined AND power >=
+            // kick. Joined-check first so a non-member with high power
+            // (e.g. former admin after Kick) can't create channels.
+            // The power check fires in the per-kind power-rules block
+            // below; this block establishes membership.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ActorNotJoined);
+            }
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1077,6 +1285,90 @@ pub fn verify_event(
             if *level > POWER_THRESHOLDS.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
+        }
+        MembershipEventKind::ChannelCreate {
+            channel_id: _,
+            name,
+            write_power,
+        } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Validate name length (1-32 chars per spec §12.3).
+            if name.trim().is_empty() || name.chars().count() > 32 {
+                return Err(VerifyError::ChannelNameInvalid);
+            }
+            // Validate write_power range.
+            if *write_power > POWER_THRESHOLDS.max {
+                return Err(VerifyError::PowerLevelOutOfRange);
+            }
+            // Note: duplicate channel_id is NOT rejected here. Cross-blob
+            // ordering can deliver a duplicate before its predecessor;
+            // materialize's `or_insert_with` is idempotent first-create-wins
+            // and converges across replicas regardless of receive order.
+            // Verify-time rejection would cause log divergence (some
+            // replicas accept the duplicate, others reject) without
+            // gaining materialized-view convergence.
+        }
+        MembershipEventKind::ChannelModify {
+            channel_id: _,
+            name,
+            write_power,
+        } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Reject all-None ChannelModify — content-intrinsic, no
+            // prior_state dependency. A signed Modify with both fields
+            // None has no meaningful payload; reject as malformed.
+            if name.is_none() && write_power.is_none() {
+                return Err(VerifyError::ChannelModifyNoOp);
+            }
+            // Validate name length when Some — content-intrinsic.
+            if let Some(n) = name {
+                if n.trim().is_empty() || n.chars().count() > 32 {
+                    return Err(VerifyError::ChannelNameInvalid);
+                }
+            }
+            // Validate write_power range when Some — content-intrinsic.
+            if let Some(wp) = write_power {
+                if *wp > POWER_THRESHOLDS.max {
+                    return Err(VerifyError::PowerLevelOutOfRange);
+                }
+            }
+            // Note: NO value-matching check against prior_state. Two
+            // mods independently renaming a channel to the same name
+            // would otherwise cause CRDT log divergence based on
+            // receive order. materialize handles redundant modifies
+            // idempotently (the get_mut + only-Some-applies pattern
+            // is no-op when values match). The slight log bloat (one
+            // extra event per redundant modify) is the cost of cross-
+            // blob safety.
+            //
+            // Note: ChannelModify on unknown channel_id is intentionally
+            // ALLOWED — DAG-sync may deliver Modify before Create;
+            // materialize safely no-ops on unknown.
+        }
+        MembershipEventKind::ChannelDelete { channel_id: _ } => {
+            if actor_power < POWER_THRESHOLDS.kick {
+                return Err(VerifyError::ChannelAdminInsufficientPower);
+            }
+            // Note: NO prior_state-dependent rejection on the receive
+            // path. Cross-blob ordering can deliver Delete before its
+            // corresponding Create, OR can deliver two Deletes in
+            // reverse order at different replicas. Verify-time rejection
+            // would cause CRDT log divergence between replicas without
+            // gaining materialized-view convergence (materialize handles
+            // unknown deletes as a safe no-op, and tombstone updates
+            // are first-delete-wins idempotent).
+            //
+            // Local UX safeguards live in the IPC preflight checks:
+            // delete_channel rejects "no such channel" / "already
+            // deleted" against the local materialized view before
+            // signing, catching the common-case user error. The race
+            // window between IPC preflight and engine insert produces
+            // at most a redundant tombstone event in the log; UX-wise
+            // both delete attempts return Ok.
         }
     }
 
