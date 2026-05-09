@@ -158,15 +158,30 @@ pub struct ChannelPostPayload<'a> {
 
 /// The signed-set tuple. Canonical CBOR of this is what `sg` covers
 /// AND what the SHA-256 (event_id derivation) hashes.
+///
+/// Same-length-keys invariant: all field renames are 2-char codes
+/// matching the corresponding wire codes on `SignedChannelEvent::Post`.
+/// This makes the canonical CBOR of the signed-set field-by-field
+/// identical to `Post` minus the `sg` field — so cross-language
+/// re-implementations using strict RFC 8949 §4.2.1 ordering compute
+/// the same hash bytes for the signature.
 #[derive(Serialize)]
 struct ChannelPostSignedSet<'a> {
+    #[serde(rename = "id")]
     id: &'a MessageId,
+    #[serde(rename = "ci")]
     community_id: &'a SpaceId,
+    #[serde(rename = "ch")]
     channel_id: &'a ChannelId,
+    #[serde(rename = "au")]
     author: &'a OwnerAddr,
+    #[serde(rename = "at")]
     at: &'a Hlc,
+    #[serde(rename = "kd")]
     content_kind: u8,
+    #[serde(rename = "bd")]
     body: &'a str,
+    #[serde(rename = "rt", skip_serializing_if = "Option::is_none")]
     reply_to: &'a Option<MessageId>,
 }
 
@@ -263,7 +278,7 @@ fn signed_set_canonical_cbor(event: &SignedChannelEvent) -> Result<Vec<u8>, Chan
         content_kind,
         body,
         reply_to,
-        ..
+        sig: _,
     } = event;
     let signed_set = ChannelPostSignedSet {
         id,
@@ -421,11 +436,11 @@ mod tests {
         let (payload, key) = fixture_payload("verify me");
         let signed = sign_channel_event(&payload, &key).expect("sign");
         let canon = signed_set_canonical_cbor(&signed).expect("canon");
-        let SignedChannelEvent::Post { sig, author, .. } = &signed;
+        let SignedChannelEvent::Post { sig, .. } = &signed;
         let pubkey = key.verifying_key();
-        // Author addr should be derivable from pubkey in production; here
-        // we just verify the signature against the explicit pubkey.
-        let _ = author;
+        // Note: in production the author addr would be derived from
+        // the identity pubkey via the resolver; here we just verify
+        // the signature against the explicit pubkey directly.
         pubkey
             .verify(&canon, &ed25519_dalek::Signature::from_bytes(sig))
             .expect("ed25519 verify");
