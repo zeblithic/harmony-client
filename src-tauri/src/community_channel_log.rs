@@ -26,6 +26,7 @@ use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 
 /// Symmetric key for one channel's wire encryption. Derived
 /// deterministically from `(MembershipKey, community_id, channel_id)`
@@ -366,8 +367,6 @@ pub fn decrypt_channel_packet(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
-use std::collections::BTreeMap;
-
 /// Per-(channel, author, device) HLC monotonicity check. Records the
 /// highest `Hlc` seen for each triple; rejects any new event whose
 /// HLC is not strictly greater (by sort-key).
@@ -409,10 +408,12 @@ impl ChannelLogReplayTracker {
         } = event;
         let key = (*channel_id, *author, at.device_id.clone());
         if let Some(prev) = self.last_seen.get(&key) {
-            // Strict monotonicity by sort-key: (wall_ms, logical, device_id).
-            // device_id is constant within this key, so really just
-            // (wall_ms, logical).
-            if (at.wall_ms, at.logical) <= (prev.wall_ms, prev.logical) {
+            // Use the canonical Hlc sort-key comparator from
+            // `owner_state_types::Hlc::is_strictly_newer_than` — same
+            // definition `CommunityRootHlcTracker::would_accept` uses.
+            // device_id is constant within this key, so the comparator
+            // behaves as if comparing (wall_ms, logical) only.
+            if !at.is_strictly_newer_than(prev) {
                 return Err(ChannelEventError::Replay {
                     event_id: *id,
                     author: *author,
@@ -425,8 +426,11 @@ impl ChannelLogReplayTracker {
         Ok(())
     }
 
-    /// Snapshot of the current tracker state. Useful for tests + Phase 3
-    /// engine startup (rebuild from persisted segments + tail).
+    /// Read-only snapshot of the current tracker state. Used by tests
+    /// to assert tracker fidelity. (Phase 3's engine, when it loads a
+    /// persisted log, will rebuild the tracker by walking events
+    /// through `check_and_advance` rather than restoring this map
+    /// directly — there's no public write seam.)
     pub fn last_seen(&self) -> &BTreeMap<(ChannelId, OwnerAddr, String), Hlc> {
         &self.last_seen
     }
@@ -723,5 +727,92 @@ mod tests {
         t.check_and_advance(&e_a).expect("a-dev recent");
         t.check_and_advance(&e_b)
             .expect("b-dev's earlier wall time is fine — distinct device lane");
+    }
+
+    #[test]
+    fn replay_tracker_independent_lanes_per_channel() {
+        // Same author + same device, but two different channels.
+        // The tracker key includes channel_id, so each channel has
+        // its own monotone lane; an earlier-walled event on channel B
+        // is fine even after a later-walled event on channel A.
+        let mut t = ChannelLogReplayTracker::new();
+        let key = fixture_signing_key(0xa1);
+        let payload_a = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+        };
+        let payload_b = ChannelPostPayload {
+            id: MessageId([0x22; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x02),
+            author: fixture_owner_addr(0xa1),
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+            content_kind: 0,
+            body: "y",
+            reply_to: None,
+        };
+        let event_a = sign_channel_event(&payload_a, &key).expect("sign a");
+        let event_b = sign_channel_event(&payload_b, &key).expect("sign b");
+        t.check_and_advance(&event_a).expect("ch=01 wall=200");
+        t.check_and_advance(&event_b)
+            .expect("ch=02 wall=100 must accept — distinct channel lane");
+    }
+
+    #[test]
+    fn replay_tracker_independent_lanes_per_author() {
+        // Same channel + same device, but two different authors.
+        // The tracker key includes author, so each author has its
+        // own monotone lane within a channel.
+        let mut t = ChannelLogReplayTracker::new();
+        let key_a = fixture_signing_key(0xa1);
+        let key_b = fixture_signing_key(0xb2);
+        let payload_a = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "shared-dev".into(),
+            },
+            content_kind: 0,
+            body: "x",
+            reply_to: None,
+        };
+        let payload_b = ChannelPostPayload {
+            id: MessageId([0x22; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xb2),
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "shared-dev".into(),
+            },
+            content_kind: 0,
+            body: "y",
+            reply_to: None,
+        };
+        let event_a = sign_channel_event(&payload_a, &key_a).expect("sign a");
+        let event_b = sign_channel_event(&payload_b, &key_b).expect("sign b");
+        t.check_and_advance(&event_a)
+            .expect("author=alice wall=200");
+        t.check_and_advance(&event_b)
+            .expect("author=bob wall=100 must accept — distinct author lane");
     }
 }
