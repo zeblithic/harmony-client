@@ -28,7 +28,7 @@ use sha2::Sha256;
 /// key without out-of-band coordination. v3 will use this seam to
 /// add private channels (distribute the ChannelKey to a subset of
 /// members) without a wire-format break.
-#[derive(Clone)]
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct ChannelKey(#[cfg_attr(not(test), allow(dead_code))] [u8; 32]);
 
 impl ChannelKey {
@@ -65,11 +65,11 @@ pub fn derive_channel_key(
     let mut info = Vec::with_capacity(8 + 16);
     info.extend_from_slice(b"channel:");
     info.extend_from_slice(&channel_id.0[..]);
-    let mut out = [0u8; 32];
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(&salt), mk.as_bytes())
-        .expand(&info, &mut out)
+        .expand(&info, out.as_mut())
         .expect("32 ≤ 8160");
-    ChannelKey(out)
+    ChannelKey(*out)
 }
 
 #[cfg(test)]
@@ -135,5 +135,15 @@ mod tests {
             k_b.as_bytes(),
             "different membership keys must yield distinct channel keys"
         );
+    }
+
+    #[test]
+    fn channel_key_zeroize_on_drop() {
+        // Use ZeroizeOnDrop's invariant: dropping the wrapper zeros the
+        // underlying [u8; 32]. We can't easily observe the freed memory,
+        // but we can verify the trait is implemented by constraining a
+        // generic function.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ChannelKey>();
     }
 }
