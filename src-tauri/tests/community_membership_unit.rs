@@ -2857,9 +2857,10 @@ fn materialize_channel_delete_tombstones_in_place() {
 fn materialize_channel_modify_on_unknown_channel_is_noop() {
     // ChannelModify referencing a channel that doesn't exist is silently
     // ignored — defense-in-depth against an event arriving before its
-    // ChannelCreate (DAG-sync may reorder; verify_event will reject this
-    // case in Task 3 anyway, but materialize must be safe even if a
-    // malformed event slips past).
+    // ChannelCreate. `verify_event` intentionally allows this case for
+    // replica convergence (cross-blob ordering can deliver Modify before
+    // Create), so materialize must remain a safe no-op until the missing
+    // create shows up in a later replay.
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
         id: [0x01; 16],

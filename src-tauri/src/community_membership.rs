@@ -647,6 +647,15 @@ pub struct MaterializedMembership {
     /// CBOR requires deterministic key order at every map-typed nesting
     /// level — `HashMap` iteration is non-deterministic and would
     /// break byte-equality across replicas.
+    ///
+    /// `#[serde(default)]` for forward/backward compat: any cached or
+    /// persisted `MaterializedMembership` from before the channels
+    /// field existed (Sub-C v1) deserializes with an empty channels
+    /// map rather than failing decode. v2-and-beyond persists channel
+    /// state via the underlying event log — `materialize` rebuilds
+    /// the channels map from events on each call — so the wire form
+    /// is functionally a derived view; the default is harmless.
+    #[serde(default)]
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
 }
 
