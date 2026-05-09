@@ -572,6 +572,265 @@ where
     Ok(())
 }
 
+use std::path::PathBuf;
+
+/// Configuration for `ChannelLog::new`. Production passes
+/// `DEFAULT_SEAL_THRESHOLD_EVENTS`; tests pass a smaller value to
+/// exercise seal/reload paths in reasonable time.
+#[derive(Clone, Debug)]
+pub struct ChannelLogConfig {
+    /// Number of events in `tail` that triggers a seal. After seal,
+    /// tail is reset to empty and a new SegmentDescriptor is appended
+    /// to the manifest.
+    pub seal_threshold_events: usize,
+}
+
+/// Per spec §8 — production seal threshold. Tests should override
+/// to a small value (e.g., 8) via `ChannelLogConfig`.
+pub const DEFAULT_SEAL_THRESHOLD_EVENTS: usize = 1024;
+
+impl Default for ChannelLogConfig {
+    fn default() -> Self {
+        Self {
+            seal_threshold_events: DEFAULT_SEAL_THRESHOLD_EVENTS,
+        }
+    }
+}
+
+/// Per-channel segmented append-only log. In-memory `tail` plus
+/// sealed segments on disk referenced by a manifest.
+///
+/// Per spec §8.
+#[derive(Debug)]
+pub struct ChannelLog {
+    pub manifest: ChannelLogManifest,
+    pub tail: Vec<SignedChannelEvent>,
+    config: ChannelLogConfig,
+    /// Root directory: `<identity_dir>/communities/{cid_hex}/channels/{ch_id_hex}/`.
+    /// Manifest at `root/manifest.cbor`, tail at `root/tail.cbor`,
+    /// sealed segments at `root/segments/{N:08x}.cbor`.
+    root: PathBuf,
+}
+
+/// On-disk index of sealed segments + the path to the active tail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLogManifest {
+    pub community_id: SpaceId,
+    pub channel_id: ChannelId,
+    /// Ordered ascending by `range.0` (first-event HLC) for fast
+    /// backfill walk in Phase 3.
+    pub segments: Vec<SegmentDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentDescriptor {
+    /// `(first_event.at, last_event.at)` inclusive. Used by Phase 3
+    /// backfill to filter which segments overlap a `since` query.
+    pub range: (Hlc, Hlc),
+    pub count: u32,
+    pub handle: SegmentHandle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SegmentHandle {
+    /// v2: local-disk segment, path relative to the channel's root dir.
+    #[serde(rename = "f")]
+    LocalFile { rel_path: String },
+    // v3 reserved (additive — no v2 wire-format break):
+    // #[serde(rename = "c")] CasBook { cid: ContentId },
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ChannelLogPersistError {
+    #[error("io: {0}")]
+    Io(String),
+    #[error("cbor encode: {0}")]
+    CborEncode(String),
+    #[error("cbor decode: {0}")]
+    CborDecode(String),
+    #[error("manifest mismatch: expected {expected:?}, got {got:?}")]
+    Manifest { expected: String, got: String },
+}
+
+impl From<std::io::Error> for ChannelLogPersistError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.to_string())
+    }
+}
+
+impl ChannelLog {
+    /// Build a fresh empty log. Doesn't touch disk — `flush_tail` and
+    /// `seal_and_persist` are explicit. The Phase 3 engine will call
+    /// `reload` on startup if the directory already exists.
+    pub fn new(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        root: PathBuf,
+        config: ChannelLogConfig,
+    ) -> Self {
+        Self {
+            manifest: ChannelLogManifest {
+                community_id,
+                channel_id,
+                segments: Vec::new(),
+            },
+            tail: Vec::new(),
+            config,
+            root,
+        }
+    }
+
+    /// Push an already-verified event onto the tail. Returns `true`
+    /// if the seal threshold was reached after this push (caller should
+    /// then call `seal_and_persist` to flush). Returns `false`
+    /// otherwise. Pure / sync / no I/O.
+    pub fn append(&mut self, event: SignedChannelEvent) -> bool {
+        self.tail.push(event);
+        self.tail.len() >= self.config.seal_threshold_events
+    }
+
+    /// Persist the active tail to `root/tail.cbor`. Atomic-rename via
+    /// `tempfile`. Idempotent; safe to call repeatedly.
+    ///
+    /// Also persists `root/manifest.cbor` if it doesn't already exist
+    /// on disk. This preserves the invariant that any persisted tail is
+    /// recoverable on reload (which requires a manifest to validate
+    /// community/channel binding before loading the tail).
+    pub fn flush_tail(&self) -> Result<(), ChannelLogPersistError> {
+        std::fs::create_dir_all(&self.root)?;
+        let manifest_path = self.root.join("manifest.cbor");
+        if !manifest_path.exists() {
+            let mut man_bytes = Vec::with_capacity(256);
+            ciborium::into_writer(&self.manifest, &mut man_bytes)
+                .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+            crate::owner_state_persist::save_atomically(&manifest_path, &man_bytes)
+                .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        }
+        let mut bytes = Vec::with_capacity(1024);
+        ciborium::into_writer(&self.tail, &mut bytes)
+            .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+        let tail_path = self.root.join("tail.cbor");
+        crate::owner_state_persist::save_atomically(&tail_path, &bytes)
+            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Seal the current tail to a new segment file and append a
+    /// SegmentDescriptor to the manifest. Resets the in-memory tail
+    /// to empty and re-persists both manifest and (now-empty) tail.
+    /// Atomic per-file via `save_atomically`.
+    ///
+    /// Idempotent at the manifest level — a crash between segment
+    /// write and manifest update will leave an orphaned segment file
+    /// that the next startup can rediscover (Phase 3 may add explicit
+    /// orphan recovery; v2 reload tolerates extra files in segments/).
+    pub fn seal_and_persist(&mut self) -> Result<(), ChannelLogPersistError> {
+        if self.tail.is_empty() {
+            // Nothing to seal. No-op.
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.root.join("segments"))?;
+        let next_index = self.manifest.segments.len() as u32;
+        let rel_path = format!("segments/{:08x}.cbor", next_index);
+        let abs_path = self.root.join(&rel_path);
+        let mut seg_bytes = Vec::with_capacity(64 * self.tail.len());
+        ciborium::into_writer(&self.tail, &mut seg_bytes)
+            .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+        crate::owner_state_persist::save_atomically(&abs_path, &seg_bytes)
+            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        let first = self.tail.first().expect("tail non-empty checked above");
+        let last = self.tail.last().expect("tail non-empty checked above");
+        let (first_at, last_at) = match (first, last) {
+            (SignedChannelEvent::Post { at: a, .. }, SignedChannelEvent::Post { at: b, .. }) => {
+                (a.clone(), b.clone())
+            }
+        };
+        self.manifest.segments.push(SegmentDescriptor {
+            range: (first_at, last_at),
+            count: self.tail.len() as u32,
+            handle: SegmentHandle::LocalFile { rel_path },
+        });
+        // Persist manifest BEFORE clearing tail. If we crash after
+        // segment + manifest writes, the cleared tail is recovered as
+        // empty on reload — fine, the events are now in the segment.
+        let mut man_bytes = Vec::with_capacity(256);
+        ciborium::into_writer(&self.manifest, &mut man_bytes)
+            .map_err(|e| ChannelLogPersistError::CborEncode(e.to_string()))?;
+        crate::owner_state_persist::save_atomically(&self.root.join("manifest.cbor"), &man_bytes)
+            .map_err(|e| ChannelLogPersistError::Io(e.to_string()))?;
+        self.tail.clear();
+        self.flush_tail()?;
+        Ok(())
+    }
+
+    /// Reload from disk. Reads manifest.cbor + tail.cbor, replays
+    /// every sealed segment in manifest order, then loads the tail.
+    /// Returns the count of events recovered (sum across segments + tail).
+    ///
+    /// If `root` doesn't exist, returns a fresh empty log.
+    pub fn reload(
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        root: PathBuf,
+        config: ChannelLogConfig,
+    ) -> Result<(Self, usize), ChannelLogPersistError> {
+        let manifest_path = root.join("manifest.cbor");
+        if !manifest_path.exists() {
+            return Ok((Self::new(community_id, channel_id, root, config), 0));
+        }
+        let manifest_bytes = std::fs::read(&manifest_path)?;
+        let manifest: ChannelLogManifest = ciborium::from_reader(manifest_bytes.as_slice())
+            .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?;
+        if manifest.community_id != community_id {
+            return Err(ChannelLogPersistError::Manifest {
+                expected: format!("{:?}", community_id),
+                got: format!("{:?}", manifest.community_id),
+            });
+        }
+        if manifest.channel_id != channel_id {
+            return Err(ChannelLogPersistError::Manifest {
+                expected: format!("{:?}", channel_id),
+                got: format!("{:?}", manifest.channel_id),
+            });
+        }
+        // Count segment events. Segments themselves are read on demand
+        // by the Phase 3 backfill code; reload doesn't materialize
+        // them all into memory (could be megabytes per segment).
+        let segment_count: usize = manifest.segments.iter().map(|s| s.count as usize).sum();
+        let tail_path = root.join("tail.cbor");
+        let tail: Vec<SignedChannelEvent> = if tail_path.exists() {
+            let bytes = std::fs::read(&tail_path)?;
+            ciborium::from_reader(bytes.as_slice())
+                .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let total = segment_count + tail.len();
+        Ok((
+            Self {
+                manifest,
+                tail,
+                config,
+                root,
+            },
+            total,
+        ))
+    }
+
+    /// Read all events from a sealed segment. Used by Phase 3 backfill.
+    /// Phase 2 ships this for tests (verify seal/reload byte-equality).
+    pub fn read_segment(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
+        let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
+        let abs_path = self.root.join(rel_path);
+        let bytes = std::fs::read(&abs_path)?;
+        ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| ChannelLogPersistError::CborDecode(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,5 +1596,217 @@ mod tests {
             matches!(err, ChannelEventError::Misroute { .. }),
             "earliest failure (step 3 misroute) must win, got {err:?}"
         );
+    }
+
+    #[test]
+    fn channel_log_append_below_threshold_no_seal_signal() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+        );
+        for i in 0..7 {
+            let event = fixture_signed_event(100_000 + i, 0, "a-dev");
+            assert!(!log.append(event), "below threshold must not signal seal");
+        }
+        assert_eq!(log.tail.len(), 7);
+        assert!(log.manifest.segments.is_empty());
+    }
+
+    #[test]
+    fn channel_log_append_at_threshold_signals_seal() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        );
+        for i in 0..3 {
+            assert!(!log.append(fixture_signed_event(100_000 + i, 0, "a-dev")));
+        }
+        assert!(
+            log.append(fixture_signed_event(103_000, 0, "a-dev")),
+            "fourth event must signal seal at threshold=4"
+        );
+    }
+
+    #[test]
+    fn channel_log_seal_and_persist_round_trip() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        );
+        // Fill exactly threshold worth of events.
+        let originals: Vec<SignedChannelEvent> = (0..4)
+            .map(|i| fixture_signed_event(100_000 + (i as u64) * 1000, 0, "a-dev"))
+            .collect();
+        for ev in &originals {
+            log.append(ev.clone());
+        }
+        log.seal_and_persist().expect("seal");
+        // After seal: tail empty, manifest grew by one, segment file exists.
+        assert!(log.tail.is_empty());
+        assert_eq!(log.manifest.segments.len(), 1);
+        assert!(root.join("segments/00000000.cbor").exists());
+        assert!(root.join("manifest.cbor").exists());
+        assert!(root.join("tail.cbor").exists());
+        // Reload: byte-identical events recovered.
+        let (reloaded, total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 4,
+            },
+        )
+        .expect("reload");
+        assert_eq!(total, 4);
+        assert_eq!(reloaded.manifest.segments.len(), 1);
+        assert!(reloaded.tail.is_empty());
+        let segment_events = reloaded
+            .read_segment(&reloaded.manifest.segments[0])
+            .expect("read segment");
+        assert_eq!(segment_events, originals);
+    }
+
+    #[test]
+    fn channel_log_reload_recovers_tail_only() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+        );
+        let originals: Vec<SignedChannelEvent> = (0..3)
+            .map(|i| fixture_signed_event(100_000 + (i as u64) * 1000, 0, "a-dev"))
+            .collect();
+        for ev in &originals {
+            log.append(ev.clone());
+        }
+        log.flush_tail().expect("flush");
+        let (reloaded, total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+        )
+        .expect("reload");
+        assert_eq!(total, 3);
+        assert!(reloaded.manifest.segments.is_empty());
+        assert_eq!(reloaded.tail, originals);
+    }
+
+    #[test]
+    fn channel_log_reload_fresh_dir_returns_empty() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (log, total) = ChannelLog::reload(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        )
+        .expect("reload empty dir");
+        assert_eq!(total, 0);
+        assert!(log.tail.is_empty());
+        assert!(log.manifest.segments.is_empty());
+    }
+
+    #[test]
+    fn channel_log_reload_rejects_wrong_community() {
+        let cid = fixture_community(0xc0);
+        let other = fixture_community(0xff);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(cid, chid, root.clone(), ChannelLogConfig::default());
+        log.append(fixture_signed_event(100_000, 0, "a-dev"));
+        log.flush_tail().expect("flush");
+        log.seal_and_persist().expect("seal");
+        let err = ChannelLog::reload(other, chid, root, ChannelLogConfig::default())
+            .expect_err("manifest community mismatch must reject");
+        assert!(matches!(err, ChannelLogPersistError::Manifest { .. }));
+    }
+
+    #[test]
+    fn channel_log_seal_idempotent_on_empty_tail() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        log.seal_and_persist().expect("seal empty");
+        assert!(log.manifest.segments.is_empty());
+        log.seal_and_persist().expect("seal empty again");
+        assert!(log.manifest.segments.is_empty());
+    }
+
+    #[test]
+    fn channel_log_multiple_seals_grow_manifest() {
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            root.clone(),
+            ChannelLogConfig {
+                seal_threshold_events: 2,
+            },
+        );
+        // Two seals × 2 events each = 4 total.
+        for i in 0..4u64 {
+            log.append(fixture_signed_event(100_000 + i * 1000, 0, "a-dev"));
+            if log.tail.len() >= 2 {
+                log.seal_and_persist().expect("seal");
+            }
+        }
+        assert_eq!(log.manifest.segments.len(), 2);
+        assert!(root.join("segments/00000000.cbor").exists());
+        assert!(root.join("segments/00000001.cbor").exists());
+        let (reloaded, total) = ChannelLog::reload(
+            cid,
+            chid,
+            root,
+            ChannelLogConfig {
+                seal_threshold_events: 2,
+            },
+        )
+        .expect("reload");
+        assert_eq!(total, 4);
+        assert_eq!(reloaded.manifest.segments.len(), 2);
     }
 }
