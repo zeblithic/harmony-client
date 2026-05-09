@@ -4,6 +4,17 @@ import { POWER_THRESHOLDS, type CommunityMember } from './types';
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
 
+/**
+ * Mirrors `RedeemInviteResultDto` in src-tauri/src/lib.rs (ZEB-265).
+ * Returned from `redeem_invite` so the caller can render a real
+ * community name + record the kind without re-decoding the invite URL.
+ */
+export interface RedeemInviteResultDto {
+  communityId: string;
+  communityName: string;
+  isInviteOnly: boolean;
+}
+
 interface HlcDto { wallMs: number; logical: number; deviceId: string; }
 interface MemberInfoDto {
   addr: string;
@@ -38,10 +49,13 @@ export class CommunityService {
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
   private degraded: Map<string, boolean> = new Map();
-  // Per-community kind, recorded locally for communities the user
-  // creates this session. Backend doesn't yet expose kind on the wire
-  // (open follow-up), so for redeemed/foreign communities we return
-  // 'unknown' rather than fabricating a value.
+  // Per-community kind. Populated by createCommunity (from the
+  // user-supplied argument) and redeemInvite (from
+  // RedeemInviteResultDto.isInviteOnly — ZEB-265). Communities the
+  // current session has neither created nor redeemed (e.g. foreign
+  // communities surfaced via cross-device sync, before any IPC
+  // round-trip) will not have an entry here, and getKind() returns
+  // 'unknown' for those.
   private knownKinds: Map<string, 'open' | 'invite-only'> = new Map();
   private unlisteners: Array<() => void> = [];
 
@@ -79,8 +93,13 @@ export class CommunityService {
     return id;
   }
 
-  async redeemInvite(url: string): Promise<string> {
-    return this.invoke<string>('redeem_invite', { url });
+  async redeemInvite(url: string): Promise<RedeemInviteResultDto> {
+    const dto = await this.invoke<RedeemInviteResultDto>('redeem_invite', { url });
+    // Now that the backend hands back the kind, redeemed/foreign
+    // communities can populate `getKind()` correctly instead of
+    // returning 'unknown'. ZEB-265.
+    this.knownKinds.set(dto.communityId, dto.isInviteOnly ? 'invite-only' : 'open');
+    return dto;
   }
 
   async leaveCommunity(communityId: string): Promise<void> {
@@ -122,9 +141,10 @@ export class CommunityService {
     return this.degraded.get(communityId) ?? false;
   }
 
-  /** Returns the locally-known kind for a community, or 'unknown' for
-   *  redeemed/foreign communities (until backend exposes kind on the
-   *  wire). Callers should render kind-specific UI conditionally on
+  /** Returns the locally-known kind for a community, or 'unknown'
+   *  when neither createCommunity nor redeemInvite has run for it in
+   *  this session (e.g. foreign communities surfaced via cross-device
+   *  sync). Callers should render kind-specific UI conditionally on
    *  this not being 'unknown' rather than assuming a default. */
   getKind(communityId: string): 'open' | 'invite-only' | 'unknown' {
     return this.knownKinds.get(communityId) ?? 'unknown';

@@ -423,10 +423,14 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     )
     .await;
 
-    assert!(
-        result.is_ok(),
-        "invite-only redeem must succeed; got {result:?}"
-    );
+    let dto = result.expect("invite-only redeem must succeed");
+    // ZEB-265: redeem_invite returns the invite's community_name + kind
+    // so the frontend can render a real name (no more
+    // `Community ${id.slice(0,8)}` placeholder) without re-decoding the
+    // URL.
+    assert_eq!(dto.community_id, hex::encode(community_id.0));
+    assert_eq!(dto.community_name, "InviteOnly");
+    assert!(dto.is_invite_only);
 
     // Alice's engine has admin Join + counter-signed Bob Join. Bob
     // materializes as Joined on Alice's side (counter-sig completes
