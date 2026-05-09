@@ -3018,7 +3018,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
 }
 
 #[test]
-fn verify_event_channel_modify_accepts_at_kick_threshold() {
+fn verify_event_channel_create_accepts_at_kick_threshold() {
     // A mod (power exactly 50, the kick threshold) is allowed to modify channels.
     let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let (mod_priv, mod_pub, mod_addr) = make_test_identity(0xBB);
