@@ -366,6 +366,72 @@ pub fn decrypt_channel_packet(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
+use std::collections::BTreeMap;
+
+/// Per-(channel, author, device) HLC monotonicity check. Records the
+/// highest `Hlc` seen for each triple; rejects any new event whose
+/// HLC is not strictly greater (by sort-key).
+///
+/// Keys: `(ChannelId, OwnerAddr, String /* device_id */)`. Mirrors the
+/// shape of `CommunityRootHlcTracker` (per-device tracking, not
+/// per-author). Storage grows linearly with the number of distinct
+/// authoring devices that have ever posted in each channel.
+///
+/// Per spec §7 step 6.
+#[derive(Default, Debug, Clone)]
+pub struct ChannelLogReplayTracker {
+    last_seen: BTreeMap<(ChannelId, OwnerAddr, String), Hlc>,
+}
+
+impl ChannelLogReplayTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check + advance the tracker for an incoming event. Returns Ok
+    /// if the event is strictly newer than the last seen for this
+    /// (channel, author, device) triple, or never-seen. Returns
+    /// `Err(Replay)` otherwise.
+    ///
+    /// On Ok, the tracker is bumped to this event's HLC. Concurrent
+    /// callers must serialize externally — the tracker holds
+    /// `&mut self` and is not internally locked.
+    pub fn check_and_advance(
+        &mut self,
+        event: &SignedChannelEvent,
+    ) -> Result<(), ChannelEventError> {
+        let SignedChannelEvent::Post {
+            channel_id,
+            author,
+            at,
+            id,
+            ..
+        } = event;
+        let key = (*channel_id, *author, at.device_id.clone());
+        if let Some(prev) = self.last_seen.get(&key) {
+            // Strict monotonicity by sort-key: (wall_ms, logical, device_id).
+            // device_id is constant within this key, so really just
+            // (wall_ms, logical).
+            if (at.wall_ms, at.logical) <= (prev.wall_ms, prev.logical) {
+                return Err(ChannelEventError::Replay {
+                    event_id: *id,
+                    author: *author,
+                    device_id: at.device_id.clone(),
+                    at: at.clone(),
+                });
+            }
+        }
+        self.last_seen.insert(key, at.clone());
+        Ok(())
+    }
+
+    /// Snapshot of the current tracker state. Useful for tests + Phase 3
+    /// engine startup (rebuild from persisted segments + tail).
+    pub fn last_seen(&self) -> &BTreeMap<(ChannelId, OwnerAddr, String), Hlc> {
+        &self.last_seen
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +652,76 @@ mod tests {
                 "len {len} should produce MalformedPacket({len}), got {err:?}"
             );
         }
+    }
+
+    fn fixture_signed_event(at_wall: u64, at_logical: u32, device: &str) -> SignedChannelEvent {
+        let key = fixture_signing_key(0xa1);
+        let payload = ChannelPostPayload {
+            id: MessageId([0x11; 16]),
+            community_id: fixture_community(0xc0),
+            channel_id: fixture_channel(0x01),
+            author: fixture_owner_addr(0xa1),
+            at: Hlc {
+                wall_ms: at_wall,
+                logical: at_logical,
+                device_id: device.to_string(),
+            },
+            content_kind: 0,
+            body: "test",
+            reply_to: None,
+        };
+        sign_channel_event(&payload, &key).expect("sign")
+    }
+
+    #[test]
+    fn replay_tracker_accepts_strictly_monotone() {
+        let mut t = ChannelLogReplayTracker::new();
+        let e1 = fixture_signed_event(100, 0, "a-dev");
+        let e2 = fixture_signed_event(200, 0, "a-dev");
+        t.check_and_advance(&e1).expect("first event");
+        t.check_and_advance(&e2)
+            .expect("strictly monotone follow-up");
+    }
+
+    #[test]
+    fn replay_tracker_accepts_logical_bump_on_same_wall() {
+        let mut t = ChannelLogReplayTracker::new();
+        let e1 = fixture_signed_event(100, 0, "a-dev");
+        let e2 = fixture_signed_event(100, 1, "a-dev");
+        t.check_and_advance(&e1).expect("first");
+        t.check_and_advance(&e2).expect("logical bump");
+    }
+
+    #[test]
+    fn replay_tracker_rejects_duplicate() {
+        let mut t = ChannelLogReplayTracker::new();
+        let e1 = fixture_signed_event(100, 0, "a-dev");
+        t.check_and_advance(&e1).expect("first");
+        let err = t
+            .check_and_advance(&e1)
+            .expect_err("identical event must replay-reject");
+        assert!(matches!(err, ChannelEventError::Replay { .. }));
+    }
+
+    #[test]
+    fn replay_tracker_rejects_stale() {
+        let mut t = ChannelLogReplayTracker::new();
+        let recent = fixture_signed_event(200, 0, "a-dev");
+        let stale = fixture_signed_event(100, 0, "a-dev");
+        t.check_and_advance(&recent).expect("recent");
+        let err = t
+            .check_and_advance(&stale)
+            .expect_err("stale event must replay-reject");
+        assert!(matches!(err, ChannelEventError::Replay { .. }));
+    }
+
+    #[test]
+    fn replay_tracker_independent_lanes_per_device() {
+        let mut t = ChannelLogReplayTracker::new();
+        let e_a = fixture_signed_event(200, 0, "a-dev");
+        let e_b = fixture_signed_event(100, 0, "b-dev");
+        t.check_and_advance(&e_a).expect("a-dev recent");
+        t.check_and_advance(&e_b)
+            .expect("b-dev's earlier wall time is fine — distinct device lane");
     }
 }
