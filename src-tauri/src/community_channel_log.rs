@@ -951,6 +951,21 @@ impl ChannelLog {
         // nor in-memory tail is mutated, so we can safely retry.
         let mut new_segments = self.manifest.segments.clone();
         new_segments.push(descriptor);
+        // Maintain the documented "ascending by range.0" invariant.
+        // verify_channel_event only guarantees per-(channel, author,
+        // device) HLC monotonicity — a late event from a new lane can
+        // produce a seal whose range.0 predates existing segments.
+        // Phase 3 backfill walks manifest.segments and depends on
+        // this ordering for "since N" filtering.
+        new_segments.sort_by(|a, b| {
+            if a.range.0.is_strictly_newer_than(&b.range.0) {
+                std::cmp::Ordering::Greater
+            } else if b.range.0.is_strictly_newer_than(&a.range.0) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
         let new_manifest = ChannelLogManifest {
             community_id: self.manifest.community_id,
             channel_id: self.manifest.channel_id,
@@ -1054,7 +1069,24 @@ impl ChannelLog {
         descriptor: &SegmentDescriptor,
     ) -> Result<Vec<SignedChannelEvent>, ChannelLogPersistError> {
         let SegmentHandle::LocalFile { rel_path } = &descriptor.handle;
-        let abs_path = self.root.join(rel_path);
+        // Validate before joining: rel_path comes from deserialized
+        // manifest.cbor, which a Phase 3 backfill peer could ship.
+        // Reject absolute paths, parent-directory escapes, and
+        // current-directory tricks; require the path to start with
+        // the segments/ prefix where seal_and_persist writes them.
+        let rel_path_p = std::path::Path::new(rel_path);
+        let valid = !rel_path_p.is_absolute()
+            && rel_path_p
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && rel_path_p.starts_with("segments");
+        if !valid {
+            return Err(ChannelLogPersistError::Io(format!(
+                "invalid segment path {:?} (must be a normalized relative path under segments/)",
+                rel_path
+            )));
+        }
+        let abs_path = self.root.join(rel_path_p);
         let bytes = std::fs::read(&abs_path)?;
         match bytes.split_first() {
             Some((&CHANNEL_LOG_SEGMENT_V1, rest)) => ciborium::from_reader(rest)
@@ -2139,5 +2171,102 @@ mod tests {
         .expect("reload");
         assert_eq!(total, 4);
         assert_eq!(reloaded.manifest.segments.len(), 2);
+    }
+
+    #[test]
+    fn channel_log_manifest_segments_sorted_by_range_start_after_late_seal() {
+        // Per-(channel, author, device) HLC monotonicity does NOT
+        // imply global HLC monotonicity across all events. A late
+        // seal containing events from a new lane can have a range.0
+        // that predates existing segments. Phase 3 backfill walks
+        // manifest.segments depending on the documented ascending-
+        // by-start invariant, so the manifest must be sorted after
+        // every seal regardless of seal arrival order.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig {
+                seal_threshold_events: 2,
+            },
+        );
+        // First seal: lane "a-dev" at wall=200.
+        log.append(fixture_signed_event(200, 0, "a-dev"));
+        log.append(fixture_signed_event(200, 1, "a-dev"));
+        log.seal_and_persist().expect("seal 1");
+        assert_eq!(log.manifest.segments.len(), 1);
+        // Second seal: lane "b-dev" at wall=100 (EARLIER than first
+        // seal — legitimate per per-lane monotonicity).
+        log.append(fixture_signed_event(100, 0, "b-dev"));
+        log.append(fixture_signed_event(100, 1, "b-dev"));
+        log.seal_and_persist().expect("seal 2");
+        assert_eq!(log.manifest.segments.len(), 2);
+        // Manifest must be sorted ascending by range.0 — the b-dev
+        // segment (range.0 wall=100) sorts BEFORE the a-dev segment
+        // (range.0 wall=200), even though b-dev was sealed second.
+        assert_eq!(
+            log.manifest.segments[0].range.0.wall_ms, 100,
+            "earliest segment by range.0 must come first"
+        );
+        assert_eq!(
+            log.manifest.segments[1].range.0.wall_ms, 200,
+            "later segment by range.0 must come second"
+        );
+    }
+
+    #[test]
+    fn channel_log_read_segment_rejects_path_traversal() {
+        // descriptor.handle.rel_path comes from deserialized
+        // manifest.cbor, which a Phase 3 backfill peer could ship
+        // hostile. read_segment must reject anything that's not a
+        // normalized relative path under segments/.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        // Construct a hostile descriptor with a parent-dir escape.
+        let hostile_paths = [
+            "../etc/passwd",
+            "../../secrets",
+            "/etc/passwd",
+            "segments/../../../etc/passwd",
+            "./segments/00000000.cbor", // leading "./" is also non-Normal
+            "other_dir/00000000.cbor",  // doesn't start with segments/
+        ];
+        for hostile in &hostile_paths {
+            let descriptor = SegmentDescriptor {
+                range: (
+                    Hlc {
+                        wall_ms: 100,
+                        logical: 0,
+                        device_id: "x".into(),
+                    },
+                    Hlc {
+                        wall_ms: 100,
+                        logical: 0,
+                        device_id: "x".into(),
+                    },
+                ),
+                count: 1,
+                handle: SegmentHandle::LocalFile {
+                    rel_path: hostile.to_string(),
+                },
+            };
+            let err = log
+                .read_segment(&descriptor)
+                .expect_err(&format!("hostile rel_path {hostile:?} must reject"));
+            assert!(
+                matches!(err, ChannelLogPersistError::Io(_)),
+                "hostile rel_path {hostile:?} must produce Io error, got {err:?}"
+            );
+        }
     }
 }
