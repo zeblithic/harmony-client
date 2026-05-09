@@ -78,7 +78,20 @@ pub fn derive_channel_key(
 /// 16-byte ULID identifying a single message within a channel.
 /// Generated client-side at post time. Stable identity for v3
 /// references (Edit/Delete/React variants will target this id).
-pub type MessageId = [u8; 16];
+///
+/// Tuple-struct newtype (not type alias) so the type system catches
+/// accidental substitution between message-IDs / event-IDs / channel-IDs
+/// at IPC boundaries; bstr serde keeps wire encoding compact (17 bytes
+/// vs CBOR array-of-u8 33 bytes for ULIDs with timestamp bytes ≥ 0x18).
+/// Mirrors the shape of `community_membership::ChannelId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MessageId(
+    #[serde(
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 16],
+);
 
 /// Static AAD bytes for ChaCha20-Poly1305 wrapping of channel events.
 /// v3 may extend with per-event AAD; for now this is a constant across
@@ -364,7 +377,7 @@ mod tests {
     ) -> (ChannelPostPayload<'static>, ed25519_dalek::SigningKey) {
         let key = fixture_signing_key(0xa1);
         let payload = ChannelPostPayload {
-            id: [0x11; 16],
+            id: MessageId([0x11; 16]),
             community_id: fixture_community(0xc0),
             channel_id: fixture_channel(0x01),
             author: fixture_owner_addr(0xa1),
