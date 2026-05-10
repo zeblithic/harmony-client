@@ -6,7 +6,7 @@
 //!
 //! See `docs/specs/2026-05-09-zeb-270-channel-log-zenoh-transport-design.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,13 +19,13 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, encrypt_channel_packet, sign_channel_event, verify_channel_event,
-    ChannelEventError, ChannelIdentityResolver, ChannelKey, ChannelLog, ChannelLogConfig,
-    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
-    MessageId, SignedChannelEvent,
+    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, sign_channel_event,
+    verify_channel_event, ChannelEventError, ChannelIdentityResolver, ChannelKey, ChannelLog,
+    ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload,
+    CommunityStateAtHlc, MessageId, SignedChannelEvent,
 };
-use crate::community_membership::ChannelId;
-use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::community_membership::{ChannelId, MaterializedMembership};
+use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -797,6 +797,389 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     }
 }
 
+impl<R: tauri::Runtime> ChannelLogEngine<R> {
+    /// Borrow the per-channel encryption key. Used by the registry's
+    /// `read_for_query` callback to encrypt backfill replies in the
+    /// same wire shape as live broadcast packets (spec §17.1).
+    pub(crate) fn channel_key_ref(&self) -> &ChannelKey {
+        self.channel_key.as_ref()
+    }
+}
+
+// ── Registry ───────────────────────────────────────────────────────────────
+
+/// Shared deps for every engine spawned by a single registry. Cloned
+/// (Arc-bumped) into the per-engine `ChannelLogEngineParams` at spawn
+/// time. Lifetime is the registry — `start_node` constructs it once
+/// per identity and stores the `Arc<ChannelLogRegistry>` on
+/// `NodeState` until `stop_inner` clears it.
+pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
+    /// Shared Zenoh session — every per-channel adapter is spawned
+    /// against this session via `event_loop::spawn_channel_log_zenoh_adapter`.
+    /// Production wiring sources this from the live `event_loop::run`
+    /// session (cloned from the same `Arc<zenoh::Session>` the
+    /// per-community state-CRDT adapters use). Tests build a throwaway
+    /// in-memory session via `zenoh::Config::default()`.
+    pub session: Arc<zenoh::Session>,
+    /// Tauri AppHandle — propagated into each engine for
+    /// `channel-message-received` / `channel-log-degraded` /
+    /// `channel-backfill-progress` event emission.
+    pub app: tauri::AppHandle<R>,
+    /// Filesystem root under which per-(community, channel) directories
+    /// live (`identity_dir/communities/{cid_hex}/channels/{ch_id_hex}/`).
+    /// Mirrors `CommunityRegistryConfig.identity_dir` — same convention.
+    pub identity_dir: PathBuf,
+    /// Local member's owner address. Stamped on every locally-minted
+    /// `ChannelPostPayload.author`; bound at registry construction so
+    /// every spawned engine shares the same self-identity.
+    pub self_owner: OwnerAddr,
+    /// Local stable device id. Used as the publisher key in HLC
+    /// reservation (`dm_outbox::reserve_next_hlc_for_device`) and as
+    /// the device_id field of every minted Hlc.
+    pub self_device_id: String,
+    /// Local Ed25519 signing key. Same Arc the community sync engine
+    /// and the DM outbox already share — sourced from `PrivateIdentity`
+    /// at `start_node` time. `Arc` so per-engine spawns are cheap (no
+    /// secret-byte copy).
+    pub signing_key: Arc<SigningKey>,
+    /// Per-engine tunables. Cloned into each engine; tests override
+    /// `log_config.seal_threshold_events` to exercise seal/reload
+    /// paths in reasonable time.
+    pub engine_config: ChannelLogEngineConfig,
+}
+
+/// Per-CommunitySyncEngine registry of running per-channel engines.
+/// Mirrors `community_state_sync::CommunitySyncRegistry` in shape:
+///   - idempotent `spawn` (returns existing Arc on duplicate)
+///   - clean `stop` (flushes engine, drops the entry — no in-memory
+///     tombstones; on-disk segments persist per spec §17.4)
+///   - `reconcile_from_state` is the boot-time / restart pass
+///   - `shutdown_all` is the stop-node hook
+///
+/// Lifetime: one registry per identity, constructed at `start_node`
+/// time alongside `CommunitySyncRegistry`, stored as
+/// `Option<Arc<...>>` on `NodeState`, cleared during `stop_inner`.
+///
+/// Lock-discipline: each map is held under its own
+/// `tokio::sync::Mutex`. The `spawn` flow takes the engines lock,
+/// performs the idempotency check, releases, does the engine + adapter
+/// construction off-lock, then re-takes the engines lock to insert.
+/// Concurrent spawns for the same `(cid, chid)` resolve to a single
+/// engine via the post-construction re-check (the second caller's
+/// engine + adapter are immediately stopped + dropped). The
+/// `adapter_handles` and `closings` maps are touched only after the
+/// engine map insert succeeds, so the three maps stay in sync.
+// Mutex<HashMap<(SpaceId, ChannelId), Arc<ChannelLogEngine<R>>>> tips
+// over clippy's type-complexity heuristic. Factoring out a `type` alias
+// for each map entry would be more code than it's worth — the three
+// fields are local to this struct, the layout is the documented spec
+// shape (per-key engine + per-key adapter + per-key closing flag), and
+// the existing `CommunitySyncRegistry` uses the same pattern without
+// being flagged because its inner type is shorter (`Arc<CommunitySyncEngine>`
+// without an `R` parameter). Allow at the struct level.
+#[allow(clippy::type_complexity)]
+pub struct ChannelLogRegistry<R: tauri::Runtime> {
+    engines: Mutex<HashMap<(SpaceId, ChannelId), Arc<ChannelLogEngine<R>>>>,
+    adapter_handles: Mutex<HashMap<(SpaceId, ChannelId), JoinHandle<()>>>,
+    closings: Mutex<HashMap<(SpaceId, ChannelId), Arc<AtomicBool>>>,
+    config: ChannelLogRegistryConfig<R>,
+}
+
+impl<R: tauri::Runtime> ChannelLogRegistry<R> {
+    pub fn new(config: ChannelLogRegistryConfig<R>) -> Arc<Self> {
+        Arc::new(Self {
+            engines: Mutex::new(HashMap::new()),
+            adapter_handles: Mutex::new(HashMap::new()),
+            closings: Mutex::new(HashMap::new()),
+            config,
+        })
+    }
+
+    /// Spawn engine + Zenoh adapter for one `(community_id, channel_id)`.
+    /// Idempotent — returns the existing Arc if already present (no new
+    /// engine spawned, no new adapter, no fs `create_dir_all`).
+    ///
+    /// `state_at_hlc`, `resolver`, `hlc_tracker` are passed through to
+    /// `ChannelLogEngineParams` unchanged. The caller (production:
+    /// the delta-consumer hook + `reconcile_from_state`; tests: the
+    /// fixture) is responsible for sourcing them from the matching
+    /// `CommunitySyncEngine`.
+    ///
+    /// On error the engine + adapter are not registered (the partial
+    /// `engines` insert is the commit point); the caller may retry.
+    pub async fn spawn(
+        self: &Arc<Self>,
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        channel_key: ChannelKey,
+        state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
+        resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
+        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    ) -> Result<Arc<ChannelLogEngine<R>>, ChannelLogEngineError> {
+        let key = (community_id, channel_id);
+
+        // Cheap pre-check under the engines lock — returns Arc-cloned
+        // existing engine on the duplicate path so we skip dir-creation,
+        // engine construction, adapter spawn, and the second insert.
+        {
+            let engines = self.engines.lock().await;
+            if let Some(existing) = engines.get(&key) {
+                return Ok(Arc::clone(existing));
+            }
+        }
+
+        let community_id_hex = hex::encode(community_id.0);
+        let channel_id_hex = hex::encode(channel_id.0);
+        let root_dir = self
+            .config
+            .identity_dir
+            .join("communities")
+            .join(&community_id_hex)
+            .join("channels")
+            .join(&channel_id_hex);
+        std::fs::create_dir_all(&root_dir).map_err(|e| {
+            ChannelLogEngineError::Persist(ChannelLogPersistError::Io(e.to_string()))
+        })?;
+
+        let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (query_request_tx, query_request_rx) = mpsc::channel::<BackfillQueryRequest>(8);
+
+        let params = ChannelLogEngineParams {
+            community_id,
+            channel_id,
+            channel_key: Arc::new(channel_key),
+            root_dir,
+            state_at_hlc,
+            resolver,
+            self_owner: self.config.self_owner,
+            self_device_id: self.config.self_device_id.clone(),
+            signing_key: Arc::clone(&self.config.signing_key),
+            hlc_tracker,
+            app: self.config.app.clone(),
+            config: self.config.engine_config.clone(),
+            publisher_tx,
+            subscriber_rx,
+            query_request_tx,
+        };
+        let engine = ChannelLogEngine::new(params).await?;
+
+        // `read_for_query` closure passed to the adapter's queryable
+        // task: maps a backfill query (since, limit) to a vec of
+        // encrypted packets — wire-identical to live broadcast (spec
+        // §17.1). Captures `Arc<engine>`. No cycle: the adapter holds
+        // the closure by `Arc`, and the closure holds `Arc<engine>`,
+        // but the adapter task itself is owned by the registry's
+        // `adapter_handles` map and dropped on `stop`. The engine has
+        // no back-reference to the adapter or its closure.
+        let engine_for_query = Arc::clone(&engine);
+        let read_for_query =
+            Arc::new(
+                move |since: Option<Hlc>,
+                      limit: usize|
+                      -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>,
+                > {
+                    let me = Arc::clone(&engine_for_query);
+                    Box::pin(async move {
+                        let events = match me.list_messages(since, limit).await {
+                            Ok(v) => v,
+                            Err(_) => return Vec::new(),
+                        };
+                        events
+                            .iter()
+                            .filter_map(|ev| encrypt_channel_packet(me.channel_key_ref(), ev).ok())
+                            .collect()
+                    })
+                },
+            );
+
+        let closing = Arc::new(AtomicBool::new(false));
+        let adapter_handle = crate::event_loop::spawn_channel_log_zenoh_adapter(
+            Arc::clone(&self.config.session),
+            community_id_hex,
+            channel_id_hex,
+            publisher_rx,
+            subscriber_tx,
+            query_request_rx,
+            read_for_query,
+            Arc::clone(&closing),
+        );
+
+        // Re-check under the lock — a concurrent spawn may have inserted
+        // for the same key while we were doing the heavy lifting above.
+        // Whoever inserts first wins; the loser's engine + adapter are
+        // shut down + dropped here (the registry maps never observe
+        // them, so external callers see the consistent winner).
+        {
+            let mut engines = self.engines.lock().await;
+            if let Some(existing) = engines.get(&key) {
+                let existing = Arc::clone(existing);
+                drop(engines);
+                // Best-effort cleanup of the loser. shutdown errors are
+                // logged but not surfaced — the winner's engine is what
+                // the caller gets back, and partial-cleanup of the loser
+                // is the recoverable case (worst outcome: a leaked
+                // tail.cbor write on the loser's path, harmless because
+                // the winner writes to the same file).
+                if let Err(e) = engine.shutdown().await {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        channel_id = ?channel_id,
+                        error = ?e,
+                        "channel-log spawn race: loser shutdown failed",
+                    );
+                }
+                closing.store(true, Ordering::SeqCst);
+                drop(adapter_handle);
+                return Ok(existing);
+            }
+            engines.insert(key, Arc::clone(&engine));
+        }
+        {
+            let mut handles = self.adapter_handles.lock().await;
+            handles.insert(key, adapter_handle);
+        }
+        {
+            let mut closings = self.closings.lock().await;
+            closings.insert(key, closing);
+        }
+
+        Ok(engine)
+    }
+
+    /// Stop engine and discard the entry. Idempotent — second call
+    /// (and stop-of-unknown) returns `Ok(())`. Per spec §17.4 the
+    /// in-memory entry is dropped; on-disk segments persist so a
+    /// subsequent re-spawn (e.g., admin re-creates the channel) reads
+    /// historical messages back.
+    ///
+    /// `engine.shutdown()` flushes the tail synchronously before the
+    /// background loops are released — by the time this returns, the
+    /// in-memory tail is durably written. The adapter task continues
+    /// until its closing-flag poll fires (≤1s); we drop the
+    /// `JoinHandle` immediately rather than awaiting it so `stop` is
+    /// fast and predictable. The closing flag stays alive in the
+    /// dropped `Arc` long enough for the adapter to observe it.
+    pub async fn stop(
+        &self,
+        community_id: &SpaceId,
+        channel_id: &ChannelId,
+    ) -> Result<(), ChannelLogEngineError> {
+        let key = (*community_id, *channel_id);
+
+        let engine = {
+            let mut engines = self.engines.lock().await;
+            engines.remove(&key)
+        };
+        let Some(engine) = engine else {
+            // Stop-of-unknown is a no-op (mirrors
+            // CommunitySyncRegistry::stop_engine semantics).
+            return Ok(());
+        };
+
+        engine.shutdown().await?;
+
+        if let Some(closing) = self.closings.lock().await.remove(&key) {
+            closing.store(true, Ordering::SeqCst);
+        }
+        // Drop the JoinHandle without await — the adapter task observes
+        // the closing flag within ≤1s and exits cleanly. Awaiting here
+        // would risk dead-locking under a different runtime than the
+        // spawn-runtime (mirrors `engine.shutdown` rationale).
+        let _ = self.adapter_handles.lock().await.remove(&key);
+
+        Ok(())
+    }
+
+    /// Snapshot of the engine for `(community_id, channel_id)`. Used
+    /// by IPC handlers (Task 5) that need to call `engine.publish` /
+    /// `engine.list_messages` / `engine.request_backfill`. Returns
+    /// `None` if no engine is currently registered.
+    pub async fn engine(
+        &self,
+        community_id: &SpaceId,
+        channel_id: &ChannelId,
+    ) -> Option<Arc<ChannelLogEngine<R>>> {
+        self.engines
+            .lock()
+            .await
+            .get(&(*community_id, *channel_id))
+            .cloned()
+    }
+
+    /// Drain every spawned engine. Surfaces the LAST error encountered
+    /// after attempting to stop all (mirrors
+    /// `CommunitySyncRegistry::shutdown_all` — bailing on first error
+    /// would leak engines after it). Called from `stop_inner`.
+    pub async fn shutdown_all(&self) -> Result<(), ChannelLogEngineError> {
+        let keys: Vec<(SpaceId, ChannelId)> = {
+            let engines = self.engines.lock().await;
+            engines.keys().copied().collect()
+        };
+        let mut last_err: Option<ChannelLogEngineError> = None;
+        for (cid, chid) in keys {
+            if let Err(e) = self.stop(&cid, &chid).await {
+                tracing::warn!(
+                    community_id = ?cid,
+                    channel_id = ?chid,
+                    error = ?e,
+                    "channel-log engine stop failed during shutdown_all",
+                );
+                last_err = Some(e);
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Walk a community's materialized channels and `spawn` an engine
+    /// for each non-tombstoned entry. Idempotent — re-running on the
+    /// same state is a no-op (each `spawn` returns the existing Arc).
+    ///
+    /// Called from `start_node` after each `CommunitySyncRegistry::spawn_engine`
+    /// returns, plus on subsequent reload paths. Mirrors spec §7.4 — the
+    /// registry state must always reflect the materialized channels map
+    /// (this is the boot-time source of truth; the delta-consumer
+    /// callback handles incremental Created/Deleted between boots).
+    ///
+    /// Takes `&MaterializedMembership` rather than `&CommunityState` —
+    /// the spec/plan called this `CommunityState`, but `CommunityState`
+    /// stores the raw event log (`events: BTreeMap<EventId, ...>`),
+    /// not the materialized `channels` map. Callers materialize first
+    /// via `CommunityState::materialized(admin_addr)` and pass the
+    /// resulting view in. Documented as a Task 4 deviation in the
+    /// commit message.
+    pub async fn reconcile_from_state(
+        self: &Arc<Self>,
+        community_id: SpaceId,
+        materialized: &MaterializedMembership,
+        membership_key: &MembershipKey,
+        state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
+        resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
+        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    ) -> Result<(), ChannelLogEngineError> {
+        for (channel_id, info) in &materialized.channels {
+            if info.deleted_at.is_some() {
+                continue;
+            }
+            let channel_key = derive_channel_key(membership_key, &community_id, channel_id);
+            self.spawn(
+                community_id,
+                *channel_id,
+                channel_key,
+                Arc::clone(&state_at_hlc),
+                Arc::clone(&resolver),
+                Arc::clone(&hlc_tracker),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,5 +1939,288 @@ mod tests {
         assert_eq!(got.wall_ms, since.wall_ms);
         assert_eq!(got.logical, since.logical);
         assert_eq!(got.device_id, since.device_id);
+    }
+
+    // ── Sub-task 4A: registry ─────────────────────────────────────────
+
+    /// Per-registry-test fixture. Holds the registry plus the
+    /// dependencies callers need to thread into `spawn` /
+    /// `reconcile_from_state`. The TempDir keeps the per-channel root
+    /// dir alive across the test's awaits.
+    struct RegistryFixture {
+        registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        state: Arc<AlwaysJoinedState>,
+        resolver: Arc<FixedIdentityResolver>,
+        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        membership_key: MembershipKey,
+        self_owner: OwnerAddr,
+        // Held to keep the temp dir alive for the duration of the test.
+        _tmp: TempDir,
+    }
+
+    /// Build a registry against an in-memory Zenoh session and stub
+    /// state/resolver/tracker. Mirrors `build_engine_fixture` shape so
+    /// the registry tests have the same per-channel deps the engine
+    /// tests already rely on.
+    ///
+    /// Marked `#[allow(...)]` for the rare-flavor flag — Zenoh's
+    /// runtime requires `multi_thread`. The default `current_thread`
+    /// flavor panics on `zenoh::open`.
+    async fn build_registry_fixture() -> RegistryFixture {
+        let tmp = TempDir::new().expect("tempdir");
+
+        let (signing_key_raw, self_owner, identity_pub_64) = fixture_identity(0x42);
+        let signing_key = Arc::new(signing_key_raw);
+
+        // The fixture's AlwaysJoinedState answers for one specific
+        // channel_id; all registry tests use the same id so the stub
+        // works for every spawned engine. We use a sentinel id here;
+        // tests that need different ids would need a wider stub.
+        let stub_channel_id = ChannelId([0xff; 16]);
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(self_owner, identity_pub_64);
+        let resolver = Arc::new(FixedIdentityResolver { map: resolver_map });
+
+        let state = Arc::new(AlwaysJoinedState {
+            channel_id: stub_channel_id,
+            owner: self_owner,
+        });
+
+        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let app = tauri::test::mock_app().handle().clone();
+
+        // In-memory Zenoh session. The adapter spawns at registry.spawn()
+        // time but the tests don't drive any messages through it — the
+        // assertion targets are the registry maps, not the wire path
+        // (the wire path has its own coverage in event_loop.rs's
+        // channel_log_adapter_tests).
+        let cfg = zenoh::Config::default();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        let config = ChannelLogRegistryConfig {
+            session,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner,
+            self_device_id: "registry-test-device".to_string(),
+            signing_key,
+            engine_config: ChannelLogEngineConfig {
+                log_config: ChannelLogConfig {
+                    seal_threshold_events: 8,
+                },
+                ..Default::default()
+            },
+        };
+        let registry = ChannelLogRegistry::new(config);
+
+        RegistryFixture {
+            registry,
+            state,
+            resolver,
+            hlc_tracker,
+            membership_key: MembershipKey::new([0x55; 32]),
+            self_owner,
+            _tmp: tmp,
+        }
+    }
+
+    /// Helper — spawn a single channel under the fixture's deps. Returns
+    /// the engine Arc so callers can chain assertions.
+    async fn spawn_under_fixture(
+        fix: &RegistryFixture,
+        community_id: SpaceId,
+        channel_id: ChannelId,
+    ) -> Arc<ChannelLogEngine<tauri::test::MockRuntime>> {
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn")
+    }
+
+    /// Suppress unused-field lint for `self_owner` — the struct is shared
+    /// across tests and not every test reads every field.
+    #[allow(dead_code)]
+    fn _registry_fixture_field_use(fix: &RegistryFixture) -> OwnerAddr {
+        fix.self_owner
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_spawn_idempotent() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0xff; 16]);
+
+        let e1 = spawn_under_fixture(&fix, community_id, channel_id).await;
+        let e2 = spawn_under_fixture(&fix, community_id, channel_id).await;
+
+        assert!(
+            Arc::ptr_eq(&e1, &e2),
+            "spawn must return the existing engine on duplicate (cid, chid)",
+        );
+
+        fix.registry
+            .stop(&community_id, &channel_id)
+            .await
+            .expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_stop_discards_entry() {
+        let fix = build_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let chid = ChannelId([0xff; 16]);
+
+        let _ = spawn_under_fixture(&fix, cid, chid).await;
+        assert!(
+            fix.registry.engine(&cid, &chid).await.is_some(),
+            "engine must be present after spawn",
+        );
+
+        fix.registry.stop(&cid, &chid).await.expect("stop");
+
+        assert!(
+            fix.registry.engine(&cid, &chid).await.is_none(),
+            "engine must be discarded after stop (spec §17.4)",
+        );
+
+        // Stop-of-unknown is a no-op.
+        fix.registry
+            .stop(&cid, &chid)
+            .await
+            .expect("idempotent stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_reconcile_skips_deleted_channels() {
+        let fix = build_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let live_chid = ChannelId([0xff; 16]);
+        let dead_chid = ChannelId([0x02; 16]);
+
+        // Build a MaterializedMembership with one live + one tombstoned
+        // channel. (`MaterializedMembership` derives `Default`; the
+        // members + power_levels maps are empty — irrelevant for this
+        // assertion which only inspects `channels`.)
+        let mut materialized = MaterializedMembership::default();
+        materialized.channels.insert(
+            live_chid,
+            crate::community_membership::ChannelInfo {
+                name: "live".to_string(),
+                write_power: 0,
+                created_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "x".to_string(),
+                },
+                deleted_at: None,
+            },
+        );
+        materialized.channels.insert(
+            dead_chid,
+            crate::community_membership::ChannelInfo {
+                name: "dead".to_string(),
+                write_power: 0,
+                created_at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "x".to_string(),
+                },
+                deleted_at: Some(Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "x".to_string(),
+                }),
+            },
+        );
+
+        Arc::clone(&fix.registry)
+            .reconcile_from_state(
+                cid,
+                &materialized,
+                &fix.membership_key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("reconcile");
+
+        assert!(
+            fix.registry.engine(&cid, &live_chid).await.is_some(),
+            "live channel must spawn",
+        );
+        assert!(
+            fix.registry.engine(&cid, &dead_chid).await.is_none(),
+            "tombstoned channel must NOT spawn",
+        );
+
+        fix.registry
+            .stop(&cid, &live_chid)
+            .await
+            .expect("cleanup stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_reconcile_idempotent() {
+        let fix = build_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let chid = ChannelId([0xff; 16]);
+
+        let mut materialized = MaterializedMembership::default();
+        materialized.channels.insert(
+            chid,
+            crate::community_membership::ChannelInfo {
+                name: "live".to_string(),
+                write_power: 0,
+                created_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "x".to_string(),
+                },
+                deleted_at: None,
+            },
+        );
+
+        Arc::clone(&fix.registry)
+            .reconcile_from_state(
+                cid,
+                &materialized,
+                &fix.membership_key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("reconcile 1");
+        let e1 = fix.registry.engine(&cid, &chid).await.expect("engine 1");
+
+        Arc::clone(&fix.registry)
+            .reconcile_from_state(
+                cid,
+                &materialized,
+                &fix.membership_key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("reconcile 2");
+        let e2 = fix.registry.engine(&cid, &chid).await.expect("engine 2");
+
+        assert!(
+            Arc::ptr_eq(&e1, &e2),
+            "second reconcile must return the same engine Arc (idempotent)",
+        );
+
+        fix.registry.stop(&cid, &chid).await.expect("cleanup stop");
     }
 }

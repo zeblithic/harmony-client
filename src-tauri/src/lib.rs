@@ -290,6 +290,22 @@ pub struct NodeState {
     /// loop's channel.
     community_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>>,
+    /// ZEB-270 Phase 3 Task 4C: per-(community, channel) ChannelLog
+    /// engine registry. `None` until `start_node` constructs it
+    /// (post-event-loop-ready, so the registry can hold the live
+    /// `Arc<zenoh::Session>` per spec §7.1). Cleared during
+    /// `stop_inner` so the per-channel engines + their Zenoh adapters
+    /// shut down cleanly before the session itself drops.
+    ///
+    /// Typed `tauri::Wry` because Wry is the production runtime;
+    /// tests construct registries directly against `tauri::test::MockRuntime`
+    /// (see `community_channel_log_engine::tests::registry_*`) without
+    /// going through `NodeState`. If we later want to support a
+    /// non-Wry production runtime, this field becomes parameterised
+    /// (which would propagate `R: Runtime` through `NodeState` itself
+    /// — a larger refactor).
+    channel_log_registry:
+        Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
 }
 
 impl NodeState {
@@ -337,6 +353,9 @@ impl Default for NodeState {
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            // ZEB-270 Task 4C: registry stays None until start_node
+            // wires it (see follow-up Task 4C deferred work).
+            channel_log_registry: None,
         }
     }
 }
@@ -483,6 +502,12 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
+    // ZEB-270 Phase 3 Task 4C: declared in the outer scope so the
+    // post-lock shutdown_all block can take it. Assigned inside the
+    // lock alongside the other `take()` calls below.
+    let channel_log_registry_for_shutdown: Option<
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -561,6 +586,14 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-270 Phase 3 Task 4C: take the registry handle so we
+        // can run `shutdown_all` against it below outside the std
+        // `MutexGuard` scope (the `block_on` would panic on the
+        // !Send guard). `let _ = ` not `take().map(...)` because the
+        // shutdown happens later — we hoist the take into the outer
+        // scope via a separate binding rather than trying to thread
+        // it through the already-saturated `tup`.
+        channel_log_registry_for_shutdown = guard.channel_log_registry.take();
         tup
     };
 
@@ -598,6 +631,45 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // last reference reach the close threshold. The event_loop's receiver
     // gets None on its next .recv() and the select arm de-registers.
     drop(unicast_send_tx);
+    // ZEB-270 Phase 3 Task 4C: shut down per-(community, channel) log
+    // engines BEFORE the per-community state engines. The channel-log
+    // engine's verify-on-receive path resolves identity + state-at-HLC
+    // from the matching CommunitySyncEngine; tearing those down first
+    // would break inflight verifies the channel-log loop is mid-await
+    // on. Final flush is synchronous per `engine.shutdown` contract,
+    // so by the time `shutdown_all` returns every channel's tail is
+    // durably written.
+    //
+    // Same `thread::scope` + ephemeral-runtime pattern as the
+    // CommunitySyncRegistry block below — `stop_inner` is sync but
+    // reachable from async contexts; a `block_on` inside an existing
+    // runtime panics.
+    if let Some(registry) = channel_log_registry_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(registry.shutdown_all()) {
+                            tracing::error!(
+                                error = %e,
+                                "ChannelLogRegistry shutdown_all failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for \
+                             ChannelLogRegistry shutdown — final flush/persist skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     // ZEB-217 Sub-C Phase 2: shut down the per-community engine pool
     // BEFORE the owner-state SyncEngine. Each community engine drives
     // its own debounced final-publish + persist pass on
@@ -1266,6 +1338,20 @@ async fn start_node(
                     {
                         let app_for_membership = app.clone();
                         let app_for_channel_config = app.clone();
+                        // ZEB-270 Phase 3 Task 4B: third callback —
+                        // the channel-log registry hook. Currently
+                        // wired as a no-op placeholder; Task 4C
+                        // production wiring (which requires the
+                        // registry handle to be threaded through to
+                        // this site) is deferred until the
+                        // session-bridge to event_loop lands. Until
+                        // then the hook just logs at trace level so
+                        // observability is preserved without polluting
+                        // the warn/info channels. The callback shape
+                        // is stable now — flipping the body to call
+                        // `registry.spawn` / `registry.stop` is a
+                        // one-edit change once `NodeState.channel_log_registry`
+                        // is populated by start_node + event_loop.
                         tokio::spawn(run_community_delta_consumer(
                             community_delta_rx,
                             move |payload| {
@@ -1290,6 +1376,15 @@ async fn start_node(
                                         );
                                     }
                                 }
+                            },
+                            move |payload: ChannelConfigChangedPayload| async move {
+                                tracing::trace!(
+                                    community_id = %payload.community_id,
+                                    channel_id = %payload.channel_id,
+                                    action = ?payload.action,
+                                    "channel-log registry hook fired (no-op pending Task 4C \
+                                     production wiring)",
+                                );
                             },
                         ));
                     }
@@ -8959,17 +9054,30 @@ pub fn delta_to_channel_config_change(
 /// Phase 3 emits one change per `community-members-changed` IPC event
 /// (engine fires one delta per CRDT mutation); the wire format leaves
 /// room for batched future deltas without a contract break.
-pub async fn run_community_delta_consumer<FM, FutM, FC, FutC>(
+pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
     mut delta_rx: tokio::sync::mpsc::Receiver<
         crate::community_state_sync::CommunityMembershipDelta,
     >,
     mut emit_membership: FM,
     mut emit_channel_config: FC,
+    mut on_channel_config_registry: FR,
 ) where
     FM: FnMut(CommunityMembersChangedPayload) -> FutM + Send + 'static,
     FutM: std::future::Future<Output = ()> + Send + 'static,
     FC: FnMut(ChannelConfigChangedPayload) -> FutC + Send + 'static,
     FutC: std::future::Future<Output = ()> + Send + 'static,
+    // ZEB-270 Phase 3 Task 4B: registry-side hook fires on the same
+    // channel-config payload as `emit_channel_config` so the
+    // `ChannelLogRegistry` can spawn / stop per-channel engines on
+    // Created / Deleted (Modified is a no-op for the registry — only
+    // metadata changed; the underlying log is unaffected). Two
+    // callbacks rather than one because the IPC-event-emit and
+    // registry-mutate paths have different lifetimes (one needs an
+    // `AppHandle`, the other an `Arc<ChannelLogRegistry>`) and
+    // different failure modes (emit logs + drops; registry surfaces
+    // errors via tracing).
+    FR: FnMut(ChannelConfigChangedPayload) -> FutR + Send + 'static,
+    FutR: std::future::Future<Output = ()> + Send + 'static,
 {
     while let Some(delta) = delta_rx.recv().await {
         if let Some((community_id, change)) = delta_to_change(&delta) {
@@ -8979,7 +9087,13 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC>(
             };
             emit_membership(payload).await;
         } else if let Some(payload) = delta_to_channel_config_change(&delta) {
-            emit_channel_config(payload).await;
+            // Fire IPC emit first (ordering matches Phase 1's
+            // membership branch — observable side effect before
+            // registry mutation), then registry hook. The registry
+            // hook receives a clone — both callbacks see the same
+            // payload bytes.
+            emit_channel_config(payload.clone()).await;
+            on_channel_config_registry(payload).await;
         }
     }
 }
@@ -10062,6 +10176,9 @@ mod delta_consumer_task_tests {
                     // No-op: this test only drives a Join through the
                     // membership branch.
                 },
+                // ZEB-270 Phase 3 Task 4B: 3rd callback (registry hook)
+                // — no-op for tests that don't exercise the registry.
+                |_payload: ChannelConfigChangedPayload| async move {},
             )
             .await
         });
@@ -10259,6 +10376,11 @@ mod create_channel_delta_tests {
                     c.lock().await.push(payload);
                 }
             },
+            // ZEB-270 Phase 3 Task 4B: 3rd callback (registry hook) —
+            // no-op for tests that don't exercise the registry. The
+            // assertion below targets the channel-config callback's
+            // capture vec, not registry side-effects.
+            |_payload: ChannelConfigChangedPayload| async move {},
         ));
 
         let community_id = SpaceId([0x37; 16]);
