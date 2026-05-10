@@ -201,19 +201,22 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         }))
     }
 
-    /// Signal closing + join all internal tasks. In Task 1 there are
-    /// no tasks so this is just the closing-flag flip; Task 2 adds
-    /// flush_now + join logic.
+    /// Signal closing + drop all internal task handles. In Task 1 there
+    /// are no tasks so this is just the closing-flag flip; Task 2 adds
+    /// flush_now + drop logic.
     pub async fn shutdown(&self) -> Result<(), ChannelLogEngineError> {
         self.closing.store(true, Ordering::SeqCst);
         self.flush_dirty.notify_one();
 
-        if let Some(handle) = self.receive_handle.lock().await.take() {
-            let _ = handle.await;
-        }
-        if let Some(handle) = self.flush_handle.lock().await.take() {
-            let _ = handle.await;
-        }
+        // Mirrors `community_state_sync::CommunitySyncEngine::shutdown` and
+        // `owner_state_sync::SyncEngine::shutdown` — we DO NOT `handle.await`
+        // the JoinHandles. Awaiting from a different runtime than the spawn-
+        // runtime risks deadlocking under future tokio releases. The closing
+        // flag + notify already signals the receive + flush loops to exit;
+        // Task 2 will add the `flush_now` synchronous-rendezvous path that
+        // gives the flush-complete guarantee.
+        let _ = self.receive_handle.lock().await.take();
+        let _ = self.flush_handle.lock().await.take();
         Ok(())
     }
 
