@@ -94,8 +94,8 @@
     role="menu"
     style="left: {contextMenu.x}px; top: {contextMenu.y}px"
   >
-    <button type="button" onclick={handleRename}>Rename</button>
-    <button type="button" onclick={handleDelete} class="destructive">Delete</button>
+    <button type="button" role="menuitem" onclick={handleRename}>Rename</button>
+    <button type="button" role="menuitem" onclick={handleDelete} class="destructive">Delete</button>
   </div>
 {/if}
 

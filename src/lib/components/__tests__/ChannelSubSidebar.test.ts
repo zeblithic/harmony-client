@@ -98,7 +98,7 @@ describe('ChannelSubSidebar', () => {
     });
     const item = container.querySelectorAll('.channel-item')[1] as HTMLElement;
     await fireEvent.contextMenu(item);
-    await fireEvent.click(getByRole('button', { name: /Rename/i }));
+    await fireEvent.click(getByRole('menuitem', { name: /Rename/i }));
     expect(onModifyClick).toHaveBeenCalledWith(announcements);
   });
 
@@ -109,7 +109,7 @@ describe('ChannelSubSidebar', () => {
     });
     const item = container.querySelectorAll('.channel-item')[1] as HTMLElement;
     await fireEvent.contextMenu(item);
-    await fireEvent.click(getByRole('button', { name: /Delete/i }));
+    await fireEvent.click(getByRole('menuitem', { name: /Delete/i }));
     expect(onDeleteClick).toHaveBeenCalledWith(announcements);
   });
 
