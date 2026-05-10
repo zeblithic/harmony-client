@@ -14,7 +14,7 @@ use harmony_app::community_channel_log::{
     CommunityStateAtHlc, CommunityStateSnapshot, SignedChannelEvent,
 };
 use harmony_app::community_channel_log_engine::{
-    ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig, SpawnOutcome,
 };
 use harmony_app::community_membership::{ChannelId, ChannelInfo};
 use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
@@ -301,7 +301,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
                 .expect("backfill progress lock") += 1;
         });
 
-    let engine_a = Arc::clone(&registry_a)
+    let engine_a = match Arc::clone(&registry_a)
         .spawn(
             community_id,
             channel_id,
@@ -311,8 +311,12 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             Arc::clone(&tracker_a),
         )
         .await
-        .expect("spawn A");
-    let _engine_b = Arc::clone(&registry_b)
+        .expect("spawn A")
+    {
+        SpawnOutcome::Spawned(e) => e,
+        SpawnOutcome::DeferredForCommit => panic!("unexpected deferred spawn"),
+    };
+    let _engine_b = match Arc::clone(&registry_b)
         .spawn(
             community_id,
             channel_id,
@@ -322,7 +326,11 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             Arc::clone(&tracker_b),
         )
         .await
-        .expect("spawn B");
+        .expect("spawn B")
+    {
+        SpawnOutcome::Spawned(e) => e,
+        SpawnOutcome::DeferredForCommit => panic!("unexpected deferred spawn"),
+    };
 
     // Give Zenoh subscribers + queryables time to declare and peers
     // time to discover. 1s is conservative; the registry-fixture tests
@@ -398,7 +406,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // ── Phase 3: B reconnects + backfill ─────────────────────────────
     // Re-spawn B's engine. The on-disk tail+segments are reloaded; the
     // existing 100 events are visible locally already.
-    let engine_b2 = Arc::clone(&registry_b)
+    let engine_b2 = match Arc::clone(&registry_b)
         .spawn(
             community_id,
             channel_id,
@@ -408,7 +416,11 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             Arc::clone(&tracker_b),
         )
         .await
-        .expect("re-spawn B");
+        .expect("re-spawn B")
+    {
+        SpawnOutcome::Spawned(e) => e,
+        SpawnOutcome::DeferredForCommit => panic!("unexpected deferred spawn"),
+    };
 
     // Wait for the new adapter to fully declare its subscriber/queryable.
     tokio::time::sleep(Duration::from_secs(1)).await;

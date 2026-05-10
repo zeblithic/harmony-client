@@ -1586,7 +1586,7 @@ async fn start_node(
                                                         return;
                                                     }
                                                 };
-                                                if let Err(e) = registry
+                                                match registry
                                                     .spawn(
                                                         cid,
                                                         chid,
@@ -1597,12 +1597,18 @@ async fn start_node(
                                                     )
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        community_id = %payload.community_id,
-                                                        channel_id = %payload.channel_id,
-                                                        error = ?e,
-                                                        "channel-log spawn failed"
-                                                    );
+                                                    Ok(crate::community_channel_log_engine::SpawnOutcome::Spawned(_)) => {}
+                                                    Ok(crate::community_channel_log_engine::SpawnOutcome::DeferredForCommit) => {
+                                                        // Deferred until a transaction commits.
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            channel_id = %payload.channel_id,
+                                                            error = ?e,
+                                                            "channel-log spawn failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             ChannelConfigChangeAction::Modified => {

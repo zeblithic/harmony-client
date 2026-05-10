@@ -65,6 +65,38 @@ pub enum ChannelLogEngineError {
     BodyNotUtf8(String),
 }
 
+// ── Transaction primitives (ZEB-271) ─────────────────────────────────────────
+
+/// Outcome of `ChannelLogRegistry::spawn`. Per ZEB-271 spec §3.3, a
+/// spawn during an open community transaction is deferred until commit;
+/// a spawn outside a transaction follows the existing fast-path and
+/// returns the live engine.
+pub enum SpawnOutcome<R: tauri::Runtime> {
+    /// The engine was constructed and inserted into the registry.
+    Spawned(Arc<ChannelLogEngine<R>>),
+    /// A community transaction is open for this `community_id`; the
+    /// spawn was queued and will fire on `commit()`.
+    DeferredForCommit,
+}
+
+/// One queued spawn within a `PendingTransaction`. Captures every
+/// argument the registry's spawn body needs so commit can replay it.
+struct DeferredSpawn {
+    channel_id: ChannelId,
+    channel_key: ChannelKey,
+    state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
+    resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
+    hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+}
+
+/// One open community transaction. `tx_id` tags every guard so a stale
+/// guard's deferred abort cannot clobber a fresh transaction's queue
+/// (spec §5.4).
+struct PendingTransaction {
+    tx_id: u64,
+    queue: Vec<DeferredSpawn>,
+}
+
 // ── DTOs (used here for Tauri event emission; surfaced to IPC layer in Task 5) ──
 
 /// Hybrid Logical Clock — wire/IPC shape.
@@ -999,6 +1031,130 @@ struct EngineEntry<R: tauri::Runtime> {
     closing: Arc<AtomicBool>,
 }
 
+// ── CommunityTransactionGuard ─────────────────────────────────────────────────
+
+/// RAII handle to an open community transaction. Drop without
+/// explicit `commit().await` or `abort().await` triggers the
+/// `tokio::spawn` safety-net abort with a `tracing::warn!` (spec §5.2).
+///
+/// `tx_id` tags the guard so a stale guard's deferred abort is a no-op
+/// after a fresh `begin_transaction(same community_id)` has overwritten
+/// the slot (spec §5.4).
+pub struct CommunityTransactionGuard<R: tauri::Runtime> {
+    registry: Arc<ChannelLogRegistry<R>>,
+    community_id: SpaceId,
+    tx_id: u64,
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
+    /// Drain the queue and fire the deferred spawns sequentially.
+    /// Returns the first error encountered; remaining items are still
+    /// drained but not spawned (logged at `warn`). Sets `completed`
+    /// so `Drop` skips the safety net.
+    pub async fn commit(self) -> Result<(), ChannelLogEngineError> {
+        let drained = {
+            let mut map = self
+                .registry
+                .pending_transactions
+                .lock()
+                .expect("pending_transactions poisoned");
+            // tx_id-tag check: only drain if the slot still belongs to
+            // this guard (spec §5.4).
+            match map.get(&self.community_id) {
+                Some(pt) if pt.tx_id == self.tx_id => {
+                    let pt = map.remove(&self.community_id).expect("just-checked");
+                    pt.queue
+                }
+                Some(pt) => {
+                    tracing::warn!(
+                        community_id = ?self.community_id,
+                        guard_tx_id = self.tx_id,
+                        slot_tx_id = pt.tx_id,
+                        "stale CommunityTransactionGuard.commit — slot \
+                         was overwritten; no-op"
+                    );
+                    self.completed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+                None => {
+                    // Already aborted (or never queued anything). Treat
+                    // as success.
+                    self.completed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+            }
+        };
+
+        // Lock dropped. Replay each deferred spawn. We invoke a helper
+        // that performs the inner-spawn body (everything except the
+        // pending_transactions check). On first error, log and continue
+        // with remaining items so a single failure doesn't strand the
+        // rest, but surface the first error from commit.
+        let mut first_err: Option<ChannelLogEngineError> = None;
+        for ds in drained {
+            match self.registry.spawn_inner_now(self.community_id, ds).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    } else {
+                        tracing::warn!(
+                            community_id = ?self.community_id,
+                            "additional deferred-spawn failure during commit drain \
+                             (ignored, first error already captured)"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Abort the transaction. Discards the queue. Sets `completed` so
+    /// `Drop` skips the safety net.
+    pub async fn abort(self) {
+        self.registry
+            .abort_transaction_internal(self.community_id, self.tx_id);
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only accessor for the internal `tx_id`. Used by the
+    /// reentrancy unit test.
+    #[cfg(test)]
+    pub(crate) fn tx_id_for_test(&self) -> u64 {
+        self.tx_id
+    }
+}
+
+impl<R: tauri::Runtime> Drop for CommunityTransactionGuard<R> {
+    fn drop(&mut self) {
+        if !self.completed.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                community_id = ?self.community_id,
+                tx_id = self.tx_id,
+                "CommunityTransactionGuard dropped without commit/abort — \
+                 running async safety net"
+            );
+            let registry = Arc::clone(&self.registry);
+            let community_id = self.community_id;
+            let tx_id = self.tx_id;
+            tokio::spawn(async move {
+                registry.abort_transaction_internal(community_id, tx_id);
+            });
+        }
+    }
+}
+
 /// Per-CommunitySyncEngine registry of running per-channel engines.
 /// Mirrors `community_state_sync::CommunitySyncRegistry` in shape:
 ///   - idempotent `spawn` (returns existing Arc on duplicate)
@@ -1035,6 +1191,12 @@ struct EngineEntry<R: tauri::Runtime> {
 pub struct ChannelLogRegistry<R: tauri::Runtime> {
     engines: Mutex<HashMap<(SpaceId, ChannelId), EngineEntry<R>>>,
     config: ChannelLogRegistryConfig<R>,
+    // ZEB-271: per-community deferred-spawn queue gated by an explicit
+    // CommunityTransactionGuard. See spec §3.1 for the rationale.
+    // std::sync::Mutex (not tokio) — critical sections never span an
+    // .await, and matching the codebase's NodeState convention.
+    pending_transactions: std::sync::Mutex<HashMap<SpaceId, PendingTransaction>>,
+    next_tx_id: std::sync::atomic::AtomicU64,
 }
 
 impl<R: tauri::Runtime> ChannelLogRegistry<R> {
@@ -1047,18 +1209,101 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         Arc::new(Self {
             engines: Mutex::new(HashMap::new()),
             config,
+            pending_transactions: std::sync::Mutex::new(HashMap::new()),
+            next_tx_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    /// Spawn engine + Zenoh adapter for one `(community_id, channel_id)`.
-    /// Idempotent — returns the existing Arc if already present (no new
-    /// engine spawned, no new adapter, no fs `create_dir_all`).
+    /// Open a community transaction. Subsequent `spawn` calls for this
+    /// `community_id` are queued in the transaction's deferred-spawn
+    /// list; they fire on `commit().await` and are dropped on
+    /// `abort().await` or guard drop. See spec §3.2.
     ///
-    /// `state_at_hlc`, `resolver`, `hlc_tracker` are passed through to
-    /// `ChannelLogEngineParams` unchanged. The caller (production:
-    /// the delta-consumer hook + `reconcile_from_state`; tests: the
-    /// fixture) is responsible for sourcing them from the matching
-    /// `CommunitySyncEngine`.
+    /// If a transaction for `community_id` is already open,
+    /// `begin_transaction` overwrites the slot with a `tracing::warn!`
+    /// (spec §5.5); the prior guard's commit/abort becomes a no-op due
+    /// to tx_id mismatch.
+    pub fn begin_transaction(
+        self: &Arc<Self>,
+        community_id: SpaceId,
+    ) -> CommunityTransactionGuard<R> {
+        let tx_id = self
+            .next_tx_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut map = self
+                .pending_transactions
+                .lock()
+                .expect("pending_transactions poisoned");
+            if let Some(prev) = map.insert(
+                community_id,
+                PendingTransaction {
+                    tx_id,
+                    queue: Vec::new(),
+                },
+            ) {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    prev_tx_id = prev.tx_id,
+                    new_tx_id = tx_id,
+                    queued = prev.queue.len(),
+                    "begin_transaction overwrote an existing pending transaction \
+                     (reentrant — see spec §5.5)"
+                );
+            }
+        }
+        CommunityTransactionGuard {
+            registry: Arc::clone(self),
+            community_id,
+            tx_id,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Internal: remove the pending-transaction slot iff `tx_id`
+    /// matches. Called from `Drop` (via `tokio::spawn`) and from
+    /// `abort()`. tx_id mismatch is a no-op (stale-guard race).
+    fn abort_transaction_internal(&self, community_id: SpaceId, tx_id: u64) {
+        let mut map = self
+            .pending_transactions
+            .lock()
+            .expect("pending_transactions poisoned");
+        match map.get(&community_id) {
+            Some(pt) if pt.tx_id == tx_id => {
+                map.remove(&community_id);
+            }
+            Some(pt) => {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    guard_tx_id = tx_id,
+                    slot_tx_id = pt.tx_id,
+                    "abort_transaction_internal: stale guard, no-op"
+                );
+            }
+            None => {
+                // Already gone — fine.
+            }
+        }
+    }
+
+    /// Test-only — `true` if a `PendingTransaction` exists for
+    /// `community_id`.
+    #[cfg(test)]
+    fn has_pending_transaction_for_test(&self, community_id: &SpaceId) -> bool {
+        let map = self
+            .pending_transactions
+            .lock()
+            .expect("pending_transactions poisoned");
+        map.contains_key(community_id)
+    }
+
+    /// Spawn a per-channel engine + adapter for `(community_id, channel_id)`.
+    ///
+    /// **ZEB-271 transaction-aware:** if `community_id` has an open
+    /// transaction (see `begin_transaction`), the spawn is queued and
+    /// fires on `commit().await`. Returns `DeferredForCommit` in that
+    /// case; the caller (delta consumer or reconcile) treats both
+    /// outcomes as success. See spec §3.3.
     ///
     /// On error the engine + adapter are not registered (the partial
     /// `engines` insert is the commit point); the caller may retry.
@@ -1070,8 +1315,49 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
         resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    ) -> Result<SpawnOutcome<R>, ChannelLogEngineError> {
+        // ZEB-271: queue iff an open transaction targets this community.
+        // Sync lock — critical section is just a HashMap mutation.
+        {
+            let mut map = self
+                .pending_transactions
+                .lock()
+                .expect("pending_transactions poisoned");
+            if let Some(pt) = map.get_mut(&community_id) {
+                pt.queue.push(DeferredSpawn {
+                    channel_id,
+                    channel_key,
+                    state_at_hlc,
+                    resolver,
+                    hlc_tracker,
+                });
+                return Ok(SpawnOutcome::DeferredForCommit);
+            }
+        }
+
+        // No open transaction — fast-path. Do the work and return the
+        // engine.
+        let ds = DeferredSpawn {
+            channel_id,
+            channel_key,
+            state_at_hlc,
+            resolver,
+            hlc_tracker,
+        };
+        let engine = self.spawn_inner_now(community_id, ds).await?;
+        Ok(SpawnOutcome::Spawned(engine))
+    }
+
+    /// Inner spawn body — the pre-ZEB-271 `spawn` content relocated to
+    /// a helper. Called from the fast-path of the outer `spawn` AND
+    /// from `CommunityTransactionGuard::commit` to drain the deferred
+    /// queue. Idempotent — returns the existing Arc if already present.
+    async fn spawn_inner_now(
+        self: &Arc<Self>,
+        community_id: SpaceId,
+        ds: DeferredSpawn,
     ) -> Result<Arc<ChannelLogEngine<R>>, ChannelLogEngineError> {
-        let key = (community_id, channel_id);
+        let key = (community_id, ds.channel_id);
 
         // Cheap pre-check under the engines lock — returns Arc-cloned
         // existing engine on the duplicate path so we skip dir-creation,
@@ -1084,7 +1370,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         }
 
         let community_id_hex = hex::encode(community_id.0);
-        let channel_id_hex = hex::encode(channel_id.0);
+        let channel_id_hex = hex::encode(ds.channel_id.0);
         let root_dir = self
             .config
             .identity_dir
@@ -1102,15 +1388,15 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
 
         let params = ChannelLogEngineParams {
             community_id,
-            channel_id,
-            channel_key: Arc::new(channel_key),
+            channel_id: ds.channel_id,
+            channel_key: Arc::new(ds.channel_key),
             root_dir,
-            state_at_hlc,
-            resolver,
+            state_at_hlc: ds.state_at_hlc,
+            resolver: ds.resolver,
             self_owner: self.config.self_owner,
             self_device_id: self.config.self_device_id.clone(),
             signing_key: Arc::clone(&self.config.signing_key),
-            hlc_tracker,
+            hlc_tracker: ds.hlc_tracker,
             app: self.config.app.clone(),
             config: self.config.engine_config.clone(),
             publisher_tx,
@@ -1181,7 +1467,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 if let Err(e) = engine.shutdown().await {
                     tracing::warn!(
                         community_id = ?community_id,
-                        channel_id = ?channel_id,
+                        channel_id = ?ds.channel_id,
                         error = ?e,
                         "channel-log spawn race: loser shutdown failed",
                     );
@@ -1221,7 +1507,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // time) and emits a `ChannelBackfillProgressPayload`.
         let app_progress = self.config.app.clone();
         let community_id_hex_progress = hex::encode(community_id.0);
-        let channel_id_hex_progress = hex::encode(channel_id.0);
+        let channel_id_hex_progress = hex::encode(ds.channel_id.0);
         let emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
             Arc::new(move |fetched: u32, total_estimate: Option<u32>| {
                 use tauri::Emitter;
@@ -1261,7 +1547,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         {
             tracing::warn!(
                 community_id = ?community_id,
-                channel_id = ?channel_id,
+                channel_id = ?ds.channel_id,
                 error = %e,
                 "channel-log adapter bridge send failed; engine spawned without wire \
                  — local publish/list_messages still work, wire transport unavailable \
@@ -1400,7 +1686,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 continue;
             }
             let channel_key = derive_channel_key(membership_key, &community_id, channel_id);
-            if let Err(e) = self
+            match self
                 .spawn(
                     community_id,
                     *channel_id,
@@ -1411,13 +1697,28 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 )
                 .await
             {
-                tracing::warn!(
-                    community_id = ?community_id,
-                    channel_id = ?channel_id,
-                    error = ?e,
-                    "channel-log reconcile: spawn failed; continuing with remaining channels"
-                );
-                last_err = Some(e);
+                Ok(SpawnOutcome::Spawned(_)) => {}
+                Ok(SpawnOutcome::DeferredForCommit) => {
+                    // reconcile_from_state runs at start_node init, outside
+                    // any transaction. DeferredForCommit here would mean a
+                    // transaction was left open on this community_id — log
+                    // and continue (the channel will spawn on commit).
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        channel_id = ?channel_id,
+                        "reconcile_from_state: spawn deferred (unexpected open transaction); \
+                         channel will spawn on commit"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        channel_id = ?channel_id,
+                        error = ?e,
+                        "channel-log reconcile: spawn failed; continuing with remaining channels"
+                    );
+                    last_err = Some(e);
+                }
             }
         }
         match last_err {
@@ -2537,13 +2838,17 @@ mod tests {
 
     /// Helper — spawn a single channel under the fixture's deps. Returns
     /// the engine Arc so callers can chain assertions.
+    ///
+    /// Panics if called during an open transaction (i.e., if spawn
+    /// returns `DeferredForCommit`) — tests exercising transactions
+    /// should call `spawn()` directly and match the outcome themselves.
     async fn spawn_under_fixture(
         fix: &RegistryFixture,
         community_id: SpaceId,
         channel_id: ChannelId,
     ) -> Arc<ChannelLogEngine<tauri::test::MockRuntime>> {
         let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
-        Arc::clone(&fix.registry)
+        match Arc::clone(&fix.registry)
             .spawn(
                 community_id,
                 channel_id,
@@ -2554,6 +2859,15 @@ mod tests {
             )
             .await
             .expect("spawn")
+        {
+            SpawnOutcome::Spawned(engine) => engine,
+            SpawnOutcome::DeferredForCommit => {
+                panic!(
+                    "spawn_under_fixture used during a transaction; tests \
+                     that exercise transactions should call spawn() directly"
+                )
+            }
+        }
     }
 
     /// Suppress unused-field lint for `self_owner` — the struct is shared
@@ -2882,5 +3196,397 @@ mod tests {
             .stop(&cid, &good_chid)
             .await
             .expect("cleanup stop");
+    }
+
+    // ZEB-271: transaction-protocol tests. These verify that
+    // begin_transaction → spawn → commit fires the deferred spawn,
+    // begin_transaction → spawn → abort drops it, and corner cases
+    // (drop safety net, stale tx_id, reentrancy, ordering, partial
+    // failure) all converge on the documented behavior. See spec §7.1.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_begin_commit_drains_queued_spawn() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0xa1; 16]);
+
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        let outcome = Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn");
+
+        assert!(
+            matches!(outcome, SpawnOutcome::DeferredForCommit),
+            "spawn during open transaction must return DeferredForCommit"
+        );
+
+        // Pre-commit: engine must NOT be in the registry yet.
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_none(),
+            "deferred spawn should not be visible in engines map before commit"
+        );
+
+        tx.commit().await.expect("commit");
+
+        // Post-commit: engine must be in the registry.
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_some(),
+            "deferred spawn must be visible after commit drains the queue"
+        );
+
+        fix.registry
+            .stop(&community_id, &channel_id)
+            .await
+            .expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_begin_abort_drops_queued_spawn() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc2; 16]);
+        let channel_id = ChannelId([0xa2; 16]);
+
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn");
+
+        tx.abort().await;
+
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_none(),
+            "aborted transaction must not spawn the queued engine"
+        );
+
+        // No on-disk dir for the channel either (the registry's spawn
+        // body never ran, so no fs::create_dir_all happened).
+        let channel_dir = fix
+            ._tmp
+            .path()
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("channels")
+            .join(hex::encode(channel_id.0));
+        assert!(
+            !channel_dir.exists(),
+            "aborted transaction must not create the channel-log on-disk dir"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_dropped_guard_safety_net_aborts() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc3; 16]);
+        let channel_id = ChannelId([0xa3; 16]);
+
+        {
+            let _tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+            let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+            Arc::clone(&fix.registry)
+                .spawn(
+                    community_id,
+                    channel_id,
+                    key,
+                    Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                    Arc::clone(&fix.hlc_tracker),
+                )
+                .await
+                .expect("spawn");
+            // _tx drops here without explicit commit/abort.
+        }
+
+        // Drop spawned a tokio task to call abort_transaction_internal.
+        // Yield repeatedly to let it run. Per spec §3.2 / §5.2 the safety
+        // net is fire-and-forget; one yield is usually enough but a small
+        // sleep removes flake risk.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_none(),
+            "dropped transaction guard must trigger safety-net abort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_spawn_outside_transaction_immediate() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc4; 16]);
+        let channel_id = ChannelId([0xa4; 16]);
+
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        let outcome = Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn");
+
+        match outcome {
+            SpawnOutcome::Spawned(engine) => {
+                assert_eq!(engine.community_id(), community_id);
+                assert_eq!(engine.channel_id(), channel_id);
+            }
+            SpawnOutcome::DeferredForCommit => {
+                panic!("spawn outside a transaction must return Spawned, not Deferred");
+            }
+        }
+
+        fix.registry
+            .stop(&community_id, &channel_id)
+            .await
+            .expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_stale_guard_commit_no_ops() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc5; 16]);
+        let channel_a = ChannelId([0xa5; 16]);
+        let channel_b = ChannelId([0xb5; 16]);
+
+        // Open tx_A.
+        let tx_a = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        // Spawn a channel under tx_A's queue.
+        let key_a = derive_channel_key(&fix.membership_key, &community_id, &channel_a);
+        Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_a,
+                key_a,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn a");
+
+        // Open tx_B for the same community_id (overwrites tx_A's entry).
+        let tx_b = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        // Spawn a different channel under tx_B's queue.
+        let key_b = derive_channel_key(&fix.membership_key, &community_id, &channel_b);
+        Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_b,
+                key_b,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn b");
+
+        // Commit tx_A — should be a no-op (tx_id mismatch).
+        tx_a.commit().await.expect("stale commit no-ops");
+
+        // Channel a was queued in tx_A's overwritten entry — it should
+        // NOT be in the registry (tx_A's queue was dropped on overwrite).
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_a)
+                .await
+                .is_none(),
+            "stale tx_A.commit must not resurrect tx_A's overwritten queue"
+        );
+
+        // tx_B's queue is intact — channel b can still be committed.
+        tx_b.commit().await.expect("commit b");
+
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_b)
+                .await
+                .is_some(),
+            "tx_B.commit must drain tx_B's queue"
+        );
+
+        fix.registry
+            .stop(&community_id, &channel_b)
+            .await
+            .expect("stop b");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_reentrant_begin_transaction_overwrites() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc6; 16]);
+
+        let tx_a = Arc::clone(&fix.registry).begin_transaction(community_id);
+        let tx_id_a = tx_a.tx_id_for_test();
+
+        let tx_b = Arc::clone(&fix.registry).begin_transaction(community_id);
+        let tx_id_b = tx_b.tx_id_for_test();
+
+        assert_ne!(
+            tx_id_a, tx_id_b,
+            "reentrant begin_transaction must mint a fresh tx_id"
+        );
+
+        // Drop both without explicit cleanup (safety net handles either).
+        drop(tx_a);
+        drop(tx_b);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Map entry should be gone (one of the safety-net aborts removed
+        // it; the other no-ops on tx_id mismatch — both correct).
+        assert!(
+            !fix.registry.has_pending_transaction_for_test(&community_id),
+            "after both drops, no pending transaction entry remains"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_multiple_deferred_spawns_drain_in_order() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc7; 16]);
+        let channels: [ChannelId; 3] = [
+            ChannelId([0x01; 16]),
+            ChannelId([0x02; 16]),
+            ChannelId([0x03; 16]),
+        ];
+
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        for ch in channels.iter() {
+            let key = derive_channel_key(&fix.membership_key, &community_id, ch);
+            Arc::clone(&fix.registry)
+                .spawn(
+                    community_id,
+                    *ch,
+                    key,
+                    Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                    Arc::clone(&fix.hlc_tracker),
+                )
+                .await
+                .expect("spawn");
+        }
+
+        tx.commit().await.expect("commit");
+
+        for ch in channels.iter() {
+            assert!(
+                fix.registry.engine(&community_id, ch).await.is_some(),
+                "channel {:?} must be present after commit",
+                ch
+            );
+            fix.registry.stop(&community_id, ch).await.expect("stop");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_commit_partial_failure_continues() {
+        // Failure injection: pre-create the second channel's dir as a
+        // FILE (not a directory) so the inner spawn's
+        // `std::fs::create_dir_all` fails on it. The first and third
+        // channels' dirs are untouched, so their spawns succeed.
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc8; 16]);
+        let channels: [ChannelId; 3] = [
+            ChannelId([0x11; 16]),
+            ChannelId([0x22; 16]),
+            ChannelId([0x33; 16]),
+        ];
+
+        // Sabotage channel 2's path — create a file at the path that
+        // create_dir_all would want to be a directory.
+        let bad_dir = fix
+            ._tmp
+            .path()
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("channels");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let bad_path = bad_dir.join(hex::encode(channels[1].0));
+        std::fs::write(&bad_path, b"sabotage").unwrap();
+
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+        for ch in channels.iter() {
+            let key = derive_channel_key(&fix.membership_key, &community_id, ch);
+            Arc::clone(&fix.registry)
+                .spawn(
+                    community_id,
+                    *ch,
+                    key,
+                    Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                    Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                    Arc::clone(&fix.hlc_tracker),
+                )
+                .await
+                .expect("spawn (queueing always succeeds during a tx)");
+        }
+
+        let result = tx.commit().await;
+        assert!(
+            result.is_err(),
+            "commit must surface the first error from the partial-failure drain"
+        );
+
+        // First channel spawned successfully; third should also have
+        // been attempted and succeeded.
+        assert!(
+            fix.registry
+                .engine(&community_id, &channels[0])
+                .await
+                .is_some(),
+            "first channel must spawn before the second's failure"
+        );
+        assert!(
+            fix.registry
+                .engine(&community_id, &channels[2])
+                .await
+                .is_some(),
+            "third channel must still be attempted after the second's failure"
+        );
+        assert!(
+            fix.registry
+                .engine(&community_id, &channels[1])
+                .await
+                .is_none(),
+            "the second (sabotaged) channel must not be present"
+        );
+
+        fix.registry.stop(&community_id, &channels[0]).await.ok();
+        fix.registry.stop(&community_id, &channels[2]).await.ok();
     }
 }
