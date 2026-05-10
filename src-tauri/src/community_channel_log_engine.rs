@@ -685,28 +685,69 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             }
         };
 
-        // 2. Verify chain. verify_channel_event takes &mut tracker and
-        // ADVANCES it on success — no separate record() call needed.
-        let verify = {
-            let mut tracker = self.replay_tracker.lock().await;
-            verify_channel_event(
-                &event,
-                &self.community_id,
-                &self.channel_id,
-                self.state_at_hlc.as_ref(),
-                self.resolver.as_ref(),
-                &mut tracker,
-            )
-            .await
-        };
-        if let Err(e) = verify {
-            match e {
+        // 2. Verify chain. The replay_tracker Mutex must NOT be held
+        // across the async I/O inside verify_channel_event (identity
+        // resolver + state snapshot — both can take tens to hundreds
+        // of ms during aggressive backfill). Holding it would stall
+        // concurrent IPC publish() calls that share the same tracker.
+        //
+        // Three-step pattern:
+        //   2a. Read-only fast-path replay check under the lock — bail
+        //       early if we already saw this event. Avoids burning
+        //       async I/O on a known duplicate.
+        //   2b. Async verification OUTSIDE the lock with a throwaway
+        //       tracker. The throwaway-tracker advance is wasted work
+        //       (writes to an empty BTreeMap, dropped); the real
+        //       replay decision is made under the lock in step 2c.
+        //   2c. Atomic check_and_advance under the lock for the real
+        //       commit. If a concurrent receive of the same event won
+        //       the race between 2a and 2c, check_and_advance returns
+        //       Err(Replay) and we drop silently.
+        //
+        // TOCTOU window between 2a and 2c is intentionally re-checked
+        // at 2c — 2c is the authoritative gate. ChannelLogReplayTracker
+        // is a `BTreeMap::new()` under the hood, so the throwaway
+        // construction is cheap.
+
+        // 2a. Fast-path replay check.
+        {
+            let tracker = self.replay_tracker.lock().await;
+            if let Err(e) = tracker.would_accept(&event) {
+                tracing::debug!(
+                    community_id = ?self.community_id,
+                    channel_id = ?self.channel_id,
+                    err = ?e,
+                    "drop replay (fast-path)"
+                );
+                return;
+            }
+            // Drop tracker lock here so async verify doesn't hold it.
+        }
+
+        // 2b. Async verification OUTSIDE the lock. Pass a throwaway
+        // tracker so verify_channel_event's signature is satisfied;
+        // the throwaway's `record` side-effect on Ok is discarded —
+        // the real tracker advance happens in step 2c.
+        let mut throwaway_tracker = ChannelLogReplayTracker::new();
+        let verify_result = verify_channel_event(
+            &event,
+            &self.community_id,
+            &self.channel_id,
+            self.state_at_hlc.as_ref(),
+            self.resolver.as_ref(),
+            &mut throwaway_tracker,
+        )
+        .await;
+        if let Err(e) = verify_result {
+            match &e {
                 ChannelEventError::Replay { .. } => {
+                    // Throwaway tracker was empty so this should never
+                    // trigger from the throwaway. Defensive log.
                     tracing::debug!(
                         community_id = ?self.community_id,
                         channel_id = ?self.channel_id,
                         err = ?e,
-                        "drop replay"
+                        "drop replay (verify path)"
                     );
                 }
                 _ => {
@@ -719,6 +760,22 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
                 }
             }
             return;
+        }
+
+        // 2c. Atomic re-check + commit under the lock. If a concurrent
+        // receive of the same event won the race between 2a and 2c,
+        // check_and_advance returns Err(Replay) and we drop silently.
+        {
+            let mut tracker = self.replay_tracker.lock().await;
+            if let Err(e) = tracker.check_and_advance(&event) {
+                tracing::debug!(
+                    community_id = ?self.community_id,
+                    channel_id = ?self.channel_id,
+                    err = ?e,
+                    "drop replay (atomic-recheck)"
+                );
+                return;
+            }
         }
 
         // 3. Append.
@@ -1332,22 +1389,41 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
     ) -> Result<(), ChannelLogEngineError> {
+        // Continue on error, accumulate the LAST error, return it after
+        // attempting all channels. Mirrors `shutdown_all` — bailing on
+        // first error would leave every channel later in the
+        // (non-deterministic) HashMap iteration order without an engine
+        // for the entire session, with the affected set varying per run.
+        let mut last_err: Option<ChannelLogEngineError> = None;
         for (channel_id, info) in &materialized.channels {
             if info.deleted_at.is_some() {
                 continue;
             }
             let channel_key = derive_channel_key(membership_key, &community_id, channel_id);
-            self.spawn(
-                community_id,
-                *channel_id,
-                channel_key,
-                Arc::clone(&state_at_hlc),
-                Arc::clone(&resolver),
-                Arc::clone(&hlc_tracker),
-            )
-            .await?;
+            if let Err(e) = self
+                .spawn(
+                    community_id,
+                    *channel_id,
+                    channel_key,
+                    Arc::clone(&state_at_hlc),
+                    Arc::clone(&resolver),
+                    Arc::clone(&hlc_tracker),
+                )
+                .await
+            {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    channel_id = ?channel_id,
+                    error = ?e,
+                    "channel-log reconcile: spawn failed; continuing with remaining channels"
+                );
+                last_err = Some(e);
+            }
         }
-        Ok(())
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2717,5 +2793,94 @@ mod tests {
                 "engine must be drained after race + cleanup stop",
             );
         }
+    }
+
+    /// Resilience regression: a `reconcile_from_state` whose first
+    /// channel-spawn fails must NOT abort iteration over the remaining
+    /// channels. Pre-fix, the loop propagated the first error via `?`,
+    /// leaving every channel later in the (non-deterministic) HashMap
+    /// iteration order without an engine for the entire session — silent,
+    /// intermittent, hard to reproduce.
+    ///
+    /// Setup: pre-create a regular file at one channel's directory path
+    /// so `spawn`'s `create_dir_all` returns `ErrorKind::NotADirectory`
+    /// (or platform equivalent) and the spawn errors. Reconcile must
+    /// then still spawn the OTHER channel and return the captured error.
+    ///
+    /// The fixture's stub `AlwaysJoinedState` only answers for one
+    /// specific channel id, but reconcile's failure path is in `spawn`
+    /// (dir-create) which runs BEFORE state is consulted, and the
+    /// successful path uses the stub's recognized channel — so this
+    /// test exercises both arms cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_reconcile_continues_past_spawn_failure() {
+        let fix = build_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        // Stub recognizes [0xff; 16] — this is the channel that should
+        // succeed and have an engine after reconcile.
+        let good_chid = ChannelId([0xff; 16]);
+        // The bad channel uses a distinct id; we sabotage its dir path.
+        let bad_chid = ChannelId([0xee; 16]);
+
+        // Sabotage: pre-create a regular file at the bad channel's
+        // directory path so create_dir_all in spawn() will fail.
+        let identity_dir = fix._tmp.path();
+        let bad_channel_dir = identity_dir
+            .join("communities")
+            .join(hex::encode(cid.0))
+            .join("channels")
+            .join(hex::encode(bad_chid.0));
+        std::fs::create_dir_all(bad_channel_dir.parent().expect("parent")).expect("parent dirs");
+        std::fs::write(&bad_channel_dir, b"sabotage").expect("write sabotage file");
+
+        let mut materialized = MaterializedMembership::default();
+        let info = |name: &str| crate::community_membership::ChannelInfo {
+            name: name.to_string(),
+            write_power: 0,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".to_string(),
+            },
+            deleted_at: None,
+        };
+        materialized.channels.insert(good_chid, info("good"));
+        materialized.channels.insert(bad_chid, info("bad"));
+
+        let result = Arc::clone(&fix.registry)
+            .reconcile_from_state(
+                cid,
+                &materialized,
+                &fix.membership_key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await;
+
+        // Reconcile must surface the bad-channel error...
+        assert!(
+            result.is_err(),
+            "reconcile_from_state must surface the spawn error from the sabotaged channel",
+        );
+
+        // ...but the GOOD channel must still have an engine spawned.
+        // This is the regression target: pre-fix, HashMap iteration
+        // order would non-deterministically determine whether the good
+        // channel got an engine, depending on whether it iterated
+        // before or after the bad one.
+        assert!(
+            fix.registry.engine(&cid, &good_chid).await.is_some(),
+            "good channel must spawn even when the bad channel's spawn fails",
+        );
+        assert!(
+            fix.registry.engine(&cid, &bad_chid).await.is_none(),
+            "bad channel must NOT have an engine (its spawn failed)",
+        );
+
+        fix.registry
+            .stop(&cid, &good_chid)
+            .await
+            .expect("cleanup stop");
     }
 }
