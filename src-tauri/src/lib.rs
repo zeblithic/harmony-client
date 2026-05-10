@@ -7257,11 +7257,11 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     )?;
 
     // ZEB-258: spawn engine + dispatch adapter BEFORE the owner-state
-    // commit. Both can fail; both have rollback paths (engine teardown
-    // via `stop_engine` — Task 7 of the Phase 4 plan will swap in
-    // `shutdown_engine_and_cleanup_persistence` so the per-community
-    // persistence dir is also removed). At this point owner-state is
-    // unchanged.
+    // commit. Both can fail; both have rollback paths. ZEB-274: the
+    // 9 scattered `shutdown_engine_and_cleanup_persistence` rollback
+    // sites are now collapsed into a single RAII guard
+    // (`community_sync_guard`) — Drop on early-return runs the
+    // shutdown automatically. At this point owner-state is unchanged.
     //
     // ZEB-271: open a channel-log transaction so any ChannelCreate
     // events that materialize during this critical section are queued
@@ -7269,6 +7269,13 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     // safety-net abort, preventing phantom default-#general spawns on
     // fence/apply_space failure. See spec §3-§5.
     let channel_log_tx = channel_log_registry.begin_transaction(minted.community_id);
+
+    // ZEB-274: RAII rollback guard for the community-sync spawn + adapter
+    // dispatch. If anything between here and `community_sync_guard.commit()`
+    // below fails (including panics), Drop runs
+    // shutdown_engine_and_cleanup_persistence. Replaces the 9 scattered
+    // explicit rollback sites that this function previously had.
+    let mut community_sync_guard = community_registry.begin_spawn_guard(minted.community_id);
 
     // Channel pair shape mirrors start_node's per-community spawn
     // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
@@ -7278,49 +7285,21 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    community_registry
-        .spawn_engine_inner_now(
+    let engine_arc = community_registry
+        .spawn_engine_with_guard(
+            &mut community_sync_guard,
             minted.community_id,
             minted.membership_key.clone(),
             self_owner,
             is_invite_only,
             pub_tx,
             sub_rx,
+            pub_rx,
+            sub_tx,
+            community_adapter_tx,
         )
         .await
-        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
-
-    if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
-        id_hex: hex::encode(minted.community_id.0),
-        publisher_rx: pub_rx,
-        subscriber_tx: sub_tx,
-    }) {
-        // Engine is in the registry but adapter wiring failed. Tear it
-        // down so we don't accumulate a zombie engine. ZEB-258 win:
-        // owner-state is still untouched at this point. ZEB-262 Task 7:
-        // shutdown_engine_and_cleanup_persistence also removes the
-        // orphan per-community persistence dir, closing the disk-leak
-        // gap that the bare stop_engine call tolerated.
-        if let Err(stop_err) = community_registry
-            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-            .await
-        {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "shutdown_engine_and_cleanup_persistence failed during create_community \
-                 rollback (adapter dispatch)"
-            );
-        }
-        return Err(match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "adapter request queue full; please retry".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "adapter request channel closed (event_loop stopped?)".to_string()
-            }
-        });
-    }
+        .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
     // Bootstrap-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the admin self-Join via the
@@ -7328,58 +7307,25 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     // publish picks up the event and writes to the per-community
     // state-root topic. ZEB-258: still BEFORE the owner-state commit;
     // a failure here tears the engine down with crdt_state untouched.
-    let engine_arc = community_registry
-        .engine_arc(&minted.community_id)
-        .await
-        .ok_or("engine vanished immediately after spawn — registry race")?;
-    // CodeRabbit P0: a `?` early-return here would leave the spawned
-    // engine + persistence dir behind. Wrap the Result and tear down
-    // on Err before returning.
-    let outcome = match engine_arc
+    //
+    // ZEB-274: engine_arc() lookup removed — spawn_engine_with_guard above
+    // returned the engine handle directly. The CodeRabbit P0 manual
+    // rollback collapses into the guard's Drop on `?` early-return.
+    let outcome = engine_arc
         .insert_local_event(minted.bootstrap_join.clone())
         .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during create_community_inner insert-err rollback"
-                );
-            }
-            return Err(format!("engine.insert_local_event: {e}"));
-        }
-    };
+        .map_err(|e| format!("engine.insert_local_event (bootstrap_join): {e}"))?;
     if !matches!(
         outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
-        // Bootstrap Join didn't insert — engine state is inconsistent
-        // with the user-visible "creator just made this community"
-        // expectation. Tear down + bail. Owner-state still untouched.
-        // ZEB-262 Task 7: cleanup also removes the per-community
-        // persist dir.
-        if let Err(stop_err) = community_registry
-            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-            .await
-        {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "shutdown_engine_and_cleanup_persistence failed during create_community \
-                 rollback (bootstrap-Join not inserted)"
-            );
-        }
+        // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
         return Err(format!("bootstrap Join not inserted (got {outcome:?})"));
     }
 
     // ZEB-248 Phase 1: atomically auto-create the default #general channel.
     // Same engine-transaction window as the bootstrap_join — if this insert
-    // fails, the same shutdown_engine_and_cleanup_persistence rollback runs.
+    // fails, community_sync_guard Drop runs the shutdown rollback (ZEB-274).
     // The HLC for the default-channel event is computed via the canonical
     // `next_hlc` helper anchored on `minted.bootstrap_join.at` — keeps
     // Join < ChannelCreate ordering deterministic without manually adding
@@ -7426,60 +7372,20 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         actor: self_owner,
         at: default_channel_at.clone(),
     };
-    let default_channel_signed = match crate::community_membership::sign_event(
-        &default_channel_payload,
-        signing_key.as_ref(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during create_community \
-                     rollback (default-channel sign error)"
-                );
-            }
-            return Err(format!("sign default-channel ChannelCreate: {e}"));
-        }
-    };
+    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+    let default_channel_signed =
+        crate::community_membership::sign_event(&default_channel_payload, signing_key.as_ref())
+            .map_err(|e| format!("sign default-channel ChannelCreate: {e}"))?;
 
-    let default_channel_outcome = match engine_arc.insert_local_event(default_channel_signed).await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during create_community \
-                     rollback (default-channel insert error)"
-                );
-            }
-            return Err(format!("engine.insert_local_event (default channel): {e}"));
-        }
-    };
+    let default_channel_outcome = engine_arc
+        .insert_local_event(default_channel_signed)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (default channel): {e}"))?;
     if !matches!(
         default_channel_outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
-        if let Err(stop_err) = community_registry
-            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-            .await
-        {
-            tracing::warn!(
-                error = %stop_err,
-                community_id = %hex::encode(minted.community_id.0),
-                "shutdown_engine_and_cleanup_persistence failed during create_community \
-                 rollback (default-channel not inserted)"
-            );
-        }
+        // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
         return Err(format!(
             "default-channel ChannelCreate not inserted (got {default_channel_outcome:?})"
         ));
@@ -7514,21 +7420,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     match verdict {
         FenceVerdict::Ok => {}
         FenceVerdict::GenerationChanged(now_gen) => {
-            // ZEB-262 Task 7: shutdown_engine_and_cleanup_persistence
-            // tears the engine down AND removes the per-community
-            // persist dir, so a fence-aborted community doesn't leave
-            // an orphan crdt.cbor / replay.cbor on disk.
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during \
-                     create_community fence-abort"
-                );
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!(
                 "node generation changed during create_community (was {}, now {}); \
                  community minted on a detached crdt_state and won't be persisted — \
@@ -7537,17 +7429,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
             ));
         }
         FenceVerdict::RegistryGone => {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during \
-                     create_community fence-abort"
-                );
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(
                 "community_registry was torn down during create_community — engine spawn \
                  suppressed"
@@ -7570,25 +7452,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
-            // Owner-state rejected the Space (CRDT invariant). The
-            // engine is up and the bootstrap-Join is in its log, but
-            // owner-state has no Space row — tear the engine down so
-            // we don't leak a zombie. Drop the state_g guard FIRST
-            // so the registry call's .await isn't holding any state
-            // lock. ZEB-262 Task 7: cleanup also removes the
-            // per-community persist dir.
-            drop(state_g);
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during \
-                     create_community rollback (apply_space rejected)"
-                );
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!("apply_space rejected new community: {outcome:?}"));
         }
         // ZEB-267: tracker advance no longer needed here — the two
@@ -7598,6 +7462,11 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         // earlier in this block): the reserved HLCs are fine to
         // "burn" — HLCs are 64-bit logical, not finite.
     }
+
+    // ZEB-274: release the community-sync rollback obligation. apply_space
+    // succeeded — the community is durable. Sync (no .await needed). Per
+    // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
+    community_sync_guard.commit();
 
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the community is committed. If commit() fails,
