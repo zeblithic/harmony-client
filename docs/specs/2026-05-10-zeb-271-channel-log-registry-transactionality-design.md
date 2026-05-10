@@ -266,7 +266,7 @@ Every existing test in `create_community_inner_tests` and `redeem_invite_inner_t
 * Generalizing the transaction primitive to other CRDT consumers (membership-changed, owner-state-replicated). This pattern is specific to the channel-log spawn callback shape; ZEB-266 has the same membership shape but a separate fix.
 * Cancellation of in-flight remote sync during transaction abort (transaction protocol only governs the channel-log spawn; remote events themselves still arrive via Zenoh and are processed by the community engine).
 * Persistence of pending transactions across app restarts (an in-flight transaction whose process dies behaves identically to an aborted transaction — the next start will not see the unspawned channels).
-* Membership-side parallel fix for ZEB-266 — same shape, separate ticket.
+* Membership-side parallel fix for [ZEB-266](https://linear.app/zeblith/issue/ZEB-266) — RESOLVED in [ZEB-274](https://linear.app/zeblith/issue/ZEB-274). Note the architecture differs (RAII rollback guard, not deferred-spawn) because the IPC handler interacts with the community-sync engine pre-commit (`engine.insert_local_event(bootstrap_join)`).
 
 ## §10 Known limitations
 
