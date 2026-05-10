@@ -22,8 +22,9 @@
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
-  import CommunitySettingsPanel from './lib/components/CommunitySettingsPanel.svelte';
+  import CommunityView from './lib/components/CommunityView.svelte';
   import { CommunityService } from './lib/community-service';
+  import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { NotificationService } from './lib/notification-service';
   import { loadProfile, saveProfile } from './lib/profile-service';
@@ -320,6 +321,8 @@
   // unmount via $effect cleanup.
   const communityService = new CommunityService();
   $effect(() => () => communityService.destroy());
+  const channelMessageService = new ChannelMessageService();
+  $effect(() => () => channelMessageService.destroy());
 
   let navNodes = $state([...navService.nodes]);
 
@@ -536,6 +539,7 @@
       await tryConnect('vine.loadFollowed', vineService.loadFollowed());
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
       await tryConnect('community', communityService.connectAdapter(adapter));
+      await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
       resolveVideoFn = async (cid: string) => {
         const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
@@ -1522,16 +1526,18 @@
        communities. Once the backend exposes kind on the wire (open
        follow-up — spec Appendix A #2), getKind() should fall back to
        the wire value rather than 'unknown'. -->
-  <CommunitySettingsPanel
+  <CommunityView
     communityId={selectedCommunityNode.id}
     communityName={selectedCommunityNode.name}
     communityKind={communityService.getKind(selectedCommunityNode.id)}
     members={communityMembers}
-    {myAddress}
+    ownAddress={myAddress}
     myPower={myCommunityPower}
     isDegraded={isCurrentCommunityDegraded}
-    onClose={() => (showCommunitySettings = false)}
-    onKick={async (target) => {
+    {communityService}
+    {channelMessageService}
+    {trustService}
+    onKickMember={async (target) => {
       if (!selectedCommunityId) return;
       try {
         await communityService.kickMember(selectedCommunityId, target);
@@ -1540,7 +1546,7 @@
         console.error('kickMember failed:', msg);
       }
     }}
-    onSetPower={async (target, power) => {
+    onSetPowerLevel={async (target, power) => {
       if (!selectedCommunityId) return;
       try {
         await communityService.setPowerLevel(selectedCommunityId, target, power);
