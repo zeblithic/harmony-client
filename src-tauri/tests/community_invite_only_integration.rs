@@ -279,7 +279,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     let (alice_pub_tx, mut alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
     let (alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
     registry_a
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             alice_minted.membership_key.clone(),
             alice_addr,

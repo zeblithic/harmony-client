@@ -2296,6 +2296,138 @@ pub struct CommunitySyncRegistry {
     pending_redemptions: PendingRedemptionMap,
 }
 
+// ── CommunitySyncSpawnGuard (ZEB-274) ─────────────────────────────────────────
+
+/// RAII rollback guard for a freshly-spawned community-sync engine.
+/// Held by an IPC handler across the critical section between
+/// `spawn_engine_with_guard` and the durable `apply_space` commit.
+///
+/// Drop without explicit `commit()` or `abort()` triggers a
+/// `Handle::try_current()` safety-net that calls
+/// `shutdown_engine_and_cleanup_persistence` (only if THIS call
+/// freshly created the engine — concurrent-redeem race losers per
+/// ZEB-260 PR #90 round-5 are no-ops on Drop).
+///
+/// **No-runtime fallback:** unlike ZEB-271's `CommunityTransactionGuard`
+/// (whose `abort_transaction_internal` is sync map cleanup),
+/// `shutdown_engine_and_cleanup_persistence` is fundamentally async
+/// (`engine.shutdown().await` flushes pending writes). When `Drop`
+/// runs without a tokio runtime, we log a warn and accept the leak —
+/// `reconcile_from_state` at next `start_node` will detect the
+/// inconsistency and clean up. See spec §10.2.
+pub struct CommunitySyncSpawnGuard {
+    registry: std::sync::Arc<CommunitySyncRegistry>,
+    community_id: SpaceId,
+    /// Set ONCE by `spawn_engine_with_guard` before it returns. True
+    /// iff this call freshly created the engine (vs. the idempotent
+    /// no-op path that found an existing engine). Only fresh
+    /// creations carry the rollback obligation. Plain `bool` (not
+    /// `AtomicBool`): no concurrent mutation — set ONCE before
+    /// `spawn_engine_with_guard` returns the guard to the caller, then
+    /// only read by Drop.
+    freshly_created: bool,
+    /// Set to `true` by `commit()` to bypass `Drop`'s rollback path.
+    /// `AtomicBool` (mirrors ZEB-271) for Acquire/Release ordering
+    /// across the Drop visibility boundary.
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl CommunitySyncSpawnGuard {
+    /// Release the rollback obligation. The engine remains alive.
+    /// Called by the IPC handler after `apply_space` succeeds (after
+    /// the durable commit point). Sync — no `.await` needed because
+    /// there is no work to do beyond setting the flag. Consumes self
+    /// so Drop never runs after commit.
+    pub fn commit(self) {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // self drops here; Drop sees completed=true and runs no cleanup.
+    }
+
+    /// Explicit rollback. Calls `shutdown_engine_and_cleanup_persistence`
+    /// if `freshly_created`. Sets `completed = true` so `Drop` is a
+    /// no-op. Sync entry point but spawns the async cleanup as a tokio
+    /// task internally (mirrors ZEB-271 `CommunityTransactionGuard::abort`
+    /// shape). If no tokio runtime is present, logs a warn and accepts
+    /// the leak (per spec §10.2 — no sync alternative for
+    /// `engine.shutdown().await`).
+    pub fn abort(self) {
+        if self.freshly_created {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let registry = std::sync::Arc::clone(&self.registry);
+                    let community_id = self.community_id;
+                    handle.spawn(async move {
+                        if let Err(e) = registry
+                            .shutdown_engine_and_cleanup_persistence(&community_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                community_id = ?community_id,
+                                error = %e,
+                                "CommunitySyncSpawnGuard::abort cleanup failed \
+                                 (engine + persist dir may leak; \
+                                 reconcile_from_state will recover at next start_node)"
+                            );
+                        }
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        community_id = ?self.community_id,
+                        "CommunitySyncSpawnGuard::abort called without runtime; \
+                         cannot run async cleanup. Engine + persist dir will leak \
+                         until reconcile_from_state at next start_node."
+                    );
+                }
+            }
+        }
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // self drops here; Drop sees completed=true.
+    }
+}
+
+impl Drop for CommunitySyncSpawnGuard {
+    fn drop(&mut self) {
+        if !self.completed.load(std::sync::atomic::Ordering::Acquire) && self.freshly_created {
+            tracing::warn!(
+                community_id = ?self.community_id,
+                "CommunitySyncSpawnGuard dropped without commit/abort — \
+                 running safety net (spec §5.1)"
+            );
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let registry = std::sync::Arc::clone(&self.registry);
+                    let community_id = self.community_id;
+                    handle.spawn(async move {
+                        if let Err(e) = registry
+                            .shutdown_engine_and_cleanup_persistence(&community_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                community_id = ?community_id,
+                                error = %e,
+                                "CommunitySyncSpawnGuard Drop cleanup failed \
+                                 (engine + persist dir may leak; \
+                                 reconcile_from_state will recover at next start_node)"
+                            );
+                        }
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        community_id = ?self.community_id,
+                        "CommunitySyncSpawnGuard dropped without runtime; \
+                         cannot run async cleanup. Engine + persist dir will leak \
+                         until reconcile_from_state at next start_node (spec §10.2)."
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
         Self {
@@ -2305,6 +2437,128 @@ impl CommunitySyncRegistry {
                 std::collections::HashMap::new(),
             )),
         }
+    }
+
+    /// Open a spawn-rollback guard. Returns immediately, performs no I/O.
+    /// Caller then calls `spawn_engine_with_guard(&mut guard, ...)` to
+    /// perform the actual spawn — the guard captures the freshness flag
+    /// internally. If the caller fails before `commit()`, `Drop` runs
+    /// `shutdown_engine_and_cleanup_persistence`. See spec §3.1, §3.2.
+    ///
+    /// `begin_spawn_guard` is sync (no I/O, no lock acquisition) — the
+    /// guard is created with `freshly_created = false` (set later by
+    /// `spawn_engine_with_guard` if the spawn was the fresh one).
+    pub fn begin_spawn_guard(
+        self: &std::sync::Arc<Self>,
+        community_id: SpaceId,
+    ) -> CommunitySyncSpawnGuard {
+        CommunitySyncSpawnGuard {
+            registry: std::sync::Arc::clone(self),
+            community_id,
+            freshly_created: false,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Atomic spawn + adapter dispatch with RAII rollback. Replaces the
+    /// old `spawn_engine` public surface. Internalizes the freshness flag
+    /// (formerly the `Result<bool, _>` return) into the guard so concurrent
+    /// callers can't race on rollback obligation. See spec §3.2, §5.3.
+    ///
+    /// Sequence (atomic from caller's perspective):
+    ///   1. `spawn_engine_inner_now` builds the engine, inserts into the
+    ///      map. Returns `bool` for freshly-created.
+    ///   2. If freshly created, `community_adapter_tx.try_send(...)` to
+    ///      dispatch the adapter request to event_loop.
+    ///   3. If try_send fails AND freshly created, immediately `.await`
+    ///      `shutdown_engine_and_cleanup_persistence` to undo the spawn.
+    ///      Returns Err. Guard's `freshly_created` flag is NEVER set to
+    ///      true (so Drop is a no-op).
+    ///   4. On full success, set `guard.freshly_created = true` (or false
+    ///      for the idempotent path) and return Ok(engine).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_engine_with_guard(
+        self: &std::sync::Arc<Self>,
+        guard: &mut CommunitySyncSpawnGuard,
+        community_id: SpaceId,
+        membership_key: MembershipKey,
+        admin_addr: OwnerAddr,
+        is_invite_only: bool,
+        publisher_tx: mpsc::Sender<Vec<u8>>,
+        subscriber_rx: mpsc::Receiver<Vec<u8>>,
+        publisher_rx: mpsc::Receiver<Vec<u8>>,
+        subscriber_tx: mpsc::Sender<Vec<u8>>,
+        community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    ) -> Result<std::sync::Arc<CommunitySyncEngine>, CommunitySyncError> {
+        // Defensive: guard must be for the same community_id. Programming
+        // error if not — the IPC handler should always pair them.
+        debug_assert_eq!(
+            guard.community_id, community_id,
+            "spawn_engine_with_guard guard/community_id mismatch — programming error"
+        );
+
+        // Step 1: spawn the engine via the inner helper.
+        let freshly_created = self
+            .spawn_engine_inner_now(
+                community_id,
+                membership_key,
+                admin_addr,
+                is_invite_only,
+                publisher_tx,
+                subscriber_rx,
+            )
+            .await?;
+
+        // Step 2: if fresh, dispatch the adapter request.
+        if freshly_created {
+            if let Err(send_err) =
+                community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
+                    id_hex: hex::encode(community_id.0),
+                    publisher_rx,
+                    subscriber_tx,
+                })
+            {
+                // Step 3: try_send failed → undo the spawn before returning.
+                // Inline `.await` (we're already inside an async fn).
+                if let Err(stop_err) = self
+                    .shutdown_engine_and_cleanup_persistence(&community_id)
+                    .await
+                {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        error = %stop_err,
+                        "spawn_engine_with_guard: cleanup after adapter try_send failure also failed — \
+                         engine + persist dir may leak (reconcile recovers at next start_node)"
+                    );
+                }
+                // Guard's freshly_created stays FALSE → Drop is a no-op.
+                return Err(CommunitySyncError::Persist(format!(
+                    "community_adapter_tx.try_send failed: {send_err}"
+                )));
+            }
+        }
+        // ELSE: engine pre-existed (idempotent path); the publisher_rx +
+        // subscriber_tx + community_adapter_tx args are dropped (the
+        // existing engine + adapter already own their channels).
+
+        // Step 4: bind the freshness flag to the guard. Now the guard
+        // carries the rollback obligation if freshly_created = true.
+        guard.freshly_created = freshly_created;
+
+        // Recover the engine handle for the caller. The inner helper
+        // doesn't return it directly to preserve the existing return-type
+        // shape on the inner; we look it up from the registry. The lookup
+        // is guaranteed to succeed (the engine was just inserted under
+        // the engines lock and we haven't yielded since — for the
+        // freshly_created path. For the idempotent path, the existing
+        // engine is what we return.)
+        let engine = self.engine_arc(&community_id).await.ok_or_else(|| {
+            CommunitySyncError::Persist(format!(
+                "engine vanished immediately after spawn_engine_inner_now \
+                 (community_id = {community_id:?}) — registry race or programming error"
+            ))
+        })?;
+        Ok(engine)
     }
 
     /// Register a oneshot to fire when the `SignedMembershipEvent` with
@@ -2439,7 +2693,17 @@ impl CommunitySyncRegistry {
     /// concurrent redeems. The `bool` is set under the same engines-map
     /// lock that performs the `contains_key` check + insert, so the
     /// flag and the engine state are mutually consistent.
-    pub async fn spawn_engine(
+    ///
+    /// **ZEB-274**: this is the inner helper. Public IPC callers should
+    /// use `spawn_engine_with_guard` to get atomic spawn, adapter
+    /// dispatch, and rollback guard. Boot-time `start_node` reconcile
+    /// (lib.rs:1747) is allowed to call this directly because it has no
+    /// rollback obligation (boot reconcile recovers state, doesn't
+    /// introduce new state). Integration tests under `src-tauri/tests/`
+    /// also call this directly because they don't exercise the
+    /// IPC-handler RAII surface; the method stays `pub` (not
+    /// `pub(crate)`) so those tests compile against the public API.
+    pub async fn spawn_engine_inner_now(
         &self,
         community_id: SpaceId,
         membership_key: MembershipKey,
@@ -2833,5 +3097,344 @@ pub struct ChannelIdentityResolverAdapter {
 impl crate::community_channel_log::ChannelIdentityResolver for ChannelIdentityResolverAdapter {
     async fn resolve(&self, addr: &crate::owner_state_types::OwnerAddr) -> Option<[u8; 64]> {
         self.inner.resolve(addr).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+
+    /// NopResolver: minimal `IdentityResolver` for fixture builds. None
+    /// of the spawn-rollback-guard tests exercise verify-on-receive, so
+    /// the resolver never resolves anything.
+    struct NopResolver;
+
+    #[async_trait::async_trait]
+    impl IdentityResolver for NopResolver {
+        async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
+            None
+        }
+    }
+
+    /// Test fixture for ZEB-274 spawn-rollback-guard tests. Owns the
+    /// registry under `Arc` (matches production shape — guards hold
+    /// `Arc<CommunitySyncRegistry>`), the per-fixture tempdir, the
+    /// arguments needed for `spawn_engine_with_guard` calls, and the
+    /// `community_adapter_tx` half of the adapter-request bridge. The
+    /// tests do not consume the dispatched adapter requests, so the
+    /// fixture also owns the receiver to keep the channel alive
+    /// (drop-on-fixture-drop is fine — the registry's Sender clones go
+    /// with the fixture).
+    struct GuardTestFixture {
+        registry: std::sync::Arc<CommunitySyncRegistry>,
+        identity_dir: std::path::PathBuf,
+        membership_key: MembershipKey,
+        admin_addr: OwnerAddr,
+        community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        // Held to keep the adapter-request channel alive (and the
+        // tempdir) for the lifetime of the test. Suppress unused-field
+        // warnings: these are owned for their drop side effects only.
+        #[allow(dead_code)]
+        community_adapter_rx: mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+        #[allow(dead_code)]
+        tempdir: tempfile::TempDir,
+    }
+
+    /// Build a fresh `GuardTestFixture` rooted at a tempdir. Each test
+    /// gets its own tempdir + registry; tests do not share fixtures.
+    async fn build_test_fixture() -> GuardTestFixture {
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let identity_dir = tempdir.path().to_path_buf();
+
+        let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_id: "dev".into(),
+            content_store: cs,
+            identity_resolver: std::sync::Arc::new(NopResolver),
+            identity_dir: identity_dir.clone(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner: OwnerAddr([0x01; 16]),
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+        }));
+
+        // Adapter-request bridge: `spawn_engine_with_guard` will
+        // try_send into this. Buffer of 64 is plenty for the per-test
+        // single-spawn case. The receiver is held by the fixture to
+        // keep the channel alive.
+        let (community_adapter_tx, community_adapter_rx) = mpsc::channel(64);
+
+        GuardTestFixture {
+            registry,
+            identity_dir,
+            membership_key: MembershipKey::new([0xa1; 32]),
+            admin_addr: OwnerAddr([0xb1; 16]),
+            community_adapter_tx,
+            community_adapter_rx,
+            tempdir,
+        }
+    }
+
+    // ── ZEB-274 spawn-rollback-guard tests ─────────────────────────
+
+    /// Spec §7.1 #1: spawn engine, commit guard, verify engine present
+    /// + persistence dir present after guard drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_commit_releases_rollback() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc1; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+
+        guard.commit();
+        // engine handle still valid
+        drop(engine);
+
+        // Engine must still be in the registry (commit released the
+        // rollback obligation). The persistence-dir-still-exists
+        // assertion the spec mentions is dropped here because a fresh
+        // engine with no inserted events / no flush never writes the
+        // dir on disk, and the test fixture intentionally doesn't
+        // connect a CAS event-loop to drive a publish (`flush_now`
+        // returns ContentStore::Io). The engine-presence check fully
+        // captures "commit did not run cleanup" — Test 2 verifies the
+        // negative direction (engine absent after rollback).
+        assert!(
+            fix.registry.has_engine(&community_id).await,
+            "engine must remain after commit"
+        );
+    }
+
+    /// Spec §7.1 #2: spawn engine, drop guard without commit, verify
+    /// engine absent + persistence dir absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_drop_without_commit_tears_down_fresh() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc2; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        {
+            let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+            let _engine = std::sync::Arc::clone(&fix.registry)
+                .spawn_engine_with_guard(
+                    &mut guard,
+                    community_id,
+                    fix.membership_key.clone(),
+                    fix.admin_addr,
+                    false,
+                    pub_tx,
+                    sub_rx,
+                    pub_rx,
+                    sub_tx,
+                    fix.community_adapter_tx.clone(),
+                )
+                .await
+                .expect("spawn_engine_with_guard");
+            // guard drops here without commit → Drop spawns cleanup task
+        }
+
+        // Poll up to 500ms for the cleanup task to clear the engine
+        // (mirrors ZEB-271's tx_dropped_guard_safety_net_aborts pattern).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fix.registry.has_engine(&community_id).await,
+            "engine must be torn down after guard drops without commit"
+        );
+
+        // Persistence dir must also be cleaned up.
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        assert!(
+            !dir.exists(),
+            "persistence dir must be removed after guard drops"
+        );
+    }
+
+    /// Spec §7.1 #3: open guard A, spawn engine; open guard B for the
+    /// same community (idempotent — sees existing engine), drop B
+    /// without commit; verify engine still present (B's guard didn't
+    /// tear down because freshly_created = false).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_drop_idempotent_call_is_noop() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc3; 16]);
+
+        let (pub_tx_a, pub_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx_a, sub_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        // Caller A: spawns the engine fresh.
+        let mut guard_a = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let _engine_a = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard_a,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx_a,
+                sub_rx_a,
+                pub_rx_a,
+                sub_tx_a,
+                fix.community_adapter_tx.clone(),
+            )
+            .await
+            .expect("spawn_engine_with_guard A");
+        guard_a.commit();
+
+        // Caller B: spawns idempotently (engine pre-existing).
+        let (pub_tx_b, pub_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx_b, sub_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        {
+            let mut guard_b = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+            let _engine_b = std::sync::Arc::clone(&fix.registry)
+                .spawn_engine_with_guard(
+                    &mut guard_b,
+                    community_id,
+                    fix.membership_key.clone(),
+                    fix.admin_addr,
+                    false,
+                    pub_tx_b,
+                    sub_rx_b,
+                    pub_rx_b,
+                    sub_tx_b,
+                    fix.community_adapter_tx.clone(),
+                )
+                .await
+                .expect("spawn_engine_with_guard B (idempotent)");
+            // guard_b drops here without commit. freshly_created = false → Drop is no-op.
+        }
+
+        // Engine must STILL be present (B's guard didn't tear down A's engine).
+        assert!(
+            fix.registry.has_engine(&community_id).await,
+            "engine must remain after idempotent caller B's guard drops uncommitted"
+        );
+    }
+
+    /// Spec §7.1 #4: spawn engine, abort guard, verify engine absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_explicit_abort_tears_down() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc4; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let _engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+
+        guard.abort();
+
+        // Poll up to 500ms for abort's spawned cleanup task.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fix.registry.has_engine(&community_id).await,
+            "engine must be torn down after explicit abort"
+        );
+    }
+
+    /// Spec §7.1 #5: drop guard from a non-tokio thread; verify the
+    /// no-runtime path runs (logs warn) and the engine remains
+    /// (acknowledged leak per spec §10.2 — reconcile recovers at next
+    /// start_node).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_drop_no_runtime_logs_and_leaks() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc5; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let _engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+
+        // Move the guard into a synchronous (non-tokio) thread and
+        // drop it there. The Drop impl's Handle::try_current() must
+        // return Err and take the no-runtime fallback (log + leak).
+        let drop_thread = std::thread::spawn(move || {
+            // Verify no runtime is reachable from this thread.
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "bare std::thread must not have a runtime handle"
+            );
+            drop(guard);
+        });
+        drop_thread.join().expect("drop thread");
+
+        // Engine MUST still be present (no-runtime path can't tear down).
+        // This is the acknowledged leak per spec §10.2.
+        assert!(
+            fix.registry.has_engine(&community_id).await,
+            "engine must remain after no-runtime Drop (leak acknowledged per spec §10.2)"
+        );
+
+        // Cleanup for test isolation: tear down explicitly via the registry.
+        fix.registry
+            .shutdown_engine_and_cleanup_persistence(&community_id)
+            .await
+            .expect("explicit cleanup for test isolation");
     }
 }

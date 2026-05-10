@@ -212,7 +212,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     spawn_forwarder(alice_pub_rx, bob_sub_tx, bob_pub_rx, alice_sub_tx);
 
     registry_a
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             membership_key.clone(),
             alice_addr,
@@ -223,7 +223,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
         .await
         .expect("spawn alice engine");
     registry_b
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             membership_key.clone(),
             alice_addr,
@@ -423,7 +423,7 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
     let (_bob_sub_tx_held, bob_sub_rx) = mpsc::channel::<Vec<u8>>(64);
 
     registry_b
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             membership_key,
             alice_addr,
@@ -586,7 +586,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
     spawn_forwarder(alice_pub_rx, bob_sub_tx, bob_pub_rx, alice_sub_tx);
 
     registry_a
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             membership_key.clone(),
             alice_addr,
@@ -597,7 +597,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
         .await
         .expect("spawn alice engine");
     registry_b
-        .spawn_engine(
+        .spawn_engine_inner_now(
             community_id,
             membership_key,
             alice_addr,

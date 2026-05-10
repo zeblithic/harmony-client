@@ -1744,7 +1744,14 @@ async fn start_node(
                         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
                         if let Err(e) = registry
-                            .spawn_engine(space_id, mk, admin, is_invite_only, pub_tx, sub_rx)
+                            .spawn_engine_inner_now(
+                                space_id,
+                                mk,
+                                admin,
+                                is_invite_only,
+                                pub_tx,
+                                sub_rx,
+                            )
                             .await
                         {
                             tracing::error!(
@@ -7272,7 +7279,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
     community_registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             minted.community_id,
             minted.membership_key.clone(),
             self_owner,
@@ -8528,7 +8535,7 @@ where
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
     let engine_freshly_created = community_registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             minted.community_id,
             minted.membership_key.clone(),
             payload.admin_addr,
