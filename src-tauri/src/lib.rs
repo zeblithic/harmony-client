@@ -4207,7 +4207,10 @@ pub(crate) fn list_root(
             .collect()
     };
     // HashMap iter is non-deterministic; sort newest-first for stable UI.
-    entries.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
+    // Rust 1.95's clippy::unnecessary_sort_by lint flags `sort_by` with a
+    // reverse comparator — sort_by_key + Reverse expresses the same intent
+    // more directly.
+    entries.sort_by_key(|e| std::cmp::Reverse(e.stored_at));
     Ok(entries)
 }
 

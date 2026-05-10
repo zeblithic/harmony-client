@@ -6,7 +6,7 @@ This file documents conventions, recommended tooling, and gotchas for working in
 
 | Task | Local command | CI gate |
 |---|---|---|
-| Run all Rust tests | `cd src-tauri && cargo nextest run --workspace --all-targets --features test-fixtures` | `rust-test` job |
+| Run all Rust tests | `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures` | `rust-test` job |
 | Run Rust lint | `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` | `rust-check` job |
 | Run Rust formatter | `cd src-tauri && cargo fmt --all -- --check` (check) / `cargo fmt --all` (fix) | `rust-check` job |
 | Run frontend tests | `npx vitest run` (from repo root) | `frontend` job |
@@ -21,11 +21,14 @@ Cargo commands run from `src-tauri/`. Frontend commands run from the repo root.
 
 - **Stable Rust toolchain** — install via [rustup](https://rustup.rs/).
 - **`cargo-nextest`** — faster test runner than `cargo test`. Used by CI and recommended locally:
+
   ```bash
   cargo install cargo-nextest --locked
   # or via your platform's binary release: https://nexte.st/docs/installation/pre-built-binaries/
   ```
+
 - **`cargo-watch`** *(optional, recommended)* — re-runs `cargo check` on file save:
+
   ```bash
   cargo install cargo-watch
   cd src-tauri && cargo watch -x check
@@ -52,7 +55,7 @@ Both CI and local dev should use it. The two cases where `cargo test` is still r
 ### Running tests in a single crate
 
 ```bash
-cd src-tauri && cargo nextest run -p harmony-client --features test-fixtures
+cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtures
 ```
 
 The `-p` flag scopes to one workspace member — much faster than the full `--workspace` run during dev.
@@ -60,13 +63,13 @@ The `-p` flag scopes to one workspace member — much faster than the full `--wo
 ### Running a single test by name
 
 ```bash
-cd src-tauri && cargo nextest run --features test-fixtures -E 'test(=test_name)'
+cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(=test_name)'
 ```
 
 Or via path-prefix match:
 
 ```bash
-cd src-tauri && cargo nextest run --features test-fixtures -E 'test(community_channel)'
+cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(community_channel)'
 ```
 
 ### The `test-fixtures` feature
@@ -137,10 +140,10 @@ When working on a specific area, scope test runs to relevant test files:
 
 ```bash
 # Just the channel-log tests
-cd src-tauri && cargo nextest run --features test-fixtures -E 'test(channel_log)'
+cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(channel_log)'
 
 # Just the integration tests
-cd src-tauri && cargo nextest run --features test-fixtures --test '*_integration'
+cd src-tauri && cargo nextest run --locked --features test-fixtures --test '*_integration'
 ```
 
 ### sccache (optional, larger speedup)
