@@ -15,6 +15,30 @@ export interface RedeemInviteResultDto {
   isInviteOnly: boolean;
 }
 
+/** Mirrors `ChannelInfoDto` in src-tauri/src/lib.rs (ZEB-266 Phase 1).
+ *  HLC fields wire as `HlcDto` ({wallMs, logical, deviceId}). */
+export interface ChannelInfo {
+  channelId: string;
+  name: string;
+  writePower: number;
+  createdAt: { wallMs: number; logical: number; deviceId: string };
+  deletedAt?: { wallMs: number; logical: number; deviceId: string };
+}
+
+/** Action discriminator on the `channel-config-updated` Tauri event.
+ *  Backend serializes via serde rename_all = "camelCase" so the wire
+ *  shape is the literal strings 'created' | 'modified' | 'deleted'. */
+export type ChannelConfigAction = 'created' | 'modified' | 'deleted';
+
+interface ChannelConfigChangedPayload {
+  communityId: string;
+  channelId: string;
+  action: ChannelConfigAction;
+  name?: string;
+  writePower?: number;
+  atWallMs: number;
+}
+
 interface HlcDto { wallMs: number; logical: number; deviceId: string; }
 interface MemberInfoDto {
   addr: string;
@@ -46,6 +70,17 @@ export class CommunityService {
    *  but does not need to invalidate any local roster state. */
   onDegradedChanged?: (communityId: string) => void;
 
+  /** Called when a channel-config CRDT mutation materializes through
+   *  the per-community state-CRDT. Receivers should refresh
+   *  listChannels(communityId) to pull the post-mutation snapshot. */
+  onChannelConfigChanged?: (
+    communityId: string,
+    action: ChannelConfigAction,
+    channelId: string,
+    name?: string,
+    writePower?: number,
+  ) => void;
+
   private adapter: TauriAdapter | null = null;
   private memberCache: Map<string, CommunityMember[]> = new Map();
   private degraded: Map<string, boolean> = new Map();
@@ -57,6 +92,8 @@ export class CommunityService {
   // round-trip) will not have an entry here, and getKind() returns
   // 'unknown' for those.
   private knownKinds: Map<string, 'open' | 'invite-only'> = new Map();
+  private channelCache = new Map<string, ChannelInfo[]>();
+  private selectedChannelByCommunity = new Map<string, string>();
   private unlisteners: Array<() => void> = [];
 
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
@@ -82,6 +119,24 @@ export class CommunityService {
       },
     );
     this.unlisteners.push(unlistenDegraded);
+
+    const unlistenChannelConfig = await adapter.listen(
+      'channel-config-updated',
+      (event) => {
+        const p = event.payload as ChannelConfigChangedPayload;
+        // Invalidate the per-community channel cache so the next
+        // listChannels(communityId) re-fetches.
+        this.channelCache.delete(p.communityId);
+        this.onChannelConfigChanged?.(
+          p.communityId,
+          p.action,
+          p.channelId,
+          p.name,
+          p.writePower,
+        );
+      },
+    );
+    this.unlisteners.push(unlistenChannelConfig);
   }
 
   async createCommunity(name: string, kind: 'open' | 'invite-only'): Promise<string> {
@@ -128,6 +183,55 @@ export class CommunityService {
     });
   }
 
+  async createChannel(
+    communityId: string,
+    name: string,
+    writePower: number,
+  ): Promise<string> {
+    return this.invoke<string>('create_channel', {
+      communityId,
+      name,
+      writePower,
+    });
+  }
+
+  async modifyChannel(
+    communityId: string,
+    channelId: string,
+    name?: string,
+    writePower?: number,
+  ): Promise<void> {
+    await this.invoke<void>('modify_channel', {
+      communityId,
+      channelId,
+      name,
+      writePower,
+    });
+  }
+
+  async deleteChannel(communityId: string, channelId: string): Promise<void> {
+    await this.invoke<void>('delete_channel', { communityId, channelId });
+  }
+
+  async listChannels(communityId: string): Promise<ChannelInfo[]> {
+    const cached = this.channelCache.get(communityId);
+    if (cached) return cached;
+    const fresh = await this.invoke<ChannelInfo[]>('list_channels', { communityId });
+    this.channelCache.set(communityId, fresh);
+    return fresh;
+  }
+
+  /** Per spec §6.5: session-scoped selected-channel map. Returns
+   *  undefined for first-visit to a community (caller falls back to
+   *  #general or first channel). Cleared by destroy(). */
+  getSelectedChannel(communityId: string): string | undefined {
+    return this.selectedChannelByCommunity.get(communityId);
+  }
+
+  setSelectedChannel(communityId: string, channelId: string): void {
+    this.selectedChannelByCommunity.set(communityId, channelId);
+  }
+
   async listCommunityMembers(communityId: string): Promise<CommunityMember[]> {
     const cached = this.memberCache.get(communityId);
     if (cached) return cached;
@@ -156,6 +260,8 @@ export class CommunityService {
     this.memberCache.clear();
     this.degraded.clear();
     this.knownKinds.clear();
+    this.channelCache.clear();
+    this.selectedChannelByCommunity.clear();
     // Null the adapter too — without this, connectAdapter's
     // duplicate-init guard (`if (this.adapter) return;`) would
     // silently no-op on reconnect after destroy(), leaving the
