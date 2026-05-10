@@ -36,11 +36,11 @@ Rejected alternatives:
 ### §3.1 New state on `ChannelLogRegistry`
 
 ```rust
-pending_transactions: parking_lot::Mutex<HashMap<SpaceId, PendingTransaction>>,
+pending_transactions: std::sync::Mutex<HashMap<SpaceId, PendingTransaction>>,
 next_tx_id: std::sync::atomic::AtomicU64,
 ```
 
-`parking_lot::Mutex` (sync) is the right choice here — critical sections never span an `.await`, and `begin_transaction` is itself sync (see §5.3).
+`std::sync::Mutex` (sync) is the right choice here — critical sections never span an `.await`, and `begin_transaction` is itself sync (see §5.3).
 
 ```rust
 struct PendingTransaction {
@@ -159,7 +159,7 @@ Called BEFORE `community_registry.spawn_engine`. Defensive — the community eng
 
 ### §5.3 Lock acquisition in begin_transaction
 
-`begin_transaction` is _synchronous_ and uses `parking_lot::Mutex` for `pending_transactions`. Critical section: HashMap insert + atomic increment. Never spans an `.await`. No tokio worker thread is parked.
+`begin_transaction` is _synchronous_ and uses `std::sync::Mutex` for `pending_transactions`. Critical section: HashMap insert + atomic increment. Never spans an `.await`. No tokio worker thread is parked.
 
 ### §5.4 tx_id-tagged transactions
 
@@ -243,7 +243,7 @@ Every existing test in `create_community_inner_tests` and `redeem_invite_inner_t
 | D2 | Queue lives in `ChannelLogRegistry`, not in the delta consumer | Single source of truth; consumer wiring unchanged |
 | D3 | `tx_id` tagging via `AtomicU64`, verified on commit/abort | Closes the stale-abort-clobbers-fresh-tx race for `redeem_invite_inner` retries |
 | D4 | Sync `Drop` + `tokio::spawn(abort_transaction_internal)` safety net with `tracing::warn!` | Catches forgotten cleanup; loud in logs |
-| D5 | `parking_lot::Mutex` for `pending_transactions` | Sync, brief critical sections, no `.await` spanning the lock |
+| D5 | `std::sync::Mutex` for `pending_transactions` | Sync, brief critical sections, no `.await` spanning the lock; matches codebase convention (NodeState, etc.); no new dep |
 | D6 | `begin_transaction` is sync, called BEFORE `community_registry.spawn_engine` | Defensive against disk-replay deltas during engine spawn |
 | D7 | `_inner` functions become `<R: tauri::Runtime>` generic | Lets tests use `MockRuntime` while production uses `Wry` |
 | D8 | `redeem_invite_inner` failure-path coverage limited to §7.1 protocol tests | Full Zenoh-driven scenario deferred; protocol-level coverage is sufficient |
