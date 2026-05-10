@@ -2588,7 +2588,16 @@ where
                     res = qbl.recv_async() => {
                         let Ok(query) = res else { break; };
                         let qkey = query.key_expr().to_string();
-                        let (since, limit) = parse_channel_backfill_key(&qkey);
+                        let (since, limit_raw) = parse_channel_backfill_key(&qkey);
+                        // Clamp peer-controlled limit per spec §6.2 (hard
+                        // cap 1000). limit=0 falls back to default 256.
+                        // Defense-in-depth: also clamped on the driver
+                        // side before the GET selector is built.
+                        let limit = if limit_raw == 0 {
+                            CHANNEL_BACKFILL_DEFAULT_LIMIT
+                        } else {
+                            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        };
                         let packets = (read_for_query_qbl)(since, limit).await;
                         for packet in packets {
                             if let Err(e) = query
@@ -2623,7 +2632,14 @@ where
                     biased;
                     maybe = query_request_rx.recv() => {
                         let Some(req) = maybe else { break; };
-                        let limit = if req.limit == 0 { 256 } else { req.limit };
+                        // Clamp our own request before encoding (defense
+                        // in depth — also prevents a misbehaving local
+                        // engine from issuing oversized requests).
+                        let limit = if req.limit == 0 {
+                            CHANNEL_BACKFILL_DEFAULT_LIMIT
+                        } else {
+                            req.limit.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        };
                         let since_hex = match &req.since {
                             Some(h) => format_hlc_hex(h),
                             None => "0".to_string(),
@@ -2649,7 +2665,15 @@ where
                             if let Ok(sample) = reply.into_result() {
                                 let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
                                 if subscriber_tx_qr.send(bytes).await.is_err() {
-                                    break;
+                                    // subscriber_rx dropped (engine
+                                    // teardown). No point serving more
+                                    // backfill requests if we can't
+                                    // deliver replies — exit the qr
+                                    // task entirely so we don't loop
+                                    // back, fire another session.get,
+                                    // and spin until the 1s closing
+                                    // poll catches up.
+                                    return;
                                 }
                             }
                         }
@@ -2668,17 +2692,26 @@ where
     })
 }
 
+/// Per spec §6.2: default backfill limit when peer/local sends 0.
+const CHANNEL_BACKFILL_DEFAULT_LIMIT: usize = 256;
+/// Per spec §6.2 + §15: hard cap on backfill `limit` (peer-controlled
+/// AND local-controlled). Bounds the reply storm on the queryable side
+/// and prevents a misbehaving local engine from issuing oversized
+/// requests on the driver side.
+const CHANNEL_BACKFILL_MAX_LIMIT: usize = 1000;
+
 /// Parse `"harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}"`
 /// into `(since, limit)`. Returns `(None, 0)` if parsing fails or
 /// if `hlc_hex == "0"`.
 fn parse_channel_backfill_key(key: &str) -> (Option<crate::owner_state_types::Hlc>, usize) {
     // Pattern is: harmony / channels / {cid} / {ch_id} / since / {hlc_hex} / {limit}
+    //               0         1          2       3         4        5            6
     let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() < 7 || parts[5] != "since" {
+    if parts.len() < 7 || parts[4] != "since" {
         return (None, 0);
     }
-    let hlc_hex = parts[6];
-    let limit_str = parts.get(7).copied().unwrap_or("0");
+    let hlc_hex = parts[5];
+    let limit_str = parts.get(6).copied().unwrap_or("0");
 
     let since = if hlc_hex == "0" {
         None
@@ -2774,5 +2807,44 @@ mod channel_log_adapter_tests {
         // doesn't latch the receiver-closed branch before closing
         // is observed.
         drop(qreq_tx);
+    }
+
+    #[test]
+    fn parse_channel_backfill_key_round_trip_with_clamp() {
+        // Format: harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}
+        let key = format!(
+            "harmony/channels/{}/{}/since/0/9999999999",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        let (since, limit_raw) = parse_channel_backfill_key(&key);
+        assert!(since.is_none(), "since=0 should parse to None");
+        assert_eq!(limit_raw, 9_999_999_999_usize, "raw limit passes through");
+
+        // Verify the clamp logic the queryable would apply:
+        let limit = if limit_raw == 0 {
+            CHANNEL_BACKFILL_DEFAULT_LIMIT
+        } else {
+            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+        };
+        assert_eq!(limit, CHANNEL_BACKFILL_MAX_LIMIT, "clamp caps at hard max");
+    }
+
+    #[test]
+    fn parse_channel_backfill_key_zero_limit_uses_default_after_clamp() {
+        let key = format!(
+            "harmony/channels/{}/{}/since/0/0",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        let (_since, limit_raw) = parse_channel_backfill_key(&key);
+        assert_eq!(limit_raw, 0);
+
+        let limit = if limit_raw == 0 {
+            CHANNEL_BACKFILL_DEFAULT_LIMIT
+        } else {
+            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+        };
+        assert_eq!(limit, CHANNEL_BACKFILL_DEFAULT_LIMIT);
     }
 }
