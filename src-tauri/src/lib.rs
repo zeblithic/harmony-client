@@ -1586,7 +1586,7 @@ async fn start_node(
                                                         return;
                                                     }
                                                 };
-                                                if let Err(e) = registry
+                                                match registry
                                                     .spawn(
                                                         cid,
                                                         chid,
@@ -1597,12 +1597,18 @@ async fn start_node(
                                                     )
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        community_id = %payload.community_id,
-                                                        channel_id = %payload.channel_id,
-                                                        error = ?e,
-                                                        "channel-log spawn failed"
-                                                    );
+                                                    Ok(crate::community_channel_log_engine::SpawnOutcome::Spawned(_)) => {}
+                                                    Ok(crate::community_channel_log_engine::SpawnOutcome::DeferredForCommit) => {
+                                                        // Deferred until a transaction commits.
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            channel_id = %payload.channel_id,
+                                                            error = ?e,
+                                                            "channel-log spawn failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             ChannelConfigChangeAction::Modified => {
@@ -7181,7 +7187,7 @@ pub fn mint_community_creation(
 /// commit. See spec at `docs/specs/2026-05-09-zeb-267-...md` for the
 /// rationale behind moving the bump out of the apply critical section.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_community_inner(
+pub async fn create_community_inner<R: tauri::Runtime>(
     name: String,
     is_invite_only: bool,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -7193,6 +7199,9 @@ pub async fn create_community_inner(
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
     snapshot_generation: u64,
     node_state: &std::sync::Mutex<NodeState>,
 ) -> Result<String, String> {
@@ -7247,6 +7256,13 @@ pub async fn create_community_inner(
     // persistence dir is also removed). At this point owner-state is
     // unchanged.
     //
+    // ZEB-271: open a channel-log transaction so any ChannelCreate
+    // events that materialize during this critical section are queued
+    // and only fire on commit. Drop on early-return triggers the
+    // safety-net abort, preventing phantom default-#general spawns on
+    // fence/apply_space failure. See spec §3-§5.
+    let channel_log_tx = channel_log_registry.begin_transaction(minted.community_id);
+
     // Channel pair shape mirrors start_node's per-community spawn
     // path: pub_tx / sub_rx feed the engine, pub_rx / sub_tx feed the
     // Zenoh adapter. The CommunityAdapterRequest carries the adapter
@@ -7576,6 +7592,23 @@ pub async fn create_community_inner(
         // "burn" — HLCs are 64-bit logical, not finite.
     }
 
+    // ZEB-271: post-durable-commit drain. apply_space above is the LAST
+    // PERSISTENT step — the community is committed. If commit() fails,
+    // log and continue: the deferred channel-log spawns (e.g., default
+    // #general) will be re-attempted by reconcile_from_state at next
+    // start_node. Returning Err here would surface the create as failed
+    // even though the community exists, leading to retry → duplicate
+    // community.
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(minted.community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable community create; \
+             pending channel-log spawns will be re-attempted via \
+             reconcile_from_state at next start_node"
+        );
+    }
+
     Ok(hex::encode(minted.community_id.0))
 }
 
@@ -7614,6 +7647,7 @@ async fn create_community(
         self_owner,
         community_registry,
         community_adapter_tx,
+        channel_log_registry,
         dm_outbox,
         snapshot_generation,
     ) = {
@@ -7633,6 +7667,9 @@ async fn create_community(
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
+            g.channel_log_registry
+                .clone()
+                .ok_or("channel_log_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
@@ -7657,6 +7694,7 @@ async fn create_community(
         signing_key,
         community_registry,
         community_adapter_tx,
+        channel_log_registry,
         snapshot_generation,
         &state_lock,
     )
@@ -7686,8 +7724,480 @@ async fn create_community(
 #[cfg(test)]
 mod create_community_inner_tests {
     use super::*;
+    use crate::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
+    use crate::community_state_sync::{
+        CommunityMembershipDelta, CommunityRegistryConfig, CommunitySyncRegistry,
+        DEFAULT_DEBOUNCE_MS,
+    };
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
     use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use tokio::sync::mpsc;
+
+    // ── Fixture helper ────────────────────────────────────────────────────────
+
+    /// Extract the canonical Ed25519 signing key from a `PrivateIdentity`.
+    /// Mirrors the pattern used by all other test modules in this file.
+    fn signing_key_from_identity(
+        identity: &PrivateIdentity,
+    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
+    }
+
+    struct CreateCommunityTestFixture {
+        crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        device_id: String,
+        self_owner: OwnerAddr,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        community_registry: std::sync::Arc<CommunitySyncRegistry>,
+        community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        node_state: std::sync::Mutex<NodeState>,
+        // Held alive so adapter channels don't report Closed.
+        _community_adapter_rx:
+            tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+        // Held alive so the channel_log registry's adapter bridge stays open.
+        _channel_log_adapter_rx:
+            tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        // Held alive so the delta consumer task keeps running.
+        _consumer_drainer: tokio::task::JoinHandle<()>,
+        // Tempdir held alive for the duration of the test.
+        _tmp: tempfile::TempDir,
+    }
+
+    impl CreateCommunityTestFixture {
+        /// Current node-state generation (mirrors the snapshot_generation
+        /// arg `create_community` passes to `create_community_inner`).
+        fn snapshot_generation(&self) -> u64 {
+            self.node_state
+                .lock()
+                .expect("node_state poisoned")
+                .generation
+        }
+
+        /// Bump the node-state generation to simulate a stop-during-await
+        /// race that triggers the fence abort path.
+        fn bump_node_state_generation(&self) {
+            self.node_state
+                .lock()
+                .expect("node_state poisoned")
+                .generation += 1;
+        }
+    }
+
+    /// Build a minimal fixture for `create_community_inner` unit tests.
+    ///
+    /// Key design choices:
+    /// - `delta_tx: Some(delta_tx)` in `CommunityRegistryConfig` — ChannelCreate
+    ///   events emitted by the engine flow to the consumer task, which mirrors
+    ///   the production lib.rs:1552+ callback: it calls
+    ///   `channel_log_registry.spawn(...)` for each Created event. During an
+    ///   open transaction this call enqueues a `DeferredSpawn`; `commit()` drains
+    ///   the queue and calls `spawn_inner_now`. After a successful commit the
+    ///   happy-path test can assert `engines_count == 1`.
+    /// - The channel-log registry uses a dummy adapter bridge (unbounded
+    ///   sender + receiver kept alive). No Zenoh drainer is needed — the
+    ///   send succeeds so `spawn_inner_now` completes, but the adapter
+    ///   request just queues unprocessed (harmless for these tests).
+    /// - The community adapter channel is live (receiver kept alive) so
+    ///   the adapter `try_send` inside `create_community_inner` succeeds.
+    /// - The fence-check `node_state` is a bare `NodeState::default()`
+    ///   with `generation = 0`. Tests that exercise the fence path bump
+    ///   the generation via `fixture.bump_node_state_generation()`.
+    async fn build_create_community_test_fixture() -> CreateCommunityTestFixture {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let identity = PrivateIdentity::from_seed(&[0xc0; 32]);
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        let identity_pub_64 = identity.identity.to_public_bytes();
+        let signing_key = signing_key_from_identity(&identity);
+
+        // Community registry — delta_tx wired so ChannelCreate deltas
+        // flow to the consumer task (spawned below). The resolver returns
+        // self_owner's identity_pub so verify_event admits the local
+        // admin's events.
+        struct SingleOwnerResolver {
+            owner: OwnerAddr,
+            pub_64: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for SingleOwnerResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.owner {
+                    Some(self.pub_64)
+                } else {
+                    None
+                }
+            }
+        }
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+
+        // delta_tx / delta_rx: engine emits CommunityMembershipDelta here;
+        // consumer task mirrors the production lib.rs:1552+ registry hook.
+        let (delta_tx, delta_rx) = mpsc::channel::<CommunityMembershipDelta>(64);
+
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "test-dev".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(SingleOwnerResolver {
+                    owner: self_owner,
+                    pub_64: identity_pub_64,
+                }),
+                identity_dir: tmp.path().to_path_buf(),
+                debounce_ms: DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: Some(delta_tx),
+                self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+            }));
+
+        // Community adapter channel — receiver kept alive so try_send
+        // succeeds inside create_community_inner.
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+
+        // Channel-log registry — dummy adapter bridge. The unbounded
+        // receiver is kept alive so adapter-request sends succeed inside
+        // spawn_inner_now, but no drainer runs (the request just queues).
+        // This is sufficient: spawn_inner_now inserts the engine into the
+        // registry map regardless of whether the adapter request is
+        // consumed, so engines_count_for_test() reflects real spawns.
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: channel_log_adapter_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner,
+            self_device_id: "test-dev".into(),
+            signing_key: std::sync::Arc::clone(&signing_key),
+            engine_config: ChannelLogEngineConfig::default(),
+        });
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        // Fence-check node state — generation starts at 0 (matches
+        // snapshot_generation = 0 for the happy-path and apply_space
+        // rejected paths). Tests that drive the fence path bump it.
+        let node_state = std::sync::Mutex::new(NodeState {
+            // Populate community_registry so the fence-check's
+            // `g.community_registry.is_none()` guard doesn't fire.
+            community_registry: Some(std::sync::Arc::clone(&community_registry)),
+            ..NodeState::default()
+        });
+
+        // Consumer task: mirrors the production lib.rs:1552+ registry hook.
+        // Drains delta_rx; for each ChannelCreate delta, derives the
+        // channel key from the community engine's membership_key and calls
+        // channel_log_registry.spawn — during an open transaction this
+        // call enqueues a DeferredSpawn; commit() drains and fires
+        // spawn_inner_now.
+        //
+        // The engine's state_at_hlc and identity_resolver are obtained
+        // via community_registry.engine_arc() — same path as production.
+        // The task exits cleanly when every delta_tx clone drops (i.e.,
+        // when community_registry is shut down or dropped at test end).
+        let _consumer_drainer = {
+            let registry_for_hook = std::sync::Arc::clone(&channel_log_registry);
+            let community_registry_for_hook = std::sync::Arc::clone(&community_registry);
+            let hlc_tracker_for_hook = std::sync::Arc::clone(&hlc_tracker);
+            tokio::spawn(run_community_delta_consumer(
+                delta_rx,
+                // membership-changed callback — no-op in test (no Tauri
+                // event emission needed).
+                |_payload| async {},
+                // channel-config-updated callback — no-op in test.
+                |_payload| async {},
+                // channel-log registry hook — mirrors lib.rs:1552+.
+                move |payload: ChannelConfigChangedPayload| {
+                    let registry = std::sync::Arc::clone(&registry_for_hook);
+                    let community_registry = std::sync::Arc::clone(&community_registry_for_hook);
+                    let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                    async move {
+                        if payload.action != ChannelConfigChangeAction::Created {
+                            return;
+                        }
+                        let cid_bytes: [u8; 16] = match hex::decode(&payload.community_id)
+                            .ok()
+                            .and_then(|v| v.try_into().ok())
+                        {
+                            Some(b) => b,
+                            None => return,
+                        };
+                        let chid_bytes: [u8; 16] = match hex::decode(&payload.channel_id)
+                            .ok()
+                            .and_then(|v| v.try_into().ok())
+                        {
+                            Some(b) => b,
+                            None => return,
+                        };
+                        let cid = crate::owner_state_types::SpaceId(cid_bytes);
+                        let chid = crate::community_membership::ChannelId(chid_bytes);
+
+                        let community_engine = match community_registry.engine_arc(&cid).await {
+                            Some(e) => e,
+                            None => return,
+                        };
+                        let membership_key = community_engine.membership_key();
+                        let key = crate::community_channel_log::derive_channel_key(
+                            &membership_key,
+                            &cid,
+                            &chid,
+                        );
+                        let state_at_hlc = community_engine.state_at_hlc_resolver();
+                        let resolver = match community_engine.identity_resolver() {
+                            Some(r) => r,
+                            None => return,
+                        };
+                        let _ = registry
+                            .spawn(cid, chid, key, state_at_hlc, resolver, hlc_tracker)
+                            .await;
+                    }
+                },
+            ))
+        };
+
+        CreateCommunityTestFixture {
+            crdt_state,
+            hlc_tracker,
+            device_id: "test-dev".into(),
+            self_owner,
+            signing_key,
+            community_registry,
+            community_adapter_tx,
+            channel_log_registry,
+            node_state,
+            _community_adapter_rx,
+            _channel_log_adapter_rx,
+            _consumer_drainer,
+            _tmp: tmp,
+        }
+    }
+
+    // ── ZEB-271 wait helpers ──────────────────────────────────────────────────
+
+    /// Bounded condition-wait: polls until `engines_count_for_test()`
+    /// equals `expected`, or `timeout` elapses. Returns `true` on match.
+    async fn wait_until_engines_count(
+        registry: &crate::community_channel_log_engine::ChannelLogRegistry<
+            tauri::test::MockRuntime,
+        >,
+        expected: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if registry.engines_count_for_test().await == expected {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    // ── ZEB-271: channel-log transaction coverage ─────────────────────────────
+    //
+    // These tests verify that `create_community_inner` opens a
+    // `CommunityTransactionGuard`, that the deferred-spawn queue actually
+    // receives the #general ChannelCreate via the wired delta consumer,
+    // and that the guard is committed (draining the queue → spawning the
+    // engine) on success or dropped (triggering safety-net abort, discarding
+    // the queue) on every failure path. See spec §7.2.
+
+    /// Happy path (spec §7.2): `create_community_inner` returns Ok.
+    ///
+    /// The wired delta consumer delivers the #general ChannelCreate to
+    /// `channel_log_registry.spawn` while the transaction is open, which
+    /// enqueues a DeferredSpawn. `commit()` drains the queue and calls
+    /// `spawn_inner_now`, inserting the engine into the registry. After
+    /// commit: no pending transaction entry, and `engines_count == 1`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn happy_path_spawns_default_channel_engine() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let result = create_community_inner(
+            "happy-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await;
+
+        assert!(result.is_ok(), "happy path must succeed: {:?}", result);
+
+        // Post-commit: no pending transaction entry remains.
+        let community_id_hex = result.unwrap();
+        let id_bytes: [u8; 16] = hex::decode(&community_id_hex)
+            .expect("hex community_id")
+            .as_slice()
+            .try_into()
+            .expect("16 bytes");
+        let community_id = crate::owner_state_types::SpaceId(id_bytes);
+
+        assert!(
+            !fixture
+                .channel_log_registry
+                .has_pending_transaction_for_test(&community_id),
+            "happy path: channel_log transaction must be committed (no pending entry)"
+        );
+
+        // Poll until the consumer task has processed the ChannelCreate delta
+        // and the engine has appeared in the registry (max 500ms).
+        // The delta may arrive before or after commit() — either way the
+        // engine ends up spawned; the bounded poll avoids a fixed sleep.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "happy path: commit() must spawn the #general channel-log engine \
+             (engines_count must be 1 after deferred-spawn drain)"
+        );
+    }
+
+    /// Failure path — fence abort after default-channel insert: the guard
+    /// is dropped (safety-net abort) and no phantom engines leak.
+    ///
+    /// # apply_space rejection — DEVIATION NOTE (spec §7.2)
+    ///
+    /// Spec §7.2 requests a test that forces `apply_space_with_canonicalization`
+    /// to reject, proving the guard's safety-net abort cleans up after that
+    /// specific failure point. The apply_space rejection path is not exercised
+    /// here because it cannot be triggered without controlling the SpaceId that
+    /// `create_community_inner` will mint — the ID is randomly generated inside
+    /// the function (rand::thread_rng().fill_bytes), so the test cannot
+    /// pre-insert a conflicting Space row for the same SpaceId.
+    ///
+    /// What would be needed to implement this properly:
+    /// 1. A `mint_community_creation` overload that accepts a caller-supplied
+    ///    SpaceId (or a seed for the RNG) so the test can predict the id.
+    /// 2. Pre-apply that SpaceId to `crdt_state` with a different
+    ///    `membership_key` or `admin_addr`. `apply_space_with_canonicalization`
+    ///    then rejects the second application with `InvariantFail` (same-SpaceId
+    ///    community creation-pinned fields are immutable — see owner_state_crdt.rs
+    ///    lines ~173–203).
+    /// 3. Call `create_community_inner` with the same SpaceId so the rejection
+    ///    actually fires.
+    ///
+    /// In the meantime this test exercises a guard abort that fires AFTER the
+    /// default-channel ChannelCreate is inserted into the engine (the fence check
+    /// fires after `insert_local_event` but before `apply_space`) — same
+    /// safety-net drop code path as the apply_space rejection branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_abort_after_default_channel_insert_no_channel_log_leak() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        // Bump the generation so the fence check fires. The fence check
+        // runs AFTER the default-channel ChannelCreate insert_local_event,
+        // so the deferred-spawn queue has one entry at abort time.
+        // Guard drop → safety-net abort → queue discarded → engines_count == 0.
+        fixture.bump_node_state_generation();
+
+        let result = create_community_inner(
+            "fence-aborted-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen, // stale — node_state.generation is now snapshot_gen + 1
+            &fixture.node_state,
+        )
+        .await;
+
+        assert!(result.is_err(), "must Err on fence abort");
+
+        // Poll until the safety-net abort has run (max 500ms).
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                0,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "no channel-log engines must leak after fence-aborted create_community_inner"
+        );
+    }
+
+    /// Failure path — fence generation changed: the guard is dropped
+    /// (safety-net abort) and no phantom engines leak. Directly
+    /// exercises the ZEB-258/ZEB-271 combined rollback property.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fence_generation_changed_no_channel_log_leak() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        // Bump BEFORE the call so the fence check (which re-acquires the
+        // node_state lock) sees a changed generation.
+        fixture.bump_node_state_generation();
+
+        let result = create_community_inner(
+            "fence-changed-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "fence generation change must abort create: {:?}",
+            result
+        );
+
+        // Poll until the safety-net abort has run (max 500ms).
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                0,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "no channel-log engines must leak after fence-generation-changed abort"
+        );
+    }
+
+    // ── Existing tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn mint_creation_produces_consistent_id_join_event_and_space() {
@@ -7933,7 +8443,7 @@ pub fn mint_redemption(
 /// `Fn` (not `FnOnce`) so future-proof retries can re-call without
 /// consuming.
 #[allow(clippy::too_many_arguments)]
-pub async fn redeem_invite_inner<F>(
+pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
@@ -7946,6 +8456,9 @@ pub async fn redeem_invite_inner<F>(
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
     fence_check: F,
 ) -> Result<RedeemInviteResultDto, String>
 where
@@ -7967,6 +8480,12 @@ where
 
     // 5. Mint (pure helper — no side effects on owner-state yet).
     let minted = mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?;
+
+    // ZEB-271: open a channel-log transaction. Protects against remote
+    // ChannelCreate events that arrive via Zenoh sync between
+    // spawn_engine and apply_space — they're queued, only fire on
+    // commit, dropped on rollback. See spec §4.2.
+    let channel_log_tx = channel_log_registry.begin_transaction(minted.community_id);
 
     // ZEB-267 (replaces the prior ZEB-258 comment): the HLC tracker
     // is bumped at reservation time (step 4) regardless of whether
@@ -8591,6 +9110,23 @@ where
         // state_g drops at scope end.
     }
 
+    // ZEB-271: post-durable-commit drain. apply_space above is the LAST
+    // PERSISTENT step — the redemption Space is committed. If commit()
+    // fails, log and continue: the deferred channel-log spawns from
+    // remote sync will be re-attempted by reconcile_from_state at next
+    // start_node. Returning Err here would surface the join as failed
+    // even though the user already joined; an OPEN retry is non-idempotent
+    // and would append a second self-Join (ZEB-260 nominal-cost path).
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(minted.community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable redemption; \
+             pending channel-log spawns will be re-attempted via \
+             reconcile_from_state at next start_node"
+        );
+    }
+
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
     // round-tripping. ZEB-265.
@@ -8684,6 +9220,7 @@ async fn redeem_invite(
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
+        channel_log_registry,
         dm_outbox,
         snapshot_generation,
     ) = {
@@ -8706,6 +9243,9 @@ async fn redeem_invite(
             g.unicast_send_tx
                 .clone()
                 .ok_or("unicast_send_tx missing — no owner identity?")?,
+            g.channel_log_registry
+                .clone()
+                .ok_or("channel_log_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
@@ -8762,6 +9302,7 @@ async fn redeem_invite(
         community_adapter_tx,
         unicast_send_tx,
         dm_outbox,
+        channel_log_registry,
         fence_check,
     )
     .await?;
@@ -8789,9 +9330,245 @@ async fn redeem_invite(
 #[cfg(test)]
 mod redeem_invite_inner_tests {
     use super::*;
+    use crate::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
     use crate::community_invite::CommunityInvitePayload;
-    use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc, MembershipKey, OwnerAddr, SpaceId};
     use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use tokio::sync::mpsc;
+
+    // ── Fixture helper ────────────────────────────────────────────────────────
+
+    fn signing_key_from_identity(
+        identity: &PrivateIdentity,
+    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
+    }
+
+    struct RedeemInviteTestFixture {
+        crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        device_id: String,
+        self_owner: OwnerAddr,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        community_registry: std::sync::Arc<CommunitySyncRegistry>,
+        community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+        channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        // Held alive so channels don't report Closed.
+        _community_adapter_rx:
+            tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+        _unicast_rx: tokio::sync::mpsc::Receiver<UnicastSendRequest>,
+        _channel_log_adapter_rx:
+            tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Build a minimal fixture for `redeem_invite_inner` unit tests.
+    ///
+    /// Key design choices:
+    /// - OPEN-only invite: `is_invite_only = false` avoids the Zenoh unicast
+    ///   path; the happy path inserts the bootstrap_join locally via the engine
+    ///   and proceeds to fence_check → apply_space.
+    /// - `delta_tx: None` in `CommunityRegistryConfig` — no ChannelCreate
+    ///   events flow to `channel_log_registry`. The registry is present to
+    ///   receive `begin_transaction` + guard drop / `commit()` calls.
+    /// - The channel-log registry uses a dummy adapter bridge (unbounded
+    ///   sender + receiver kept alive). No Zenoh drainer runs — harmless
+    ///   since no spawns reach `spawn_inner_now` during an OPEN redeem
+    ///   (remote Zenoh events don't arrive in unit tests).
+    /// - `unicast_send_tx` receiver is kept alive so try_send doesn't see
+    ///   Closed (needed by the INVITE-ONLY branch; unused on the OPEN path).
+    async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        // Joiner identity (self).
+        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let self_owner = OwnerAddr(joiner_identity.identity.address_hash);
+        let signing_key = signing_key_from_identity(&joiner_identity);
+
+        // Admin identity (invite creator). Used only for invite payload construction.
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_owner = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub_64 = admin_identity.identity.to_public_bytes();
+
+        // Identity resolver that admits events signed by both admin and joiner.
+        struct TwoOwnerResolver {
+            admin: OwnerAddr,
+            admin_pub: [u8; 64],
+            joiner: OwnerAddr,
+            joiner_pub: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for TwoOwnerResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.admin {
+                    Some(self.admin_pub)
+                } else if *addr == self.joiner {
+                    Some(self.joiner_pub)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let joiner_pub_64 = joiner_identity.identity.to_public_bytes();
+
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "joiner-dev".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
+                    admin: admin_owner,
+                    admin_pub: admin_pub_64,
+                    joiner: self_owner,
+                    joiner_pub: joiner_pub_64,
+                }),
+                identity_dir: tmp.path().to_path_buf(),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+            }));
+
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "joiner-dev".into(),
+            self_owner,
+            DeviceIdentityHash(joiner_identity.identity.address_hash),
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::new(joiner_identity),
+        )));
+
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: channel_log_adapter_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner,
+            self_device_id: "joiner-dev".into(),
+            signing_key: std::sync::Arc::clone(&signing_key),
+            engine_config: ChannelLogEngineConfig::default(),
+        });
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        RedeemInviteTestFixture {
+            crdt_state,
+            hlc_tracker,
+            device_id: "joiner-dev".into(),
+            self_owner,
+            signing_key,
+            community_registry,
+            community_adapter_tx,
+            unicast_send_tx,
+            dm_outbox,
+            channel_log_registry,
+            _community_adapter_rx,
+            _unicast_rx,
+            _channel_log_adapter_rx,
+            _tmp: tmp,
+        }
+    }
+
+    // ── ZEB-271: channel-log transaction coverage ──────────────────────────────
+
+    /// Happy path (spec §7.3): `redeem_invite_inner` returns Ok for an
+    /// OPEN-community invite. After success the transaction must be committed
+    /// (no lingering pending entry in `channel_log_registry`).
+    ///
+    /// Note: unlike `create_community_inner`, `redeem_invite_inner` does NOT
+    /// mint ChannelCreate events — the transaction protects against remote
+    /// ChannelCreate events that arrive via Zenoh sync. In this unit test
+    /// there is no Zenoh session, so the deferred queue is empty at commit.
+    /// The assertion "no pending tx" is a proxy for "commit was called".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn happy_path_no_pending_transaction_after_success() {
+        let fixture = build_redeem_invite_test_fixture().await;
+
+        // Build a minimal OPEN-community invite URL. The invite carries:
+        // - community_id: fixed test bytes so we can check later
+        // - membership_key: arbitrary 32 bytes
+        // - admin_addr: admin_identity.address_hash (matches our resolver)
+        // - is_invite_only: false  ← OPEN path (no Zenoh unicast needed)
+        // - no invite_token / admin_bootstrap
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let community_id = crate::owner_state_types::SpaceId([0xf1; 16]);
+        let membership_key = MembershipKey::new([0x42; 32]);
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr,
+            community_name: "TestRedeemCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "redeem_invite_inner happy path must succeed: {:?}",
+            result
+        );
+
+        // Proxy assertion for "tx was committed": no pending entry
+        // remaining for this community_id.
+        assert!(
+            !fixture
+                .channel_log_registry
+                .has_pending_transaction_for_test(&community_id),
+            "happy path: channel_log transaction must be committed (no lingering pending entry)"
+        );
+    }
+
+    // ── Existing tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn mint_redemption_produces_self_join_and_matching_space() {
