@@ -132,32 +132,37 @@ export class ChannelMessageService {
   /** Fire-and-forget backfill request. Single-in-flight per
    *  (communityId, channelId) per spec §6.7 — additional calls during
    *  in-flight are no-ops. The gate releases when:
-   *    1. The IPC promise settles (success or error), OR
-   *    2. A terminal `channel-backfill-progress` event arrives.
+   *    1. The IPC promise rejects (engine error / not-connected), OR
+   *    2. A terminal `channel-backfill-progress` event arrives (success).
    *
-   *  The returned promise resolves once the gate check passes and the IPC
-   *  is dispatched — it does NOT await IPC completion. This lets callers
-   *  use `void requestBackfill(...)` or `await requestBackfill(...)` and
-   *  get the same fast return; gate management happens internally via
-   *  `.finally()` on the IPC promise. */
-  requestBackfill(
+   *  IMPORTANT: This `await`s the IPC dispatch but the IPC itself returns
+   *  immediately (fire-and-forget on the backend). The gate is held until
+   *  a terminal progress event arrives via the channel-backfill-progress
+   *  listener (which calls inFlightBackfill.delete() in connectAdapter).
+   *  This is the correct spec §6.7 behavior — gate represents "backfill
+   *  is producing packets", not "IPC dispatch is in-flight". */
+  async requestBackfill(
     communityId: string,
     channelId: string,
     since?: HlcDto,
   ): Promise<void> {
-    if (!this.adapter) return Promise.reject(new Error('ChannelMessageService.requestBackfill: adapter not connected'));
+    if (!this.adapter) throw new Error('ChannelMessageService.requestBackfill: adapter not connected');
     const key = chKey(communityId, channelId);
-    if (this.inFlightBackfill.has(key)) return Promise.resolve();
+    if (this.inFlightBackfill.has(key)) return;
     this.inFlightBackfill.add(key);
-    // Fire the IPC without awaiting — gate is released when it settles.
-    this.adapter.invoke('request_channel_backfill', {
-      communityId,
-      channelId,
-      since,
-    }).finally(() => {
+    try {
+      await this.adapter.invoke('request_channel_backfill', {
+        communityId,
+        channelId,
+        since,
+      });
+      // Don't release the gate here — wait for a terminal progress tick,
+      // because the IPC returns immediately (fire-and-forget) and packets
+      // arrive afterward via channel-message-received.
+    } catch (e) {
       this.inFlightBackfill.delete(key);
-    });
-    return Promise.resolve();
+      throw e;
+    }
   }
 
   /** Subscribe to live + backfilled messages on a single channel.

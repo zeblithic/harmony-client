@@ -220,7 +220,12 @@ describe('ChannelMessageService', () => {
     await p1;
     await p2;
 
-    // After the first completes, a third call should fire a new IPC.
+    // Gate is held until terminal progress (IPC is fire-and-forget on backend).
+    // Fire a terminal progress event to release the gate.
+    const progressHandler = adapter.listeners.get('channel-backfill-progress')!;
+    progressHandler({ payload: { communityId: 'aa'.repeat(16), channelId: 'bb'.repeat(16), fetched: 5, totalEstimate: 5 } });
+
+    // After the gate is released, a third call should fire a new IPC.
     (adapter.invoke as any).mockResolvedValue(undefined);
     await service.requestBackfill('aa'.repeat(16), 'bb'.repeat(16));
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
@@ -228,14 +233,15 @@ describe('ChannelMessageService', () => {
 
   it('in-flight gate is per (communityId, channelId)', async () => {
     await service.connectAdapter(adapter);
-    let resolveA: () => void = () => {};
-    (adapter.invoke as any).mockImplementation(() => new Promise<void>(r => { resolveA = () => r(); }));
+    const resolvers: Array<() => void> = [];
+    (adapter.invoke as any).mockImplementation(() => new Promise<void>((r) => { resolvers.push(() => r()); }));
 
     const pA = service.requestBackfill('aa'.repeat(16), 'bb'.repeat(16));
     const pB = service.requestBackfill('aa'.repeat(16), 'cc'.repeat(16));
     expect(adapter.invoke).toHaveBeenCalledTimes(2);  // independent gates
 
-    resolveA();
+    // Resolve both invoke promises so both pA and pB can settle.
+    for (const r of resolvers) r();
     await pA;
     await pB;
   });
@@ -270,10 +276,12 @@ describe('ChannelMessageService', () => {
     // terminal. Use the in-flight check via a second invoke attempt:
     const handler = adapter.listeners.get('channel-backfill-progress')!;
 
-    // After the IPC promise resolved, the in-flight gate is already
-    // released by the .finally(). The test below verifies the
-    // PROGRESS-driven gate-release case for callers that fire and forget.
-    // Re-arm the gate by firing a second backfill that hangs:
+    // The gate is still held after IPC resolves (fire-and-forget backend).
+    // Re-arm the gate by firing a second backfill that hangs — but first
+    // release the gate from the first call via terminal progress:
+    handler({ payload: { communityId: 'aa'.repeat(16), channelId: 'bb'.repeat(16), fetched: 5, totalEstimate: 5 } });
+
+    // Now re-arm the gate with a backfill that hangs (IPC doesn't resolve):
     let resolve2: () => void = () => {};
     (adapter.invoke as any).mockReturnValue(new Promise<void>(r => { resolve2 = () => r(); }));
     void service.requestBackfill('aa'.repeat(16), 'bb'.repeat(16));
