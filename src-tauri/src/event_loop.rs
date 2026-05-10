@@ -2590,6 +2590,14 @@ where
     );
 
     tokio::spawn(async move {
+        // Spawn-stop race fast path: if closing was flipped after the
+        // request was queued but before this task started, exit
+        // immediately without declaring Zenoh resources or holding the
+        // read_for_query closure (which keeps the engine alive).
+        if closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         let events_key = match zenoh::key_expr::KeyExpr::try_from(events_topic.clone()) {
             Ok(k) => k,
             Err(e) => {
@@ -3012,8 +3020,42 @@ mod channel_log_adapter_tests {
             Arc::clone(&closing),
         );
 
-        // Give the subscriber time to come up (Zenoh declare is async).
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Wait for the Zenoh subscriber to come online by round-tripping
+        // a synthetic warmup packet. Replaces the prior fixed 250ms sleep
+        // which was scheduler-dependent and flaked under load. We use a
+        // distinct warmup byte sequence so leftover warmup deliveries
+        // can't be mistaken for the real payload assertion below.
+        let warmup_payload = b"__warmup__".to_vec();
+        let warmup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= warmup_deadline {
+                panic!("subscriber didn't come online within 2s");
+            }
+            pub_tx
+                .send(warmup_payload.clone())
+                .await
+                .expect("publish warmup");
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub_rx.recv()).await {
+                Ok(Some(received)) if received == warmup_payload => break,
+                _ => {
+                    // Subscriber not ready yet; retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Drain any extra warmup deliveries the subscriber may have
+        // queued before it came online, so the real payload assertion
+        // below is unambiguous.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(20), sub_rx.recv()).await {
+                Ok(Some(extra)) if extra == warmup_payload => continue,
+                Ok(Some(other)) => {
+                    panic!("unexpected non-warmup payload during drain: {:?}", other);
+                }
+                _ => break,
+            }
+        }
 
         let payload = b"channel-log-roundtrip".to_vec();
         pub_tx.send(payload.clone()).await.expect("publish send");
