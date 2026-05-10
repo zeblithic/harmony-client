@@ -128,10 +128,22 @@ let tx = channel_log_registry.begin_transaction(minted.community_id);
 // default-channel mint + insert, fence, apply_space …
 // All existing rollback paths just `return Err(...)` — the dropped tx auto-aborts.
 
-// SUCCESS: after apply_space succeeds, before Ok return:
-tx.commit()
-    .await
-    .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+// SUCCESS: after apply_space succeeds, before Ok return.
+// apply_space is the LAST PERSISTENT step — the community is committed.
+// If commit() fails, log and continue: the deferred channel-log spawns
+// (e.g., default #general) will be re-attempted by reconcile_from_state
+// at next start_node. Returning Err here would surface the create as
+// failed even though the community exists, leading to retry → duplicate
+// community.
+if let Err(e) = tx.commit().await {
+    tracing::warn!(
+        community_id = %hex::encode(minted.community_id.0),
+        error = %e,
+        "channel_log_registry commit failed after durable community create; \
+         pending channel-log spawns will be re-attempted via \
+         reconcile_from_state at next start_node"
+    );
+}
 Ok(hex::encode(minted.community_id.0))
 ```
 
@@ -139,7 +151,7 @@ The `begin_transaction` line goes BEFORE `community_registry.spawn_engine` (per 
 
 ### §4.2 `redeem_invite_inner`
 
-Same shape. `begin_transaction(minted.community_id)` immediately after `mint_redemption` (around current line 7969), `tx.commit().await?` on success, drop on failure.
+Same shape. `begin_transaction(minted.community_id)` immediately after `mint_redemption` (around current line 7969), log-and-continue pattern on commit failure (not `?` propagation — see §4.1 rationale). The redemption Space is durable at apply_space; returning Err would cause a non-idempotent retry → second self-Join append (ZEB-260 nominal-cost path).
 
 For invite-only redemption that walks through the counter-sign hop, the transaction stays open across the unicast send + counter-sign wait. Acceptable: no new `ChannelCreate` events arrive locally during that window (the engine is only sending unicast requests; no remote sync until the counter-signed Join lands).
 
@@ -152,10 +164,11 @@ Called BEFORE `community_registry.spawn_engine`. Defensive — the community eng
 ### §5.2 Drop safety net
 
 * Sync `Drop` (cannot be async).
-* Spawns a Tokio task to call `abort_transaction_internal`. The task captures `Arc<Self>` so the registry stays alive.
+* Uses `Handle::try_current()` to decide which abort path to take:
+  * If a runtime is present: spawns a Tokio task via `handle.spawn(...)` to call `abort_transaction_internal`. The task captures `Arc<Self>` so the registry stays alive.
+  * If no runtime is present (e.g., panic-during-drop after runtime teardown, or a future sync caller of `begin_transaction`): calls `abort_transaction_internal` synchronously on the calling thread. Both paths converge on the same map-cleanup outcome.
 * Logs `tracing::warn!` so dropped transactions are loud in tests and prod.
 * Real failure paths in `_inner` functions are early-returns; the safety net only matters for panics or future refactors.
-* If the runtime has stopped (test teardown), the spawned task is dropped silently — fine, the prior fast-path teardown clears state.
 
 ### §5.3 Lock acquisition in begin_transaction
 

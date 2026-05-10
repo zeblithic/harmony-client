@@ -1035,7 +1035,11 @@ struct EngineEntry<R: tauri::Runtime> {
 
 /// RAII handle to an open community transaction. Drop without
 /// explicit `commit().await` or `abort().await` triggers the
-/// `tokio::spawn` safety-net abort with a `tracing::warn!` (spec §5.2).
+/// `Handle::try_current()` safety-net abort with a `tracing::warn!`
+/// (spec §5.2). If no runtime is present (e.g., panic-during-drop after
+/// runtime teardown, or a future sync caller of `begin_transaction`),
+/// Drop falls back to a synchronous `abort_transaction_internal` call
+/// directly. Both paths converge on the same map cleanup.
 ///
 /// `tx_id` tags the guard so a stale guard's deferred abort is a no-op
 /// after a fresh `begin_transaction(same community_id)` has overwritten
@@ -1049,9 +1053,10 @@ pub struct CommunityTransactionGuard<R: tauri::Runtime> {
 
 impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
     /// Drain the queue and fire the deferred spawns sequentially.
-    /// Returns the first error encountered; remaining items are still
-    /// drained but not spawned (logged at `warn`). Sets `completed`
-    /// so `Drop` skips the safety net.
+    /// On failure of any spawn, the remaining items are STILL attempted —
+    /// only the first error is returned; subsequent errors are logged at
+    /// `warn` (so a single bad channel doesn't strand the rest). Sets
+    /// `completed = true` so `Drop` skips the safety net.
     pub async fn commit(self) -> Result<(), ChannelLogEngineError> {
         let drained = {
             let mut map = self
@@ -1144,14 +1149,26 @@ impl<R: tauri::Runtime> Drop for CommunityTransactionGuard<R> {
                 community_id = ?self.community_id,
                 tx_id = self.tx_id,
                 "CommunityTransactionGuard dropped without commit/abort — \
-                 running async safety net"
+                 running safety net"
             );
-            let registry = Arc::clone(&self.registry);
-            let community_id = self.community_id;
-            let tx_id = self.tx_id;
-            tokio::spawn(async move {
-                registry.abort_transaction_internal(community_id, tx_id);
-            });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let registry = Arc::clone(&self.registry);
+                    let community_id = self.community_id;
+                    let tx_id = self.tx_id;
+                    handle.spawn(async move {
+                        registry.abort_transaction_internal(community_id, tx_id);
+                    });
+                }
+                Err(_) => {
+                    // No tokio runtime present (e.g., panic-during-drop after
+                    // runtime teardown, or a future sync caller of
+                    // begin_transaction). Call the sync abort directly so we
+                    // don't panic via tokio::spawn. Same map-cleanup outcome.
+                    self.registry
+                        .abort_transaction_internal(self.community_id, self.tx_id);
+                }
+            }
         }
     }
 }
@@ -3228,6 +3245,24 @@ mod tests {
     // (drop safety net, stale tx_id, reentrancy, ordering, partial
     // failure) all converge on the documented behavior. See spec §7.1.
 
+    /// Bounded condition-wait: polls until the registry has no pending
+    /// transaction for `community_id`, or `timeout` elapses.
+    /// Returns `true` if the condition was met before the deadline.
+    async fn wait_until_no_pending_tx(
+        registry: &ChannelLogRegistry<tauri::test::MockRuntime>,
+        community_id: &SpaceId,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if !registry.has_pending_transaction_for_test(community_id) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tx_begin_commit_drains_queued_spawn() {
         let fix = build_registry_fixture().await;
@@ -3350,10 +3385,17 @@ mod tests {
         }
 
         // Drop spawned a tokio task to call abort_transaction_internal.
-        // Yield repeatedly to let it run. Per spec §3.2 / §5.2 the safety
-        // net is fire-and-forget; one yield is usually enough but a small
-        // sleep removes flake risk.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Poll until the pending-tx map entry is gone (max 500ms) to
+        // avoid flakes without a fixed sleep.
+        assert!(
+            wait_until_no_pending_tx(
+                &fix.registry,
+                &community_id,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "dropped transaction guard must trigger safety-net abort"
+        );
 
         assert!(
             fix.registry
@@ -3361,6 +3403,73 @@ mod tests {
                 .await
                 .is_none(),
             "dropped transaction guard must trigger safety-net abort"
+        );
+    }
+
+    /// Drop safety-net — no-runtime fallback (CodeAnt Major fix).
+    ///
+    /// Verify that `CommunityTransactionGuard::drop` takes the sync
+    /// `abort_transaction_internal` path (not `tokio::spawn`) when there
+    /// is no active Tokio runtime in the drop thread. A bare
+    /// `std::thread::spawn` closure has no runtime association, so
+    /// `Handle::try_current()` returns `Err` and the guard's drop code
+    /// must fall back to the synchronous abort path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_dropped_guard_no_runtime_falls_back_to_sync_abort() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xcd; 16]);
+        let channel_id = ChannelId([0xad; 16]);
+
+        // Open a transaction and queue a deferred spawn so there is an
+        // entry in pending_transactions to be cleaned up by the drop.
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn");
+
+        // Move the guard into a bare OS thread. std::thread::spawn
+        // closures have no Tokio runtime association, so
+        // Handle::try_current() returns Err and the drop code takes the
+        // synchronous abort path (not tokio::spawn, which would panic).
+        let registry_clone = Arc::clone(&fix.registry);
+        std::thread::spawn(move || {
+            // Verify no runtime is reachable from this thread.
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "bare std::thread must not have a runtime handle"
+            );
+            // Drop the guard — exercises the sync fallback.
+            drop(tx);
+            // The sync path cleans up immediately (no yield needed).
+            assert!(
+                !registry_clone.has_pending_transaction_for_test(&community_id),
+                "sync abort path must clean up pending_transactions immediately"
+            );
+        })
+        .join()
+        .expect("thread join");
+
+        // Double-check from the async context.
+        assert!(
+            !fix.registry.has_pending_transaction_for_test(&community_id),
+            "no pending transaction entry after no-runtime sync abort"
+        );
+        // The queue was discarded — no engine was spawned.
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_none(),
+            "no-runtime sync abort must discard the deferred spawn"
         );
     }
 
@@ -3489,12 +3598,15 @@ mod tests {
         // Drop both without explicit cleanup (safety net handles either).
         drop(tx_a);
         drop(tx_b);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Map entry should be gone (one of the safety-net aborts removed
-        // it; the other no-ops on tx_id mismatch — both correct).
+        // Poll until the pending-tx map entry is gone (max 500ms).
         assert!(
-            !fix.registry.has_pending_transaction_for_test(&community_id),
+            wait_until_no_pending_tx(
+                &fix.registry,
+                &community_id,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
             "after both drops, no pending transaction entry remains"
         );
     }

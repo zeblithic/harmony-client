@@ -7592,13 +7592,22 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         // "burn" — HLCs are 64-bit logical, not finite.
     }
 
-    // ZEB-271: durable commit reached. Drain the deferred-spawn queue
-    // and fire the real ChannelLogRegistry::spawn for each queued
-    // channel-create that materialized during this critical section.
-    channel_log_tx
-        .commit()
-        .await
-        .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+    // ZEB-271: post-durable-commit drain. apply_space above is the LAST
+    // PERSISTENT step — the community is committed. If commit() fails,
+    // log and continue: the deferred channel-log spawns (e.g., default
+    // #general) will be re-attempted by reconcile_from_state at next
+    // start_node. Returning Err here would surface the create as failed
+    // even though the community exists, leading to retry → duplicate
+    // community.
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(minted.community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable community create; \
+             pending channel-log spawns will be re-attempted via \
+             reconcile_from_state at next start_node"
+        );
+    }
 
     Ok(hex::encode(minted.community_id.0))
 }
@@ -7981,6 +7990,27 @@ mod create_community_inner_tests {
         }
     }
 
+    // ── ZEB-271 wait helpers ──────────────────────────────────────────────────
+
+    /// Bounded condition-wait: polls until `engines_count_for_test()`
+    /// equals `expected`, or `timeout` elapses. Returns `true` on match.
+    async fn wait_until_engines_count(
+        registry: &crate::community_channel_log_engine::ChannelLogRegistry<
+            tauri::test::MockRuntime,
+        >,
+        expected: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if registry.engines_count_for_test().await == expected {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
     // ── ZEB-271: channel-log transaction coverage ─────────────────────────────
     //
     // These tests verify that `create_community_inner` opens a
@@ -8036,19 +8066,17 @@ mod create_community_inner_tests {
             "happy path: channel_log transaction must be committed (no pending entry)"
         );
 
-        // Allow the consumer task time to process the ChannelCreate delta
-        // and call channel_log_registry.spawn. If the delta was processed
-        // before commit(), the spawn was deferred and commit() drained it
-        // synchronously. If the consumer runs after commit() (fast path),
-        // spawn_inner_now fires immediately. Either way, a short sleep
-        // ensures the consumer has had a scheduling window.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // The #general ChannelCreate delta → deferred spawn → commit()
-        // drain → spawn_inner_now: exactly one engine in the registry.
-        let engine_count = fixture.channel_log_registry.engines_count_for_test().await;
-        assert_eq!(
-            engine_count, 1,
+        // Poll until the consumer task has processed the ChannelCreate delta
+        // and the engine has appeared in the registry (max 500ms).
+        // The delta may arrive before or after commit() — either way the
+        // engine ends up spawned; the bounded poll avoids a fixed sleep.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
             "happy path: commit() must spawn the #general channel-log engine \
              (engines_count must be 1 after deferred-spawn drain)"
         );
@@ -8111,13 +8139,14 @@ mod create_community_inner_tests {
 
         assert!(result.is_err(), "must Err on fence abort");
 
-        // Allow the dropped CommunityTransactionGuard's safety-net
-        // tokio::spawn to run.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let leaked = fixture.channel_log_registry.engines_count_for_test().await;
-        assert_eq!(
-            leaked, 0,
+        // Poll until the safety-net abort has run (max 500ms).
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                0,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
             "no channel-log engines must leak after fence-aborted create_community_inner"
         );
     }
@@ -8156,11 +8185,14 @@ mod create_community_inner_tests {
             result
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let leaked = fixture.channel_log_registry.engines_count_for_test().await;
-        assert_eq!(
-            leaked, 0,
+        // Poll until the safety-net abort has run (max 500ms).
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                0,
+                std::time::Duration::from_millis(500)
+            )
+            .await,
             "no channel-log engines must leak after fence-generation-changed abort"
         );
     }
@@ -9078,13 +9110,22 @@ where
         // state_g drops at scope end.
     }
 
-    // ZEB-271: durable commit reached. Drain any queued channel-log
-    // spawns that Zenoh sync surfaced during this redemption's critical
-    // section (between spawn_engine and apply_space).
-    channel_log_tx
-        .commit()
-        .await
-        .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+    // ZEB-271: post-durable-commit drain. apply_space above is the LAST
+    // PERSISTENT step — the redemption Space is committed. If commit()
+    // fails, log and continue: the deferred channel-log spawns from
+    // remote sync will be re-attempted by reconcile_from_state at next
+    // start_node. Returning Err here would surface the join as failed
+    // even though the user already joined; an OPEN retry is non-idempotent
+    // and would append a second self-Join (ZEB-260 nominal-cost path).
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(minted.community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable redemption; \
+             pending channel-log spawns will be re-attempted via \
+             reconcile_from_state at next start_node"
+        );
+    }
 
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or

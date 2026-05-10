@@ -74,41 +74,46 @@ git log --oneline -3
 
 - [ ] **Step 2: cargo fmt check**
 
-```bash
-cd src-tauri && cargo fmt --all -- --check
-```
-Expected: no output, exit 0.
+  ```bash
+  cd src-tauri && cargo fmt --all -- --check
+  ```
+
+  Expected: no output, exit 0.
 
 - [ ] **Step 3: cargo clippy**
 
-```bash
-cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
-```
-Expected: clean build, no warnings, exit 0.
+  ```bash
+  cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+  ```
+
+  Expected: clean build, no warnings, exit 0.
 
 - [ ] **Step 4: cargo nextest run**
 
-```bash
-cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast
-```
-Expected: all tests pass.
+  ```bash
+  cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast
+  ```
+
+  Expected: all tests pass.
 
 - [ ] **Step 5: cargo check (msrv proxy)**
 
-The MSRV check uses the declared `rust-version` in `Cargo.toml`; locally we run with whatever stable is installed, which is fine for a baseline confirmation (CI catches a real MSRV regression).
+  The MSRV check uses the declared `rust-version` in `Cargo.toml`; locally we run with whatever stable is installed, which is fine for a baseline confirmation (CI catches a real MSRV regression).
 
-```bash
-cd src-tauri && cargo check --locked --all-targets --features test-fixtures
-```
-Expected: clean exit 0.
+  ```bash
+  cd src-tauri && cargo check --locked --all-targets --features test-fixtures
+  ```
 
-- [ ] **Step 6: Frontend gates**
+  Expected: clean exit 0.
 
-```bash
-cd /Users/zeblith/work/zeblithic/harmony-client && npx tsc --noEmit
-cd /Users/zeblith/work/zeblithic/harmony-client && npx vitest run
-```
-Expected: clean exits.
+- [ ] **Step 6: Frontend gates** (run from repo root)
+
+  ```bash
+  npx tsc --noEmit
+  npx vitest run
+  ```
+
+  Expected: clean exits.
 
 **No commit.** Move to Task 1.
 
@@ -510,10 +515,11 @@ These tests reference symbols that don't exist yet (`SpawnOutcome`, `begin_trans
 
 - [ ] **Step 2: Confirm compile failures**
 
-```bash
-cd src-tauri && cargo nextest list --features test-fixtures 2>&1 | tail -20
-```
-Expected: compile errors naming `SpawnOutcome`, `begin_transaction`, `tx_id_for_test`, `has_pending_transaction_for_test`. This is the "tests fail" baseline.
+  ```bash
+  cd src-tauri && cargo nextest list --features test-fixtures 2>&1 | tail -20
+  ```
+
+  Expected: compile errors naming `SpawnOutcome`, `begin_transaction`, `tx_id_for_test`, `has_pending_transaction_for_test`. This is the "tests fail" baseline.
 
 - [ ] **Step 3: Add `SpawnOutcome` enum + `DeferredSpawn` + `PendingTransaction`**
 
@@ -1708,11 +1714,11 @@ All four must exit 0.
 - [ ] **Step 2: Frontend gates from repo root**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client && npx tsc --noEmit
-cd /Users/zeblith/work/zeblithic/harmony-client && npx vitest run
+npx tsc --noEmit
+npx vitest run
 ```
 
-Both must exit 0. (The frontend is unchanged but the gates run anyway as a regression sanity check.)
+Both must exit 0. (Run from the repo root. The frontend is unchanged but the gates run anyway as a regression sanity check.)
 
 - [ ] **Step 3: Verify branch state**
 
