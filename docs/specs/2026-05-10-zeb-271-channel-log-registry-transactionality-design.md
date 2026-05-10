@@ -69,13 +69,13 @@ Synchronous. Acquires `pending_transactions`, generates a fresh `tx_id` from `ne
 pub async fn commit(self) -> Result<(), ChannelLogEngineError>;
 ```
 
-Consuming method on `CommunityTransactionGuard`. Acquires the lock, removes the entry _only if_ `tx_id` matches; on mismatch, no-op with `tracing::warn!` (stale guard, transaction already overwritten). Drains the queue, releases the lock, then sequentially invokes the inner spawn body for each `DeferredSpawn`. Returns the first error encountered; remaining items still drained but not spawned (logged at `warn`). Sets `completed = true` so `Drop` skips the safety net.
+Consuming method on `CommunityTransactionGuard`. Acquires the lock, removes the entry _only if_ `tx_id` matches; on mismatch, no-op with `tracing::warn!` (stale guard, transaction already overwritten). Drains the queue, releases the lock, then sequentially invokes the inner spawn body for each `DeferredSpawn`. **Continues attempting all remaining spawns even after an error**: the first error encountered is captured and surfaced as the `Err` return; subsequent errors are logged at `warn` (`additional deferred-spawn failure during commit drain (ignored, first error already captured)`) but do not abort the loop. This matches `shutdown_all`'s "drain everything, return last error" pattern — bailing on first error would leave later channels permanently un-spawned for this session, with the affected set varying per run depending on `HashMap` iteration order. Sets `completed = true` so `Drop` skips the safety net.
 
 ```rust
-pub async fn abort(self);
+pub fn abort(self);
 ```
 
-Consuming method on `CommunityTransactionGuard`. Acquires the lock, removes the entry _only if_ `tx_id` matches. Sets `completed = true`.
+Consuming method on `CommunityTransactionGuard`. Sync (the body has no `.await` points; the `self`-by-value receiver still bypasses the `Drop` safety net). Acquires the lock, removes the entry _only if_ `tx_id` matches. Sets `completed = true`.
 
 ```rust
 impl<R: tauri::Runtime> Drop for CommunityTransactionGuard<R> {
@@ -268,7 +268,27 @@ Every existing test in `create_community_inner_tests` and `redeem_invite_inner_t
 * Persistence of pending transactions across app restarts (an in-flight transaction whose process dies behaves identically to an aborted transaction — the next start will not see the unspawned channels).
 * Membership-side parallel fix for ZEB-266 — same shape, separate ticket.
 
-## §10 Acceptance criteria (mirror ZEB-271)
+## §10 Known limitations
+
+These are deliberate trade-offs, surfaced and accepted during round 2 review of PR #99. Future tickets MAY address them; this spec does not.
+
+### §10.1 `channel-config-updated` may emit before the channel-log engine is alive
+
+`run_community_delta_consumer`'s second callback emits `channel-config-updated` immediately after the third callback returns. When the third callback returns `SpawnOutcome::DeferredForCommit`, the engine is not yet running — the frontend can observe the new channel and immediately call `list_channel_messages` / `post_channel_message` against it before `commit()` drains the queue, hitting `EngineNotRunning`.
+
+The race window is bounded by `commit()` duration (small ms in the success case), and the frontend already handles `EngineNotRunning` gracefully (the data plane returns an empty list / surfaces the error to the user via the standard IPC error path). The race existed pre-ZEB-271 too — `DeferredForCommit` makes it consistent rather than introducing it.
+
+A future fix would suppress the `channel-config-updated` emit when the third callback returns `DeferredForCommit` and re-emit it from `commit()`'s drain loop after each successful `spawn_inner_now`. This requires extending the consumer's callback contract (a fourth callback or a richer return type from the third) and is out of scope for ZEB-271. (CodeRabbit Major round 2 outside-diff.)
+
+### §10.2 `commit()` failures are recovery-deferred to the next `start_node`
+
+When `channel_log_tx.commit().await` returns `Err` from inside `create_community_inner` / `redeem_invite_inner`, the IPC handler logs the error at `warn` and **still returns `Ok`** with the durably-committed `community_id`. Deferred spawns that did not run are lost for this session — they are re-attempted on the next process start via `reconcile_from_state`, which iterates the materialized membership and spawns each non-deleted channel.
+
+The alternative — propagating `commit()` errors as IPC `Err` — would tell the caller the create/redeem failed even though `apply_space` had already durably committed. The user's retry would mint a duplicate community (in the create case) or append a second self-Join (in the OPEN-invite redeem case, which is explicitly non-idempotent). The log-and-continue pattern is the lesser evil, but the user-observable consequence is real: between the failed-commit and the next `start_node`, the affected channels are visible (the `channel-config-updated` emit fires regardless) but their data plane is dead. The frontend's `EngineNotRunning` handling is the only end-user signal.
+
+Future enhancement candidates: (a) a per-process retry loop that re-runs `spawn_inner_now` for failed commits with bounded backoff; (b) emitting a `channel-log-spawn-failed` event the frontend can show as a banner. Both are out of scope for ZEB-271. (CodeRabbit Major round 1; Greptile P2 round 2 — both surfaced this; the user explicitly signed off on log-and-continue at convergence.)
+
+## §11 Acceptance criteria (mirror ZEB-271)
 
 1. ✅ Decision (a) selected: defer-spawn via commit signal, queue lives in `ChannelLogRegistry`. Approach (b) and (c) rejected (per §2).
 2. Implementation:
@@ -279,7 +299,7 @@ Every existing test in `create_community_inner_tests` and `redeem_invite_inner_t
 3. (n/a — approach (a) selected; (c)'s documentation requirement folded into this spec's §1)
 4. Same approach applied to `redeem_invite_inner` — see §4.2 + §7.3.
 
-## §11 References
+## §12 References
 
 * This ticket: [ZEB-271](https://linear.app/zeblith/issue/ZEB-271)
 * Parent: [ZEB-248](https://linear.app/zeblith/issue/ZEB-248) Sub-C v2 — channels-within-communities (DONE)

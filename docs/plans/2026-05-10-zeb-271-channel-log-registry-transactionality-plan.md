@@ -1341,10 +1341,22 @@ Replace the final `Ok(hex::encode(minted.community_id.0))` (line ~7579) with:
     // ZEB-271: durable commit reached. Drain the deferred-spawn queue
     // and fire the real ChannelLogRegistry::spawn for each queued
     // channel-create that materialized during this critical section.
-    channel_log_tx
-        .commit()
-        .await
-        .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+    //
+    // Log-and-continue (NOT `?`): apply_space has already durably
+    // committed the community by this point. Returning Err here would
+    // tell the caller the create failed, but the community is real;
+    // the user's retry would mint a duplicate. So a commit() failure
+    // is treated as recovery deferred to the next start_node, which
+    // re-runs reconcile_from_state. (CodeRabbit Major round 1.)
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(minted.community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable community create; \
+             pending channel-log spawns will be re-attempted via reconcile_from_state \
+             on next start_node"
+        );
+    }
 
     Ok(hex::encode(minted.community_id.0))
 }
@@ -1569,10 +1581,21 @@ Locate the final `Ok(RedeemInviteResultDto { ... })` in `redeem_invite_inner` (e
 ```rust
     // ZEB-271: durable commit reached. Drain any queued channel-log
     // spawns that the engine sync surfaced during this redemption.
-    channel_log_tx
-        .commit()
-        .await
-        .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+    //
+    // Log-and-continue (NOT `?`): the redemption Space is already
+    // durable. Returning Err would tell the UI the invite failed even
+    // though the user already joined; the OPEN-invite retry path is
+    // explicitly non-idempotent and would append a second self-Join.
+    // (CodeRabbit Major round 1.)
+    if let Err(e) = channel_log_tx.commit().await {
+        tracing::warn!(
+            community_id = %hex::encode(community_id.0),
+            error = %e,
+            "channel_log_registry commit failed after durable invite redemption; \
+             pending channel-log spawns will be re-attempted via reconcile_from_state \
+             on next start_node"
+        );
+    }
 
     Ok(RedeemInviteResultDto { /* existing fields */ })
 }
@@ -1791,7 +1814,7 @@ Per `feedback_autonomous_pr_monitoring_loop`, the calling agent enters the bot-r
 
 ---
 
-## Acceptance criteria recap (from spec §10)
+## Acceptance criteria recap (from spec §11)
 
 1. ✅ Decision (a) selected: defer-spawn via commit signal, queue lives in `ChannelLogRegistry`. Approach (b) and (c) rejected.
 2. Implementation (after Tasks 1-4 land):

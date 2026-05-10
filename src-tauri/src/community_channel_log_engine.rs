@@ -63,6 +63,9 @@ pub enum ChannelLogEngineError {
 
     #[error("body not valid UTF-8: {0}")]
     BodyNotUtf8(String),
+
+    #[error("invariant violation: {0}")]
+    InvariantViolation(String),
 }
 
 // ── Transaction primitives (ZEB-271) ─────────────────────────────────────────
@@ -1127,7 +1130,11 @@ impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
 
     /// Abort the transaction. Discards the queue. Sets `completed` so
     /// `Drop` skips the safety net.
-    pub async fn abort(self) {
+    ///
+    /// Sync (not `async`): the body has no `.await` points; callers do
+    /// not need to `.await` it. The `self`-by-value receiver still
+    /// guarantees the `Drop` safety net is bypassed (Greptile P2 round 2).
+    pub fn abort(self) {
         self.registry
             .abort_transaction_internal(self.community_id, self.tx_id);
         self.completed
@@ -1741,15 +1748,26 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 Ok(SpawnOutcome::Spawned(_)) => {}
                 Ok(SpawnOutcome::DeferredForCommit) => {
                     // reconcile_from_state runs at start_node init, outside
-                    // any transaction. DeferredForCommit here would mean a
-                    // transaction was left open on this community_id — log
-                    // and continue (the channel will spawn on commit).
-                    tracing::warn!(
+                    // any transaction. DeferredForCommit here means a
+                    // pending transaction was left open across boots —
+                    // an invariant violation, since the only owners of
+                    // begin_transaction are create_community_inner /
+                    // redeem_invite_inner, both of which scope the guard
+                    // to the IPC handler's call frame. Hard-fail so the
+                    // bug surfaces immediately rather than masquerading
+                    // as a missing-engine NotRunning error later
+                    // (CodeRabbit Minor round 2).
+                    let msg = format!(
+                        "reconcile_from_state observed pending transaction for \
+                         community {community_id:?} (channel {channel_id:?}); \
+                         transactions must not span boots"
+                    );
+                    tracing::error!(
                         community_id = ?community_id,
                         channel_id = ?channel_id,
-                        "reconcile_from_state: spawn deferred (unexpected open transaction); \
-                         channel will spawn on commit"
+                        "{msg}"
                     );
+                    return Err(ChannelLogEngineError::InvariantViolation(msg));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -3336,7 +3354,7 @@ mod tests {
             .await
             .expect("spawn");
 
-        tx.abort().await;
+        tx.abort();
 
         assert!(
             fix.registry
@@ -3387,6 +3405,18 @@ mod tests {
         // Drop spawned a tokio task to call abort_transaction_internal.
         // Poll until the pending-tx map entry is gone (max 500ms) to
         // avoid flakes without a fixed sleep.
+        //
+        // Greptile round 2 P2: `wait_until_no_pending_tx` uses
+        // `yield_now()` which only yields to the Tokio scheduler. Under
+        // `worker_threads = 1` or extreme load this could in principle
+        // re-enter before the spawned cleanup task runs. We accept that
+        // theoretical risk because (a) this test pins
+        // `worker_threads = 2`, so the cleanup task always has a free
+        // worker, and (b) the alternative — capturing a `JoinHandle`
+        // from inside `Drop` — would force the guard to expose the
+        // cleanup task externally just for tests. The no-runtime sibling
+        // test (`tx_dropped_guard_no_runtime_falls_back_to_sync_abort`)
+        // covers the race-free synchronous abort path.
         assert!(
             wait_until_no_pending_tx(
                 &fix.registry,
