@@ -121,8 +121,12 @@
 
     void (async () => {
       await refreshChannels();
-      // After initial load, default selection if not already set.
-      if (!activeChannelId) {
+      // After initial load, validate the persisted activeChannelId still
+      // resolves to a non-deleted channel; if not (e.g., the channel was
+      // deleted while user was elsewhere), default-select per §6.4.
+      const stillExists = activeChannelId !== null
+        && channels.some((c) => c.channelId === activeChannelId);
+      if (!stillExists) {
         const general = channels.find((c) => c.name === 'general');
         activeChannelId = general?.channelId ?? channels[0]?.channelId ?? null;
         if (activeChannelId) {

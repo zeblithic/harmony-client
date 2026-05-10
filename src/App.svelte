@@ -166,7 +166,6 @@
   let redeemError = $state<string | null>(null);
   let redeemUrl = $state('');
   let selectedCommunityId = $state<string | null>(null);
-  let showCommunitySettings = $state(false);
   let communityMembers = $state<CommunityMember[]>([]);
   let myAddress = $state('');
   // Local mirror of communityService.isDegraded(selectedCommunityId).
@@ -886,7 +885,6 @@
     // Clicking any non-community navigable node clears the community
     // overview so the message feed shows through.
     changeSelectedCommunity(null);
-    showCommunitySettings = false;
     const switched = id !== activeChannel;
     activeChannel = node.id;
     activeHub = findNearestFolder(navNodes, node.id) ?? '';
@@ -1151,17 +1149,62 @@
   {/snippet}
   {#snippet textFeed()}
     {#if selectedCommunityNode}
-      <!-- ZEB-263 Phase 5 Task 7: community-overview placeholder. The
-           right-pane shows community metadata + a Manage button while
-           selectedCommunityId is set; clicking any DM/channel in the nav
-           clears it and the message feed shows through again. Channels
-           inside a community arrive in a later phase. -->
-      <div class="community-overview">
-        <h2>{selectedCommunityNode.name}</h2>
-        <p class="member-line">{joinedCommunityCount} {joinedCommunityCount === 1 ? 'member' : 'members'}</p>
-        <p class="empty-line">No channels yet — channels arrive in a later phase.</p>
-        <button class="manage-btn" onclick={() => (showCommunitySettings = true)}>Manage community</button>
-      </div>
+      <CommunityView
+        communityId={selectedCommunityNode.id}
+        communityName={selectedCommunityNode.name}
+        communityKind={communityService.getKind(selectedCommunityNode.id)}
+        members={communityMembers}
+        ownAddress={myAddress}
+        myPower={myCommunityPower}
+        isDegraded={isCurrentCommunityDegraded}
+        {communityService}
+        {channelMessageService}
+        {trustService}
+        onKickMember={async (target) => {
+          if (!selectedCommunityId) return;
+          try {
+            await communityService.kickMember(selectedCommunityId, target);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error('kickMember failed:', msg);
+          }
+        }}
+        onSetPowerLevel={async (target, power) => {
+          if (!selectedCommunityId) return;
+          try {
+            await communityService.setPowerLevel(selectedCommunityId, target, power);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error('setPowerLevel failed:', msg);
+          }
+        }}
+        onLeave={async () => {
+          if (!selectedCommunityId) return;
+          const leavingId = selectedCommunityId;
+          try {
+            await communityService.leaveCommunity(leavingId);
+            // ZEB-265: backend emits nav-updated { action: "removed" }, but
+            // events aren't buffered for late listeners. Mirror locally so
+            // the node disappears even if the listener missed the emit.
+            navService.addOrUpdateNavSpace({
+              action: 'removed',
+              spaceId: leavingId,
+              kind: 'community',
+              name: '',
+              members: [],
+              parentId: null,
+            });
+            changeSelectedCommunity(null);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error('leaveCommunity failed:', msg);
+          }
+        }}
+        onGenerateInvite={async () => {
+          if (!selectedCommunityId) throw new Error('no community selected');
+          return communityService.generateInvite(selectedCommunityId);
+        }}
+      />
     {:else}
       <TextFeed
         messages={mainFeedMessages}
@@ -1519,71 +1562,6 @@
   />
 {/if}
 
-{#if showCommunitySettings && selectedCommunityNode}
-  <!-- ZEB-263 Phase 5: communityKind is sourced from
-       CommunityService.getKind(), which knows the kind for communities
-       this session created and returns 'unknown' for redeemed/foreign
-       communities. Once the backend exposes kind on the wire (open
-       follow-up — spec Appendix A #2), getKind() should fall back to
-       the wire value rather than 'unknown'. -->
-  <CommunityView
-    communityId={selectedCommunityNode.id}
-    communityName={selectedCommunityNode.name}
-    communityKind={communityService.getKind(selectedCommunityNode.id)}
-    members={communityMembers}
-    ownAddress={myAddress}
-    myPower={myCommunityPower}
-    isDegraded={isCurrentCommunityDegraded}
-    {communityService}
-    {channelMessageService}
-    {trustService}
-    onKickMember={async (target) => {
-      if (!selectedCommunityId) return;
-      try {
-        await communityService.kickMember(selectedCommunityId, target);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error('kickMember failed:', msg);
-      }
-    }}
-    onSetPowerLevel={async (target, power) => {
-      if (!selectedCommunityId) return;
-      try {
-        await communityService.setPowerLevel(selectedCommunityId, target, power);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error('setPowerLevel failed:', msg);
-      }
-    }}
-    onLeave={async () => {
-      if (!selectedCommunityId) return;
-      const leavingId = selectedCommunityId;
-      try {
-        await communityService.leaveCommunity(leavingId);
-        // ZEB-265: backend emits nav-updated { action: "removed" }, but
-        // events aren't buffered for late listeners. Mirror locally so
-        // the node disappears even if the listener missed the emit.
-        navService.addOrUpdateNavSpace({
-          action: 'removed',
-          spaceId: leavingId,
-          kind: 'community',
-          name: '',
-          members: [],
-          parentId: null,
-        });
-        changeSelectedCommunity(null);
-        showCommunitySettings = false;
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error('leaveCommunity failed:', msg);
-      }
-    }}
-    onGenerateInvite={async () => {
-      if (!selectedCommunityId) throw new Error('no community selected');
-      return communityService.generateInvite(selectedCommunityId);
-    }}
-  />
-{/if}
 
 <style>
   :global(.text-message) {
@@ -1649,40 +1627,4 @@
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   }
 
-  /* ── ZEB-263: community right-pane overview placeholder ───────────── */
-  .community-overview {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 32px 28px;
-    color: var(--text-primary, #e8eaed);
-  }
-  .community-overview h2 {
-    margin: 0;
-    font-size: 1.25rem;
-  }
-  .community-overview .member-line {
-    margin: 0;
-    color: var(--text-secondary, #b8bcc4);
-    font-size: 0.85rem;
-  }
-  .community-overview .empty-line {
-    margin: 0 0 8px 0;
-    color: var(--text-muted, #949ba4);
-    font-size: 0.8rem;
-  }
-  .community-overview .manage-btn {
-    background: var(--accent, #5865f2);
-    color: var(--text-primary, #e8eaed);
-    border: none;
-    padding: 8px 16px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.875rem;
-  }
-  .community-overview .manage-btn:focus-visible {
-    outline: 2px solid var(--accent, #5865f2);
-    outline-offset: 2px;
-  }
 </style>

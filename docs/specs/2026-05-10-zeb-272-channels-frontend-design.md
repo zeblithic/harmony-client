@@ -51,7 +51,7 @@ These are out of scope for Phase 4 and remain deferred to v3 or sibling tickets:
 
 Phase 4 introduces no new substrates. All backend interaction is mediated by the two existing IPC streams from Phases 1-3 (channel-config + channel-message + backfill-progress), which are consumed by two services in the frontend (`CommunityService`-extended + new `ChannelMessageService`), which are then consumed by four new Svelte components (`CommunityView` layout shell + three column components) plus two new dialogs (`CreateChannelDialog` + `ModifyChannelDialog`). The existing `CommunitySettingsPanel.svelte` is **not modified** — only its mount-point changes from "direct child of App.svelte" to "child of a modal inside CommunityView."
 
-```
+```text
                           BACKEND IPCs                  FRONTEND CONSUMERS
                           ───────────────                ─────────────────────
 channel-config-updated  ─────────────────────▶  CommunityService.onChannelConfigChanged
@@ -74,7 +74,7 @@ channel-backfill-progress ──────────────────
 
 ### 5.1 New files (13 total)
 
-```
+```text
 src/lib/
 ├── channel-message-service.ts                         (~250L; mirrors message-service.ts shape)
 └── components/
@@ -95,7 +95,7 @@ src/lib/
 
 ### 5.2 Modified files (3)
 
-```
+```text
 src/lib/community-service.ts                           (+~80L: createChannel/modifyChannel/deleteChannel/listChannels + onChannelConfigChanged + selectedChannelByCommunity Map)
 src/lib/__tests__/community-service.test.ts            (+~80L: channel-config method + selected-channel tests)
 src/App.svelte                                         (~-30L net: replace CommunitySettingsPanel mount at L1525 with CommunityView, route members-changed/myPower props through; add channelMessageService instantiation alongside communityService)
@@ -374,7 +374,7 @@ class CommunityService {
 
 ### 8.1 Channel-config flow (rename / create / delete)
 
-```
+```text
 backend ChannelCreate/Modify/Delete event materializes
    └─▶ channel-config-updated IPC fires
           └─▶ communityService.onChannelConfigChanged(action, channelId, name?, writePower?)
@@ -392,7 +392,7 @@ backend ChannelCreate/Modify/Delete event materializes
 
 ### 8.2 Channel-message flow (live + backfill)
 
-```
+```text
 backend channel-message-received IPC fires
    └─▶ channelMessageService internal listener
           ├─ dedupe by message.id (per-channel seenIds set)
@@ -405,7 +405,7 @@ backend channel-message-received IPC fires
 
 ### 8.3 Backfill flow (scroll-trigger + progress)
 
-```
+```text
 user scrolls to scrollTop < 50px
    └─▶ ChannelMessageFeed scrollAtTop = true
           └─▶ 250ms stable timer
@@ -425,7 +425,7 @@ user scrolls to scrollTop < 50px
 
 ### 8.4 Reactive cascade for myPower (§6.8)
 
-```
+```text
 backend Kick / SetPower event materializes
    └─▶ community-members-changed IPC fires
           └─▶ communityService.onMembersChanged(communityId)
@@ -438,7 +438,7 @@ backend Kick / SetPower event materializes
 
 ### 8.5 ComposeBar post flow
 
-```
+```text
 user types "hello" + presses Enter
    └─▶ ComposeBar onSend("hello")
           └─▶ ChannelMessageFeed handler
@@ -451,7 +451,7 @@ user types "hello" + presses Enter
 
 ### 8.6 ⚙️ settings modal
 
-```
+```text
 user clicks ⚙️ in CommunityView header
    └─▶ settingsModalOpen = true
           └─▶ <CommunitySettingsPanel> mounts inside <div role="dialog" aria-modal="true">

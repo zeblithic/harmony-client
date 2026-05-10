@@ -231,9 +231,21 @@ export class ChannelMessageService {
     const idx = sortedInsertIndex(arr, message);
     arr.splice(idx, 0, message);
 
-    this.onMessage?.(communityId, channelId, message);
+    try {
+      this.onMessage?.(communityId, channelId, message);
+    } catch (e) {
+      console.error(`ChannelMessageService onMessage failed for ${key}:`, e);
+    }
     const subs = this.subscribers.get(key);
-    if (subs) for (const cb of subs) cb(message);
+    if (subs) {
+      for (const cb of subs) {
+        try {
+          cb(message);
+        } catch (e) {
+          console.error(`ChannelMessageService subscriber failed for ${key}:`, e);
+        }
+      }
+    }
   }
 }
 

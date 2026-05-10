@@ -52,6 +52,15 @@
     messages = [];
     composeError = null;
     backfillProgress = null;
+    // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
+    // bleed-over between channels (Qodo PR #97 finding).
+    backfillInFlight = false;
+    scrollAtBottom = true;
+    scrollAtTop = false;
+    if (scrollAtTopTimer) {
+      clearTimeout(scrollAtTopTimer);
+      scrollAtTopTimer = null;
+    }
 
     // Tear down prior subscription before creating new one.
     if (unsubChannel) {

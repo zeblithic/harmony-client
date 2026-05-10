@@ -123,4 +123,26 @@ describe('ChannelSubSidebar', () => {
     await fireEvent.click(container.querySelector('.channel-sub-sidebar') as HTMLElement);
     expect(container.querySelector('.context-menu')).toBeNull();
   });
+
+  it('closes context menu when myPower drops below 50 while open', async () => {
+    const { container, rerender } = render(ChannelSubSidebar, { props: baseProps });
+    const item = container.querySelectorAll('.channel-item')[1] as HTMLElement;
+    await fireEvent.contextMenu(item);
+    expect(container.querySelector('.context-menu')).toBeTruthy();
+
+    // Demote: myPower below kick threshold should auto-close the menu.
+    await rerender({ ...baseProps, myPower: 25 });
+    expect(container.querySelector('.context-menu')).toBeNull();
+  });
+
+  it('clicking truly outside the sidebar (document.body) dismisses the context menu', async () => {
+    const { container } = render(ChannelSubSidebar, { props: baseProps });
+    const item = container.querySelectorAll('.channel-item')[1] as HTMLElement;
+    await fireEvent.contextMenu(item);
+    expect(container.querySelector('.context-menu')).toBeTruthy();
+
+    // Click on document.body — outside the sidebar entirely.
+    await fireEvent.click(document.body);
+    expect(container.querySelector('.context-menu')).toBeNull();
+  });
 });

@@ -22,12 +22,38 @@
 
   let canModerate = $derived(myPower >= POWER_THRESHOLDS.kick);
 
+  // Per spec §6.8: when local user is demoted below kick threshold,
+  // close any open context menu (stale moderation surface).
+  $effect(() => {
+    if (!canModerate) {
+      contextMenu = null;
+    }
+  });
+
   // Per spec §6.4: parent (CommunityView) hands us a list of joined-only
   // channels (deletedAt is filtered upstream). We just render in input
   // order.
   let visible = $derived(channels.filter((c) => c.deletedAt === undefined));
 
   let contextMenu = $state<{ channel: ChannelInfo; x: number; y: number } | null>(null);
+
+  $effect(() => {
+    if (!contextMenu) return;
+    // Document-level outside-click listener — only active while menu is open.
+    function onDocClick(e: MouseEvent) {
+      // If the click landed inside the menu itself, don't dismiss
+      // (the menu's own button onclick handlers will close it after action).
+      const target = e.target as Node | null;
+      const menuEl = document.querySelector('.context-menu');
+      if (menuEl && target && menuEl.contains(target)) return;
+      contextMenu = null;
+    }
+    // capture: true so we beat the menu's own button onclick listeners
+    // for clicks OUTSIDE the menu, while still letting menu-item clicks
+    // through (since the contains() check short-circuits).
+    document.addEventListener('click', onDocClick, true);
+    return () => document.removeEventListener('click', onDocClick, true);
+  });
 
   function handleContextMenu(e: MouseEvent, channel: ChannelInfo) {
     if (!canModerate) return;
@@ -58,7 +84,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<nav class="channel-sub-sidebar" aria-label="Channels" onclick={dismissContextMenu}>
+<nav class="channel-sub-sidebar" aria-label="Channels">
   <ul class="channel-list">
     {#each visible as channel (channel.channelId)}
       <li>
