@@ -608,9 +608,10 @@ pub struct CommunityTransactionGuard<R: tauri::Runtime> {
 
 impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
     /// Drain the queue and fire the deferred spawns sequentially.
-    /// Returns the first error encountered; remaining items are still
-    /// drained but not spawned (logged at `warn`). Sets `completed`
-    /// so `Drop` skips the safety net.
+    /// Continues attempting all remaining spawns even after an error;
+    /// the first error encountered is captured and surfaced as `Err`,
+    /// subsequent errors are logged at `warn`. Sets `completed` so
+    /// `Drop` skips the safety net.
     pub async fn commit(self) -> Result<(), ChannelLogEngineError> {
         let drained = {
             let mut map = self.registry.pending_transactions.lock().expect(
@@ -681,7 +682,11 @@ impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
 
     /// Abort the transaction. Discards the queue. Sets `completed` so
     /// `Drop` skips the safety net.
-    pub async fn abort(self) {
+    ///
+    /// Sync (not `async`): the body has no `.await` points; callers do
+    /// not need to `.await` it. The `self`-by-value receiver still
+    /// guarantees the `Drop` safety net is bypassed.
+    pub fn abort(self) {
         self.registry
             .abort_transaction_internal(self.community_id, self.tx_id);
         self.completed

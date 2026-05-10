@@ -1329,22 +1329,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         engines.len()
     }
 
-    /// Test-only — all engines registered for `community_id`. Returns a
-    /// `Vec` of `(ChannelId, Arc<ChannelLogEngine<R>>)` pairs so callers
-    /// can assert both count and identity without exposing the full map.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub async fn engines_for_community_for_test(
-        &self,
-        community_id: &SpaceId,
-    ) -> Vec<(ChannelId, Arc<ChannelLogEngine<R>>)> {
-        let engines = self.engines.lock().await;
-        engines
-            .iter()
-            .filter(|((cid, _), _)| cid == community_id)
-            .map(|((_, chid), entry)| (*chid, Arc::clone(&entry.engine)))
-            .collect()
-    }
-
     /// Spawn a per-channel engine + adapter for `(community_id, channel_id)`.
     ///
     /// **ZEB-271 transaction-aware:** if `community_id` has an open
@@ -1625,6 +1609,27 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         channel_id: &ChannelId,
     ) -> Result<(), ChannelLogEngineError> {
         let key = (*community_id, *channel_id);
+
+        // ZEB-271 round 3: drop any queued deferred spawn for this
+        // channel from the open transaction (if one is open). Without
+        // this, a Created→Deleted sequence within the same critical
+        // section would leave the deferred spawn in the queue, and
+        // `commit()` would resurrect a channel that the materialized
+        // state has already deleted. This can happen during
+        // `redeem_invite_inner` when the engine sync surfaces both a
+        // ChannelCreate and a ChannelDelete for the same channel
+        // before the post-apply_space commit. Cleared first so a
+        // concurrent `spawn` racing the engine remove cannot see a
+        // stale queue entry. (CodeRabbit Major round 3 outside-diff.)
+        {
+            let mut pending = self
+                .pending_transactions
+                .lock()
+                .expect("pending_transactions poisoned");
+            if let Some(pt) = pending.get_mut(community_id) {
+                pt.queue.retain(|ds| ds.channel_id != *channel_id);
+            }
+        }
 
         // Atomic remove: engine and closing flag come out together,
         // so we cannot race a concurrent `spawn` into a state where
@@ -3376,6 +3381,73 @@ mod tests {
         assert!(
             !channel_dir.exists(),
             "aborted transaction must not create the channel-log on-disk dir"
+        );
+    }
+
+    /// CodeRabbit Major round 3: stop() must clear queued deferred
+    /// spawns for the same channel, otherwise commit() resurrects a
+    /// channel that the materialized state has already deleted.
+    ///
+    /// Scenario: open transaction; spawn channel A → DeferredForCommit
+    /// (queued); stop channel A (no live engine yet); commit drains the
+    /// queue. Without the fix, commit would spawn A. With the fix, the
+    /// queue is empty after stop and commit is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_stop_cancels_queued_deferred_spawn() {
+        let fix = build_registry_fixture().await;
+        let community_id = SpaceId([0xc4; 16]);
+        let channel_id = ChannelId([0xa4; 16]);
+
+        let tx = Arc::clone(&fix.registry).begin_transaction(community_id);
+
+        let key = derive_channel_key(&fix.membership_key, &community_id, &channel_id);
+        let outcome = Arc::clone(&fix.registry)
+            .spawn(
+                community_id,
+                channel_id,
+                key,
+                Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>,
+                Arc::clone(&fix.hlc_tracker),
+            )
+            .await
+            .expect("spawn");
+        assert!(
+            matches!(outcome, SpawnOutcome::DeferredForCommit),
+            "spawn inside open tx must return DeferredForCommit"
+        );
+
+        // Simulate the consumer observing a Delete for the same channel
+        // before commit. stop() must drop the queued deferred spawn.
+        fix.registry
+            .stop(&community_id, &channel_id)
+            .await
+            .expect("stop");
+
+        // commit() now drains an empty queue (because stop scrubbed it)
+        // and must NOT resurrect the channel.
+        tx.commit().await.expect("commit");
+
+        assert!(
+            fix.registry
+                .engine(&community_id, &channel_id)
+                .await
+                .is_none(),
+            "stop() before commit() must cancel the queued deferred spawn — \
+             commit must NOT resurrect a channel that has been deleted"
+        );
+
+        // No on-disk dir either — the spawn body never ran.
+        let channel_dir = fix
+            ._tmp
+            .path()
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("channels")
+            .join(hex::encode(channel_id.0));
+        assert!(
+            !channel_dir.exists(),
+            "stop-before-commit must not create the channel-log on-disk dir"
         );
     }
 
