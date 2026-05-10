@@ -185,7 +185,8 @@
 
 <div class="channel-message-feed">
   <header class="channel-header">
-    <span class="channel-title">#{channelName}</span>
+    <span class="hash" aria-hidden="true">#</span>
+    <span class="name">{channelName}</span>
   </header>
 
   <div
@@ -254,7 +255,8 @@
     color: var(--text-primary);
     font-weight: 500;
   }
-  .channel-title { color: var(--text-primary); }
+  .channel-header .hash { color: var(--text-secondary); }
+  .channel-header .name { color: var(--text-primary); }
   .messages-scroll {
     flex: 1;
     overflow-y: auto;

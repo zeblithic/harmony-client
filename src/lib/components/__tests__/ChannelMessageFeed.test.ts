@@ -61,8 +61,12 @@ describe('ChannelMessageFeed', () => {
   });
 
   it('renders the channel header with #channelName', async () => {
-    const { getByText } = await setup({ channelName: 'announcements' });
-    expect(getByText('#announcements')).toBeTruthy();
+    const { container } = await setup({ channelName: 'announcements' });
+    const header = container.querySelector('.channel-header');
+    expect(header?.textContent).toContain('#');
+    expect(header?.textContent).toContain('announcements');
+    // Verify the .name class hook exists for Task 7's CommunityView test:
+    expect(container.querySelector('.channel-header .name')?.textContent?.trim()).toBe('announcements');
   });
 
   it('renders a message when one arrives via channel-message-received', async () => {
