@@ -824,7 +824,7 @@ impl CommunitySyncEngine {
     /// The membership key is bound at `spawn_engine` time and never
     /// changes for the engine's lifetime, so handing out a clone is
     /// safe.
-    pub fn membership_key(&self) -> MembershipKey {
+    pub(crate) fn membership_key(&self) -> MembershipKey {
         self.membership_key.clone()
     }
 
@@ -834,7 +834,7 @@ impl CommunitySyncEngine {
     /// (`verify_channel_event`) takes a `&dyn CommunityStateAtHlc`
     /// resolved at `event.at`; this accessor produces the production
     /// adapter that materializes the live CRDT to the requested HLC.
-    pub fn state_at_hlc_resolver(
+    pub(crate) fn state_at_hlc_resolver(
         &self,
     ) -> Arc<dyn crate::community_channel_log::CommunityStateAtHlc + Send + Sync> {
         Arc::new(CommunityStateAtHlcAdapter {
@@ -855,7 +855,7 @@ impl CommunitySyncEngine {
     /// identity_resolver (legacy unit tests pre-Task 8). Production
     /// engines always have one (registry config carries the resolver
     /// and clones it into every spawned engine — see `spawn_engine`).
-    pub fn identity_resolver(
+    pub(crate) fn identity_resolver(
         &self,
     ) -> Option<Arc<dyn crate::community_channel_log::ChannelIdentityResolver + Send + Sync>> {
         self.identity_resolver
@@ -2769,48 +2769,52 @@ pub struct CommunityStateAtHlcAdapter {
 
 #[async_trait::async_trait]
 impl crate::community_channel_log::CommunityStateAtHlc for CommunityStateAtHlcAdapter {
-    async fn channel_at(
+    async fn snapshot_at(
         &self,
         channel_id: &crate::community_membership::ChannelId,
+        author: &crate::owner_state_types::OwnerAddr,
         at: &crate::owner_state_types::Hlc,
-    ) -> Option<crate::community_membership::ChannelInfo> {
-        let state = self.state.lock().await;
+    ) -> crate::community_channel_log::CommunityStateSnapshot {
         // Snapshot the event log under the lock, then drop the guard
         // before materialising. `prior_state_at_hlc` is a pure function
         // of (events, target_hlc, admin_addr) — it doesn't touch the
         // shared CommunityState, so we can release the lock first to
         // avoid blocking the engine's writer for the duration of the
         // O(events) replay.
-        let events: Vec<crate::community_membership::SignedMembershipEvent> =
-            state.events.values().cloned().collect();
-        drop(state);
-        let materialized =
-            crate::community_membership::prior_state_at_hlc(&events, at, self.admin_addr);
-        materialized.channels.get(channel_id).cloned()
-    }
-
-    async fn author_power_at(
-        &self,
-        author: &crate::owner_state_types::OwnerAddr,
-        at: &crate::owner_state_types::Hlc,
-    ) -> Option<u8> {
+        //
+        // Critical: ONE lock acquisition + ONE materialization for both
+        // the channel-config lookup and the author-power lookup. The
+        // previous shape (two trait methods, two lock acquisitions, two
+        // materializations) admitted a torn read where a CRDT update
+        // landing between the two awaits could let verify_channel_event
+        // admit a post on a state that never coexisted at one HLC.
         let state = self.state.lock().await;
         let events: Vec<crate::community_membership::SignedMembershipEvent> =
             state.events.values().cloned().collect();
         drop(state);
         let materialized =
             crate::community_membership::prior_state_at_hlc(&events, at, self.admin_addr);
+
+        let channel = materialized.channels.get(channel_id).cloned();
         // Member must be Joined at `at` (Left/Banned/Invited drop the
         // post). `power_levels` defaults to 0 for unset entries; for
         // Joined non-listed members the lookup is `Some(0)`. For
         // never-Joined / Left / Banned we return `None` so verify
         // surfaces NotAuthorized rather than a misleading 0.
-        let member = materialized.members.get(author)?;
-        match member.status {
-            crate::community_membership::MemberStatus::Joined => {
-                Some(materialized.power_levels.get(author).copied().unwrap_or(0))
-            }
-            _ => None,
+        let author_power =
+            materialized
+                .members
+                .get(author)
+                .and_then(|member| match member.status {
+                    crate::community_membership::MemberStatus::Joined => {
+                        Some(materialized.power_levels.get(author).copied().unwrap_or(0))
+                    }
+                    _ => None,
+                });
+
+        crate::community_channel_log::CommunityStateSnapshot {
+            channel,
+            author_power,
         }
     }
 }

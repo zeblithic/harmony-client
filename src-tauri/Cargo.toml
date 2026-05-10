@@ -9,6 +9,18 @@ rust-version = "1.88"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# `test-fixtures` exposes test-only helpers (deterministic-nonce
+# encrypt, etc.) to integration tests in `tests/*.rs`. Integration
+# tests compile against the crate's public API, so `#[cfg(test)]`
+# alone won't reach them — that gate only fires for inside-the-crate
+# tests. Helpers gated on `test-fixtures` are physically excluded from
+# release builds; the CI lib + workspace cargo invocations enable the
+# feature to keep wire-format pin tests compilable. NEVER enable in a
+# production build — see `community_channel_log::encrypt_channel_packet_with_nonce`
+# for the nonce-reuse footgun this gate guards.
+test-fixtures = []
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

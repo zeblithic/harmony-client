@@ -9658,13 +9658,26 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
             };
             emit_membership(payload).await;
         } else if let Some(payload) = delta_to_channel_config_change(&delta) {
-            // Fire IPC emit first (ordering matches Phase 1's
-            // membership branch — observable side effect before
-            // registry mutation), then registry hook. The registry
-            // hook receives a clone — both callbacks see the same
-            // payload bytes.
-            emit_channel_config(payload.clone()).await;
-            on_channel_config_registry(payload).await;
+            // Order matters: registry hook FIRST (awaits engine
+            // spawn/stop), THEN UI event. The UI consumer of
+            // `channel-config-updated` for a Created channel
+            // immediately fires `list_channel_messages` /
+            // `post_channel_message` IPCs that look up the engine
+            // in the registry. If we emit the Tauri event before
+            // `registry.spawn` has awaited to completion, those
+            // IPCs hit a "no engine for ..." race and surface
+            // false-error toasts.
+            //
+            // Cost: UI sees the channel-config-updated event a few
+            // ms later (registry.spawn does dir-create + tail
+            // reload + adapter bridge enqueue). For Modified the
+            // registry hook is a no-op; for Deleted it's
+            // registry.stop (cheap). Trade is unambiguously worth
+            // it — the previous order was an observed UI race.
+            //
+            // Both callbacks see the same payload bytes.
+            on_channel_config_registry(payload.clone()).await;
+            emit_channel_config(payload).await;
         }
     }
 }

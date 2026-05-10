@@ -49,7 +49,7 @@ Phase 3 ships the Zenoh transport that wraps the Phase 2 primitives, plus the li
 
 The data plane mirrors the well-established split in `community_state_sync.rs` + `event_loop.rs`:
 
-```
+```text
                  ┌─────────────────────────────────────────────┐
    IPC layer ───▶│ ChannelLogEngine                            │
                  │   - log: Arc<Mutex<ChannelLog>>            │
@@ -202,7 +202,8 @@ impl Default for ChannelLogEngineConfig {
 ### 6.4 Internal state machines
 
 **Flush loop:**
-```
+
+```rust
 loop {
     select! {
         _ = flush_dirty.notified() => {
@@ -230,7 +231,8 @@ loop {
 ```
 
 **Receive loop:**
-```
+
+```rust
 loop {
     select! {
         Some(packet_bytes) = subscriber_rx.recv() => {
@@ -264,7 +266,14 @@ pub struct ChannelLogRegistry {
 }
 
 pub struct ChannelLogRegistryConfig {
-    pub session: Arc<zenoh::Session>,
+    /// Bridge to `event_loop::run` (Task 4.5). The registry does NOT
+    /// hold a Zenoh session directly; the session lives exclusively
+    /// inside `event_loop::run`. Each `spawn` call enqueues a
+    /// `ChannelLogAdapterRequest` over this mpsc, and the event loop
+    /// drains it and binds the per-channel adapter against the live
+    /// session via `spawn_channel_log_zenoh_adapter`. Same architectural
+    /// rationale as the community-state engine's `CommunityAdapterRequest`.
+    pub adapter_request_tx: mpsc::UnboundedSender<ChannelLogAdapterRequest>,
     pub app: AppHandle,
     pub identity_dir: PathBuf,
     pub self_owner: OwnerAddr,
@@ -393,7 +402,7 @@ The queryable handler needs read access to the engine's log. Two options were co
 
 ### 8.2 Topic shapes (locked)
 
-```
+```text
 Live broadcast (sub + put):
     harmony/channels/{cid_hex}/{ch_id_hex}/events
 
@@ -493,6 +502,8 @@ pub enum ChannelLogEngineError {
     BodyTooLarge { len: usize, max: usize },             // hard cap, e.g. 64 KiB; Phase 4 will surface this
     #[error("limit too large: {0} (max {max})")]
     LimitTooLarge { limit: u32, max: u32 },
+    #[error("body not valid UTF-8: {0}")]
+    BodyNotUtf8(String),                                 // Task 2: surfaced when DTO body bytes don't decode
 }
 ```
 
@@ -526,7 +537,7 @@ Emission sites:
 
 Phase 3 adds nothing to disk beyond what Phase 2 already created. Layout (per Phase 2):
 
-```
+```text
 <identity_dir>/communities/{cid_hex}/channels/{ch_id_hex}/
     manifest.cbor                                         (schema-versioned CBOR, V1 byte prefix)
     tail.cbor                                             (schema-versioned CBOR, V1 byte prefix)

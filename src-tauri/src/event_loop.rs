@@ -129,6 +129,15 @@ pub struct ChannelLogAdapterRequest {
     /// progress emissions. Default 16; tests can override via
     /// `ChannelLogEngineConfig.backfill_progress_event_interval`.
     pub backfill_progress_interval: usize,
+    /// Per-engine default backfill limit applied when a
+    /// `BackfillQueryRequest` carries `limit == 0`. Sourced from
+    /// `ChannelLogEngineConfig.backfill_default_limit` at registry
+    /// `spawn` time so per-community config overrides take effect
+    /// (the previous shape hardcoded `CHANNEL_BACKFILL_DEFAULT_LIMIT`
+    /// in the adapter, ignoring engine config). The hard cap
+    /// `CHANNEL_BACKFILL_MAX_LIMIT` still applies on the adapter
+    /// side as a server-side reply-storm bound.
+    pub backfill_default_limit: usize,
     /// Closing flag for the adapter task. Independent from the
     /// engine's internal closing flag — they're flipped by separate
     /// paths:
@@ -1418,6 +1427,7 @@ pub async fn run<R: Runtime>(
                     req.read_for_query,
                     req.emit_backfill_progress,
                     req.backfill_progress_interval,
+                    req.backfill_default_limit,
                     req.closing,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget.
@@ -2552,6 +2562,7 @@ pub fn spawn_channel_log_zenoh_adapter<F>(
     read_for_query: Arc<F>,
     emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static>,
     backfill_progress_interval: usize,
+    backfill_default_limit: usize,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -2687,6 +2698,7 @@ where
         let prefix_qbl = queryable_prefix.clone();
         let read_for_query_qbl = Arc::clone(&read_for_query);
         let closing_qbl = Arc::clone(&closing);
+        let backfill_default_limit_qbl = backfill_default_limit;
         let qbl_handle = tokio::spawn(async move {
             let qbl = match session_qbl.declare_queryable(&key_qbl).await {
                 Ok(q) => q,
@@ -2709,11 +2721,16 @@ where
                         let qkey = query.key_expr().to_string();
                         let (since, limit_raw) = parse_channel_backfill_key(&qkey);
                         // Clamp peer-controlled limit per spec §6.2 (hard
-                        // cap 1000). limit=0 falls back to default 256.
-                        // Defense-in-depth: also clamped on the driver
-                        // side before the GET selector is built.
+                        // cap 1000). limit=0 falls back to per-engine
+                        // default sourced from
+                        // `ChannelLogEngineConfig.backfill_default_limit`
+                        // (also clamped to MAX so a misconfigured engine
+                        // can't blow past the server-side reply-storm
+                        // bound). Defense-in-depth: the qr-driver below
+                        // applies the same clamp before the GET selector
+                        // is built.
                         let limit = if limit_raw == 0 {
-                            CHANNEL_BACKFILL_DEFAULT_LIMIT
+                            backfill_default_limit_qbl.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         } else {
                             limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         };
@@ -2746,6 +2763,7 @@ where
         let subscriber_tx_qr = subscriber_tx.clone();
         let closing_qr = Arc::clone(&closing);
         let emit_backfill_progress_qr = Arc::clone(&emit_backfill_progress);
+        let backfill_default_limit_qr = backfill_default_limit;
         let qr_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2754,9 +2772,17 @@ where
                         let Some(req) = maybe else { break; };
                         // Clamp our own request before encoding (defense
                         // in depth — also prevents a misbehaving local
-                        // engine from issuing oversized requests).
+                        // engine from issuing oversized requests). The
+                        // per-engine `backfill_default_limit` (sourced
+                        // from `ChannelLogEngineConfig` at registry
+                        // spawn time, plumbed through
+                        // `ChannelLogAdapterRequest`) replaces the
+                        // previous hardcoded `CHANNEL_BACKFILL_DEFAULT_LIMIT`
+                        // — config overrides now take effect. The MAX
+                        // cap stays as the constant (server-side hard
+                        // cap independent of engine config).
                         let limit = if req.limit == 0 {
-                            CHANNEL_BACKFILL_DEFAULT_LIMIT
+                            backfill_default_limit_qr.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         } else {
                             req.limit.min(CHANNEL_BACKFILL_MAX_LIMIT)
                         };
@@ -2794,40 +2820,69 @@ where
                             }
                         };
                         let mut fetched: u32 = 0;
-                        while let Ok(reply) = receiver.recv_async().await {
-                            if let Ok(sample) = reply.into_result() {
-                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                if subscriber_tx_qr.send(bytes).await.is_err() {
-                                    // subscriber_rx dropped (engine
-                                    // teardown). No point serving more
-                                    // backfill requests if we can't
-                                    // deliver replies — exit the qr
-                                    // task entirely so we don't loop
-                                    // back, fire another session.get,
-                                    // and spin until the 1s closing
-                                    // poll catches up.
-                                    return;
+                        // Inner reply-drain loop with closing-poll arm.
+                        // `recv_async()` blocks until the reply stream
+                        // closes; if the peer hangs (partition / dropped
+                        // session / silent peer) it can block forever.
+                        // Wrap in `select!` so a flipped closing flag
+                        // unblocks teardown within ~500ms instead of
+                        // waiting on the outer 1s closing-poll AFTER the
+                        // hung recv eventually returns. The 500ms inner
+                        // poll is tighter than the outer 1s because
+                        // backfill is user-triggered and stop() latency
+                        // is a UX concern.
+                        let drained_clean: bool = loop {
+                            tokio::select! {
+                                biased;
+                                res = receiver.recv_async() => {
+                                    let Ok(reply) = res else { break true; };
+                                    if let Ok(sample) = reply.into_result() {
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if subscriber_tx_qr.send(bytes).await.is_err() {
+                                            // subscriber_rx dropped (engine
+                                            // teardown). No point serving more
+                                            // backfill requests if we can't
+                                            // deliver replies — exit the qr
+                                            // task entirely so we don't loop
+                                            // back, fire another session.get,
+                                            // and spin until the 1s closing
+                                            // poll catches up.
+                                            return;
+                                        }
+                                        fetched = fetched.saturating_add(1);
+                                        // Spec §10: emit channel-backfill-progress
+                                        // every N replies. `total_estimate` is
+                                        // `None` — we don't know the total until
+                                        // the receiver closes (Zenoh streams
+                                        // replies one-at-a-time).
+                                        if backfill_progress_interval > 0
+                                            && (fetched as usize)
+                                                .is_multiple_of(backfill_progress_interval)
+                                        {
+                                            (emit_backfill_progress_qr)(fetched, None);
+                                        }
+                                    }
                                 }
-                                fetched = fetched.saturating_add(1);
-                                // Spec §10: emit channel-backfill-progress
-                                // every N replies. `total_estimate` is
-                                // `None` — we don't know the total until
-                                // the receiver closes (Zenoh streams
-                                // replies one-at-a-time).
-                                if backfill_progress_interval > 0
-                                    && (fetched as usize)
-                                        .is_multiple_of(backfill_progress_interval)
-                                {
-                                    (emit_backfill_progress_qr)(fetched, None);
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                    if closing_qr.load(Ordering::SeqCst) {
+                                        // Adapter is tearing down. Don't
+                                        // emit a final progress tick
+                                        // (consumer is going away) — exit
+                                        // immediately and let the outer
+                                        // closing-poll arm break the loop.
+                                        break false;
+                                    }
                                 }
                             }
-                        }
+                        };
                         // Spec §10: emit a final progress tick at end-of-
                         // request (so single-event replies + tail-of-
                         // batch get one event even if N didn't divide
                         // evenly). Skip if zero replies — nothing to
-                        // signal.
-                        if fetched > 0 {
+                        // signal. Also skip on shutdown — the consumer
+                        // is going away and a final tick after the
+                        // closing flag flipped is racy noise.
+                        if drained_clean && fetched > 0 {
                             (emit_backfill_progress_qr)(fetched, None);
                         }
                     }
@@ -2846,6 +2901,12 @@ where
 }
 
 /// Per spec §6.2: default backfill limit when peer/local sends 0.
+/// Used by the engine config (`ChannelLogEngineConfig.backfill_default_limit`)
+/// as the production default; the adapter no longer references this
+/// constant directly (it now uses the per-engine value plumbed through
+/// `ChannelLogAdapterRequest.backfill_default_limit`). Kept for the
+/// event-loop unit tests that still want a stable sentinel.
+#[cfg(test)]
 const CHANNEL_BACKFILL_DEFAULT_LIMIT: usize = 256;
 /// Per spec §6.2 + §15: hard cap on backfill `limit` (peer-controlled
 /// AND local-controlled). Bounds the reply storm on the queryable side
@@ -2947,6 +3008,7 @@ mod channel_log_adapter_tests {
             read_for_query,
             emit_progress,
             16,
+            CHANNEL_BACKFILL_DEFAULT_LIMIT,
             Arc::clone(&closing),
         );
 

@@ -268,9 +268,20 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         // every author/device HLC already on disk. Otherwise backfill
         // replies for previously-stored events get re-appended +
         // re-emitted (the tracker's would_accept gate is what dedupes
-        // backfill; it can't dedupe what it never saw). We walk the
-        // tail (loaded above) AND each sealed segment to rebuild
-        // last_seen.
+        // backfill; it can't dedupe what it never saw). We walk every
+        // sealed segment AND the tail to rebuild last_seen.
+        //
+        // Iteration order matters: `ChannelLogReplayTracker::record`
+        // overwrites unconditionally (blind insert), so the LAST call
+        // for any (author, device) lane wins. Sealed segments hold the
+        // older history; the tail holds the most recent events. We
+        // walk segments first then tail so the tail's `record` calls
+        // win — this matches the natural ChannelLog::reload order
+        // (segments first, then tail). Reversing this order would
+        // regress the high-water mark whenever segments contain newer-
+        // than-tail events (possible in the post-tail-flush window
+        // before the next seal lands), allowing already-persisted
+        // events to be re-accepted on respawn.
         //
         // Why call `record` directly (vs `check_and_advance`): on-disk
         // events were validated when first appended; re-running the
@@ -278,9 +289,6 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         // occurrence of any (author, device) lane as a replay. We just
         // want the high-water mark recorded.
         let mut tracker = ChannelLogReplayTracker::new();
-        for ev in &log.tail {
-            tracker.record(ev);
-        }
         for seg in &log.manifest.segments {
             let events = log
                 .read_segment(seg)
@@ -288,6 +296,9 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             for ev in &events {
                 tracker.record(ev);
             }
+        }
+        for ev in &log.tail {
+            tracker.record(ev);
         }
 
         let engine = Arc::new(Self {
@@ -1173,6 +1184,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 }
             });
         let backfill_progress_interval = self.config.engine_config.backfill_progress_event_interval;
+        let backfill_default_limit = self.config.engine_config.backfill_default_limit;
 
         if let Err(e) =
             self.config
@@ -1186,6 +1198,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                     read_for_query,
                     emit_backfill_progress,
                     backfill_progress_interval,
+                    backfill_default_limit,
                     closing: Arc::clone(&closing),
                 })
         {
@@ -1359,27 +1372,34 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommunityStateAtHlc for AlwaysJoinedState {
-        async fn channel_at(&self, channel_id: &ChannelId, _at: &Hlc) -> Option<ChannelInfo> {
-            if channel_id != &self.channel_id {
-                return None;
-            }
-            Some(ChannelInfo {
-                name: "test".to_string(),
-                write_power: 0,
-                created_at: Hlc {
-                    wall_ms: 0,
-                    logical: 0,
-                    device_id: "fixture".to_string(),
-                },
-                deleted_at: None,
-            })
-        }
-
-        async fn author_power_at(&self, author: &OwnerAddr, _at: &Hlc) -> Option<u8> {
-            if author == &self.owner {
+        async fn snapshot_at(
+            &self,
+            channel_id: &ChannelId,
+            author: &OwnerAddr,
+            _at: &Hlc,
+        ) -> crate::community_channel_log::CommunityStateSnapshot {
+            let channel = if channel_id == &self.channel_id {
+                Some(ChannelInfo {
+                    name: "test".to_string(),
+                    write_power: 0,
+                    created_at: Hlc {
+                        wall_ms: 0,
+                        logical: 0,
+                        device_id: "fixture".to_string(),
+                    },
+                    deleted_at: None,
+                })
+            } else {
+                None
+            };
+            let author_power = if author == &self.owner {
                 Some(100)
             } else {
                 None
+            };
+            crate::community_channel_log::CommunityStateSnapshot {
+                channel,
+                author_power,
             }
         }
     }
@@ -2067,6 +2087,172 @@ mod tests {
         assert!(std::fs::metadata(&tail_path).expect("meta").len() > 1);
     }
 
+    /// Regression: replay tracker rebuild on respawn must walk sealed
+    /// segments BEFORE the tail so the tail's (more-recent) HLC wins
+    /// when the same (author, device) lane is touched in both.
+    /// `ChannelLogReplayTracker::record` overwrites unconditionally;
+    /// reversing the order regresses the high-water mark and lets a
+    /// re-broadcast of an already-persisted event slip through verify.
+    ///
+    /// Strategy:
+    /// 1. Build engine with a tight seal threshold; append events with
+    ///    strictly-monotone HLCs from a single (author, device) lane.
+    /// 2. Force a seal partway through so some events are sealed and
+    ///    some are still in tail. The tail's last HLC strictly exceeds
+    ///    every sealed event's HLC.
+    /// 3. Drop the engine; respawn it (same dir, same identity).
+    /// 4. Take a packet that was originally appended (now in a sealed
+    ///    segment OR in the persisted tail) and inject it into the new
+    ///    engine's subscriber path. The verify chain must reject it as
+    ///    `ChannelEventError::Replay` — i.e. the rebuilt tracker's
+    ///    high-water mark must reflect the LATEST event from that lane,
+    ///    not whichever happened to be visited last in the rebuild.
+    #[tokio::test]
+    async fn replay_tracker_survives_respawn_without_high_water_regression() {
+        // Build first engine; small seal threshold so we get sealed segments.
+        let fix = build_engine_fixture(3, 5_000, 10_000).await;
+        let dir = fix.tmp.path().to_path_buf();
+        let community_id = fix.community_id;
+        let channel_id = fix.channel_id;
+        let self_owner = fix.self_owner;
+        let signing_key = Arc::clone(&fix.signing_key);
+        let channel_key = Arc::clone(&fix.channel_key);
+
+        // Append 7 events with strictly-monotone HLCs on a single
+        // (author=self_owner, device="test-device") lane. Force a seal
+        // after the 4th — leaves 4 events sealed (segment 0 — 3 events,
+        // sealed because seal_threshold=3) and 3 events in tail.
+        // The tail's last HLC (wall_ms=106) strictly exceeds every
+        // sealed event's HLC (max wall_ms=103). The wrong rebuild
+        // order (tail-then-segments) would leave the tracker pointing
+        // at wall_ms=103 and accept wall_ms=104..106 as fresh.
+        let mut events = Vec::new();
+        for i in 0..7u64 {
+            let hlc = Hlc {
+                wall_ms: 100 + i,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            };
+            let ev = make_signed_event(
+                community_id,
+                channel_id,
+                self_owner,
+                hlc,
+                &format!("msg-{i}"),
+                &signing_key,
+            );
+            events.push(ev);
+        }
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for (i, ev) in events.iter().enumerate() {
+                log.append(ev.clone()).expect("append");
+                if i == 3 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            assert!(
+                !log.manifest.segments.is_empty(),
+                "test setup expected ≥ 1 sealed segment after the partway seal",
+            );
+            assert!(
+                !log.tail.is_empty(),
+                "test setup expected ≥ 1 event left in tail post-seal",
+            );
+        }
+        // Force tail.cbor to disk so the respawn sees it.
+        fix.engine.flush_now().await.expect("flush_now");
+        // Drop the original engine. shutdown joins the loops cleanly so
+        // we can respawn against the same root_dir without racing.
+        fix.engine.shutdown().await.expect("shutdown");
+
+        // Re-build dependencies for the respawned engine. Same identity,
+        // same dir, same channel_key — different mpsc endpoints since
+        // the originals were owned by the dropped fixture.
+        let resolver = {
+            let priv_id = harmony_identity::PrivateIdentity::from_seed(&[0x42u8; 32]);
+            let pub_64 = priv_id.identity.to_public_bytes();
+            let mut m = HashMap::new();
+            m.insert(self_owner, pub_64);
+            Arc::new(FixedIdentityResolver { map: m })
+        };
+        let state = Arc::new(AlwaysJoinedState {
+            channel_id,
+            owner: self_owner,
+        });
+        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let (publisher_tx, _publisher_rx) = mpsc::channel(64);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
+        let (query_request_tx, _query_request_rx) = mpsc::channel(8);
+        let app = tauri::test::mock_app().handle().clone();
+        let config = ChannelLogEngineConfig {
+            log_config: ChannelLogConfig {
+                seal_threshold_events: 3,
+            },
+            flush_debounce_ms: 5_000,
+            max_dirty_ms: 10_000,
+            ..Default::default()
+        };
+        let params = ChannelLogEngineParams {
+            community_id,
+            channel_id,
+            channel_key: Arc::clone(&channel_key),
+            root_dir: dir,
+            state_at_hlc: state,
+            resolver,
+            self_owner,
+            self_device_id: "test-device".to_string(),
+            signing_key: Arc::clone(&signing_key),
+            hlc_tracker,
+            app,
+            config,
+            publisher_tx,
+            subscriber_rx,
+            query_request_tx,
+        };
+        let engine2 = ChannelLogEngine::new(params).await.expect("respawn");
+
+        // Pick the LAST event (newest HLC, in the tail). Re-encrypt
+        // and inject it via the subscriber path. The rebuilt tracker
+        // must already reflect this HLC, so verify rejects with Replay.
+        // This is the precise test the wrong order fails: with
+        // tail-then-segments, the tail's record() runs first and is
+        // overwritten by the older sealed events' record() calls,
+        // dropping last_seen back to wall_ms=103. The injected
+        // wall_ms=106 packet would then verify cleanly and append.
+        let last_event = events.last().expect("events non-empty").clone();
+        let packet = encrypt_channel_packet(&channel_key, &last_event).expect("encrypt");
+
+        let log_count_before = engine2
+            .list_messages(None, 100)
+            .await
+            .expect("list before")
+            .len();
+        subscriber_tx
+            .send(packet)
+            .await
+            .expect("send injected packet");
+
+        // Give the receive loop a brief window to process. If the
+        // tracker correctly carries the wall_ms=106 high-water, the
+        // packet is dropped (no log mutation). Otherwise the broken
+        // path appends — which we'd see as a count increase.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let log_count_after = engine2
+            .list_messages(None, 100)
+            .await
+            .expect("list after")
+            .len();
+        assert_eq!(
+            log_count_before, log_count_after,
+            "replay tracker rebuild regressed: re-broadcast of already-persisted \
+             event was accepted (count: {} -> {})",
+            log_count_before, log_count_after,
+        );
+
+        engine2.shutdown().await.expect("respawn shutdown");
+    }
+
     // Smoke: skeleton tests still work end-to-end.
     #[tokio::test]
     async fn engine_construct_shutdown_round_trip() {
@@ -2237,6 +2423,7 @@ mod tests {
                     req.read_for_query,
                     req.emit_backfill_progress,
                     req.backfill_progress_interval,
+                    req.backfill_default_limit,
                     req.closing,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget;

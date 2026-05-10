@@ -369,6 +369,16 @@ pub fn encrypt_channel_packet(
 /// ChaCha20-Poly1305 confidentiality + integrity. Production code MUST
 /// use `encrypt_channel_packet`; this helper exists only because pin
 /// tests need byte-determinism.
+///
+/// Gated behind `cfg(any(test, feature = "test-fixtures"))` so it is
+/// physically excluded from release builds. The `test-fixtures` feature
+/// is what lets integration tests in `tests/*.rs` (which compile against
+/// the crate's public API and therefore can't see `#[cfg(test)]`-only
+/// items) reach this helper without re-exposing the nonce-reuse footgun
+/// to production callers. CI runs `cargo test --workspace --features
+/// test-fixtures` to keep these tests compilable; release builds never
+/// enable the feature.
+#[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub fn encrypt_channel_packet_with_nonce(
     key: &ChannelKey,
@@ -543,15 +553,50 @@ impl ChannelLogReplayTracker {
 /// Locking that Mutex requires `.await`, so the trait methods must be
 /// async. Mocks (`MockState` / `AlwaysJoinedState`) implement the
 /// async signature trivially since their data is in-memory.
+///
+/// **Single-method contract.** The trait exposes ONE method
+/// (`snapshot_at`) that returns BOTH the channel-config and the
+/// author's power level in a single materialized snapshot. The previous
+/// shape (two methods, called sequentially with `.await` between them)
+/// allowed a torn read: the production adapter re-acquires the live
+/// `Arc<Mutex<CommunityState>>` lock on each call and re-materializes,
+/// so a CRDT update landing between the two awaits — membership change,
+/// channel deletion, write_power change — would let `verify_channel_event`
+/// decide based on data that NEVER coexisted at one HLC. Returning
+/// both values from one call under one lock acquisition closes that
+/// authorization-bug hole.
 #[async_trait::async_trait]
 pub trait CommunityStateAtHlc {
-    /// Lookup the channel-config snapshot at `at`. Returns None if
-    /// the channel didn't exist at that HLC.
-    async fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo>;
+    /// Materialize the community state at `at` and return BOTH the
+    /// channel info and the author's effective power in a single
+    /// atomic snapshot. The production adapter takes the
+    /// `Arc<Mutex<CommunityState>>` lock once and projects both
+    /// values from one materialization, guaranteeing they reflect
+    /// the same state. Failed lookups are surfaced as `None` on the
+    /// individual snapshot fields (channel didn't exist at `at` /
+    /// author wasn't Joined at `at`).
+    async fn snapshot_at(
+        &self,
+        channel_id: &ChannelId,
+        author: &OwnerAddr,
+        at: &Hlc,
+    ) -> CommunityStateSnapshot;
+}
 
-    /// Author's effective power level at `at`. Returns None if the
-    /// author was not Joined (or never present) at `at`.
-    async fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8>;
+/// Atomic snapshot returned by `CommunityStateAtHlc::snapshot_at`.
+/// Both fields reflect a single materialized state at the requested
+/// HLC, so verify-time authorization decisions are coherent — see the
+/// trait doc-comment for the torn-read failure mode this prevents.
+#[derive(Clone, Debug)]
+pub struct CommunityStateSnapshot {
+    /// Channel-config slice at the requested HLC. `None` if the
+    /// channel didn't exist at `at`.
+    pub channel: Option<ChannelInfo>,
+    /// Author's effective power level at the requested HLC. `None`
+    /// if the author was not Joined (Left / Banned / never-present);
+    /// `Some(0)` for a Joined member with no explicit power-level
+    /// entry (`power_levels` defaults to 0).
+    pub author_power: Option<u8>,
 }
 
 /// Identity-resolution trait. Mirrors the existing
@@ -656,7 +701,17 @@ where
     // tombstone (`deleted_at`) are evaluated AS OF event.at, not as
     // of "now" — channel-config events between post-time and verify-
     // time may have raised/lowered the threshold or deleted the channel.
-    let channel_info = state.channel_at(channel_id, at).await.ok_or_else(|| {
+    //
+    // Single `snapshot_at` call (vs the previous two-call shape) so
+    // both `channel_info` and `author_power` reflect ONE materialized
+    // state at `at`. The previous shape allowed a torn read: the
+    // production adapter re-acquired the CommunityState lock on each
+    // call, and a CRDT update landing between the two `.await` points
+    // could let the verify chain admit a post based on a state that
+    // never coexisted at one HLC. See `CommunityStateAtHlc` trait
+    // doc-comment for full rationale.
+    let snapshot = state.snapshot_at(channel_id, author, at).await;
+    let channel_info = snapshot.channel.ok_or_else(|| {
         ChannelEventError::NotAuthorized(format!(
             "channel {:?} did not exist at {:?}",
             channel_id, at
@@ -672,7 +727,7 @@ where
             )));
         }
     }
-    let author_power = state.author_power_at(author, at).await.ok_or_else(|| {
+    let author_power = snapshot.author_power.ok_or_else(|| {
         ChannelEventError::NotAuthorized(format!("author {:?} not Joined at {:?}", author, at))
     })?;
     if author_power < channel_info.write_power {
@@ -1630,41 +1685,63 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommunityStateAtHlc for MockState {
-        async fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo> {
-            // Return the channel-config snapshot most recent at `at`.
-            // Walk back-to-front via DoubleEndedIterator + find — first
+        async fn snapshot_at(
+            &self,
+            channel_id: &ChannelId,
+            author: &OwnerAddr,
+            at: &Hlc,
+        ) -> CommunityStateSnapshot {
+            // Channel-config snapshot most recent at `at`. Walk
+            // back-to-front via DoubleEndedIterator + find — first
             // hit is the most recent at-or-before `at`. (Avoids
             // `Iterator::last` on a DoubleEndedIterator, per clippy.)
-            let history = self.channels.get(channel_id)?;
-            history
-                .iter()
-                .rev()
-                .find(|(hlc, _)| {
-                    (hlc.wall_ms, hlc.logical, &hlc.device_id)
-                        <= (at.wall_ms, at.logical, &at.device_id)
-                })
-                .map(|(_, info)| info.clone())
-        }
+            let channel = self.channels.get(channel_id).and_then(|history| {
+                history
+                    .iter()
+                    .rev()
+                    .find(|(hlc, _)| {
+                        (hlc.wall_ms, hlc.logical, &hlc.device_id)
+                            <= (at.wall_ms, at.logical, &at.device_id)
+                    })
+                    .map(|(_, info)| info.clone())
+            });
 
-        async fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8> {
             // Most recent power level at-or-before `at`. None if author
             // had Left before `at` or was never Joined.
-            if let Some(left_hlc) = self.left_at.get(author) {
+            let author_power = if let Some(left_hlc) = self.left_at.get(author) {
                 if (left_hlc.wall_ms, left_hlc.logical, &left_hlc.device_id)
                     <= (at.wall_ms, at.logical, &at.device_id)
                 {
-                    return None;
+                    None
+                } else {
+                    self.members.get(author).and_then(|history| {
+                        history
+                            .iter()
+                            .rev()
+                            .find(|(hlc, _)| {
+                                (hlc.wall_ms, hlc.logical, &hlc.device_id)
+                                    <= (at.wall_ms, at.logical, &at.device_id)
+                            })
+                            .map(|(_, p)| *p)
+                    })
                 }
-            }
-            let history = self.members.get(author)?;
-            history
-                .iter()
-                .rev()
-                .find(|(hlc, _)| {
-                    (hlc.wall_ms, hlc.logical, &hlc.device_id)
-                        <= (at.wall_ms, at.logical, &at.device_id)
+            } else {
+                self.members.get(author).and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|(hlc, _)| {
+                            (hlc.wall_ms, hlc.logical, &hlc.device_id)
+                                <= (at.wall_ms, at.logical, &at.device_id)
+                        })
+                        .map(|(_, p)| *p)
                 })
-                .map(|(_, p)| *p)
+            };
+
+            CommunityStateSnapshot {
+                channel,
+                author_power,
+            }
         }
     }
 

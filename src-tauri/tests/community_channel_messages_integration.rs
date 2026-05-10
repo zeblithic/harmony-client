@@ -11,7 +11,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use harmony_app::community_channel_log::{
     derive_channel_key, encrypt_channel_packet, ChannelIdentityResolver, ChannelLogConfig,
-    CommunityStateAtHlc, SignedChannelEvent,
+    CommunityStateAtHlc, CommunityStateSnapshot, SignedChannelEvent,
 };
 use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
@@ -53,27 +53,34 @@ struct BothJoinedState {
 
 #[async_trait::async_trait]
 impl CommunityStateAtHlc for BothJoinedState {
-    async fn channel_at(&self, channel_id: &ChannelId, _at: &Hlc) -> Option<ChannelInfo> {
-        if channel_id != &self.channel_id {
-            return None;
-        }
-        Some(ChannelInfo {
-            name: "general".to_string(),
-            write_power: 0,
-            created_at: Hlc {
-                wall_ms: 1,
-                logical: 0,
-                device_id: "test".to_string(),
-            },
-            deleted_at: None,
-        })
-    }
-
-    async fn author_power_at(&self, author: &OwnerAddr, _at: &Hlc) -> Option<u8> {
-        if author == &self.a || author == &self.b {
+    async fn snapshot_at(
+        &self,
+        channel_id: &ChannelId,
+        author: &OwnerAddr,
+        _at: &Hlc,
+    ) -> CommunityStateSnapshot {
+        let channel = if channel_id == &self.channel_id {
+            Some(ChannelInfo {
+                name: "general".to_string(),
+                write_power: 0,
+                created_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                deleted_at: None,
+            })
+        } else {
+            None
+        };
+        let author_power = if author == &self.a || author == &self.b {
             Some(100)
         } else {
             None
+        };
+        CommunityStateSnapshot {
+            channel,
+            author_power,
         }
     }
 }
@@ -117,6 +124,7 @@ fn spawn_adapter_bridge_drainer(
                 req.read_for_query,
                 req.emit_backfill_progress,
                 req.backfill_progress_interval,
+                req.backfill_default_limit,
                 req.closing,
             );
             // JoinHandle dropped — adapter task is fire-and-forget;

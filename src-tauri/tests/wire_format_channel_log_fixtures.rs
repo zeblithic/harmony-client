@@ -25,11 +25,24 @@
 //! 4. Re-run without the env var to confirm the pin holds.
 
 use harmony_app::community_channel_log::{
-    derive_channel_key, encrypt_channel_packet_with_nonce, sign_channel_event, ChannelPostPayload,
-    MessageId, SignedChannelEvent,
+    sign_channel_event, ChannelPostPayload, MessageId, SignedChannelEvent,
 };
 use harmony_app::community_membership::ChannelId;
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+// `encrypt_channel_packet_with_nonce` is a deterministic-nonce variant
+// of the production AEAD helper; it is `#[cfg]`-gated to
+// `any(test, feature = "test-fixtures")` because random-nonce reuse
+// under ChaCha20-Poly1305 is catastrophic. Integration tests compile
+// against the crate's public API and cannot see `#[cfg(test)]`-only
+// items, so the `test-fixtures` feature is what makes this import
+// resolvable here. CI enables the feature; local `cargo test` without
+// `--features test-fixtures` skips just the backfill-packet pin and
+// leaves the SignedChannelEvent CBOR pin running.
+#[cfg(feature = "test-fixtures")]
+use harmony_app::community_channel_log::{derive_channel_key, encrypt_channel_packet_with_nonce};
+#[cfg(feature = "test-fixtures")]
+use harmony_app::owner_state_types::MembershipKey;
 
 fn fixture() -> SignedChannelEvent {
     let key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
@@ -74,7 +87,12 @@ fn signed_channel_event_post_wire_bytes_pinned() {
 /// channel key, nonce). Drift-guards the format against silent changes
 /// from Phase 4 / later work.
 ///
+/// Gated on `test-fixtures` because it calls
+/// `encrypt_channel_packet_with_nonce` — see the import block above
+/// for the nonce-reuse rationale. CI enables the feature.
+///
 /// Re-pin procedure documented in the file's header comment.
+#[cfg(feature = "test-fixtures")]
 #[test]
 fn backfill_reply_packet_wire_bytes_pinned() {
     // Deterministic seeds — match the existing wire-format test

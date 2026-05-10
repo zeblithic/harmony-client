@@ -77,11 +77,21 @@ jobs:
       # patched/yanked deps and CI would be testing a different graph than
       # contributors run locally. The MSRV job already uses --locked; the
       # main gate should match.
+      # `--features test-fixtures` is required so the integration test
+      # `tests/wire_format_channel_log_fixtures.rs` can compile — it
+      # uses `encrypt_channel_packet_with_nonce`, a deterministic-nonce
+      # variant of the production AEAD helper that is `#[cfg]`-gated to
+      # `any(test, feature = "test-fixtures")` so it cannot be reached
+      # from a release build (production code MUST use the random-nonce
+      # `encrypt_channel_packet`; the deterministic variant is a
+      # pin-test footgun if accidentally called). Integration tests
+      # compile against the crate's public API and cannot see
+      # `#[cfg(test)]`-only items, hence the feature gate.
       - name: cargo clippy --locked --all-targets
-        run: cargo clippy --locked --all-targets --no-deps
+        run: cargo clippy --locked --all-targets --features test-fixtures --no-deps
 
       - name: cargo test --locked --workspace --all-targets
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --features test-fixtures
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust` job
   # above runs on stable for newer clippy lints + fastest iteration; this job
@@ -145,8 +155,10 @@ jobs:
           workspaces: src-tauri
           key: msrv
 
+      # See the rust job's clippy/test steps for why `--features
+      # test-fixtures` is required to compile `--all-targets`.
       - name: cargo check --locked --all-targets
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets --features test-fixtures
 
   frontend:
     name: Frontend — tsc, vitest
