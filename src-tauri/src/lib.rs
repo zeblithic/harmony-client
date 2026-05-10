@@ -7719,7 +7719,8 @@ mod create_community_inner_tests {
         ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
     };
     use crate::community_state_sync::{
-        CommunityRegistryConfig, CommunitySyncRegistry, DEFAULT_DEBOUNCE_MS,
+        CommunityMembershipDelta, CommunityRegistryConfig, CommunitySyncRegistry,
+        DEFAULT_DEBOUNCE_MS,
     };
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::owner_state_crdt::OwnerState;
@@ -7758,6 +7759,8 @@ mod create_community_inner_tests {
         // Held alive so the channel_log registry's adapter bridge stays open.
         _channel_log_adapter_rx:
             tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        // Held alive so the delta consumer task keeps running.
+        _consumer_drainer: tokio::task::JoinHandle<()>,
         // Tempdir held alive for the duration of the test.
         _tmp: tempfile::TempDir,
     }
@@ -7785,13 +7788,17 @@ mod create_community_inner_tests {
     /// Build a minimal fixture for `create_community_inner` unit tests.
     ///
     /// Key design choices:
-    /// - `delta_tx: None` in `CommunityRegistryConfig` — no ChannelCreate
-    ///   events flow to `channel_log_registry` during the test (the delta
-    ///   consumer is not wired). The registry is present to receive
-    ///   `begin_transaction` + guard drop / `commit()` calls.
+    /// - `delta_tx: Some(delta_tx)` in `CommunityRegistryConfig` — ChannelCreate
+    ///   events emitted by the engine flow to the consumer task, which mirrors
+    ///   the production lib.rs:1552+ callback: it calls
+    ///   `channel_log_registry.spawn(...)` for each Created event. During an
+    ///   open transaction this call enqueues a `DeferredSpawn`; `commit()` drains
+    ///   the queue and calls `spawn_inner_now`. After a successful commit the
+    ///   happy-path test can assert `engines_count == 1`.
     /// - The channel-log registry uses a dummy adapter bridge (unbounded
-    ///   sender + no drainer task). No Zenoh session is needed since no
-    ///   spawns actually reach `spawn_inner_now` in these tests.
+    ///   sender + receiver kept alive). No Zenoh drainer is needed — the
+    ///   send succeeds so `spawn_inner_now` completes, but the adapter
+    ///   request just queues unprocessed (harmless for these tests).
     /// - The community adapter channel is live (receiver kept alive) so
     ///   the adapter `try_send` inside `create_community_inner` succeeds.
     /// - The fence-check `node_state` is a bare `NodeState::default()`
@@ -7805,9 +7812,10 @@ mod create_community_inner_tests {
         let identity_pub_64 = identity.identity.to_public_bytes();
         let signing_key = signing_key_from_identity(&identity);
 
-        // Community registry — delta_tx: None so no ChannelCreate events
-        // flow to channel_log_registry. The resolver returns self_owner's
-        // identity_pub so verify_event admits the local admin's events.
+        // Community registry — delta_tx wired so ChannelCreate deltas
+        // flow to the consumer task (spawned below). The resolver returns
+        // self_owner's identity_pub so verify_event admits the local
+        // admin's events.
         struct SingleOwnerResolver {
             owner: OwnerAddr,
             pub_64: [u8; 64],
@@ -7827,6 +7835,11 @@ mod create_community_inner_tests {
             cas_op_tx,
             std::time::Duration::from_millis(1000),
         ));
+
+        // delta_tx / delta_rx: engine emits CommunityMembershipDelta here;
+        // consumer task mirrors the production lib.rs:1552+ registry hook.
+        let (delta_tx, delta_rx) = mpsc::channel::<CommunityMembershipDelta>(64);
+
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
                 device_id: "test-dev".into(),
@@ -7838,7 +7851,7 @@ mod create_community_inner_tests {
                 identity_dir: tmp.path().to_path_buf(),
                 debounce_ms: DEFAULT_DEBOUNCE_MS,
                 error_tx: None,
-                delta_tx: None,
+                delta_tx: Some(delta_tx),
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
             }));
@@ -7848,10 +7861,12 @@ mod create_community_inner_tests {
         let (community_adapter_tx, _community_adapter_rx) =
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
 
-        // Channel-log registry — dummy adapter bridge, no Zenoh needed.
-        // The adapter_request_tx is kept open (receiver kept alive) but
-        // no drainer task is started — fine since no spawns reach
-        // spawn_inner_now in these unit tests.
+        // Channel-log registry — dummy adapter bridge. The unbounded
+        // receiver is kept alive so adapter-request sends succeed inside
+        // spawn_inner_now, but no drainer runs (the request just queues).
+        // This is sufficient: spawn_inner_now inserts the engine into the
+        // registry map regardless of whether the adapter request is
+        // consumed, so engines_count_for_test() reflects real spawns.
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
         let app = tauri::test::mock_app().handle().clone();
@@ -7878,6 +7893,77 @@ mod create_community_inner_tests {
             ..NodeState::default()
         });
 
+        // Consumer task: mirrors the production lib.rs:1552+ registry hook.
+        // Drains delta_rx; for each ChannelCreate delta, derives the
+        // channel key from the community engine's membership_key and calls
+        // channel_log_registry.spawn — during an open transaction this
+        // call enqueues a DeferredSpawn; commit() drains and fires
+        // spawn_inner_now.
+        //
+        // The engine's state_at_hlc and identity_resolver are obtained
+        // via community_registry.engine_arc() — same path as production.
+        // The task exits cleanly when every delta_tx clone drops (i.e.,
+        // when community_registry is shut down or dropped at test end).
+        let _consumer_drainer = {
+            let registry_for_hook = std::sync::Arc::clone(&channel_log_registry);
+            let community_registry_for_hook = std::sync::Arc::clone(&community_registry);
+            let hlc_tracker_for_hook = std::sync::Arc::clone(&hlc_tracker);
+            tokio::spawn(run_community_delta_consumer(
+                delta_rx,
+                // membership-changed callback — no-op in test (no Tauri
+                // event emission needed).
+                |_payload| async {},
+                // channel-config-updated callback — no-op in test.
+                |_payload| async {},
+                // channel-log registry hook — mirrors lib.rs:1552+.
+                move |payload: ChannelConfigChangedPayload| {
+                    let registry = std::sync::Arc::clone(&registry_for_hook);
+                    let community_registry = std::sync::Arc::clone(&community_registry_for_hook);
+                    let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                    async move {
+                        if payload.action != ChannelConfigChangeAction::Created {
+                            return;
+                        }
+                        let cid_bytes: [u8; 16] = match hex::decode(&payload.community_id)
+                            .ok()
+                            .and_then(|v| v.try_into().ok())
+                        {
+                            Some(b) => b,
+                            None => return,
+                        };
+                        let chid_bytes: [u8; 16] = match hex::decode(&payload.channel_id)
+                            .ok()
+                            .and_then(|v| v.try_into().ok())
+                        {
+                            Some(b) => b,
+                            None => return,
+                        };
+                        let cid = crate::owner_state_types::SpaceId(cid_bytes);
+                        let chid = crate::community_membership::ChannelId(chid_bytes);
+
+                        let community_engine = match community_registry.engine_arc(&cid).await {
+                            Some(e) => e,
+                            None => return,
+                        };
+                        let membership_key = community_engine.membership_key();
+                        let key = crate::community_channel_log::derive_channel_key(
+                            &membership_key,
+                            &cid,
+                            &chid,
+                        );
+                        let state_at_hlc = community_engine.state_at_hlc_resolver();
+                        let resolver = match community_engine.identity_resolver() {
+                            Some(r) => r,
+                            None => return,
+                        };
+                        let _ = registry
+                            .spawn(cid, chid, key, state_at_hlc, resolver, hlc_tracker)
+                            .await;
+                    }
+                },
+            ))
+        };
+
         CreateCommunityTestFixture {
             crdt_state,
             hlc_tracker,
@@ -7890,6 +7976,7 @@ mod create_community_inner_tests {
             node_state,
             _community_adapter_rx,
             _channel_log_adapter_rx,
+            _consumer_drainer,
             _tmp: tmp,
         }
     }
@@ -7897,21 +7984,21 @@ mod create_community_inner_tests {
     // ── ZEB-271: channel-log transaction coverage ─────────────────────────────
     //
     // These tests verify that `create_community_inner` opens a
-    // `CommunityTransactionGuard` and that the guard is committed on
-    // success or dropped (triggering safety-net abort) on every failure
-    // path. The `channel_log_registry` is constructed with `delta_tx:
-    // None` in the community registry, so no ChannelCreate events are
-    // delivered to `channel_log_registry.spawn` during the test — the
-    // deferred queue is empty on commit. The assertions focus on the
-    // absence of leaked phantom engines and the absence of a pending
-    // transaction entry. See spec §7.2.
+    // `CommunityTransactionGuard`, that the deferred-spawn queue actually
+    // receives the #general ChannelCreate via the wired delta consumer,
+    // and that the guard is committed (draining the queue → spawning the
+    // engine) on success or dropped (triggering safety-net abort, discarding
+    // the queue) on every failure path. See spec §7.2.
 
-    /// Happy path: `create_community_inner` returns Ok, the transaction
-    /// is committed (no pending entry), and no phantom engines are in the
-    /// registry (delta_tx: None means no ChannelCreate events were
-    /// delivered — committed an empty queue is the correct outcome).
+    /// Happy path (spec §7.2): `create_community_inner` returns Ok.
+    ///
+    /// The wired delta consumer delivers the #general ChannelCreate to
+    /// `channel_log_registry.spawn` while the transaction is open, which
+    /// enqueues a DeferredSpawn. `commit()` drains the queue and calls
+    /// `spawn_inner_now`, inserting the engine into the registry. After
+    /// commit: no pending transaction entry, and `engines_count == 1`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn happy_path_commits_channel_log_transaction() {
+    async fn happy_path_spawns_default_channel_engine() {
         let fixture = build_create_community_test_fixture().await;
         let snapshot_gen = fixture.snapshot_generation();
 
@@ -7949,63 +8036,61 @@ mod create_community_inner_tests {
             "happy path: channel_log transaction must be committed (no pending entry)"
         );
 
-        // delta_tx: None → no engines spawned through the registry; empty
-        // commit is correct, no phantom engines.
-        let leaked = fixture.channel_log_registry.engines_count_for_test().await;
+        // Allow the consumer task time to process the ChannelCreate delta
+        // and call channel_log_registry.spawn. If the delta was processed
+        // before commit(), the spawn was deferred and commit() drained it
+        // synchronously. If the consumer runs after commit() (fast path),
+        // spawn_inner_now fires immediately. Either way, a short sleep
+        // ensures the consumer has had a scheduling window.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The #general ChannelCreate delta → deferred spawn → commit()
+        // drain → spawn_inner_now: exactly one engine in the registry.
+        let engine_count = fixture.channel_log_registry.engines_count_for_test().await;
         assert_eq!(
-            leaked, 0,
-            "happy path with delta_tx:None must leave zero engines in the registry"
+            engine_count, 1,
+            "happy path: commit() must spawn the #general channel-log engine \
+             (engines_count must be 1 after deferred-spawn drain)"
         );
     }
 
-    /// Failure path — `apply_space` rejected: the guard is dropped
-    /// (safety-net abort); no phantom channel-log engines must leak.
+    /// Failure path — fence abort after default-channel insert: the guard
+    /// is dropped (safety-net abort) and no phantom engines leak.
+    ///
+    /// # apply_space rejection — DEVIATION NOTE (spec §7.2)
+    ///
+    /// Spec §7.2 requests a test that forces `apply_space_with_canonicalization`
+    /// to reject, proving the guard's safety-net abort cleans up after that
+    /// specific failure point. The apply_space rejection path is not exercised
+    /// here because it cannot be triggered without controlling the SpaceId that
+    /// `create_community_inner` will mint — the ID is randomly generated inside
+    /// the function (rand::thread_rng().fill_bytes), so the test cannot
+    /// pre-insert a conflicting Space row for the same SpaceId.
+    ///
+    /// What would be needed to implement this properly:
+    /// 1. A `mint_community_creation` overload that accepts a caller-supplied
+    ///    SpaceId (or a seed for the RNG) so the test can predict the id.
+    /// 2. Pre-apply that SpaceId to `crdt_state` with a different
+    ///    `membership_key` or `admin_addr`. `apply_space_with_canonicalization`
+    ///    then rejects the second application with `InvariantFail` (same-SpaceId
+    ///    community creation-pinned fields are immutable — see owner_state_crdt.rs
+    ///    lines ~173–203).
+    /// 3. Call `create_community_inner` with the same SpaceId so the rejection
+    ///    actually fires.
+    ///
+    /// In the meantime this test exercises a guard abort that fires AFTER the
+    /// default-channel ChannelCreate is inserted into the engine (the fence check
+    /// fires after `insert_local_event` but before `apply_space`) — same
+    /// safety-net drop code path as the apply_space rejection branch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn apply_space_rejected_no_channel_log_leak() {
+    async fn fence_abort_after_default_channel_insert_no_channel_log_leak() {
         let fixture = build_create_community_test_fixture().await;
         let snapshot_gen = fixture.snapshot_generation();
 
-        // Pre-poison the crdt_state with the same SpaceId that
-        // `create_community_inner` will try to apply. We don't know the
-        // id in advance (it's random), so we call once to get it, then
-        // manually insert its Space into the crdt so the second call
-        // (the real test call) hits the Rejected branch.
-        //
-        // Simpler alternative: apply_space_with_canonicalization only
-        // rejects on exact duplicate — instead we call inner twice so
-        // the second minted community id is guaranteed different. That
-        // doesn't test the rejection path. The proper injection is to
-        // pre-insert the minted space into crdt_state so the second
-        // call sees it.
-        //
-        // The simplest injection is to call create_community_inner once
-        // successfully, then call it again. The second call mints a
-        // NEW community id, which will NOT collide. To force a rejection
-        // we instead call apply_space_with_canonicalization ourselves
-        // with a hand-crafted Space whose id we know.
-        //
-        // Implementation: we borrow the mint helper to get a pre-built
-        // space, insert it into crdt_state, then pass the same space-id's
-        // community_id into a create_community_inner that re-mints a
-        // fresh random id — those IDs are random, so a collision is
-        // astronomically unlikely. This doesn't test the rejection branch.
-        //
-        // The practical approach: mock apply_space so it rejects. Since we
-        // can't mock at this level, we instead verify that dropping the
-        // guard (safety-net abort) happens correctly by doing a fence
-        // failure after the default-channel insert but before apply_space.
-        //
-        // See the fence test below. For apply_space rejection specifically,
-        // we accept that the unit-test can't easily forge a CRDT collision,
-        // so we just verify the no-engine-leak invariant holds after an
-        // unrelated fence abort (same code path — the guard is dropped
-        // in both cases). The failure-injection property (engine count == 0
-        // after any non-Ok return) is what matters.
-        //
-        // Inject: bump generation AFTER the snapshot so the fence fires.
-        // That causes create_community_inner to return Err after the
-        // default-channel ChannelCreate insert, but BEFORE apply_space.
-        // Guard drop → safety-net abort.
+        // Bump the generation so the fence check fires. The fence check
+        // runs AFTER the default-channel ChannelCreate insert_local_event,
+        // so the deferred-spawn queue has one entry at abort time.
+        // Guard drop → safety-net abort → queue discarded → engines_count == 0.
         fixture.bump_node_state_generation();
 
         let result = create_community_inner(
