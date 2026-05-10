@@ -4,7 +4,7 @@
 
 **Goal:** Add a `CommunityTransactionGuard` primitive to `ChannelLogRegistry` that defers per-channel spawns until a durable-commit signal, eliminating the phantom-engine leak when `create_community_inner` or `redeem_invite_inner` aborts after inserting `ChannelCreate` events.
 
-**Architecture:** `ChannelLogRegistry` gains a `pending_transactions: Mutex<HashMap<SpaceId, PendingTransaction>>` map and a `next_tx_id: AtomicU64` counter. `begin_transaction(community_id)` returns a `CommunityTransactionGuard` whose `commit().await` drains the queue (firing real spawns) and whose `abort().await` (or `Drop` safety net) discards the queue. `ChannelLogRegistry::spawn` checks the map: if a transaction is open, it appends a `DeferredSpawn` and returns `SpawnOutcome::DeferredForCommit`; otherwise the existing fast-path runs and returns `SpawnOutcome::Spawned(Arc<ChannelLogEngine>)`. `tx_id`-tagged guards close the stale-abort-clobbers-fresh-tx race for `redeem_invite_inner` retries.
+**Architecture:** `ChannelLogRegistry` gains a `pending_transactions: Mutex<HashMap<SpaceId, PendingTransaction>>` map and a `next_tx_id: AtomicU64` counter. `begin_transaction(community_id)` returns a `CommunityTransactionGuard` whose `commit().await` drains the queue (firing real spawns) and whose `abort()` (sync — or `Drop` safety net) discards the queue. `ChannelLogRegistry::spawn` checks the map: if a transaction is open, it appends a `DeferredSpawn` and returns `SpawnOutcome::DeferredForCommit`; otherwise the existing fast-path runs and returns `SpawnOutcome::Spawned(Arc<ChannelLogEngine>)`. `tx_id`-tagged guards close the stale-abort-clobbers-fresh-tx race for `redeem_invite_inner` retries.
 
 **Tech Stack:** Rust 2021, `tokio` (already in use), `std::sync::Mutex` for the sync map, `tracing` for diagnostics, `tauri::test::MockRuntime` for tests.
 
@@ -127,6 +127,8 @@ git log --oneline -3
 
 **Goal:** Add the transaction protocol to `ChannelLogRegistry` (begin_transaction, commit, abort, Drop safety net, modified spawn). Behavior of all existing spawn callsites is preserved (transaction-less spawn is the existing fast-path). **The migration of existing callers to the new `SpawnOutcome` return type happens in Task 2** — Task 1's job is to ship the API + unit tests.
 
+> **Plan-vs-implementation note (CodeRabbit round 3):** Changing `ChannelLogRegistry::spawn`'s return type to `Result<SpawnOutcome<R>, _>` is technically a breaking change for the existing `lib.rs` and integration-test callsites — Task 1 as scoped here would land a compile-broken tree if pushed in isolation. In the actual implementation, Task 1 and Task 2 were folded into a **single commit** (`d482f49`) so the workspace stays compile-clean at every commit boundary. The plan's task split is preserved here for reading order; treat Task 1 + Task 2 as a single atomic unit when executing.
+
 **Strategy:** TDD — write the 8 unit tests from spec §7.1 first as failing scaffolds (compile errors are fine), then implement just enough to make them pass one bucket at a time.
 
 - [ ] **Step 1: Write all 8 failing tests as scaffolds**
@@ -207,7 +209,7 @@ Add the following test bodies at the end of the existing `tests` mod in `src-tau
             .await
             .expect("spawn");
 
-        tx.abort().await;
+        tx.abort();
 
         assert!(
             fix.registry.engine(&community_id, &channel_id).await.is_none(),
@@ -593,7 +595,7 @@ Add the guard as a sibling type to `ChannelLogRegistry`, in the same file. Reads
 
 ```rust
 /// RAII handle to an open community transaction. Drop without
-/// explicit `commit().await` or `abort().await` triggers the
+/// explicit `commit().await` or `abort()` triggers the
 /// `tokio::spawn` safety-net abort with a `tracing::warn!` (spec §5.2).
 ///
 /// `tx_id` tags the guard so a stale guard's deferred abort is a no-op
@@ -727,7 +729,7 @@ Now add `begin_transaction`, `abort_transaction_internal`, and the test-only acc
     /// Open a community transaction. Subsequent `spawn` calls for this
     /// `community_id` are queued in the transaction's deferred-spawn
     /// list; they fire on `commit().await` and are dropped on
-    /// `abort().await` or guard drop. See spec §3.2.
+    /// `abort()` or guard drop. See spec §3.2.
     ///
     /// If a transaction for `community_id` is already open,
     /// `begin_transaction` overwrites the slot with a `tracing::warn!`
@@ -1778,7 +1780,7 @@ gh pr create --title "ZEB-271: channel-log registry transactionality" --body "$(
 Adds a `CommunityTransactionGuard` primitive to `ChannelLogRegistry` that defers per-channel spawns until a durable-commit signal, eliminating the phantom-engine leak when `create_community_inner` or `redeem_invite_inner` aborts after inserting `ChannelCreate` events.
 
 * `ChannelLogRegistry::spawn` now returns `SpawnOutcome<R>`: either `Spawned(Arc<Engine>)` for the existing fast-path (no transaction open) or `DeferredForCommit` (a transaction is open; spawn is queued).
-* `begin_transaction(community_id) → CommunityTransactionGuard` opens a per-community deferred-spawn queue. `commit().await` drains the queue and fires the real spawns; `abort().await` discards them. `Drop` runs a `tokio::spawn` safety-net abort with a `tracing::warn!`.
+* `begin_transaction(community_id) → CommunityTransactionGuard` opens a per-community deferred-spawn queue. `commit().await` drains the queue and fires the real spawns; `abort()` (sync) discards them. `Drop` runs a safety-net abort via `Handle::try_current()` with a `tracing::warn!` (sync fallback if no runtime).
 * `tx_id`-tagged guards close the stale-abort-clobbers-fresh-tx race for `redeem_invite_inner` retries.
 * `create_community_inner` and `redeem_invite_inner` open transactions before `community_registry.spawn_engine` and commit after `apply_space`. All early-return rollback paths now auto-abort via the dropped guard.
 

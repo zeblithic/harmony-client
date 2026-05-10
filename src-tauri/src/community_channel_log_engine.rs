@@ -1037,7 +1037,7 @@ struct EngineEntry<R: tauri::Runtime> {
 // ── CommunityTransactionGuard ─────────────────────────────────────────────────
 
 /// RAII handle to an open community transaction. Drop without
-/// explicit `commit().await` or `abort().await` triggers the
+/// explicit `commit().await` or `abort()` triggers the
 /// `Handle::try_current()` safety-net abort with a `tracing::warn!`
 /// (spec §5.2). If no runtime is present (e.g., panic-during-drop after
 /// runtime teardown, or a future sync caller of `begin_transaction`),
@@ -1242,7 +1242,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     /// Open a community transaction. Subsequent `spawn` calls for this
     /// `community_id` are queued in the transaction's deferred-spawn
     /// list; they fire on `commit().await` and are dropped on
-    /// `abort().await` or guard drop. See spec §3.2.
+    /// `abort()` or guard drop. See spec §3.2.
     ///
     /// If a transaction for `community_id` is already open,
     /// `begin_transaction` overwrites the slot with a `tracing::warn!`
@@ -1334,8 +1334,14 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     /// **ZEB-271 transaction-aware:** if `community_id` has an open
     /// transaction (see `begin_transaction`), the spawn is queued and
     /// fires on `commit().await`. Returns `DeferredForCommit` in that
-    /// case; the caller (delta consumer or reconcile) treats both
-    /// outcomes as success. See spec §3.3.
+    /// case. The live-callers path (the delta consumer in
+    /// `lib.rs::run_community_delta_consumer`, which runs inside the
+    /// `create_community_inner` / `redeem_invite_inner` transaction
+    /// scope) treats `DeferredForCommit` as success and lets `commit()`
+    /// drain the queue. `reconcile_from_state`, by contrast, runs at
+    /// `start_node` init outside any transaction and treats
+    /// `DeferredForCommit` as a hard `InvariantViolation` error
+    /// (transactions must not span boots). See spec §3.3 + §10.
     ///
     /// On error the engine + adapter are not registered (the partial
     /// `engines` insert is the commit point); the caller may retry.
