@@ -749,6 +749,10 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     pub(crate) fn notify_dirty_for_test(&self) {
         self.flush_dirty.notify_one();
     }
+
+    pub(crate) fn app_handle_for_test(&self) -> &tauri::AppHandle<R> {
+        &self.app
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1015,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_messages_walks_tail_then_segments() {
+        // Spec §14.1: with seal_threshold=4 and 10 events appended,
+        // the engine ends up with 2 sealed segments + 2 events in the
+        // tail. list_messages must walk segments first then tail and
+        // return all 10 in HLC order. Closes a coverage gap — the
+        // existing list_messages tests never populate manifest.segments,
+        // so the segment-walk branch (lines ~358-385) was structurally
+        // executed against an empty list only.
+        let fix = build_engine_fixture(4, 250, 1000).await;
+
+        let mut events = Vec::new();
+        for i in 0..10u64 {
+            let hlc = Hlc {
+                wall_ms: 100 + i,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            };
+            let ev = make_signed_event(
+                fix.community_id,
+                fix.channel_id,
+                fix.self_owner,
+                hlc,
+                &format!("msg-{i}"),
+                &fix.signing_key,
+            );
+            events.push(ev);
+        }
+
+        // Append + seal directly under the log mutex. Manual seal-
+        // every-4 (matching seal_threshold) gives a deterministic
+        // 2-segment + 2-tail layout without racing the flush loop.
+        {
+            let mut log = fix.engine.log_for_test().lock().await;
+            for (i, ev) in events.iter().enumerate() {
+                log.append(ev.clone()).expect("append");
+                if (i + 1) % 4 == 0 {
+                    log.seal_and_persist().expect("seal");
+                }
+            }
+            assert_eq!(
+                log.manifest.segments.len(),
+                2,
+                "expected 2 sealed segments after 8 of 10 appends",
+            );
+            assert_eq!(log.tail.len(), 2, "expected 2 events left in tail");
+        }
+
+        let listed = fix.engine.list_messages(None, 100).await.expect("list");
+        assert_eq!(listed.len(), 10, "all 10 events must be returned");
+
+        // HLC-ascending order across the segment+tail boundary.
+        for (i, ev) in listed.iter().enumerate() {
+            let SignedChannelEvent::Post { at, .. } = ev;
+            assert_eq!(
+                at.wall_ms,
+                100 + i as u64,
+                "event {i} out of HLC order (got wall_ms={})",
+                at.wall_ms,
+            );
+        }
+
+        // First/last bookend checks per spec §14.1.
+        let SignedChannelEvent::Post { at: first_at, .. } = &listed[0];
+        let SignedChannelEvent::Post { at: last_at, .. } = &listed[9];
+        assert_eq!(first_at.wall_ms, 100);
+        assert_eq!(last_at.wall_ms, 109);
+        assert_eq!(extract_id(&listed[0]), extract_id(&events[0]));
+        assert_eq!(extract_id(&listed[9]), extract_id(&events[9]));
+    }
+
+    #[tokio::test]
     async fn list_messages_respects_limit() {
         let fix = build_engine_fixture(8, 250, 1000).await;
 
@@ -1063,6 +1138,78 @@ mod tests {
         // The packet decrypts back to the same event.
         let decrypted = decrypt_channel_packet(&fix.channel_key, &packet).expect("decrypt");
         assert_eq!(extract_id(&decrypted), msg_id);
+    }
+
+    #[tokio::test]
+    async fn publish_emits_channel_message_received_event() {
+        // Spec §14.1 requires "log mutation + Tauri event" for the
+        // publish + receive paths. The other publish test only checks
+        // log mutation; this one closes the gap by installing a real
+        // Tauri listener on the mock runtime and asserting the
+        // channel-message-received payload shape.
+        use std::sync::Mutex as StdMutex;
+        use tauri::Listener;
+
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        fix.engine
+            .app_handle_for_test()
+            .listen("channel-message-received", move |event| {
+                captured_for_listener
+                    .lock()
+                    .expect("captured lock")
+                    .push(event.payload().to_string());
+            });
+
+        let body = b"emit-test-body".to_vec();
+        let msg_id = Arc::clone(&fix.engine)
+            .publish(body.clone(), None)
+            .await
+            .expect("publish");
+
+        let captured_payload = wait_for(
+            || {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let v = captured.lock().expect("captured lock");
+                    v.first().cloned()
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("listener must receive channel-message-received within 1s");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&captured_payload).expect("payload is JSON");
+
+        assert_eq!(
+            payload["communityId"].as_str(),
+            Some(hex::encode(fix.community_id.0).as_str()),
+            "communityId in payload",
+        );
+        assert_eq!(
+            payload["channelId"].as_str(),
+            Some(hex::encode(fix.channel_id.0).as_str()),
+            "channelId in payload",
+        );
+        assert_eq!(
+            payload["message"]["messageId"].as_str(),
+            Some(hex::encode(msg_id.0).as_str()),
+            "message.messageId matches publish() return",
+        );
+
+        // Body is serialized by serde as a JSON array of byte values.
+        let body_arr = payload["message"]["body"]
+            .as_array()
+            .expect("message.body must be a JSON array");
+        let body_bytes: Vec<u8> = body_arr
+            .iter()
+            .map(|v| v.as_u64().expect("byte fits u64") as u8)
+            .collect();
+        assert_eq!(body_bytes, body, "message.body matches input bytes");
     }
 
     #[tokio::test]
