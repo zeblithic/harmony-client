@@ -8363,6 +8363,15 @@ where
     // commit, dropped on rollback. See spec §4.2.
     let channel_log_tx = channel_log_registry.begin_transaction(minted.community_id);
 
+    // ZEB-274: RAII rollback guard for the community-sync spawn + adapter
+    // dispatch. Same pattern as create_community_inner. Internalizes
+    // the freshness flag — the local fresh-creation bool (was at
+    // lib.rs:8530 pre-ZEB-274, ZEB-260 PR #90 round-5) is removed; the
+    // guard tracks it and its Drop only runs cleanup if THIS call's
+    // spawn was the fresh one. Concurrent-redeem race losers' guards
+    // are no-ops on Drop (spec §5.2).
+    let mut community_sync_guard = community_registry.begin_spawn_guard(minted.community_id);
+
     // ZEB-267 (replaces the prior ZEB-258 comment): the HLC tracker
     // is bumped at reservation time (step 4) regardless of whether
     // owner-state apply_space succeeds at step 9. Burn semantics:
@@ -8376,78 +8385,56 @@ where
     // consistency drift — the tracker is a per-device monotone
     // counter, not a constraint on the Space-row map.
 
-    // 6. Spawn engine + dispatch adapter. Both can fail; failure
-    //    rolls back via `shutdown_engine_and_cleanup_persistence`.
-    //    Owner-state is still untouched at this point.
+    // 6. Spawn engine + dispatch adapter atomically via the guard.
+    //    Owner-state is still untouched at this point. ZEB-274: rollback
+    //    on any subsequent early-return is handled by the
+    //    community_sync_guard's Drop — no manual shutdown calls in this
+    //    function.
     //
-    //    spawn_engine takes `payload.admin_addr` (the original
+    //    spawn_engine_with_guard takes `payload.admin_addr` (the original
     //    community admin from the invite), NOT self_owner — the
     //    engine's authority root is the creator's identity. Invite-
     //    only engines spawn with `is_invite_only=true` so verify_event
     //    applies the countersig rule.
     //
-    //    Re-redemption guard: ZEB-260 PR #90 round-5 (CodeRabbit) —
-    //    we use the atomic `bool` returned by `spawn_engine` (true =
-    //    this call freshly created the engine) rather than a separate
-    //    pre-`spawn_engine` `engine_arc().is_some()` check. The pre-
-    //    check was racy: two concurrent `redeem_invite_inner` calls
-    //    for the same community could both observe `false`, then both
-    //    proceed past spawn_engine into a "fresh engine" path; if the
-    //    loser hit a rollback site it would tear down the engine the
-    //    winner created. Sourcing the flag directly from spawn_engine
-    //    closes that hole — the bool is set under the engines-map
-    //    lock, atomically with the contains_key check + insert.
-    //    spawn_engine is idempotent; on a pre-existing engine, the
-    //    freshly-built channels we passed in are dropped (the engine
-    //    already owns its live adapter pair).
+    //    Re-redemption guard: ZEB-260 PR #90 round-5 (CodeRabbit) — the
+    //    freshness flag (true = this call freshly created the engine) is
+    //    now captured INSIDE the guard by spawn_engine_with_guard rather
+    //    than being a local bool. ZEB-274 collapses the prior 17 manual
+    //    fresh-only rollback sites into the guard's Drop. The race-safety
+    //    is preserved: only the call whose spawn freshly created the
+    //    engine carries the rollback obligation. Concurrent-redeem race
+    //    losers see freshly_created = false and their guard Drop is a
+    //    no-op (spec §5.2). spawn_engine is idempotent; on a pre-existing
+    //    engine the freshly-built channels we passed in are dropped
+    //    inside spawn_engine_with_guard (the engine already owns its
+    //    live adapter pair).
     let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    let engine_freshly_created = community_registry
-        .spawn_engine_inner_now(
+    // ZEB-274: spawn engine + dispatch adapter atomically via the guard.
+    // Internalizes the freshness flag — no separate freshness local (the
+    // guard tracks it). Concurrent-redeem race losers see a
+    // pre-existing engine; their pub_rx/sub_tx/community_adapter_tx args
+    // are dropped inside spawn_engine_with_guard's idempotent path and
+    // their guard's freshly_created stays false → Drop is a no-op (spec
+    // §5.2). Adapter try_send failure also tears down inline and leaves
+    // the guard's freshly_created false (spec §5.3).
+    let engine_arc = community_registry
+        .spawn_engine_with_guard(
+            &mut community_sync_guard,
             minted.community_id,
             minted.membership_key.clone(),
             payload.admin_addr,
             payload.is_invite_only,
             pub_tx,
             sub_rx,
+            pub_rx,
+            sub_tx,
+            community_adapter_tx,
         )
         .await
-        .map_err(|e| format!("registry.spawn_engine: {e}"))?;
-
-    if engine_freshly_created {
-        if let Err(e) = community_adapter_tx.try_send(crate::event_loop::CommunityAdapterRequest {
-            id_hex: hex::encode(minted.community_id.0),
-            publisher_rx: pub_rx,
-            subscriber_tx: sub_tx,
-        }) {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown_engine_and_cleanup_persistence failed during redeem_invite \
-                     adapter-dispatch rollback"
-                );
-            }
-            return Err(match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    "adapter request queue full; please retry".to_string()
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    "adapter request channel closed (event_loop stopped?)".to_string()
-                }
-            });
-        }
-    } else {
-        // Idempotent re-redemption: pre-existing engine already owns
-        // its live adapter pair from the original spawn. Drop the
-        // freshly-built halves we no longer need.
-        drop(pub_rx);
-        drop(sub_tx);
-    }
+        .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
     // 7. Branch on payload.is_invite_only.
     if !payload.is_invite_only {
@@ -8455,95 +8442,30 @@ where
         // `insert_local_event` runs verify_event (which authorizes the
         // open Join via signature alone) and fires `notify_dirty` on
         // success.
-        // ZEB-260 PR #90 round-4 (CodeRabbit): a `?` early-return here
-        // would leave the freshly-spawned engine + persistence dir
-        // behind. Wrap in a match so the engine-vanished path tears
-        // down via shutdown_engine_and_cleanup_persistence before
-        // returning. Guard with engine_freshly_created so a
-        // re-redemption retry doesn't tear down the prior engine.
-        let engine_arc = match community_registry.engine_arc(&minted.community_id).await {
-            Some(e) => e,
-            None => {
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite OPEN-branch engine-vanished rollback"
-                        );
-                    }
-                }
-                return Err("engine vanished immediately after spawn — registry race".to_string());
-            }
-        };
-        // CodeRabbit P0 (PR #89): a `?` early-return inside the match
-        // below would leave the spawned engine + persistence dir
-        // behind. Wrap the Result and tear down on Err before returning.
-        let outcome = match engine_arc
+        //
+        // ZEB-274: engine_arc() lookup removed — spawn_engine_with_guard
+        // above returned the engine handle directly. All rollback sites
+        // collapse into community_sync_guard's Drop on early-return.
+        let outcome = engine_arc
             .insert_local_event(minted.bootstrap_join.clone())
             .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite OPEN-branch insert-err rollback"
-                        );
-                    }
-                }
-                return Err(format!("engine.insert_local_event: {e}"));
-            }
-        };
+            .map_err(|e| format!("engine.insert_local_event: {e}"))?;
         if !matches!(
             outcome,
             crate::community_state_crdt::InsertOutcome::Inserted
         ) {
-            // Bootstrap Join didn't insert — tear down so we don't
-            // leak a zombie engine.
-            if engine_freshly_created {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite OPEN-branch insert-rejected rollback"
-                    );
-                }
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!("self Join not inserted (got {outcome:?})"));
         }
     } else {
         // INVITE-ONLY: 7a-d.
-        // The engine + persistence dir were spawned at step 6; a `?`
-        // early-return on a missing invite_token would leak both
-        // (Greptile P1: zombie engine on malformed URL). Tear down
-        // explicitly before returning.
+        // ZEB-274: the engine + persistence dir were spawned via the
+        // guard above; all rollback sites in this branch collapse into
+        // community_sync_guard's Drop on early-return.
         let invite_token = match payload.invite_token.as_ref() {
             Some(t) => t.clone(),
             None => {
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite missing-invite-token rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err("invite-only payload missing invite_token".to_string());
             }
         };
@@ -8557,63 +8479,19 @@ where
         // strictly later than the unicast arrives at admin, so the
         // bootstrap insert here cannot be raced.
         let (admin_bootstrap, admin_identity_pub) =
-            match crate::community_invite::verify_admin_bootstrap(&payload) {
-                Ok(pair) => pair,
-                Err(verify_err) => {
-                    // Engine + persistence dir were spawned at step 6;
-                    // tear down before returning so we don't leak.
-                    // Guard: if the engine pre-existed (re-redemption
-                    // retry), tearing it down would destroy state from
-                    // the prior successful path. ZEB-260 PR #90.
-                    if engine_freshly_created {
-                        if let Err(stop_err) = community_registry
-                            .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %stop_err,
-                                community_id = %hex::encode(minted.community_id.0),
-                                reason_tag = verify_err.reason_tag(),
-                                "shutdown failed during redeem_invite admin-bootstrap-verify rollback"
-                            );
-                        }
-                    }
-                    return Err(verify_err.to_string());
-                }
-            };
+            crate::community_invite::verify_admin_bootstrap(&payload)
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                .map_err(|verify_err| verify_err.to_string())?;
         // Idempotent on retry: insert_local_event_with_pubs dedups on
         // event-id. The clone is cheap (SignedMembershipEvent is a few
         // hundred bytes) and required because the engine consumes by
         // value.
         let admin_bootstrap_owned = admin_bootstrap.clone();
         let admin_identity_pub_owned = *admin_identity_pub;
-        let bootstrap_engine = match community_registry.engine_arc(&minted.community_id).await {
-            Some(e) => e,
-            None => {
-                // Engine vanished between spawn and lookup — registry
-                // race. Treated as a transient failure; tear down and
-                // surface a deterministic error.
-                // Guard: if the engine pre-existed (re-redemption
-                // retry), tearing it down would destroy state from
-                // the prior successful path. ZEB-260 PR #90.
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite engine-vanished rollback"
-                        );
-                    }
-                }
-                return Err(
-                    "engine vanished immediately after spawn — registry race (invite-only branch)"
-                        .to_string(),
-                );
-            }
-        };
+        // ZEB-274: engine_arc() lookup removed — spawn_engine_with_guard
+        // returned the engine handle directly. The engine-vanished
+        // rollback is no longer reachable here.
+        //
         // ZEB-260 PR #90 round-3 (CodeRabbit): explicitly match on the
         // InsertOutcome variant. Treating Ok(_) as success would silently
         // proceed past Ok(InsertOutcome::Rejected(verify_err)), which
@@ -8623,47 +8501,19 @@ where
         // re-runs verify under its VerifyContext) would land us in the
         // unicast-send-and-wait path with no admin-state in the engine,
         // causing a publish-back rejection downstream. Surface
-        // explicitly and tear down on Rejected just like on Err.
-        match bootstrap_engine
+        // explicitly on Rejected just like on Err.
+        match engine_arc
             .insert_local_event_with_pubs(admin_bootstrap_owned, admin_identity_pub_owned, None)
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
             | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
             Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite admin-bootstrap-insert-rejected rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err(format!("engine rejected admin bootstrap: {verify_err}"));
             }
             Err(insert_err) => {
-                // Bootstrap insert errored — should be effectively
-                // unreachable given the verify chain just passed, but
-                // surface deterministically and tear down.
-                // Guard: if the engine pre-existed (re-redemption retry),
-                // tearing it down would destroy state from the prior
-                // successful path. ZEB-260 PR #90.
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite admin-bootstrap-insert rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err(format!(
                     "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"
                 ));
@@ -8719,18 +8569,7 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite build-packet rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err(format!("build_signed_invite_packet: {e}"));
             }
         };
@@ -8740,18 +8579,7 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite encode-packet rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err(format!("encode_packet: {e}"));
             }
         };
@@ -8760,22 +8588,11 @@ where
         let inviter_addr = payload.admin_addr;
         let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
         if destinations.is_empty() {
-            // No known device for inviter → drop oneshot + tear down.
+            // No known device for inviter → drop oneshot.
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if engine_freshly_created {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite inviter-unknown rollback"
-                    );
-                }
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!(
                 "no known device for inviter {} — invite cannot route",
                 hex::encode(inviter_addr.0)
@@ -8814,18 +8631,7 @@ where
             let _ = community_registry
                 .take_pending_redemption(&minted.bootstrap_join.id)
                 .await;
-            if engine_freshly_created {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite unicast-send rollback"
-                    );
-                }
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             return Err(format!(
                 "unicast_send_tx try_send failed for all {} destination(s){}",
                 destinations.len(),
@@ -8850,18 +8656,7 @@ where
                 // Sender dropped without sending — should be
                 // unreachable with the current pending_redemptions
                 // shape, but treat defensively as a failure.
-                if engine_freshly_created {
-                    if let Err(stop_err) = community_registry
-                        .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %stop_err,
-                            community_id = %hex::encode(minted.community_id.0),
-                            "shutdown failed during redeem_invite oneshot-recv-err rollback"
-                        );
-                    }
-                }
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 return Err("invite-only redemption oneshot closed unexpectedly".into());
             }
             Err(_elapsed) => {
@@ -8899,18 +8694,7 @@ where
                     .await
                 {
                     Some(_tx) => {
-                        if engine_freshly_created {
-                            if let Err(stop_err) = community_registry
-                                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                                .await
-                            {
-                                tracing::warn!(
-                                    error = %stop_err,
-                                    community_id = %hex::encode(minted.community_id.0),
-                                    "shutdown failed during redeem_invite timeout rollback"
-                                );
-                            }
-                        }
+                        // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                         return Err(format!(
                             "invite-only redemption timed out after {timeout_ms}ms"
                         ));
@@ -8936,21 +8720,8 @@ where
     //    pass `|| Ok(())`. If the node was stopped (or stop+restart
     //    raced our await chain), this returns Err with crdt_state
     //    still untouched.
-    if let Err(fence_err) = fence_check() {
-        if engine_freshly_created {
-            if let Err(stop_err) = community_registry
-                .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                .await
-            {
-                tracing::warn!(
-                    error = %stop_err,
-                    community_id = %hex::encode(minted.community_id.0),
-                    "shutdown failed during redeem_invite fence-check rollback"
-                );
-            }
-        }
-        return Err(fence_err);
-    }
+    // ZEB-274: rollback on Err collapses into community_sync_guard Drop.
+    fence_check()?;
 
     // 9. COMMIT owner-state Space as the LAST persistent step
     //    (ZEB-258 reorder). Pre-ZEB-267 this block also held the
@@ -8962,21 +8733,10 @@ where
         let mut state_g = crdt_state.lock().await;
         let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
-            // Drop the state_g guard FIRST so the registry call's
-            // .await isn't holding any state lock.
-            drop(state_g);
-            if engine_freshly_created {
-                if let Err(stop_err) = community_registry
-                    .shutdown_engine_and_cleanup_persistence(&minted.community_id)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %stop_err,
-                        community_id = %hex::encode(minted.community_id.0),
-                        "shutdown failed during redeem_invite apply-rejected rollback"
-                    );
-                }
-            }
+            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+            // state_g drops at this block's scope end (before the function-
+            // exit guard Drop, which spawns its async cleanup via
+            // Handle::try_current — no lock held across the spawn).
             return Err(format!(
                 "apply_space rejected redemption Space: {outcome:?}"
             ));
@@ -8985,6 +8745,11 @@ where
         // reservation at step 4 already bumped the tracker atomically.
         // state_g drops at scope end.
     }
+
+    // ZEB-274: release the community-sync rollback obligation. apply_space
+    // succeeded — the redemption is durable. Sync (no .await needed). Per
+    // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
+    community_sync_guard.commit();
 
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the redemption Space is committed. If commit()
