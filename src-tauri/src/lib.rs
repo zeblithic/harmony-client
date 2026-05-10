@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub mod community_channel_log;
+pub mod community_channel_log_engine;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_state_crdt;
