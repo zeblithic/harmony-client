@@ -2414,3 +2414,365 @@ pub fn spawn_community_state_zenoh_adapter(
         let _ = sub_handle.await;
     })
 }
+
+/// Per-(community, channel) Zenoh adapter for the ChannelLog data
+/// plane (ZEB-270 / ZEB-248 Phase 3). Mirrors
+/// `spawn_community_state_zenoh_adapter` in shape: spawns four
+/// tokio tasks (publisher, subscriber, queryable, query-request
+/// driver), all bound to the per-channel topics.
+///
+/// Topics:
+/// - `harmony/channels/{cid_hex}/{ch_id_hex}/events` — live broadcast
+/// - `harmony/channels/{cid_hex}/{ch_id_hex}/since/{hlc_hex}/{limit}` — queryable
+///
+/// The `read_for_query` callback is what the queryable handler uses
+/// to fetch events for a backfill request — passed in to avoid
+/// the engine ↔ adapter circular dep (per spec §8.1).
+#[allow(clippy::too_many_arguments)] // Signature locked by spec §8 + plan Task 3.
+pub fn spawn_channel_log_zenoh_adapter<F>(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    channel_id_hex: String,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut query_request_rx: tokio::sync::mpsc::Receiver<
+        crate::community_channel_log_engine::BackfillQueryRequest,
+    >,
+    read_for_query: Arc<F>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(
+            Option<crate::owner_state_types::Hlc>,
+            usize,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    let events_topic = format!(
+        "harmony/channels/{}/{}/events",
+        community_id_hex, channel_id_hex
+    );
+    let queryable_prefix = format!(
+        "harmony/channels/{}/{}/since/**",
+        community_id_hex, channel_id_hex
+    );
+
+    tokio::spawn(async move {
+        let events_key = match zenoh::key_expr::KeyExpr::try_from(events_topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %events_topic,
+                    "channel-log events key_expr invalid; adapter skipped"
+                );
+                return;
+            }
+        };
+        let queryable_key = match zenoh::key_expr::KeyExpr::try_from(queryable_prefix.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %queryable_prefix,
+                    "channel-log queryable key_expr invalid; adapter skipped"
+                );
+                return;
+            }
+        };
+
+        // ── Publisher task ─────────────────────────────────────────
+        let session_pub = Arc::clone(&session);
+        let key_pub = events_key.clone();
+        let topic_pub = events_topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let pub_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = publisher_rx.recv() => {
+                        let Some(bytes) = maybe else { break; };
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    topic = %topic_pub,
+                                    error = %e,
+                                    "channel-log publish failed"
+                                );
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Subscriber task ────────────────────────────────────────
+        let session_sub = Arc::clone(&session);
+        let key_sub = events_key.clone();
+        let topic_sub = events_topic.clone();
+        let subscriber_tx_sub = subscriber_tx.clone();
+        let closing_sub = Arc::clone(&closing);
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare channel-log subscriber"
+                        );
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx_sub.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "channel-log subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = subscriber_tx_sub.closed() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Queryable task ─────────────────────────────────────────
+        let session_qbl = Arc::clone(&session);
+        let key_qbl = queryable_key.clone();
+        let prefix_qbl = queryable_prefix.clone();
+        let read_for_query_qbl = Arc::clone(&read_for_query);
+        let closing_qbl = Arc::clone(&closing);
+        let qbl_handle = tokio::spawn(async move {
+            let qbl = match session_qbl.declare_queryable(&key_qbl).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_qbl.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            prefix = %prefix_qbl,
+                            error = %e,
+                            "failed to declare channel-log queryable"
+                        );
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        let qkey = query.key_expr().to_string();
+                        let (since, limit) = parse_channel_backfill_key(&qkey);
+                        let packets = (read_for_query_qbl)(since, limit).await;
+                        for packet in packets {
+                            if let Err(e) = query
+                                .reply(query.key_expr(), packet)
+                                .await
+                            {
+                                tracing::warn!(
+                                    prefix = %prefix_qbl,
+                                    error = %e,
+                                    "channel-log queryable reply failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qbl.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Query-request driver ───────────────────────────────────
+        let session_qr = Arc::clone(&session);
+        let community_id_hex_qr = community_id_hex.clone();
+        let channel_id_hex_qr = channel_id_hex.clone();
+        let subscriber_tx_qr = subscriber_tx.clone();
+        let closing_qr = Arc::clone(&closing);
+        let qr_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = query_request_rx.recv() => {
+                        let Some(req) = maybe else { break; };
+                        let limit = if req.limit == 0 { 256 } else { req.limit };
+                        let since_hex = match &req.since {
+                            Some(h) => format_hlc_hex(h),
+                            None => "0".to_string(),
+                        };
+                        let key = format!(
+                            "harmony/channels/{}/{}/since/{}/{}",
+                            community_id_hex_qr, channel_id_hex_qr, since_hex, limit
+                        );
+                        let receiver = match session_qr.get(&key).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if !closing_qr.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        %key,
+                                        error = %e,
+                                        "channel-log backfill query failed"
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        while let Ok(reply) = receiver.recv_async().await {
+                            if let Ok(sample) = reply.into_result() {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx_qr.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qr.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
+        let _ = qbl_handle.await;
+        let _ = qr_handle.await;
+    })
+}
+
+/// Parse `"harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}"`
+/// into `(since, limit)`. Returns `(None, 0)` if parsing fails or
+/// if `hlc_hex == "0"`.
+fn parse_channel_backfill_key(key: &str) -> (Option<crate::owner_state_types::Hlc>, usize) {
+    // Pattern is: harmony / channels / {cid} / {ch_id} / since / {hlc_hex} / {limit}
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() < 7 || parts[5] != "since" {
+        return (None, 0);
+    }
+    let hlc_hex = parts[6];
+    let limit_str = parts.get(7).copied().unwrap_or("0");
+
+    let since = if hlc_hex == "0" {
+        None
+    } else {
+        parse_hlc_hex(hlc_hex)
+    };
+    let limit = limit_str.parse::<usize>().unwrap_or(0);
+    (since, limit)
+}
+
+fn parse_hlc_hex(hex_str: &str) -> Option<crate::owner_state_types::Hlc> {
+    // wall_ms LE u64 (16 hex) || logical LE u32 (8 hex) || device_id_bytes (rest)
+    if hex_str.len() < 24 {
+        return None;
+    }
+    let wall_ms_bytes = hex::decode(&hex_str[0..16]).ok()?;
+    let logical_bytes = hex::decode(&hex_str[16..24]).ok()?;
+    let device_id_bytes = hex::decode(&hex_str[24..]).ok()?;
+    let wall_ms = u64::from_le_bytes(wall_ms_bytes.try_into().ok()?);
+    let logical = u32::from_le_bytes(logical_bytes.try_into().ok()?);
+    let device_id = String::from_utf8(device_id_bytes).ok()?;
+    Some(crate::owner_state_types::Hlc {
+        wall_ms,
+        logical,
+        device_id,
+    })
+}
+
+fn format_hlc_hex(hlc: &crate::owner_state_types::Hlc) -> String {
+    let mut out = String::new();
+    out.push_str(&hex::encode(hlc.wall_ms.to_le_bytes()));
+    out.push_str(&hex::encode(hlc.logical.to_le_bytes()));
+    out.push_str(&hex::encode(hlc.device_id.as_bytes()));
+    out
+}
+
+#[cfg(test)]
+mod channel_log_adapter_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Spawns the adapter, sends one packet via publisher, asserts
+    /// the subscriber side receives it. Uses an in-memory Zenoh
+    /// router so no real network is touched.
+    ///
+    /// Requires `multi_thread` flavor — Zenoh's runtime panics under
+    /// the default current-thread scheduler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_log_adapter_publish_subscribe_round_trip() {
+        let cfg = zenoh::Config::default();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (qreq_tx, qreq_rx) =
+            mpsc::channel::<crate::community_channel_log_engine::BackfillQueryRequest>(2);
+
+        let read_for_query = Arc::new(
+            |_since: Option<crate::owner_state_types::Hlc>, _limit: usize| {
+                Box::pin(async move { Vec::<Vec<u8>>::new() })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            },
+        );
+
+        let closing = Arc::new(AtomicBool::new(false));
+        let _adapter = spawn_channel_log_zenoh_adapter(
+            Arc::clone(&session),
+            "aabb".repeat(8),
+            "ccdd".repeat(8),
+            pub_rx,
+            sub_tx,
+            qreq_rx,
+            read_for_query,
+            Arc::clone(&closing),
+        );
+
+        // Give the subscriber time to come up (Zenoh declare is async).
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let payload = b"channel-log-roundtrip".to_vec();
+        pub_tx.send(payload.clone()).await.expect("publish send");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("sub_rx open");
+        assert_eq!(received, payload);
+
+        closing.store(true, Ordering::SeqCst);
+        // Keep qreq_tx alive until end so the query-request driver
+        // doesn't latch the receiver-closed branch before closing
+        // is observed.
+        drop(qreq_tx);
+    }
+}

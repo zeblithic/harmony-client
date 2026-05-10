@@ -224,7 +224,6 @@ pub struct ChannelLogEngine<R: tauri::Runtime> {
     config: ChannelLogEngineConfig,
 
     publisher_tx: mpsc::Sender<Vec<u8>>,
-    #[allow(dead_code)] // Task 3 wires request_backfill through this.
     query_request_tx: mpsc::Sender<BackfillQueryRequest>,
 
     receive_handle: Mutex<Option<JoinHandle<()>>>,
@@ -536,6 +535,20 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         let log = self.log.lock().await;
         log.flush_tail().map_err(ChannelLogEngineError::Persist)?;
         Ok(())
+    }
+
+    /// Fire a Zenoh queryable request via the adapter. Reply packets
+    /// stream back through the same subscriber path (per spec §8.1
+    /// — backfill replies are wire-identical to live broadcasts), so
+    /// this method is fire-and-forget.
+    pub async fn request_backfill(
+        self: Arc<Self>,
+        since: Option<Hlc>,
+    ) -> Result<(), ChannelLogEngineError> {
+        self.query_request_tx
+            .send(BackfillQueryRequest { since, limit: 0 })
+            .await
+            .map_err(|e| ChannelLogEngineError::BackfillFailed(e.to_string()))
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -859,7 +872,6 @@ mod tests {
         engine: Arc<ChannelLogEngine<tauri::test::MockRuntime>>,
         publisher_rx: mpsc::Receiver<Vec<u8>>,
         subscriber_tx: mpsc::Sender<Vec<u8>>,
-        #[allow(dead_code)] // Task 3 will drive backfill requests through here.
         query_request_rx: mpsc::Receiver<BackfillQueryRequest>,
         self_owner: OwnerAddr,
         signing_key: Arc<SigningKey>,
@@ -1504,5 +1516,45 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "shutdown took {elapsed:?}, expected < 200ms"
         );
+    }
+
+    #[tokio::test]
+    async fn request_backfill_queues_query_request() {
+        let mut fix = build_engine_fixture(8, 250, 1000).await;
+
+        Arc::clone(&fix.engine)
+            .request_backfill(None)
+            .await
+            .expect("backfill");
+
+        let req = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        assert!(req.since.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_backfill_passes_since_through() {
+        let mut fix = build_engine_fixture(8, 250, 1000).await;
+
+        let since = Hlc {
+            wall_ms: 12_345,
+            logical: 7,
+            device_id: "from".to_string(),
+        };
+        Arc::clone(&fix.engine)
+            .request_backfill(Some(since.clone()))
+            .await
+            .expect("backfill");
+
+        let req = tokio::time::timeout(Duration::from_millis(500), fix.query_request_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("rx open");
+        let got = req.since.expect("Some since");
+        assert_eq!(got.wall_ms, since.wall_ms);
+        assert_eq!(got.logical, since.logical);
+        assert_eq!(got.device_id, since.device_id);
     }
 }
