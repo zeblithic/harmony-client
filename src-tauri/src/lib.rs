@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 pub mod community_channel_log;
+pub mod community_channel_log_engine;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_state_crdt;
@@ -289,6 +290,22 @@ pub struct NodeState {
     /// loop's channel.
     community_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>>,
+    /// ZEB-270 Phase 3 Task 4C: per-(community, channel) ChannelLog
+    /// engine registry. `None` until `start_node` constructs it
+    /// (post-event-loop-ready, so the registry can hold the live
+    /// `Arc<zenoh::Session>` per spec §7.1). Cleared during
+    /// `stop_inner` so the per-channel engines + their Zenoh adapters
+    /// shut down cleanly before the session itself drops.
+    ///
+    /// Typed `tauri::Wry` because Wry is the production runtime;
+    /// tests construct registries directly against `tauri::test::MockRuntime`
+    /// (see `community_channel_log_engine::tests::registry_*`) without
+    /// going through `NodeState`. If we later want to support a
+    /// non-Wry production runtime, this field becomes parameterised
+    /// (which would propagate `R: Runtime` through `NodeState` itself
+    /// — a larger refactor).
+    channel_log_registry:
+        Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
 }
 
 impl NodeState {
@@ -336,6 +353,9 @@ impl Default for NodeState {
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            // ZEB-270 Task 4C: registry stays None until start_node
+            // wires it (see follow-up Task 4C deferred work).
+            channel_log_registry: None,
         }
     }
 }
@@ -482,6 +502,12 @@ fn stop_handles(
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
+    // ZEB-270 Phase 3 Task 4C: declared in the outer scope so the
+    // post-lock shutdown_all block can take it. Assigned inside the
+    // lock alongside the other `take()` calls below.
+    let channel_log_registry_for_shutdown: Option<
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -560,6 +586,14 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-270 Phase 3 Task 4C: take the registry handle so we
+        // can run `shutdown_all` against it below outside the std
+        // `MutexGuard` scope (the `block_on` would panic on the
+        // !Send guard). `let _ = ` not `take().map(...)` because the
+        // shutdown happens later — we hoist the take into the outer
+        // scope via a separate binding rather than trying to thread
+        // it through the already-saturated `tup`.
+        channel_log_registry_for_shutdown = guard.channel_log_registry.take();
         tup
     };
 
@@ -597,6 +631,45 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // last reference reach the close threshold. The event_loop's receiver
     // gets None on its next .recv() and the select arm de-registers.
     drop(unicast_send_tx);
+    // ZEB-270 Phase 3 Task 4C: shut down per-(community, channel) log
+    // engines BEFORE the per-community state engines. The channel-log
+    // engine's verify-on-receive path resolves identity + state-at-HLC
+    // from the matching CommunitySyncEngine; tearing those down first
+    // would break inflight verifies the channel-log loop is mid-await
+    // on. Final flush is synchronous per `engine.shutdown` contract,
+    // so by the time `shutdown_all` returns every channel's tail is
+    // durably written.
+    //
+    // Same `thread::scope` + ephemeral-runtime pattern as the
+    // CommunitySyncRegistry block below — `stop_inner` is sync but
+    // reachable from async contexts; a `block_on` inside an existing
+    // runtime panics.
+    if let Some(registry) = channel_log_registry_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(registry.shutdown_all()) {
+                            tracing::error!(
+                                error = %e,
+                                "ChannelLogRegistry shutdown_all failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for \
+                             ChannelLogRegistry shutdown — final flush/persist skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     // ZEB-217 Sub-C Phase 2: shut down the per-community engine pool
     // BEFORE the owner-state SyncEngine. Each community engine drives
     // its own debounced final-publish + persist pass on
@@ -784,6 +857,14 @@ async fn start_node(
     // scoping, rustc's async generator analysis sees the guard's
     // storage slot as live across the await point and rejects the
     // function as not `Send`.
+    //
+    // ZEB-270 Phase 3 Task 4.5: declared in outer scope so the
+    // post-lock shutdown_all block can take it. Assigned inside the
+    // lock alongside the other `take()` calls below (see
+    // `old_channel_log_registry = guard.channel_log_registry.take();`).
+    let old_channel_log_registry: Option<
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+    >;
     let (
         old_shutdown,
         old_thread,
@@ -857,6 +938,15 @@ async fn start_node(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-270 Phase 3 Task 4.5: take the prior channel-log
+        // registry into the outer-scope binding. Awaited outside the
+        // guard scope (the std `MutexGuard` is `!Send`) — mirrors
+        // `old_community_registry`'s pattern. Hoisted out via the
+        // separate outer binding rather than adding to the already-
+        // saturated tuple. Awaited via `shutdown_all()` BEFORE the
+        // community engine pool shuts down (verify-chain dependency,
+        // same ordering as stop_inner).
+        old_channel_log_registry = guard.channel_log_registry.take();
         tup
     };
 
@@ -887,6 +977,22 @@ async fn start_node(
     // so the new generation's RuntimeUnicastTransport (Task 11) sees no
     // stale clones outside the new NodeState.
     drop(old_unicast_send_tx);
+    // ZEB-270 Phase 3 Task 4.5: explicitly await the previous channel-
+    // log registry's shutdown BEFORE the per-community state engines
+    // tear down. The channel-log engine's verify-on-receive path
+    // resolves identity + state-at-HLC from the matching
+    // CommunitySyncEngine; tearing those down first would break
+    // inflight verifies. Same async ordering rule as stop_inner; here
+    // we're already in async context so no thread::scope juggling
+    // needed.
+    if let Some(registry) = old_channel_log_registry {
+        if let Err(e) = registry.shutdown_all().await {
+            tracing::error!(
+                error = %e,
+                "previous ChannelLogRegistry shutdown_all failed during start_node restart"
+            );
+        }
+    }
     // ZEB-217 Sub-C Phase 2: explicitly await the previous community
     // engine pool's shutdown BEFORE the owner SyncEngine. Mirrors
     // stop_inner's ordering — community engines need their final
@@ -1053,6 +1159,29 @@ async fn start_node(
         > = None;
         let mut community_adapter_requests: Vec<crate::event_loop::CommunityAdapterRequest> =
             Vec::new();
+        // ZEB-270 Phase 3 Task 4.5: bridge channel for the channel-log
+        // adapter requests. Built unconditionally — even when no owner
+        // identity is loaded, `event_loop::run` needs to be passed the
+        // receiver half. The matching sender is only handed to a
+        // ChannelLogRegistry inside the owner-loaded branch below; an
+        // unloaded node has no spawn calls so the rx never wakes.
+        //
+        // **Unbounded.** Boot-time `reconcile_from_state` runs BEFORE
+        // event_loop spawns (the reconcile populates the bridge so
+        // event_loop can wire each request to the session as soon as
+        // it opens). A bounded channel could deadlock at boot if a
+        // user has more channels than the bound — `.send` would await
+        // forever because no consumer exists yet. See
+        // `ChannelLogRegistryConfig.adapter_request_tx` doc for the
+        // full rationale.
+        let (channel_log_adapter_request_tx_outer, channel_log_adapter_request_rx_for_loop) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        // Outer-scope holder for the channel-log registry handle. The
+        // owner-loaded branch builds + populates it; the post-spawn
+        // NodeState assignment below stashes it.
+        let mut channel_log_registry_arc: Option<
+            std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+        > = None;
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -1255,6 +1384,48 @@ async fn start_node(
                         )
                     };
 
+                    // ZEB-270 Phase 3 Task 4.5: per-(community, channel)
+                    // log engine registry. Built BEFORE the delta
+                    // consumer spawn so the consumer's 3rd callback can
+                    // capture it (the callback fires `registry.spawn` /
+                    // `registry.stop` on Created / Deleted channel-config
+                    // events). Built BEFORE the community_snapshots loop
+                    // so the boot-time `reconcile_from_state` per-
+                    // community can run there.
+                    //
+                    // The matching adapter-request `Receiver` was
+                    // constructed in outer scope above
+                    // (`channel_log_adapter_request_rx_for_loop`) so
+                    // event_loop::run can be called with a uniform
+                    // signature regardless of whether an owner identity
+                    // is loaded. Here we pair the outer `Sender` with
+                    // the registry config — `take()` because the outer
+                    // sender is moved by value once.
+                    let channel_log_registry: std::sync::Arc<
+                        crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>,
+                    > = crate::community_channel_log_engine::ChannelLogRegistry::new(
+                        crate::community_channel_log_engine::ChannelLogRegistryConfig {
+                            adapter_request_tx: channel_log_adapter_request_tx_outer.clone(),
+                            app: app.clone(),
+                            identity_dir: identity_dir.clone(),
+                            self_owner,
+                            self_device_id: device_id.clone(),
+                            signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            engine_config:
+                                crate::community_channel_log_engine::ChannelLogEngineConfig::default(
+                                ),
+                        },
+                    );
+                    // Clones of the registry: one for the delta
+                    // consumer's third callback, one for the boot-time
+                    // reconcile loop below, one for NodeState (assigned
+                    // post-thread-spawn).
+                    let channel_log_registry_for_consumer =
+                        std::sync::Arc::clone(&channel_log_registry);
+                    let channel_log_registry_for_reconcile =
+                        std::sync::Arc::clone(&channel_log_registry);
+                    channel_log_registry_arc = Some(channel_log_registry);
+
                     // Spawn the delta consumer: each `CommunityMembershipDelta`
                     // becomes one `community-members-changed` Tauri event.
                     // Task exits cleanly when every per-engine `delta_tx`
@@ -1265,6 +1436,20 @@ async fn start_node(
                     {
                         let app_for_membership = app.clone();
                         let app_for_channel_config = app.clone();
+                        // ZEB-270 Phase 3 Task 4B: third callback —
+                        // the channel-log registry hook. Currently
+                        // wired as a no-op placeholder; Task 4C
+                        // production wiring (which requires the
+                        // registry handle to be threaded through to
+                        // this site) is deferred until the
+                        // session-bridge to event_loop lands. Until
+                        // then the hook just logs at trace level so
+                        // observability is preserved without polluting
+                        // the warn/info channels. The callback shape
+                        // is stable now — flipping the body to call
+                        // `registry.spawn` / `registry.stop` is a
+                        // one-edit change once `NodeState.channel_log_registry`
+                        // is populated by start_node + event_loop.
                         tokio::spawn(run_community_delta_consumer(
                             community_delta_rx,
                             move |payload| {
@@ -1287,6 +1472,161 @@ async fn start_node(
                                             error = ?e,
                                             "failed to emit channel-config-updated"
                                         );
+                                    }
+                                }
+                            },
+                            // ZEB-270 Phase 3 Task 4.5: production
+                            // channel-log registry hook. Per spec §7.3,
+                            // Created → registry.spawn (which derives
+                            // the per-channel key + dispatches the
+                            // adapter request through the bridge);
+                            // Modified → no-op (config change without a
+                            // new log lifecycle event); Deleted →
+                            // registry.stop (idempotent — flushes the
+                            // engine + flips the closing flag; on-disk
+                            // segments persist per spec §17.4).
+                            //
+                            // The closure captures three Arcs through
+                            // a wrapping block expression:
+                            //   - channel-log registry (target of spawn/stop)
+                            //   - community sync registry (source of
+                            //     membership_key + state-at-HLC + identity
+                            //     resolver via engine_arc())
+                            //   - per-device hlc_tracker (the SAME
+                            //     `Arc<Mutex<BTreeMap<String, Hlc>>>`
+                            //     dm_outbox::reserve_next_hlc_for_device
+                            //     uses; channel-log mints share this
+                            //     monotonicity lane).
+                            //
+                            // All three Arcs are cloned per delta
+                            // because the FnMut callback may fire many
+                            // times across the consumer's lifetime —
+                            // each invocation clones for its own future
+                            // body.
+                            {
+                                let registry_for_hook =
+                                    std::sync::Arc::clone(&channel_log_registry_for_consumer);
+                                let community_registry_for_hook = std::sync::Arc::clone(&registry);
+                                let hlc_tracker_for_hook = std::sync::Arc::clone(&tracker);
+                                move |payload: ChannelConfigChangedPayload| {
+                                    let registry = std::sync::Arc::clone(&registry_for_hook);
+                                    let community_registry =
+                                        std::sync::Arc::clone(&community_registry_for_hook);
+                                    let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                                    async move {
+                                        let cid_bytes: [u8; 16] = match hex::decode(
+                                            &payload.community_id,
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.try_into().ok())
+                                        {
+                                            Some(b) => b,
+                                            None => {
+                                                tracing::warn!(
+                                                    community_id = %payload.community_id,
+                                                    "channel-log registry hook: invalid community_id hex"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let chid_bytes: [u8; 16] = match hex::decode(
+                                            &payload.channel_id,
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.try_into().ok())
+                                        {
+                                            Some(b) => b,
+                                            None => {
+                                                tracing::warn!(
+                                                    channel_id = %payload.channel_id,
+                                                    "channel-log registry hook: invalid channel_id hex"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let cid = crate::owner_state_types::SpaceId(cid_bytes);
+                                        let chid =
+                                            crate::community_membership::ChannelId(chid_bytes);
+
+                                        match payload.action {
+                                            ChannelConfigChangeAction::Created => {
+                                                let community_engine = match community_registry
+                                                    .engine_arc(&cid)
+                                                    .await
+                                                {
+                                                    Some(e) => e,
+                                                    None => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            "channel-log registry hook: \
+                                                             no community engine spawned"
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                let membership_key =
+                                                    community_engine.membership_key();
+                                                let key = crate::community_channel_log::derive_channel_key(
+                                                &membership_key,
+                                                &cid,
+                                                &chid,
+                                            );
+                                                let state_at_hlc =
+                                                    community_engine.state_at_hlc_resolver();
+                                                let resolver = match community_engine
+                                                    .identity_resolver()
+                                                {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            "channel-log registry hook: \
+                                                             community engine has no identity resolver"
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                if let Err(e) = registry
+                                                    .spawn(
+                                                        cid,
+                                                        chid,
+                                                        key,
+                                                        state_at_hlc,
+                                                        resolver,
+                                                        hlc_tracker,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        community_id = %payload.community_id,
+                                                        channel_id = %payload.channel_id,
+                                                        error = ?e,
+                                                        "channel-log spawn failed"
+                                                    );
+                                                }
+                                            }
+                                            ChannelConfigChangeAction::Modified => {
+                                                // No-op per spec §7.3. The
+                                                // channel-log itself is
+                                                // unaffected by metadata
+                                                // changes (rename,
+                                                // write_power) — those are
+                                                // membership-CRDT events
+                                                // and the in-flight engine
+                                                // sees them through its
+                                                // shared state-at-HLC view.
+                                            }
+                                            ChannelConfigChangeAction::Deleted => {
+                                                if let Err(e) = registry.stop(&cid, &chid).await {
+                                                    tracing::warn!(
+                                                        community_id = %payload.community_id,
+                                                        channel_id = %payload.channel_id,
+                                                        error = ?e,
+                                                        "channel-log stop failed"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -1419,6 +1759,63 @@ async fn start_node(
                                 subscriber_tx: sub_tx,
                             },
                         );
+
+                        // ZEB-270 Phase 3 Task 4.5: walk this
+                        // community's materialized channels map and
+                        // spawn a per-channel engine for each live
+                        // (non-tombstoned) entry. Source the
+                        // membership_key from the just-spawned engine
+                        // (clone-by-value; same bytes as `mk` above
+                        // which got moved into spawn_engine). The
+                        // adapter requests for the per-channel engines
+                        // queue into `channel_log_adapter_request_tx_outer`
+                        // — the matching rx is moved into event_loop
+                        // below, where it's drained AFTER the Zenoh
+                        // session opens.
+                        if let Some(community_engine) = registry.engine_arc(&space_id).await {
+                            // Materialise the channels map under the
+                            // engine's CRDT lock. `materialized` (cached)
+                            // is cheap — it holds the lock briefly,
+                            // recomputes if stale, returns a clone.
+                            let materialized = {
+                                let state_g = community_engine.state();
+                                let g = state_g.lock().await;
+                                g.materialized(community_engine.admin_addr())
+                            };
+                            let membership_key = community_engine.membership_key();
+                            let state_at_hlc = community_engine.state_at_hlc_resolver();
+                            let resolver = match community_engine.identity_resolver() {
+                                Some(r) => r,
+                                None => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        "boot reconcile: community engine has no identity \
+                                         resolver — skipping per-channel reconcile (engine \
+                                         can still receive own publishes but cannot verify peers)"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let hlc_tracker_for_reconcile = std::sync::Arc::clone(&tracker);
+                            if let Err(e) =
+                                std::sync::Arc::clone(&channel_log_registry_for_reconcile)
+                                    .reconcile_from_state(
+                                        space_id,
+                                        &materialized,
+                                        &membership_key,
+                                        state_at_hlc,
+                                        resolver,
+                                        hlc_tracker_for_reconcile,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(
+                                    ?space_id,
+                                    error = ?e,
+                                    "channel-log registry reconcile_from_state failed at boot"
+                                );
+                            }
+                        }
                     }
 
                     community_registry_arc = Some(registry);
@@ -1643,6 +2040,7 @@ async fn start_node(
                         community_adapter_requests_for_loop,
                         community_adapter_request_rx,
                         community_registry_for_loop,
+                        channel_log_adapter_request_rx_for_loop,
                     )
                     .await;
                 });
@@ -1712,6 +2110,13 @@ async fn start_node(
                 // `CommunityAdapterRequest`s into the event loop. The
                 // matching rx was moved into event_loop::run above.
                 guard.community_adapter_request_tx = Some(community_adapter_request_tx);
+                // ZEB-270 Phase 3 Task 4.5: store the channel-log
+                // registry handle so stop_inner can flip every
+                // per-channel `closing` flag and run final flushes
+                // before the event loop tears down. `None` here when
+                // no owner identity is loaded — the registry is gated
+                // on owner-load above.
+                guard.channel_log_registry = channel_log_registry_arc.clone();
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -1729,11 +2134,30 @@ async fn start_node(
             thread_install_failure,
             sync_engine_arc.clone(),
             community_registry_arc.clone(),
+            channel_log_registry_arc.clone(),
         )
     };
-    let (our_gen, thread_spawn_failure, engine_for_cleanup, registry_for_cleanup) = our_gen;
+    let (
+        our_gen,
+        thread_spawn_failure,
+        engine_for_cleanup,
+        registry_for_cleanup,
+        channel_log_registry_for_cleanup,
+    ) = our_gen;
 
     if let Some(msg) = thread_spawn_failure {
+        // ZEB-270 Phase 3 Task 4.5: shutdown the channel-log registry
+        // FIRST so each per-channel engine's final flush completes
+        // before the per-community state engines (which back the
+        // verify chain) tear down. Mirrors stop_inner's ordering.
+        if let Some(registry) = channel_log_registry_for_cleanup {
+            if let Err(e) = registry.shutdown_all().await {
+                tracing::error!(
+                    error = %e,
+                    "ChannelLogRegistry cleanup after runtime-thread spawn failure"
+                );
+            }
+        }
         // ZEB-217 Sub-C Phase 2: shutdown the registry FIRST so each
         // community engine's final flush completes before the owner
         // SyncEngine tears down. Mirrors stop_inner's ordering.
@@ -6271,6 +6695,249 @@ async fn list_channels(
     Ok(rows)
 }
 
+// ── ZEB-270 Phase 3: channel-message IPCs ────────────────────────────
+//
+// Three IPCs per spec §9 that wrap the ChannelLogEngine surface:
+//   - post_channel_message          → engine.publish
+//   - list_channel_messages         → engine.list_messages
+//   - request_channel_backfill      → engine.request_backfill (fire-and-forget)
+//
+// Each IPC validates hex strings + length at the boundary so JS callers
+// fail fast without minting events that would be rejected at the engine.
+// Engine lookup is via NodeState.channel_log_registry (populated by
+// start_node in Task 4+4.5); a missing registry means the node isn't
+// running and is surfaced as Err. A missing engine for the requested
+// (community_id, channel_id) means that channel isn't currently live
+// (not joined or not yet spawned by the delta consumer).
+
+/// Tauri IPC: post a message to a channel.
+///
+/// `body` is opaque bytes (the frontend serializes the display format —
+/// text, markdown, etc.). The engine's `publish` enforces UTF-8 and a
+/// hard `MAX_BODY_BYTES` cap; the IPC layer just forwards.
+///
+/// `reply_to` is an optional hex `MessageId` (32 chars) of an earlier
+/// message in the same channel.
+///
+/// Returns the hex `MessageId` of the newly minted Post event.
+///
+/// Errors (string-mapped from `ChannelLogEngineError::to_string()`):
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")` /
+///   `Err("reply_to must be 16 bytes (32 hex chars)")` — bad length.
+/// - `Err("invalid {field} hex: ...")` — bad hex characters.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")` — channel isn't live.
+/// - `Err("body too large: ...")` / `Err("body not UTF-8: ...")` /
+///   `Err("publish failed: ...")` etc. — engine surfaces.
+#[tauri::command]
+async fn post_channel_message(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    body: Vec<u8>,
+    reply_to: Option<String>,
+) -> Result<String, String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let reply_to_msg_id = match reply_to {
+        Some(s) => {
+            if s.len() != 32 {
+                return Err("reply_to must be 16 bytes (32 hex chars)".to_string());
+            }
+            let bytes: [u8; 16] = hex::decode(&s)
+                .map_err(|e| format!("invalid reply_to hex: {e}"))?
+                .try_into()
+                .map_err(|_| "reply_to length wrong".to_string())?;
+            Some(crate::community_channel_log::MessageId(bytes))
+        }
+        None => None,
+    };
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let msg_id = engine
+        .publish(body, reply_to_msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(msg_id.0))
+}
+
+/// Tauri IPC: list locally-known messages in a channel.
+///
+/// `since` filters to events strictly newer than the given HLC; `None`
+/// means "from earliest available locally". `limit` caps the reply —
+/// `0` means "use the engine's default (256)"; the IPC enforces a hard
+/// cap of 1000 per spec §9.2 (rejected before reaching the engine).
+///
+/// Returns DTOs in HLC order (segments first, then in-memory tail).
+///
+/// Errors:
+/// - `Err("limit {N} exceeds max 1000")` — boundary cap.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")`.
+/// - `Err("invalid {field} hex: ...")`.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")`.
+/// - `Err("persist error: ...")` — engine read failure (e.g., corrupt
+///   segment).
+#[tauri::command]
+async fn list_channel_messages(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
+    if limit > 1000 {
+        return Err(format!("limit {limit} exceeds max 1000"));
+    }
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
+        wall_ms: h.wall_ms,
+        logical: h.logical,
+        device_id: h.device_id,
+    });
+
+    let events = engine
+        .list_messages(since_hlc, limit as usize)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(events
+        .into_iter()
+        .map(|ev| engine.event_to_dto(&ev))
+        .collect())
+}
+
+/// Tauri IPC: fire a backfill request via the channel's Zenoh queryable.
+///
+/// Fire-and-forget — the engine forwards the `BackfillQueryRequest` to
+/// the adapter's query-driver task, which fans out the Zenoh `get` and
+/// pumps reply packets back through the same subscriber path so they
+/// surface to the UI as `channel-message-received` events alongside
+/// live broadcasts. No reply payload here.
+///
+/// Errors:
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")`.
+/// - `Err("invalid {field} hex: ...")`.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")`.
+/// - `Err("backfill request failed: ...")` — adapter channel closed.
+#[tauri::command]
+async fn request_channel_backfill(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
+        wall_ms: h.wall_ms,
+        logical: h.logical,
+        device_id: h.device_id,
+    });
+
+    engine
+        .request_backfill(since_hlc)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Encode a CommunityInvitePayload into the harmony://invite/ URL form.
 /// Thin wrapper over `community_invite::encode_invite_url` so call sites
 /// don't need to import the lower-level error type — surfaces failures
@@ -8958,17 +9625,30 @@ pub fn delta_to_channel_config_change(
 /// Phase 3 emits one change per `community-members-changed` IPC event
 /// (engine fires one delta per CRDT mutation); the wire format leaves
 /// room for batched future deltas without a contract break.
-pub async fn run_community_delta_consumer<FM, FutM, FC, FutC>(
+pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
     mut delta_rx: tokio::sync::mpsc::Receiver<
         crate::community_state_sync::CommunityMembershipDelta,
     >,
     mut emit_membership: FM,
     mut emit_channel_config: FC,
+    mut on_channel_config_registry: FR,
 ) where
     FM: FnMut(CommunityMembersChangedPayload) -> FutM + Send + 'static,
     FutM: std::future::Future<Output = ()> + Send + 'static,
     FC: FnMut(ChannelConfigChangedPayload) -> FutC + Send + 'static,
     FutC: std::future::Future<Output = ()> + Send + 'static,
+    // ZEB-270 Phase 3 Task 4B: registry-side hook fires on the same
+    // channel-config payload as `emit_channel_config` so the
+    // `ChannelLogRegistry` can spawn / stop per-channel engines on
+    // Created / Deleted (Modified is a no-op for the registry — only
+    // metadata changed; the underlying log is unaffected). Two
+    // callbacks rather than one because the IPC-event-emit and
+    // registry-mutate paths have different lifetimes (one needs an
+    // `AppHandle`, the other an `Arc<ChannelLogRegistry>`) and
+    // different failure modes (emit logs + drops; registry surfaces
+    // errors via tracing).
+    FR: FnMut(ChannelConfigChangedPayload) -> FutR + Send + 'static,
+    FutR: std::future::Future<Output = ()> + Send + 'static,
 {
     while let Some(delta) = delta_rx.recv().await {
         if let Some((community_id, change)) = delta_to_change(&delta) {
@@ -8978,6 +9658,25 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC>(
             };
             emit_membership(payload).await;
         } else if let Some(payload) = delta_to_channel_config_change(&delta) {
+            // Order matters: registry hook FIRST (awaits engine
+            // spawn/stop), THEN UI event. The UI consumer of
+            // `channel-config-updated` for a Created channel
+            // immediately fires `list_channel_messages` /
+            // `post_channel_message` IPCs that look up the engine
+            // in the registry. If we emit the Tauri event before
+            // `registry.spawn` has awaited to completion, those
+            // IPCs hit a "no engine for ..." race and surface
+            // false-error toasts.
+            //
+            // Cost: UI sees the channel-config-updated event a few
+            // ms later (registry.spawn does dir-create + tail
+            // reload + adapter bridge enqueue). For Modified the
+            // registry hook is a no-op; for Deleted it's
+            // registry.stop (cheap). Trade is unambiguously worth
+            // it — the previous order was an observed UI race.
+            //
+            // Both callbacks see the same payload bytes.
+            on_channel_config_registry(payload.clone()).await;
             emit_channel_config(payload).await;
         }
     }
@@ -9202,6 +9901,9 @@ pub fn run() {
             modify_channel,
             delete_channel,
             list_channels,
+            list_channel_messages,
+            post_channel_message,
+            request_channel_backfill,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -10061,6 +10763,9 @@ mod delta_consumer_task_tests {
                     // No-op: this test only drives a Join through the
                     // membership branch.
                 },
+                // ZEB-270 Phase 3 Task 4B: 3rd callback (registry hook)
+                // — no-op for tests that don't exercise the registry.
+                |_payload: ChannelConfigChangedPayload| async move {},
             )
             .await
         });
@@ -10258,6 +10963,11 @@ mod create_channel_delta_tests {
                     c.lock().await.push(payload);
                 }
             },
+            // ZEB-270 Phase 3 Task 4B: 3rd callback (registry hook) —
+            // no-op for tests that don't exercise the registry. The
+            // assertion below targets the channel-config callback's
+            // capture vec, not registry side-effects.
+            |_payload: ChannelConfigChangedPayload| async move {},
         ));
 
         let community_id = SpaceId([0x37; 16]);
@@ -10293,6 +11003,190 @@ mod create_channel_delta_tests {
         assert_eq!(
             captured_channel.lock().await[0].action,
             ChannelConfigChangeAction::Created
+        );
+    }
+}
+
+// ── ZEB-270 Phase 3 Task 5: channel-message IPC smoke tests ──────────
+//
+// Boundary-validation coverage for the three new IPCs. Driving the full
+// IPC layer (post→engine→Zenoh→subscribe roundtrip) requires a live
+// ChannelLogRegistry bound to a real Zenoh session, which lives in the
+// Task 6 integration test. These tests exercise the IPC-boundary
+// validation paths (hex length / parse / limit cap / missing-registry)
+// against a default NodeState (registry = None), which is the path JS
+// callers hit pre-start_node.
+//
+// `NodeState.channel_log_registry` is hardcoded to `tauri::Wry`, so we
+// can't populate it with the test fixture's `MockRuntime` registry.
+// End-to-end IPC roundtrips with a populated registry are therefore
+// out of scope here — see Task 6's integration test for that coverage.
+#[cfg(test)]
+mod channel_message_ipc_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tauri::Manager;
+
+    /// Build a mock app with an empty `NodeState` (registry = None).
+    /// Mirrors Phase 1's pattern of testing helper paths without
+    /// standing up the production state-machine.
+    fn mock_app_with_default_node_state() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(StdMutex::new(NodeState::default()));
+        app
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "deadbeef".into(), "00".repeat(16), vec![1], None)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_channel_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None)
+            .await
+            .expect_err("short chid must error");
+        assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None)
+            .await
+            .expect_err("bad hex must error");
+        assert!(err.contains("invalid community_id hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_reply_to() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            Some("ab".into()),
+        )
+        .await
+        .expect_err("short reply_to must error");
+        assert!(err.contains("reply_to must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_errors_when_registry_missing() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "11".repeat(16),
+            vec![104, 105],
+            None,
+        )
+        .await
+        .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_rejects_limit_over_cap() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1001)
+            .await
+            .expect_err("over-cap limit must error");
+        assert_eq!(err, "limit 1001 exceeds max 1000");
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_accepts_zero_limit() {
+        // limit=0 is the "use engine default 256" sentinel; it must NOT
+        // be rejected at the boundary. The call still errors at the
+        // registry-lookup step (missing registry), which proves the
+        // validation passed.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 0)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "limit=0 should fall through to registry lookup; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_accepts_limit_at_cap() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1000)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "limit=1000 (== cap) should pass validation; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "ab".into(), "00".repeat(16), None, 10)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = request_channel_backfill(state, "ab".into(), "00".repeat(16), None)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_errors_when_registry_missing() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = request_channel_backfill(state, "00".repeat(16), "00".repeat(16), None)
+            .await
+            .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_accepts_some_since() {
+        // since: Some(HlcDto) is the deserialize path — verifies the
+        // DTO is wired correctly as IPC input. The call still errors
+        // at the registry-lookup step, which proves deserialize +
+        // validation succeeded.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let since = Some(crate::community_channel_log_engine::HlcDto {
+            wall_ms: 1234,
+            logical: 5,
+            device_id: "device-x".into(),
+        });
+        let err = request_channel_backfill(state, "00".repeat(16), "00".repeat(16), since)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "Some(HlcDto) should fall through to registry lookup; got: {err}"
         );
     }
 }

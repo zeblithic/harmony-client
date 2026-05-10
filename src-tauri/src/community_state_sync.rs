@@ -662,6 +662,14 @@ pub struct CommunitySyncEngine {
     /// by a forged publish. `#[doc(hidden)]` until production callers
     /// need a public surface.
     tracker: Arc<Mutex<CommunityRootHlcTracker>>,
+    /// Per-community symmetric key. Retained on the engine so the
+    /// ZEB-270 Phase 3 channel-log registry (which derives per-channel
+    /// keys via `derive_channel_key(membership_key, cid, chid)`) can
+    /// reach it through `engine_arc(cid).membership_key()` without
+    /// re-plumbing the value through `NodeState` or the registry.
+    /// `MembershipKey` derives `Clone` (just a 32-byte wrapper) so the
+    /// accessor returns by value.
+    membership_key: MembershipKey,
     /// Community identity this engine was configured with. Bound at
     /// construction so `insert_local_event` can:
     ///   1. Reject mis-routed events (caller passed an event whose
@@ -728,6 +736,11 @@ impl CommunitySyncEngine {
         let is_invite_only_for_engine = cfg.is_invite_only;
         let delta_tx_for_engine = cfg.delta_tx.clone();
         let pending_redemptions_for_engine = cfg.pending_redemptions.clone();
+        // ZEB-270 Phase 3 Task 4.5: retain the membership_key on the
+        // engine so the channel-log registry can reach it via
+        // `engine_arc(cid).membership_key()`. Cheap clone (32-byte
+        // wrapper); the spawned task gets its own clone via cfg.
+        let membership_key_for_engine = cfg.membership_key.clone();
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -762,6 +775,7 @@ impl CommunitySyncEngine {
             task: Mutex::new(Some(task)),
             state: state_for_engine,
             tracker: tracker_for_engine,
+            membership_key: membership_key_for_engine,
             community_id: community_id_for_engine,
             admin_addr,
             identity_resolver: identity_resolver_for_engine,
@@ -801,6 +815,56 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn admin_addr(&self) -> OwnerAddr {
         self.admin_addr
+    }
+
+    /// Returns this engine's per-community symmetric `MembershipKey`.
+    /// ZEB-270 Phase 3 Task 4.5: the channel-log registry's `spawn`
+    /// derives a per-channel symmetric key via
+    /// `derive_channel_key(membership_key, community_id, channel_id)`.
+    /// The membership key is bound at `spawn_engine` time and never
+    /// changes for the engine's lifetime, so handing out a clone is
+    /// safe.
+    pub(crate) fn membership_key(&self) -> MembershipKey {
+        self.membership_key.clone()
+    }
+
+    /// Returns a `CommunityStateAtHlc` adapter wrapping this engine's
+    /// shared `Arc<Mutex<CommunityState>>` plus admin_addr. ZEB-270
+    /// Phase 3 Task 4.5: the channel-log engine's verify chain
+    /// (`verify_channel_event`) takes a `&dyn CommunityStateAtHlc`
+    /// resolved at `event.at`; this accessor produces the production
+    /// adapter that materializes the live CRDT to the requested HLC.
+    pub(crate) fn state_at_hlc_resolver(
+        &self,
+    ) -> Arc<dyn crate::community_channel_log::CommunityStateAtHlc + Send + Sync> {
+        Arc::new(CommunityStateAtHlcAdapter {
+            state: Arc::clone(&self.state),
+            admin_addr: self.admin_addr,
+        })
+    }
+
+    /// Returns a `ChannelIdentityResolver` adapter wrapping this
+    /// engine's `IdentityResolver`. ZEB-270 Phase 3 Task 4.5: the
+    /// channel-log engine's verify chain needs an OwnerAddr →
+    /// 64-byte composite resolver with the same shape as the existing
+    /// `IdentityResolver` (Phase 2 already shares a single
+    /// `OwnerDeviceCacheResolver` across all community engines via
+    /// `CommunityRegistryConfig.identity_resolver`).
+    ///
+    /// Returns `None` if the engine was constructed without an
+    /// identity_resolver (legacy unit tests pre-Task 8). Production
+    /// engines always have one (registry config carries the resolver
+    /// and clones it into every spawned engine — see `spawn_engine`).
+    pub(crate) fn identity_resolver(
+        &self,
+    ) -> Option<Arc<dyn crate::community_channel_log::ChannelIdentityResolver + Send + Sync>> {
+        self.identity_resolver
+            .as_ref()
+            .map(|inner| -> Arc<dyn crate::community_channel_log::ChannelIdentityResolver + Send + Sync> {
+                Arc::new(ChannelIdentityResolverAdapter {
+                    inner: Arc::clone(inner),
+                })
+            })
     }
 
     /// Insert a locally-minted event into the community CRDT, verify it
@@ -2676,5 +2740,98 @@ impl IdentityResolver for OwnerDeviceCacheResolver {
         // (both wrap [u8; 16]). Reinterpret without copying.
         let device_hash = DeviceIdentityHash(addr.0);
         lookup_pubkey_for_device(&cache.owner_device_cache, device_hash)
+    }
+}
+
+// ── ZEB-270 Phase 3 Task 4.5: production adapters for the channel-log
+//    verify chain ────────────────────────────────────────────────────────
+
+/// Wraps the live per-community `Arc<Mutex<CommunityState>>` to
+/// satisfy the channel-log `CommunityStateAtHlc` trait. Materialises
+/// the CRDT to "now" and projects the requested HLC slice via the
+/// existing `prior_state_at_hlc` helper.
+///
+/// Construction is cheap (two Arc bumps + a copy of `admin_addr`); the
+/// expensive work happens only on a verify-chain call from the
+/// channel-log engine's receive loop.
+///
+/// **Lock posture.** `state.lock().await` runs against the same
+/// `tokio::sync::Mutex` the per-community sync engine uses for its
+/// CRDT writes. Holding the lock briefly across the `materialize`
+/// projection is acceptable — the engine's publish path also holds
+/// the lock across `materialized()` calls (a similar O(events) walk),
+/// and the verify chain runs on the channel-log receive task, NOT on
+/// the engine's task, so they never block each other.
+pub struct CommunityStateAtHlcAdapter {
+    pub state: Arc<Mutex<crate::community_state_crdt::CommunityState>>,
+    pub admin_addr: OwnerAddr,
+}
+
+#[async_trait::async_trait]
+impl crate::community_channel_log::CommunityStateAtHlc for CommunityStateAtHlcAdapter {
+    async fn snapshot_at(
+        &self,
+        channel_id: &crate::community_membership::ChannelId,
+        author: &crate::owner_state_types::OwnerAddr,
+        at: &crate::owner_state_types::Hlc,
+    ) -> crate::community_channel_log::CommunityStateSnapshot {
+        // Snapshot the event log under the lock, then drop the guard
+        // before materialising. `prior_state_at_hlc` is a pure function
+        // of (events, target_hlc, admin_addr) — it doesn't touch the
+        // shared CommunityState, so we can release the lock first to
+        // avoid blocking the engine's writer for the duration of the
+        // O(events) replay.
+        //
+        // Critical: ONE lock acquisition + ONE materialization for both
+        // the channel-config lookup and the author-power lookup. The
+        // previous shape (two trait methods, two lock acquisitions, two
+        // materializations) admitted a torn read where a CRDT update
+        // landing between the two awaits could let verify_channel_event
+        // admit a post on a state that never coexisted at one HLC.
+        let state = self.state.lock().await;
+        let events: Vec<crate::community_membership::SignedMembershipEvent> =
+            state.events.values().cloned().collect();
+        drop(state);
+        let materialized =
+            crate::community_membership::prior_state_at_hlc(&events, at, self.admin_addr);
+
+        let channel = materialized.channels.get(channel_id).cloned();
+        // Member must be Joined at `at` (Left/Banned/Invited drop the
+        // post). `power_levels` defaults to 0 for unset entries; for
+        // Joined non-listed members the lookup is `Some(0)`. For
+        // never-Joined / Left / Banned we return `None` so verify
+        // surfaces NotAuthorized rather than a misleading 0.
+        let author_power =
+            materialized
+                .members
+                .get(author)
+                .and_then(|member| match member.status {
+                    crate::community_membership::MemberStatus::Joined => {
+                        Some(materialized.power_levels.get(author).copied().unwrap_or(0))
+                    }
+                    _ => None,
+                });
+
+        crate::community_channel_log::CommunityStateSnapshot {
+            channel,
+            author_power,
+        }
+    }
+}
+
+/// Adapts a generic `Arc<dyn IdentityResolver>` (the resolver shape
+/// already used by the per-community sync engine) to the channel-log
+/// `ChannelIdentityResolver` trait. Both expose the same `OwnerAddr →
+/// 64-byte composite (X25519 || Ed25519)` lookup; this wrapper exists
+/// only because the two traits live in different modules and can't
+/// directly impl each other without one depending on the other's crate.
+pub struct ChannelIdentityResolverAdapter {
+    pub inner: Arc<dyn IdentityResolver>,
+}
+
+#[async_trait::async_trait]
+impl crate::community_channel_log::ChannelIdentityResolver for ChannelIdentityResolverAdapter {
+    async fn resolve(&self, addr: &crate::owner_state_types::OwnerAddr) -> Option<[u8; 64]> {
+        self.inner.resolve(addr).await
     }
 }

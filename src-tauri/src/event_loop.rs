@@ -71,6 +71,88 @@ pub struct CommunityAdapterRequest {
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
+/// `ChannelLogRegistry::spawn` (lib.rs / runtime IPC) into the event
+/// loop's Zenoh-session scope.
+///
+/// Same architectural rationale as `CommunityAdapterRequest`: the
+/// channel-log engine is constructed from `start_node` (and from the
+/// Phase 3 delta-consumer task), but the Zenoh `Session` lives
+/// exclusively inside `event_loop::run`. Carrying the per-channel mpsc
+/// halves through this struct lets the registry's `spawn` enqueue an
+/// adapter binding without ever touching the session, and the event
+/// loop's `select!` arm wires the halves to a Zenoh adapter against the
+/// live session by calling `spawn_channel_log_zenoh_adapter`.
+pub struct ChannelLogAdapterRequest {
+    /// Hex-encoded community SpaceId (32 chars, lowercase) — used to
+    /// form the per-channel events topic key
+    /// `harmony/channels/{community_id_hex}/{channel_id_hex}/events`.
+    pub community_id_hex: String,
+    /// Hex-encoded ChannelId (32 chars, lowercase).
+    pub channel_id_hex: String,
+    /// Engine's outbound channel: bytes the engine writes here drain
+    /// into Zenoh `put` on the per-channel events topic.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Engine's inbound channel: bytes Zenoh receives on the per-
+    /// channel events topic are forwarded here.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Engine's backfill query-request channel — drained by the
+    /// adapter's queryable-driver task to issue `session.get` requests
+    /// against the per-channel `since/**` queryable prefix.
+    pub query_request_rx:
+        tokio::sync::mpsc::Receiver<crate::community_channel_log_engine::BackfillQueryRequest>,
+    /// Read-side closure invoked by the queryable task on each `since`
+    /// query. Closes over an `Arc<ChannelLogEngine>` so the queryable
+    /// can map (since, limit) to a vec of encrypted packets without
+    /// holding a back-reference to the registry.
+    #[allow(clippy::type_complexity)]
+    pub read_for_query: Arc<
+        dyn Fn(
+                Option<crate::owner_state_types::Hlc>,
+                usize,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    >,
+    /// Per spec §10 + §8.4: emit `channel-backfill-progress` Tauri
+    /// event from the query-request driver task every N events
+    /// (`backfill_progress_event_interval`) and once at end. Receives
+    /// (`fetched`, `total_estimate`); the adapter doesn't know the AppHandle
+    /// directly (the registry constructs the closure with its `app:
+    /// AppHandle<R>` captured), so this callback bridges the runtime
+    /// type erasure.
+    #[allow(clippy::type_complexity)]
+    pub emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static>,
+    /// Spec §10: how many incoming reply packets to count between
+    /// progress emissions. Default 16; tests can override via
+    /// `ChannelLogEngineConfig.backfill_progress_event_interval`.
+    pub backfill_progress_interval: usize,
+    /// Per-engine default backfill limit applied when a
+    /// `BackfillQueryRequest` carries `limit == 0`. Sourced from
+    /// `ChannelLogEngineConfig.backfill_default_limit` at registry
+    /// `spawn` time so per-community config overrides take effect
+    /// (the previous shape hardcoded `CHANNEL_BACKFILL_DEFAULT_LIMIT`
+    /// in the adapter, ignoring engine config). The hard cap
+    /// `CHANNEL_BACKFILL_MAX_LIMIT` still applies on the adapter
+    /// side as a server-side reply-storm bound.
+    pub backfill_default_limit: usize,
+    /// Closing flag for the adapter task. Independent from the
+    /// engine's internal closing flag — they're flipped by separate
+    /// paths:
+    /// - `ChannelLogRegistry::stop` flips this bridge flag (unblocks
+    ///   the adapter's pub/sub/qbl/qr task select arms within ~1s
+    ///   closing-poll).
+    /// - `ChannelLogEngine::shutdown` flips the engine's internal
+    ///   flag (unblocks the engine's receive + flush loops).
+    ///
+    /// Both flips happen on `stop()`, but each bit is owned by its
+    /// own teardown path and is freshly allocated at engine-construction
+    /// time (see `ChannelLogRegistry::spawn`).
+    pub closing: Arc<AtomicBool>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -243,6 +325,18 @@ pub async fn run<R: Runtime>(
     // `crdt_state`. The handler drops the packet (with a warn-log) if
     // the registry isn't set yet.
     community_registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+    // ZEB-270 Phase 3 Task 4.5: per-channel Zenoh adapter request
+    // receiver. `start_node` constructs the `ChannelLogRegistry` with
+    // the matching `UnboundedSender` half; the registry's `spawn`
+    // enqueues one request per (community, channel) pair. The select
+    // arm below drains and binds each request to a Zenoh adapter
+    // against the live session. Both boot-time `reconcile_from_state`
+    // and runtime `Created` channel-config events flow through this
+    // same channel. Unbounded because boot reconcile (which runs
+    // BEFORE event_loop drains) may queue more requests than any
+    // sensible bound — see `adapter_request_tx` doc on
+    // `ChannelLogRegistryConfig` for the full rationale.
+    mut channel_log_adapter_request_rx: mpsc::UnboundedReceiver<ChannelLogAdapterRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1311,6 +1405,33 @@ pub async fn run<R: Runtime>(
                     req.subscriber_tx,
                     Arc::clone(&closing),
                 );
+            }
+
+            // ── ZEB-270 Phase 3 Task 4.5: channel-log adapter bridge ──
+            // Drained whenever `ChannelLogRegistry::spawn` enqueues an
+            // adapter request. Spawns the per-channel Zenoh adapter
+            // (publisher + subscriber + queryable + query-driver) against
+            // the live `session_arc`. Per-channel `closing` flag in
+            // `req.closing` is shared with the registry — `registry.stop`
+            // flips it; the adapter task observes within ≤1s and exits.
+            // Engine-level `closing` (held inside ChannelLogEngine itself)
+            // is the engine's own flag and is independent.
+            Some(req) = channel_log_adapter_request_rx.recv() => {
+                let _handle = spawn_channel_log_zenoh_adapter(
+                    Arc::clone(&session_arc),
+                    req.community_id_hex,
+                    req.channel_id_hex,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    req.query_request_rx,
+                    req.read_for_query,
+                    req.emit_backfill_progress,
+                    req.backfill_progress_interval,
+                    req.backfill_default_limit,
+                    req.closing,
+                );
+                // JoinHandle dropped — adapter task is fire-and-forget.
+                // The registry-held closing flag drives shutdown.
             }
 
             // ── Shutdown signal ──────────────────────────────────────
@@ -2413,4 +2534,671 @@ pub fn spawn_community_state_zenoh_adapter(
         let _ = pub_handle.await;
         let _ = sub_handle.await;
     })
+}
+
+/// Per-(community, channel) Zenoh adapter for the ChannelLog data
+/// plane (ZEB-270 / ZEB-248 Phase 3). Mirrors
+/// `spawn_community_state_zenoh_adapter` in shape: spawns four
+/// tokio tasks (publisher, subscriber, queryable, query-request
+/// driver), all bound to the per-channel topics.
+///
+/// Topics:
+/// - `harmony/channels/{cid_hex}/{ch_id_hex}/events` — live broadcast
+/// - `harmony/channels/{cid_hex}/{ch_id_hex}/since/{hlc_hex}/{limit}` — queryable
+///
+/// The `read_for_query` callback is what the queryable handler uses
+/// to fetch events for a backfill request — passed in to avoid
+/// the engine ↔ adapter circular dep (per spec §8.1).
+#[allow(clippy::too_many_arguments)] // Signature locked by spec §8 + plan Task 3.
+pub fn spawn_channel_log_zenoh_adapter<F>(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    channel_id_hex: String,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut query_request_rx: tokio::sync::mpsc::Receiver<
+        crate::community_channel_log_engine::BackfillQueryRequest,
+    >,
+    read_for_query: Arc<F>,
+    emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static>,
+    backfill_progress_interval: usize,
+    backfill_default_limit: usize,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()>
+where
+    // `?Sized` so callers can pass `Arc<dyn Fn(...) + Send + Sync>`
+    // — the production bridge (ChannelLogAdapterRequest) carries the
+    // closure as a trait object so it can be packed into an mpsc with
+    // a uniform type. Concrete `Arc<F>` callers (the existing
+    // event_loop unit tests) still compile under the relaxed bound.
+    F: Fn(
+            Option<crate::owner_state_types::Hlc>,
+            usize,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+        + Send
+        + Sync
+        + ?Sized
+        + 'static,
+{
+    let events_topic = format!(
+        "harmony/channels/{}/{}/events",
+        community_id_hex, channel_id_hex
+    );
+    let queryable_prefix = format!(
+        "harmony/channels/{}/{}/since/**",
+        community_id_hex, channel_id_hex
+    );
+
+    tokio::spawn(async move {
+        // Spawn-stop race fast path: if closing was flipped after the
+        // request was queued but before this task started, exit
+        // immediately without declaring Zenoh resources or holding the
+        // read_for_query closure (which keeps the engine alive).
+        if closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        let events_key = match zenoh::key_expr::KeyExpr::try_from(events_topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %events_topic,
+                    "channel-log events key_expr invalid; adapter skipped"
+                );
+                return;
+            }
+        };
+        let queryable_key = match zenoh::key_expr::KeyExpr::try_from(queryable_prefix.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %queryable_prefix,
+                    "channel-log queryable key_expr invalid; adapter skipped"
+                );
+                return;
+            }
+        };
+
+        // ── Publisher task ─────────────────────────────────────────
+        let session_pub = Arc::clone(&session);
+        let key_pub = events_key.clone();
+        let topic_pub = events_topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let pub_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = publisher_rx.recv() => {
+                        let Some(bytes) = maybe else { break; };
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    topic = %topic_pub,
+                                    error = %e,
+                                    "channel-log publish failed"
+                                );
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Subscriber task ────────────────────────────────────────
+        let session_sub = Arc::clone(&session);
+        let key_sub = events_key.clone();
+        let topic_sub = events_topic.clone();
+        let subscriber_tx_sub = subscriber_tx.clone();
+        let closing_sub = Arc::clone(&closing);
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare channel-log subscriber"
+                        );
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx_sub.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "channel-log subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = subscriber_tx_sub.closed() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Queryable task ─────────────────────────────────────────
+        let session_qbl = Arc::clone(&session);
+        let key_qbl = queryable_key.clone();
+        let prefix_qbl = queryable_prefix.clone();
+        let read_for_query_qbl = Arc::clone(&read_for_query);
+        let closing_qbl = Arc::clone(&closing);
+        let backfill_default_limit_qbl = backfill_default_limit;
+        let qbl_handle = tokio::spawn(async move {
+            let qbl = match session_qbl.declare_queryable(&key_qbl).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_qbl.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            prefix = %prefix_qbl,
+                            error = %e,
+                            "failed to declare channel-log queryable"
+                        );
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        let qkey = query.key_expr().to_string();
+                        // Reject malformed selectors outright instead of
+                        // silently widening to a full backfill. A bad
+                        // selector like `.../since/not_hlc/500` previously
+                        // collapsed to `since=None` and served the entire
+                        // log — broader result set than the requester
+                        // asked for, and masked protocol bugs. Now we
+                        // skip the reply (continue to next query) and
+                        // log at debug.
+                        let ParsedBackfillKey::Valid { since, limit: limit_raw } =
+                            parse_channel_backfill_key(&qkey)
+                        else {
+                            tracing::debug!(%qkey, "ignoring malformed channel-log backfill selector");
+                            continue;
+                        };
+                        // Clamp peer-controlled limit per spec §6.2 (hard
+                        // cap 1000). limit=0 falls back to per-engine
+                        // default sourced from
+                        // `ChannelLogEngineConfig.backfill_default_limit`
+                        // (also clamped to MAX so a misconfigured engine
+                        // can't blow past the server-side reply-storm
+                        // bound). Defense-in-depth: the qr-driver below
+                        // applies the same clamp before the GET selector
+                        // is built.
+                        let limit = if limit_raw == 0 {
+                            backfill_default_limit_qbl.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        } else {
+                            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        };
+                        let packets = (read_for_query_qbl)(since, limit).await;
+                        for packet in packets {
+                            if let Err(e) = query
+                                .reply(query.key_expr(), packet)
+                                .await
+                            {
+                                tracing::warn!(
+                                    prefix = %prefix_qbl,
+                                    error = %e,
+                                    "channel-log queryable reply failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qbl.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // ── Query-request driver ───────────────────────────────────
+        let session_qr = Arc::clone(&session);
+        let community_id_hex_qr = community_id_hex.clone();
+        let channel_id_hex_qr = channel_id_hex.clone();
+        let subscriber_tx_qr = subscriber_tx.clone();
+        let closing_qr = Arc::clone(&closing);
+        let emit_backfill_progress_qr = Arc::clone(&emit_backfill_progress);
+        let backfill_default_limit_qr = backfill_default_limit;
+        let qr_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = query_request_rx.recv() => {
+                        let Some(req) = maybe else { break; };
+                        // Clamp our own request before encoding (defense
+                        // in depth — also prevents a misbehaving local
+                        // engine from issuing oversized requests). The
+                        // per-engine `backfill_default_limit` (sourced
+                        // from `ChannelLogEngineConfig` at registry
+                        // spawn time, plumbed through
+                        // `ChannelLogAdapterRequest`) replaces the
+                        // previous hardcoded `CHANNEL_BACKFILL_DEFAULT_LIMIT`
+                        // — config overrides now take effect. The MAX
+                        // cap stays as the constant (server-side hard
+                        // cap independent of engine config).
+                        let limit = if req.limit == 0 {
+                            backfill_default_limit_qr.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        } else {
+                            req.limit.min(CHANNEL_BACKFILL_MAX_LIMIT)
+                        };
+                        let since_hex = match &req.since {
+                            Some(h) => format_hlc_hex(h),
+                            None => "0".to_string(),
+                        };
+                        let key = format!(
+                            "harmony/channels/{}/{}/since/{}/{}",
+                            community_id_hex_qr, channel_id_hex_qr, since_hex, limit
+                        );
+                        // ConsolidationMode::None: backfill streams ALL
+                        // per-event reply packets back from the queryable
+                        // (spec §17.1: per-event packets, wire-identical
+                        // to live broadcasts). Default consolidation
+                        // (Auto → Latest) collapses to a single reply per
+                        // source key, dropping every event but one.
+                        // Mirrors the `mailbox_get_first_value` shape at
+                        // `event_loop.rs:1903`.
+                        let receiver = match session_qr
+                            .get(&key)
+                            .consolidation(zenoh::query::ConsolidationMode::None)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if !closing_qr.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        %key,
+                                        error = %e,
+                                        "channel-log backfill query failed"
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        let mut fetched: u32 = 0;
+                        // Inner reply-drain loop with closing-poll arm.
+                        // `recv_async()` blocks until the reply stream
+                        // closes; if the peer hangs (partition / dropped
+                        // session / silent peer) it can block forever.
+                        // Wrap in `select!` so a flipped closing flag
+                        // unblocks teardown within ~500ms instead of
+                        // waiting on the outer 1s closing-poll AFTER the
+                        // hung recv eventually returns. The 500ms inner
+                        // poll is tighter than the outer 1s because
+                        // backfill is user-triggered and stop() latency
+                        // is a UX concern.
+                        let drained_clean: bool = loop {
+                            tokio::select! {
+                                biased;
+                                res = receiver.recv_async() => {
+                                    let Ok(reply) = res else { break true; };
+                                    if let Ok(sample) = reply.into_result() {
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if subscriber_tx_qr.send(bytes).await.is_err() {
+                                            // subscriber_rx dropped (engine
+                                            // teardown). No point serving more
+                                            // backfill requests if we can't
+                                            // deliver replies — exit the qr
+                                            // task entirely so we don't loop
+                                            // back, fire another session.get,
+                                            // and spin until the 1s closing
+                                            // poll catches up.
+                                            return;
+                                        }
+                                        fetched = fetched.saturating_add(1);
+                                        // Spec §10: emit channel-backfill-progress
+                                        // every N replies. `total_estimate` is
+                                        // `None` — we don't know the total until
+                                        // the receiver closes (Zenoh streams
+                                        // replies one-at-a-time).
+                                        if backfill_progress_interval > 0
+                                            && (fetched as usize)
+                                                .is_multiple_of(backfill_progress_interval)
+                                        {
+                                            (emit_backfill_progress_qr)(fetched, None);
+                                        }
+                                    }
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                    if closing_qr.load(Ordering::SeqCst) {
+                                        // Adapter is tearing down. Don't
+                                        // emit a final progress tick
+                                        // (consumer is going away) — exit
+                                        // immediately and let the outer
+                                        // closing-poll arm break the loop.
+                                        break false;
+                                    }
+                                }
+                            }
+                        };
+                        // Spec §10: emit a final progress tick at end-of-
+                        // request. We always fire on `drained_clean`
+                        // (including `fetched == 0`) so the UI can
+                        // distinguish "backfill finished with zero
+                        // results" from "backfill is still in flight" —
+                        // a zero-result drain is otherwise invisible.
+                        // `total_estimate = Some(fetched)` is the true
+                        // total now that the reply stream has closed
+                        // naturally; this lets the UI tell apart
+                        // periodic mid-drain ticks (where total is
+                        // unknown, `None`) from the terminal one.
+                        // Skip on shutdown — the consumer is going away
+                        // and a final tick after the closing flag
+                        // flipped is racy noise.
+                        if drained_clean {
+                            (emit_backfill_progress_qr)(fetched, Some(fetched));
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_qr.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
+        let _ = qbl_handle.await;
+        let _ = qr_handle.await;
+    })
+}
+
+/// Per spec §6.2: default backfill limit when peer/local sends 0.
+/// Used by the engine config (`ChannelLogEngineConfig.backfill_default_limit`)
+/// as the production default; the adapter no longer references this
+/// constant directly (it now uses the per-engine value plumbed through
+/// `ChannelLogAdapterRequest.backfill_default_limit`). Kept for the
+/// event-loop unit tests that still want a stable sentinel.
+#[cfg(test)]
+const CHANNEL_BACKFILL_DEFAULT_LIMIT: usize = 256;
+/// Per spec §6.2 + §15: hard cap on backfill `limit` (peer-controlled
+/// AND local-controlled). Bounds the reply storm on the queryable side
+/// and prevents a misbehaving local engine from issuing oversized
+/// requests on the driver side.
+const CHANNEL_BACKFILL_MAX_LIMIT: usize = 1000;
+
+/// Outcome of parsing a channel-log backfill selector key.
+///
+/// Distinguishes "valid selector with the explicit `0` sentinel (=
+/// from earliest)" from "malformed selector". Previously both
+/// collapsed to `since = None`, which silently widened a malformed
+/// selector like `harmony/channels/.../since/not_hlc/500` into a
+/// real full backfill — broader result set than intended and
+/// masked protocol bugs in the requester. The queryable now skips
+/// replying entirely on `Invalid`.
+#[derive(Debug)]
+enum ParsedBackfillKey {
+    Valid {
+        /// `None` means the explicit `"0"` sentinel — backfill from
+        /// earliest. `Some(hlc)` means backfill strictly after this
+        /// HLC.
+        since: Option<crate::owner_state_types::Hlc>,
+        /// Raw limit (still subject to the queryable's
+        /// per-engine default + MAX clamp before use).
+        limit: usize,
+    },
+    /// Selector didn't parse — wrong shape, missing segments, or
+    /// non-`"0"` HLC field that didn't decode. Caller MUST skip
+    /// replying.
+    Invalid,
+}
+
+/// Parse `"harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}"`.
+///
+/// Returns `ParsedBackfillKey::Valid` for well-formed selectors
+/// (with `since = None` only when the HLC field is the explicit
+/// `"0"` sentinel), or `ParsedBackfillKey::Invalid` when the
+/// selector is malformed (wrong segment count, wrong literal at
+/// index 4, or non-`"0"` HLC that fails to decode). A bad limit
+/// integer falls back to `0`, which the caller's clamp converts to
+/// the per-engine default — bad-limit isn't fatal, only bad-HLC
+/// is, because the limit field has a safe default but the HLC
+/// field directly determines the result-set boundary.
+fn parse_channel_backfill_key(key: &str) -> ParsedBackfillKey {
+    // Pattern is: harmony / channels / {cid} / {ch_id} / since / {hlc_hex} / {limit}
+    //               0         1          2       3         4        5            6
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() < 7 || parts[4] != "since" {
+        return ParsedBackfillKey::Invalid;
+    }
+    let hlc_hex = parts[5];
+    let limit_str = parts.get(6).copied().unwrap_or("0");
+
+    let since = if hlc_hex == "0" {
+        None
+    } else {
+        match parse_hlc_hex(hlc_hex) {
+            Some(hlc) => Some(hlc),
+            None => return ParsedBackfillKey::Invalid,
+        }
+    };
+    let limit = limit_str.parse::<usize>().unwrap_or(0);
+    ParsedBackfillKey::Valid { since, limit }
+}
+
+fn parse_hlc_hex(hex_str: &str) -> Option<crate::owner_state_types::Hlc> {
+    // wall_ms LE u64 (16 hex) || logical LE u32 (8 hex) || device_id_bytes (rest)
+    if hex_str.len() < 24 {
+        return None;
+    }
+    let wall_ms_bytes = hex::decode(&hex_str[0..16]).ok()?;
+    let logical_bytes = hex::decode(&hex_str[16..24]).ok()?;
+    let device_id_bytes = hex::decode(&hex_str[24..]).ok()?;
+    let wall_ms = u64::from_le_bytes(wall_ms_bytes.try_into().ok()?);
+    let logical = u32::from_le_bytes(logical_bytes.try_into().ok()?);
+    let device_id = String::from_utf8(device_id_bytes).ok()?;
+    Some(crate::owner_state_types::Hlc {
+        wall_ms,
+        logical,
+        device_id,
+    })
+}
+
+fn format_hlc_hex(hlc: &crate::owner_state_types::Hlc) -> String {
+    let mut out = String::new();
+    out.push_str(&hex::encode(hlc.wall_ms.to_le_bytes()));
+    out.push_str(&hex::encode(hlc.logical.to_le_bytes()));
+    out.push_str(&hex::encode(hlc.device_id.as_bytes()));
+    out
+}
+
+#[cfg(test)]
+mod channel_log_adapter_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Spawns the adapter, sends one packet via publisher, asserts
+    /// the subscriber side receives it. Uses an in-memory Zenoh
+    /// router so no real network is touched.
+    ///
+    /// Requires `multi_thread` flavor — Zenoh's runtime panics under
+    /// the default current-thread scheduler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_log_adapter_publish_subscribe_round_trip() {
+        let cfg = zenoh::Config::default();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (qreq_tx, qreq_rx) =
+            mpsc::channel::<crate::community_channel_log_engine::BackfillQueryRequest>(2);
+
+        let read_for_query = Arc::new(
+            |_since: Option<crate::owner_state_types::Hlc>, _limit: usize| {
+                Box::pin(async move { Vec::<Vec<u8>>::new() })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            },
+        );
+
+        let closing = Arc::new(AtomicBool::new(false));
+        // No-op progress callback for the publish/subscribe round-trip
+        // unit test — no backfill query fires here, so the callback is
+        // never invoked.
+        let emit_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(|_, _| {});
+        let _adapter = spawn_channel_log_zenoh_adapter(
+            Arc::clone(&session),
+            "aabb".repeat(8),
+            "ccdd".repeat(8),
+            pub_rx,
+            sub_tx,
+            qreq_rx,
+            read_for_query,
+            emit_progress,
+            16,
+            CHANNEL_BACKFILL_DEFAULT_LIMIT,
+            Arc::clone(&closing),
+        );
+
+        // Wait for the Zenoh subscriber to come online by round-tripping
+        // a synthetic warmup packet. Replaces the prior fixed 250ms sleep
+        // which was scheduler-dependent and flaked under load. We use a
+        // distinct warmup byte sequence so leftover warmup deliveries
+        // can't be mistaken for the real payload assertion below.
+        let warmup_payload = b"__warmup__".to_vec();
+        let warmup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= warmup_deadline {
+                panic!("subscriber didn't come online within 2s");
+            }
+            pub_tx
+                .send(warmup_payload.clone())
+                .await
+                .expect("publish warmup");
+            match tokio::time::timeout(std::time::Duration::from_millis(50), sub_rx.recv()).await {
+                Ok(Some(received)) if received == warmup_payload => break,
+                _ => {
+                    // Subscriber not ready yet; retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Drain any extra warmup deliveries the subscriber may have
+        // queued before it came online, so the real payload assertion
+        // below is unambiguous.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(20), sub_rx.recv()).await {
+                Ok(Some(extra)) if extra == warmup_payload => continue,
+                Ok(Some(other)) => {
+                    panic!("unexpected non-warmup payload during drain: {:?}", other);
+                }
+                _ => break,
+            }
+        }
+
+        let payload = b"channel-log-roundtrip".to_vec();
+        pub_tx.send(payload.clone()).await.expect("publish send");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("sub_rx open");
+        assert_eq!(received, payload);
+
+        closing.store(true, Ordering::SeqCst);
+        // Keep qreq_tx alive until end so the query-request driver
+        // doesn't latch the receiver-closed branch before closing
+        // is observed.
+        drop(qreq_tx);
+    }
+
+    #[test]
+    fn parse_channel_backfill_key_round_trip_with_clamp() {
+        // Format: harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}
+        let key = format!(
+            "harmony/channels/{}/{}/since/0/9999999999",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        let ParsedBackfillKey::Valid {
+            since,
+            limit: limit_raw,
+        } = parse_channel_backfill_key(&key)
+        else {
+            panic!("expected ParsedBackfillKey::Valid for well-formed selector");
+        };
+        assert!(since.is_none(), "since=0 should parse to None");
+        assert_eq!(limit_raw, 9_999_999_999_usize, "raw limit passes through");
+
+        // Verify the clamp logic the queryable would apply:
+        let limit = if limit_raw == 0 {
+            CHANNEL_BACKFILL_DEFAULT_LIMIT
+        } else {
+            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+        };
+        assert_eq!(limit, CHANNEL_BACKFILL_MAX_LIMIT, "clamp caps at hard max");
+    }
+
+    #[test]
+    fn parse_channel_backfill_key_zero_limit_uses_default_after_clamp() {
+        let key = format!(
+            "harmony/channels/{}/{}/since/0/0",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        let ParsedBackfillKey::Valid {
+            since: _,
+            limit: limit_raw,
+        } = parse_channel_backfill_key(&key)
+        else {
+            panic!("expected ParsedBackfillKey::Valid for well-formed selector");
+        };
+        assert_eq!(limit_raw, 0);
+
+        let limit = if limit_raw == 0 {
+            CHANNEL_BACKFILL_DEFAULT_LIMIT
+        } else {
+            limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
+        };
+        assert_eq!(limit, CHANNEL_BACKFILL_DEFAULT_LIMIT);
+    }
+
+    /// Round 3 (R3-1): a malformed HLC field MUST surface as
+    /// `ParsedBackfillKey::Invalid`, not silently widen to a full
+    /// backfill (the prior `(None, _)` collapse). The queryable
+    /// handler skips replying on `Invalid` so a protocol-violating
+    /// requester gets no data instead of getting more data than it
+    /// asked for.
+    #[test]
+    fn parse_channel_backfill_key_rejects_malformed_hlc() {
+        let key = format!(
+            "harmony/channels/{}/{}/since/not_hlc/500",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        match parse_channel_backfill_key(&key) {
+            ParsedBackfillKey::Invalid => {}
+            ParsedBackfillKey::Valid { .. } => {
+                panic!("malformed HLC field must surface as Invalid, not silently widen to full backfill");
+            }
+        }
+    }
 }

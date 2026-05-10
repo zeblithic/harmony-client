@@ -155,6 +155,15 @@ async fn ingest_list_pin_burn_roundtrip() {
                         rx
                     },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
+                    {
+                        // ZEB-270 Phase 3 Task 4.5: channel-log adapter
+                        // request rx; tx dropped immediately so the
+                        // select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                            harmony_app::event_loop::ChannelLogAdapterRequest,
+                        >();
+                        rx
+                    },
                 )
                 .await;
             });
@@ -413,6 +422,15 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                         rx
                     },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
+                    {
+                        // ZEB-270 Phase 3 Task 4.5: channel-log adapter
+                        // request rx; tx dropped immediately so the
+                        // select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                            harmony_app::event_loop::ChannelLogAdapterRequest,
+                        >();
+                        rx
+                    },
                 )
                 .await;
             });
@@ -749,6 +767,15 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                         rx
                     },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
+                    {
+                        // ZEB-270 Phase 3 Task 4.5: channel-log adapter
+                        // request rx; tx dropped immediately so the
+                        // select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                            harmony_app::event_loop::ChannelLogAdapterRequest,
+                        >();
+                        rx
+                    },
                 )
                 .await;
             });

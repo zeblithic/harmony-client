@@ -266,6 +266,15 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                         rx
                     },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
+                    {
+                        // ZEB-270 Phase 3 Task 4.5: channel-log adapter
+                        // request rx; tx dropped immediately so the
+                        // select arm idles.
+                        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                            harmony_app::event_loop::ChannelLogAdapterRequest,
+                        >();
+                        rx
+                    },
                 )
                 .await;
             });
