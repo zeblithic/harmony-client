@@ -2727,7 +2727,20 @@ where
                     res = qbl.recv_async() => {
                         let Ok(query) = res else { break; };
                         let qkey = query.key_expr().to_string();
-                        let (since, limit_raw) = parse_channel_backfill_key(&qkey);
+                        // Reject malformed selectors outright instead of
+                        // silently widening to a full backfill. A bad
+                        // selector like `.../since/not_hlc/500` previously
+                        // collapsed to `since=None` and served the entire
+                        // log — broader result set than the requester
+                        // asked for, and masked protocol bugs. Now we
+                        // skip the reply (continue to next query) and
+                        // log at debug.
+                        let ParsedBackfillKey::Valid { since, limit: limit_raw } =
+                            parse_channel_backfill_key(&qkey)
+                        else {
+                            tracing::debug!(%qkey, "ignoring malformed channel-log backfill selector");
+                            continue;
+                        };
                         // Clamp peer-controlled limit per spec §6.2 (hard
                         // cap 1000). limit=0 falls back to per-engine
                         // default sourced from
@@ -2884,14 +2897,21 @@ where
                             }
                         };
                         // Spec §10: emit a final progress tick at end-of-
-                        // request (so single-event replies + tail-of-
-                        // batch get one event even if N didn't divide
-                        // evenly). Skip if zero replies — nothing to
-                        // signal. Also skip on shutdown — the consumer
-                        // is going away and a final tick after the
-                        // closing flag flipped is racy noise.
-                        if drained_clean && fetched > 0 {
-                            (emit_backfill_progress_qr)(fetched, None);
+                        // request. We always fire on `drained_clean`
+                        // (including `fetched == 0`) so the UI can
+                        // distinguish "backfill finished with zero
+                        // results" from "backfill is still in flight" —
+                        // a zero-result drain is otherwise invisible.
+                        // `total_estimate = Some(fetched)` is the true
+                        // total now that the reply stream has closed
+                        // naturally; this lets the UI tell apart
+                        // periodic mid-drain ticks (where total is
+                        // unknown, `None`) from the terminal one.
+                        // Skip on shutdown — the consumer is going away
+                        // and a final tick after the closing flag
+                        // flipped is racy noise.
+                        if drained_clean {
+                            (emit_backfill_progress_qr)(fetched, Some(fetched));
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -2922,15 +2942,49 @@ const CHANNEL_BACKFILL_DEFAULT_LIMIT: usize = 256;
 /// requests on the driver side.
 const CHANNEL_BACKFILL_MAX_LIMIT: usize = 1000;
 
-/// Parse `"harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}"`
-/// into `(since, limit)`. Returns `(None, 0)` if parsing fails or
-/// if `hlc_hex == "0"`.
-fn parse_channel_backfill_key(key: &str) -> (Option<crate::owner_state_types::Hlc>, usize) {
+/// Outcome of parsing a channel-log backfill selector key.
+///
+/// Distinguishes "valid selector with the explicit `0` sentinel (=
+/// from earliest)" from "malformed selector". Previously both
+/// collapsed to `since = None`, which silently widened a malformed
+/// selector like `harmony/channels/.../since/not_hlc/500` into a
+/// real full backfill — broader result set than intended and
+/// masked protocol bugs in the requester. The queryable now skips
+/// replying entirely on `Invalid`.
+#[derive(Debug)]
+enum ParsedBackfillKey {
+    Valid {
+        /// `None` means the explicit `"0"` sentinel — backfill from
+        /// earliest. `Some(hlc)` means backfill strictly after this
+        /// HLC.
+        since: Option<crate::owner_state_types::Hlc>,
+        /// Raw limit (still subject to the queryable's
+        /// per-engine default + MAX clamp before use).
+        limit: usize,
+    },
+    /// Selector didn't parse — wrong shape, missing segments, or
+    /// non-`"0"` HLC field that didn't decode. Caller MUST skip
+    /// replying.
+    Invalid,
+}
+
+/// Parse `"harmony/channels/{cid}/{ch_id}/since/{hlc_hex}/{limit}"`.
+///
+/// Returns `ParsedBackfillKey::Valid` for well-formed selectors
+/// (with `since = None` only when the HLC field is the explicit
+/// `"0"` sentinel), or `ParsedBackfillKey::Invalid` when the
+/// selector is malformed (wrong segment count, wrong literal at
+/// index 4, or non-`"0"` HLC that fails to decode). A bad limit
+/// integer falls back to `0`, which the caller's clamp converts to
+/// the per-engine default — bad-limit isn't fatal, only bad-HLC
+/// is, because the limit field has a safe default but the HLC
+/// field directly determines the result-set boundary.
+fn parse_channel_backfill_key(key: &str) -> ParsedBackfillKey {
     // Pattern is: harmony / channels / {cid} / {ch_id} / since / {hlc_hex} / {limit}
     //               0         1          2       3         4        5            6
     let parts: Vec<&str> = key.split('/').collect();
     if parts.len() < 7 || parts[4] != "since" {
-        return (None, 0);
+        return ParsedBackfillKey::Invalid;
     }
     let hlc_hex = parts[5];
     let limit_str = parts.get(6).copied().unwrap_or("0");
@@ -2938,10 +2992,13 @@ fn parse_channel_backfill_key(key: &str) -> (Option<crate::owner_state_types::Hl
     let since = if hlc_hex == "0" {
         None
     } else {
-        parse_hlc_hex(hlc_hex)
+        match parse_hlc_hex(hlc_hex) {
+            Some(hlc) => Some(hlc),
+            None => return ParsedBackfillKey::Invalid,
+        }
     };
     let limit = limit_str.parse::<usize>().unwrap_or(0);
-    (since, limit)
+    ParsedBackfillKey::Valid { since, limit }
 }
 
 fn parse_hlc_hex(hex_str: &str) -> Option<crate::owner_state_types::Hlc> {
@@ -3081,7 +3138,13 @@ mod channel_log_adapter_tests {
             "aa".repeat(16),
             "bb".repeat(16)
         );
-        let (since, limit_raw) = parse_channel_backfill_key(&key);
+        let ParsedBackfillKey::Valid {
+            since,
+            limit: limit_raw,
+        } = parse_channel_backfill_key(&key)
+        else {
+            panic!("expected ParsedBackfillKey::Valid for well-formed selector");
+        };
         assert!(since.is_none(), "since=0 should parse to None");
         assert_eq!(limit_raw, 9_999_999_999_usize, "raw limit passes through");
 
@@ -3101,7 +3164,13 @@ mod channel_log_adapter_tests {
             "aa".repeat(16),
             "bb".repeat(16)
         );
-        let (_since, limit_raw) = parse_channel_backfill_key(&key);
+        let ParsedBackfillKey::Valid {
+            since: _,
+            limit: limit_raw,
+        } = parse_channel_backfill_key(&key)
+        else {
+            panic!("expected ParsedBackfillKey::Valid for well-formed selector");
+        };
         assert_eq!(limit_raw, 0);
 
         let limit = if limit_raw == 0 {
@@ -3110,5 +3179,26 @@ mod channel_log_adapter_tests {
             limit_raw.min(CHANNEL_BACKFILL_MAX_LIMIT)
         };
         assert_eq!(limit, CHANNEL_BACKFILL_DEFAULT_LIMIT);
+    }
+
+    /// Round 3 (R3-1): a malformed HLC field MUST surface as
+    /// `ParsedBackfillKey::Invalid`, not silently widen to a full
+    /// backfill (the prior `(None, _)` collapse). The queryable
+    /// handler skips replying on `Invalid` so a protocol-violating
+    /// requester gets no data instead of getting more data than it
+    /// asked for.
+    #[test]
+    fn parse_channel_backfill_key_rejects_malformed_hlc() {
+        let key = format!(
+            "harmony/channels/{}/{}/since/not_hlc/500",
+            "aa".repeat(16),
+            "bb".repeat(16)
+        );
+        match parse_channel_backfill_key(&key) {
+            ParsedBackfillKey::Invalid => {}
+            ParsedBackfillKey::Valid { .. } => {
+                panic!("malformed HLC field must surface as Invalid, not silently widen to full backfill");
+            }
+        }
     }
 }
