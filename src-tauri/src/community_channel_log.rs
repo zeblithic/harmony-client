@@ -552,7 +552,7 @@ pub async fn verify_channel_event<S, R>(
     replay_tracker: &mut ChannelLogReplayTracker,
 ) -> Result<(), ChannelEventError>
 where
-    S: CommunityStateAtHlc + Sync,
+    S: CommunityStateAtHlc + Sync + ?Sized,
     R: ChannelIdentityResolver + ?Sized,
 {
     let SignedChannelEvent::Post {
@@ -782,6 +782,16 @@ impl ChannelLog {
             config,
             root,
         }
+    }
+
+    /// Borrow the config this log was built with. Phase 3's flush
+    /// loop reads `seal_threshold_events` to drive the seal-on-tail-
+    /// length policy from outside the per-append `Ok(seal_ready)`
+    /// signal — necessary because the flush loop also handles tails
+    /// that were appended directly by tests bypassing the engine's
+    /// publish path.
+    pub fn config(&self) -> &ChannelLogConfig {
+        &self.config
     }
 
     /// Push a verified event onto the in-memory tail. Validates that
