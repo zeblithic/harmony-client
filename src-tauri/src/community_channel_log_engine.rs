@@ -248,19 +248,54 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     pub async fn new(
         params: ChannelLogEngineParams<R>,
     ) -> Result<Arc<Self>, ChannelLogEngineError> {
-        let log = ChannelLog::new(
+        // Per spec §14.2 acceptance criterion + §17.4 (segments persist
+        // across stop/respawn): on construction, attempt to reload any
+        // on-disk log state. ChannelLog::reload returns a fresh empty
+        // log if no manifest exists (cold start) — same shape as
+        // ChannelLog::new in that case. The boolean second-tuple value
+        // (segment_count + tail.len) is unused here; we just want the
+        // tail in memory so the replay tracker rebuild below sees it.
+        let (log, _total_count) = ChannelLog::reload(
             params.community_id,
             params.channel_id,
             params.root_dir,
             params.config.log_config.clone(),
-        );
+        )
+        .map_err(ChannelLogEngineError::Persist)?;
+
+        // Per spec §14.2 step 5 (deduped against existing log entries
+        // by message_id): on respawn the replay tracker must reflect
+        // every author/device HLC already on disk. Otherwise backfill
+        // replies for previously-stored events get re-appended +
+        // re-emitted (the tracker's would_accept gate is what dedupes
+        // backfill; it can't dedupe what it never saw). We walk the
+        // tail (loaded above) AND each sealed segment to rebuild
+        // last_seen.
+        //
+        // Why call `record` directly (vs `check_and_advance`): on-disk
+        // events were validated when first appended; re-running the
+        // replay check during a rebuild would falsely flag the SECOND
+        // occurrence of any (author, device) lane as a replay. We just
+        // want the high-water mark recorded.
+        let mut tracker = ChannelLogReplayTracker::new();
+        for ev in &log.tail {
+            tracker.record(ev);
+        }
+        for seg in &log.manifest.segments {
+            let events = log
+                .read_segment(seg)
+                .map_err(ChannelLogEngineError::Persist)?;
+            for ev in &events {
+                tracker.record(ev);
+            }
+        }
 
         let engine = Arc::new(Self {
             community_id: params.community_id,
             channel_id: params.channel_id,
             channel_key: params.channel_key,
             log: Arc::new(Mutex::new(log)),
-            replay_tracker: Arc::new(Mutex::new(ChannelLogReplayTracker::new())),
+            replay_tracker: Arc::new(Mutex::new(tracker)),
             state_at_hlc: params.state_at_hlc,
             resolver: params.resolver,
             self_owner: params.self_owner,
@@ -1111,6 +1146,34 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // Unbounded send is non-blocking (no .await) — the bridge
         // can't apply back-pressure. See `adapter_request_tx` doc on
         // ChannelLogRegistryConfig for why.
+        // Per spec §10: emit `channel-backfill-progress` from the
+        // adapter's qr task. The adapter is runtime-erased (sees no
+        // `tauri::AppHandle<R>`), so the registry constructs a closure
+        // that captures the AppHandle (typed at registry-creation
+        // time) and emits a `ChannelBackfillProgressPayload`.
+        let app_progress = self.config.app.clone();
+        let community_id_hex_progress = hex::encode(community_id.0);
+        let channel_id_hex_progress = hex::encode(channel_id.0);
+        let emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(move |fetched: u32, total_estimate: Option<u32>| {
+                use tauri::Emitter;
+                let payload = ChannelBackfillProgressPayload {
+                    community_id: community_id_hex_progress.clone(),
+                    channel_id: channel_id_hex_progress.clone(),
+                    fetched,
+                    total_estimate,
+                };
+                if let Err(e) = app_progress.emit("channel-backfill-progress", &payload) {
+                    tracing::warn!(
+                        community_id = %community_id_hex_progress,
+                        channel_id = %channel_id_hex_progress,
+                        err = ?e,
+                        "failed to emit channel-backfill-progress"
+                    );
+                }
+            });
+        let backfill_progress_interval = self.config.engine_config.backfill_progress_event_interval;
+
         if let Err(e) =
             self.config
                 .adapter_request_tx
@@ -1121,6 +1184,8 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                     subscriber_tx,
                     query_request_rx,
                     read_for_query,
+                    emit_backfill_progress,
+                    backfill_progress_interval,
                     closing: Arc::clone(&closing),
                 })
         {
@@ -2170,6 +2235,8 @@ mod tests {
                     req.subscriber_tx,
                     req.query_request_rx,
                     req.read_for_query,
+                    req.emit_backfill_progress,
+                    req.backfill_progress_interval,
                     req.closing,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget;

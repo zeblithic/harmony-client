@@ -354,14 +354,45 @@ pub fn encrypt_channel_packet(
     key: &ChannelKey,
     event: &SignedChannelEvent,
 ) -> Result<Vec<u8>, ChannelEventError> {
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    encrypt_channel_packet_with_nonce_inner(key, event, nonce.into())
+}
+
+/// Deterministic-nonce variant of `encrypt_channel_packet`. Used by
+/// the wire-format pin tests in `tests/wire_format_channel_log_fixtures.rs`
+/// to assert backfill replies (and live broadcasts) are byte-stable
+/// under fixed inputs — the random-nonce variant above is the
+/// production path; this is a test-only helper.
+///
+/// SECURITY: caller must supply a unique nonce per (key, plaintext)
+/// pair. Reusing a nonce under the same key is catastrophic for
+/// ChaCha20-Poly1305 confidentiality + integrity. Production code MUST
+/// use `encrypt_channel_packet`; this helper exists only because pin
+/// tests need byte-determinism.
+#[doc(hidden)]
+pub fn encrypt_channel_packet_with_nonce(
+    key: &ChannelKey,
+    event: &SignedChannelEvent,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
+    encrypt_channel_packet_with_nonce_inner(key, event, nonce)
+}
+
+/// Internal encrypt helper — both `encrypt_channel_packet` and the
+/// pin-test variant `encrypt_channel_packet_with_nonce` route through
+/// this single AEAD-call site so the wire format stays in sync.
+fn encrypt_channel_packet_with_nonce_inner(
+    key: &ChannelKey,
+    event: &SignedChannelEvent,
+    nonce: [u8; 12],
+) -> Result<Vec<u8>, ChannelEventError> {
     let mut plaintext = Vec::with_capacity(256);
     ciborium::into_writer(event, &mut plaintext)
         .map_err(|e| ChannelEventError::CborEncode(e.to_string()))?;
     let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
-    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(
-            &nonce,
+            (&nonce).into(),
             Payload {
                 msg: &plaintext,
                 aad: CHANNEL_PACKET_AAD,
@@ -369,7 +400,7 @@ pub fn encrypt_channel_packet(
         )
         .map_err(|e| ChannelEventError::AeadEncrypt(e.to_string()))?;
     let mut packet = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    packet.extend_from_slice(nonce.as_slice());
+    packet.extend_from_slice(&nonce);
     packet.extend_from_slice(&ciphertext);
     Ok(packet)
 }

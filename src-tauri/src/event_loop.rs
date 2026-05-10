@@ -116,6 +116,19 @@ pub struct ChannelLogAdapterRequest {
             + Sync
             + 'static,
     >,
+    /// Per spec §10 + §8.4: emit `channel-backfill-progress` Tauri
+    /// event from the query-request driver task every N events
+    /// (`backfill_progress_event_interval`) and once at end. Receives
+    /// (`fetched`, `total_estimate`); the adapter doesn't know the AppHandle
+    /// directly (the registry constructs the closure with its `app:
+    /// AppHandle<R>` captured), so this callback bridges the runtime
+    /// type erasure.
+    #[allow(clippy::type_complexity)]
+    pub emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static>,
+    /// Spec §10: how many incoming reply packets to count between
+    /// progress emissions. Default 16; tests can override via
+    /// `ChannelLogEngineConfig.backfill_progress_event_interval`.
+    pub backfill_progress_interval: usize,
     /// Closing flag for the adapter task. Independent from the
     /// engine's internal closing flag — they're flipped by separate
     /// paths:
@@ -1403,6 +1416,8 @@ pub async fn run<R: Runtime>(
                     req.subscriber_tx,
                     req.query_request_rx,
                     req.read_for_query,
+                    req.emit_backfill_progress,
+                    req.backfill_progress_interval,
                     req.closing,
                 );
                 // JoinHandle dropped — adapter task is fire-and-forget.
@@ -2535,6 +2550,8 @@ pub fn spawn_channel_log_zenoh_adapter<F>(
         crate::community_channel_log_engine::BackfillQueryRequest,
     >,
     read_for_query: Arc<F>,
+    emit_backfill_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static>,
+    backfill_progress_interval: usize,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -2728,6 +2745,7 @@ where
         let channel_id_hex_qr = channel_id_hex.clone();
         let subscriber_tx_qr = subscriber_tx.clone();
         let closing_qr = Arc::clone(&closing);
+        let emit_backfill_progress_qr = Arc::clone(&emit_backfill_progress);
         let qr_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2750,7 +2768,19 @@ where
                             "harmony/channels/{}/{}/since/{}/{}",
                             community_id_hex_qr, channel_id_hex_qr, since_hex, limit
                         );
-                        let receiver = match session_qr.get(&key).await {
+                        // ConsolidationMode::None: backfill streams ALL
+                        // per-event reply packets back from the queryable
+                        // (spec §17.1: per-event packets, wire-identical
+                        // to live broadcasts). Default consolidation
+                        // (Auto → Latest) collapses to a single reply per
+                        // source key, dropping every event but one.
+                        // Mirrors the `mailbox_get_first_value` shape at
+                        // `event_loop.rs:1903`.
+                        let receiver = match session_qr
+                            .get(&key)
+                            .consolidation(zenoh::query::ConsolidationMode::None)
+                            .await
+                        {
                             Ok(r) => r,
                             Err(e) => {
                                 if !closing_qr.load(Ordering::SeqCst) {
@@ -2763,6 +2793,7 @@ where
                                 continue;
                             }
                         };
+                        let mut fetched: u32 = 0;
                         while let Ok(reply) = receiver.recv_async().await {
                             if let Ok(sample) = reply.into_result() {
                                 let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
@@ -2777,7 +2808,27 @@ where
                                     // poll catches up.
                                     return;
                                 }
+                                fetched = fetched.saturating_add(1);
+                                // Spec §10: emit channel-backfill-progress
+                                // every N replies. `total_estimate` is
+                                // `None` — we don't know the total until
+                                // the receiver closes (Zenoh streams
+                                // replies one-at-a-time).
+                                if backfill_progress_interval > 0
+                                    && (fetched as usize)
+                                        .is_multiple_of(backfill_progress_interval)
+                                {
+                                    (emit_backfill_progress_qr)(fetched, None);
+                                }
                             }
+                        }
+                        // Spec §10: emit a final progress tick at end-of-
+                        // request (so single-event replies + tail-of-
+                        // batch get one event even if N didn't divide
+                        // evenly). Skip if zero replies — nothing to
+                        // signal.
+                        if fetched > 0 {
+                            (emit_backfill_progress_qr)(fetched, None);
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -2881,6 +2932,11 @@ mod channel_log_adapter_tests {
         );
 
         let closing = Arc::new(AtomicBool::new(false));
+        // No-op progress callback for the publish/subscribe round-trip
+        // unit test — no backfill query fires here, so the callback is
+        // never invoked.
+        let emit_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(|_, _| {});
         let _adapter = spawn_channel_log_zenoh_adapter(
             Arc::clone(&session),
             "aabb".repeat(8),
@@ -2889,6 +2945,8 @@ mod channel_log_adapter_tests {
             sub_tx,
             qreq_rx,
             read_for_query,
+            emit_progress,
+            16,
             Arc::clone(&closing),
         );
 
