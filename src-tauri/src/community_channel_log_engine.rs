@@ -232,6 +232,14 @@ pub struct ChannelLogEngine<R: tauri::Runtime> {
 
     flush_dirty: Arc<Notify>,
     closing: Arc<AtomicBool>,
+    /// Wakeup signal for background loops to re-check `closing`.
+    /// Both the receive and flush loops `.notified()` on this in
+    /// their outer `select!` instead of polling the closing flag on
+    /// a 1s timer. `shutdown` calls `notify_waiters` (NOT
+    /// `notify_one`) after flipping `closing` so both loops wake.
+    /// `closing` remains the source of truth; `Notify` only ensures
+    /// prompt wakeup so the next `closing.load()` happens within ms.
+    closing_notify: Arc<Notify>,
 }
 
 impl<R: tauri::Runtime> ChannelLogEngine<R> {
@@ -268,6 +276,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             flush_handle: Mutex::new(None),
             flush_dirty: Arc::new(Notify::new()),
             closing: Arc::new(AtomicBool::new(false)),
+            closing_notify: Arc::new(Notify::new()),
         });
 
         // Spawn receive loop, taking ownership of subscriber_rx.
@@ -275,6 +284,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             let me = Arc::clone(&engine);
             let mut rx = params.subscriber_rx;
             let closing = Arc::clone(&engine.closing);
+            let closing_notify = Arc::clone(&engine.closing_notify);
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -283,7 +293,7 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
                             let Some(packet) = maybe else { break; };
                             me.process_inbound_packet(packet).await;
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        _ = closing_notify.notified() => {
                             if closing.load(Ordering::SeqCst) { break; }
                         }
                     }
@@ -310,6 +320,10 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     /// in-memory tail has been written to disk.
     pub async fn shutdown(&self) -> Result<(), ChannelLogEngineError> {
         self.closing.store(true, Ordering::SeqCst);
+        // Wake BOTH background loops (receive + flush) so they re-check
+        // `closing` and exit promptly. `notify_waiters` (vs `notify_one`)
+        // delivers to every current waiter; we have two.
+        self.closing_notify.notify_waiters();
         self.flush_dirty.notify_one();
 
         // Force-flush the tail synchronously BEFORE dropping the flush
@@ -464,9 +478,39 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
         let packet = encrypt_channel_packet(&self.channel_key, &event)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
 
+        // Order matters here. We must bump the replay tracker BEFORE
+        // putting the packet on publisher_tx — otherwise a Zenoh
+        // self-loopback delivery via subscriber_rx can race
+        // process_inbound_packet through verify_channel_event (which
+        // calls would_accept against a not-yet-bumped tracker, passes,
+        // then advances + appends + emits) before publish gets to its
+        // own append, producing a duplicate tail entry persisted to
+        // disk. With this ordering, any loopback packet finds the
+        // tracker already at the new HLC and is dropped as Replay at
+        // the receive-loop's debug level. Aligns with
+        // feedback_metadata_before_irreversible_write (verify state
+        // before broadcast) and feedback_two_ipc_toctou (bind through
+        // server-side cached state, not via re-verification on the
+        // loopback path).
+        {
+            let mut tracker = self.replay_tracker.lock().await;
+            // Self-mint path: HLC reservation guarantees this event is
+            // strictly newer than any prior on this lane (the
+            // `hlc_tracker` lock above is the serialization point), so
+            // would_accept is a known-true precondition and we call
+            // record directly. record is unconditional insert.
+            tracker.record(&event);
+        }
+        {
+            let mut log = self.log.lock().await;
+            log.append(event.clone())
+                .map_err(ChannelLogEngineError::Persist)?;
+        }
+
         // Send to adapter for Zenoh broadcast. Drop on full channel
-        // (degraded mode) — local append still proceeds so the user
-        // sees their own message.
+        // (degraded mode) — local append already succeeded so the user
+        // sees their own message; remote peers will catch up via
+        // backfill on next reconnect.
         if let Err(e) = self.publisher_tx.try_send(packet) {
             tracing::warn!(
                 community_id = ?self.community_id,
@@ -474,22 +518,6 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
                 err = ?e,
                 "publisher_tx full or closed; broadcast skipped"
             );
-        }
-
-        // Local append + replay tracker bump.
-        {
-            let mut log = self.log.lock().await;
-            log.append(event.clone())
-                .map_err(ChannelLogEngineError::Persist)?;
-        }
-        {
-            let mut tracker = self.replay_tracker.lock().await;
-            // would_accept + record split; we just minted this event
-            // so it's strictly newer than any prior on this lane.
-            // Ignore would_accept error here — record is idempotent
-            // by-key and the local-mint path is the source of truth.
-            let _ = tracker.would_accept(&event);
-            tracker.record(&event);
         }
 
         // Notify flush loop.
@@ -656,12 +684,13 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
 
         tokio::spawn(async move {
             let closing = Arc::clone(&me.closing);
+            let closing_notify = Arc::clone(&me.closing_notify);
             loop {
-                // Wait for first dirty notification (or 1s closing-poll tick).
+                // Wait for first dirty notification (or shutdown wakeup).
                 tokio::select! {
                     biased;
                     _ = me.flush_dirty.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    _ = closing_notify.notified() => {
                         if closing.load(Ordering::SeqCst) { break; }
                         continue;
                     }
@@ -1453,5 +1482,27 @@ mod tests {
     async fn engine_construct_shutdown_round_trip() {
         let fix = build_engine_fixture(8, 250, 1000).await;
         fix.engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Shutdown must complete promptly via the closing_notify wakeup
+    /// path rather than the previous 1s closing-flag-poll. Tightens
+    /// the API contract that Ok(()) means the background loops have
+    /// actually exited (or are about to within a few ms) and removes
+    /// a known source of TempDir-cleanup test flakiness.
+    ///
+    /// 200ms gives generous slack vs the previous 0–1000ms range.
+    /// The flush loop's inner sliding-debounce can still hold up
+    /// shutdown if it's mid-debounce, but with no dirty events here
+    /// that path never enters.
+    #[tokio::test]
+    async fn shutdown_completes_promptly() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let start = std::time::Instant::now();
+        fix.engine.shutdown().await.expect("shutdown");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "shutdown took {elapsed:?}, expected < 200ms"
+        );
     }
 }
