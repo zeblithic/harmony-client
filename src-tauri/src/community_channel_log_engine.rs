@@ -1103,6 +1103,7 @@ impl<R: tauri::Runtime> CommunityTransactionGuard<R> {
                     } else {
                         tracing::warn!(
                             community_id = ?self.community_id,
+                            error = ?e,
                             "additional deferred-spawn failure during commit drain \
                              (ignored, first error already captured)"
                         );
