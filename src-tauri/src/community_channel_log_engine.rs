@@ -1290,12 +1290,35 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     /// Test-only — `true` if a `PendingTransaction` exists for
     /// `community_id`.
     #[cfg(test)]
-    fn has_pending_transaction_for_test(&self, community_id: &SpaceId) -> bool {
+    pub(crate) fn has_pending_transaction_for_test(&self, community_id: &SpaceId) -> bool {
         let map = self
             .pending_transactions
             .lock()
             .expect("pending_transactions poisoned");
         map.contains_key(community_id)
+    }
+
+    /// Test-only — total number of engine entries in the registry map.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn engines_count_for_test(&self) -> usize {
+        let engines = self.engines.lock().await;
+        engines.len()
+    }
+
+    /// Test-only — all engines registered for `community_id`. Returns a
+    /// `Vec` of `(ChannelId, Arc<ChannelLogEngine<R>>)` pairs so callers
+    /// can assert both count and identity without exposing the full map.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn engines_for_community_for_test(
+        &self,
+        community_id: &SpaceId,
+    ) -> Vec<(ChannelId, Arc<ChannelLogEngine<R>>)> {
+        let engines = self.engines.lock().await;
+        engines
+            .iter()
+            .filter(|((cid, _), _)| cid == community_id)
+            .map(|((_, chid), entry)| (*chid, Arc::clone(&entry.engine)))
+            .collect()
     }
 
     /// Spawn a per-channel engine + adapter for `(community_id, channel_id)`.

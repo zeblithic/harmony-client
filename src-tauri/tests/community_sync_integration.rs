@@ -1879,6 +1879,9 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
 // differ.
 #[tokio::test]
 async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
+    use harmony_app::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
     use harmony_app::community_state_sync::{
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
     };
@@ -1929,6 +1932,23 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         signing_key: Arc::clone(&signing_key),
     }));
 
+    // ZEB-271: ChannelLogRegistry required by the new create_community_inner
+    // signature. Build a minimal instance with a dummy adapter bridge — no
+    // Zenoh session needed since this test returns before any channel-log
+    // spawns occur (adapter dispatch fails first).
+    let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
+    let app = tauri::test::mock_app();
+    let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        adapter_request_tx: channel_log_adapter_tx,
+        app: app.handle().clone(),
+        identity_dir: dir.path().to_path_buf(),
+        self_owner,
+        self_device_id: "test-dev".into(),
+        signing_key: Arc::clone(&signing_key),
+        engine_config: ChannelLogEngineConfig::default(),
+    });
+
     // Pre-call snapshot of owner-state's canonical byte encoding. Any
     // mutation between here and the post-call snapshot would change at
     // least one byte (the schema version byte stays put, but the body
@@ -1950,12 +1970,12 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     // Drive `create_community_inner` directly. With a closed adapter
     // channel, the helper:
     //   1. mints Space + bootstrap_join (no side effects)
-    //   2. spawns the engine (success)
-    //   3. `community_adapter_tx.try_send` → Closed → rollback branch:
-    //      `community_registry.stop_engine` then `return Err(...)`
-    // crdt_state is not touched on this branch. Phase 4 Task 7 will
-    // swap stop_engine for shutdown_engine_and_cleanup_persistence;
-    // for ZEB-258 the byte-identity invariant is on owner-state alone.
+    //   2. ZEB-271: opens a CommunityTransactionGuard
+    //   3. spawns the engine (success)
+    //   4. `community_adapter_tx.try_send` → Closed → rollback branch:
+    //      `community_registry.shutdown_engine_and_cleanup_persistence`
+    //      then `return Err(...)` (guard dropped → safety-net abort)
+    // crdt_state is not touched on this branch.
     let result = harmony_app::create_community_inner(
         "TestCommunity".into(),
         false,
@@ -1966,6 +1986,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         Arc::clone(&signing_key),
         Arc::clone(&registry),
         adapter_tx,
+        channel_log_registry,
         0, // snapshot_generation; fence not reached on this path
         &node_state,
     )
