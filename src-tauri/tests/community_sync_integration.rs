@@ -2474,6 +2474,9 @@ mod task3_kick_setpower_round_trip {
 // Mutex and compares `generation`, while this test passes `|| Ok(())`.
 #[tokio::test]
 async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
+    use harmony_app::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
     use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
     use harmony_app::community_state_sync::{
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
@@ -2662,6 +2665,23 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         Arc::clone(&bob),
     )));
 
+    // ZEB-271: ChannelLogRegistry required by the new redeem_invite_inner
+    // signature. Build a minimal instance with a dummy adapter bridge — no
+    // Zenoh session needed since this test fails before any channel-log
+    // spawns occur (inviter is unreachable → timeout → rollback).
+    let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
+    let app = tauri::test::mock_app();
+    let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        adapter_request_tx: channel_log_adapter_tx,
+        app: app.handle().clone(),
+        identity_dir: dir.path().to_path_buf(),
+        self_owner: bob_addr,
+        self_device_id: "bob-dev".into(),
+        signing_key: Arc::clone(&bob_signing_key),
+        engine_config: ChannelLogEngineConfig::default(),
+    });
+
     // Pre-call snapshot of owner-state's canonical encoding. Any
     // mutation between here and post-call would change the bytes.
     let pre_bytes: Vec<u8> = {
@@ -2686,6 +2706,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         adapter_tx,
         unicast_tx,
         Arc::clone(&dm_outbox),
+        channel_log_registry,
         || Ok(()),
     )
     .await;

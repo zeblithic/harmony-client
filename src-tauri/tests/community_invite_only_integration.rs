@@ -29,6 +29,9 @@
 //!     the same Phase 2 round-trip pattern as
 //!     `community_open_flow_integration::open_community_create_redeem_leave_round_trip`.
 
+use harmony_app::community_channel_log_engine::{
+    ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+};
 use harmony_app::community_invite::{
     self, canonical_invite_token_bytes, CommunityInvitePayload, InviteToken,
 };
@@ -404,6 +407,24 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         }
     });
 
+    // ZEB-271: ChannelLogRegistry required by the new redeem_invite_inner
+    // signature. Build a minimal instance with a dummy adapter bridge for
+    // Bob's side. No Zenoh drainer is needed — sends succeed (receiver alive)
+    // but the request just queues; harmless since the channel-log is not the
+    // focus of this integration test.
+    let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
+    let bob_app = tauri::test::mock_app();
+    let bob_channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        adapter_request_tx: bob_channel_log_adapter_tx,
+        app: bob_app.handle().clone(),
+        identity_dir: dir_b.path().to_path_buf(),
+        self_owner: bob_addr,
+        self_device_id: "bob-dev".into(),
+        signing_key: Arc::clone(&bob_sk),
+        engine_config: ChannelLogEngineConfig::default(),
+    });
+
     // Bob redeems. redeem_invite_inner spawns Bob's engine (fresh, no
     // pre-spawn), inserts alice's bootstrap_join from the invite URL
     // into Bob's engine, sends the unicast packet to Alice, Alice
@@ -421,6 +442,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         bob_adapter_tx,
         bob_unicast_tx,
         Arc::clone(&bob_dm_outbox),
+        bob_channel_log_registry,
         || Ok(()),
     )
     .await;

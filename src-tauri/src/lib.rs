@@ -8411,7 +8411,7 @@ pub fn mint_redemption(
 /// `Fn` (not `FnOnce`) so future-proof retries can re-call without
 /// consuming.
 #[allow(clippy::too_many_arguments)]
-pub async fn redeem_invite_inner<F>(
+pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
@@ -8424,6 +8424,9 @@ pub async fn redeem_invite_inner<F>(
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
     dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
     fence_check: F,
 ) -> Result<RedeemInviteResultDto, String>
 where
@@ -8445,6 +8448,12 @@ where
 
     // 5. Mint (pure helper — no side effects on owner-state yet).
     let minted = mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?;
+
+    // ZEB-271: open a channel-log transaction. Protects against remote
+    // ChannelCreate events that arrive via Zenoh sync between
+    // spawn_engine and apply_space — they're queued, only fire on
+    // commit, dropped on rollback. See spec §4.2.
+    let channel_log_tx = channel_log_registry.begin_transaction(minted.community_id);
 
     // ZEB-267 (replaces the prior ZEB-258 comment): the HLC tracker
     // is bumped at reservation time (step 4) regardless of whether
@@ -9069,6 +9078,14 @@ where
         // state_g drops at scope end.
     }
 
+    // ZEB-271: durable commit reached. Drain any queued channel-log
+    // spawns that Zenoh sync surfaced during this redemption's critical
+    // section (between spawn_engine and apply_space).
+    channel_log_tx
+        .commit()
+        .await
+        .map_err(|e| format!("channel_log_registry tx commit: {e}"))?;
+
     // 10. Return DTO with the invite's name + kind so the caller can
     // render the new community without re-decoding the URL or
     // round-tripping. ZEB-265.
@@ -9162,6 +9179,7 @@ async fn redeem_invite(
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
+        channel_log_registry,
         dm_outbox,
         snapshot_generation,
     ) = {
@@ -9184,6 +9202,9 @@ async fn redeem_invite(
             g.unicast_send_tx
                 .clone()
                 .ok_or("unicast_send_tx missing — no owner identity?")?,
+            g.channel_log_registry
+                .clone()
+                .ok_or("channel_log_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
@@ -9240,6 +9261,7 @@ async fn redeem_invite(
         community_adapter_tx,
         unicast_send_tx,
         dm_outbox,
+        channel_log_registry,
         fence_check,
     )
     .await?;
@@ -9267,9 +9289,245 @@ async fn redeem_invite(
 #[cfg(test)]
 mod redeem_invite_inner_tests {
     use super::*;
+    use crate::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
     use crate::community_invite::CommunityInvitePayload;
-    use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
+    use crate::content_store::{ContentStore, RuntimeContentStore};
+    use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc, MembershipKey, OwnerAddr, SpaceId};
     use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use tokio::sync::mpsc;
+
+    // ── Fixture helper ────────────────────────────────────────────────────────
+
+    fn signing_key_from_identity(
+        identity: &PrivateIdentity,
+    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
+    }
+
+    struct RedeemInviteTestFixture {
+        crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        device_id: String,
+        self_owner: OwnerAddr,
+        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        community_registry: std::sync::Arc<CommunitySyncRegistry>,
+        community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+        channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+        // Held alive so channels don't report Closed.
+        _community_adapter_rx:
+            tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+        _unicast_rx: tokio::sync::mpsc::Receiver<UnicastSendRequest>,
+        _channel_log_adapter_rx:
+            tokio::sync::mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Build a minimal fixture for `redeem_invite_inner` unit tests.
+    ///
+    /// Key design choices:
+    /// - OPEN-only invite: `is_invite_only = false` avoids the Zenoh unicast
+    ///   path; the happy path inserts the bootstrap_join locally via the engine
+    ///   and proceeds to fence_check → apply_space.
+    /// - `delta_tx: None` in `CommunityRegistryConfig` — no ChannelCreate
+    ///   events flow to `channel_log_registry`. The registry is present to
+    ///   receive `begin_transaction` + guard drop / `commit()` calls.
+    /// - The channel-log registry uses a dummy adapter bridge (unbounded
+    ///   sender + receiver kept alive). No Zenoh drainer runs — harmless
+    ///   since no spawns reach `spawn_inner_now` during an OPEN redeem
+    ///   (remote Zenoh events don't arrive in unit tests).
+    /// - `unicast_send_tx` receiver is kept alive so try_send doesn't see
+    ///   Closed (needed by the INVITE-ONLY branch; unused on the OPEN path).
+    async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        // Joiner identity (self).
+        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let self_owner = OwnerAddr(joiner_identity.identity.address_hash);
+        let signing_key = signing_key_from_identity(&joiner_identity);
+
+        // Admin identity (invite creator). Used only for invite payload construction.
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_owner = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub_64 = admin_identity.identity.to_public_bytes();
+
+        // Identity resolver that admits events signed by both admin and joiner.
+        struct TwoOwnerResolver {
+            admin: OwnerAddr,
+            admin_pub: [u8; 64],
+            joiner: OwnerAddr,
+            joiner_pub: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for TwoOwnerResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.admin {
+                    Some(self.admin_pub)
+                } else if *addr == self.joiner {
+                    Some(self.joiner_pub)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let joiner_pub_64 = joiner_identity.identity.to_public_bytes();
+
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "joiner-dev".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
+                    admin: admin_owner,
+                    admin_pub: admin_pub_64,
+                    joiner: self_owner,
+                    joiner_pub: joiner_pub_64,
+                }),
+                identity_dir: tmp.path().to_path_buf(),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+            }));
+
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "joiner-dev".into(),
+            self_owner,
+            DeviceIdentityHash(joiner_identity.identity.address_hash),
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::new(joiner_identity),
+        )));
+
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry = ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: channel_log_adapter_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner,
+            self_device_id: "joiner-dev".into(),
+            signing_key: std::sync::Arc::clone(&signing_key),
+            engine_config: ChannelLogEngineConfig::default(),
+        });
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        RedeemInviteTestFixture {
+            crdt_state,
+            hlc_tracker,
+            device_id: "joiner-dev".into(),
+            self_owner,
+            signing_key,
+            community_registry,
+            community_adapter_tx,
+            unicast_send_tx,
+            dm_outbox,
+            channel_log_registry,
+            _community_adapter_rx,
+            _unicast_rx,
+            _channel_log_adapter_rx,
+            _tmp: tmp,
+        }
+    }
+
+    // ── ZEB-271: channel-log transaction coverage ──────────────────────────────
+
+    /// Happy path (spec §7.3): `redeem_invite_inner` returns Ok for an
+    /// OPEN-community invite. After success the transaction must be committed
+    /// (no lingering pending entry in `channel_log_registry`).
+    ///
+    /// Note: unlike `create_community_inner`, `redeem_invite_inner` does NOT
+    /// mint ChannelCreate events — the transaction protects against remote
+    /// ChannelCreate events that arrive via Zenoh sync. In this unit test
+    /// there is no Zenoh session, so the deferred queue is empty at commit.
+    /// The assertion "no pending tx" is a proxy for "commit was called".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn happy_path_no_pending_transaction_after_success() {
+        let fixture = build_redeem_invite_test_fixture().await;
+
+        // Build a minimal OPEN-community invite URL. The invite carries:
+        // - community_id: fixed test bytes so we can check later
+        // - membership_key: arbitrary 32 bytes
+        // - admin_addr: admin_identity.address_hash (matches our resolver)
+        // - is_invite_only: false  ← OPEN path (no Zenoh unicast needed)
+        // - no invite_token / admin_bootstrap
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let community_id = crate::owner_state_types::SpaceId([0xf1; 16]);
+        let membership_key = MembershipKey::new([0x42; 32]);
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr,
+            community_name: "TestRedeemCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "redeem_invite_inner happy path must succeed: {:?}",
+            result
+        );
+
+        // Proxy assertion for "tx was committed": no pending entry
+        // remaining for this community_id.
+        assert!(
+            !fixture
+                .channel_log_registry
+                .has_pending_transaction_for_test(&community_id),
+            "happy path: channel_log transaction must be committed (no lingering pending entry)"
+        );
+    }
+
+    // ── Existing tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn mint_redemption_produces_self_join_and_matching_space() {
