@@ -857,6 +857,14 @@ async fn start_node(
     // scoping, rustc's async generator analysis sees the guard's
     // storage slot as live across the await point and rejects the
     // function as not `Send`.
+    //
+    // ZEB-270 Phase 3 Task 4.5: declared in outer scope so the
+    // post-lock shutdown_all block can take it. Assigned inside the
+    // lock alongside the other `take()` calls below (see
+    // `old_channel_log_registry = guard.channel_log_registry.take();`).
+    let old_channel_log_registry: Option<
+        std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+    >;
     let (
         old_shutdown,
         old_thread,
@@ -930,6 +938,15 @@ async fn start_node(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-270 Phase 3 Task 4.5: take the prior channel-log
+        // registry into the outer-scope binding. Awaited outside the
+        // guard scope (the std `MutexGuard` is `!Send`) — mirrors
+        // `old_community_registry`'s pattern. Hoisted out via the
+        // separate outer binding rather than adding to the already-
+        // saturated tuple. Awaited via `shutdown_all()` BEFORE the
+        // community engine pool shuts down (verify-chain dependency,
+        // same ordering as stop_inner).
+        old_channel_log_registry = guard.channel_log_registry.take();
         tup
     };
 
@@ -960,6 +977,22 @@ async fn start_node(
     // so the new generation's RuntimeUnicastTransport (Task 11) sees no
     // stale clones outside the new NodeState.
     drop(old_unicast_send_tx);
+    // ZEB-270 Phase 3 Task 4.5: explicitly await the previous channel-
+    // log registry's shutdown BEFORE the per-community state engines
+    // tear down. The channel-log engine's verify-on-receive path
+    // resolves identity + state-at-HLC from the matching
+    // CommunitySyncEngine; tearing those down first would break
+    // inflight verifies. Same async ordering rule as stop_inner; here
+    // we're already in async context so no thread::scope juggling
+    // needed.
+    if let Some(registry) = old_channel_log_registry {
+        if let Err(e) = registry.shutdown_all().await {
+            tracing::error!(
+                error = %e,
+                "previous ChannelLogRegistry shutdown_all failed during start_node restart"
+            );
+        }
+    }
     // ZEB-217 Sub-C Phase 2: explicitly await the previous community
     // engine pool's shutdown BEFORE the owner SyncEngine. Mirrors
     // stop_inner's ordering — community engines need their final
@@ -1126,6 +1159,29 @@ async fn start_node(
         > = None;
         let mut community_adapter_requests: Vec<crate::event_loop::CommunityAdapterRequest> =
             Vec::new();
+        // ZEB-270 Phase 3 Task 4.5: bridge channel for the channel-log
+        // adapter requests. Built unconditionally — even when no owner
+        // identity is loaded, `event_loop::run` needs to be passed the
+        // receiver half. The matching sender is only handed to a
+        // ChannelLogRegistry inside the owner-loaded branch below; an
+        // unloaded node has no spawn calls so the rx never wakes.
+        //
+        // **Unbounded.** Boot-time `reconcile_from_state` runs BEFORE
+        // event_loop spawns (the reconcile populates the bridge so
+        // event_loop can wire each request to the session as soon as
+        // it opens). A bounded channel could deadlock at boot if a
+        // user has more channels than the bound — `.send` would await
+        // forever because no consumer exists yet. See
+        // `ChannelLogRegistryConfig.adapter_request_tx` doc for the
+        // full rationale.
+        let (channel_log_adapter_request_tx_outer, channel_log_adapter_request_rx_for_loop) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        // Outer-scope holder for the channel-log registry handle. The
+        // owner-loaded branch builds + populates it; the post-spawn
+        // NodeState assignment below stashes it.
+        let mut channel_log_registry_arc: Option<
+            std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
+        > = None;
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -1328,6 +1384,48 @@ async fn start_node(
                         )
                     };
 
+                    // ZEB-270 Phase 3 Task 4.5: per-(community, channel)
+                    // log engine registry. Built BEFORE the delta
+                    // consumer spawn so the consumer's 3rd callback can
+                    // capture it (the callback fires `registry.spawn` /
+                    // `registry.stop` on Created / Deleted channel-config
+                    // events). Built BEFORE the community_snapshots loop
+                    // so the boot-time `reconcile_from_state` per-
+                    // community can run there.
+                    //
+                    // The matching adapter-request `Receiver` was
+                    // constructed in outer scope above
+                    // (`channel_log_adapter_request_rx_for_loop`) so
+                    // event_loop::run can be called with a uniform
+                    // signature regardless of whether an owner identity
+                    // is loaded. Here we pair the outer `Sender` with
+                    // the registry config — `take()` because the outer
+                    // sender is moved by value once.
+                    let channel_log_registry: std::sync::Arc<
+                        crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>,
+                    > = crate::community_channel_log_engine::ChannelLogRegistry::new(
+                        crate::community_channel_log_engine::ChannelLogRegistryConfig {
+                            adapter_request_tx: channel_log_adapter_request_tx_outer.clone(),
+                            app: app.clone(),
+                            identity_dir: identity_dir.clone(),
+                            self_owner,
+                            self_device_id: device_id.clone(),
+                            signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            engine_config:
+                                crate::community_channel_log_engine::ChannelLogEngineConfig::default(
+                                ),
+                        },
+                    );
+                    // Clones of the registry: one for the delta
+                    // consumer's third callback, one for the boot-time
+                    // reconcile loop below, one for NodeState (assigned
+                    // post-thread-spawn).
+                    let channel_log_registry_for_consumer =
+                        std::sync::Arc::clone(&channel_log_registry);
+                    let channel_log_registry_for_reconcile =
+                        std::sync::Arc::clone(&channel_log_registry);
+                    channel_log_registry_arc = Some(channel_log_registry);
+
                     // Spawn the delta consumer: each `CommunityMembershipDelta`
                     // becomes one `community-members-changed` Tauri event.
                     // Task exits cleanly when every per-engine `delta_tx`
@@ -1377,14 +1475,160 @@ async fn start_node(
                                     }
                                 }
                             },
-                            move |payload: ChannelConfigChangedPayload| async move {
-                                tracing::trace!(
-                                    community_id = %payload.community_id,
-                                    channel_id = %payload.channel_id,
-                                    action = ?payload.action,
-                                    "channel-log registry hook fired (no-op pending Task 4C \
-                                     production wiring)",
-                                );
+                            // ZEB-270 Phase 3 Task 4.5: production
+                            // channel-log registry hook. Per spec §7.3,
+                            // Created → registry.spawn (which derives
+                            // the per-channel key + dispatches the
+                            // adapter request through the bridge);
+                            // Modified → no-op (config change without a
+                            // new log lifecycle event); Deleted →
+                            // registry.stop (idempotent — flushes the
+                            // engine + flips the closing flag; on-disk
+                            // segments persist per spec §17.4).
+                            //
+                            // The closure captures three Arcs through
+                            // a wrapping block expression:
+                            //   - channel-log registry (target of spawn/stop)
+                            //   - community sync registry (source of
+                            //     membership_key + state-at-HLC + identity
+                            //     resolver via engine_arc())
+                            //   - per-device hlc_tracker (the SAME
+                            //     `Arc<Mutex<BTreeMap<String, Hlc>>>`
+                            //     dm_outbox::reserve_next_hlc_for_device
+                            //     uses; channel-log mints share this
+                            //     monotonicity lane).
+                            //
+                            // All three Arcs are cloned per delta
+                            // because the FnMut callback may fire many
+                            // times across the consumer's lifetime —
+                            // each invocation clones for its own future
+                            // body.
+                            {
+                                let registry_for_hook =
+                                    std::sync::Arc::clone(&channel_log_registry_for_consumer);
+                                let community_registry_for_hook = std::sync::Arc::clone(&registry);
+                                let hlc_tracker_for_hook = std::sync::Arc::clone(&tracker);
+                                move |payload: ChannelConfigChangedPayload| {
+                                    let registry = std::sync::Arc::clone(&registry_for_hook);
+                                    let community_registry =
+                                        std::sync::Arc::clone(&community_registry_for_hook);
+                                    let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                                    async move {
+                                        let cid_bytes: [u8; 16] = match hex::decode(
+                                            &payload.community_id,
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.try_into().ok())
+                                        {
+                                            Some(b) => b,
+                                            None => {
+                                                tracing::warn!(
+                                                    community_id = %payload.community_id,
+                                                    "channel-log registry hook: invalid community_id hex"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let chid_bytes: [u8; 16] = match hex::decode(
+                                            &payload.channel_id,
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.try_into().ok())
+                                        {
+                                            Some(b) => b,
+                                            None => {
+                                                tracing::warn!(
+                                                    channel_id = %payload.channel_id,
+                                                    "channel-log registry hook: invalid channel_id hex"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let cid = crate::owner_state_types::SpaceId(cid_bytes);
+                                        let chid =
+                                            crate::community_membership::ChannelId(chid_bytes);
+
+                                        match payload.action {
+                                            ChannelConfigChangeAction::Created => {
+                                                let community_engine = match community_registry
+                                                    .engine_arc(&cid)
+                                                    .await
+                                                {
+                                                    Some(e) => e,
+                                                    None => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            "channel-log registry hook: \
+                                                             no community engine spawned"
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                let membership_key =
+                                                    community_engine.membership_key();
+                                                let key = crate::community_channel_log::derive_channel_key(
+                                                &membership_key,
+                                                &cid,
+                                                &chid,
+                                            );
+                                                let state_at_hlc =
+                                                    community_engine.state_at_hlc_resolver();
+                                                let resolver = match community_engine
+                                                    .identity_resolver()
+                                                {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        tracing::warn!(
+                                                            community_id = %payload.community_id,
+                                                            "channel-log registry hook: \
+                                                             community engine has no identity resolver"
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                                if let Err(e) = registry
+                                                    .spawn(
+                                                        cid,
+                                                        chid,
+                                                        key,
+                                                        state_at_hlc,
+                                                        resolver,
+                                                        hlc_tracker,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        community_id = %payload.community_id,
+                                                        channel_id = %payload.channel_id,
+                                                        error = ?e,
+                                                        "channel-log spawn failed"
+                                                    );
+                                                }
+                                            }
+                                            ChannelConfigChangeAction::Modified => {
+                                                // No-op per spec §7.3. The
+                                                // channel-log itself is
+                                                // unaffected by metadata
+                                                // changes (rename,
+                                                // write_power) — those are
+                                                // membership-CRDT events
+                                                // and the in-flight engine
+                                                // sees them through its
+                                                // shared state-at-HLC view.
+                                            }
+                                            ChannelConfigChangeAction::Deleted => {
+                                                if let Err(e) = registry.stop(&cid, &chid).await {
+                                                    tracing::warn!(
+                                                        community_id = %payload.community_id,
+                                                        channel_id = %payload.channel_id,
+                                                        error = ?e,
+                                                        "channel-log stop failed"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             },
                         ));
                     }
@@ -1515,6 +1759,63 @@ async fn start_node(
                                 subscriber_tx: sub_tx,
                             },
                         );
+
+                        // ZEB-270 Phase 3 Task 4.5: walk this
+                        // community's materialized channels map and
+                        // spawn a per-channel engine for each live
+                        // (non-tombstoned) entry. Source the
+                        // membership_key from the just-spawned engine
+                        // (clone-by-value; same bytes as `mk` above
+                        // which got moved into spawn_engine). The
+                        // adapter requests for the per-channel engines
+                        // queue into `channel_log_adapter_request_tx_outer`
+                        // — the matching rx is moved into event_loop
+                        // below, where it's drained AFTER the Zenoh
+                        // session opens.
+                        if let Some(community_engine) = registry.engine_arc(&space_id).await {
+                            // Materialise the channels map under the
+                            // engine's CRDT lock. `materialized` (cached)
+                            // is cheap — it holds the lock briefly,
+                            // recomputes if stale, returns a clone.
+                            let materialized = {
+                                let state_g = community_engine.state();
+                                let g = state_g.lock().await;
+                                g.materialized(community_engine.admin_addr())
+                            };
+                            let membership_key = community_engine.membership_key();
+                            let state_at_hlc = community_engine.state_at_hlc_resolver();
+                            let resolver = match community_engine.identity_resolver() {
+                                Some(r) => r,
+                                None => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        "boot reconcile: community engine has no identity \
+                                         resolver — skipping per-channel reconcile (engine \
+                                         can still receive own publishes but cannot verify peers)"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let hlc_tracker_for_reconcile = std::sync::Arc::clone(&tracker);
+                            if let Err(e) =
+                                std::sync::Arc::clone(&channel_log_registry_for_reconcile)
+                                    .reconcile_from_state(
+                                        space_id,
+                                        &materialized,
+                                        &membership_key,
+                                        state_at_hlc,
+                                        resolver,
+                                        hlc_tracker_for_reconcile,
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(
+                                    ?space_id,
+                                    error = ?e,
+                                    "channel-log registry reconcile_from_state failed at boot"
+                                );
+                            }
+                        }
                     }
 
                     community_registry_arc = Some(registry);
@@ -1739,6 +2040,7 @@ async fn start_node(
                         community_adapter_requests_for_loop,
                         community_adapter_request_rx,
                         community_registry_for_loop,
+                        channel_log_adapter_request_rx_for_loop,
                     )
                     .await;
                 });
@@ -1808,6 +2110,13 @@ async fn start_node(
                 // `CommunityAdapterRequest`s into the event loop. The
                 // matching rx was moved into event_loop::run above.
                 guard.community_adapter_request_tx = Some(community_adapter_request_tx);
+                // ZEB-270 Phase 3 Task 4.5: store the channel-log
+                // registry handle so stop_inner can flip every
+                // per-channel `closing` flag and run final flushes
+                // before the event loop tears down. `None` here when
+                // no owner identity is loaded — the registry is gated
+                // on owner-load above.
+                guard.channel_log_registry = channel_log_registry_arc.clone();
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -1825,11 +2134,30 @@ async fn start_node(
             thread_install_failure,
             sync_engine_arc.clone(),
             community_registry_arc.clone(),
+            channel_log_registry_arc.clone(),
         )
     };
-    let (our_gen, thread_spawn_failure, engine_for_cleanup, registry_for_cleanup) = our_gen;
+    let (
+        our_gen,
+        thread_spawn_failure,
+        engine_for_cleanup,
+        registry_for_cleanup,
+        channel_log_registry_for_cleanup,
+    ) = our_gen;
 
     if let Some(msg) = thread_spawn_failure {
+        // ZEB-270 Phase 3 Task 4.5: shutdown the channel-log registry
+        // FIRST so each per-channel engine's final flush completes
+        // before the per-community state engines (which back the
+        // verify chain) tear down. Mirrors stop_inner's ordering.
+        if let Some(registry) = channel_log_registry_for_cleanup {
+            if let Err(e) = registry.shutdown_all().await {
+                tracing::error!(
+                    error = %e,
+                    "ChannelLogRegistry cleanup after runtime-thread spawn failure"
+                );
+            }
+        }
         // ZEB-217 Sub-C Phase 2: shutdown the registry FIRST so each
         // community engine's final flush completes before the owner
         // SyncEngine tears down. Mirrors stop_inner's ordering.

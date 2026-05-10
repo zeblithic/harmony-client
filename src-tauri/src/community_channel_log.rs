@@ -503,18 +503,24 @@ impl ChannelLogReplayTracker {
 }
 
 /// Snapshot of community state at a particular HLC, exposing just
-/// what `verify_channel_event` needs. Phase 3's engine will produce
-/// this by materializing the community-state CRDT to `event.at`;
-/// Phase 2 keeps the trait small so unit tests can pass mock state
-/// without dragging in the full CommunityState materialization.
+/// what `verify_channel_event` needs. Phase 3's engine produces this
+/// by materializing the community-state CRDT to `event.at`.
+///
+/// **Async by design.** The production adapter
+/// (`CommunityStateAtHlcAdapter`) wraps an `Arc<tokio::sync::Mutex<CommunityState>>`
+/// — the same Mutex Phase 1's `CommunitySyncEngine` uses for its CRDT.
+/// Locking that Mutex requires `.await`, so the trait methods must be
+/// async. Mocks (`MockState` / `AlwaysJoinedState`) implement the
+/// async signature trivially since their data is in-memory.
+#[async_trait::async_trait]
 pub trait CommunityStateAtHlc {
     /// Lookup the channel-config snapshot at `at`. Returns None if
     /// the channel didn't exist at that HLC.
-    fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo>;
+    async fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo>;
 
     /// Author's effective power level at `at`. Returns None if the
     /// author was not Joined (or never present) at `at`.
-    fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8>;
+    async fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8>;
 }
 
 /// Identity-resolution trait. Mirrors the existing
@@ -619,7 +625,7 @@ where
     // tombstone (`deleted_at`) are evaluated AS OF event.at, not as
     // of "now" — channel-config events between post-time and verify-
     // time may have raised/lowered the threshold or deleted the channel.
-    let channel_info = state.channel_at(channel_id, at).ok_or_else(|| {
+    let channel_info = state.channel_at(channel_id, at).await.ok_or_else(|| {
         ChannelEventError::NotAuthorized(format!(
             "channel {:?} did not exist at {:?}",
             channel_id, at
@@ -635,7 +641,7 @@ where
             )));
         }
     }
-    let author_power = state.author_power_at(author, at).ok_or_else(|| {
+    let author_power = state.author_power_at(author, at).await.ok_or_else(|| {
         ChannelEventError::NotAuthorized(format!("author {:?} not Joined at {:?}", author, at))
     })?;
     if author_power < channel_info.write_power {
@@ -1591,8 +1597,9 @@ mod tests {
         left_at: HashMap<OwnerAddr, Hlc>,
     }
 
+    #[async_trait::async_trait]
     impl CommunityStateAtHlc for MockState {
-        fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo> {
+        async fn channel_at(&self, channel_id: &ChannelId, at: &Hlc) -> Option<ChannelInfo> {
             // Return the channel-config snapshot most recent at `at`.
             // Walk back-to-front via DoubleEndedIterator + find — first
             // hit is the most recent at-or-before `at`. (Avoids
@@ -1608,7 +1615,7 @@ mod tests {
                 .map(|(_, info)| info.clone())
         }
 
-        fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8> {
+        async fn author_power_at(&self, author: &OwnerAddr, at: &Hlc) -> Option<u8> {
             // Most recent power level at-or-before `at`. None if author
             // had Left before `at` or was never Joined.
             if let Some(left_hlc) = self.left_at.get(author) {

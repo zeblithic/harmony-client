@@ -813,14 +813,35 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
 /// time. Lifetime is the registry — `start_node` constructs it once
 /// per identity and stores the `Arc<ChannelLogRegistry>` on
 /// `NodeState` until `stop_inner` clears it.
+///
+/// **Note on Zenoh session.** ZEB-270 Phase 3 Task 4.5 replaced the
+/// prior `session: Arc<zenoh::Session>` field with the
+/// `adapter_request_tx` mpsc bridge below. The session lives
+/// exclusively inside `event_loop::run`'s scope (it's opened during
+/// node-runtime bootstrap and dropped on shutdown); the registry's
+/// `spawn` enqueues a `ChannelLogAdapterRequest` over the bridge, and
+/// the event loop's `select!` arm wires the request to a per-channel
+/// adapter against the live session. This decouples the registry from
+/// the session lifetime — which was load-bearing because the registry
+/// is constructed in `start_node`'s scope, where the session isn't
+/// reachable.
 pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
-    /// Shared Zenoh session — every per-channel adapter is spawned
-    /// against this session via `event_loop::spawn_channel_log_zenoh_adapter`.
-    /// Production wiring sources this from the live `event_loop::run`
-    /// session (cloned from the same `Arc<zenoh::Session>` the
-    /// per-community state-CRDT adapters use). Tests build a throwaway
-    /// in-memory session via `zenoh::Config::default()`.
-    pub session: Arc<zenoh::Session>,
+    /// Adapter-request bridge to `event_loop::run`. Each
+    /// `ChannelLogRegistry::spawn` call enqueues one
+    /// `ChannelLogAdapterRequest`; the event loop drains the matching
+    /// receiver and calls `spawn_channel_log_zenoh_adapter` against
+    /// the live `Arc<zenoh::Session>`.
+    ///
+    /// **Unbounded by design.** Boot-time `reconcile_from_state` runs
+    /// BEFORE the event-loop thread spawns (the reconcile must
+    /// populate the bridge so event_loop can wire each request to the
+    /// session as soon as it opens). A bounded channel would deadlock
+    /// at boot if a user has more channels than the bound — `.send`
+    /// would await forever because no consumer exists yet. Memory
+    /// pressure is a non-issue: each request is a few Arcs + a
+    /// closure; for a user with 1000 channels, the queued requests
+    /// are O(KB).
+    pub adapter_request_tx: mpsc::UnboundedSender<crate::event_loop::ChannelLogAdapterRequest>,
     /// Tauri AppHandle — propagated into each engine for
     /// `channel-message-received` / `channel-log-degraded` /
     /// `channel-backfill-progress` event emission.
@@ -860,36 +881,39 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
 /// time alongside `CommunitySyncRegistry`, stored as
 /// `Option<Arc<...>>` on `NodeState`, cleared during `stop_inner`.
 ///
+/// **Adapter lifetime.** ZEB-270 Phase 3 Task 4.5 moved Zenoh adapter
+/// ownership out of the registry: the registry's `spawn` enqueues a
+/// `ChannelLogAdapterRequest` over the bridge mpsc, and `event_loop::run`
+/// owns the adapter `JoinHandle`. The registry only retains the per-
+/// channel `closing` flag — flipping it to `true` causes the adapter's
+/// per-task select arms to exit on their next 1s closing-poll. The
+/// adapter's `JoinHandle` is dropped by event_loop on shutdown.
+///
 /// Lock-discipline: each map is held under its own
 /// `tokio::sync::Mutex`. The `spawn` flow takes the engines lock,
-/// performs the idempotency check, releases, does the engine + adapter
-/// construction off-lock, then re-takes the engines lock to insert.
-/// Concurrent spawns for the same `(cid, chid)` resolve to a single
-/// engine via the post-construction re-check (the second caller's
-/// engine + adapter are immediately stopped + dropped). The
-/// `adapter_handles` and `closings` maps are touched only after the
-/// engine map insert succeeds, so the three maps stay in sync.
-// Mutex<HashMap<(SpaceId, ChannelId), Arc<ChannelLogEngine<R>>>> tips
-// over clippy's type-complexity heuristic. Factoring out a `type` alias
-// for each map entry would be more code than it's worth — the three
-// fields are local to this struct, the layout is the documented spec
-// shape (per-key engine + per-key adapter + per-key closing flag), and
-// the existing `CommunitySyncRegistry` uses the same pattern without
-// being flagged because its inner type is shorter (`Arc<CommunitySyncEngine>`
-// without an `R` parameter). Allow at the struct level.
+/// performs the idempotency check, releases, does the engine
+/// construction + adapter request build off-lock, then re-takes the
+/// engines lock to insert. Concurrent spawns for the same `(cid, chid)`
+/// resolve to a single engine via the post-construction re-check (the
+/// second caller's engine is immediately stopped + dropped, and the
+/// loser's adapter request is never enqueued). The `closings` map is
+/// touched only after the engine map insert succeeds.
 #[allow(clippy::type_complexity)]
 pub struct ChannelLogRegistry<R: tauri::Runtime> {
     engines: Mutex<HashMap<(SpaceId, ChannelId), Arc<ChannelLogEngine<R>>>>,
-    adapter_handles: Mutex<HashMap<(SpaceId, ChannelId), JoinHandle<()>>>,
     closings: Mutex<HashMap<(SpaceId, ChannelId), Arc<AtomicBool>>>,
     config: ChannelLogRegistryConfig<R>,
 }
 
 impl<R: tauri::Runtime> ChannelLogRegistry<R> {
+    /// Production constructor. Wires the registry to the
+    /// adapter-request bridge defined in `ChannelLogRegistryConfig`.
+    /// Each `spawn` call enqueues a `ChannelLogAdapterRequest` over
+    /// the bridge; `event_loop::run` drains the matching receiver and
+    /// spawns the per-channel Zenoh adapter against the live session.
     pub fn new(config: ChannelLogRegistryConfig<R>) -> Arc<Self> {
         Arc::new(Self {
             engines: Mutex::new(HashMap::new()),
-            adapter_handles: Mutex::new(HashMap::new()),
             closings: Mutex::new(HashMap::new()),
             config,
         })
@@ -995,33 +1019,26 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             );
 
         let closing = Arc::new(AtomicBool::new(false));
-        let adapter_handle = crate::event_loop::spawn_channel_log_zenoh_adapter(
-            Arc::clone(&self.config.session),
-            community_id_hex,
-            channel_id_hex,
-            publisher_rx,
-            subscriber_tx,
-            query_request_rx,
-            read_for_query,
-            Arc::clone(&closing),
-        );
 
-        // Re-check under the lock — a concurrent spawn may have inserted
-        // for the same key while we were doing the heavy lifting above.
-        // Whoever inserts first wins; the loser's engine + adapter are
-        // shut down + dropped here (the registry maps never observe
-        // them, so external callers see the consistent winner).
+        // Re-check under the engines lock — a concurrent spawn may
+        // have inserted for the same key while we were doing the
+        // heavy lifting (dir-create + engine construction). Whoever
+        // inserts first wins; the loser's engine is shut down + dropped
+        // here BEFORE the adapter-request is enqueued, so the adapter
+        // bridge never sees the loser's halves. The registry maps never
+        // observe the loser's engine, so external callers see the
+        // consistent winner.
         {
             let mut engines = self.engines.lock().await;
             if let Some(existing) = engines.get(&key) {
                 let existing = Arc::clone(existing);
                 drop(engines);
-                // Best-effort cleanup of the loser. shutdown errors are
-                // logged but not surfaced — the winner's engine is what
-                // the caller gets back, and partial-cleanup of the loser
-                // is the recoverable case (worst outcome: a leaked
-                // tail.cbor write on the loser's path, harmless because
-                // the winner writes to the same file).
+                // Best-effort cleanup of the loser. shutdown errors
+                // are logged but not surfaced — the winner's engine is
+                // what the caller gets back, and partial-cleanup of
+                // the loser is the recoverable case (worst outcome: a
+                // leaked tail.cbor write on the loser's path, harmless
+                // because the winner writes to the same file).
                 if let Err(e) = engine.shutdown().await {
                     tracing::warn!(
                         community_id = ?community_id,
@@ -1030,19 +1047,53 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                         "channel-log spawn race: loser shutdown failed",
                     );
                 }
-                closing.store(true, Ordering::SeqCst);
-                drop(adapter_handle);
+                // closing flag wasn't published anywhere yet; just
+                // drop it. publisher_rx / subscriber_tx /
+                // query_request_rx are dropped at scope end — never
+                // wired to a Zenoh adapter, so no observable effect.
                 return Ok(existing);
             }
             engines.insert(key, Arc::clone(&engine));
         }
         {
-            let mut handles = self.adapter_handles.lock().await;
-            handles.insert(key, adapter_handle);
-        }
-        {
             let mut closings = self.closings.lock().await;
-            closings.insert(key, closing);
+            closings.insert(key, Arc::clone(&closing));
+        }
+
+        // Send the adapter request over the bridge. The event loop
+        // drains the matching receiver and spawns the per-channel
+        // Zenoh adapter against the live session. Send failure means
+        // the bridge is closed (event_loop already exited) — log + drop
+        // the local-only engine references; the caller still gets back
+        // a valid local engine (publish/list_messages still work off
+        // the per-channel disk segments), it just can't reach the wire
+        // until next start_node. shutdown_all on stop_inner will clean
+        // it up.
+        //
+        // Unbounded send is non-blocking (no .await) — the bridge
+        // can't apply back-pressure. See `adapter_request_tx` doc on
+        // ChannelLogRegistryConfig for why.
+        if let Err(e) =
+            self.config
+                .adapter_request_tx
+                .send(crate::event_loop::ChannelLogAdapterRequest {
+                    community_id_hex,
+                    channel_id_hex,
+                    publisher_rx,
+                    subscriber_tx,
+                    query_request_rx,
+                    read_for_query,
+                    closing: Arc::clone(&closing),
+                })
+        {
+            tracing::warn!(
+                community_id = ?community_id,
+                channel_id = ?channel_id,
+                error = %e,
+                "channel-log adapter bridge send failed; engine spawned without wire \
+                 — local publish/list_messages still work, wire transport unavailable \
+                 until next start_node"
+            );
         }
 
         Ok(engine)
@@ -1083,11 +1134,12 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         if let Some(closing) = self.closings.lock().await.remove(&key) {
             closing.store(true, Ordering::SeqCst);
         }
-        // Drop the JoinHandle without await — the adapter task observes
-        // the closing flag within ≤1s and exits cleanly. Awaiting here
-        // would risk dead-locking under a different runtime than the
-        // spawn-runtime (mirrors `engine.shutdown` rationale).
-        let _ = self.adapter_handles.lock().await.remove(&key);
+        // ZEB-270 Phase 3 Task 4.5: the adapter `JoinHandle` is owned
+        // by `event_loop::run` (the bridge architecture moved it out
+        // of the registry). Flipping `closing` above causes the
+        // adapter's per-task select arms to exit on their next 1s
+        // closing-poll; the JoinHandle is dropped by event_loop on
+        // shutdown.
 
         Ok(())
     }
@@ -1199,8 +1251,9 @@ mod tests {
         owner: OwnerAddr,
     }
 
+    #[async_trait::async_trait]
     impl CommunityStateAtHlc for AlwaysJoinedState {
-        fn channel_at(&self, channel_id: &ChannelId, _at: &Hlc) -> Option<ChannelInfo> {
+        async fn channel_at(&self, channel_id: &ChannelId, _at: &Hlc) -> Option<ChannelInfo> {
             if channel_id != &self.channel_id {
                 return None;
             }
@@ -1216,7 +1269,7 @@ mod tests {
             })
         }
 
-        fn author_power_at(&self, author: &OwnerAddr, _at: &Hlc) -> Option<u8> {
+        async fn author_power_at(&self, author: &OwnerAddr, _at: &Hlc) -> Option<u8> {
             if author == &self.owner {
                 Some(100)
             } else {
@@ -1946,7 +1999,12 @@ mod tests {
     /// Per-registry-test fixture. Holds the registry plus the
     /// dependencies callers need to thread into `spawn` /
     /// `reconcile_from_state`. The TempDir keeps the per-channel root
-    /// dir alive across the test's awaits.
+    /// dir alive across the test's awaits. The `_adapter_drainer`
+    /// JoinHandle keeps the test-side adapter loop alive — drained
+    /// adapter requests have their channels reconnected to a real
+    /// Zenoh session so the post-spawn handshake completes; the
+    /// drainer exits cleanly when `adapter_request_tx` drops on
+    /// fixture teardown.
     struct RegistryFixture {
         registry: Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
         state: Arc<AlwaysJoinedState>,
@@ -1956,12 +2014,27 @@ mod tests {
         self_owner: OwnerAddr,
         // Held to keep the temp dir alive for the duration of the test.
         _tmp: TempDir,
+        // Held to keep the adapter-bridge drainer alive. Drops at
+        // fixture teardown; the drainer's recv() then returns None and
+        // the task exits.
+        _adapter_drainer: tokio::task::JoinHandle<()>,
     }
 
     /// Build a registry against an in-memory Zenoh session and stub
     /// state/resolver/tracker. Mirrors `build_engine_fixture` shape so
     /// the registry tests have the same per-channel deps the engine
     /// tests already rely on.
+    ///
+    /// Test-side adapter bridge: the production wiring (Phase 3 Task
+    /// 4.5) routes adapter requests through an mpsc to `event_loop::run`
+    /// which owns the live Zenoh session. The test fixture instead
+    /// runs a small drainer task that reads each request and binds it
+    /// to a real in-process Zenoh session via
+    /// `spawn_channel_log_zenoh_adapter` — same call shape as the
+    /// production event_loop arm. The four registry tests don't drive
+    /// messages through the wire path (the assertion targets are the
+    /// registry's engine map, not the wire), so the drainer is purely
+    /// to satisfy the bridge's consumer side.
     ///
     /// Marked `#[allow(...)]` for the rare-flavor flag — Zenoh's
     /// runtime requires `multi_thread`. The default `current_thread`
@@ -1990,16 +2063,45 @@ mod tests {
 
         let app = tauri::test::mock_app().handle().clone();
 
-        // In-memory Zenoh session. The adapter spawns at registry.spawn()
-        // time but the tests don't drive any messages through it — the
-        // assertion targets are the registry maps, not the wire path
-        // (the wire path has its own coverage in event_loop.rs's
-        // channel_log_adapter_tests).
+        // In-memory Zenoh session for the test-side adapter drainer.
         let cfg = zenoh::Config::default();
         let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
 
+        // Adapter-request bridge for the test fixture. Unbounded to
+        // mirror the production shape (see
+        // `ChannelLogRegistryConfig.adapter_request_tx` doc for why
+        // production is unbounded).
+        let (adapter_request_tx, mut adapter_request_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+
+        // Drainer task: stand-in for `event_loop::run`'s select arm
+        // (production code path lives in event_loop.rs; the test just
+        // needs a consumer that satisfies the bridge handshake). Each
+        // received request gets bound to the in-memory session via
+        // the same `spawn_channel_log_zenoh_adapter` the production
+        // path uses. The fixture's `_adapter_drainer` field keeps the
+        // task alive; on fixture drop, `adapter_request_tx` drops, the
+        // recv() returns None, and the task exits cleanly.
+        let drainer_session = Arc::clone(&session);
+        let _adapter_drainer = tokio::spawn(async move {
+            while let Some(req) = adapter_request_rx.recv().await {
+                let _handle = crate::event_loop::spawn_channel_log_zenoh_adapter(
+                    Arc::clone(&drainer_session),
+                    req.community_id_hex,
+                    req.channel_id_hex,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    req.query_request_rx,
+                    req.read_for_query,
+                    req.closing,
+                );
+                // JoinHandle dropped — adapter task is fire-and-forget;
+                // closing flag (held by registry) signals shutdown.
+            }
+        });
+
         let config = ChannelLogRegistryConfig {
-            session,
+            adapter_request_tx,
             app,
             identity_dir: tmp.path().to_path_buf(),
             self_owner,
@@ -2022,6 +2124,7 @@ mod tests {
             membership_key: MembershipKey::new([0x55; 32]),
             self_owner,
             _tmp: tmp,
+            _adapter_drainer,
         }
     }
 

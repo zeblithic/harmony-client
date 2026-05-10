@@ -71,6 +71,58 @@ pub struct CommunityAdapterRequest {
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
+/// `ChannelLogRegistry::spawn` (lib.rs / runtime IPC) into the event
+/// loop's Zenoh-session scope.
+///
+/// Same architectural rationale as `CommunityAdapterRequest`: the
+/// channel-log engine is constructed from `start_node` (and from the
+/// Phase 3 delta-consumer task), but the Zenoh `Session` lives
+/// exclusively inside `event_loop::run`. Carrying the per-channel mpsc
+/// halves through this struct lets the registry's `spawn` enqueue an
+/// adapter binding without ever touching the session, and the event
+/// loop's `select!` arm wires the halves to a Zenoh adapter against the
+/// live session by calling `spawn_channel_log_zenoh_adapter`.
+pub struct ChannelLogAdapterRequest {
+    /// Hex-encoded community SpaceId (32 chars, lowercase) — used to
+    /// form the per-channel events topic key
+    /// `harmony/channels/{community_id_hex}/{channel_id_hex}/events`.
+    pub community_id_hex: String,
+    /// Hex-encoded ChannelId (32 chars, lowercase).
+    pub channel_id_hex: String,
+    /// Engine's outbound channel: bytes the engine writes here drain
+    /// into Zenoh `put` on the per-channel events topic.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Engine's inbound channel: bytes Zenoh receives on the per-
+    /// channel events topic are forwarded here.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Engine's backfill query-request channel — drained by the
+    /// adapter's queryable-driver task to issue `session.get` requests
+    /// against the per-channel `since/**` queryable prefix.
+    pub query_request_rx:
+        tokio::sync::mpsc::Receiver<crate::community_channel_log_engine::BackfillQueryRequest>,
+    /// Read-side closure invoked by the queryable task on each `since`
+    /// query. Closes over an `Arc<ChannelLogEngine>` so the queryable
+    /// can map (since, limit) to a vec of encrypted packets without
+    /// holding a back-reference to the registry.
+    #[allow(clippy::type_complexity)]
+    pub read_for_query: Arc<
+        dyn Fn(
+                Option<crate::owner_state_types::Hlc>,
+                usize,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    >,
+    /// Per-channel closing flag. The registry flips this to `true` on
+    /// `stop()`; the adapter's per-task select arms poll it on a 1s
+    /// cadence so they exit promptly. Shared with the engine's `closing`
+    /// is intentional — both shut down on the same signal.
+    pub closing: Arc<AtomicBool>,
+}
+
 /// A publish request sent from the Tauri command thread into the event loop.
 pub struct PublishRequest {
     pub key_expr: String,
@@ -243,6 +295,18 @@ pub async fn run<R: Runtime>(
     // `crdt_state`. The handler drops the packet (with a warn-log) if
     // the registry isn't set yet.
     community_registry: Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
+    // ZEB-270 Phase 3 Task 4.5: per-channel Zenoh adapter request
+    // receiver. `start_node` constructs the `ChannelLogRegistry` with
+    // the matching `UnboundedSender` half; the registry's `spawn`
+    // enqueues one request per (community, channel) pair. The select
+    // arm below drains and binds each request to a Zenoh adapter
+    // against the live session. Both boot-time `reconcile_from_state`
+    // and runtime `Created` channel-config events flow through this
+    // same channel. Unbounded because boot reconcile (which runs
+    // BEFORE event_loop drains) may queue more requests than any
+    // sensible bound — see `adapter_request_tx` doc on
+    // `ChannelLogRegistryConfig` for the full rationale.
+    mut channel_log_adapter_request_rx: mpsc::UnboundedReceiver<ChannelLogAdapterRequest>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -1311,6 +1375,30 @@ pub async fn run<R: Runtime>(
                     req.subscriber_tx,
                     Arc::clone(&closing),
                 );
+            }
+
+            // ── ZEB-270 Phase 3 Task 4.5: channel-log adapter bridge ──
+            // Drained whenever `ChannelLogRegistry::spawn` enqueues an
+            // adapter request. Spawns the per-channel Zenoh adapter
+            // (publisher + subscriber + queryable + query-driver) against
+            // the live `session_arc`. Per-channel `closing` flag in
+            // `req.closing` is shared with the registry — `registry.stop`
+            // flips it; the adapter task observes within ≤1s and exits.
+            // Engine-level `closing` (held inside ChannelLogEngine itself)
+            // is the engine's own flag and is independent.
+            Some(req) = channel_log_adapter_request_rx.recv() => {
+                let _handle = spawn_channel_log_zenoh_adapter(
+                    Arc::clone(&session_arc),
+                    req.community_id_hex,
+                    req.channel_id_hex,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    req.query_request_rx,
+                    req.read_for_query,
+                    req.closing,
+                );
+                // JoinHandle dropped — adapter task is fire-and-forget.
+                // The registry-held closing flag drives shutdown.
             }
 
             // ── Shutdown signal ──────────────────────────────────────
@@ -2442,12 +2530,18 @@ pub fn spawn_channel_log_zenoh_adapter<F>(
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
+    // `?Sized` so callers can pass `Arc<dyn Fn(...) + Send + Sync>`
+    // — the production bridge (ChannelLogAdapterRequest) carries the
+    // closure as a trait object so it can be packed into an mpsc with
+    // a uniform type. Concrete `Arc<F>` callers (the existing
+    // event_loop unit tests) still compile under the relaxed bound.
     F: Fn(
             Option<crate::owner_state_types::Hlc>,
             usize,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
         + Send
         + Sync
+        + ?Sized
         + 'static,
 {
     let events_topic = format!(
