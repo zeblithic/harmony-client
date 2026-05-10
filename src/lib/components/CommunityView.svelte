@@ -9,7 +9,7 @@
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CreateChannelDialog from './CreateChannelDialog.svelte';
   import ModifyChannelDialog from './ModifyChannelDialog.svelte';
-  import ConfirmDialog from './ConfirmDialog.svelte';
+  import TypedConfirmationModal from './TypedConfirmationModal.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
 
   let {
@@ -103,12 +103,16 @@
       prevOnChannelConfigChanged?.(cid, action, channelId, name, writePower);
       if (cid !== communityId) return;
       void (async () => {
-        await refreshChannels();
-        if (action === 'deleted' && channelId === activeChannelId) {
-          activeChannelId = pickFallbackChannel(channelId);
-          if (activeChannelId) {
-            communityService.setSelectedChannel(communityId, activeChannelId);
+        try {
+          await refreshChannels();
+          if (action === 'deleted' && channelId === activeChannelId) {
+            activeChannelId = pickFallbackChannel(channelId);
+            if (activeChannelId) {
+              communityService.setSelectedChannel(communityId, activeChannelId);
+            }
           }
+        } catch (e) {
+          console.warn('CommunityView: refreshChannels failed in onChannelConfigChanged:', e);
         }
       })();
     };
@@ -128,24 +132,28 @@
     activeChannelId = null;
 
     void (async () => {
-      // Capture persisted before refresh so the post-refresh validation
-      // sees the most recent stored value.
-      const persisted = communityService.getSelectedChannel(cid);
-      if (cancelled) return;
-      if (persisted) activeChannelId = persisted;
-      await refreshChannels();
-      if (cancelled) return;
-      // Validate the persisted activeChannelId still resolves to a
-      // non-deleted channel; if not (e.g., the channel was deleted while
-      // user was elsewhere), default-select per §6.4.
-      const stillExists = activeChannelId !== null
-        && channels.some((c) => c.channelId === activeChannelId);
-      if (!stillExists) {
-        const general = channels.find((c) => c.name === 'general');
-        activeChannelId = general?.channelId ?? channels[0]?.channelId ?? null;
-        if (activeChannelId) {
-          communityService.setSelectedChannel(cid, activeChannelId);
+      try {
+        // Capture persisted before refresh so the post-refresh validation
+        // sees the most recent stored value.
+        const persisted = communityService.getSelectedChannel(cid);
+        if (cancelled) return;
+        if (persisted) activeChannelId = persisted;
+        await refreshChannels();
+        if (cancelled) return;
+        // Validate the persisted activeChannelId still resolves to a
+        // non-deleted channel; if not (e.g., the channel was deleted while
+        // user was elsewhere), default-select per §6.4.
+        const stillExists = activeChannelId !== null
+          && channels.some((c) => c.channelId === activeChannelId);
+        if (!stillExists) {
+          const general = channels.find((c) => c.name === 'general');
+          activeChannelId = general?.channelId ?? channels[0]?.channelId ?? null;
+          if (activeChannelId) {
+            communityService.setSelectedChannel(cid, activeChannelId);
+          }
         }
+      } catch (e) {
+        console.warn('CommunityView: refreshChannels failed in community $effect:', e);
       }
     })();
 
@@ -162,12 +170,21 @@
 <section class="community-view" aria-label={`Community: ${communityName}`}>
   <header class="community-header">
     <h2 class="community-name">{communityName}</h2>
-    <button
-      type="button"
-      class="settings-btn"
-      aria-label="Open community settings"
-      onclick={() => { settingsModalOpen = true; }}
-    >⚙️</button>
+    <div class="header-actions">
+      <button
+        type="button"
+        class="members-toggle-btn"
+        aria-label={membersPanelCollapsed ? 'Show members panel' : 'Hide members panel'}
+        aria-pressed={!membersPanelCollapsed}
+        onclick={() => { membersPanelCollapsed = !membersPanelCollapsed; }}
+      >👥</button>
+      <button
+        type="button"
+        class="settings-btn"
+        aria-label="Open community settings"
+        onclick={() => { settingsModalOpen = true; }}
+      >⚙️</button>
+    </div>
   </header>
 
   <div class="three-cols">
@@ -251,11 +268,11 @@
 {/if}
 
 {#if deleteConfirmChannel}
-  <ConfirmDialog
+  <TypedConfirmationModal
     title={`Delete #${deleteConfirmChannel.name}?`}
-    message={`Channel deletion is permanent. The message log persists but no new messages can be posted. Type "${deleteConfirmChannel.name}" to confirm.`}
+    description="Channel deletion is permanent. The message log persists on existing devices, but no new messages can be posted and the channel will disappear from the sidebar for everyone."
+    requiredText={deleteConfirmChannel.name}
     confirmLabel="Delete channel"
-    destructive={true}
     onConfirm={handleConfirmDelete}
     onCancel={() => { deleteConfirmChannel = null; }}
   />
@@ -277,6 +294,11 @@
     background: var(--bg-secondary);
   }
   .community-name { margin: 0; color: var(--text-primary); font-size: 1rem; }
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
   .settings-btn {
     background: none;
     border: none;
@@ -286,6 +308,16 @@
     border-radius: 4px;
   }
   .settings-btn:hover { background: var(--bg-tertiary); }
+  .members-toggle-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1.1rem;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  .members-toggle-btn:hover { background: var(--bg-tertiary); }
+  .members-toggle-btn[aria-pressed="false"] { opacity: 0.5; }
   .three-cols {
     display: flex;
     flex: 1;

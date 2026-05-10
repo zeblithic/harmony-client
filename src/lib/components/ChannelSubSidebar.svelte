@@ -36,6 +36,7 @@
   let visible = $derived(channels.filter((c) => c.deletedAt === undefined));
 
   let contextMenu = $state<{ channel: ChannelInfo; x: number; y: number } | null>(null);
+  let menuEl: HTMLElement | undefined = $state();
 
   $effect(() => {
     if (!contextMenu) return;
@@ -44,7 +45,6 @@
       // If the click landed inside the menu itself, don't dismiss
       // (the menu's own button onclick handlers will close it after action).
       const target = e.target as Node | null;
-      const menuEl = document.querySelector('.context-menu');
       if (menuEl && target && menuEl.contains(target)) return;
       contextMenu = null;
     }
@@ -116,6 +116,7 @@
 
 {#if contextMenu}
   <div
+    bind:this={menuEl}
     class="context-menu"
     role="menu"
     style="left: {contextMenu.x}px; top: {contextMenu.y}px"

@@ -34,6 +34,7 @@
   let backfillProgress = $state<{ fetched: number; totalEstimate?: number } | null>(null);
   let composeText = $state('');
   let composeError = $state<string | null>(null);
+  let loadError = $state<string | null>(null);
   let posting = $state(false);
 
   let scrollEl: HTMLDivElement | undefined = $state();
@@ -52,6 +53,7 @@
     // Fresh local mirror per channel switch.
     messages = [];
     composeError = null;
+    loadError = null;
     backfillProgress = null;
     // Phase 4 round-1 fixup: also reset scroll/backfill state to avoid
     // bleed-over between channels (Qodo PR #97 finding).
@@ -85,14 +87,19 @@
     // Pull initial page (last 100 messages). Guard against the old promise
     // overwriting the new channel's state if user switched mid-flight
     // (Cursor Bugbot MEDIUM on PR #97 round 1).
-    void channelMessageService.listMessages(cid, chid, undefined, 100).then(() => {
-      if (cancelled) return;
-      messages = channelMessageService.getMessages(cid, chid);
-      queueMicrotask(() => {
+    void channelMessageService.listMessages(cid, chid, undefined, 100)
+      .then(() => {
         if (cancelled) return;
-        scrollToBottom();
+        messages = channelMessageService.getMessages(cid, chid);
+        queueMicrotask(() => {
+          if (cancelled) return;
+          scrollToBottom();
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        loadError = err instanceof Error ? err.message : String(err);
       });
-    });
 
     return () => {
       cancelled = true;
@@ -188,6 +195,18 @@
     }
   }
 
+  function retryLoad() {
+    loadError = null;
+    void channelMessageService.listMessages(communityId, channelId, undefined, 100)
+      .then(() => {
+        messages = channelMessageService.getMessages(communityId, channelId);
+        queueMicrotask(scrollToBottom);
+      })
+      .catch((err) => {
+        loadError = err instanceof Error ? err.message : String(err);
+      });
+  }
+
   function bodyToText(body: number[]): string {
     try {
       return new TextDecoder().decode(new Uint8Array(body));
@@ -225,6 +244,12 @@
         {#if backfillProgress?.totalEstimate}
           ({backfillProgress.fetched}/{backfillProgress.totalEstimate})
         {/if}
+      </div>
+    {/if}
+    {#if loadError}
+      <div class="load-error" role="alert">
+        Couldn't load messages: {loadError}
+        <button type="button" class="retry-btn" onclick={retryLoad}>Retry</button>
       </div>
     {/if}
     {#each messages as msg (msg.messageId)}
@@ -332,4 +357,26 @@
   }
   .compose-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .compose-input:disabled { opacity: 0.6; }
+  .load-error {
+    background: var(--bg-tertiary);
+    border: 1px solid #d83c3e;
+    color: #d83c3e;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin: 8px 16px;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .retry-btn {
+    background: var(--accent);
+    color: var(--text-primary);
+    border: none;
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    margin-left: auto;
+  }
 </style>
