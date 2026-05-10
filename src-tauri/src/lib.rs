@@ -6695,6 +6695,249 @@ async fn list_channels(
     Ok(rows)
 }
 
+// ── ZEB-270 Phase 3: channel-message IPCs ────────────────────────────
+//
+// Three IPCs per spec §9 that wrap the ChannelLogEngine surface:
+//   - post_channel_message          → engine.publish
+//   - list_channel_messages         → engine.list_messages
+//   - request_channel_backfill      → engine.request_backfill (fire-and-forget)
+//
+// Each IPC validates hex strings + length at the boundary so JS callers
+// fail fast without minting events that would be rejected at the engine.
+// Engine lookup is via NodeState.channel_log_registry (populated by
+// start_node in Task 4+4.5); a missing registry means the node isn't
+// running and is surfaced as Err. A missing engine for the requested
+// (community_id, channel_id) means that channel isn't currently live
+// (not joined or not yet spawned by the delta consumer).
+
+/// Tauri IPC: post a message to a channel.
+///
+/// `body` is opaque bytes (the frontend serializes the display format —
+/// text, markdown, etc.). The engine's `publish` enforces UTF-8 and a
+/// hard `MAX_BODY_BYTES` cap; the IPC layer just forwards.
+///
+/// `reply_to` is an optional hex `MessageId` (32 chars) of an earlier
+/// message in the same channel.
+///
+/// Returns the hex `MessageId` of the newly minted Post event.
+///
+/// Errors (string-mapped from `ChannelLogEngineError::to_string()`):
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")` /
+///   `Err("reply_to must be 16 bytes (32 hex chars)")` — bad length.
+/// - `Err("invalid {field} hex: ...")` — bad hex characters.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")` — channel isn't live.
+/// - `Err("body too large: ...")` / `Err("body not UTF-8: ...")` /
+///   `Err("publish failed: ...")` etc. — engine surfaces.
+#[tauri::command]
+async fn post_channel_message(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    body: Vec<u8>,
+    reply_to: Option<String>,
+) -> Result<String, String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let reply_to_msg_id = match reply_to {
+        Some(s) => {
+            if s.len() != 32 {
+                return Err("reply_to must be 16 bytes (32 hex chars)".to_string());
+            }
+            let bytes: [u8; 16] = hex::decode(&s)
+                .map_err(|e| format!("invalid reply_to hex: {e}"))?
+                .try_into()
+                .map_err(|_| "reply_to length wrong".to_string())?;
+            Some(crate::community_channel_log::MessageId(bytes))
+        }
+        None => None,
+    };
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let msg_id = engine
+        .publish(body, reply_to_msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(msg_id.0))
+}
+
+/// Tauri IPC: list locally-known messages in a channel.
+///
+/// `since` filters to events strictly newer than the given HLC; `None`
+/// means "from earliest available locally". `limit` caps the reply —
+/// `0` means "use the engine's default (256)"; the IPC enforces a hard
+/// cap of 1000 per spec §9.2 (rejected before reaching the engine).
+///
+/// Returns DTOs in HLC order (segments first, then in-memory tail).
+///
+/// Errors:
+/// - `Err("limit {N} exceeds max 1000")` — boundary cap.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")`.
+/// - `Err("invalid {field} hex: ...")`.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")`.
+/// - `Err("persist error: ...")` — engine read failure (e.g., corrupt
+///   segment).
+#[tauri::command]
+async fn list_channel_messages(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+) -> Result<Vec<crate::community_channel_log_engine::ChannelMessageDto>, String> {
+    if limit > 1000 {
+        return Err(format!("limit {limit} exceeds max 1000"));
+    }
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
+        wall_ms: h.wall_ms,
+        logical: h.logical,
+        device_id: h.device_id,
+    });
+
+    let events = engine
+        .list_messages(since_hlc, limit as usize)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(events
+        .into_iter()
+        .map(|ev| engine.event_to_dto(&ev))
+        .collect())
+}
+
+/// Tauri IPC: fire a backfill request via the channel's Zenoh queryable.
+///
+/// Fire-and-forget — the engine forwards the `BackfillQueryRequest` to
+/// the adapter's query-driver task, which fans out the Zenoh `get` and
+/// pumps reply packets back through the same subscriber path so they
+/// surface to the UI as `channel-message-received` events alongside
+/// live broadcasts. No reply payload here.
+///
+/// Errors:
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` /
+///   `Err("channel_id must be 16 bytes (32 hex chars)")`.
+/// - `Err("invalid {field} hex: ...")`.
+/// - `Err("channel_log_registry missing — node not running")`.
+/// - `Err("no engine for {cid}/{chid}")`.
+/// - `Err("backfill request failed: ...")` — adapter channel closed.
+#[tauri::command]
+async fn request_channel_backfill(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    channel_id: String,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+) -> Result<(), String> {
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    if channel_id.len() != 32 {
+        return Err("channel_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "community_id length wrong".to_string())?;
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .try_into()
+        .map_err(|_| "channel_id length wrong".to_string())?;
+    let cid = crate::owner_state_types::SpaceId(cid_bytes);
+    let chid = crate::community_membership::ChannelId(chid_bytes);
+
+    let registry = {
+        let guard = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        guard
+            .channel_log_registry
+            .as_ref()
+            .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?
+            .clone()
+    };
+
+    let engine = registry
+        .engine(&cid, &chid)
+        .await
+        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+
+    let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
+        wall_ms: h.wall_ms,
+        logical: h.logical,
+        device_id: h.device_id,
+    });
+
+    engine
+        .request_backfill(since_hlc)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Encode a CommunityInvitePayload into the harmony://invite/ URL form.
 /// Thin wrapper over `community_invite::encode_invite_url` so call sites
 /// don't need to import the lower-level error type — surfaces failures
@@ -9645,6 +9888,9 @@ pub fn run() {
             modify_channel,
             delete_channel,
             list_channels,
+            list_channel_messages,
+            post_channel_message,
+            request_channel_backfill,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -10744,6 +10990,190 @@ mod create_channel_delta_tests {
         assert_eq!(
             captured_channel.lock().await[0].action,
             ChannelConfigChangeAction::Created
+        );
+    }
+}
+
+// ── ZEB-270 Phase 3 Task 5: channel-message IPC smoke tests ──────────
+//
+// Boundary-validation coverage for the three new IPCs. Driving the full
+// IPC layer (post→engine→Zenoh→subscribe roundtrip) requires a live
+// ChannelLogRegistry bound to a real Zenoh session, which lives in the
+// Task 6 integration test. These tests exercise the IPC-boundary
+// validation paths (hex length / parse / limit cap / missing-registry)
+// against a default NodeState (registry = None), which is the path JS
+// callers hit pre-start_node.
+//
+// `NodeState.channel_log_registry` is hardcoded to `tauri::Wry`, so we
+// can't populate it with the test fixture's `MockRuntime` registry.
+// End-to-end IPC roundtrips with a populated registry are therefore
+// out of scope here — see Task 6's integration test for that coverage.
+#[cfg(test)]
+mod channel_message_ipc_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tauri::Manager;
+
+    /// Build a mock app with an empty `NodeState` (registry = None).
+    /// Mirrors Phase 1's pattern of testing helper paths without
+    /// standing up the production state-machine.
+    fn mock_app_with_default_node_state() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(StdMutex::new(NodeState::default()));
+        app
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "deadbeef".into(), "00".repeat(16), vec![1], None)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_channel_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "00".repeat(16), "ab".into(), vec![1], None)
+            .await
+            .expect_err("short chid must error");
+        assert!(err.contains("channel_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_bad_hex() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(state, "zz".repeat(16), "00".repeat(16), vec![1], None)
+            .await
+            .expect_err("bad hex must error");
+        assert!(err.contains("invalid community_id hex"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_rejects_short_reply_to() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "00".repeat(16),
+            vec![1],
+            Some("ab".into()),
+        )
+        .await
+        .expect_err("short reply_to must error");
+        assert!(err.contains("reply_to must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_errors_when_registry_missing() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = post_channel_message(
+            state,
+            "00".repeat(16),
+            "11".repeat(16),
+            vec![104, 105],
+            None,
+        )
+        .await
+        .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_rejects_limit_over_cap() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1001)
+            .await
+            .expect_err("over-cap limit must error");
+        assert_eq!(err, "limit 1001 exceeds max 1000");
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_accepts_zero_limit() {
+        // limit=0 is the "use engine default 256" sentinel; it must NOT
+        // be rejected at the boundary. The call still errors at the
+        // registry-lookup step (missing registry), which proves the
+        // validation passed.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 0)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "limit=0 should fall through to registry lookup; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_accepts_limit_at_cap() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "00".repeat(16), "00".repeat(16), None, 1000)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "limit=1000 (== cap) should pass validation; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_channel_messages_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = list_channel_messages(state, "ab".into(), "00".repeat(16), None, 10)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_rejects_short_community_id() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = request_channel_backfill(state, "ab".into(), "00".repeat(16), None)
+            .await
+            .expect_err("short cid must error");
+        assert!(err.contains("community_id must be 16 bytes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_errors_when_registry_missing() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let err = request_channel_backfill(state, "00".repeat(16), "00".repeat(16), None)
+            .await
+            .expect_err("missing registry must error");
+        assert!(err.contains("channel_log_registry missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn request_channel_backfill_accepts_some_since() {
+        // since: Some(HlcDto) is the deserialize path — verifies the
+        // DTO is wired correctly as IPC input. The call still errors
+        // at the registry-lookup step, which proves deserialize +
+        // validation succeeded.
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let since = Some(crate::community_channel_log_engine::HlcDto {
+            wall_ms: 1234,
+            logical: 5,
+            device_id: "device-x".into(),
+        });
+        let err = request_channel_backfill(state, "00".repeat(16), "00".repeat(16), since)
+            .await
+            .expect_err("missing registry must error");
+        assert!(
+            err.contains("channel_log_registry missing"),
+            "Some(HlcDto) should fall through to registry lookup; got: {err}"
         );
     }
 }

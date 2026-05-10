@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -73,7 +73,7 @@ pub enum ChannelLogEngineError {
 /// Tauri/IPC surface. Phase 2's `Hlc` keeps single-letter wire keys
 /// (`w` / `l` / `d`) for canonical-CBOR field-length parity, which is
 /// the wrong shape for a TypeScript consumer.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HlcDto {
     pub wall_ms: u64,
@@ -569,6 +569,17 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
                 "failed to emit channel-message-received"
             );
         }
+    }
+
+    /// Public accessor: project a `SignedChannelEvent` to the IPC
+    /// `ChannelMessageDto` shape using the engine's `(community_id,
+    /// channel_id)` context. The IPC layer (`list_channel_messages`)
+    /// uses this to project the engine's `list_messages` output.
+    /// Wraps the existing private `message_dto_for_event` so the emit
+    /// helper and the IPC projection stay symmetric — change one,
+    /// change both.
+    pub fn event_to_dto(&self, event: &SignedChannelEvent) -> ChannelMessageDto {
+        self.message_dto_for_event(event)
     }
 
     fn message_dto_for_event(&self, event: &SignedChannelEvent) -> ChannelMessageDto {
@@ -1519,6 +1530,42 @@ mod tests {
         for (got, want) in listed.iter().zip(events.iter()) {
             assert_eq!(extract_id(got), extract_id(want));
         }
+    }
+
+    /// ZEB-270 Phase 3 Task 5: pub `event_to_dto` accessor.
+    ///
+    /// The IPC layer (`list_channel_messages`) projects engine output
+    /// to `ChannelMessageDto` via this accessor. Verifies the
+    /// projection lifts every relevant `SignedChannelEvent::Post`
+    /// field, and that hex encoding + body byte projection match
+    /// the spec §9.1 shape.
+    #[tokio::test]
+    async fn event_to_dto_projects_post_fields() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let hlc = Hlc {
+            wall_ms: 4_242,
+            logical: 7,
+            device_id: "device-x".to_string(),
+        };
+        let ev = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            hlc,
+            "hello",
+            &fix.signing_key,
+        );
+        let dto = fix.engine.event_to_dto(&ev);
+
+        assert_eq!(dto.community_id, hex::encode(fix.community_id.0));
+        assert_eq!(dto.channel_id, hex::encode(fix.channel_id.0));
+        assert_eq!(dto.author, hex::encode(fix.self_owner.0));
+        assert_eq!(dto.message_id, hex::encode(extract_id(&ev).0));
+        assert_eq!(dto.at.wall_ms, 4_242);
+        assert_eq!(dto.at.logical, 7);
+        assert_eq!(dto.at.device_id, "device-x");
+        assert_eq!(dto.body, b"hello".to_vec());
+        assert!(dto.reply_to.is_none());
     }
 
     #[tokio::test]
