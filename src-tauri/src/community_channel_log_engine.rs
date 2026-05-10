@@ -869,6 +869,22 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
     pub engine_config: ChannelLogEngineConfig,
 }
 
+/// One registered channel: the running engine and the adapter's
+/// closing flag, held together so `spawn` and `stop` operate
+/// atomically on both. Storing them in a single map (rather than two
+/// parallel maps) eliminates a spawn-stop race that previously could
+/// orphan an adapter task — see `ChannelLogRegistry` doc.
+struct EngineEntry<R: tauri::Runtime> {
+    engine: Arc<ChannelLogEngine<R>>,
+    /// Closing flag for the per-channel adapter task that
+    /// `event_loop::run` spawned in response to the spawn-time
+    /// `ChannelLogAdapterRequest`. Flipping it to `true` causes the
+    /// adapter's per-task select arms to exit on their next 1s
+    /// closing-poll. Independent from the engine's internal closing
+    /// flag — see `event_loop::ChannelLogAdapterRequest.closing` doc.
+    closing: Arc<AtomicBool>,
+}
+
 /// Per-CommunitySyncEngine registry of running per-channel engines.
 /// Mirrors `community_state_sync::CommunitySyncRegistry` in shape:
 ///   - idempotent `spawn` (returns existing Arc on duplicate)
@@ -885,23 +901,25 @@ pub struct ChannelLogRegistryConfig<R: tauri::Runtime> {
 /// ownership out of the registry: the registry's `spawn` enqueues a
 /// `ChannelLogAdapterRequest` over the bridge mpsc, and `event_loop::run`
 /// owns the adapter `JoinHandle`. The registry only retains the per-
-/// channel `closing` flag — flipping it to `true` causes the adapter's
-/// per-task select arms to exit on their next 1s closing-poll. The
-/// adapter's `JoinHandle` is dropped by event_loop on shutdown.
+/// channel `closing` flag (inside `EngineEntry`) — flipping it to
+/// `true` causes the adapter's per-task select arms to exit on their
+/// next 1s closing-poll. The adapter's `JoinHandle` is dropped by
+/// event_loop on shutdown.
 ///
-/// Lock-discipline: each map is held under its own
-/// `tokio::sync::Mutex`. The `spawn` flow takes the engines lock,
-/// performs the idempotency check, releases, does the engine
-/// construction + adapter request build off-lock, then re-takes the
-/// engines lock to insert. Concurrent spawns for the same `(cid, chid)`
-/// resolve to a single engine via the post-construction re-check (the
-/// second caller's engine is immediately stopped + dropped, and the
-/// loser's adapter request is never enqueued). The `closings` map is
-/// touched only after the engine map insert succeeds.
-#[allow(clippy::type_complexity)]
+/// Lock-discipline: a single `tokio::sync::Mutex<HashMap<key,
+/// EngineEntry>>` holds both the engine and its closing flag together.
+/// The `spawn` flow takes the engines lock, performs the idempotency
+/// check, releases, does the engine construction + adapter request
+/// build off-lock, then re-takes the engines lock to insert the
+/// `EngineEntry` atomically. Concurrent spawns for the same
+/// `(cid, chid)` resolve to a single engine via the post-construction
+/// re-check (the second caller's engine is immediately stopped +
+/// dropped, and the loser's adapter request is never enqueued). A
+/// concurrent `spawn` + `stop` for the same key cannot orphan the
+/// adapter: `stop` removes the entire `EngineEntry` (engine + closing)
+/// in one map op, so the closing flag goes with the engine.
 pub struct ChannelLogRegistry<R: tauri::Runtime> {
-    engines: Mutex<HashMap<(SpaceId, ChannelId), Arc<ChannelLogEngine<R>>>>,
-    closings: Mutex<HashMap<(SpaceId, ChannelId), Arc<AtomicBool>>>,
+    engines: Mutex<HashMap<(SpaceId, ChannelId), EngineEntry<R>>>,
     config: ChannelLogRegistryConfig<R>,
 }
 
@@ -914,7 +932,6 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     pub fn new(config: ChannelLogRegistryConfig<R>) -> Arc<Self> {
         Arc::new(Self {
             engines: Mutex::new(HashMap::new()),
-            closings: Mutex::new(HashMap::new()),
             config,
         })
     }
@@ -948,7 +965,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         {
             let engines = self.engines.lock().await;
             if let Some(existing) = engines.get(&key) {
-                return Ok(Arc::clone(existing));
+                return Ok(Arc::clone(&existing.engine));
             }
         }
 
@@ -993,9 +1010,12 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // encrypted packets — wire-identical to live broadcast (spec
         // §17.1). Captures `Arc<engine>`. No cycle: the adapter holds
         // the closure by `Arc`, and the closure holds `Arc<engine>`,
-        // but the adapter task itself is owned by the registry's
-        // `adapter_handles` map and dropped on `stop`. The engine has
-        // no back-reference to the adapter or its closure.
+        // but the adapter task this closure feeds is owned by
+        // `event_loop::run`'s select-arm draining of
+        // `ChannelLogAdapterRequest`. The adapter exits when its
+        // closing flag (held in this registry's `engines` map per
+        // `EngineEntry.closing`) flips on `stop()`. The engine has no
+        // back-reference to the adapter or its closure.
         let engine_for_query = Arc::clone(&engine);
         let read_for_query =
             Arc::new(
@@ -1025,13 +1045,18 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         // heavy lifting (dir-create + engine construction). Whoever
         // inserts first wins; the loser's engine is shut down + dropped
         // here BEFORE the adapter-request is enqueued, so the adapter
-        // bridge never sees the loser's halves. The registry maps never
-        // observe the loser's engine, so external callers see the
-        // consistent winner.
+        // bridge never sees the loser's halves. The registry map never
+        // observes the loser's engine, so external callers see the
+        // consistent winner. The `EngineEntry` insert (engine +
+        // closing flag together) is atomic under this single lock —
+        // a concurrent `stop` for the same key cannot remove the
+        // engine without also removing the closing flag, so the
+        // adapter task spawned below always remains reachable from
+        // `stop()`.
         {
             let mut engines = self.engines.lock().await;
             if let Some(existing) = engines.get(&key) {
-                let existing = Arc::clone(existing);
+                let existing = Arc::clone(&existing.engine);
                 drop(engines);
                 // Best-effort cleanup of the loser. shutdown errors
                 // are logged but not surfaced — the winner's engine is
@@ -1053,11 +1078,13 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
                 // wired to a Zenoh adapter, so no observable effect.
                 return Ok(existing);
             }
-            engines.insert(key, Arc::clone(&engine));
-        }
-        {
-            let mut closings = self.closings.lock().await;
-            closings.insert(key, Arc::clone(&closing));
+            engines.insert(
+                key,
+                EngineEntry {
+                    engine: Arc::clone(&engine),
+                    closing: Arc::clone(&closing),
+                },
+            );
         }
 
         // Send the adapter request over the bridge. The event loop
@@ -1119,11 +1146,16 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
     ) -> Result<(), ChannelLogEngineError> {
         let key = (*community_id, *channel_id);
 
-        let engine = {
+        // Atomic remove: engine and closing flag come out together,
+        // so we cannot race a concurrent `spawn` into a state where
+        // the engine is gone but the closing flag remains (or vice
+        // versa). Either the entry exists (we get both halves) or
+        // it doesn't (no-op).
+        let entry = {
             let mut engines = self.engines.lock().await;
             engines.remove(&key)
         };
-        let Some(engine) = engine else {
+        let Some(EngineEntry { engine, closing }) = entry else {
             // Stop-of-unknown is a no-op (mirrors
             // CommunitySyncRegistry::stop_engine semantics).
             return Ok(());
@@ -1131,9 +1163,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
 
         engine.shutdown().await?;
 
-        if let Some(closing) = self.closings.lock().await.remove(&key) {
-            closing.store(true, Ordering::SeqCst);
-        }
+        closing.store(true, Ordering::SeqCst);
         // ZEB-270 Phase 3 Task 4.5: the adapter `JoinHandle` is owned
         // by `event_loop::run` (the bridge architecture moved it out
         // of the registry). Flipping `closing` above causes the
@@ -1157,7 +1187,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
             .lock()
             .await
             .get(&(*community_id, *channel_id))
-            .cloned()
+            .map(|entry| Arc::clone(&entry.engine))
     }
 
     /// Drain every spawned engine. Surfaces the LAST error encountered
@@ -2325,5 +2355,66 @@ mod tests {
         );
 
         fix.registry.stop(&cid, &chid).await.expect("cleanup stop");
+    }
+
+    /// Concurrency regression: a `spawn` racing a `stop` for the same
+    /// `(cid, chid)` must not orphan the adapter task (i.e., must not
+    /// leave the closing flag unreachable from `stop()`). Pre-fix, the
+    /// registry stored the engine and closing flag in two separate
+    /// `Mutex<HashMap>`s; a stop interleaved between the two inserts
+    /// would remove the engine, fail to find a closing flag, and the
+    /// subsequent insert of the orphan closing flag would never be
+    /// flipped — leaking the adapter for the registry's lifetime.
+    /// With the atomic `EngineEntry` insert, the registry's terminal
+    /// state after each iteration is consistent: either the entry
+    /// exists (next stop drains it) or it doesn't.
+    ///
+    /// We don't assert on the adapter task itself (the bridge drainer
+    /// runs in the fixture, the JoinHandle is dropped fire-and-forget);
+    /// we assert on the registry's observable state, which is the
+    /// invariant the bug violated. A `stop` after the race must always
+    /// converge on `engine() == None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registry_spawn_stop_race_does_not_orphan() {
+        let fix = build_registry_fixture().await;
+        let cid = SpaceId([0xc1; 16]);
+        let chid = ChannelId([0xff; 16]);
+        let key = derive_channel_key(&fix.membership_key, &cid, &chid);
+
+        for _ in 0..50 {
+            let r1 = Arc::clone(&fix.registry);
+            let r2 = Arc::clone(&fix.registry);
+            let state = Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>;
+            let resolver =
+                Arc::clone(&fix.resolver) as Arc<dyn ChannelIdentityResolver + Send + Sync>;
+            let tracker = Arc::clone(&fix.hlc_tracker);
+            let key_for_spawn = key.clone();
+
+            let handle1 = tokio::spawn(async move {
+                let _ = r1
+                    .spawn(cid, chid, key_for_spawn, state, resolver, tracker)
+                    .await;
+            });
+            let handle2 = tokio::spawn(async move {
+                let _ = r2.stop(&cid, &chid).await;
+            });
+            let _ = tokio::join!(handle1, handle2);
+
+            // Cleanup: stop again to drain whichever ordering won. Pre-fix,
+            // an orphaned closing flag would be leaked here (the engine
+            // map would be empty, but the closings map would contain a
+            // flag no caller can reach — and the in-flight adapter task
+            // would never observe its closing signal).
+            fix.registry
+                .stop(&cid, &chid)
+                .await
+                .expect("post-race stop");
+
+            // Final state per iteration: registry must be clean.
+            assert!(
+                fix.registry.engine(&cid, &chid).await.is_none(),
+                "engine must be drained after race + cleanup stop",
+            );
+        }
     }
 }

@@ -116,10 +116,18 @@ pub struct ChannelLogAdapterRequest {
             + Sync
             + 'static,
     >,
-    /// Per-channel closing flag. The registry flips this to `true` on
-    /// `stop()`; the adapter's per-task select arms poll it on a 1s
-    /// cadence so they exit promptly. Shared with the engine's `closing`
-    /// is intentional — both shut down on the same signal.
+    /// Closing flag for the adapter task. Independent from the
+    /// engine's internal closing flag — they're flipped by separate
+    /// paths:
+    /// - `ChannelLogRegistry::stop` flips this bridge flag (unblocks
+    ///   the adapter's pub/sub/qbl/qr task select arms within ~1s
+    ///   closing-poll).
+    /// - `ChannelLogEngine::shutdown` flips the engine's internal
+    ///   flag (unblocks the engine's receive + flush loops).
+    ///
+    /// Both flips happen on `stop()`, but each bit is owned by its
+    /// own teardown path and is freshly allocated at engine-construction
+    /// time (see `ChannelLogRegistry::spawn`).
     pub closing: Arc<AtomicBool>,
 }
 
