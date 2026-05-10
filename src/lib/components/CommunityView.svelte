@@ -96,14 +96,8 @@
   }
 
   onMount(() => {
-    // Capture the active selected-channel from CommunityService (set by
-    // a prior visit in this session). Otherwise default to #general or
-    // first channel after the initial refresh.
-    const persisted = communityService.getSelectedChannel(communityId);
-    if (persisted) activeChannelId = persisted;
-
-    // Hook channel-config callback. Chain prior so we don't clobber
-    // App.svelte's listener if it had one.
+    // Hook channel-config callback ONCE per component lifetime. Chain prior
+    // so we don't clobber App.svelte's listener if it had one.
     prevOnChannelConfigChanged = communityService.onChannelConfigChanged;
     communityService.onChannelConfigChanged = (cid, action, channelId, name, writePower) => {
       prevOnChannelConfigChanged?.(cid, action, channelId, name, writePower);
@@ -118,22 +112,46 @@
         }
       })();
     };
+  });
+
+  // Per-community initialization runs whenever `communityId` changes (or on
+  // first mount). Without this $effect, switching communities reuses the
+  // component instance but leaves it pinned to the previous community's
+  // channel list (Cursor Bugbot HIGH on PR #97 round 1).
+  $effect(() => {
+    const cid = communityId;
+    let cancelled = false;
+    // Reset activeChannelId so the persisted-channel logic re-runs for the
+    // new community. The prior community's `setSelectedChannel` already
+    // captured its last-viewed channel into the service map, so switching
+    // back will restore from there.
+    activeChannelId = null;
 
     void (async () => {
+      // Capture persisted before refresh so the post-refresh validation
+      // sees the most recent stored value.
+      const persisted = communityService.getSelectedChannel(cid);
+      if (cancelled) return;
+      if (persisted) activeChannelId = persisted;
       await refreshChannels();
-      // After initial load, validate the persisted activeChannelId still
-      // resolves to a non-deleted channel; if not (e.g., the channel was
-      // deleted while user was elsewhere), default-select per §6.4.
+      if (cancelled) return;
+      // Validate the persisted activeChannelId still resolves to a
+      // non-deleted channel; if not (e.g., the channel was deleted while
+      // user was elsewhere), default-select per §6.4.
       const stillExists = activeChannelId !== null
         && channels.some((c) => c.channelId === activeChannelId);
       if (!stillExists) {
         const general = channels.find((c) => c.name === 'general');
         activeChannelId = general?.channelId ?? channels[0]?.channelId ?? null;
         if (activeChannelId) {
-          communityService.setSelectedChannel(communityId, activeChannelId);
+          communityService.setSelectedChannel(cid, activeChannelId);
         }
       }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   });
 
   onDestroy(() => {

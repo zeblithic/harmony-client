@@ -48,6 +48,7 @@
   $effect(() => {
     const cid = communityId;
     const chid = channelId;
+    let cancelled = false;
     // Fresh local mirror per channel switch.
     messages = [];
     composeError = null;
@@ -68,6 +69,7 @@
       unsubChannel = null;
     }
     unsubChannel = channelMessageService.subscribeToChannel(cid, chid, (_msg) => {
+      if (cancelled) return;
       // Append in HLC-sorted insert position. Service emits AFTER its
       // internal ingest, so the cache is already sorted; we mirror by
       // re-reading rather than splicing.
@@ -75,15 +77,26 @@
       // Auto-scroll to bottom on new live message IF scrollAtBottom was
       // already true. We use a microtask so the DOM update completes first.
       queueMicrotask(() => {
+        if (cancelled) return;
         if (scrollAtBottom) scrollToBottom();
       });
     });
 
-    // Pull initial page (last 100 messages).
+    // Pull initial page (last 100 messages). Guard against the old promise
+    // overwriting the new channel's state if user switched mid-flight
+    // (Cursor Bugbot MEDIUM on PR #97 round 1).
     void channelMessageService.listMessages(cid, chid, undefined, 100).then(() => {
+      if (cancelled) return;
       messages = channelMessageService.getMessages(cid, chid);
-      queueMicrotask(scrollToBottom);
+      queueMicrotask(() => {
+        if (cancelled) return;
+        scrollToBottom();
+      });
     });
+
+    return () => {
+      cancelled = true;
+    };
   });
 
   onMount(() => {
