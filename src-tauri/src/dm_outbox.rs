@@ -1172,6 +1172,20 @@ impl DmOutbox {
                     return;
                 }
             };
+            // ZEB-275: gate on SpaceKind before any decrypt-path work.
+            // Defends against forged CidNotifys targeting Channel /
+            // PublicChannel spaces (which can also have members for
+            // read-access controls). `validate_invariants` guarantees
+            // content_key.is_some() only for Dm/GroupDm — without this
+            // gate, Phase C's `space.content_key.as_ref().expect(...)`
+            // panics the spawned task.
+            if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SpaceKindMismatch,
+                    "handle_cidnotify_lifted Phase A: dropping packet"
+                );
+                return;
+            }
             if !space.members.contains(&resolved_owner) {
                 tracing::warn!(
                     error = ?DmReceiveError::SenderNotInSpaceMembers,
@@ -1626,6 +1640,13 @@ pub enum DmReceiveError {
     /// ex-members whose signing key is still cached in OwnerDeviceCache.
     #[error("sender's resolved owner is not in space.members (ex-member with cached key?)")]
     SenderNotInSpaceMembers,
+    /// Space.kind is not `Dm` or `GroupDm`. `validate_invariants` guarantees
+    /// `content_key.is_some()` only for Dm/GroupDm — without this gate, a
+    /// forged CidNotify whose space_id resolves to a Channel/PublicChannel
+    /// Space (which can also have members) would reach Phase C's decrypt
+    /// path and panic on `space.content_key.as_ref().expect(...)`. ZEB-275.
+    #[error("Space.kind is not Dm or GroupDm (forged CidNotify targeting non-DM space?)")]
+    SpaceKindMismatch,
     #[error("CAS fetch failed or timed out: {0}")]
     CasFetchFailed(String),
     #[error("DM blob decryption failed under all candidate keys")]
@@ -5113,6 +5134,146 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no ack must be emitted when sender kicked in TOCTOU window"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_gates_on_spacekind_dm_or_groupdm() {
+        // ZEB-275: a forged DmCidNotify whose space_id resolves to a
+        // Channel Space — where the resolved sender happens to appear
+        // in space.members (channels can have members for read-access
+        // controls) — must be dropped in Phase A, not allowed to fall
+        // through to Phase C's `space.content_key.as_ref().expect(...)`
+        // panic.
+        //
+        // validate_invariants guarantees content_key.is_none() for
+        // Channel/PublicChannel — so without the SpaceKind gate, the
+        // spawned task panics. With the gate, Phase A drops with
+        // SpaceKindMismatch and the handler returns cleanly.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        // Build a Channel Space with alice in members. Direct-insert
+        // bypasses validate_invariants (which would otherwise enforce
+        // community_id + parent constraints we don't care about for
+        // this test). The kind-vs-content_key invariant is satisfied:
+        // Channel + content_key=None.
+        let mut members = vec![alice, bob];
+        members.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Channel,
+            parent: None,
+            community_id: None,
+            name: "#general".into(),
+            transport: None,
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
+        };
+        state.spaces.insert(space_id, space);
+
+        // Build a CidNotify that signature-verifies. The message_cid
+        // doesn't need to resolve in CAS — the gate fires in Phase A
+        // before Phase B's fetch.
+        let fake_cid = harmony_content::cid::ContentId::for_book(
+            b"unused payload",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid: fake_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let cas = std::sync::Arc::new(InMemoryStub::default());
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        // The handler must complete without panicking. Pre-ZEB-275,
+        // the .expect("DM Space MUST have content_key") in Phase C
+        // would have fired had Phase A let the packet through.
+        DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&cas) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
+
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // No InboxEntry written — Phase A SpaceKindMismatch gate
+        // fires BEFORE Phase B/C touch the inbox.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid: fake_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed for non-DM space"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on Phase A SpaceKindMismatch drop"
+        );
+
+        // No ack fan-out — gate fires BEFORE the ack build/encode/
+        // try_send block in Phase C.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted when SpaceKind != Dm|GroupDm"
         );
     }
 
