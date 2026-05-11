@@ -174,7 +174,8 @@ fn decode_rejects_truncated_cbor() {
 #[test]
 fn decode_rejects_oversized_payload() {
     use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
-    let huge_body = "A".repeat(10_000);
+    // Must exceed MAX_INVITE_BODY_B64_CHARS (85_333 = ≈64 KiB decoded).
+    let huge_body = "A".repeat(90_000);
     let url = format!("harmony://invite/{huge_body}");
     let err = decode_invite_url(&url).unwrap_err();
     assert!(matches!(err, InviteUrlError::TooLarge(_)));

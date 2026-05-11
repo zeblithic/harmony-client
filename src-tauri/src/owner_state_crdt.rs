@@ -1131,6 +1131,57 @@ mod apply_space_tests {
     }
 
     #[test]
+    fn apply_space_rejects_same_space_id_community_current_epoch_change() {
+        use crate::owner_state_types::EpochKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
+        assert_eq!(original.current_epoch, Some(0));
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut update = original.clone();
+        update.current_epoch = Some(1); // attempt to advance epoch without EpochRotation event
+        update.updated_at = hlc(999);
+        let outcome = s.apply_space(update);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("current_epoch"),
+                    "expected current_epoch rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_space_rejects_same_space_id_community_old_epoch_keys_change() {
+        use crate::owner_state_types::EpochKey;
+
+        let mut s = OwnerState::default();
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
+        assert!(original.old_epoch_keys.is_empty());
+        let outcome = s.apply_space(original.clone());
+        assert_eq!(outcome, ApplyOutcome::Inserted);
+
+        let mut update = original.clone();
+        // Inject a stale old key — must be rejected
+        update.old_epoch_keys.insert(0, EpochKey::new([0xdd; 32]));
+        update.updated_at = hlc(999);
+        let outcome = s.apply_space(update);
+        match outcome {
+            ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
+                assert!(
+                    msg.contains("old_epoch_keys"),
+                    "expected old_epoch_keys rejection; got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantFail rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_space_rejects_same_space_id_community_is_invite_only_flip() {
         use crate::owner_state_types::EpochKey;
 
@@ -1272,6 +1323,17 @@ mod apply_space_tests {
             merged.is_invite_only,
             Some(false),
             "is_invite_only must pin to creation — privacy mode is set once"
+        );
+        // M13: current_epoch and old_epoch_keys must also pin to the older creator.
+        assert_eq!(
+            merged.current_epoch,
+            Some(0),
+            "current_epoch must pin to older creator's value — epoch advance via EpochRotation only"
+        );
+        assert_eq!(
+            merged.old_epoch_keys,
+            std::collections::BTreeMap::new(),
+            "old_epoch_keys must pin to older creator's value — key history via EpochRotation only"
         );
         // Mutable fields still LWW (newer wins)
         assert_eq!(

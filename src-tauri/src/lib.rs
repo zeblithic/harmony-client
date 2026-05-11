@@ -8606,6 +8606,28 @@ where
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
+    // ZEB-249 Task 6 spec §5.2: seed the bootstrap hint BEFORE the first
+    // insert_local_event so the guard (version == 0 && events.is_empty())
+    // in CommunityState::materialized() can actually return the hint.
+    // The hint is seeded here — after the engine is spawned (state exists)
+    // but before either path inserts any event. Once the first real event
+    // arrives the hint is superseded by CRDT replay (spec §5.2 + §10.3).
+    {
+        let snapshot = &payload.epoch_snapshot.state_snapshot;
+        let hint = crate::community_membership::MaterializedMembership {
+            members: snapshot.members.clone(),
+            channels: snapshot.channels.clone(),
+            power_levels: snapshot.power_levels.clone(),
+            current_epoch: Some(payload.epoch_snapshot.epoch),
+            pending_rotation_for: std::collections::BTreeSet::new(),
+            pending_catchup_for: std::collections::BTreeSet::new(),
+        };
+        if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
+            let state_g = state_arc.lock().await;
+            state_g.seed_bootstrap_hint(hint);
+        }
+    }
+
     // 7. Branch on payload.is_invite_only.
     if !payload.is_invite_only {
         // OPEN: insert bootstrap_join via the engine. The engine's
@@ -8920,32 +8942,6 @@ where
     // succeeded — the redemption is durable. Sync (no .await needed). Per
     // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
     community_sync_guard.commit();
-
-    // ZEB-249 Task 6 spec §5.2: seed the invitee's materialized-state cache
-    // from `payload.epoch_snapshot.state_snapshot` so the UI can render
-    // community state immediately after join, before CRDT events arrive via
-    // Zenoh sync.
-    //
-    // Implementation: we resolved this using option (a) from the old TODO —
-    // a `bootstrap_hint` field on `CommunityState` that `materialized()`
-    // returns when the event log is still empty (version == 0). The first
-    // real CRDT event insert invalidates the cache and CRDT replay supersedes
-    // any inviter-tampered snapshot (spec §5.2 + §10.3).
-    {
-        let snapshot = &payload.epoch_snapshot.state_snapshot;
-        let hint = crate::community_membership::MaterializedMembership {
-            members: snapshot.members.clone(),
-            channels: snapshot.channels.clone(),
-            power_levels: snapshot.power_levels.clone(),
-            current_epoch: Some(payload.epoch_snapshot.epoch),
-            pending_rotation_for: std::collections::BTreeSet::new(),
-            pending_catchup_for: std::collections::BTreeSet::new(),
-        };
-        if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
-            let state_g = state_arc.lock().await;
-            state_g.seed_bootstrap_hint(hint);
-        }
-    }
 
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the redemption Space is committed. If commit()
@@ -10810,17 +10806,21 @@ pub async fn self_heal_community_observer(
             let state_g = state_g.lock().await;
             state_g.events.values().cloned().collect()
         };
-        let triggered_by_id = events.iter().find_map(|e| match &e.kind {
-            crate::community_membership::MembershipEventKind::Kick { target: t, .. }
-                if *t == target =>
-            {
-                Some(e.id)
-            }
-            crate::community_membership::MembershipEventKind::Leave if e.actor == target => {
-                Some(e.id)
-            }
-            _ => None,
-        });
+        // Select the NEWEST matching Kick or Leave so that a rejoin+re-kick
+        // sequence picks the most-recent removal rather than the stale one,
+        // ensuring the dedup key (community_id, target, triggered_by_id) is
+        // distinct from the prior rotation and a fresh rotation fires.
+        let triggered_by_id = events
+            .iter()
+            .filter(|e| match &e.kind {
+                crate::community_membership::MembershipEventKind::Kick { target: t, .. } => {
+                    *t == target
+                }
+                crate::community_membership::MembershipEventKind::Leave => e.actor == target,
+                _ => false,
+            })
+            .max_by_key(|e| (e.at.wall_ms, e.at.logical, e.at.device_id.as_str(), e.id))
+            .map(|e| e.id);
 
         let Some(triggered_by) = triggered_by_id else {
             tracing::warn!(

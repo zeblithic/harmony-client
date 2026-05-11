@@ -457,11 +457,17 @@ pub enum InviteUrlError {
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
 /// chars) we'll hand to the base64 + CBOR decoders. 4096 base64 chars
-/// decode to ≈3072 raw bytes — well above the expected ~180-byte
-/// payload (community_id + membership_key + admin_addr + name + flags).
+/// v2 budget: `InviteEpochSnapshot` embeds `MaterializedCommunityState`
+/// which grows linearly with community size. At ~500 members the CBOR
+/// payload is roughly 40-50 KB, base64-encoded to ~60-70 KB. 85333
+/// base64 chars decodes to exactly 64 KiB raw — a comfortable ceiling
+/// for moderate communities while still bounding the work done on
+/// untrusted input. Open-community v1 payloads (~180 bytes, ~240 base64
+/// chars) are well within this limit.
+///
 /// Greptile P2 on PR #87 round 2 flagged that the prior name "BYTES"
 /// misled. See `InviteUrlError::TooLarge`.
-const MAX_INVITE_BODY_B64_CHARS: usize = 4096;
+const MAX_INVITE_BODY_B64_CHARS: usize = 85_333; // ≈ 64 KiB decoded
 
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
@@ -482,6 +488,11 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     }
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+    // Encode-time size check: fail fast rather than producing an invite URL
+    // that decode_invite_url would immediately reject with TooLarge.
+    if b64.len() > MAX_INVITE_BODY_B64_CHARS {
+        return Err(InviteUrlError::TooLarge(b64.len()));
+    }
     Ok(format!("{URL_PREFIX}{b64}"))
 }
 

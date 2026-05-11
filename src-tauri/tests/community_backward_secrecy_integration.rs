@@ -297,8 +297,8 @@ fn seal_epoch_to_members(
     recipients
         .iter()
         .map(|(addr, sk)| {
-            let pub64 = sk.verifying_key().to_bytes();
-            let x25519_pub = ed25519_pub_to_x25519(&pub64).expect("ed25519_pub_to_x25519");
+            let pub32 = sk.verifying_key().to_bytes(); // 32-byte Ed25519 pubkey
+            let x25519_pub = ed25519_pub_to_x25519(&pub32).expect("ed25519_pub_to_x25519");
             let sealed = seal_to_owner(&x25519_pub, k_next.as_bytes()).expect("seal_to_owner");
             (**addr, sealed)
         })

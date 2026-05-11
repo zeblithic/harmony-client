@@ -1323,10 +1323,10 @@ impl CommunitySyncEngine {
             }
         }
         // A single dirty notification suffices for both inserts.
-        if matches!(
-            first_outcome,
-            InsertOutcome::Inserted | InsertOutcome::AlreadyKnown
-        ) || matches!(second_outcome, InsertOutcome::Inserted)
+        // Only fire on actual fresh insertions — AlreadyKnown idempotent
+        // retries must NOT republish or bump state.
+        if matches!(first_outcome, InsertOutcome::Inserted)
+            || matches!(second_outcome, InsertOutcome::Inserted)
         {
             self.notify_dirty();
         }
