@@ -2330,6 +2330,13 @@ pub struct CommunitySyncSpawnGuard {
     /// `AtomicBool` (mirrors ZEB-271) for Acquire/Release ordering
     /// across the Drop visibility boundary.
     completed: std::sync::atomic::AtomicBool,
+    /// Use-once flag (CR round 4 finding #2): set by
+    /// `spawn_engine_with_guard` via `compare_exchange(false, true)`.
+    /// If a second call sees `true`, it returns Err immediately. This
+    /// prevents the failure mode where a guard is reused and its
+    /// `freshly_created` field gets overwritten — silently disabling
+    /// the rollback obligation from the first spawn. Non-resettable.
+    used: std::sync::atomic::AtomicBool,
 }
 
 impl CommunitySyncSpawnGuard {
@@ -2457,6 +2464,7 @@ impl CommunitySyncRegistry {
             community_id,
             freshly_created: false,
             completed: std::sync::atomic::AtomicBool::new(false),
+            used: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2515,6 +2523,30 @@ impl CommunitySyncRegistry {
             )));
         }
 
+        // CR round 4 finding #2: use-once enforcement. compare_exchange
+        // returns Err if `used` was already true → reject the call.
+        // Without this, a second call on the same guard would overwrite
+        // freshly_created and silently disable the rollback obligation
+        // from the first spawn. Non-resettable: the guard is exhausted
+        // after one attempt regardless of success/failure. Callers must
+        // create a new guard via begin_spawn_guard for retries.
+        if guard
+            .used
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Err(CommunitySyncError::Persist(format!(
+                "spawn_engine_with_guard called twice on the same guard — \
+                 programming error (community_id = {community_id:?}). \
+                 Guards are use-once; create a fresh one via begin_spawn_guard."
+            )));
+        }
+
         // Step 1: spawn the engine via the inner helper.
         let freshly_created = self
             .spawn_engine_inner_now(
@@ -2527,6 +2559,15 @@ impl CommunitySyncRegistry {
             )
             .await?;
 
+        // CR round 4 finding #3: ARM the guard NOW (before any further
+        // failure-prone work) so the Drop safety net catches any later
+        // failure in this function. Set-early pattern: we'd rather have
+        // Drop run a redundant teardown than leave an orphaned engine.
+        // This also fixes the engine_arc-vanished race below — without
+        // arming-early, the rare engine_arc lookup-fail path would leave
+        // the engine in the registry without cleanup.
+        guard.freshly_created = freshly_created;
+
         // Step 2: if fresh, dispatch the adapter request.
         if freshly_created {
             if let Err(send_err) =
@@ -2536,20 +2577,29 @@ impl CommunitySyncRegistry {
                     subscriber_tx,
                 })
             {
-                // Step 3: try_send failed → undo the spawn before returning.
-                // Inline `.await` (we're already inside an async fn).
-                if let Err(stop_err) = self
+                // Step 3: try_send failed → undo the spawn inline.
+                match self
                     .shutdown_engine_and_cleanup_persistence(&community_id)
                     .await
                 {
-                    tracing::warn!(
-                        community_id = ?community_id,
-                        error = %stop_err,
-                        "spawn_engine_with_guard: cleanup after adapter try_send failure also failed — \
-                         engine + persist dir may leak (reconcile recovers at next start_node)"
-                    );
+                    Ok(_) => {
+                        // Inline cleanup succeeded → DISARM the guard
+                        // (Drop would otherwise run a redundant teardown
+                        // that finds nothing and logs spurious warns).
+                        guard.freshly_created = false;
+                    }
+                    Err(stop_err) => {
+                        // Inline cleanup ALSO failed → leave guard armed
+                        // (freshly_created stays true) so the Drop safety
+                        // net retries the cleanup. CR round 4 finding #3.
+                        tracing::warn!(
+                            community_id = ?community_id,
+                            error = %stop_err,
+                            "spawn_engine_with_guard: cleanup after adapter try_send failure also failed — \
+                             leaving guard armed for Drop retry; if Drop also fails, reconcile recovers at next start_node"
+                        );
+                    }
                 }
-                // Guard's freshly_created stays FALSE → Drop is a no-op.
                 return Err(CommunitySyncError::Persist(format!(
                     "community_adapter_tx.try_send failed: {send_err}"
                 )));
@@ -2558,10 +2608,10 @@ impl CommunitySyncRegistry {
         // ELSE: engine pre-existed (idempotent path); the publisher_rx +
         // subscriber_tx + community_adapter_tx args are dropped (the
         // existing engine + adapter already own their channels).
+        // freshly_created was set false above; guard's Drop is a no-op.
 
-        // Step 4: bind the freshness flag to the guard. Now the guard
-        // carries the rollback obligation if freshly_created = true.
-        guard.freshly_created = freshly_created;
+        // (Set-early arm above already bound guard.freshly_created;
+        // CR round 4 finding #3 made this safe against engine_arc-vanished.)
 
         // Recover the engine handle for the caller. The inner helper
         // doesn't return it directly to preserve the existing return-type
@@ -3539,13 +3589,84 @@ mod tests {
              (rolled back inline before guard arming)"
         );
 
-        // The guard drops at scope exit. Its Drop should be a no-op
-        // because freshly_created stayed false (never set, since
-        // spawn_engine_with_guard returned Err before binding it).
-        // We don't assert anything else — Drop running cleanup again
-        // would be the bug; if it ran, the (already-cleaned-up) state
-        // wouldn't change anyway, but the spawned cleanup task would
-        // log a warn about a missing engine. Inspect logs if this test
-        // ever flakes.
+        // The guard drops at scope exit. Its Drop should be a no-op:
+        // CR round 4's set-early-arm pattern initially sets
+        // freshly_created=true (so Drop catches any later failure),
+        // but the successful inline cleanup branch resets it to false
+        // before returning Err. So the guard arrives at Drop with
+        // freshly_created=false → no redundant teardown.
+    }
+
+    /// CR round 4 finding #2: regression test for the use-once flag.
+    /// Calling spawn_engine_with_guard a second time on the same guard
+    /// must return Err immediately — without this check, the second
+    /// call would overwrite freshly_created and silently disable the
+    /// rollback obligation from the first spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_use_once_rejects_second_spawn_call() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc7; 16]);
+
+        let (pub_tx_a, pub_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx_a, sub_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+
+        // First call: succeeds. Engine is spawned + adapter dispatched.
+        std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx_a,
+                sub_rx_a,
+                pub_rx_a,
+                sub_tx_a,
+                fix.community_adapter_tx.clone(),
+            )
+            .await
+            .expect("first spawn_engine_with_guard call");
+
+        // Second call on the SAME guard: must Err with use-once message.
+        let (pub_tx_b, pub_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx_b, sub_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let result = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx_b,
+                sub_rx_b,
+                pub_rx_b,
+                sub_tx_b,
+                fix.community_adapter_tx.clone(),
+            )
+            .await;
+
+        // Arc<CommunitySyncEngine> doesn't implement Debug, so use
+        // match instead of expect_err.
+        let err = match result {
+            Ok(_) => panic!("second spawn_engine_with_guard call must Err, got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("called twice on the same guard"),
+            "second-call Err must mention use-once violation; got: {msg}"
+        );
+
+        // Commit the guard to release rollback obligation cleanly.
+        guard.commit();
+
+        // Engine must still be present (the second call's Err didn't
+        // tear it down — only the rejection message matters).
+        assert!(
+            fix.registry.has_engine(&community_id).await,
+            "engine from the first call must remain after the second use-once-rejected call"
+        );
     }
 }
