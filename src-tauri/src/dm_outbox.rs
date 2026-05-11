@@ -1177,8 +1177,13 @@ impl DmOutbox {
             // PublicChannel spaces (which can also have members for
             // read-access controls). `validate_invariants` guarantees
             // content_key.is_some() only for Dm/GroupDm — without this
-            // gate, Phase C's `space.content_key.as_ref().expect(...)`
-            // panics the spawned task.
+            // gate, the handler proceeds into Phase B's 500ms CAS fetch
+            // and Phase C, which then log-drops on content_key=None at
+            // line ~1308 with a generic "invariant violation" warning.
+            // The gate fires earlier (cheap path), avoids wasted CAS
+            // bandwidth, and emits the precise SpaceKindMismatch
+            // telemetry. Also defense-in-depth against a future code
+            // change that might reintroduce a panic in the decrypt path.
             if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
                 tracing::warn!(
                     error = ?DmReceiveError::SpaceKindMismatch,
@@ -1641,10 +1646,13 @@ pub enum DmReceiveError {
     #[error("sender's resolved owner is not in space.members (ex-member with cached key?)")]
     SenderNotInSpaceMembers,
     /// Space.kind is not `Dm` or `GroupDm`. `validate_invariants` guarantees
-    /// `content_key.is_some()` only for Dm/GroupDm — without this gate, a
-    /// forged CidNotify whose space_id resolves to a Channel/PublicChannel
-    /// Space (which can also have members) would reach Phase C's decrypt
-    /// path and panic on `space.content_key.as_ref().expect(...)`. ZEB-275.
+    /// `content_key.is_some()` only for Dm/GroupDm — without this gate,
+    /// a forged CidNotify targeting a Channel/PublicChannel Space (which
+    /// can also have members for read-access controls) would proceed
+    /// through Phase B's 500ms CAS fetch and reach Phase C, which then
+    /// log-drops with a generic "invariant violation" warning. The Phase A
+    /// gate is the early-drop optimization (avoid CAS bandwidth) and the
+    /// precise telemetry channel for this attack vector. ZEB-275.
     #[error("Space.kind is not Dm or GroupDm (forged CidNotify targeting non-DM space?)")]
     SpaceKindMismatch,
     #[error("CAS fetch failed or timed out: {0}")]
@@ -5137,19 +5145,50 @@ mod tests {
         );
     }
 
+    /// Counting CAS stub: wraps `InMemoryStub` and tracks the number of
+    /// `get()` calls. Used by `handle_cidnotify_lifted_gates_on_spacekind_dm_or_groupdm`
+    /// below to assert the Phase A gate short-circuits BEFORE Phase B
+    /// invokes the CAS fetch — the load-bearing distinguisher between
+    /// "gate fired (call_count == 0)" and "fell through to Phase B
+    /// (call_count == 1)".
+    struct CountingCasStub {
+        inner: InMemoryStub,
+        get_call_count: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ContentStore for CountingCasStub {
+        async fn put(
+            &self,
+            cid: ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.inner.put(cid, blob).await
+        }
+        async fn get(
+            &self,
+            cid: &ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(cid).await
+        }
+    }
+
     #[tokio::test]
     async fn handle_cidnotify_lifted_gates_on_spacekind_dm_or_groupdm() {
         // ZEB-275: a forged DmCidNotify whose space_id resolves to a
         // Channel Space — where the resolved sender happens to appear
         // in space.members (channels can have members for read-access
-        // controls) — must be dropped in Phase A, not allowed to fall
-        // through to Phase C's `space.content_key.as_ref().expect(...)`
-        // panic.
+        // controls) — must be dropped in Phase A, BEFORE Phase B
+        // invokes `cas.get()` to fetch the message blob.
         //
-        // validate_invariants guarantees content_key.is_none() for
-        // Channel/PublicChannel — so without the SpaceKind gate, the
-        // spawned task panics. With the gate, Phase A drops with
-        // SpaceKindMismatch and the handler returns cleanly.
+        // Without the gate, the handler would proceed into Phase B's
+        // 500ms CAS fetch and reach Phase C, which then log-drops on
+        // `content_key=None` (Channel spaces have content_key=None per
+        // validate_invariants). The observable end state is identical
+        // either way (empty inbox, no ack) — so to make this test
+        // load-bearing, the counting CAS stub asserts get_call_count
+        // == 0, confirming Phase A short-circuited before Phase B.
         let alice = OwnerAddr([0x01; 16]);
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
@@ -5227,16 +5266,19 @@ mod tests {
         let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private_alice.sign(&signed_bytes);
 
-        let cas = std::sync::Arc::new(InMemoryStub::default());
+        let cas = std::sync::Arc::new(CountingCasStub {
+            inner: InMemoryStub::default(),
+            get_call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
         let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
         let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
         let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
         let app = tauri::test::mock_app().handle().clone();
 
-        // The handler must complete without panicking. Pre-ZEB-275,
-        // the .expect("DM Space MUST have content_key") in Phase C
-        // would have fired had Phase A let the packet through.
+        // The handler must complete without panicking and the gate
+        // must short-circuit BEFORE Phase B's CAS fetch — verified
+        // via the counting CAS stub assertion below.
         DmOutbox::handle_cidnotify_lifted(
             std::sync::Arc::clone(&outbox_arc),
             std::sync::Arc::clone(&state_arc),
@@ -5274,6 +5316,20 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no ack must be emitted when SpaceKind != Dm|GroupDm"
+        );
+
+        // LOAD-BEARING: Phase A's SpaceKindMismatch gate must
+        // short-circuit BEFORE Phase B's CAS fetch. Without this
+        // assertion, the test would pass even if the gate were
+        // removed (Phase B/C also drop on this scenario, just
+        // wastefully — same observable end state). With this
+        // assertion, removing the gate causes a test failure
+        // (get_call_count == 1) while keeping it green (== 0).
+        assert_eq!(
+            cas.get_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Phase A gate must fire BEFORE Phase B's CAS fetch — \
+             counter would be 1 if the gate were bypassed"
         );
     }
 
