@@ -1245,11 +1245,28 @@ impl DmOutbox {
             // landed during Phase B is reflected here; the prior_keys
             // fallback decrypts blobs that were encrypted with a key
             // listed in `space_c.prior_content_keys`.
+            //
+            // Defense-in-depth: log + drop instead of expect()/panic.
+            // In the spawned-task path, panic dies silently (no caller
+            // to surface); converting to a graceful drop keeps the
+            // method panic-free as documented and matches the rest of
+            // Phase C's error handling. Reachable only via corrupted
+            // state, migration bug, or direct test insertion that
+            // bypasses validate_invariants — in production this should
+            // never fire, but the failure mode is now observable.
+            let content_key = match space_c.content_key.as_ref() {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        "handle_cidnotify_lifted Phase C: dropping packet \
+                         (DM Space lacks content_key — invariant violation, \
+                         possibly corrupted state)"
+                    );
+                    return;
+                }
+            };
             let payload = match crate::dm_crypto::decrypt_dm_message(
-                space_c
-                    .content_key
-                    .as_ref()
-                    .expect("DM Space MUST have content_key per validate_invariants"),
+                content_key,
                 &space_c.prior_content_keys,
                 &aad,
                 &blob,
@@ -4590,25 +4607,34 @@ mod tests {
     // I/O) ample headroom to acquire+release locks before the test
     // mutates state. Bumping if any flake observed.
 
-    /// Time the test sleeps after spawning `handle_cidnotify_lifted`
-    /// to let Phase A run and drop its locks before the test mutates
-    /// state. Phase A is purely in-memory (signature verify + BTreeMap
-    /// lookup + clone) — microsecond-scale even on contended runners.
-    /// 50ms is ~5 orders of magnitude headroom; if this ever flakes
-    /// on CI bump to 200ms.
-    const PHASE_A_GRACE_MS: u64 = 50;
-
     /// CAS stub that blocks `get()` on a `tokio::sync::Notify` until
-    /// `release()` fires. Used by the ZEB-241 TOCTOU regression tests
-    /// to inject state mutations between Phase A (Space snapshot) and
-    /// Phase C (Space re-fetch + apply) of `handle_cidnotify_lifted`.
+    /// `release()` fires, AND signals when Phase B has been entered
+    /// (via a second Notify) so tests can wait deterministically
+    /// instead of using a timing-based sleep. Used by the ZEB-241
+    /// TOCTOU regression tests to inject state mutations between
+    /// Phase A (Space snapshot) and Phase C (Space re-fetch + apply)
+    /// of `handle_cidnotify_lifted`.
+    ///
+    /// Test sequence (deterministic, no time dependence):
+    ///   1. spawn handle_cidnotify_lifted task (begins Phase A)
+    ///   2. test calls `wait_for_phase_b().await` — blocks until
+    ///      Phase A drops its locks AND Phase B's CAS get() is reached
+    ///   3. test acquires state lock, mutates, drops lock
+    ///   4. test calls `release()` — unblocks Phase B
+    ///   5. handler runs Phase C against the post-mutation state
+    ///   6. test joins the spawned task + asserts
     ///
     /// `put()` is a no-op — these tests pre-seed the blob via the
     /// constructor and never exercise the put path.
     struct GatedCasStub {
         blob: Vec<u8>,
         cid: ContentId,
+        /// Signaled by `release()`; awaited by `get()` to gate Phase B.
         gate: tokio::sync::Notify,
+        /// Signaled by `get()` on entry; awaited by tests to know
+        /// Phase A has dropped its locks AND Phase B is parked at the
+        /// CAS get(). Eliminates the need for a timing-based sleep.
+        phase_b_entered: tokio::sync::Notify,
     }
 
     impl GatedCasStub {
@@ -4617,6 +4643,7 @@ mod tests {
                 blob,
                 cid,
                 gate: tokio::sync::Notify::new(),
+                phase_b_entered: tokio::sync::Notify::new(),
             }
         }
 
@@ -4628,6 +4655,15 @@ mod tests {
         fn release(&self) {
             self.gate.notify_one();
         }
+
+        /// Block until the spawned task's Phase B has entered the CAS
+        /// `get()` call. By this point Phase A has provably dropped
+        /// its locks (it must, in order for Phase B to start). Tests
+        /// call this instead of `tokio::time::sleep` to eliminate
+        /// timing dependence.
+        async fn wait_for_phase_b(&self) {
+            self.phase_b_entered.notified().await;
+        }
     }
 
     #[async_trait]
@@ -4637,6 +4673,10 @@ mod tests {
         }
 
         async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            // Signal Phase B entry BEFORE blocking on the gate, so
+            // tests can deterministically wait on this point instead
+            // of using a timing-based sleep.
+            self.phase_b_entered.notify_one();
             self.gate.notified().await;
             if cid == &self.cid {
                 Ok(Some(self.blob.clone()))
@@ -4725,7 +4765,7 @@ mod tests {
 
         // Let Phase A run + drop its locks. Phase A is microsecond-
         // scale (no I/O), 50ms is generous headroom.
-        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
+        gated.wait_for_phase_b().await;
 
         // Mutate state under the lock: rotate content_key K1 → K2,
         // record K1 as prior. Direct insertion bypasses
@@ -4828,7 +4868,7 @@ mod tests {
             500,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
+        gated.wait_for_phase_b().await;
 
         // Mutate state: remove the Space entirely. Direct removal
         // bypasses any tombstone semantics (Phase 2 is in-memory,
@@ -4995,7 +5035,7 @@ mod tests {
             500,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
+        gated.wait_for_phase_b().await;
 
         // Mutate state: kick alice. The remaining members [bob,
         // charlie] is len=2 which would fail GroupDm's 3+ invariant

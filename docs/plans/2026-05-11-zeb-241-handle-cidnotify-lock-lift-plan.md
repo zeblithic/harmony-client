@@ -386,7 +386,7 @@ Add any missing imports at the top of `dm_outbox.rs`.
 - [ ] **Step 4: Run formatter + clippy + full nextest**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cd src-tauri
 cargo fmt --all
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
@@ -397,7 +397,7 @@ Expected: 0 fmt diff, 0 clippy warnings, all existing tests pass (no behavior ch
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+# (run from repo root)
 git add src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
 feat(zeb-241): add handle_cidnotify_lifted alongside old monolith
@@ -524,7 +524,7 @@ If `tauri::test::mock_app` is unavailable or scaffolds too much, an alternative 
 - [ ] **Step 4: Run all gates**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cd src-tauri
 cargo fmt --all
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
@@ -535,7 +535,7 @@ Expected: all green. If any test fails on the migration, diagnose + fix before p
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+# (run from repo root)
 git add src-tauri/src/event_loop.rs src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
 refactor(zeb-241): wire event_loop to spawn handle_cidnotify_lifted; remove old monolith
@@ -587,7 +587,7 @@ GroupDm Space; sender ∈ members at Phase A; during Phase B, test removes sende
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cd src-tauri
 cargo fmt --all
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --features test-fixtures \
@@ -599,7 +599,7 @@ Expected: 3 new tests + all existing handle_cidnotify_lifted tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+# (run from repo root)
 git add src-tauri/src/dm_outbox.rs
 git commit -m "$(cat <<'EOF'
 test(zeb-241): TOCTOU regression tests for handle_cidnotify_lifted
