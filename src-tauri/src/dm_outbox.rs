@@ -4566,6 +4566,476 @@ mod tests {
         );
     }
 
+    // ── ZEB-241 Task 3: TOCTOU regression tests ────────────────────────
+    //
+    // The lifted handler runs in three phases: Phase A (locked, fast —
+    // verify + snapshot Space), Phase B (unlocked, slow — CAS fetch),
+    // Phase C (re-locked, fast — re-fetch Space + decrypt + apply).
+    //
+    // The TOCTOU window is the gap between Phase A's lock-drop and
+    // Phase C's lock-acquire. To exercise it deterministically, the
+    // tests below use a `GatedCasStub` whose `get()` blocks on a
+    // `tokio::sync::Notify` until the test releases it. This pattern
+    // lets the test:
+    //   1. Spawn the lifted handler.
+    //   2. Wait briefly so Phase A runs to completion.
+    //   3. Acquire the state lock and mutate state (rotate key /
+    //      remove Space / kick member).
+    //   4. Drop the lock.
+    //   5. Release the gate so Phase B unblocks.
+    //   6. Await the spawned handler.
+    //   7. Inspect post-call state.
+    //
+    // The 50ms post-spawn sleep gives Phase A (microsecond-scale, no
+    // I/O) ample headroom to acquire+release locks before the test
+    // mutates state. Bumping if any flake observed.
+
+    /// CAS stub that blocks `get()` on a `tokio::sync::Notify` until
+    /// `release()` fires. Used by the ZEB-241 TOCTOU regression tests
+    /// to inject state mutations between Phase A (Space snapshot) and
+    /// Phase C (Space re-fetch + apply) of `handle_cidnotify_lifted`.
+    ///
+    /// `put()` is a no-op — these tests pre-seed the blob via the
+    /// constructor and never exercise the put path.
+    struct GatedCasStub {
+        blob: Vec<u8>,
+        cid: ContentId,
+        gate: tokio::sync::Notify,
+    }
+
+    impl GatedCasStub {
+        fn new(cid: ContentId, blob: Vec<u8>) -> Self {
+            Self {
+                blob,
+                cid,
+                gate: tokio::sync::Notify::new(),
+            }
+        }
+
+        /// Release the next (or stored) `notified()` future inside
+        /// `get()`. Notify::notify_one stores a permit if no waiter is
+        /// parked yet, so calling release() before the spawned task
+        /// reaches `gate.notified().await` is safe — the next await
+        /// consumes the permit immediately.
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for GatedCasStub {
+        async fn put(&self, _cid: ContentId, _blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            self.gate.notified().await;
+            if cid == &self.cid {
+                Ok(Some(self.blob.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_decrypts_via_prior_keys_when_content_key_rotates_during_lift()
+    {
+        // TOCTOU: Phase A snapshots Space with content_key=K1. Between
+        // Phase A's lock-drop and Phase C's lock-acquire, the test
+        // rotates the Space's key to K2 with prior_content_keys=[K1].
+        // Phase C re-fetches the Space (now K2 + prior=[K1]) and
+        // decrypts the K1-encrypted blob via the prior-keys fallback in
+        // `dm_crypto::decrypt_dm_message`.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let k1 = DmContentKey::new([0x11; 32]);
+        let k2 = DmContentKey::new([0x22; 32]);
+        // Sender encrypts with K1 — fixture sets up Space with K1.
+        let (state, _cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                k1.clone(),
+            )
+            .await;
+
+        // Take the K1-encrypted blob out of the fixture's CAS by
+        // re-encrypting deterministically. Simpler: reach into the
+        // fixture's cas. But we own _cas above — drop it and rebuild
+        // the blob to feed into our gated stub. Re-encrypt path with
+        // the same content_key + AAD reproduces the same ciphertext-
+        // shape (different nonce, but decryptable under K1).
+        let space_a = state.spaces.get(&space_id).cloned().unwrap();
+        let aad = crate::dm_crypto::compute_aad(&space_a).unwrap();
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi bob".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let blob = crate::dm_crypto::encrypt_dm_message(&k1, &aad, &payload).unwrap();
+
+        // The gated stub's `get(cid)` must return THIS blob for the
+        // notify's message_cid. We don't recompute the cid from the
+        // re-encrypted blob — we use the fixture's `message_cid` so
+        // the signed CidNotify keeps verifying. This is fine because
+        // the lifted handler doesn't re-verify cid==hash(blob); it
+        // just decrypts whatever bytes the CAS returns. Production
+        // CAS guarantees that, but for this TOCTOU test the stub's
+        // contract is "return the blob the test wants Phase C to
+        // decrypt".
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        // Let Phase A run + drop its locks. Phase A is microsecond-
+        // scale (no I/O), 50ms is generous headroom.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Mutate state under the lock: rotate content_key K1 → K2,
+        // record K1 as prior. Direct insertion bypasses
+        // apply_space_with_canonicalization's same-SpaceId
+        // content_key-immutability rejection (which exists for v1's
+        // no-rotation policy, but Sub-C key rotation will eventually
+        // need a different write path). The TOCTOU semantics under
+        // test are independent of the rotation policy — Phase C just
+        // re-reads whatever Space is in state.
+        {
+            let mut state_g = state_arc.lock().await;
+            let mut sp = state_g.spaces.get(&space_id).cloned().unwrap();
+            sp.content_key = Some(k2);
+            sp.prior_content_keys = vec![k1];
+            state_g.spaces.insert(space_id, sp);
+        }
+
+        // Release the gate — Phase B can now complete + Phase C runs.
+        gated.release();
+
+        handler.await.expect("handler must not panic");
+
+        // Recover ownership of state for inspection.
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Phase C must have decrypted via prior-keys fallback,
+        // installed the InboxEntry, and fanned out one ack.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST be installed — prior-keys fallback should decrypt K1 blob under rotated K2"
+        );
+        let entry = state.inbox.get(&inbox_key).unwrap();
+        assert_eq!(entry.from, alice);
+        let req = rx.try_recv().expect("ack must have fanned out");
+        assert!(!req.packet.is_empty(), "ack packet must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_drops_when_space_deleted_during_lift() {
+        // TOCTOU: Phase A snapshots Space S. Between Phase A's lock-
+        // drop and Phase C's lock-acquire, the test removes S from
+        // state.spaces. Phase C's re-fetch returns None → log warn +
+        // drop. No InboxEntry written, no ack emitted.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (state, _cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key.clone(),
+            )
+            .await;
+
+        // Re-encrypt to feed the gated stub directly (mirrors Test 1
+        // pattern). This blob would decrypt successfully if Phase C
+        // ran — what we assert is that Phase C drops on
+        // SpaceNotFound BEFORE reaching the decrypt step.
+        let space_a = state.spaces.get(&space_id).cloned().unwrap();
+        let aad = crate::dm_crypto::compute_aad(&space_a).unwrap();
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi bob".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Mutate state: remove the Space entirely. Direct removal
+        // bypasses any tombstone semantics (Phase 2 is in-memory,
+        // tombstones are runtime-only). Phase C's `state_g.spaces
+        // .get(&signed.space_id)` will return None → warn + return.
+        {
+            let mut state_g = state_arc.lock().await;
+            state_g.spaces.remove(&space_id);
+        }
+
+        gated.release();
+        handler.await.expect("handler must not panic");
+
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Inbox unchanged — Phase C's SpaceNotFound branch fires
+        // BEFORE apply_inbox.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed when Space is deleted in TOCTOU window"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on Phase C SpaceNotFound drop"
+        );
+
+        // No ack fan-out — the SpaceNotFound branch fires BEFORE the
+        // ack build/encode/try_send block.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted when Space is deleted in TOCTOU window"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_drops_when_sender_kicked_from_groupdm_during_lift() {
+        // TOCTOU: GroupDm Space with sender (alice) ∈ members at
+        // Phase A. Between Phase A and Phase C, the test removes
+        // alice from space.members (kick). Phase C's
+        // `space_c.members.contains(&resolved_owner)` check fails →
+        // log warn + drop. No InboxEntry written, no ack emitted.
+        //
+        // The fixture builds for SpaceKind::Dm (2 members) — we
+        // construct the GroupDm Space inline here because GroupDm
+        // requires 3..=16 distinct sorted members per
+        // validate_invariants, which the fixture's 2-member layout
+        // can't satisfy.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let charlie = OwnerAddr([0x03; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+
+        // Build state + alice's cache binding ourselves (mirrors
+        // build_cidnotify_fixture's pre-seed step).
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        // Build the GroupDm Space with [alice, bob, charlie] sorted.
+        let mut members = vec![alice, bob, charlie];
+        members.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "trio".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
+        };
+        let outcome = state.apply_space_with_canonicalization(space.clone());
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "GroupDm fixture install failed: {outcome:?}"
+        );
+
+        // Encrypt + sign as alice.
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi crew".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Mutate state: kick alice. The remaining members [bob,
+        // charlie] is len=2 which would fail GroupDm's 3+ invariant
+        // — so we can't push the mutated Space through
+        // apply_space_with_canonicalization. Direct insert
+        // (mirroring the existing handle_cidnotify_drops_when_
+        // resolved_owner_not_in_space_members test pattern at
+        // line 4222) bypasses the invariant check, simulating a
+        // post-revocation state where the local cache has the kick
+        // applied.
+        {
+            let mut state_g = state_arc.lock().await;
+            let mut sp = state_g.spaces.get(&space_id).cloned().unwrap();
+            sp.members = vec![bob, charlie];
+            sp.members.sort();
+            state_g.spaces.insert(space_id, sp);
+        }
+
+        gated.release();
+        handler.await.expect("handler must not panic");
+
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Inbox unchanged — Phase C's SenderNotInSpaceMembers branch
+        // fires BEFORE apply_inbox.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed when sender kicked in TOCTOU window"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on Phase C membership-gate drop"
+        );
+
+        // No ack fan-out — membership gate fires BEFORE the ack
+        // build/encode/try_send block.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted when sender kicked in TOCTOU window"
+        );
+    }
+
     #[tokio::test]
     async fn reserve_next_hlc_for_device_handles_wall_regression() {
         use std::collections::BTreeMap;
