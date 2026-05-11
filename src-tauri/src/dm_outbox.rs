@@ -839,6 +839,24 @@ impl DmOutbox {
         // 1. Apply each send result.
         for r in results {
             self.in_flight.remove(&(r.entry_id, r.recipient));
+            // ZEB-233 round 4 (CodeRabbit Minor): skip the backoff
+            // write if a concurrent `handle_ack` already marked this
+            // recipient delivered between Phase B's send and Phase C's
+            // (delayed, spawned) lock acquisition. Without this check,
+            // we'd resurrect stale per-recipient retry state for an
+            // already-acked recipient, which then sticks until the
+            // whole message completes or expires (Step 4's
+            // backoff.retain only sees the entry-level Pending/Partial
+            // status, not per-recipient delivered_to).
+            let recipient_still_pending = state.outbox.get(&r.entry_id).is_some_and(|entry| {
+                matches!(
+                    entry.delivery_status,
+                    DeliveryStatus::Pending | DeliveryStatus::Partial
+                ) && !entry.delivered_to.contains(&r.recipient)
+            });
+            if !recipient_still_pending {
+                continue;
+            }
             match r.result {
                 Ok(()) => {
                     // Throttle post-Ok retries until the ack arrives.
@@ -1814,7 +1832,15 @@ pub async fn drain_lifted<R: tauri::Runtime>(
     for unit in work {
         let entry_id = unit.entry_id;
         let recipient = unit.recipient;
-        let still_live = match (outbox.try_lock(), state.try_lock()) {
+        // ZEB-233 round 4 (CodeRabbit Major): the liveness re-check
+        // ALSO re-resolves destinations from the CURRENT
+        // `owner_device_cache`. Phase A's snapshot can be stale if a
+        // device was rotated/revoked between Phase A and Phase B —
+        // without the re-resolve, the send would target stale device
+        // hashes (misdelivery to a revoked device). Returns
+        // `Some(destinations)` only when both still-live AND
+        // lock-acquisition succeed.
+        let destinations = match (outbox.try_lock(), state.try_lock()) {
             (Ok(o_g), Ok(s_g)) => {
                 let live = s_g.outbox.get(&entry_id).is_some_and(|entry| {
                     matches!(
@@ -1823,9 +1849,16 @@ pub async fn drain_lifted<R: tauri::Runtime>(
                     ) && !entry.delivered_to.contains(&recipient)
                         && o_g.in_flight.contains(&(entry_id, recipient))
                 });
-                // o_g + s_g drop at end of match arm — BEFORE the
-                // `.await` below. No locks held across the await.
-                live
+                // Compute the re-resolved destinations under the same
+                // try_lock guard, so the cache read is consistent with
+                // the liveness check above. o_g + s_g drop at end of
+                // match arm — BEFORE the `.await` below. No locks
+                // held across the await.
+                if live {
+                    Some(resolve_destinations(&s_g.owner_device_cache, recipient))
+                } else {
+                    None
+                }
             }
             _ => {
                 tracing::debug!(
@@ -1833,15 +1866,15 @@ pub async fn drain_lifted<R: tauri::Runtime>(
                     ?recipient,
                     "drain_lifted Phase B: lock contended on liveness re-check; skipping send (next tick retries)"
                 );
-                false
+                None
             }
         };
-        if !still_live {
+        let Some(destinations) = destinations else {
             skipped.push((entry_id, recipient));
             continue;
-        }
+        };
         let result = transport
-            .send(&unit.entry_clone, recipient, unit.destinations)
+            .send(&unit.entry_clone, recipient, destinations)
             .await;
         results.push(DrainSendResult {
             entry_id,
@@ -2721,6 +2754,73 @@ mod tests {
              is not a send attempt; bumping failure_count would unfairly \
              throttle a healthy entry next tick"
         );
+    }
+
+    #[test]
+    fn drain_phase_c_skips_backoff_for_recipient_already_acked() {
+        // ZEB-233 round 4 (CodeRabbit Minor): Phase C runs in a
+        // spawned task that can be delayed by Phase C lock acquisition
+        // (e.g., contended by a concurrent handle_ack). If handle_ack
+        // marks a recipient `delivered` between Phase B's send and
+        // Phase C's lock acquisition, Phase C MUST NOT resurrect
+        // stale per-recipient backoff for that recipient.
+        //
+        // Test: install entry with bob as a recipient already in
+        // delivered_to (simulating handle_ack having completed bob
+        // between Phase B and Phase C). Run Phase C with a result for
+        // bob. Assert: backoff entry NOT created for (entry, bob).
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let mut entry = entry_with_age(7, vec![bob, carol], 1_000);
+        // Simulate handle_ack: bob already delivered before Phase C runs.
+        // Mark Partial status (some delivered, others pending).
+        entry.delivered_to.insert(bob);
+        entry.delivery_status = DeliveryStatus::Partial;
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        o.in_flight.insert((entry_id, bob));
+        o.in_flight.insert((entry_id, carol));
+
+        // Phase B finished sending to both; results for both arrive.
+        // But by the time Phase C runs, bob has already been acked
+        // (via handle_ack between Phase B and Phase C).
+        let results = vec![
+            DrainSendResult {
+                entry_id,
+                recipient: bob,
+                result: Ok(()),
+            },
+            DrainSendResult {
+                entry_id,
+                recipient: carol,
+                result: Ok(()),
+            },
+        ];
+        let _outcome = o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
+
+        // bob's backoff MUST NOT be set — handle_ack already cleared
+        // his per-recipient retry state; Phase C must not resurrect.
+        assert!(
+            !o.backoff.contains_key(&(entry_id, bob)),
+            "backoff for already-acked recipient must NOT be set by Phase C \
+             (would resurrect stale retry state)"
+        );
+
+        // carol's backoff MUST be set (she's still Pending in delivered_to).
+        assert!(
+            o.backoff.contains_key(&(entry_id, carol)),
+            "backoff for still-pending recipient MUST be set normally"
+        );
+
+        // Both in_flight markers cleared.
+        assert!(!o.in_flight.contains(&(entry_id, bob)));
+        assert!(!o.in_flight.contains(&(entry_id, carol)));
     }
 
     #[test]
