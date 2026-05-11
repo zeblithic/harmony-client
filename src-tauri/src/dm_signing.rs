@@ -35,6 +35,8 @@ pub enum DmSignError {
     DecryptionFailed,
     #[error("malformed sealed envelope (too short or bad framing)")]
     MalformedSealedEnvelope,
+    #[error("invalid Ed25519 pubkey (cannot decompress)")]
+    InvalidEd25519Pubkey,
 }
 
 /// Seal a payload to a recipient's X25519 public key using
@@ -107,6 +109,38 @@ pub fn open_from_owner(
     cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
         .map_err(|_| DmSignError::DecryptionFailed)
+}
+
+/// Convert an Ed25519 public key to an X25519 public key via the
+/// standard birational map (RFC 7748 §5). Used for sealing material
+/// to recipients identified by their Ed25519 identity.
+///
+/// The Ed25519 curve point is the Twisted Edwards curve point y → u
+/// Montgomery form: u = (1 + y) / (1 - y) mod p.
+pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignError> {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let edwards = CompressedEdwardsY(*ed25519_pub)
+        .decompress()
+        .ok_or(DmSignError::InvalidEd25519Pubkey)?;
+    Ok(edwards.to_montgomery().to_bytes())
+}
+
+/// Convert an Ed25519 signing key to an X25519 private key via the
+/// standard derivation (RFC 7748 §5 with SHA-512 + clamping).
+///
+/// The Ed25519 secret scalar is derived via SHA-512 of the 32-byte
+/// private seed; the first 32 bytes are the X25519 scalar candidate,
+/// clamped per RFC 7748 §5 before use.
+pub fn ed25519_priv_to_x25519(signing_key: &ed25519_dalek::SigningKey) -> [u8; 32] {
+    use sha2::{Digest, Sha512};
+    let hash = Sha512::digest(signing_key.to_bytes());
+    let mut x_priv = [0u8; 32];
+    x_priv.copy_from_slice(&hash[..32]);
+    // Clamp per RFC 7748 §5.
+    x_priv[0] &= 248;
+    x_priv[31] &= 127;
+    x_priv[31] |= 64;
+    x_priv
 }
 
 /// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
@@ -232,6 +266,41 @@ pub fn verify_dm_packet_signature(
         .verify(body_bytes, &sig)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ed25519_x25519_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_to_x25519_round_trip_via_seal() {
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying = signing.verifying_key();
+        let x_pub = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("conversion");
+        let x_priv = ed25519_priv_to_x25519(&signing);
+
+        let payload = b"some 32-byte payload xxxxxxxxxxx";
+        let sealed = seal_to_owner(&x_pub, payload).expect("seal");
+        let opened = open_from_owner(&x_priv, &sealed).expect("open");
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn ed25519_pub_to_x25519_deterministic() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying = signing.verifying_key();
+        let x1 = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("first");
+        let x2 = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("second");
+        assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn ed25519_priv_to_x25519_deterministic() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let x1 = ed25519_priv_to_x25519(&signing);
+        let x2 = ed25519_priv_to_x25519(&signing);
+        assert_eq!(x1, x2);
+    }
 }
 
 #[cfg(test)]

@@ -7045,9 +7045,22 @@ async fn generate_invite(
         );
     }
 
+    // ZEB-249: build InviteEpochSnapshot. For open communities there is no
+    // specific invitee to seal to, so sealed_epoch_key carries the raw 32-byte
+    // epoch key (the key is "public" for open joins — anyone with the link may
+    // join). Phase 4 invite-only will use X25519-sealed delivery.
+    let epoch = space
+        .current_epoch
+        .ok_or("community Space missing current_epoch (corrupt row?)")?;
+    let epoch_snapshot = crate::community_invite::InviteEpochSnapshot {
+        epoch,
+        sealed_epoch_key: mk.as_bytes().to_vec(),
+        state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+    };
+
     let payload = crate::community_invite::CommunityInvitePayload {
         community_id: space_id,
-        membership_key: mk,
+        epoch_snapshot,
         admin_addr: admin,
         community_name: space.name.clone(),
         is_invite_only: false,
@@ -8240,8 +8253,28 @@ pub fn mint_redemption(
     join_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use crate::owner_state_types::{Space, SpaceKind};
+    use crate::owner_state_types::{EpochKey, Space, SpaceKind};
     use rand::RngCore;
+
+    // ZEB-249: extract the epoch key from the snapshot.
+    // Open-community invites store the raw 32-byte key in sealed_epoch_key.
+    // Invite-only invites (Phase 4+) will store a 92-byte X25519-sealed
+    // envelope; callers needing to decrypt must pass the decrypted bytes
+    // via a different path (redeem_invite_inner handles that case directly).
+    let epoch_key_bytes: [u8; 32] = payload
+        .epoch_snapshot
+        .sealed_epoch_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "epoch_snapshot.sealed_epoch_key must be 32 bytes for open communities \
+                 (got {}); invite-only decryption is handled in redeem_invite_inner",
+                payload.epoch_snapshot.sealed_epoch_key.len()
+            )
+        })?;
+    let membership_key = EpochKey::new(epoch_key_bytes);
+    let epoch = payload.epoch_snapshot.epoch;
 
     let mut rng = rand::thread_rng();
     let mut event_id_bytes = [0u8; 16];
@@ -8272,8 +8305,8 @@ pub fn mint_redemption(
         updated_at: join_hlc,
         content_key: None,
         prior_content_keys: Vec::new(),
-        current_epoch: Some(0),
-        current_epoch_key: Some(payload.membership_key.clone()),
+        current_epoch: Some(epoch),
+        current_epoch_key: Some(membership_key.clone()),
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(payload.admin_addr),
         // Use the invite's declared is_invite_only so the redeemer's
@@ -8285,7 +8318,7 @@ pub fn mint_redemption(
 
     Ok(MintedCommunity {
         community_id: payload.community_id,
-        membership_key: payload.membership_key.clone(),
+        membership_key,
         space,
         bootstrap_join,
     })
@@ -9170,7 +9203,11 @@ mod redeem_invite_inner_tests {
 
         let invite_payload = CommunityInvitePayload {
             community_id,
-            membership_key: membership_key.clone(),
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
             admin_addr,
             community_name: "TestRedeemCom".into(),
             is_invite_only: false,
@@ -9233,7 +9270,11 @@ mod redeem_invite_inner_tests {
 
         let payload = CommunityInvitePayload {
             community_id: SpaceId([0xee; 16]),
-            membership_key: EpochKey::new([0x77; 32]),
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0x77; 32]).as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
             admin_addr: OwnerAddr([0x33; 16]),
             community_name: "TestCom".into(),
             is_invite_only: false,
@@ -11079,7 +11120,11 @@ mod generate_invite_helper_tests {
     fn build_open_invite_payload_round_trips_via_url() {
         let payload = CommunityInvitePayload {
             community_id: SpaceId([7; 16]),
-            membership_key: EpochKey::new([0x99; 32]),
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0x99; 32]).as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
             admin_addr: OwnerAddr([0x11; 16]),
             community_name: "DoorClub".into(),
             is_invite_only: false,

@@ -33,7 +33,8 @@ use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
 };
 use harmony_app::community_invite::{
-    self, canonical_invite_token_bytes, CommunityInvitePayload, InviteToken,
+    self, canonical_invite_token_bytes, CommunityInvitePayload, InviteEpochSnapshot, InviteToken,
+    MaterializedCommunityState,
 };
 use harmony_app::community_membership::{materialize, MemberStatus};
 use harmony_app::community_state_sync::{
@@ -330,7 +331,11 @@ async fn alice_redeems_invite_only_against_bob_admin() {
 
     let invite_url = community_invite::encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: alice_minted.membership_key.clone(),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: alice_minted.membership_key.as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "InviteOnly".into(),
         is_invite_only: true,
@@ -521,8 +526,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     use harmony_app::community_invite::{
-        decode_invite_url, encode_invite_url, verify_admin_bootstrap, CommunityInvitePayload,
-        InviteToken, RedeemBootstrapVerifyError,
+        decode_invite_url, encode_invite_url, verify_admin_bootstrap, RedeemBootstrapVerifyError,
     };
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -556,7 +560,11 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
 
     let invite_url = encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: EpochKey::new([0xDD; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0xDD; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "TamperedTest".into(),
         is_invite_only: true,

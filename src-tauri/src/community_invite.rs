@@ -12,8 +12,70 @@ use serde::{Deserialize, Serialize};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, SpaceId,
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr, SpaceId,
 };
+
+/// ZEB-249: A snapshot of the community at invite issuance, bound to
+/// the invitee via X25519-sealed EpochKey. Carried inside
+/// `CommunityInvitePayload.epoch_snapshot`.
+///
+/// `state_snapshot` is a UI bootstrap hint — CRDT replay post-redemption
+/// is the source of truth (spec §5.2 + §10.3).
+///
+/// For open-community invites (no specific invitee), `sealed_epoch_key`
+/// carries the raw 32-byte EpochKey unencrypted (the key is "public"
+/// for open communities — anyone with the link can join and receive it).
+/// For invite-only flows (Phase 4+), it carries the X25519-sealed key
+/// (92 bytes: 32 ephemeral_pub + 12 nonce + 32 ct + 16 tag).
+///
+/// Spec §5.1 + §7.3. Field keys (ep, sk, ss) are 2-char.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteEpochSnapshot {
+    #[serde(rename = "ep")]
+    pub epoch: u64,
+
+    /// EpochKey delivery bytes. For open communities: 32 raw bytes.
+    /// For invite-only (Phase 4+): 92-byte X25519-sealed envelope
+    /// (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag).
+    #[serde(
+        rename = "sk",
+        serialize_with = "crate::owner_state_types::serialize_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_from_bstr"
+    )]
+    pub sealed_epoch_key: Vec<u8>,
+
+    #[serde(rename = "ss")]
+    pub state_snapshot: MaterializedCommunityState,
+}
+
+/// Materialized state snapshot for UI bootstrap on join. Spec §5.1.
+/// Field keys (mb, ch, pl) are 2-char.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedCommunityState {
+    #[serde(rename = "mb")]
+    pub members: std::collections::BTreeMap<
+        crate::owner_state_types::OwnerAddr,
+        crate::community_membership::MemberState,
+    >,
+
+    #[serde(
+        rename = "ch",
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub channels: std::collections::BTreeMap<
+        crate::community_membership::ChannelId,
+        crate::community_membership::ChannelInfo,
+    >,
+
+    #[serde(rename = "pl")]
+    pub power_levels: std::collections::BTreeMap<crate::owner_state_types::OwnerAddr, u8>,
+}
+
+impl CanonicalPayloadSealed for InviteEpochSnapshot {}
+impl CanonicalPayload for InviteEpochSnapshot {}
+impl CanonicalPayloadSealed for MaterializedCommunityState {}
+impl CanonicalPayload for MaterializedCommunityState {}
 
 /// The full payload an invite link carries. Encoded as canonical CBOR
 /// (~120-180 bytes), then base64url-encoded into the URL form
@@ -29,8 +91,11 @@ pub struct CommunityInvitePayload {
     #[serde(rename = "ci")]
     pub community_id: SpaceId,
 
-    #[serde(rename = "mk")]
-    pub membership_key: EpochKey,
+    /// ZEB-249: replaces v1's flat `membership_key: EpochKey` field.
+    /// Carries the epoch number, invitee-bound EpochKey delivery bytes,
+    /// and frozen materialized state for UI bootstrap.
+    #[serde(rename = "es")]
+    pub epoch_snapshot: InviteEpochSnapshot,
 
     #[serde(rename = "ad")]
     pub admin_addr: OwnerAddr,

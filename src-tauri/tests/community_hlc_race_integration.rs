@@ -194,7 +194,11 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     // appear in prior_state.members (required for kick validation).
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
         community_id,
-        membership_key: minted.membership_key.clone(),
+        epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: minted.membership_key.as_bytes().to_vec(),
+            state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "TestCommunity".into(),
         is_invite_only: false,

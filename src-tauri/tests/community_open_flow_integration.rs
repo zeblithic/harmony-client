@@ -275,7 +275,11 @@ async fn open_community_create_redeem_leave_round_trip() {
     // ── Step 2: B redeems an invite for the same community. ────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
         community_id,
-        membership_key: minted_a.membership_key.clone(),
+        epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+            state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
+        },
         admin_addr: owner_a,
         community_name: "TestCommunity".into(),
         is_invite_only: false,
@@ -584,7 +588,11 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     // ── First redemption: B mints + inserts ───────────────────────────
     let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
         community_id,
-        membership_key: minted_a.membership_key.clone(),
+        epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+            state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(),
+        },
         admin_addr: owner_a,
         community_name: "TestCommunity".into(),
         is_invite_only: false,

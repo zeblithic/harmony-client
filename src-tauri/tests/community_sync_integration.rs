@@ -2274,7 +2274,12 @@ mod task3_kick_setpower_round_trip {
         // Step 2: B redeems an open invite for the same community.
         let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
             community_id,
-            membership_key: minted_a.membership_key.clone(),
+            epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+                state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
+                ),
+            },
             admin_addr: owner_a,
             community_name: "TestCommunity".into(),
             is_invite_only: false,
@@ -2477,7 +2482,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::community_channel_log_engine::{
         ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
     };
-    use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteToken,
+        MaterializedCommunityState,
+    };
     use harmony_app::community_state_sync::{
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
     };
@@ -2583,7 +2591,11 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     };
     let url = encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: mk.clone(),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: mk.as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "Test".into(),
         is_invite_only: true,

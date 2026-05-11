@@ -5,12 +5,15 @@
 //! fixtures — locking the encoded bytes prevents silent wire-form drift
 //! across phases.
 
+use harmony_app::community_invite::{
+    CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
+};
 use harmony_app::community_membership::{MembershipEventKind, RecipientCiphertext};
 use harmony_app::community_state_sync::{
     CommunityRootPublishPayload, CommunityRootSignedPayload, EncryptedEnvelope,
 };
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
-use harmony_app::owner_state_types::{Hlc, OwnerAddr};
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use harmony_content::cid::ContentId;
 
 #[test]
@@ -175,6 +178,47 @@ fn encrypted_envelope_wire_bytes_pinned_v3_with_ratchet() {
     let expected_hex = "a462657005626e634c10101010101010101010101062637458202020202020202020202020202020202020202020202020202020202020202020627267182a";
     let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
         eprintln!("\nACTUAL bytes for pinning: {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER with the bytes above");
+    });
+    assert_eq!(
+        bytes,
+        expected,
+        "drifted: {} vs {}",
+        hex::encode(&bytes),
+        hex::encode(&expected)
+    );
+}
+
+/// ZEB-249: Wire-format pinning for `CommunityInvitePayload` with the new
+/// `epoch_snapshot: InviteEpochSnapshot` field (replacing v1's `membership_key: EpochKey`).
+/// Minimal fixture: open community (no invite_token / admin_bootstrap / admin_identity_pub),
+/// empty state_snapshot (no members / channels / power_levels).
+///
+/// Run with `--no-capture` to print the actual hex once, then replace PLACEHOLDER.
+#[test]
+fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
+    let payload = CommunityInvitePayload {
+        community_id: SpaceId([0xc0; 16]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: vec![0xab; 32],
+            state_snapshot: MaterializedCommunityState::default(),
+        },
+        admin_addr: OwnerAddr([0xd0; 16]),
+        community_name: "pin".into(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+    };
+    let bytes = canonical_cbor_encode(&payload).expect("encode");
+    let expected_hex = "a562636950c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0626573a36265700062736b5820abababababababababababababababababababababababababababababababab627373a2626d62a062706ca062616450d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0626e6d6370696e62696ff4";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!(
+            "\nACTUAL bytes for pinning (copy into expected_hex above):\n  {}\n",
+            hex::encode(&bytes)
+        );
         panic!("update PLACEHOLDER with the bytes above");
     });
     assert_eq!(
