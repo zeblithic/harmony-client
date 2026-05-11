@@ -3003,6 +3003,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_lifted_phase_b_reresolves_destinations_after_cache_mutation() {
+        // ZEB-233 round 4 (CodeRabbit Trivial): regression test for the
+        // Phase B destination-refresh fix. Phase A captures
+        // `destinations` into the work unit; Phase B IGNORES that and
+        // re-resolves from the CURRENT `owner_device_cache`. A device
+        // rotation/revocation between Phase A and Phase B must reach
+        // the transport — without this fix, drain would misdeliver to
+        // a revoked device hash.
+        //
+        // Multi-recipient scenario so we can observe a mid-Phase-B
+        // mutation: the entry targets [bob, carol]. The custom
+        // transport mutates carol's cache entry during bob's send().
+        // When the Phase B loop advances to carol, its try_lock +
+        // resolve_destinations reads the NEW value. A regression that
+        // uses `unit.destinations` (Phase A's snapshot) would observe
+        // the OLD value instead.
+        use crate::dm_signing::compute_dm_destination_hash;
+        use crate::owner_state_types::OwnerDeviceEntry;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        type Captures = Arc<std::sync::Mutex<Vec<(OwnerAddr, Vec<[u8; 16]>)>>>;
+
+        struct DestinationRefreshProbe {
+            state: Arc<Mutex<OwnerState>>,
+            captures: Captures,
+            rotate_target: OwnerAddr,
+            rotate_to: OwnerDeviceEntry,
+            triggered: AtomicBool,
+        }
+
+        #[async_trait]
+        impl DmTransport for DestinationRefreshProbe {
+            async fn send(
+                &self,
+                _entry: &OutboxEntry,
+                recipient: OwnerAddr,
+                destinations: Vec<[u8; 16]>,
+            ) -> Result<(), TransportError> {
+                self.captures
+                    .lock()
+                    .expect("captures poisoned")
+                    .push((recipient, destinations));
+                if !self.triggered.swap(true, Ordering::SeqCst) {
+                    // First send call (bob's). Phase B dropped both
+                    // locks before awaiting send(), so state.lock()
+                    // acquires cleanly. Mutate carol's cache BEFORE
+                    // Phase B's next iteration runs its try_lock +
+                    // re-resolve.
+                    let mut s = self.state.lock().await;
+                    s.owner_device_cache
+                        .devices
+                        .insert(self.rotate_target, self.rotate_to.clone());
+                }
+                Ok(())
+            }
+        }
+
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let bob_dev = DeviceIdentityHash([0xb1; 16]);
+        let carol_dev_old = DeviceIdentityHash([0xc1; 16]);
+        let carol_dev_new = DeviceIdentityHash([0xc2; 16]);
+
+        let learned_at = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "dev".into(),
+        };
+        let bob_entry = OwnerDeviceEntry {
+            devices: vec![bob_dev],
+            device_identity_pubs: vec![Some([0xbb; 64])],
+            learned_at: learned_at.clone(),
+        };
+        let carol_old_entry = OwnerDeviceEntry {
+            devices: vec![carol_dev_old],
+            device_identity_pubs: vec![Some([0xc1; 64])],
+            learned_at: learned_at.clone(),
+        };
+        let carol_new_entry = OwnerDeviceEntry {
+            devices: vec![carol_dev_new],
+            device_identity_pubs: vec![Some([0xc2; 64])],
+            learned_at,
+        };
+
+        let mut state = OwnerState::default();
+        state.owner_device_cache.devices.insert(bob, bob_entry);
+        state
+            .owner_device_cache
+            .devices
+            .insert(carol, carol_old_entry);
+        // Single outbox entry targeting [bob, carol] in that order so
+        // Phase A produces work units in that order (recipient_owners
+        // is a Vec; drain_phase_a preserves Vec order — see line ~776).
+        let entry = entry_with_age(7, vec![bob, carol], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox = make_outbox_synthetic("dev", alice);
+        let outbox_arc = Arc::new(Mutex::new(outbox));
+        let state_arc = Arc::new(Mutex::new(state));
+
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = DestinationRefreshProbe {
+            state: Arc::clone(&state_arc),
+            captures: Arc::clone(&captures),
+            rotate_target: carol,
+            rotate_to: carol_new_entry,
+            triggered: AtomicBool::new(false),
+        };
+
+        let app = tauri::test::mock_app().handle().clone();
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+        )
+        .await;
+
+        let captured = captures.lock().expect("captures poisoned");
+        assert_eq!(
+            captured.len(),
+            2,
+            "expected send() called for both bob and carol; got {} calls",
+            captured.len()
+        );
+        assert_eq!(
+            captured[0],
+            (bob, vec![compute_dm_destination_hash(bob_dev.0)]),
+            "first send must be bob with bob's cached destination"
+        );
+        // Load-bearing assertion: carol's send must observe the
+        // POST-rotation device hash. A regression that uses
+        // `unit.destinations` (Phase A's snapshot) would observe
+        // carol_dev_old here.
+        assert_eq!(
+            captured[1],
+            (carol, vec![compute_dm_destination_hash(carol_dev_new.0)]),
+            "ZEB-233 round 4 regression: carol's send must reflect the \
+             POST-rotation device hash. If this assertion fails with \
+             the pre-rotation hash, Phase B is using `unit.destinations` \
+             (Phase A snapshot) instead of re-resolving from the \
+             current `owner_device_cache`."
+        );
+    }
+
+    #[tokio::test]
     async fn drain_partial_state_some_recipients_acked() {
         let mut state = OwnerState::default();
         let alice = OwnerAddr([0xaa; 16]);
