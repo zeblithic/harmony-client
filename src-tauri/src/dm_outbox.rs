@@ -728,7 +728,9 @@ impl DmOutbox {
         }
         // Test wrapper holds locks throughout, so no TOCTOU-skip
         // semantics — pass an empty `skipped` Vec to drain_phase_c.
-        self.drain_phase_c(state, results, Vec::new(), wall_now_ms)
+        // Same `wall_now_ms` for both backoff and expiration clocks
+        // since tests don't simulate Phase B/C latency.
+        self.drain_phase_c(state, results, Vec::new(), wall_now_ms, wall_now_ms)
     }
 
     /// Phase A of drain: under the outbox + state locks, collect every
@@ -807,12 +809,30 @@ impl DmOutbox {
     /// Their in_flight markers MUST be cleared here so a future drain
     /// tick can re-attempt; backoff is NOT updated (skipping isn't an
     /// attempt).
+    ///
+    /// Two distinct timestamps (ZEB-233 round 3, CodeRabbit Major):
+    ///
+    /// * `backoff_now_ms`: fresh wall-clock captured AFTER Phase C
+    ///   acquired its locks. Reflects when the send outcome was
+    ///   actually recorded — accurate for `last_attempt_wall_ms`
+    ///   bookkeeping so the next is_due check uses a real "we tried
+    ///   at time T" anchor.
+    ///
+    /// * `expiration_now_ms`: original tick-time wall-clock (Phase A's
+    ///   `wall_now_ms`). Reflects when Phase A admitted this drain
+    ///   tick as in-flight. Used for the 30-day expiration sweep so
+    ///   that an entry Phase A admitted as live can NEVER be expired
+    ///   in the same tick due to Phase B/C latency. A slow
+    ///   `transport.send()` (or contended Phase C lock acquisition)
+    ///   that takes the wall-clock past `EXPIRATION_MS` must NOT mark
+    ///   the just-sent entry Expired before its ack arrives.
     fn drain_phase_c(
         &mut self,
         state: &mut OwnerState,
         results: Vec<DrainSendResult>,
         skipped: Vec<(OutboxEntryId, OwnerAddr)>,
-        wall_now_ms: u64,
+        backoff_now_ms: u64,
+        expiration_now_ms: u64,
     ) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
 
@@ -836,7 +856,7 @@ impl DmOutbox {
                     self.backoff.insert(
                         (r.entry_id, r.recipient),
                         AttemptState {
-                            last_attempt_wall_ms: wall_now_ms,
+                            last_attempt_wall_ms: backoff_now_ms,
                             failure_count: 1,
                         },
                     );
@@ -855,7 +875,7 @@ impl DmOutbox {
                                 last_attempt_wall_ms: 0,
                                 failure_count: 0,
                             });
-                    st.last_attempt_wall_ms = wall_now_ms;
+                    st.last_attempt_wall_ms = backoff_now_ms;
                     st.failure_count = st.failure_count.saturating_add(1);
                 }
             }
@@ -882,7 +902,7 @@ impl DmOutbox {
             ) {
                 continue;
             }
-            let age = wall_now_ms.saturating_sub(entry.created_at.wall_ms);
+            let age = expiration_now_ms.saturating_sub(entry.created_at.wall_ms);
             if age >= EXPIRATION_MS {
                 let recipient_set: BTreeSet<&OwnerAddr> = entry.recipient_owners.iter().collect();
                 let all_acked = recipient_set
@@ -1838,20 +1858,20 @@ pub async fn drain_lifted<R: tauri::Runtime>(
     tokio::spawn(async move {
         let mut o_g = outbox.lock().await;
         let mut s_g = state.lock().await;
-        // ZEB-233 round 1 (Qodo Correctness #1): recompute wall_now_ms
-        // AFTER locks are acquired. Phase A's `wall_now_ms` is stale by
-        // the time Phase C runs — Phase B's sequential sends can take
-        // seconds (500ms-5s/recipient on real Reticulum), and Phase C
-        // can wait further on the lock if a concurrent send_dm holds
-        // it during cas.put. Using the stale value would write backoff
-        // last_attempt_wall_ms in the past, shortening effective retry
-        // windows. The fresh value reflects when the outcome was
-        // actually recorded.
-        let phase_c_wall_now_ms = std::time::SystemTime::now()
+        // ZEB-233 round 1 (Qodo Correctness #1) + round 3 (CodeRabbit
+        // Major): Phase C needs two distinct timestamps. `backoff_now_ms`
+        // is recomputed AFTER lock acquisition — it reflects when the
+        // send outcome was actually recorded, so `last_attempt_wall_ms`
+        // bookkeeping is accurate. `expiration_now_ms` REUSES the
+        // outer `wall_now_ms` from the captured `let` move — it
+        // reflects when Phase A admitted this drain tick as in-flight,
+        // so the 30-day expiration sweep can't expire an entry in the
+        // same tick it was just sent due to Phase B/C latency.
+        let backoff_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let outcome = o_g.drain_phase_c(&mut s_g, results, skipped, phase_c_wall_now_ms);
+        let outcome = o_g.drain_phase_c(&mut s_g, results, skipped, backoff_now_ms, wall_now_ms);
         // Drop locks before emitting IPC events.
         drop(s_g);
         drop(o_g);
@@ -2674,7 +2694,7 @@ mod tests {
         }];
         let skipped = vec![(entry_skipped_id, carol)];
 
-        let _outcome = o.drain_phase_c(&mut state, results, skipped, 2_000);
+        let _outcome = o.drain_phase_c(&mut state, results, skipped, 2_000, 2_000);
 
         // Both in_flight markers should be cleared.
         assert!(
@@ -2700,6 +2720,82 @@ mod tests {
             "backoff MUST NOT be updated for skipped pair — skipping \
              is not a send attempt; bumping failure_count would unfairly \
              throttle a healthy entry next tick"
+        );
+    }
+
+    #[test]
+    fn drain_phase_c_uses_expiration_clock_not_backoff_clock_for_sweep() {
+        // ZEB-233 round 3 (CodeRabbit Major): drain_phase_c uses two
+        // distinct timestamps:
+        //
+        //   backoff_now_ms       — fresh wall clock, post-Phase-B
+        //                          (when the send outcome was recorded)
+        //   expiration_now_ms    — original tick clock, Phase A admission
+        //                          time (when the tick started)
+        //
+        // Without this split, a slow transport.send or contended
+        // Phase C lock could push an entry past EXPIRATION_MS in the
+        // same tick it was just sent, marking it Expired before its
+        // ack can arrive. This test pins the contract: entries
+        // admitted by Phase A as live must NOT be expired by Phase C
+        // in the same tick, regardless of Phase B/C latency.
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+
+        // Entry created at wall=0. EXPIRATION_MS = 30 days.
+        let entry = entry_with_age(7, vec![bob], 0);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        o.in_flight.insert((entry_id, bob));
+
+        // Simulate Phase A admitting the entry at wall = EXPIRATION_MS - 10s.
+        // Phase B + Phase C lock contention then push wall past
+        // EXPIRATION_MS before Phase C runs. backoff_now_ms reflects
+        // the slow post-Phase-B time; expiration_now_ms reflects the
+        // Phase A admission time.
+        let expiration_now_ms = EXPIRATION_MS - 10_000; // Phase A's tick time
+        let backoff_now_ms = EXPIRATION_MS + 20_000; // 20s past EXPIRATION
+
+        let results = vec![DrainSendResult {
+            entry_id,
+            recipient: bob,
+            result: Ok(()),
+        }];
+        let outcome = o.drain_phase_c(
+            &mut state,
+            results,
+            Vec::new(),
+            backoff_now_ms,
+            expiration_now_ms,
+        );
+
+        // Contract: entry admitted by Phase A as live (age <
+        // EXPIRATION_MS at expiration_now_ms) MUST NOT be expired in
+        // this same tick, even though backoff_now_ms is well past
+        // EXPIRATION_MS.
+        assert!(
+            outcome.newly_expired.is_empty(),
+            "entry admitted by Phase A must NOT be expired in same tick \
+             due to Phase B/C latency; got newly_expired: {:?}",
+            outcome.newly_expired
+        );
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Pending),
+            "entry must stay Pending; expiration uses tick time, not Phase C time"
+        );
+
+        // Backoff bookkeeping uses backoff_now_ms (the fresh clock),
+        // so the next is_due check anchors to the actual send time.
+        let backoff_entry = o.backoff.get(&(entry_id, bob)).unwrap();
+        assert_eq!(
+            backoff_entry.last_attempt_wall_ms, backoff_now_ms,
+            "backoff uses backoff_now_ms (Phase C clock) — accurate \
+             post-send anchor for the next is_due check"
         );
     }
 
