@@ -1370,37 +1370,48 @@ impl DmOutbox {
                 ack_from_devices: our_ack_devices,
                 signing_device_hash: outbox_g.our_signing_device_hash,
             };
-            let ack_packet =
+            // Ack pipeline: build + encode + try_send. Failures here
+            // do NOT abort — apply_inbox already mutated state, and
+            // skipping the post-lock IPC emit would diverge UI from
+            // persisted state. Match the existing channel-pressure
+            // pattern below: log + continue. Sender retransmits the
+            // CidNotify which produces a fresh ack opportunity.
+            let ack_wire_opt =
                 match crate::dm_envelope::build_signed_ack(ack_signed, &outbox_g.signing_key) {
-                    Ok(p) => p,
+                    Ok(packet) => match crate::dm_envelope::encode_packet(&packet) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
+                                "handle_cidnotify_lifted Phase C: ack encode failed; \
+                                 continuing to dm-received emit so UI stays in sync \
+                                 with persisted inbox; sender will retransmit CidNotify"
+                            );
+                            None
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             error = ?DmReceiveError::Decode(format!("build_signed_ack: {e}")),
-                            "handle_cidnotify_lifted Phase C: ack build failed"
+                            "handle_cidnotify_lifted Phase C: ack build failed; \
+                             continuing to dm-received emit so UI stays in sync \
+                             with persisted inbox; sender will retransmit CidNotify"
                         );
-                        return;
+                        None
                     }
                 };
-            let ack_wire = match crate::dm_envelope::encode_packet(&ack_packet) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
-                        "handle_cidnotify_lifted Phase C: ack encode failed"
-                    );
-                    return;
-                }
-            };
-            for device in &signed.sender_devices {
-                let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-                if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
-                    destination_hash: dest_hash,
-                    packet: ack_wire.clone(),
-                }) {
-                    tracing::warn!(
-                        error = ?e,
-                        "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
-                    );
+            if let Some(ack_wire) = ack_wire_opt {
+                for device in &signed.sender_devices {
+                    let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+                    if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
+                        destination_hash: dest_hash,
+                        packet: ack_wire.clone(),
+                    }) {
+                        tracing::warn!(
+                            error = ?e,
+                            "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
+                        );
+                    }
                 }
             }
 
