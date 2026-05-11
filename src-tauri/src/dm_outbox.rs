@@ -726,7 +726,9 @@ impl DmOutbox {
                 result,
             });
         }
-        self.drain_phase_c(state, results, wall_now_ms)
+        // Test wrapper holds locks throughout, so no TOCTOU-skip
+        // semantics — pass an empty `skipped` Vec to drain_phase_c.
+        self.drain_phase_c(state, results, Vec::new(), wall_now_ms)
     }
 
     /// Phase A of drain: under the outbox + state locks, collect every
@@ -794,14 +796,22 @@ impl DmOutbox {
     }
 
     /// Phase C of drain: under the outbox + state locks, apply each
-    /// transport.send result (update backoff, clear in_flight), run the
-    /// 30-day expiration sweep, and clean up backoff/in_flight entries
-    /// for OutboxEntries that are no longer Pending/Partial.
-    /// Synchronous.
+    /// transport.send result (update backoff, clear in_flight), clear
+    /// in_flight for pairs Phase B skipped (liveness check failed or
+    /// lock contended), run the 30-day expiration sweep, and clean up
+    /// backoff/in_flight entries for OutboxEntries that are no longer
+    /// Pending/Partial. Synchronous.
+    ///
+    /// `skipped` carries the (entry_id, recipient) pairs that Phase B
+    /// chose NOT to send via the liveness re-check (ZEB-233 round 2).
+    /// Their in_flight markers MUST be cleared here so a future drain
+    /// tick can re-attempt; backoff is NOT updated (skipping isn't an
+    /// attempt).
     fn drain_phase_c(
         &mut self,
         state: &mut OwnerState,
         results: Vec<DrainSendResult>,
+        skipped: Vec<(OutboxEntryId, OwnerAddr)>,
         wall_now_ms: u64,
     ) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
@@ -851,7 +861,19 @@ impl DmOutbox {
             }
         }
 
-        // 2. Expiration sweep.
+        // 2. Clear in_flight markers for skipped pairs (ZEB-233 round 2).
+        // Phase B chose not to send these — either the liveness check
+        // saw the entry deleted/acked, or outbox/state was contended
+        // and we conservatively skipped rather than send a possibly-
+        // stale entry. DO NOT update backoff: skipping isn't a send
+        // attempt, and bumping `failure_count` would unfairly throttle
+        // a healthy entry on the next tick. The next drain tick's
+        // Phase A will re-evaluate is_due + include if still due.
+        for (entry_id, recipient) in skipped {
+            self.in_flight.remove(&(entry_id, recipient));
+        }
+
+        // 3. Expiration sweep.
         let mut expired: Vec<OutboxEntryId> = Vec::new();
         for (id, entry) in state.outbox.iter_mut() {
             if !matches!(
@@ -873,7 +895,7 @@ impl DmOutbox {
             }
         }
 
-        // 3. Cleanup backoff/in_flight for entries no longer Pending/Partial.
+        // 4. Cleanup backoff/in_flight for entries no longer Pending/Partial.
         // Covers expired (just marked above), Complete via local handle_ack
         // (already cleaned in handle_ack but defensive double-cleanup is
         // cheap), AND Complete via CRDT merge (a peer device's ack
@@ -1743,38 +1765,67 @@ pub async fn drain_lifted<R: tauri::Runtime>(
     // Phase B: unlocked transport sends. Concurrent send_dm IPCs hold
     // outbox/state during this stretch, so they don't block on us.
     //
-    // ## Known TOCTOU window (ZEB-233 round 1)
+    // ## TOCTOU liveness re-check (ZEB-233 round 2, closes ZEB-277)
     //
     // Between Phase A's lock-drop and a given `transport.send` in this
     // loop, the (entry, recipient) pair could have its OutboxEntry
-    // deleted by `delete_dm_outbox_entry` or marked Complete for that
-    // recipient by `handle_ack`. We do NOT re-check liveness here
-    // because the obvious fix (`outbox.lock().await` + `state.lock().await`)
-    // would reintroduce the same deadlock Phase A's try_lock was
-    // designed to avoid: drain_lifted runs on the event_loop's timer
-    // arm, so `.lock().await` on a contended lock parks the timer arm
-    // → cas_op_rx is not pumped → send_dm (which holds the lock while
-    // awaiting `cas.put → cas_op_tx`) cannot release → deadlock.
+    // deleted by `delete_dm_outbox_entry`, marked Complete for that
+    // recipient by `handle_ack`, or had its in_flight marker cleared
+    // by a previous Phase C cleanup pass. Before each send we re-check
+    // liveness using `try_lock` (NOT `.lock().await` — that would
+    // reintroduce the deadlock Phase A's try_lock was designed to
+    // avoid). On contention OR liveness-check-fail, we push to
+    // `skipped` and let Phase C clear the in_flight marker; the next
+    // drain tick re-evaluates.
     //
-    // The worst-case TOCTOU impact: one extra network packet per
-    // (entry, recipient) pair before the delete/ack reaches drain on
-    // the next tick. The receiver dedups by `(space_id, message_cid)`
-    // in `handle_cidnotify_lifted` (the InboxKey invariant), so the
-    // duplicate packet does NOT produce a duplicate UI message.
+    // Cost: one try_lock pair (outbox + state) per work unit. The
+    // guards drop at the end of the `match` arm — BEFORE
+    // `transport.send.await`. No locks held across the await.
     //
-    // If production telemetry surfaces actual duplicate-send issues,
-    // ZEB-277 explores mitigation strategies (try_lock + skip with
-    // in_flight cleanup, dedicated liveness channel, or Phase A
-    // richer snapshot). Not implemented here because the obvious
-    // `.lock().await` fix reintroduces the deadlock ZEB-233 fixed.
+    // Failure modes after this fix:
+    //   * Locks contended at the moment of try_lock: skip + clear
+    //     in_flight in Phase C → next tick re-attempts.
+    //   * Entry deleted between Phase A and Phase B: skip + clear
+    //     in_flight in Phase C → no stale send.
+    //   * Recipient acked between Phase A and Phase B: skip + clear
+    //     in_flight in Phase C → no duplicate send.
     let mut results = Vec::with_capacity(work.len());
+    let mut skipped: Vec<(OutboxEntryId, OwnerAddr)> = Vec::new();
     for unit in work {
+        let entry_id = unit.entry_id;
+        let recipient = unit.recipient;
+        let still_live = match (outbox.try_lock(), state.try_lock()) {
+            (Ok(o_g), Ok(s_g)) => {
+                let live = s_g.outbox.get(&entry_id).is_some_and(|entry| {
+                    matches!(
+                        entry.delivery_status,
+                        DeliveryStatus::Pending | DeliveryStatus::Partial
+                    ) && !entry.delivered_to.contains(&recipient)
+                        && o_g.in_flight.contains(&(entry_id, recipient))
+                });
+                // o_g + s_g drop at end of match arm — BEFORE the
+                // `.await` below. No locks held across the await.
+                live
+            }
+            _ => {
+                tracing::debug!(
+                    ?entry_id,
+                    ?recipient,
+                    "drain_lifted Phase B: lock contended on liveness re-check; skipping send (next tick retries)"
+                );
+                false
+            }
+        };
+        if !still_live {
+            skipped.push((entry_id, recipient));
+            continue;
+        }
         let result = transport
-            .send(&unit.entry_clone, unit.recipient, unit.destinations)
+            .send(&unit.entry_clone, recipient, unit.destinations)
             .await;
         results.push(DrainSendResult {
-            entry_id: unit.entry_id,
-            recipient: unit.recipient,
+            entry_id,
+            recipient,
             result,
         });
     }
@@ -1800,7 +1851,7 @@ pub async fn drain_lifted<R: tauri::Runtime>(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let outcome = o_g.drain_phase_c(&mut s_g, results, phase_c_wall_now_ms);
+        let outcome = o_g.drain_phase_c(&mut s_g, results, skipped, phase_c_wall_now_ms);
         // Drop locks before emitting IPC events.
         drop(s_g);
         drop(o_g);
@@ -2577,6 +2628,79 @@ mod tests {
         assert!(inserted);
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[test]
+    fn drain_phase_c_clears_in_flight_for_skipped_pairs() {
+        // ZEB-233 round 2 (closes ZEB-277): Phase C must clear
+        // in_flight markers for (entry_id, recipient) pairs that
+        // Phase B skipped, in addition to pairs that produced send
+        // results. Otherwise the marker would leak and the next
+        // drain tick's Phase A would skip this pair forever.
+        //
+        // Contract verified here:
+        //   * Skipped pair's in_flight marker is cleared.
+        //   * Skipped pair's backoff is NOT updated (skipping isn't
+        //     a send attempt — bumping failure_count would unfairly
+        //     throttle a healthy entry on the next tick).
+        //   * Sent pair's in_flight is cleared AND backoff is
+        //     updated (the existing post-Ok backoff entry).
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let entry_sent = entry_with_age(7, vec![bob], 1_000);
+        let entry_sent_id = entry_sent.id;
+        let entry_skipped = entry_with_age(8, vec![carol], 1_000);
+        let entry_skipped_id = entry_skipped.id;
+        install_outbox_entry(&mut state, entry_sent);
+        install_outbox_entry(&mut state, entry_skipped);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        // Phase A would mark BOTH (entry, recipient) pairs in_flight;
+        // simulate that here.
+        o.in_flight.insert((entry_sent_id, bob));
+        o.in_flight.insert((entry_skipped_id, carol));
+
+        // Phase B's outcome: entry_sent was sent successfully,
+        // entry_skipped was skipped (liveness check failed / lock
+        // contention).
+        let results = vec![DrainSendResult {
+            entry_id: entry_sent_id,
+            recipient: bob,
+            result: Ok(()),
+        }];
+        let skipped = vec![(entry_skipped_id, carol)];
+
+        let _outcome = o.drain_phase_c(&mut state, results, skipped, 2_000);
+
+        // Both in_flight markers should be cleared.
+        assert!(
+            !o.in_flight.contains(&(entry_sent_id, bob)),
+            "in_flight for sent pair must be cleared"
+        );
+        assert!(
+            !o.in_flight.contains(&(entry_skipped_id, carol)),
+            "in_flight for skipped pair must be cleared (otherwise next \
+             drain tick would skip this pair forever)"
+        );
+
+        // Sent pair's backoff updated (failure_count=1 for "sent but
+        // ack pending" — the existing post-Ok throttle).
+        assert!(
+            o.backoff.contains_key(&(entry_sent_id, bob)),
+            "backoff updated for sent pair (post-Ok throttle)"
+        );
+
+        // Skipped pair's backoff NOT updated.
+        assert!(
+            !o.backoff.contains_key(&(entry_skipped_id, carol)),
+            "backoff MUST NOT be updated for skipped pair — skipping \
+             is not a send attempt; bumping failure_count would unfairly \
+             throttle a healthy entry next tick"
+        );
     }
 
     #[tokio::test]
