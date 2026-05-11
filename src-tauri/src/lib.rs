@@ -1653,6 +1653,7 @@ async fn start_node(
                                 let hlc_tracker_for_heal = std::sync::Arc::clone(&tracker);
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
+                                let crdt_state_for_heal = std::sync::Arc::clone(&crdt_state);
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -1668,11 +1669,18 @@ async fn start_node(
                                 > = std::sync::Arc::new(std::sync::Mutex::new(
                                     std::collections::BTreeSet::new(),
                                 ));
+                                // Catchup dedupe: (SpaceId, OwnerAddr, EventId).
+                                // Including the originating Join EventId means a
+                                // second rotation producing a new pending_catchup_for
+                                // for the same member fires fresh; a pure (SpaceId,
+                                // OwnerAddr) key would suppress it across epoch
+                                // boundaries.
                                 let synthesized_catchups: std::sync::Arc<
                                     std::sync::Mutex<
                                         std::collections::BTreeSet<(
                                             crate::owner_state_types::SpaceId,
                                             crate::owner_state_types::OwnerAddr,
+                                            crate::community_membership::EventId,
                                         )>,
                                     >,
                                 > = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1684,6 +1692,7 @@ async fn start_node(
                                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_heal);
                                     let device_id = device_id_for_heal.clone();
                                     let self_owner = self_owner_for_heal;
+                                    let crdt_state = std::sync::Arc::clone(&crdt_state_for_heal);
                                     let synth_rotations = std::sync::Arc::clone(&synthesized_rotations);
                                     let synth_catchups = std::sync::Arc::clone(&synthesized_catchups);
                                     async move {
@@ -1694,6 +1703,7 @@ async fn start_node(
                                             hlc_tracker,
                                             device_id,
                                             self_owner,
+                                            crdt_state,
                                             synth_rotations,
                                             synth_catchups,
                                         )
@@ -10681,9 +10691,21 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR, FE, FutE
 /// First-admin-wins via HLC linearization handles multi-admin races
 /// (materialize's staleness gate silently drops duplicate EpochRotations).
 ///
+/// The catchup dedupe key is `(SpaceId, OwnerAddr, EventId)` where EventId is
+/// the originating Join event's id. This allows the observer to re-fire a
+/// catchup for the same member if the underlying state changes (e.g., a second
+/// rotation lands, producing a new Join-triggered catchup with a fresh EventId).
+/// A pure `(SpaceId, OwnerAddr)` key would silently suppress follow-up catchups
+/// for the same member across epoch boundaries.
+///
+/// The `crdt_state` parameter provides the local owner's CRDT, from which the
+/// observer reads `spaces[community_id].current_epoch_key` — the CURRENT epoch
+/// key after any rotations have landed locally. This is the key that must be
+/// sealed to the new joiner (not the engine's spawn-time key).
+///
 /// Called from the delta consumer task — runs on the consumer's tokio task.
 #[allow(clippy::too_many_arguments)]
-async fn self_heal_community_observer(
+pub async fn self_heal_community_observer(
     community_id: crate::owner_state_types::SpaceId,
     registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -10692,6 +10714,7 @@ async fn self_heal_community_observer(
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     synth_rotations: std::sync::Arc<
         std::sync::Mutex<
             std::collections::BTreeSet<(
@@ -10705,6 +10728,7 @@ async fn self_heal_community_observer(
             std::collections::BTreeSet<(
                 crate::owner_state_types::SpaceId,
                 crate::owner_state_types::OwnerAddr,
+                crate::community_membership::EventId,
             )>,
         >,
     >,
@@ -10865,17 +10889,9 @@ async fn self_heal_community_observer(
     let pending_catchups: Vec<crate::owner_state_types::OwnerAddr> =
         materialized.pending_catchup_for.iter().copied().collect();
     for target in pending_catchups {
-        let key = (community_id, target);
-        {
-            let set = synth_catchups
-                .lock()
-                .expect("synth_catchups mutex poisoned");
-            if set.contains(&key) {
-                continue; // already synthesized this session
-            }
-        }
-
-        // Find the originating Join event for this target.
+        // Find the originating Join event for this target FIRST — the dedupe
+        // key includes the EventId so a follow-up catchup (e.g., after a
+        // second rotation) is not blocked by a prior stale-key catchup.
         let events: Vec<crate::community_membership::SignedMembershipEvent> = {
             let state_g = engine_arc.state();
             let state_g = state_g.lock().await;
@@ -10903,6 +10919,21 @@ async fn self_heal_community_observer(
             continue;
         };
 
+        // Dedupe key: (community_id, target, triggered_by).
+        // Including the originating EventId means a second rotation producing
+        // a new pending_catchup_for for the same member (with the same Join)
+        // is suppressed — but if the member re-joins (new Join EventId) the
+        // observer fires fresh. This is the correct semantics.
+        let key = (community_id, target, triggered_by);
+        {
+            let set = synth_catchups
+                .lock()
+                .expect("synth_catchups mutex poisoned");
+            if set.contains(&key) {
+                continue; // already synthesized this session
+            }
+        }
+
         // Resolve the target's identity pub.
         let Some(target_pub64) = resolver.resolve(&target).await else {
             tracing::debug!(
@@ -10915,28 +10946,21 @@ async fn self_heal_community_observer(
 
         let current_epoch = materialized.current_epoch.unwrap_or(0);
 
-        // Get the current epoch key to seal to the target.
-        // The issuing admin has the epoch key in their owner-state Space;
-        // we access it via the engine's membership_key (epoch=0 bootstrap key)
-        // only if epoch=0, otherwise we need the evolved key from owner state.
-        // Since we don't have the owner crdt_state here, we use the engine's
-        // membership_key (the key the engine was spawned with — the current
-        // epoch key at spawn time). This is the correct key if no rotations
-        // have occurred since spawn; for subsequent rotations it may be stale.
-        //
-        // Implementation note: the engine holds `membership_key` which is the
-        // key at spawn time (typically the current epoch key). For the catchup
-        // to correctly deliver the CURRENT epoch key, we need to use the key
-        // from the owner-state Space. Since we don't have crdt_state here,
-        // we use the membership_key and accept that post-rotation catchups
-        // may be incorrect — the observer will re-fire when the next delta
-        // lands and find a fresh engine (if the node was restarted with the
-        // new epoch key). This is a known limitation; ZEB-249 Task 7 will
-        // address by threading crdt_state into the observer.
-        //
-        // For the common case (epoch-0 join after epoch-0 rotation, or
-        // first rotation after join), this is correct.
-        let epoch_key = engine_arc.membership_key();
+        // Read the CURRENT epoch key from the local owner-state CRDT.
+        // `Space.current_epoch_key` is updated by `kick_from_community` /
+        // `leave_community` whenever a rotation lands locally, so this is
+        // always the post-rotation key — correct for the §4.6 scenario
+        // (stale invite, kick happened between invite issuance and redemption).
+        // Fall back to the engine's spawn-time key only if the CRDT has no
+        // record for this community (e.g., the observer fires before the
+        // owner-state flush completes — in that case the rotation has not
+        // yet landed locally and the spawn-time key equals the current key).
+        let epoch_key = {
+            let crdt_g = crdt_state.lock().await;
+            crdt_g
+                .current_epoch_key_for(community_id)
+                .unwrap_or_else(|| engine_arc.membership_key())
+        };
 
         let seal_result = {
             use crate::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};

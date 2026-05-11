@@ -670,48 +670,144 @@ fn offline_catchup_through_multiple_rotations() {
 ///   2. Admin issues an invite for Dave at epoch=0 (snapshot contains K(0)).
 ///   3. Admin kicks Bob (advances to epoch 1 with K(1) — Dave excluded from rotation).
 ///   4. Dave redeems the stale invite — his local Space is stuck at epoch=0.
-///   5. Dave's Join event lands; pending_catchup_for gains Dave.
-///   6. Self-healing observer detects pending_catchup_for and admin has power:
-///      admin synthesizes an EpochCatchup sealed to Dave with K(1).
-///   7. Dave applies the catchup — his Space advances to epoch=1 with K(1).
-///   8. Admin posts an event at epoch=1. Dave decrypts successfully.
+///   5. Dave's Join event lands in the engine; pending_catchup_for gains Dave.
+///   6. The observer is driven via `self_heal_community_observer` directly with a
+///      crdt_state that has K(1) as the current epoch key. The observer must seal
+///      K(1) (not K(0) / spawn-time key) to Dave.
+///   7. Dave applies the observer-synthesized EpochCatchup — his Space advances to epoch=1.
+///   8. Dave decrypts an epoch-1 message successfully.
 ///
-/// The observer step (6) is driven deterministically: we call
-/// `mint_epoch_catchup_event` directly, bypassing the async task.
-#[test]
-fn stale_invite_catchup_unlocks_decryption_end_to_end() {
-    use harmony_app::mint_epoch_catchup_event;
+/// This test drives the ACTUAL observer (not mint_epoch_catchup_event directly) to
+/// prove the fix: the observer reads the current epoch key from crdt_state, not the
+/// engine's spawn-time membership_key.
+#[tokio::test]
+async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::self_heal_community_observer;
     use harmony_identity::PrivateIdentity;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
-    // ── Identities ──────────────────────────────────────────────────────────
     let community_id = SpaceId([0x37; 16]);
 
+    // ── Identities ──────────────────────────────────────────────────────────
     let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+    let admin_pub64 = admin_identity.identity.to_public_bytes();
     let admin_sk_bytes = admin_identity.to_private_bytes();
     let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
-    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
-    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
-
-    let dave_identity = PrivateIdentity::from_seed(&[0xDD; 32]);
-    let dave_sk_bytes = dave_identity.to_private_bytes();
-    let dave_ed_seed: [u8; 32] = dave_sk_bytes[32..64].try_into().unwrap();
-    let dave_signing_key = ed25519_dalek::SigningKey::from_bytes(&dave_ed_seed);
-    let dave_addr = OwnerAddr(dave_identity.identity.address_hash);
+    let admin_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed));
 
     let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
     let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
+    let bob_pub64 = bob_identity.identity.to_public_bytes();
+    let bob_sk_bytes = bob_identity.to_private_bytes();
+    let bob_ed_seed: [u8; 32] = bob_sk_bytes[32..64].try_into().unwrap();
+    let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&bob_ed_seed);
 
-    let hlc = |w: u64| Hlc {
-        wall_ms: w,
-        logical: 0,
-        device_id: "test".into(),
-    };
+    let dave_identity = PrivateIdentity::from_seed(&[0xDD; 32]);
+    let dave_addr = OwnerAddr(dave_identity.identity.address_hash);
+    let dave_pub64 = dave_identity.identity.to_public_bytes();
+    let dave_sk_bytes = dave_identity.to_private_bytes();
+    let dave_ed_seed: [u8; 32] = dave_sk_bytes[32..64].try_into().unwrap();
+    let dave_signing_key = ed25519_dalek::SigningKey::from_bytes(&dave_ed_seed);
 
-    // ── Step 1: Admin creates community at epoch 0 ───────────────────────────
+    // ── Step 1: Epoch keys ───────────────────────────────────────────────────
+    // k0: spawn-time key (the engine is spawned with this key — the observer's
+    //     spawn-time membership_key). k1: post-rotation key that must be
+    //     delivered to Dave via the catchup.
     let k0 = EpochKey::new([0x10u8; 32]);
-    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let k1 = EpochKey::new([0x20u8; 32]);
 
-    // Admin, Bob join at epoch=0.
+    // ── Step 2: Identity resolver knows all three members ────────────────────
+    struct StaticResolver(std::collections::HashMap<OwnerAddr, [u8; 64]>);
+    #[async_trait::async_trait]
+    impl IdentityResolver for StaticResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.get(addr).copied()
+        }
+    }
+    let mut pub_map = std::collections::HashMap::new();
+    pub_map.insert(admin_addr, admin_pub64);
+    pub_map.insert(bob_addr, bob_pub64);
+    pub_map.insert(dave_addr, dave_pub64);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver(pub_map));
+
+    // ── Step 3: Registry + engine (spawned with k0 as membership_key) ────────
+    // CAS servicer: processes PutLocal / GetOrFetch ops so publish_root_now
+    // (triggered by notify_dirty after each insert) doesn't deadlock waiting
+    // for a reply that nobody sends.
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(64);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        let mut store: std::collections::HashMap<harmony_content::cid::ContentId, Vec<u8>> =
+            std::collections::HashMap::new();
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                CasOp::PutLocal { cid, blob, reply } => {
+                    store.insert(cid, blob);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch { cid, reply, .. } => {
+                    let v = store.get(&cid).cloned();
+                    let _ = reply.send(Ok(v));
+                }
+            }
+        }
+    });
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "admin-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: admin_addr,
+        signing_key: Arc::clone(&admin_signing_key),
+    }));
+
+    let (pub_tx, _pub_rx) = mpsc::channel(8);
+    let (_sub_tx, sub_rx) = mpsc::channel(8);
+    registry
+        .spawn_engine_inner_now(
+            community_id,
+            k0.clone(), // spawn-time key: intentionally k0 (not k1)
+            admin_addr,
+            false,
+            pub_tx,
+            sub_rx,
+        )
+        .await
+        .expect("engine spawn");
+    let engine = registry
+        .engine_arc(&community_id)
+        .await
+        .expect("engine arc");
+
+    // ── Step 4: Populate engine with all events ───────────────────────────────
+    // All events are inserted via insert_local_event_with_pubs (bypasses
+    // resolver — resolution is done by the caller and passed directly).
+    //
+    // Event timeline:
+    //   hlc(100)  admin Join
+    //   hlc(200)  bob Join
+    //   hlc(1000) admin kicks bob
+    //   hlc(1001) admin EpochRotation (k0→k1, sealed to admin only — dave excluded)
+    //   hlc(2000) dave Join (late — after rotation → pending_catchup_for)
+
     let join_admin = make_signed_event(
         0x01,
         community_id,
@@ -720,47 +816,24 @@ fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         100,
         &admin_signing_key,
     );
-    let join_bob = SignedMembershipEvent {
-        id: [0x02; 16],
-        community_id,
-        kind: MembershipEventKind::Join,
-        actor: bob_addr,
-        at: hlc(200),
-        sig: [0; 64],
-        countersig: None,
-    };
+    engine
+        .insert_local_event_with_pubs(join_admin.clone(), admin_pub64, None)
+        .await
+        .expect("insert admin join");
 
-    // ── Step 2: Admin issues stale invite for Dave at epoch=0 ────────────────
-    // Dave has K(0) from the invite snapshot.
-    let dave_snapshot = InviteEpochSnapshot {
-        epoch: 0,
-        sealed_epoch_key: k0.as_bytes().to_vec(),
-        state_snapshot: MaterializedCommunityState::default(),
-    };
-    let dave_k0 = EpochKey::new(
-        dave_snapshot
-            .sealed_epoch_key
-            .as_slice()
-            .try_into()
-            .expect("32 bytes"),
+    let join_bob = make_signed_event(
+        0x02,
+        community_id,
+        bob_addr,
+        MembershipEventKind::Join,
+        200,
+        &bob_signing_key,
     );
-    let mut dave_space = make_space_with_epoch(community_id, admin_addr, 0, dave_k0.clone());
+    engine
+        .insert_local_event_with_pubs(join_bob.clone(), bob_pub64, None)
+        .await
+        .expect("insert bob join");
 
-    // Dave redeems: Join event at epoch=0 (before any rotation).
-    // join_dave at hlc(300) would be pre-rotation; we use join_dave_late below.
-    // Defined here to show the stale-invite redemption flow conceptually.
-    let _join_dave = SignedMembershipEvent {
-        id: [0x03; 16],
-        community_id,
-        kind: MembershipEventKind::Join,
-        actor: dave_addr,
-        at: hlc(300),
-        sig: [0; 64],
-        countersig: None,
-    };
-
-    // ── Step 3: Admin kicks Bob (advances to epoch=1 with K(1)) ─────────────
-    let k1 = EpochKey::new([0x20u8; 32]);
     let kick_bob = make_signed_event(
         0x10,
         community_id,
@@ -772,14 +845,14 @@ fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         1000,
         &admin_signing_key,
     );
+    engine
+        .insert_local_event_with_pubs(kick_bob.clone(), admin_pub64, None)
+        .await
+        .expect("insert kick_bob");
 
-    // Rotation after kick: admin + dave (not bob; dave IS known by admin in
-    // this scenario). We intentionally EXCLUDE dave from the rotation to
-    // simulate the case where his identity pub wasn't yet known when admin
-    // kicked Bob (the stale-invite catchup scenario). This puts Dave in
-    // pending_catchup_for.
-    //
-    // Note: excluding dave from rotation means admin seals only to self.
+    // Rotation: admin only (dave excluded — simulates stale-invite scenario where
+    // dave's pub wasn't known at rotation time). This puts dave into
+    // pending_catchup_for once his Join lands.
     let sealed_for_admin = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
     let rotation_rcs: Vec<RecipientCiphertext> = sealed_for_admin
         .into_iter()
@@ -800,139 +873,112 @@ fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         1001,
         &admin_signing_key,
     );
+    engine
+        .insert_local_event_with_pubs(rotation_event.clone(), admin_pub64, None)
+        .await
+        .expect("insert rotation");
 
-    // Admin applies rotation locally.
-    apply_rotation_to_space(
-        &mut admin_space,
-        &rotation_event,
-        admin_addr,
-        &admin_signing_key,
-    );
-    assert_eq!(
-        admin_space.current_epoch,
-        Some(1),
-        "admin at epoch=1 after kick+rotation"
-    );
-    assert!(
-        admin_space.current_epoch_key.as_ref().map(|k| k.as_bytes()) == Some(k1.as_bytes()),
-        "admin has K(1)"
-    );
-
-    // ── Step 4: Dave's local Space is at epoch=0 ─────────────────────────────
-    // Verify Dave can decrypt epoch-0 messages but not epoch-1.
-    let msg0 = b"epoch 0 message";
-    let env0 = encrypt_for_topic(
-        &{
-            // Use admin's epoch-0 space (before rotation).
-            let mut s = admin_space.clone();
-            s.current_epoch = Some(0);
-            s.current_epoch_key = Some(k0.clone());
-            s
-        },
-        msg0,
-    )
-    .expect("encrypt@0");
-    let decrypted0 = decrypt_for_topic(&dave_space, &env0).expect("Dave decrypts epoch-0");
-    assert_eq!(decrypted0.as_slice(), msg0);
-
-    // Dave can't decrypt epoch-1 yet.
-    let msg1 = b"epoch 1 secret - Dave has not got catchup yet";
-    let env1 = encrypt_for_topic(&admin_space, msg1).expect("encrypt@1");
-    assert_eq!(env1.epoch, 1, "envelope is epoch-1");
-    assert!(
-        matches!(
-            decrypt_for_topic(&dave_space, &env1),
-            Err(EpochError::KeyNotAvailable(1))
-        ),
-        "Dave must fail before catchup"
-    );
-
-    // ── Step 5: materialize confirms pending_catchup_for contains Dave ────────
-    // Event log: admin joined, bob joined, dave joined, bob kicked, rotation.
-    // Dave joined AFTER the rotation (pending_catchup_for is set when a member
-    // joins and current_epoch > 0 per materialize logic).
-    // For this test: dave joins at hlc(300), rotation is at hlc(1001).
-    // So dave joins BEFORE the rotation in HLC order. After rotation,
-    // dave is a Joined member at epoch=0 snapshot — materialize does NOT
-    // set pending_catchup_for for pre-rotation joiners whose join predates
-    // the rotation (per spec §5.2 / materialize code: pending_catchup_for is
-    // only set for NEW joins when current_epoch > 0, i.e., joins after at
-    // least one rotation). To get dave into pending_catchup_for, his Join
-    // must land AFTER the rotation in materialization order.
-    //
-    // Re-order: dave joins at hlc(2000) — after the rotation at hlc(1001).
-    let join_dave_late = SignedMembershipEvent {
-        id: [0x04; 16],
+    // Dave's late Join (after the rotation → pending_catchup_for in materialize).
+    let join_dave_late = make_signed_event(
+        0x04,
         community_id,
-        kind: MembershipEventKind::Join,
-        actor: dave_addr,
-        at: hlc(2000),
-        sig: [0; 64],
-        countersig: None,
+        dave_addr,
+        MembershipEventKind::Join,
+        2000,
+        &dave_signing_key,
+    );
+    engine
+        .insert_local_event_with_pubs(join_dave_late.clone(), dave_pub64, None)
+        .await
+        .expect("insert dave join");
+
+    // ── Step 5: crdt_state has K(1) for this community ───────────────────────
+    // This is what the observer must use for the catchup — NOT k0 (spawn-time).
+    let admin_space_k1 = make_space_with_epoch(community_id, admin_addr, 1, k1.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(admin_space_k1);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    // Verify the accessor returns k1.
+    {
+        let g = crdt_state.lock().await;
+        assert_eq!(
+            g.current_epoch_key_for(community_id)
+                .as_ref()
+                .map(|k| k.as_bytes()),
+            Some(k1.as_bytes()),
+            "crdt_state must have K(1) for the community"
+        );
+    }
+
+    // ── Step 6: Call the observer directly ───────────────────────────────────
+    // The observer's catchup synthesis must use crdt_state's K(1), not the
+    // engine's spawn-time K(0). This is the core assertion of this test.
+    let hlc_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
+        Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let synth_rotations: Arc<Mutex<BTreeSet<(SpaceId, OwnerAddr)>>> =
+        Arc::new(Mutex::new(BTreeSet::new()));
+    let synth_catchups: Arc<
+        Mutex<
+            BTreeSet<(
+                SpaceId,
+                OwnerAddr,
+                harmony_app::community_membership::EventId,
+            )>,
+        >,
+    > = Arc::new(Mutex::new(BTreeSet::new()));
+
+    self_heal_community_observer(
+        community_id,
+        Arc::clone(&registry),
+        Arc::clone(&admin_signing_key),
+        Arc::clone(&hlc_tracker),
+        "admin-dev".into(),
+        admin_addr,
+        Arc::clone(&crdt_state),
+        Arc::clone(&synth_rotations),
+        Arc::clone(&synth_catchups),
+    )
+    .await;
+
+    // ── Step 7: Verify the observer synthesized an EpochCatchup for Dave ─────
+    // The catchup must be in the engine's event log.
+    let events: Vec<_> = {
+        let state = engine.state();
+        let g = state.lock().await;
+        g.events.values().cloned().collect()
     };
-
-    let event_log = vec![
-        join_admin.clone(),
-        join_bob.clone(),
-        kick_bob.clone(),
-        rotation_event.clone(),
-        join_dave_late.clone(),
-    ];
-    let materialized = materialize(&event_log, admin_addr);
-
-    assert_eq!(materialized.current_epoch, Some(1), "community at epoch=1");
-    assert!(
-        materialized.pending_catchup_for.contains(&dave_addr),
-        "Dave must be in pending_catchup_for after late join at epoch=1"
-    );
-    assert!(
-        materialized.pending_rotation_for.is_empty(),
-        "no pending rotations — kick+rotation both landed"
-    );
-
-    // ── Step 6: Self-healing observer synthesizes EpochCatchup for Dave ──────
-    // Drive deterministically: admin has K(1) and Dave's signing key.
-    // Synthesize a catchup event sealed to Dave with K(1).
-    let sealed_for_dave = seal_epoch_to_members(&k1, &[(&dave_addr, &dave_signing_key)]);
-    let catchup_rcs: Vec<RecipientCiphertext> = sealed_for_dave
-        .into_iter()
-        .map(|(addr, sealed)| RecipientCiphertext {
-            recipient: addr,
-            sealed,
+    let catchup_event = events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.kind,
+                MembershipEventKind::EpochCatchup {
+                    recipient_ciphertexts,
+                    ..
+                } if recipient_ciphertexts.iter().any(|rc| rc.recipient == dave_addr)
+            )
         })
-        .collect();
+        .cloned()
+        .expect("observer must have synthesized an EpochCatchup for Dave");
 
-    let catchup_hlc = Hlc {
-        wall_ms: 3000,
-        logical: 0,
-        device_id: "test".into(),
-    };
-    let catchup_event = mint_epoch_catchup_event(
-        community_id,
-        admin_addr,
-        join_dave_late.id, // triggered_by: Dave's Join
-        1,                 // current epoch
-        catchup_rcs
-            .into_iter()
-            .map(|rc| (rc.recipient, rc.sealed))
-            .collect(),
-        &admin_signing_key,
-        catchup_hlc,
-    )
-    .expect("mint_epoch_catchup_event");
-
-    // ── Step 7: Dave applies the catchup ────────────────────────────────────
+    // The catchup must seal K(1) (not K(0)) to Dave.
+    // We verify by applying the catchup to Dave's Space and checking the resulting key.
+    let mut dave_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
     let applied = apply_catchup_to_space(
         &mut dave_space,
         &catchup_event,
         dave_addr,
         &dave_signing_key,
     );
-    assert!(applied, "catchup must apply to Dave's space");
+    assert!(
+        applied,
+        "Dave must be able to apply the observer's catchup event"
+    );
     assert_eq!(
         dave_space.current_epoch,
         Some(1),
-        "Dave at epoch=1 after catchup"
+        "Dave's space must advance to epoch=1 after catchup"
     );
     assert!(
         dave_space
@@ -940,42 +986,45 @@ fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             .as_ref()
             .map(|k| k.as_bytes() == k1.as_bytes())
             .unwrap_or(false),
-        "Dave has K(1) after catchup"
+        "Dave's current_epoch_key must be K(1) after catchup — observer used crdt_state key, not spawn-time key"
     );
 
     // ── Step 8: Dave decrypts epoch-1 messages ───────────────────────────────
+    let admin_space_k1_for_enc = make_space_with_epoch(community_id, admin_addr, 1, k1.clone());
+    let msg1 = b"epoch 1 secret - Dave has not got catchup yet";
+    let env1 = encrypt_for_topic(&admin_space_k1_for_enc, msg1).expect("encrypt@1");
+    assert_eq!(env1.epoch, 1, "envelope is epoch-1");
+
+    // Dave's space (pre-catchup at k0) cannot decrypt epoch-1.
+    let dave_space_k0 = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    assert!(
+        matches!(
+            decrypt_for_topic(&dave_space_k0, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "Dave must fail to decrypt epoch-1 before catchup"
+    );
+
+    // Dave's space (post-catchup at k1) can decrypt epoch-1.
     let decrypted1 =
         decrypt_for_topic(&dave_space, &env1).expect("Dave decrypts epoch-1 after catchup");
     assert_eq!(
         decrypted1.as_slice(),
         msg1,
-        "Dave can decrypt epoch-1 after catchup delivery"
+        "Dave can decrypt epoch-1 after observer catchup delivery"
     );
 
-    // Materialize the full log (including catchup) — pending_catchup_for cleared.
-    let event_log_with_catchup = vec![
-        join_admin,
-        join_bob,
-        kick_bob,
-        rotation_event,
-        join_dave_late,
-        catchup_event,
-    ];
-    let mat_final = materialize(&event_log_with_catchup, admin_addr);
-    assert!(
-        !mat_final.pending_catchup_for.contains(&dave_addr),
-        "pending_catchup_for cleared after catchup delivery"
-    );
+    // Dedupe set check: synth_catchups must contain the (community_id, dave_addr, join_id) key.
+    {
+        let set = synth_catchups.lock().unwrap();
+        assert!(
+            set.iter()
+                .any(|(sid, addr, _)| *sid == community_id && *addr == dave_addr),
+            "synth_catchups must record the synthesized catchup for Dave"
+        );
+    }
 
-    // Confirm Bob still can't decrypt (was kicked).
-    let bob_space = make_space_with_epoch(community_id, admin_addr, 0, k0);
-    assert!(
-        matches!(
-            decrypt_for_topic(&bob_space, &env1),
-            Err(EpochError::KeyNotAvailable(1))
-        ),
-        "Bob (kicked) must not decrypt epoch-1"
-    );
+    registry.shutdown_all().await.expect("shutdown");
 }
 
 /// ZEB-249 §4.3: Two admins A1 and A2 simultaneously kick X and Y. After

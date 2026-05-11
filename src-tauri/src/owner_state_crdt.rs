@@ -730,6 +730,21 @@ impl OwnerState {
             ApplyOutcome::Inserted
         }
     }
+
+    /// Returns the current epoch key for a community Space, or `None` if the
+    /// Space is not found or has no epoch key set.
+    ///
+    /// Used by the self-healing observer to obtain the CURRENT epoch key (the
+    /// key that was installed when `kick_from_community` / `leave_community`
+    /// landed the rotation locally) rather than the engine's spawn-time key.
+    pub fn current_epoch_key_for(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+    ) -> Option<crate::owner_state_types::EpochKey> {
+        self.spaces
+            .get(&community_id)
+            .and_then(|s| s.current_epoch_key.clone())
+    }
 }
 
 /// Merge two sides' content keys per ZEB-216 §"Dedupe-merge cap rule":
