@@ -2,6 +2,16 @@
 //! IPCs (`send_dm`, `read_dm_thread`, `delete_outbox_entry`,
 //! `add_space`).
 //!
+//! ## Feature gate
+//!
+//! The entire file is gated behind `#![cfg(feature = "test-fixtures")]`
+//! because every test depends on `harmony_app::add_dm_ipc_handlers`,
+//! which is itself `#[cfg(any(test, feature = "test-fixtures"))]`.
+//! Without the feature, the helper isn't exported and this file would
+//! fail to compile. CI always runs with `--features test-fixtures`
+//! (see `CLAUDE.md`); a plain `cargo test` without the flag will
+//! silently skip these tests — that's intentional.
+//!
 //! ## Why this test exists
 //!
 //! PR #81 round 4 caught a silent IPC param-naming bug
@@ -40,6 +50,8 @@
 //!   the rest is a separate follow-up if desired.
 //! * **Frontend-side coverage.** vitest covers the JS shapes; this
 //!   file covers the Tauri JSON deserializer boundary.
+
+#![cfg(feature = "test-fixtures")]
 
 use std::sync::Mutex;
 
@@ -240,18 +252,23 @@ fn send_dm_rejects_snake_case_keys_that_dont_match_param_names() {
     let err_value = response
         .expect_err("wrong key name must NOT bind silently — should produce a deserialization Err");
     let err_str = err_value_as_string(&err_value);
-    // The error must NOT contain the empty-NodeState marker (which
-    // would imply silent binding to defaults), AND should mention
-    // missing fields or similar deserialization-failure terminology.
+    // The load-bearing contract: the error MUST NOT contain any
+    // empty-NodeState marker. If it did, that would mean the command
+    // body ran (i.e., Tauri silently bound the unknown key to a
+    // default or accepted partial binding) — exactly the PR #81
+    // failure mode this test guards against.
+    //
+    // We deliberately do NOT assert on the specific wording of
+    // Tauri's deserialization Err: that's brittle (could change
+    // across Tauri minor versions) and Qodo's review on PR #104
+    // flagged it as such. The absence of the empty-state markers is
+    // sufficient to prove the contract.
     assert!(
-        !err_str.contains("node not running") && !err_str.contains("no owner identity"),
-        "send_dm should NOT silently bind unknown keys to defaults — got: {err_str}"
-    );
-    assert!(
-        err_str.contains("invalid args")
-            || err_str.contains("missing field")
-            || err_str.contains("spaceId")
-            || err_str.contains("space_id"),
-        "expected deserialization Err mentioning missing/invalid field; got: {err_str}"
+        !err_str.contains("node not running")
+            && !err_str.contains("no owner identity")
+            && !err_str.contains("crdt_state missing")
+            && !err_str.contains("dm_outbox"),
+        "send_dm should NOT silently bind unknown keys to defaults \
+         (would imply the command body ran). got: {err_str}"
     );
 }
