@@ -312,59 +312,111 @@ async fn dm_full_round_trip_through_unicast_channel() {
         "Alice's outbound dest_hash must match Bob's registered DM dest"
     );
 
-    // ── Bob receives. handle_unicast does signature verify + cas fetch
-    //    + decrypt + apply_inbox + ack fan-out into bob_unicast_tx. ──
-    let bob_outcome = {
-        let mut bob_g = bob_state.lock().await;
-        let mut bob_outbox_g = bob_outbox.lock().await;
-        bob_outbox_g
-            .handle_unicast(
-                &mut bob_g,
-                cas.as_ref(),
-                &bob_unicast_tx,
-                alice_to_bob.packet,
-                300,
-            )
-            .await
-            .expect("Bob's handle_unicast(CidNotify) ok")
-    };
-    assert_eq!(
-        bob_outcome.newly_received.len(),
-        1,
-        "Bob's apply_inbox should have inserted one entry (CidNotify happy path)"
-    );
-    let received_cid = bob_outcome.newly_received[0].inbox_entry.message_cid;
-    {
+    // ── Bob receives. ZEB-241: dispatch CidNotify through the lifted
+    //    variant (production path: event_loop pre-decodes, spawns the
+    //    lifted task). The lifted handler does signature verify + cas
+    //    fetch + decrypt + apply_inbox + ack fan-out into bob_unicast_tx
+    //    + emits `dm-received` via app.emit. We attach a listener on a
+    //    mock AppHandle to capture the emitted payload (since the lifted
+    //    variant returns `()` instead of DrainOutcome). ──
+    let bob_app = tauri::test::mock_app();
+    let bob_app_handle = bob_app.handle().clone();
+    let received_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_payloads_for_listener = Arc::clone(&received_payloads);
+    let _unlisten = tauri::Listener::listen(&bob_app_handle, "dm-received", move |event| {
+        let payload: serde_json::Value =
+            serde_json::from_str(event.payload()).expect("parse dm-received payload");
+        received_payloads_for_listener
+            .lock()
+            .expect("received_payloads lock")
+            .push(payload);
+    });
+    let (signed, signature, signed_bytes) =
+        match harmony_app::dm_envelope::decode_packet(&alice_to_bob.packet)
+            .expect("alice's outbound packet must decode")
+        {
+            harmony_app::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => (signed, signature, signed_bytes.to_vec()),
+            other => panic!("expected CidNotify, got {other:?}"),
+        };
+    DmOutbox::handle_cidnotify_lifted(
+        Arc::clone(&bob_outbox),
+        Arc::clone(&bob_state),
+        Arc::clone(&cas),
+        bob_unicast_tx.clone(),
+        bob_app_handle,
+        signed,
+        signature,
+        signed_bytes,
+        300,
+    )
+    .await;
+
+    // State-observable assertion: InboxEntry installed.
+    let received_cid = {
         let bob_g = bob_state.lock().await;
+        let entry = bob_g
+            .inbox
+            .iter()
+            .find(|(k, _)| k.space_id == space_id)
+            .map(|(_, e)| e.clone())
+            .expect("Bob's inbox must contain the freshly-applied entry");
         assert!(
             bob_g.inbox.contains_key(&InboxKey {
                 space_id,
-                message_cid: received_cid,
+                message_cid: entry.message_cid,
             }),
             "Bob's inbox must contain the freshly-applied entry"
         );
-    }
+        entry.message_cid
+    };
 
-    // Phase 4: ReceivedMessage carries the decrypted body + mime_type +
-    // sender's HLC sent_at. The IPC emit threads these into the
-    // dm-received payload — assert they survive the encrypt → decrypt
-    // round-trip intact and aren't shuffled / dropped.
-    let received = &bob_outcome.newly_received[0];
+    // Phase 4 IPC payload assertions: dm-received emit threads body +
+    // mime_type + sent_at through to the frontend. The lifted variant
+    // emits via app.emit — listener captures the payload. Tauri's
+    // listener delivery is async on a separate task; allow a short window
+    // for the event to land.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !received_payloads.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dm-received listener did not fire within 2s");
+    // Snapshot the payloads vec, then drop the guard before further
+    // awaits — clippy::await_holding_lock requires no std::Mutex guard
+    // outlives an `.await` point.
+    let received = {
+        let payloads = received_payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1, "exactly one dm-received emit expected");
+        payloads[0].clone()
+    };
     assert_eq!(
-        received.body, body,
+        received["body"].as_str().unwrap(),
+        hex::encode(&body),
         "decrypted body must match Alice's plaintext"
     );
     assert_eq!(
-        received.mime_type, mime_type,
+        received["mimeType"].as_str().unwrap(),
+        mime_type,
         "mime_type must match Alice's send_dm input"
     );
     assert_eq!(
-        received.sent_at.wall_ms, send_wall_ms,
+        received["sentAt"].as_u64().unwrap(),
+        send_wall_ms,
         "sent_at.wall_ms must match the wall_now_ms Alice's send_dm stamped"
     );
     assert_eq!(
-        received.sent_at.device_id, "alice-device",
-        "sent_at.device_id must be Alice's signing device (sender's HLC)"
+        received["messageCid"].as_str().unwrap(),
+        hex::encode(received_cid.to_bytes()),
+        "messageCid in dm-received emit must match Bob's inbox entry"
     );
 
     // ── Bob's ack got pushed onto bob_unicast_tx (one ack per device in
@@ -636,21 +688,44 @@ async fn dm_offline_recipient_then_online_delivers() {
         dm_signing::compute_dm_destination_hash(bob_device.0)
     );
 
-    let bob_outcome = {
-        let mut bob_g = bob_state.lock().await;
-        let mut bob_outbox_g = bob_outbox.lock().await;
-        bob_outbox_g
-            .handle_unicast(
-                &mut bob_g,
-                cas.as_ref(),
-                &bob_unicast_tx,
-                alice_to_bob.packet,
-                7_000,
-            )
-            .await
-            .expect("Bob's handle_unicast(CidNotify) ok")
-    };
-    assert_eq!(bob_outcome.newly_received.len(), 1);
+    // ZEB-241: dispatch CidNotify through the lifted variant (production
+    // path: event_loop pre-decodes, spawns the lifted task). The lifted
+    // handler emits dm-received via app.emit instead of returning
+    // DrainOutcome — assert via state inspection (InboxEntry installed).
+    let bob_app = tauri::test::mock_app();
+    let bob_app_handle = bob_app.handle().clone();
+    let (signed, signature, signed_bytes) =
+        match harmony_app::dm_envelope::decode_packet(&alice_to_bob.packet)
+            .expect("alice's outbound packet must decode")
+        {
+            harmony_app::dm_envelope::DmPacket::CidNotify {
+                signed,
+                signature,
+                signed_bytes,
+            } => (signed, signature, signed_bytes.to_vec()),
+            other => panic!("expected CidNotify, got {other:?}"),
+        };
+    let bob_inbox_before = bob_state.lock().await.inbox.len();
+    DmOutbox::handle_cidnotify_lifted(
+        Arc::clone(&bob_outbox),
+        Arc::clone(&bob_state),
+        Arc::clone(&cas),
+        bob_unicast_tx.clone(),
+        bob_app_handle,
+        signed,
+        signature,
+        signed_bytes,
+        7_000,
+    )
+    .await;
+    {
+        let bob_g = bob_state.lock().await;
+        assert_eq!(
+            bob_g.inbox.len(),
+            bob_inbox_before + 1,
+            "Bob's inbox must have one new entry after lifted CidNotify dispatch"
+        );
+    }
 
     let bob_to_alice =
         tokio::time::timeout(std::time::Duration::from_secs(5), bob_unicast_rx.recv())

@@ -1577,23 +1577,66 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
         if let (Some(outbox), Some(state), Some(cas), Some(tx)) =
             (dm_outbox, crdt_state, cas_handle, unicast_send_tx)
         {
+            // ZEB-241: pre-decode to detect CidNotify; spawn lifted handler
+            // so the 500ms CAS fetch in Phase B doesn't hold the outbox +
+            // state locks. Invite/Ack continue through the existing
+            // try_lock + handle_unicast path (unchanged behavior).
+            let packet_bytes = match &action {
+                RuntimeAction::UnicastReceived { packet, .. } => packet.clone(),
+                _ => unreachable!("matched UnicastReceived above"),
+            };
+            let wall_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            match crate::dm_envelope::decode_packet(&packet_bytes) {
+                Ok(crate::dm_envelope::DmPacket::CidNotify {
+                    signed,
+                    signature,
+                    signed_bytes,
+                }) => {
+                    // Spawn lifted handler — fire-and-forget. Phase A
+                    // locks are acquired inside the spawned task; the
+                    // event_loop's select! returns immediately after
+                    // spawn so the next inbound action can start.
+                    let outbox_clone = std::sync::Arc::clone(outbox);
+                    let state_clone = std::sync::Arc::clone(state);
+                    let cas_clone = std::sync::Arc::clone(cas);
+                    let tx_clone = tx.clone();
+                    let app_clone = app.clone();
+                    let signed_bytes_owned = signed_bytes.to_vec();
+                    tokio::spawn(async move {
+                        crate::dm_outbox::DmOutbox::handle_cidnotify_lifted(
+                            outbox_clone,
+                            state_clone,
+                            cas_clone,
+                            tx_clone,
+                            app_clone,
+                            signed,
+                            signature,
+                            signed_bytes_owned,
+                            wall_now_ms,
+                        )
+                        .await;
+                    });
+                    return;
+                }
+                Ok(_) | Err(_) => {
+                    // Invite / Ack / decode-failure: fall through to
+                    // existing try_lock + handle_unicast path. The
+                    // decode failure case re-decodes inside
+                    // handle_unicast and tracing::warn!s accordingly,
+                    // preserving prior error-handling behavior.
+                }
+            }
+
             let outbox_try = outbox.try_lock();
             let state_try = state.try_lock();
             match (outbox_try, state_try) {
                 (Ok(mut outbox_g), Ok(mut state_g)) => {
-                    // Extract packet bytes from the action without cloning when
-                    // possible. We re-bind to take ownership inside the match
-                    // arm via destructuring of `action` itself.
-                    let packet = match &action {
-                        RuntimeAction::UnicastReceived { packet, .. } => packet.clone(),
-                        _ => unreachable!("matched UnicastReceived above"),
-                    };
-                    let wall_now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
                     let result = outbox_g
-                        .handle_unicast(&mut state_g, cas.as_ref(), tx, packet, wall_now_ms)
+                        .handle_unicast(&mut state_g, cas.as_ref(), tx, packet_bytes, wall_now_ms)
                         .await;
                     // Drop locks before IPC emits.
                     drop(state_g);

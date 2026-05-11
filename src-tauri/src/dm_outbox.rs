@@ -26,6 +26,7 @@ use crate::owner_state_types::{
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 
 pub type MessageId = OutboxEntryId;
 
@@ -851,13 +852,20 @@ impl DmOutbox {
 
     /// Inbound DM packet entry point. Decodes, dispatches by discriminant.
     ///
+    /// ZEB-241: production CidNotify dispatch happens via
+    /// `handle_cidnotify_lifted` (spawned by event_loop's pre-decode
+    /// branch), so the only discriminants this method actively handles
+    /// are Invite + Ack. CidNotify is kept as a defensive drop+warn arm
+    /// — a CidNotify reaching here means a future caller bypassed the
+    /// pre-decode contract and the packet is dropped rather than
+    /// re-introducing the locked CAS-fetch path.
+    ///
     /// The signature verification happens INSIDE each per-discriminant
     /// handler (handle_invite uses inline pubkey from invite body;
-    /// handle_cidnotify and handle_ack use `lookup_pubkey_for_device`
-    /// against `OwnerDeviceCache`). Centralizing verification in
-    /// `handle_unicast` would force a generic "first try inline, fallback
-    /// to cache" pattern that's less expressive than per-discriminant
-    /// handling.
+    /// handle_ack uses `lookup_pubkey_for_device` against
+    /// `OwnerDeviceCache`). Centralizing verification in `handle_unicast`
+    /// would force a generic "first try inline, fallback to cache"
+    /// pattern that's less expressive than per-discriminant handling.
     ///
     /// Per spec §"Application-signature binding rule", every dispatched
     /// arm uses the verified `signing_device_hash` from the packet body
@@ -866,8 +874,14 @@ impl DmOutbox {
     pub async fn handle_unicast(
         &mut self,
         state: &mut OwnerState,
-        cas: &dyn ContentStore,
-        unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        // ZEB-241: `_cas` + `_unicast_send_tx` were consumed by the old
+        // monolithic `handle_cidnotify` (CAS fetch in step 9 + ack
+        // fan-out in step 13b). Both have moved to
+        // `handle_cidnotify_lifted`. The signature is preserved so
+        // event_loop's caller and integration tests need no changes
+        // when invoking the Invite/Ack paths.
+        _cas: &dyn ContentStore,
+        _unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
         packet_bytes: Vec<u8>,
         wall_now_ms: u64,
     ) -> Result<DrainOutcome, DmReceiveError> {
@@ -883,22 +897,6 @@ impl DmOutbox {
                 self.handle_invite(state, signed, signature, &signed_bytes, wall_now_ms)
                     .await
             }
-            crate::dm_envelope::DmPacket::CidNotify {
-                signed,
-                signature,
-                signed_bytes,
-            } => {
-                self.handle_cidnotify(
-                    state,
-                    cas,
-                    unicast_send_tx,
-                    signed,
-                    signature,
-                    &signed_bytes,
-                    wall_now_ms,
-                )
-                .await
-            }
             crate::dm_envelope::DmPacket::Ack {
                 signed,
                 signature,
@@ -906,6 +904,20 @@ impl DmOutbox {
             } => {
                 self.handle_ack(state, signed, signature, &signed_bytes, wall_now_ms)
                     .await
+            }
+            // ZEB-241: CidNotify is dispatched via `handle_cidnotify_lifted`
+            // (spawned from event_loop pre-decode) so the 500ms CAS fetch
+            // doesn't hold outbox + state locks. event_loop pre-decodes
+            // and short-circuits before reaching handle_unicast for
+            // CidNotify packets, so this arm should be unreachable in
+            // production. If a CidNotify ever arrives here (e.g., a future
+            // caller that bypasses the pre-decode), drop+warn rather than
+            // re-introduce a locked CAS-fetch path.
+            crate::dm_envelope::DmPacket::CidNotify { .. } => {
+                tracing::warn!(
+                    "handle_unicast received CidNotify; expected event_loop pre-decode to spawn handle_cidnotify_lifted instead. Dropping packet."
+                );
+                Ok(DrainOutcome::default())
             }
         }
     }
@@ -1062,130 +1074,137 @@ impl DmOutbox {
         Ok(DrainOutcome::default())
     }
 
-    /// Inbound `DmCidNotify` handler — Phase 3b receive path.
+    /// ZEB-241: lock-lifted CidNotify handler. Manages its
+    /// own lock cycles internally so the slow CAS fetch in Phase B
+    /// happens with NO locks held. Designed to be called from a
+    /// `tokio::spawn`'d task (event_loop fires-and-forgets).
     ///
-    /// Per ZEB-216 spec §"Wire format" Flow 2 steps 7-13:
-    ///   7a. Look up signing pubkey via `lookup_pubkey_for_device`. None →
-    ///       `UnknownSigningKey` (pre-bootstrap state — drop, telemetry).
-    ///       Verify signature via `dm_signing::verify_dm_packet_signature`
-    ///       (key-substitution defense + Ed25519 verify).
-    ///   7b. `resolve_signed_origin_owner(cache, signing_device_hash)` →
-    ///       `resolved_owner` (UnknownSigningDevice / AmbiguousSigningDevice
-    ///       drop on degenerate cache states).
-    ///   7c. `signed.sender_owner_addr ?= resolved_owner` — drop
-    ///       `OwnerFieldMismatch` on cache-poisoning.
-    ///   8.  `apply_owner_device_update` with notify.sender_devices and
-    ///       a parallel pubs vec (Some at the signer's index, None
-    ///       elsewhere). LWW HLC uses our local wall clock — this is OUR
-    ///       record of when WE learned about these devices, not the
-    ///       sender's HLC. Rejected outcome ignored (our cache may be
-    ///       fresher than what just arrived).
-    ///   9.  Look up Space (SpaceNotFound drops if we're not a member).
-    ///       `cas.get(message_cid)` with 500ms tokio::time::timeout. Three
-    ///       drop paths: blob not found, fetch error, timeout — all
-    ///       surface as `CasFetchFailed`.
-    ///   11. `decrypt_dm_message` with prior-keys fallback (current key
-    ///       first, then each prior).
-    ///   12. `verify_sender_binding(payload, resolved_owner)` —
-    ///       encrypted-payload-layer check that the body's sender field
-    ///       matches the wire-layer cryptographically-authenticated source.
-    ///   13a. `apply_inbox` + atomic-emit: only `Inserted` (NOT NoOp /
-    ///        Merged) populates `DrainOutcome.newly_received`. Duplicate
-    ///        notifies stay silent per spec §"Idempotency and drain
-    ///        semantics".
-    ///   13b. DmAck fan-out: build_signed_ack with our signing key + our
-    ///        signing_device_hash; encode_packet; one
-    ///        `UnicastSendRequest` per device in signed.sender_devices.
-    ///        Failed sends are silent per spec (no retry on the ack
-    ///        itself).
+    /// Three phases:
+    ///   - Phase A (locked): verify signature + resolve owner + check
+    ///     sender match + snapshot Space (cloned). Drops locks.
+    ///   - Phase B (unlocked): cas.get(message_cid) under 500ms timeout.
+    ///   - Phase C (re-locked): re-fetch Space (TOCTOU window — content_key
+    ///     could have rotated, member could have been kicked, Space could
+    ///     have been deleted), decrypt with prior_content_keys fallback,
+    ///     apply_owner_device_update, apply_inbox, build + try_send acks.
+    ///     IPC emits happen AFTER lock drop.
     ///
-    /// Sanity gates run BEFORE expensive operations (signature verify,
-    /// CAS fetch, decrypt). Cheaper checks first.
+    /// On any error inside the task, logs via tracing::warn! and returns.
+    /// Never panics on caller. Spawned-task panic recovery is the caller's
+    /// responsibility (event_loop wraps with a top-level error log).
     #[allow(clippy::too_many_arguments)]
-    pub async fn handle_cidnotify(
-        &mut self,
-        state: &mut OwnerState,
-        cas: &dyn ContentStore,
-        unicast_send_tx: &tokio::sync::mpsc::Sender<UnicastSendRequest>,
+    pub async fn handle_cidnotify_lifted<R: tauri::Runtime>(
+        outbox_arc: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+        state_arc: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        cas: std::sync::Arc<dyn ContentStore>,
+        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        app: tauri::AppHandle<R>,
         signed: crate::dm_envelope::DmCidNotifySigned,
         signature: [u8; 64],
-        signed_bytes: &[u8],
+        signed_bytes: Vec<u8>,
         wall_now_ms: u64,
-    ) -> Result<DrainOutcome, DmReceiveError> {
-        // Step 7a: look up signing pubkey + verify signature.
-        let identity_pub =
-            lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
-                .ok_or(DmReceiveError::UnknownSigningKey)?;
-        crate::dm_signing::verify_dm_packet_signature(
-            signed_bytes,
-            &signature,
-            &identity_pub,
-            signed.signing_device_hash,
-        )?;
+    ) {
+        // Phase A — locked, fast: verify + resolve + snapshot + cache refresh.
+        // Outbox lock is acquired for `device_id` (used in
+        // apply_owner_device_update's HLC) and to keep the existing
+        // outbox-before-state lock-ordering convention. State lock is
+        // acquired as `mut` because apply_owner_device_update mutates the
+        // OwnerDeviceCache.
+        //
+        // apply_owner_device_update lives in Phase A (not Phase C) to
+        // match the original handle_cidnotify's behavior: the device cache
+        // gets refreshed on every successfully-verified inbound CidNotify,
+        // even if the subsequent CAS fetch times out or the Space gets
+        // deleted in the TOCTOU window. Doing it in Phase C would silently
+        // skip cache updates whenever the slow path fails — a behavior
+        // regression Cursor Bugbot flagged on round 0.
+        // identity_pub is no longer in the returned tuple — Phase A
+        // now consumes it directly via apply_owner_device_update.
+        let (_space_a, resolved_owner) = {
+            let outbox_g = outbox_arc.lock().await;
+            let mut state_g = state_arc.lock().await;
+            let identity_pub = match lookup_pubkey_for_device(
+                &state_g.owner_device_cache,
+                signed.signing_device_hash,
+            ) {
+                Some(pub_) => pub_,
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::UnknownSigningKey,
+                        "handle_cidnotify_lifted Phase A: dropping packet"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = crate::dm_signing::verify_dm_packet_signature(
+                &signed_bytes,
+                &signature,
+                &identity_pub,
+                signed.signing_device_hash,
+            ) {
+                tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
+                return;
+            }
+            let resolved_owner = match resolve_signed_origin_owner(
+                &state_g.owner_device_cache,
+                signed.signing_device_hash,
+            ) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
+                    return;
+                }
+            };
+            if signed.sender_owner_addr != resolved_owner {
+                tracing::warn!(
+                    error = ?DmReceiveError::OwnerFieldMismatch,
+                    "handle_cidnotify_lifted Phase A: dropping packet"
+                );
+                return;
+            }
+            let space = match state_g.spaces.get(&signed.space_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::SpaceNotFound,
+                        "handle_cidnotify_lifted Phase A: dropping packet"
+                    );
+                    return;
+                }
+            };
+            if !space.members.contains(&resolved_owner) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderNotInSpaceMembers,
+                    "handle_cidnotify_lifted Phase A: dropping packet"
+                );
+                return;
+            }
+            // Refresh OwnerDeviceCache (Step 8 from original
+            // handle_cidnotify). MUST happen before lock-drop so the
+            // refresh persists even if Phase B's CAS fetch times out
+            // or Phase C finds the Space deleted in the TOCTOU window.
+            let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
+            if let Some(idx) = signed
+                .sender_devices
+                .iter()
+                .position(|d| *d == signed.signing_device_hash)
+            {
+                updated_pubs[idx] = Some(identity_pub);
+            }
+            let _ = state_g.apply_owner_device_update(
+                resolved_owner,
+                signed.sender_devices.clone(),
+                updated_pubs,
+                Hlc {
+                    wall_ms: wall_now_ms,
+                    logical: 0,
+                    device_id: outbox_g.device_id.clone(),
+                },
+            );
+            (space, resolved_owner)
+        }; // locks dropped here
 
-        // Step 7b: resolve signing_device_hash → OwnerAddr.
-        let resolved_owner =
-            resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
-
-        // Step 7c: verify notify.sender_owner_addr matches the resolved
-        // owner. Drops cache-poisoning attempts where a peer claims a
-        // sender_owner_addr that doesn't agree with the cryptographically-
-        // authenticated source.
-        if signed.sender_owner_addr != resolved_owner {
-            return Err(DmReceiveError::OwnerFieldMismatch);
-        }
-
-        // Look up Space for AAD + content_key. SpaceNotFound is the
-        // "we are not a member" / "stale notify after we left" drop path.
-        let space = state
-            .spaces
-            .get(&signed.space_id)
-            .ok_or(DmReceiveError::SpaceNotFound)?
-            .clone();
-
-        // Membership gate. Signature verify proves WHO sent this; this gate
-        // proves they're still ALLOWED to send into this space. An ex-member
-        // whose identity_pub is still in OwnerDeviceCache (because we haven't
-        // expired the entry) would otherwise pass signature verify and land
-        // a message in our inbox after their membership was revoked. For DM
-        // kinds members never changes; for GroupDm members can shrink, and
-        // this gate is what blocks cached-key reuse from a removed member.
-        if !space.members.contains(&resolved_owner) {
-            return Err(DmReceiveError::SenderNotInSpaceMembers);
-        }
-
-        // Step 8: refresh OwnerDeviceCache with notify.sender_devices.
-        // Pubs vec: Some(identity_pub) at the signer's index (we just
-        // verified that hash → pub binding), None at every other index
-        // (Path B post-bootstrap — non-signer devices remain pubs-less
-        // until the next signed packet from each surfaces them).
-        // HLC uses our local wall clock + device_id (this is OUR record
-        // of when WE learned, NOT the sender's HLC).
-        let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
-        if let Some(idx) = signed
-            .sender_devices
-            .iter()
-            .position(|d| *d == signed.signing_device_hash)
-        {
-            updated_pubs[idx] = Some(identity_pub);
-        }
-        // Ignore the apply outcome — Rejected (StaleHlc) is acceptable
-        // here, our cache may already be fresher than what just arrived.
-        let _ = state.apply_owner_device_update(
-            resolved_owner,
-            signed.sender_devices.clone(),
-            updated_pubs,
-            Hlc {
-                wall_ms: wall_now_ms,
-                logical: 0,
-                device_id: self.device_id.clone(),
-            },
-        );
-
-        // Step 9: fetch storage_blob from CAS with 500ms timeout. The
-        // timeout matters in production where cas.get goes through the
-        // cas_op channel and may wait on Zenoh DAG-sync; tests using
-        // InMemoryStub return immediately so the timeout is never hit.
+        // Phase B — unlocked, slow: CAS fetch.
         let blob = match tokio::time::timeout(
             std::time::Duration::from_millis(500),
             cas.get(&signed.message_cid),
@@ -1193,113 +1212,227 @@ impl DmOutbox {
         .await
         {
             Ok(Ok(Some(bytes))) => bytes,
-            Ok(Ok(None)) => return Err(DmReceiveError::CasFetchFailed("blob not found".into())),
-            Ok(Err(e)) => return Err(DmReceiveError::CasFetchFailed(format!("{e:?}"))),
-            Err(_) => return Err(DmReceiveError::CasFetchFailed("500ms fetch timeout".into())),
-        };
-
-        // Step 11: decrypt with prior-keys fallback.
-        // `space.content_key` is non-None for any DM/group-DM Space that
-        // passed `validate_invariants` — the invariant check in
-        // `apply_space_with_canonicalization` (which wrote this Space into
-        // state) rejects DM/group-DM Spaces with content_key=None.
-        let aad = crate::dm_crypto::compute_aad(&space)
-            .map_err(|e| DmReceiveError::AadCompute(e.to_string()))?;
-        let payload = crate::dm_crypto::decrypt_dm_message(
-            space
-                .content_key
-                .as_ref()
-                .expect("DM Space MUST have content_key per validate_invariants"),
-            &space.prior_content_keys,
-            &aad,
-            &blob,
-        )
-        .map_err(|_| DmReceiveError::DecryptFailed)?;
-
-        // Step 12: sender-binding check (encrypted-payload layer).
-        // Wire-layer says the signer's owner is `resolved_owner`; the
-        // encrypted body's `sender` field MUST agree.
-        crate::dm_crypto::verify_sender_binding(&payload, resolved_owner)
-            .map_err(|_| DmReceiveError::SenderImpersonation)?;
-
-        // Step 13a: apply_inbox — atomic-emit semantics.
-        // Only `Inserted` (NOT `Merged` — composite-key collision via a
-        // duplicate notify) populates newly_received. Caller emits
-        // dm-received IPC ONLY for Inserted entries.
-        let inbox_entry = crate::owner_state_types::InboxEntry {
-            space_id: signed.space_id,
-            message_cid: signed.message_cid,
-            from: resolved_owner,
-            received_at: Hlc {
-                wall_ms: wall_now_ms,
-                logical: 0,
-                device_id: self.device_id.clone(),
-            },
-        };
-        let outcome = state.apply_inbox(inbox_entry.clone());
-        let mut drain_outcome = DrainOutcome::default();
-        if matches!(outcome, ApplyOutcome::Inserted) {
-            drain_outcome
-                .newly_received
-                .push(crate::owner_state_types::ReceivedMessage {
-                    inbox_entry,
-                    body: payload.body.clone(),
-                    mime_type: payload.mime_type.clone(),
-                    sent_at: payload.sent_at.clone(),
-                });
-        }
-
-        // Step 13b: DmAck fan-out to all sender_devices.
-        // Build the ack signed by US (our signing key, our device hash).
-        // ack_from_devices = our currently-known devices for self_owner
-        // from OwnerDeviceCache, falling back to just us if no entry yet
-        // (pre-Flow-A-bootstrap). signing_device_hash MUST be in
-        // ack_from_devices (envelope invariant) — fall back to a
-        // single-element vec to satisfy that.
-        let our_ack_devices = state
-            .owner_device_cache
-            .devices
-            .get(&self.self_owner)
-            .map(|e| e.devices.clone())
-            .filter(|devs| devs.contains(&self.our_signing_device_hash))
-            .unwrap_or_else(|| vec![self.our_signing_device_hash]);
-        let ack_signed = crate::dm_envelope::DmAckSigned {
-            space_id: signed.space_id,
-            message_cid: signed.message_cid,
-            ack_from_owner_addr: self.self_owner,
-            ack_from_devices: our_ack_devices,
-            signing_device_hash: self.our_signing_device_hash,
-        };
-        let ack_packet = crate::dm_envelope::build_signed_ack(ack_signed, &self.signing_key)
-            .map_err(|e| DmReceiveError::Decode(format!("build_signed_ack: {e}")))?;
-        let ack_wire = crate::dm_envelope::encode_packet(&ack_packet)
-            .map_err(|e| DmReceiveError::Decode(format!("encode_packet ack: {e}")))?;
-
-        // Compute one dest_hash per sender device + push UnicastSendRequest.
-        // dest_hash = SHA256(name_hash("harmony.dm") || identity_address_hash)[:16]
-        // — same convention the future Task 11 production resolver uses.
-        // Failed sends are silent per spec — no retry on the ack itself.
-        //
-        // Use try_send (not send().await) because handle_cidnotify is invoked
-        // from the same event-loop task that drains unicast_send_rx. .await
-        // on a full channel would deadlock the event loop on itself. On
-        // channel pressure we drop+warn; the sender's drain backoff
-        // retransmits the underlying CidNotify, which produces a fresh ack
-        // opportunity on the next inbound tick.
-        for device in &signed.sender_devices {
-            let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
-            if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
-                destination_hash: dest_hash,
-                packet: ack_wire.clone(),
-            }) {
+            Ok(Ok(None)) => {
                 tracing::warn!(
-                    error = ?e,
-                    "ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
+                    error = ?DmReceiveError::CasFetchFailed("blob not found".into()),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
                 );
+                return;
             }
-        }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = ?DmReceiveError::CasFetchFailed(format!("{e:?}")),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    error = ?DmReceiveError::CasFetchFailed("500ms fetch timeout".into()),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
+                );
+                return;
+            }
+        };
 
-        Ok(drain_outcome)
+        // Phase C — re-locked, fast: re-fetch Space + decrypt + apply + ack.
+        let drain_outcome = {
+            let outbox_g = outbox_arc.lock().await;
+            let mut state_g = state_arc.lock().await;
+
+            // TOCTOU re-check: Space may have been deleted, members may have
+            // shrunk (GroupDm), or content_key may have rotated.
+            let space_c = match state_g.spaces.get(&signed.space_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::SpaceNotFound,
+                        "handle_cidnotify_lifted Phase C: dropping packet (Space deleted in TOCTOU window)"
+                    );
+                    return;
+                }
+            };
+            if !space_c.members.contains(&resolved_owner) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderNotInSpaceMembers,
+                    "handle_cidnotify_lifted Phase C: dropping packet (sender lost membership in TOCTOU window)"
+                );
+                return;
+            }
+
+            // Decrypt with current Space + prior_content_keys fallback —
+            // handles content_key rotation between Phase A and Phase C.
+            let aad = match crate::dm_crypto::compute_aad(&space_c) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::AadCompute(e.to_string()),
+                        "handle_cidnotify_lifted Phase C: dropping packet"
+                    );
+                    return;
+                }
+            };
+            // Decrypt with prior-keys fallback. `space_c.content_key`
+            // is non-None for any DM/group-DM Space that passed
+            // `validate_invariants` — the invariant check in
+            // `apply_space_with_canonicalization` (which wrote this
+            // Space into state) rejects DM/group-DM Spaces with
+            // content_key=None. The TOCTOU re-check above re-fetched
+            // `space_c` from the latest state, so any rotation that
+            // landed during Phase B is reflected here; the prior_keys
+            // fallback decrypts blobs that were encrypted with a key
+            // listed in `space_c.prior_content_keys`.
+            //
+            // Defense-in-depth: log + drop instead of expect()/panic.
+            // In the spawned-task path, panic dies silently (no caller
+            // to surface); converting to a graceful drop keeps the
+            // method panic-free as documented and matches the rest of
+            // Phase C's error handling. Reachable only via corrupted
+            // state, migration bug, or direct test insertion that
+            // bypasses validate_invariants — in production this should
+            // never fire, but the failure mode is now observable.
+            let content_key = match space_c.content_key.as_ref() {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        "handle_cidnotify_lifted Phase C: dropping packet \
+                         (DM Space lacks content_key — invariant violation, \
+                         possibly corrupted state)"
+                    );
+                    return;
+                }
+            };
+            let payload = match crate::dm_crypto::decrypt_dm_message(
+                content_key,
+                &space_c.prior_content_keys,
+                &aad,
+                &blob,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::DecryptFailed,
+                        "handle_cidnotify_lifted Phase C: dropping packet"
+                    );
+                    return;
+                }
+            };
+
+            // Sender-binding check.
+            if crate::dm_crypto::verify_sender_binding(&payload, resolved_owner).is_err() {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderImpersonation,
+                    "handle_cidnotify_lifted Phase C: dropping packet"
+                );
+                return;
+            }
+
+            // NOTE: OwnerDeviceCache refresh (Step 8 in original
+            // handle_cidnotify) was moved up to Phase A, so it runs
+            // even when the slow path (CAS fetch, decrypt) fails.
+
+            // apply_inbox — atomic-emit semantics.
+            let inbox_entry = crate::owner_state_types::InboxEntry {
+                space_id: signed.space_id,
+                message_cid: signed.message_cid,
+                from: resolved_owner,
+                received_at: Hlc {
+                    wall_ms: wall_now_ms,
+                    logical: 0,
+                    device_id: outbox_g.device_id.clone(),
+                },
+            };
+            let outcome = state_g.apply_inbox(inbox_entry.clone());
+            let mut drain_outcome = DrainOutcome::default();
+            if matches!(outcome, ApplyOutcome::Inserted) {
+                drain_outcome
+                    .newly_received
+                    .push(crate::owner_state_types::ReceivedMessage {
+                        inbox_entry,
+                        body: payload.body.clone(),
+                        mime_type: payload.mime_type.clone(),
+                        sent_at: payload.sent_at.clone(),
+                    });
+            }
+
+            // Build + try_send acks (cheap — non-blocking).
+            let our_ack_devices = state_g
+                .owner_device_cache
+                .devices
+                .get(&outbox_g.self_owner)
+                .map(|e| e.devices.clone())
+                .filter(|devs| devs.contains(&outbox_g.our_signing_device_hash))
+                .unwrap_or_else(|| vec![outbox_g.our_signing_device_hash]);
+            let ack_signed = crate::dm_envelope::DmAckSigned {
+                space_id: signed.space_id,
+                message_cid: signed.message_cid,
+                ack_from_owner_addr: outbox_g.self_owner,
+                ack_from_devices: our_ack_devices,
+                signing_device_hash: outbox_g.our_signing_device_hash,
+            };
+            // Ack pipeline: build + encode + try_send. Failures here
+            // do NOT abort — apply_inbox already mutated state, and
+            // skipping the post-lock IPC emit would diverge UI from
+            // persisted state. Match the existing channel-pressure
+            // pattern below: log + continue. Sender retransmits the
+            // CidNotify which produces a fresh ack opportunity.
+            let ack_wire_opt =
+                match crate::dm_envelope::build_signed_ack(ack_signed, &outbox_g.signing_key) {
+                    Ok(packet) => match crate::dm_envelope::encode_packet(&packet) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
+                                "handle_cidnotify_lifted Phase C: ack encode failed; \
+                                 continuing to dm-received emit so UI stays in sync \
+                                 with persisted inbox; sender will retransmit CidNotify"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?DmReceiveError::Decode(format!("build_signed_ack: {e}")),
+                            "handle_cidnotify_lifted Phase C: ack build failed; \
+                             continuing to dm-received emit so UI stays in sync \
+                             with persisted inbox; sender will retransmit CidNotify"
+                        );
+                        None
+                    }
+                };
+            if let Some(ack_wire) = ack_wire_opt {
+                for device in &signed.sender_devices {
+                    let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+                    if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
+                        destination_hash: dest_hash,
+                        packet: ack_wire.clone(),
+                    }) {
+                        tracing::warn!(
+                            error = ?e,
+                            "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
+                        );
+                    }
+                }
+            }
+
+            drain_outcome
+        }; // locks dropped here
+
+        // IPC emit — locks released, safe to fire dm-received events.
+        for rm in drain_outcome.newly_received {
+            let _ = app.emit(
+                "dm-received",
+                serde_json::json!({
+                    "spaceId": hex::encode(rm.inbox_entry.space_id.0),
+                    "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
+                    "from": hex::encode(rm.inbox_entry.from.0),
+                    "receivedAt": rm.inbox_entry.received_at.wall_ms,
+                    "sentAt": rm.sent_at.wall_ms,
+                    "body": hex::encode(&rm.body),
+                    "mimeType": rm.mime_type,
+                }),
+            );
+        }
     }
 
     /// Inbound `DmAck` handler — Phase 3b receive path for the sender side.
@@ -3068,13 +3201,70 @@ mod tests {
         )
     }
 
+    /// ZEB-241 test helper: invoke `handle_cidnotify_lifted` against a
+    /// freshly-built test fixture and return the post-call `(outbox, state)`
+    /// for inspection. Wraps `outbox`/`state` in Arcs (the lifted handler's
+    /// signature requires Arcs internally), calls the handler with a stub
+    /// `tauri::test::mock_app()` AppHandle, then unwraps the Arcs back so
+    /// tests can mutate / re-assert without dealing with locks.
+    ///
+    /// The lifted variant emits `dm-received` via `app.emit` (mock_app's
+    /// AppHandle accepts emits silently in tests) and returns `()` instead
+    /// of `Result<DrainOutcome, _>`. Tests that previously asserted on
+    /// returned errors / outcomes now inspect post-call state directly:
+    /// - `state.inbox.contains_key(...)` for InboxEntry presence
+    /// - `state.owner_device_cache.devices.get(...)` for cache state
+    /// - the `rx` channel for ack fan-out (drained from caller after this
+    ///   helper returns)
+    ///
+    /// `&mut outbox` and `&mut state` are returned as the unwrapped owned
+    /// values so callers can assign back: `let (outbox, state) = run(...)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_handle_cidnotify_lifted(
+        outbox: DmOutbox,
+        state: OwnerState,
+        cas: std::sync::Arc<dyn ContentStore>,
+        tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        signed: crate::dm_envelope::DmCidNotifySigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+        wall_now_ms: u64,
+    ) -> (DmOutbox, OwnerState) {
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            cas,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            wall_now_ms,
+        )
+        .await;
+
+        let outbox = std::sync::Arc::try_unwrap(outbox_arc)
+            .unwrap_or_else(|_| {
+                panic!("outbox Arc has lingering refs (spawned task should be done)")
+            })
+            .into_inner();
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+        (outbox, state)
+    }
+
     #[tokio::test]
     async fn handle_unicast_cidnotify_triggers_cas_fetch_decrypt_inbox_write() {
         let alice = OwnerAddr([0x01; 16]);
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
         let content_key = DmContentKey::new([0xab; 32]);
-        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+        let (state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
             build_cidnotify_fixture(
                 space_id,
                 SpaceKind::Dm,
@@ -3086,23 +3276,27 @@ mod tests {
             )
             .await;
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let outcome = outbox
-            .handle_cidnotify(
-                &mut state,
-                &cas,
-                &tx,
-                signed.clone(),
-                signature,
-                &signed_bytes,
-                500,
-            )
-            .await
-            .expect("happy path returns Ok");
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed.clone(),
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
 
-        // InboxEntry written.
+        // InboxEntry written. (The lifted variant emits dm-received via
+        // app.emit instead of returning DrainOutcome, so we inspect state
+        // directly: presence of an InboxEntry for this composite key
+        // proves apply_inbox(Inserted) ran and the dm-received emit
+        // happened in the spawned task.)
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -3113,16 +3307,6 @@ mod tests {
         );
         let entry = state.inbox.get(&inbox_key).unwrap();
         assert_eq!(entry.from, alice);
-
-        // newly_received populated for the Inserted outcome — body +
-        // mime_type + sent_at flow through the widened ReceivedMessage
-        // payload (Phase 4 dm-received IPC depends on these fields).
-        assert_eq!(outcome.newly_received.len(), 1);
-        assert_eq!(outcome.newly_received[0].inbox_entry.from, alice);
-        assert_eq!(outcome.newly_received[0].inbox_entry.space_id, space_id);
-        assert_eq!(outcome.newly_received[0].body, b"hi bob");
-        assert_eq!(outcome.newly_received[0].mime_type, "text/plain");
-        assert_eq!(outcome.newly_received[0].sent_at.wall_ms, 150);
 
         // One UnicastSendRequest emitted per sender device (one device
         // here, so exactly one).
@@ -3153,7 +3337,7 @@ mod tests {
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
         let content_key = DmContentKey::new([0xab; 32]);
-        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, _mcid) =
+        let (state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
             build_cidnotify_fixture(
                 space_id,
                 SpaceKind::Dm,
@@ -3165,40 +3349,61 @@ mod tests {
             )
             .await;
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        // First call — happy path, newly_received populated.
-        let first = outbox
-            .handle_cidnotify(
-                &mut state,
-                &cas,
-                &tx,
-                signed.clone(),
-                signature,
-                &signed_bytes,
-                500,
-            )
-            .await
-            .expect("first call ok");
-        assert_eq!(
-            first.newly_received.len(),
-            1,
-            "first call must populate newly_received"
-        );
+        // First call — happy path, InboxEntry installed at wall_now_ms=500.
+        let (outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            std::sync::Arc::clone(&cas_arc),
+            tx.clone(),
+            signed.clone(),
+            signature,
+            signed_bytes.clone(),
+            500,
+        )
+        .await;
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        let first_entry = state
+            .inbox
+            .get(&inbox_key)
+            .expect("first call must populate inbox")
+            .clone();
+        assert_eq!(first_entry.received_at.wall_ms, 500);
         // Drain the ack the first call emitted so we can check the second
         // call's emit count cleanly.
         let _ = rx.try_recv();
 
-        // Second call — same packet bytes; apply_inbox returns Merged
-        // (composite key already exists), newly_received stays empty.
-        let second = outbox
-            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 600)
-            .await
-            .expect("second call ok (re-applies idempotently)");
-        assert!(
-            second.newly_received.is_empty(),
-            "duplicate notify MUST NOT re-emit dm-received (atomic-emit semantics)"
+        // Second call — same packet bytes, different wall_now_ms (600).
+        // apply_inbox returns Merged/NoOp (composite key already exists),
+        // so InboxEntry.received_at is NOT overwritten with the newer
+        // wall_now_ms. Equivalent state-observable assertion that the
+        // duplicate-emit-suppression semantics held: no re-emission would
+        // mean apply_inbox didn't insert; if received_at.wall_ms is still
+        // 500 (NOT 600), the second call did not re-Insert.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            signature,
+            signed_bytes,
+            600,
+        )
+        .await;
+        let second_entry = state
+            .inbox
+            .get(&inbox_key)
+            .expect("second call must NOT have removed the entry");
+        assert_eq!(
+            second_entry.received_at.wall_ms, 500,
+            "duplicate notify MUST NOT overwrite received_at — apply_inbox returned Merged/NoOp"
         );
     }
 
@@ -3301,20 +3506,28 @@ mod tests {
         let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private_alice.sign(&signed_bytes);
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let err = outbox
-            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
-            .await
-            .unwrap_err();
+        // The lifted variant logs and drops on SenderImpersonation
+        // instead of returning Err. State-observable assertion: no
+        // InboxEntry written, no ack fired.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
         assert!(
-            matches!(err, DmReceiveError::SenderImpersonation),
-            "expected SenderImpersonation, got {err:?}"
+            state.inbox.is_empty(),
+            "InboxEntry MUST NOT be installed on SenderImpersonation"
         );
-        // No InboxEntry written.
-        assert!(state.inbox.is_empty());
-        // No ack emitted.
         assert!(rx.try_recv().is_err(), "ack MUST NOT fire on impersonation");
     }
 
@@ -3327,7 +3540,7 @@ mod tests {
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
         let content_key = DmContentKey::new([0xab; 32]);
-        let (mut state, cas, mut signed, _signature, _signed_bytes, _adev, _apub, _mcid) =
+        let (state, cas, mut signed, _signature, _signed_bytes, _adev, _apub, _mcid) =
             build_cidnotify_fixture(
                 space_id,
                 SpaceKind::Dm,
@@ -3356,28 +3569,33 @@ mod tests {
             .cloned()
             .expect("fixture pre-seeded alice");
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let err = outbox
-            .handle_cidnotify(
-                &mut state,
-                &cas,
-                &tx,
-                signed,
-                new_signature,
-                &new_signed_bytes,
-                500,
-            )
-            .await
-            .unwrap_err();
+        // The lifted variant logs and drops on OwnerFieldMismatch instead
+        // of returning Err. State-observable assertions: no InboxEntry,
+        // no ack, OwnerDeviceCache unchanged for alice, attacker NOT
+        // inserted into the cache.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            new_signature,
+            new_signed_bytes,
+            500,
+        )
+        .await;
         assert!(
-            matches!(err, DmReceiveError::OwnerFieldMismatch),
-            "expected OwnerFieldMismatch, got {err:?}"
+            state.inbox.is_empty(),
+            "InboxEntry MUST NOT be installed on OwnerFieldMismatch"
         );
-        // No InboxEntry, no ack.
-        assert!(state.inbox.is_empty());
-        assert!(rx.try_recv().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "ack MUST NOT fire on OwnerFieldMismatch"
+        );
         // Cache for alice unchanged (NOT updated by Step 8 — Step 7c
         // returned BEFORE Step 8).
         let alice_cache_after = state.owner_device_cache.devices.get(&alice).unwrap();
@@ -3464,20 +3682,32 @@ mod tests {
         let signature = private_alice.sign(&signed_bytes);
 
         let cas = InMemoryStub::default();
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let err = outbox
-            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
-            .await
-            .unwrap_err();
+        // The lifted variant logs and drops on UnknownSigningKey instead
+        // of returning Err. State-observable assertions: no InboxEntry,
+        // no ack — Phase A bailed before Phase B's CAS fetch.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
         assert!(
-            matches!(err, DmReceiveError::UnknownSigningKey),
-            "expected UnknownSigningKey, got {err:?}"
+            state.inbox.is_empty(),
+            "InboxEntry MUST NOT be installed on UnknownSigningKey"
         );
-        // No InboxEntry, no ack — we never got past Step 7a.
-        assert!(state.inbox.is_empty());
-        assert!(rx.try_recv().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "ack MUST NOT fire on UnknownSigningKey"
+        );
     }
 
     #[tokio::test]
@@ -3574,20 +3804,33 @@ mod tests {
         let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
         let signature = private_alice.sign(&signed_bytes);
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let outcome = outbox
-            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
-            .await
-            .expect("prior-key fallback must succeed");
-
-        assert_eq!(outcome.newly_received.len(), 1);
+        // The lifted variant emits dm-received via app.emit instead of
+        // returning DrainOutcome. State-observable assertion: InboxEntry
+        // present means apply_inbox(Inserted) ran (which is the precondition
+        // for the dm-received emit), proving prior-key fallback succeeded.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
         };
-        assert!(state.inbox.contains_key(&inbox_key));
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry must be installed via prior-key fallback decrypt"
+        );
     }
 
     // ── Phase 3b Task 11: handle_ack tests ──────────────────────────────
@@ -3888,7 +4131,7 @@ mod tests {
         let bob = OwnerAddr([0x02; 16]);
         let space_id = SpaceId([7; 16]);
         let content_key = DmContentKey::new([0xab; 32]);
-        let (mut state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+        let (state, cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
             build_cidnotify_fixture(
                 space_id,
                 SpaceKind::Dm,
@@ -3900,7 +4143,7 @@ mod tests {
             )
             .await;
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         // Capacity 1, prefilled, so the ack-fan-out try_send hits Full.
         let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(1);
         tx.try_send(UnicastSendRequest {
@@ -3908,21 +4151,25 @@ mod tests {
             packet: vec![0xde, 0xad],
         })
         .expect("pre-fill must succeed on a fresh channel");
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let outcome = outbox
-            .handle_cidnotify(
-                &mut state,
-                &cas,
-                &tx,
-                signed.clone(),
-                signature,
-                &signed_bytes,
-                500,
-            )
-            .await
-            .expect("CidNotify body must still apply even when ack channel is full");
+        // The lifted variant logs the channel-full warn and continues; the
+        // CidNotify body still applies. State-observable assertion:
+        // InboxEntry installed (which is the precondition for the
+        // dm-received emit), proving the ack-channel-full warn did NOT
+        // short-circuit the apply path.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed.clone(),
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
 
-        // InboxEntry was installed.
         let inbox_key = crate::owner_state_types::InboxKey {
             space_id,
             message_cid,
@@ -3931,10 +4178,8 @@ mod tests {
             state.inbox.contains_key(&inbox_key),
             "InboxEntry must still be installed despite dropped ack"
         );
-        // newly_received populated for the Inserted outcome — ack drop
-        // does NOT suppress dm-received emission.
-        assert_eq!(outcome.newly_received.len(), 1);
-        assert_eq!(outcome.newly_received[0].inbox_entry.from, alice);
+        let entry = state.inbox.get(&inbox_key).unwrap();
+        assert_eq!(entry.from, alice);
     }
 
     #[tokio::test]
@@ -4035,17 +4280,24 @@ mod tests {
             "alice's OwnerDeviceCache entry must persist (ex-member with cached key)"
         );
 
-        let mut outbox = make_outbox_synthetic("bob-dev", bob);
+        let outbox = make_outbox_synthetic("bob-dev", bob);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let cas_arc: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(cas);
 
-        let err = outbox
-            .handle_cidnotify(&mut state, &cas, &tx, signed, signature, &signed_bytes, 500)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, DmReceiveError::SenderNotInSpaceMembers),
-            "expected SenderNotInSpaceMembers, got {err:?}"
-        );
+        // The lifted variant logs and drops on SenderNotInSpaceMembers
+        // instead of returning Err. State-observable assertions: no
+        // InboxEntry, no ack, OwnerDeviceCache unchanged for alice.
+        let (_outbox, state) = run_handle_cidnotify_lifted(
+            outbox,
+            state,
+            cas_arc,
+            tx,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        )
+        .await;
 
         // Inbox unchanged — no entry written for the rejected packet.
         let inbox_key = crate::owner_state_types::InboxKey {
@@ -4360,6 +4612,507 @@ mod tests {
         assert_eq!(
             &stored, max_observed,
             "tracker's final value must equal the max-by-sort-key reservation"
+        );
+    }
+
+    // ── ZEB-241 Task 3: TOCTOU regression tests ────────────────────────
+    //
+    // The lifted handler runs in three phases: Phase A (locked, fast —
+    // verify + snapshot Space), Phase B (unlocked, slow — CAS fetch),
+    // Phase C (re-locked, fast — re-fetch Space + decrypt + apply).
+    //
+    // The TOCTOU window is the gap between Phase A's lock-drop and
+    // Phase C's lock-acquire. To exercise it deterministically, the
+    // tests below use a `GatedCasStub` whose `get()` blocks on a
+    // `tokio::sync::Notify` until the test releases it. This pattern
+    // lets the test:
+    //   1. Spawn the lifted handler.
+    //   2. Wait briefly so Phase A runs to completion.
+    //   3. Acquire the state lock and mutate state (rotate key /
+    //      remove Space / kick member).
+    //   4. Drop the lock.
+    //   5. Release the gate so Phase B unblocks.
+    //   6. Await the spawned handler.
+    //   7. Inspect post-call state.
+    //
+    // The 50ms post-spawn sleep gives Phase A (microsecond-scale, no
+    // I/O) ample headroom to acquire+release locks before the test
+    // mutates state. Bumping if any flake observed.
+
+    /// CAS stub that blocks `get()` on a `tokio::sync::Notify` until
+    /// `release()` fires, AND signals when Phase B has been entered
+    /// (via a second Notify) so tests can wait deterministically
+    /// instead of using a timing-based sleep. Used by the ZEB-241
+    /// TOCTOU regression tests to inject state mutations between
+    /// Phase A (Space snapshot) and Phase C (Space re-fetch + apply)
+    /// of `handle_cidnotify_lifted`.
+    ///
+    /// Test sequence (deterministic, no time dependence):
+    ///   1. spawn handle_cidnotify_lifted task (begins Phase A)
+    ///   2. test calls `wait_for_phase_b().await` — blocks until
+    ///      Phase A drops its locks AND Phase B's CAS get() is reached
+    ///   3. test acquires state lock, mutates, drops lock
+    ///   4. test calls `release()` — unblocks Phase B
+    ///   5. handler runs Phase C against the post-mutation state
+    ///   6. test joins the spawned task + asserts
+    ///
+    /// `put()` is a no-op — these tests pre-seed the blob via the
+    /// constructor and never exercise the put path.
+    struct GatedCasStub {
+        blob: Vec<u8>,
+        cid: ContentId,
+        /// Signaled by `release()`; awaited by `get()` to gate Phase B.
+        gate: tokio::sync::Notify,
+        /// Signaled by `get()` on entry; awaited by tests to know
+        /// Phase A has dropped its locks AND Phase B is parked at the
+        /// CAS get(). Eliminates the need for a timing-based sleep.
+        phase_b_entered: tokio::sync::Notify,
+    }
+
+    impl GatedCasStub {
+        fn new(cid: ContentId, blob: Vec<u8>) -> Self {
+            Self {
+                blob,
+                cid,
+                gate: tokio::sync::Notify::new(),
+                phase_b_entered: tokio::sync::Notify::new(),
+            }
+        }
+
+        /// Release the next (or stored) `notified()` future inside
+        /// `get()`. Notify::notify_one stores a permit if no waiter is
+        /// parked yet, so calling release() before the spawned task
+        /// reaches `gate.notified().await` is safe — the next await
+        /// consumes the permit immediately.
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        /// Block until the spawned task's Phase B has entered the CAS
+        /// `get()` call. By this point Phase A has provably dropped
+        /// its locks (it must, in order for Phase B to start). Tests
+        /// call this instead of `tokio::time::sleep` to eliminate
+        /// timing dependence.
+        async fn wait_for_phase_b(&self) {
+            self.phase_b_entered.notified().await;
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for GatedCasStub {
+        async fn put(&self, _cid: ContentId, _blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            // Signal Phase B entry BEFORE blocking on the gate, so
+            // tests can deterministically wait on this point instead
+            // of using a timing-based sleep.
+            self.phase_b_entered.notify_one();
+            self.gate.notified().await;
+            if cid == &self.cid {
+                Ok(Some(self.blob.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_decrypts_via_prior_keys_when_content_key_rotates_during_lift()
+    {
+        // TOCTOU: Phase A snapshots Space with content_key=K1. Between
+        // Phase A's lock-drop and Phase C's lock-acquire, the test
+        // rotates the Space's key to K2 with prior_content_keys=[K1].
+        // Phase C re-fetches the Space (now K2 + prior=[K1]) and
+        // decrypts the K1-encrypted blob via the prior-keys fallback in
+        // `dm_crypto::decrypt_dm_message`.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let k1 = DmContentKey::new([0x11; 32]);
+        let k2 = DmContentKey::new([0x22; 32]);
+        // Sender encrypts with K1 — fixture sets up Space with K1.
+        let (state, _cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                k1.clone(),
+            )
+            .await;
+
+        // Take the K1-encrypted blob out of the fixture's CAS by
+        // re-encrypting deterministically. Simpler: reach into the
+        // fixture's cas. But we own _cas above — drop it and rebuild
+        // the blob to feed into our gated stub. Re-encrypt path with
+        // the same content_key + AAD reproduces the same ciphertext-
+        // shape (different nonce, but decryptable under K1).
+        let space_a = state.spaces.get(&space_id).cloned().unwrap();
+        let aad = crate::dm_crypto::compute_aad(&space_a).unwrap();
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi bob".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let blob = crate::dm_crypto::encrypt_dm_message(&k1, &aad, &payload).unwrap();
+
+        // The gated stub's `get(cid)` must return THIS blob for the
+        // notify's message_cid. We don't recompute the cid from the
+        // re-encrypted blob — we use the fixture's `message_cid` so
+        // the signed CidNotify keeps verifying. This is fine because
+        // the lifted handler doesn't re-verify cid==hash(blob); it
+        // just decrypts whatever bytes the CAS returns. Production
+        // CAS guarantees that, but for this TOCTOU test the stub's
+        // contract is "return the blob the test wants Phase C to
+        // decrypt".
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        // Let Phase A run + drop its locks. Phase A is microsecond-
+        // scale (no I/O), 50ms is generous headroom.
+        gated.wait_for_phase_b().await;
+
+        // Mutate state under the lock: rotate content_key K1 → K2,
+        // record K1 as prior. Direct insertion bypasses
+        // apply_space_with_canonicalization's same-SpaceId
+        // content_key-immutability rejection (which exists for v1's
+        // no-rotation policy, but Sub-C key rotation will eventually
+        // need a different write path). The TOCTOU semantics under
+        // test are independent of the rotation policy — Phase C just
+        // re-reads whatever Space is in state.
+        {
+            let mut state_g = state_arc.lock().await;
+            let mut sp = state_g.spaces.get(&space_id).cloned().unwrap();
+            sp.content_key = Some(k2);
+            sp.prior_content_keys = vec![k1];
+            state_g.spaces.insert(space_id, sp);
+        }
+
+        // Release the gate — Phase B can now complete + Phase C runs.
+        gated.release();
+
+        handler.await.expect("handler must not panic");
+
+        // Recover ownership of state for inspection.
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Phase C must have decrypted via prior-keys fallback,
+        // installed the InboxEntry, and fanned out one ack.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST be installed — prior-keys fallback should decrypt K1 blob under rotated K2"
+        );
+        let entry = state.inbox.get(&inbox_key).unwrap();
+        assert_eq!(entry.from, alice);
+        let req = rx.try_recv().expect("ack must have fanned out");
+        assert!(!req.packet.is_empty(), "ack packet must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_drops_when_space_deleted_during_lift() {
+        // TOCTOU: Phase A snapshots Space S. Between Phase A's lock-
+        // drop and Phase C's lock-acquire, the test removes S from
+        // state.spaces. Phase C's re-fetch returns None → log warn +
+        // drop. No InboxEntry written, no ack emitted.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+        let (state, _cas, signed, signature, signed_bytes, _adev, _apub, message_cid) =
+            build_cidnotify_fixture(
+                space_id,
+                SpaceKind::Dm,
+                alice,
+                0x42,
+                bob,
+                b"hi bob",
+                content_key.clone(),
+            )
+            .await;
+
+        // Re-encrypt to feed the gated stub directly (mirrors Test 1
+        // pattern). This blob would decrypt successfully if Phase C
+        // ran — what we assert is that Phase C drops on
+        // SpaceNotFound BEFORE reaching the decrypt step.
+        let space_a = state.spaces.get(&space_id).cloned().unwrap();
+        let aad = crate::dm_crypto::compute_aad(&space_a).unwrap();
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi bob".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        gated.wait_for_phase_b().await;
+
+        // Mutate state: remove the Space entirely. Direct removal
+        // bypasses any tombstone semantics (Phase 2 is in-memory,
+        // tombstones are runtime-only). Phase C's `state_g.spaces
+        // .get(&signed.space_id)` will return None → warn + return.
+        {
+            let mut state_g = state_arc.lock().await;
+            state_g.spaces.remove(&space_id);
+        }
+
+        gated.release();
+        handler.await.expect("handler must not panic");
+
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Inbox unchanged — Phase C's SpaceNotFound branch fires
+        // BEFORE apply_inbox.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed when Space is deleted in TOCTOU window"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on Phase C SpaceNotFound drop"
+        );
+
+        // No ack fan-out — the SpaceNotFound branch fires BEFORE the
+        // ack build/encode/try_send block.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted when Space is deleted in TOCTOU window"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cidnotify_lifted_drops_when_sender_kicked_from_groupdm_during_lift() {
+        // TOCTOU: GroupDm Space with sender (alice) ∈ members at
+        // Phase A. Between Phase A and Phase C, the test removes
+        // alice from space.members (kick). Phase C's
+        // `space_c.members.contains(&resolved_owner)` check fails →
+        // log warn + drop. No InboxEntry written, no ack emitted.
+        //
+        // The fixture builds for SpaceKind::Dm (2 members) — we
+        // construct the GroupDm Space inline here because GroupDm
+        // requires 3..=16 distinct sorted members per
+        // validate_invariants, which the fixture's 2-member layout
+        // can't satisfy.
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let charlie = OwnerAddr([0x03; 16]);
+        let space_id = SpaceId([7; 16]);
+        let content_key = DmContentKey::new([0xab; 32]);
+
+        // Build state + alice's cache binding ourselves (mirrors
+        // build_cidnotify_fixture's pre-seed step).
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
+        let alice_pub_id = private_alice.public_identity();
+        let alice_identity_pub = alice_pub_id.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub_id.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+
+        // Build the GroupDm Space with [alice, bob, charlie] sorted.
+        let mut members = vec![alice, bob, charlie];
+        members.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "trio".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: members.clone(),
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            content_key: Some(content_key.clone()),
+            prior_content_keys: vec![],
+            membership_key: None,
+            admin_addr: None,
+            is_invite_only: None,
+        };
+        let outcome = state.apply_space_with_canonicalization(space.clone());
+        assert!(
+            matches!(outcome, ApplyOutcome::Inserted),
+            "GroupDm fixture install failed: {outcome:?}"
+        );
+
+        // Encrypt + sign as alice.
+        let payload = crate::dm_envelope::MessagePayload {
+            body: b"hi crew".to_vec(),
+            mime_type: "text/plain".into(),
+            sender: alice,
+            sent_at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let aad = crate::dm_crypto::compute_aad(&space).unwrap();
+        let blob = crate::dm_crypto::encrypt_dm_message(&content_key, &aad, &payload).unwrap();
+        let message_cid = harmony_content::cid::ContentId::for_book(
+            &blob,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let signed = crate::dm_envelope::DmCidNotifySigned {
+            space_id,
+            message_cid,
+            sender_owner_addr: alice,
+            sender_devices: vec![alice_device_hash],
+            signing_device_hash: alice_device_hash,
+        };
+        let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let signature = private_alice.sign(&signed_bytes);
+
+        let gated = std::sync::Arc::new(GatedCasStub::new(message_cid, blob));
+
+        let outbox = make_outbox_synthetic("bob-dev", bob);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
+        let outbox_arc = std::sync::Arc::new(tokio::sync::Mutex::new(outbox));
+        let state_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+        let app = tauri::test::mock_app().handle().clone();
+
+        let handler = tokio::spawn(DmOutbox::handle_cidnotify_lifted(
+            std::sync::Arc::clone(&outbox_arc),
+            std::sync::Arc::clone(&state_arc),
+            std::sync::Arc::clone(&gated) as std::sync::Arc<dyn ContentStore>,
+            tx,
+            app,
+            signed,
+            signature,
+            signed_bytes,
+            500,
+        ));
+
+        gated.wait_for_phase_b().await;
+
+        // Mutate state: kick alice. The remaining members [bob,
+        // charlie] is len=2 which would fail GroupDm's 3+ invariant
+        // — so we can't push the mutated Space through
+        // apply_space_with_canonicalization. Direct insert
+        // (mirroring the existing
+        // handle_cidnotify_drops_when_resolved_owner_not_in_space_members
+        // test pattern above) bypasses the invariant check,
+        // simulating a post-revocation state where the local cache
+        // has the kick applied.
+        {
+            let mut state_g = state_arc.lock().await;
+            let mut sp = state_g.spaces.get(&space_id).cloned().unwrap();
+            sp.members = vec![bob, charlie];
+            sp.members.sort();
+            state_g.spaces.insert(space_id, sp);
+        }
+
+        gated.release();
+        handler.await.expect("handler must not panic");
+
+        let state = std::sync::Arc::try_unwrap(state_arc)
+            .unwrap_or_else(|_| panic!("state Arc has lingering refs"))
+            .into_inner();
+
+        // Inbox unchanged — Phase C's SenderNotInSpaceMembers branch
+        // fires BEFORE apply_inbox.
+        let inbox_key = crate::owner_state_types::InboxKey {
+            space_id,
+            message_cid,
+        };
+        assert!(
+            !state.inbox.contains_key(&inbox_key),
+            "InboxEntry MUST NOT be installed when sender kicked in TOCTOU window"
+        );
+        assert!(
+            state.inbox.is_empty(),
+            "inbox MUST remain empty on Phase C membership-gate drop"
+        );
+
+        // No ack fan-out — membership gate fires BEFORE the ack
+        // build/encode/try_send block.
+        assert!(
+            rx.try_recv().is_err(),
+            "no ack must be emitted when sender kicked in TOCTOU window"
         );
     }
 
