@@ -281,7 +281,7 @@ pub async fn run<R: Runtime>(
     // required because the arm calls `.as_mut()` on the Option.
     mut unicast_send_rx: Option<mpsc::Receiver<crate::dm_outbox::UnicastSendRequest>>,
     // ZEB-227 Path B Task 11: ContentStore handle for the
-    // RuntimeAction::UnicastReceived interception block. handle_cidnotify
+    // RuntimeAction::UnicastReceived interception block. handle_cidnotify_lifted
     // does a 500ms-timeout cas.get on the message_cid before
     // decrypt+inbox-write; without this handle the interception block
     // can't service inbound CidNotify packets. None when no owner identity
@@ -289,7 +289,7 @@ pub async fn run<R: Runtime>(
     cas_handle: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
     // ZEB-227 Path B Task 11: outbound DM unicast SENDER (clone of the
     // tx half of `unicast_send_rx`'s channel). The interception block
-    // hands this to `DmOutbox.handle_unicast` so handle_cidnotify can
+    // hands this to `DmOutbox.handle_unicast` so handle_cidnotify_lifted can
     // push DmAck fan-out requests back through the same channel that
     // RuntimeUnicastTransport uses for outbound CidNotify. Same channel,
     // both directions push; event_loop drains via unicast_send_rx for
