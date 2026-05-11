@@ -203,7 +203,7 @@ pub struct UnicastSendRequest {
 ///
 /// `DmInvite` outbound is Phase 4's `add_space` IPC for DM kinds
 /// (spec Flow 1). `DmAck` outbound is built directly by the receive-side
-/// `handle_cidnotify` (Task 10) — it bypasses `DmTransport::send`
+/// `handle_cidnotify_lifted` (Task 10) — it bypasses `DmTransport::send`
 /// because acks are not tied to an `OutboxEntry` retry loop.
 pub struct RuntimeUnicastTransport {
     tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
@@ -313,14 +313,14 @@ pub struct DrainOutcome {
     pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
     /// Entries that transitioned to Expired this tick.
     pub newly_expired: Vec<OutboxEntryId>,
-    /// Phase 4: ReceivedMessage bundles written by `handle_cidnotify` for
+    /// Phase 4: ReceivedMessage bundles written by `handle_cidnotify_lifted` for
     /// which `apply_inbox` returned `ApplyOutcome::Inserted` (NOT
     /// `Merged`/NoOp). The caller emits `dm-received` IPC events from this
     /// field. Per spec §"Idempotency and drain semantics", the
     /// inserted-vs-already-present discriminant from `apply_inbox` is the
     /// atomic-emit boundary; duplicate notifies hitting the same
     /// `(space_id, message_cid)` key don't re-emit. `drain` (sender-side)
-    /// leaves this empty; only `handle_cidnotify` (receiver-side)
+    /// leaves this empty; only `handle_cidnotify_lifted` (receiver-side)
     /// populates it.
     ///
     /// Each element wraps the InboxEntry alongside the decrypted body,
@@ -377,12 +377,12 @@ pub struct DmOutbox {
     pub(crate) self_owner: OwnerAddr,
     /// Phase 3b: our device-Identity hash, used as the
     /// `signing_device_hash` in outbound DmAck packets fanned out by
-    /// `handle_cidnotify`. Mirrors `RuntimeUnicastTransport`'s field of
+    /// `handle_cidnotify_lifted`. Mirrors `RuntimeUnicastTransport`'s field of
     /// the same name; both are populated from the same identity-management
     /// site in production (Task 11 wires `lib.rs::start_node`).
     pub(crate) our_signing_device_hash: DeviceIdentityHash,
     /// Phase 3b: our device's Ed25519 signing key, used to sign outbound
-    /// DmAck packets in `handle_cidnotify`. Held via `Arc` so the outbox
+    /// DmAck packets in `handle_cidnotify_lifted`. Held via `Arc` so the outbox
     /// can outlive any single owning context — `RuntimeUnicastTransport`
     /// holds it the same way.
     pub(crate) signing_key: Arc<ed25519_dalek::SigningKey>,
@@ -874,9 +874,9 @@ impl DmOutbox {
     pub async fn handle_unicast(
         &mut self,
         state: &mut OwnerState,
-        // ZEB-241: `_cas` + `_unicast_send_tx` were consumed by the old
-        // monolithic `handle_cidnotify` (CAS fetch in step 9 + ack
-        // fan-out in step 13b). Both have moved to
+        // ZEB-241: `_cas` + `_unicast_send_tx` were consumed by the
+        // now-deleted monolithic handle_cidnotify (CAS fetch in step 9
+        // + ack fan-out in step 13b). Both have moved to
         // `handle_cidnotify_lifted`. The signature is preserved so
         // event_loop's caller and integration tests need no changes
         // when invoking the Invite/Ack paths.
@@ -1017,7 +1017,7 @@ impl DmOutbox {
         // pinning the local cache and rejecting every legitimate
         // future update from the same owner as `StaleHlc` — a
         // denial-of-updates attack. Mirror the pattern that
-        // `handle_cidnotify` step 8 already uses (local wall clock
+        // `handle_cidnotify_lifted` Phase A already uses (local wall clock
         // + our device_id).
         let learned_at = Hlc {
             wall_ms: wall_now_ms,
@@ -1112,7 +1112,7 @@ impl DmOutbox {
         // OwnerDeviceCache.
         //
         // apply_owner_device_update lives in Phase A (not Phase C) to
-        // match the original handle_cidnotify's behavior: the device cache
+        // match the now-deleted handle_cidnotify's behavior: the device cache
         // gets refreshed on every successfully-verified inbound CidNotify,
         // even if the subsequent CAS fetch times out or the Space gets
         // deleted in the TOCTOU window. Doing it in Phase C would silently
@@ -1193,7 +1193,7 @@ impl DmOutbox {
                 );
                 return;
             }
-            // Refresh OwnerDeviceCache (Step 8 from original
+            // Refresh OwnerDeviceCache (Step 8 from the now-deleted
             // handle_cidnotify). MUST happen before lock-drop so the
             // refresh persists even if Phase B's CAS fetch times out
             // or Phase C finds the Space deleted in the TOCTOU window.
@@ -1341,7 +1341,7 @@ impl DmOutbox {
                 return;
             }
 
-            // NOTE: OwnerDeviceCache refresh (Step 8 in original
+            // NOTE: OwnerDeviceCache refresh (Step 8 in the now-deleted
             // handle_cidnotify) was moved up to Phase A, so it runs
             // even when the slow path (CAS fetch, decrypt) fails.
 
@@ -1523,8 +1523,8 @@ impl DmOutbox {
         // legitimately ack the message; their ack must not advance
         // delivered_to.
         //
-        // No `space.members` gate parallel to `handle_cidnotify`'s membership
-        // check is needed here. handle_cidnotify gates against the LIVE
+        // No `space.members` gate parallel to `handle_cidnotify_lifted`'s membership
+        // check is needed here. handle_cidnotify_lifted gates against the LIVE
         // space.members snapshot to block ex-members from injecting fresh
         // inbox writes. handle_ack instead gates against the OutboxEntry's
         // OWN `recipient_owners` snapshot, which was frozen at send time.
@@ -1737,7 +1737,7 @@ pub async fn reserve_next_hlc_for_device(
 /// jointly with the parallel `device_identity_pubs` vec — see
 /// `owner_state_types.rs:286-307`).
 // Task 9 (handle_invite) does NOT call this — invites carry the inviter
-// inline so resolution is unnecessary. Task 10 (handle_cidnotify) is the
+// inline so resolution is unnecessary. Task 10 (handle_cidnotify_lifted) is the
 // first consumer; Task 11 (handle_ack) will be the second.
 pub(crate) fn resolve_signed_origin_owner(
     cache: &OwnerDeviceCache,
@@ -1798,9 +1798,9 @@ mod tests {
     /// Test-only helper: build a `DmOutbox` with synthetic signing key +
     /// device hash that don't actually verify against each other. Most
     /// tests in this module are sender-side / state-machine-only paths that
-    /// never invoke handle_cidnotify (which is the only consumer of the new
+    /// never invoke handle_cidnotify_lifted (which is the only consumer of the new
     /// signing fields), so synthetic values suffice. Tests that DO verify
-    /// signature bytes (the handle_invite suite, the handle_cidnotify suite
+    /// signature bytes (the handle_invite suite, the handle_cidnotify_lifted suite
     /// added in Phase 3b Task 10) construct keys + hashes from
     /// `harmony_identity::PrivateIdentity::from_seed` directly.
     fn make_outbox_synthetic(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
@@ -2800,7 +2800,7 @@ mod tests {
         // — a denial-of-updates attack.
         //
         // The fix uses our local `wall_now_ms` + `self.device_id` to
-        // build the LWW HLC (mirroring `handle_cidnotify` step 8). The
+        // build the LWW HLC (mirroring `handle_cidnotify_lifted` Phase A). The
         // assertion: after handle_invite, the cache entry's
         // `learned_at.wall_ms` MUST be `wall_now_ms`, NOT the remote
         // far-future value.
@@ -3086,7 +3086,7 @@ mod tests {
         assert!(!state.spaces.contains_key(&SpaceId([7; 16])));
     }
 
-    // ── Phase 3b Task 10: handle_cidnotify tests ────────────────────────
+    // ── Phase 3b Task 10: handle_cidnotify_lifted tests ────────────────────────
 
     /// Build the standard receive-side fixture: a self-owner Bob (the
     /// `outbox`'s self_owner), a peer Alice with a known signing identity

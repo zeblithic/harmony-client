@@ -24,7 +24,7 @@ use crate::owner_state_types::DeviceIdentityHash;
 /// `harmony_reticulum::destination::DestinationName::from_name` for the
 /// canonical naming scheme. Pinned here as a constant so both the
 /// drain-side `resolve_destinations` helper in `dm_outbox` and the
-/// ack-fan-out path in `handle_cidnotify` (Task 10) compute the same
+/// ack-fan-out path in `handle_cidnotify_lifted` (Task 10) compute the same
 /// destination hash for any given device-identity hash.
 const DM_DESTINATION_FULL_NAME: &[u8] = b"harmony.dm";
 

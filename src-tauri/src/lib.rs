@@ -795,10 +795,10 @@ async fn start_node(
     // ZEB-227 Path B: outbound DM unicast channel. Sized at 256 to absorb
     // realistic group-DM fan-out spikes: a single send_dm to a group can
     // emit up to 16 members × 4 devices = 64 UnicastSendRequests, and
-    // overlapping batches from concurrent send_dm + handle_cidnotify ack
+    // overlapping batches from concurrent send_dm + handle_cidnotify_lifted ack
     // fan-out can stack on top. 256 is "doubled-and-then-some" of that
     // single-send bound — production try_send call sites
-    // (RuntimeUnicastTransport::send + handle_cidnotify ack fan-out)
+    // (RuntimeUnicastTransport::send + handle_cidnotify_lifted ack fan-out)
     // surface Transient on full so back-pressure NEVER causes deadlock
     // even if the cap is exceeded; the larger cap just keeps that
     // recovery path off the hot path. Sender clone is lifted onto
@@ -1931,9 +1931,9 @@ async fn start_node(
         let crdt_state_for_loop = crdt_state_for_state.clone();
         // ZEB-227 Path B Task 11: extra handles for the
         // RuntimeAction::UnicastReceived interception block in event_loop.
-        // cas_handle: handle_cidnotify does a 500ms-timeout cas.get; reuse
+        // cas_handle: handle_cidnotify_lifted does a 500ms-timeout cas.get; reuse
         //   the same RuntimeContentStore the SyncEngine consumes.
-        // unicast_send_tx_for_loop: handle_cidnotify pushes DmAck fan-out
+        // unicast_send_tx_for_loop: handle_cidnotify_lifted pushes DmAck fan-out
         //   into the same channel the production transport uses for
         //   outbound CidNotify. Same channel, both directions push.
         let cas_handle_for_loop = content_store_for_state.clone();
@@ -2825,7 +2825,7 @@ fn filter_sort_paginate_inbox(
 ///      truncated to `limit`.
 ///   4. Each surviving InboxEntry's `message_cid` is fetched from CAS and
 ///      decrypted via `dm_crypto::decrypt_dm_message` with the prior-keys
-///      fallback (matches `handle_cidnotify`'s receive path so post-key-
+///      fallback (matches `handle_cidnotify_lifted`'s receive path so post-key-
 ///      rotation scrollback works).
 ///   5. Any per-entry CAS miss (`Ok(None)`) or fetch error (`Err(_)`) or
 ///      decrypt failure surfaces as a single `Err` with the failing
@@ -2888,7 +2888,7 @@ pub async fn read_dm_thread_inner(
 ///   `received_at.wall_ms < before_hlc`. None = newest first page.
 ///
 /// Decryption uses `dm_crypto::decrypt_dm_message` with the prior-keys
-/// fallback (matches `handle_cidnotify`'s receive path), so scrollback
+/// fallback (matches `handle_cidnotify_lifted`'s receive path), so scrollback
 /// after a content_key rotation still surfaces older messages encrypted
 /// under the previous key.
 ///
