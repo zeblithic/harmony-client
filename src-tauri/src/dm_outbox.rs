@@ -1465,6 +1465,16 @@ impl DmOutbox {
                     return;
                 }
             };
+            // Decrypt with prior-keys fallback. `space_c.content_key`
+            // is non-None for any DM/group-DM Space that passed
+            // `validate_invariants` — the invariant check in
+            // `apply_space_with_canonicalization` (which wrote this
+            // Space into state) rejects DM/group-DM Spaces with
+            // content_key=None. The TOCTOU re-check above re-fetched
+            // `space_c` from the latest state, so any rotation that
+            // landed during Phase B is reflected here; the prior_keys
+            // fallback decrypts blobs that were encrypted with a key
+            // listed in `space_c.prior_content_keys`.
             let payload = match crate::dm_crypto::decrypt_dm_message(
                 space_c
                     .content_key
@@ -1581,7 +1591,7 @@ impl DmOutbox {
                 }) {
                     tracing::warn!(
                         error = ?e,
-                        "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure"
+                        "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure; sender will retransmit CidNotify"
                     );
                 }
             }
