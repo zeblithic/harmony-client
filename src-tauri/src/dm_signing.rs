@@ -18,6 +18,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
@@ -62,7 +63,7 @@ pub fn seal_to_owner(
 
     let shared = ephemeral.diffie_hellman(&recipient_pub);
     let key_bytes = derive_seal_key(shared.as_bytes());
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
     let mut nonce_bytes = [0u8; 12];
     use rand::RngCore;
@@ -101,7 +102,7 @@ pub fn open_from_owner(
     let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
     let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
     let key_bytes = derive_seal_key(shared.as_bytes());
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
     cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
@@ -110,12 +111,14 @@ pub fn open_from_owner(
 
 /// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
 /// shared secret. Empty salt, domain-separated info string.
-fn derive_seal_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+/// Returns `Zeroizing<[u8; 32]>` so the HKDF-derived material is
+/// zeroized on drop, matching the protection level of EpochKey itself.
+fn derive_seal_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     use hkdf::Hkdf;
 
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut okm = [0u8; 32];
-    hk.expand(b"harmony-zeb-249-epoch-key-seal", &mut okm)
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(b"harmony-zeb-249-epoch-key-seal", okm.as_mut())
         .expect("HKDF expand to 32 bytes always succeeds");
     okm
 }

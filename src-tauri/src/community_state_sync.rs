@@ -329,6 +329,9 @@ pub enum EpochError {
     #[error("key for epoch {0} not available locally")]
     KeyNotAvailable(u64),
 
+    #[error("AEAD encryption failed at epoch {0}")]
+    EncryptionFailed(u64),
+
     #[error("AEAD tag mismatch on event at epoch {0}")]
     DecryptionFailed(u64),
 
@@ -369,7 +372,7 @@ pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnv
 
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-        .map_err(|_| EpochError::DecryptionFailed(epoch))?;
+        .map_err(|_| EpochError::EncryptionFailed(epoch))?;
 
     Ok(EncryptedEnvelope {
         epoch,
