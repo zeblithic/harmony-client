@@ -54,7 +54,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
 use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, SpaceId,
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, Space, SpaceId,
 };
 
 /// Errors specific to community-state encryption + decryption.
@@ -279,6 +279,133 @@ impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
             at: w.at.clone(),
         }
     }
+}
+
+/// Per-event encrypted envelope. Replaces the bare ChaCha20-Poly1305
+/// output of v1's membership-topic encryption with an epoch-tagged
+/// container that lets receivers select the right historical key.
+///
+/// Wire format: 3-key or 4-key CBOR map. All keys are 2 chars to
+/// satisfy the same-length-keys invariant at this nesting level.
+///
+/// `ratchet_generation` is reserved for a future forward-secrecy
+/// extension (ZEB-249 spec §9.2). v2 readers MUST tolerate `rg`
+/// present-but-null; v2 writers MUST always set `rg = None`.
+///
+/// See ZEB-249 spec §3.4 + §7.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedEnvelope {
+    #[serde(rename = "ep")]
+    pub epoch: u64,
+
+    #[serde(
+        rename = "nc",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub nonce: [u8; 12],
+
+    #[serde(
+        rename = "ct",
+        serialize_with = "crate::owner_state_types::serialize_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_from_bstr"
+    )]
+    pub ciphertext: Vec<u8>,
+
+    /// Reserved for ZEB-249 spec §9.2 forward-secrecy extension.
+    /// Always `None` in v2 writers; `None` and `Some(_)` both decode in
+    /// v2 readers (forward-compat).
+    #[serde(rename = "rg", default, skip_serializing_if = "Option::is_none")]
+    pub ratchet_generation: Option<u64>,
+}
+
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for EncryptedEnvelope {}
+impl crate::owner_state_crypto::CanonicalPayload for EncryptedEnvelope {}
+
+/// Failure modes for epoch-aware encryption/decryption.
+/// See ZEB-249 spec §6.2.
+#[derive(Debug, thiserror::Error)]
+pub enum EpochError {
+    #[error("key for epoch {0} not available locally")]
+    KeyNotAvailable(u64),
+
+    #[error("AEAD tag mismatch on event at epoch {0}")]
+    DecryptionFailed(u64),
+
+    #[error("rotation references stale prior_epoch {provided}, current is {current}")]
+    StaleRotation { provided: u64, current: u64 },
+
+    #[error("malformed rotation: target {target:?} included in recipient_ciphertexts")]
+    MalformedRotation {
+        target: crate::owner_state_types::OwnerAddr,
+    },
+
+    #[error("rotation issuer {issuer:?} lacks authority (not admin and not target)")]
+    InvalidIssuer {
+        issuer: crate::owner_state_types::OwnerAddr,
+    },
+}
+
+/// Encrypt `plaintext` under the community's current epoch key,
+/// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
+/// epoch for receiver-side key selection.
+///
+/// `space` MUST be a Community Space with `current_epoch` and
+/// `current_epoch_key` both `Some`. Panics if invariant violated
+/// (caller bug — validate_invariants would have rejected such a
+/// Space before it reached this helper).
+pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnvelope, EpochError> {
+    let epoch = space
+        .current_epoch
+        .expect("community must have current_epoch");
+    let key = space
+        .current_epoch_key
+        .as_ref()
+        .expect("community must have current_epoch_key");
+    let cipher = ChaCha20Poly1305::new(key.as_chacha_key());
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| EpochError::DecryptionFailed(epoch))?;
+
+    Ok(EncryptedEnvelope {
+        epoch,
+        nonce: nonce_bytes,
+        ciphertext,
+        ratchet_generation: None,
+    })
+}
+
+/// Decrypt an `EncryptedEnvelope` using the appropriate epoch key
+/// from the community Space's current or old epoch keys.
+///
+/// Returns `EpochError::KeyNotAvailable(epoch)` if neither
+/// `current_epoch_key` (when epoch matches `current_epoch`) nor
+/// `old_epoch_keys[epoch]` contains the needed key.
+pub fn decrypt_for_topic(
+    space: &Space,
+    envelope: &EncryptedEnvelope,
+) -> Result<Vec<u8>, EpochError> {
+    let current_epoch = space
+        .current_epoch
+        .ok_or(EpochError::KeyNotAvailable(envelope.epoch))?;
+    let key = if envelope.epoch == current_epoch {
+        space.current_epoch_key.as_ref()
+    } else {
+        space.old_epoch_keys.get(&envelope.epoch)
+    }
+    .ok_or(EpochError::KeyNotAvailable(envelope.epoch))?;
+
+    let cipher = ChaCha20Poly1305::new(key.as_chacha_key());
+    cipher
+        .decrypt(
+            Nonce::from_slice(&envelope.nonce),
+            envelope.ciphertext.as_slice(),
+        )
+        .map_err(|_| EpochError::DecryptionFailed(envelope.epoch))
 }
 
 /// Default debounce window between a `notify_dirty` and the resulting
@@ -3780,5 +3907,126 @@ mod tests {
 
         // Commit guard for X to release rollback obligation cleanly.
         guard.commit();
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    #[test]
+    fn encrypted_envelope_round_trip() {
+        let env = EncryptedEnvelope {
+            epoch: 5,
+            nonce: [0x10; 12],
+            ciphertext: vec![0x20; 32],
+            ratchet_generation: None,
+        };
+        let bytes = canonical_cbor_encode(&env).expect("encode");
+        let decoded: EncryptedEnvelope = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(
+            decoded, env,
+            "EncryptedEnvelope round-trip must preserve all fields"
+        );
+    }
+
+    #[test]
+    fn encrypted_envelope_with_ratchet_generation() {
+        let env = EncryptedEnvelope {
+            epoch: 5,
+            nonce: [0x10; 12],
+            ciphertext: vec![0x20; 32],
+            ratchet_generation: Some(42),
+        };
+        let bytes = canonical_cbor_encode(&env).expect("encode");
+        let decoded: EncryptedEnvelope = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(decoded, env);
+        assert_eq!(decoded.ratchet_generation, Some(42));
+    }
+
+    /// Build a minimal Community-kind Space with the given epoch and key.
+    /// Uses placeholder values for fields not relevant to epoch crypto.
+    fn build_test_community_space(epoch: u64, key: EpochKey) -> Space {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(epoch),
+            current_epoch_key: Some(key),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        }
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_current_epoch() {
+        let key = EpochKey::new([0xab; 32]);
+        let space = build_test_community_space(0, key);
+
+        let plaintext = b"hello world from epoch 0";
+        let envelope = encrypt_for_topic(&space, plaintext).expect("encrypt");
+        assert_eq!(envelope.epoch, 0);
+        let decrypted = decrypt_for_topic(&space, &envelope).expect("decrypt");
+        assert_eq!(decrypted.as_slice(), plaintext.as_ref());
+    }
+
+    #[test]
+    fn decrypt_with_old_epoch_key_succeeds() {
+        let old_key = EpochKey::new([0xcc; 32]);
+        let new_key = EpochKey::new([0xdd; 32]);
+        let mut space = build_test_community_space(1, new_key);
+        space.old_epoch_keys.insert(0, old_key.clone());
+
+        // Encrypt with old_key at epoch=0; decrypt under new state with old in old_epoch_keys.
+        let nonce = [0x11u8; 12];
+        let plaintext = b"old epoch message";
+        let cipher = ChaCha20Poly1305::new(old_key.as_chacha_key());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .expect("encrypt");
+        let envelope = EncryptedEnvelope {
+            epoch: 0,
+            nonce,
+            ciphertext,
+            ratchet_generation: None,
+        };
+        let decrypted = decrypt_for_topic(&space, &envelope).expect("decrypt old epoch");
+        assert_eq!(decrypted.as_slice(), plaintext.as_ref());
+    }
+
+    #[test]
+    fn decrypt_missing_epoch_returns_key_not_available() {
+        let key = EpochKey::new([0xab; 32]);
+        let space = build_test_community_space(0, key);
+        let envelope = EncryptedEnvelope {
+            epoch: 999,
+            nonce: [0; 12],
+            ciphertext: vec![0; 16],
+            ratchet_generation: None,
+        };
+        let err = decrypt_for_topic(&space, &envelope).expect_err("must fail");
+        assert!(
+            matches!(err, EpochError::KeyNotAvailable(999)),
+            "expected KeyNotAvailable(999), got {err:?}"
+        );
     }
 }

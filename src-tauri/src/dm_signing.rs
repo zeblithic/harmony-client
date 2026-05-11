@@ -13,11 +13,112 @@
 //! computed hash match `DeviceIdentityHash` values stored in
 //! OwnerDeviceCache.devices — an Ed25519-only hash would diverge.
 
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use sha2::{Digest, Sha256};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
+
+/// Errors from epoch-key sealing operations (`seal_to_owner` / `open_from_owner`).
+/// Distinct from `DmReceiveError` because these helpers are used in
+/// EpochRotation/EpochCatchup key-delivery paths (Tasks 3+), not the
+/// DM-packet receive pipeline.
+#[derive(Debug, thiserror::Error)]
+pub enum DmSignError {
+    #[error("AEAD encryption failed")]
+    EncryptionFailed,
+    #[error("AEAD decryption failed (tag mismatch or wrong key)")]
+    DecryptionFailed,
+    #[error("malformed sealed envelope (too short or bad framing)")]
+    MalformedSealedEnvelope,
+}
+
+/// Seal a payload to a recipient's X25519 public key using
+/// X25519-ECDH-derived ChaCha20-Poly1305 (hybrid public-key encryption).
+///
+/// Output layout (92 bytes total for a 32-byte payload):
+///   - 32 bytes: ephemeral X25519 public key (fresh per call)
+///   - 12 bytes: AEAD random nonce
+///   - 32 bytes: ciphertext
+///   - 16 bytes: Poly1305 authentication tag
+///
+/// The shared secret is HKDF-derived from the ECDH output with empty
+/// salt + a domain-separation `info` string. The ephemeral pubkey is
+/// fresh per call — no nonce-reuse risk across multiple seals to the
+/// same recipient.
+///
+/// Used by ZEB-249's EpochRotation/EpochCatchup events to deliver
+/// fresh EpochKeys to specific recipients.
+pub fn seal_to_owner(
+    recipient_x25519_pub: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
+    let recipient_pub = PublicKey::from(*recipient_x25519_pub);
+    let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let ephemeral_pub_bytes = *PublicKey::from(&ephemeral).as_bytes();
+
+    let shared = ephemeral.diffie_hellman(&recipient_pub);
+    let key_bytes = derive_seal_key(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+
+    let mut nonce_bytes = [0u8; 12];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| DmSignError::EncryptionFailed)?;
+
+    let mut out = Vec::with_capacity(32 + 12 + ciphertext.len());
+    out.extend_from_slice(&ephemeral_pub_bytes);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Open a sealed envelope using the recipient's X25519 private key.
+/// Inverse of `seal_to_owner`. Returns `DmSignError::DecryptionFailed`
+/// on AEAD tag mismatch (wrong recipient OR tampered ciphertext).
+pub fn open_from_owner(
+    recipient_x25519_priv: &[u8; 32],
+    sealed: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
+    if sealed.len() < 32 + 12 + 16 {
+        return Err(DmSignError::MalformedSealedEnvelope);
+    }
+    let ephemeral_pub_bytes: [u8; 32] = sealed[0..32]
+        .try_into()
+        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
+    let nonce_bytes: [u8; 12] = sealed[32..44]
+        .try_into()
+        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
+    let ciphertext = &sealed[44..];
+
+    let recipient_secret = StaticSecret::from(*recipient_x25519_priv);
+    let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
+    let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
+    let key_bytes = derive_seal_key(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+
+    cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+        .map_err(|_| DmSignError::DecryptionFailed)
+}
+
+/// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
+/// shared secret. Empty salt, domain-separated info string.
+fn derive_seal_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+    use hkdf::Hkdf;
+
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(b"harmony-zeb-249-epoch-key-seal", &mut okm)
+        .expect("HKDF expand to 32 bytes always succeeds");
+    okm
+}
 
 /// Reticulum app+aspect for DM-protocol packets. The full destination
 /// name is `"harmony.dm"` (app `"harmony"`, single aspect `"dm"`); see
@@ -128,6 +229,63 @@ pub fn verify_dm_packet_signature(
         .verify(body_bytes, &sig)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod epoch_seal_tests {
+    use super::*;
+
+    /// Build a test X25519 keypair from an Ed25519 seed for use in seal
+    /// round-trip tests. Returns (x25519_private_bytes, x25519_public_bytes).
+    fn make_x25519_keypair(seed_byte: u8) -> ([u8; 32], [u8; 32]) {
+        // Derive an Ed25519 signing key from seed, then convert the scalar
+        // to an X25519 static secret. x25519-dalek StaticSecret accepts
+        // the raw 32 bytes directly.
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let seed = [seed_byte; 32];
+        let hk = Hkdf::<Sha256>::new(None, &seed);
+        let mut scalar = [0u8; 32];
+        hk.expand(b"harmony-zeb-249-test-x25519-scalar", &mut scalar)
+            .expect("HKDF 32 bytes always works");
+
+        let secret = StaticSecret::from(scalar);
+        let public = PublicKey::from(&secret);
+        (scalar, *public.as_bytes())
+    }
+
+    #[test]
+    fn seal_and_open_round_trip() {
+        let (priv_bytes, pub_bytes) = make_x25519_keypair(0x01);
+        let plaintext = [0xde_u8; 32];
+        let sealed = seal_to_owner(&pub_bytes, &plaintext).expect("seal must succeed");
+        // Expected layout: 32 ephemeral_pub + 12 nonce + (32 + 16 tag) = 92 bytes.
+        assert_eq!(
+            sealed.len(),
+            92,
+            "sealed length must be 92 for 32-byte plaintext"
+        );
+        let recovered = open_from_owner(&priv_bytes, &sealed).expect("open must succeed");
+        assert_eq!(
+            recovered, plaintext,
+            "recovered plaintext must match original"
+        );
+    }
+
+    #[test]
+    fn open_with_wrong_key_fails() {
+        let (_priv1, pub1) = make_x25519_keypair(0x01);
+        let (priv2, _pub2) = make_x25519_keypair(0x02);
+        let plaintext = b"wrong key test payload";
+        let sealed = seal_to_owner(&pub1, plaintext).expect("seal must succeed");
+        let err = open_from_owner(&priv2, &sealed).expect_err("opening with wrong key must fail");
+        assert!(
+            matches!(err, DmSignError::DecryptionFailed),
+            "expected DecryptionFailed, got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]

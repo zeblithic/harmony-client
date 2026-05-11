@@ -5,7 +5,9 @@
 //! fixtures — locking the encoded bytes prevents silent wire-form drift
 //! across phases.
 
-use harmony_app::community_state_sync::{CommunityRootPublishPayload, CommunityRootSignedPayload};
+use harmony_app::community_state_sync::{
+    CommunityRootPublishPayload, CommunityRootSignedPayload, EncryptedEnvelope,
+};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 use harmony_content::cid::ContentId;
@@ -73,4 +75,50 @@ fn community_root_publish_payload_wire_bytes_pinned() {
     );
     let decoded: CommunityRootPublishPayload = canonical_cbor_decode(&bytes).expect("decode");
     assert_eq!(decoded, p, "decoded payload must round-trip identically");
+}
+
+#[test]
+fn encrypted_envelope_wire_bytes_pinned_v2_null_ratchet() {
+    let env = EncryptedEnvelope {
+        epoch: 5,
+        nonce: [0x10; 12],
+        ciphertext: vec![0x20; 32],
+        ratchet_generation: None,
+    };
+    let bytes = canonical_cbor_encode(&env).expect("encode");
+    let expected_hex = "a362657005626e634c10101010101010101010101062637458202020202020202020202020202020202020202020202020202020202020202020";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for pinning: {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER with the bytes above");
+    });
+    assert_eq!(
+        bytes,
+        expected,
+        "drifted: {} vs {}",
+        hex::encode(&bytes),
+        hex::encode(&expected)
+    );
+}
+
+#[test]
+fn encrypted_envelope_wire_bytes_pinned_v3_with_ratchet() {
+    let env = EncryptedEnvelope {
+        epoch: 5,
+        nonce: [0x10; 12],
+        ciphertext: vec![0x20; 32],
+        ratchet_generation: Some(42),
+    };
+    let bytes = canonical_cbor_encode(&env).expect("encode");
+    let expected_hex = "a462657005626e634c10101010101010101010101062637458202020202020202020202020202020202020202020202020202020202020202020627267182a";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for pinning: {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER with the bytes above");
+    });
+    assert_eq!(
+        bytes,
+        expected,
+        "drifted: {} vs {}",
+        hex::encode(&bytes),
+        hex::encode(&expected)
+    );
 }
