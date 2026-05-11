@@ -1137,6 +1137,144 @@ impl CommunitySyncEngine {
         Ok(outcome)
     }
 
+    /// Atomic pair insert: inserts `first` then `second` under a single
+    /// `state` lock hold, then emits both deltas and fires `notify_dirty`
+    /// once.
+    ///
+    /// ZEB-249 Task 6 §4.1 atomicity: the kick+rotation pair (and the
+    /// leave+rotation pair) must land together. Sequential
+    /// `insert_local_event` calls have a crash window between the two
+    /// writes — if a crash occurs after the Kick but before the Rotation
+    /// is inserted, the CRDT has a Kick with no matching Rotation and
+    /// `pending_rotation_for` remains set until the self-healing observer
+    /// runs. This method collapses that window to zero at the cost of a
+    /// slightly longer lock hold (both `CommunityState::insert_event`
+    /// calls run under the same mutex guard, then the lock is released
+    /// before the async delta-emit + oneshot-notify calls).
+    ///
+    /// Returns `(first_outcome, second_outcome)`. If `first` is `Rejected`
+    /// or `AlreadyKnown`, `second` is NOT inserted and its outcome is
+    /// `AlreadyKnown` (the pair is treated as a unit: the primary event
+    /// must land for the rotation to make sense). The caller should treat
+    /// a rejected first event as the definitive error; the second outcome
+    /// can be ignored.
+    pub async fn insert_local_event_pair(
+        &self,
+        first: crate::community_membership::SignedMembershipEvent,
+        second: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<
+        (
+            crate::community_state_crdt::InsertOutcome,
+            crate::community_state_crdt::InsertOutcome,
+        ),
+        LocalInsertError,
+    > {
+        use crate::community_state_crdt::InsertOutcome;
+
+        // Route check for both events.
+        if first.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: first.community_id,
+            });
+        }
+        if second.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: second.community_id,
+            });
+        }
+
+        let resolver = self
+            .identity_resolver
+            .as_ref()
+            .ok_or(LocalInsertError::MissingIdentityResolver)?;
+
+        // Resolve actor pubs for both events. Both resolves happen
+        // BEFORE the lock — the lock hold is kept as short as possible.
+        let first_actor_pub = resolver
+            .resolve(&first.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(first.actor))?;
+        let first_countersigner_pub = if let Some(cs) = first.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        let second_actor_pub = resolver
+            .resolve(&second.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(second.actor))?;
+        let second_countersigner_pub = if let Some(cs) = second.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        let first_ctx = crate::community_membership::VerifyContext {
+            expected_community_id: self.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &first_actor_pub,
+            countersigner_identity_pub: first_countersigner_pub.as_ref(),
+        };
+        let second_ctx = crate::community_membership::VerifyContext {
+            expected_community_id: self.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &second_actor_pub,
+            countersigner_identity_pub: second_countersigner_pub.as_ref(),
+        };
+
+        // Hold the lock across BOTH inserts — this is the atomicity guarantee.
+        let (first_outcome, second_outcome) = {
+            let mut state_g = self.state.lock().await;
+            let o1 = state_g.insert_event(first.clone(), &first_ctx);
+            // Only insert second if first landed.
+            let o2 = if matches!(o1, InsertOutcome::Inserted | InsertOutcome::AlreadyKnown) {
+                state_g.insert_event(second.clone(), &second_ctx)
+            } else {
+                InsertOutcome::AlreadyKnown // sentinel: pair rejected at first
+            };
+            (o1, o2)
+        };
+
+        // Post-lock: emit deltas + oneshot notifications.
+        if matches!(first_outcome, InsertOutcome::Inserted) {
+            if let Some(pending) = self.pending_redemptions.as_ref() {
+                notify_pending_redemption_in_map(pending, &first.id).await;
+            }
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: first.community_id,
+                    event: first,
+                });
+            }
+        }
+        if matches!(second_outcome, InsertOutcome::Inserted) {
+            if let Some(pending) = self.pending_redemptions.as_ref() {
+                notify_pending_redemption_in_map(pending, &second.id).await;
+            }
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: second.community_id,
+                    event: second,
+                });
+            }
+        }
+        // A single dirty notification suffices for both inserts.
+        if matches!(
+            first_outcome,
+            InsertOutcome::Inserted | InsertOutcome::AlreadyKnown
+        ) || matches!(second_outcome, InsertOutcome::Inserted)
+        {
+            self.notify_dirty();
+        }
+
+        Ok((first_outcome, second_outcome))
+    }
+
     /// Hint that local CRDT state has mutated and a debounced publish
     /// should fire after `debounce_ms`. Non-blocking.
     pub fn notify_dirty(&self) {

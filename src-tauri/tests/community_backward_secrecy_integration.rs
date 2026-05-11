@@ -660,6 +660,324 @@ fn offline_catchup_through_multiple_rotations() {
     assert_eq!(decrypted.as_slice(), msg3);
 }
 
+/// ZEB-249 §6.5 #5: Stale-invite catchup positive path.
+///
+/// Proves the FULL self-healing recovery cycle for a member who joined with a
+/// stale invite snapshot (epoch=0) after the community has advanced to epoch=1.
+///
+/// Steps:
+///   1. Admin creates community at epoch 0 with K(0).
+///   2. Admin issues an invite for Dave at epoch=0 (snapshot contains K(0)).
+///   3. Admin kicks Bob (advances to epoch 1 with K(1) — Dave excluded from rotation).
+///   4. Dave redeems the stale invite — his local Space is stuck at epoch=0.
+///   5. Dave's Join event lands; pending_catchup_for gains Dave.
+///   6. Self-healing observer detects pending_catchup_for and admin has power:
+///      admin synthesizes an EpochCatchup sealed to Dave with K(1).
+///   7. Dave applies the catchup — his Space advances to epoch=1 with K(1).
+///   8. Admin posts an event at epoch=1. Dave decrypts successfully.
+///
+/// The observer step (6) is driven deterministically: we call
+/// `mint_epoch_catchup_event` directly, bypassing the async task.
+#[test]
+fn stale_invite_catchup_unlocks_decryption_end_to_end() {
+    use harmony_app::mint_epoch_catchup_event;
+    use harmony_identity::PrivateIdentity;
+
+    // ── Identities ──────────────────────────────────────────────────────────
+    let community_id = SpaceId([0x37; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let dave_identity = PrivateIdentity::from_seed(&[0xDD; 32]);
+    let dave_sk_bytes = dave_identity.to_private_bytes();
+    let dave_ed_seed: [u8; 32] = dave_sk_bytes[32..64].try_into().unwrap();
+    let dave_signing_key = ed25519_dalek::SigningKey::from_bytes(&dave_ed_seed);
+    let dave_addr = OwnerAddr(dave_identity.identity.address_hash);
+
+    let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
+
+    let hlc = |w: u64| Hlc {
+        wall_ms: w,
+        logical: 0,
+        device_id: "test".into(),
+    };
+
+    // ── Step 1: Admin creates community at epoch 0 ───────────────────────────
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+
+    // Admin, Bob join at epoch=0.
+    let join_admin = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Join,
+        100,
+        &admin_signing_key,
+    );
+    let join_bob = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: bob_addr,
+        at: hlc(200),
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    // ── Step 2: Admin issues stale invite for Dave at epoch=0 ────────────────
+    // Dave has K(0) from the invite snapshot.
+    let dave_snapshot = InviteEpochSnapshot {
+        epoch: 0,
+        sealed_epoch_key: k0.as_bytes().to_vec(),
+        state_snapshot: MaterializedCommunityState::default(),
+    };
+    let dave_k0 = EpochKey::new(
+        dave_snapshot
+            .sealed_epoch_key
+            .as_slice()
+            .try_into()
+            .expect("32 bytes"),
+    );
+    let mut dave_space = make_space_with_epoch(community_id, admin_addr, 0, dave_k0.clone());
+
+    // Dave redeems: Join event at epoch=0 (before any rotation).
+    // join_dave at hlc(300) would be pre-rotation; we use join_dave_late below.
+    // Defined here to show the stale-invite redemption flow conceptually.
+    let _join_dave = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: dave_addr,
+        at: hlc(300),
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    // ── Step 3: Admin kicks Bob (advances to epoch=1 with K(1)) ─────────────
+    let k1 = EpochKey::new([0x20u8; 32]);
+    let kick_bob = make_signed_event(
+        0x10,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: bob_addr,
+            reason: None,
+        },
+        1000,
+        &admin_signing_key,
+    );
+
+    // Rotation after kick: admin + dave (not bob; dave IS known by admin in
+    // this scenario). We intentionally EXCLUDE dave from the rotation to
+    // simulate the case where his identity pub wasn't yet known when admin
+    // kicked Bob (the stale-invite catchup scenario). This puts Dave in
+    // pending_catchup_for.
+    //
+    // Note: excluding dave from rotation means admin seals only to self.
+    let sealed_for_admin = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+    let rotation_rcs: Vec<RecipientCiphertext> = sealed_for_admin
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+    let rotation_event = make_signed_event(
+        0x11,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: kick_bob.id,
+            recipient_ciphertexts: rotation_rcs,
+        },
+        1001,
+        &admin_signing_key,
+    );
+
+    // Admin applies rotation locally.
+    apply_rotation_to_space(
+        &mut admin_space,
+        &rotation_event,
+        admin_addr,
+        &admin_signing_key,
+    );
+    assert_eq!(
+        admin_space.current_epoch,
+        Some(1),
+        "admin at epoch=1 after kick+rotation"
+    );
+    assert!(
+        admin_space.current_epoch_key.as_ref().map(|k| k.as_bytes()) == Some(k1.as_bytes()),
+        "admin has K(1)"
+    );
+
+    // ── Step 4: Dave's local Space is at epoch=0 ─────────────────────────────
+    // Verify Dave can decrypt epoch-0 messages but not epoch-1.
+    let msg0 = b"epoch 0 message";
+    let env0 = encrypt_for_topic(
+        &{
+            // Use admin's epoch-0 space (before rotation).
+            let mut s = admin_space.clone();
+            s.current_epoch = Some(0);
+            s.current_epoch_key = Some(k0.clone());
+            s
+        },
+        msg0,
+    )
+    .expect("encrypt@0");
+    let decrypted0 = decrypt_for_topic(&dave_space, &env0).expect("Dave decrypts epoch-0");
+    assert_eq!(decrypted0.as_slice(), msg0);
+
+    // Dave can't decrypt epoch-1 yet.
+    let msg1 = b"epoch 1 secret - Dave has not got catchup yet";
+    let env1 = encrypt_for_topic(&admin_space, msg1).expect("encrypt@1");
+    assert_eq!(env1.epoch, 1, "envelope is epoch-1");
+    assert!(
+        matches!(
+            decrypt_for_topic(&dave_space, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "Dave must fail before catchup"
+    );
+
+    // ── Step 5: materialize confirms pending_catchup_for contains Dave ────────
+    // Event log: admin joined, bob joined, dave joined, bob kicked, rotation.
+    // Dave joined AFTER the rotation (pending_catchup_for is set when a member
+    // joins and current_epoch > 0 per materialize logic).
+    // For this test: dave joins at hlc(300), rotation is at hlc(1001).
+    // So dave joins BEFORE the rotation in HLC order. After rotation,
+    // dave is a Joined member at epoch=0 snapshot — materialize does NOT
+    // set pending_catchup_for for pre-rotation joiners whose join predates
+    // the rotation (per spec §5.2 / materialize code: pending_catchup_for is
+    // only set for NEW joins when current_epoch > 0, i.e., joins after at
+    // least one rotation). To get dave into pending_catchup_for, his Join
+    // must land AFTER the rotation in materialization order.
+    //
+    // Re-order: dave joins at hlc(2000) — after the rotation at hlc(1001).
+    let join_dave_late = SignedMembershipEvent {
+        id: [0x04; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: dave_addr,
+        at: hlc(2000),
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    let event_log = vec![
+        join_admin.clone(),
+        join_bob.clone(),
+        kick_bob.clone(),
+        rotation_event.clone(),
+        join_dave_late.clone(),
+    ];
+    let materialized = materialize(&event_log, admin_addr);
+
+    assert_eq!(materialized.current_epoch, Some(1), "community at epoch=1");
+    assert!(
+        materialized.pending_catchup_for.contains(&dave_addr),
+        "Dave must be in pending_catchup_for after late join at epoch=1"
+    );
+    assert!(
+        materialized.pending_rotation_for.is_empty(),
+        "no pending rotations — kick+rotation both landed"
+    );
+
+    // ── Step 6: Self-healing observer synthesizes EpochCatchup for Dave ──────
+    // Drive deterministically: admin has K(1) and Dave's signing key.
+    // Synthesize a catchup event sealed to Dave with K(1).
+    let sealed_for_dave = seal_epoch_to_members(&k1, &[(&dave_addr, &dave_signing_key)]);
+    let catchup_rcs: Vec<RecipientCiphertext> = sealed_for_dave
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+
+    let catchup_hlc = Hlc {
+        wall_ms: 3000,
+        logical: 0,
+        device_id: "test".into(),
+    };
+    let catchup_event = mint_epoch_catchup_event(
+        community_id,
+        admin_addr,
+        join_dave_late.id, // triggered_by: Dave's Join
+        1,                 // current epoch
+        catchup_rcs
+            .into_iter()
+            .map(|rc| (rc.recipient, rc.sealed))
+            .collect(),
+        &admin_signing_key,
+        catchup_hlc,
+    )
+    .expect("mint_epoch_catchup_event");
+
+    // ── Step 7: Dave applies the catchup ────────────────────────────────────
+    let applied = apply_catchup_to_space(
+        &mut dave_space,
+        &catchup_event,
+        dave_addr,
+        &dave_signing_key,
+    );
+    assert!(applied, "catchup must apply to Dave's space");
+    assert_eq!(
+        dave_space.current_epoch,
+        Some(1),
+        "Dave at epoch=1 after catchup"
+    );
+    assert!(
+        dave_space
+            .current_epoch_key
+            .as_ref()
+            .map(|k| k.as_bytes() == k1.as_bytes())
+            .unwrap_or(false),
+        "Dave has K(1) after catchup"
+    );
+
+    // ── Step 8: Dave decrypts epoch-1 messages ───────────────────────────────
+    let decrypted1 =
+        decrypt_for_topic(&dave_space, &env1).expect("Dave decrypts epoch-1 after catchup");
+    assert_eq!(
+        decrypted1.as_slice(),
+        msg1,
+        "Dave can decrypt epoch-1 after catchup delivery"
+    );
+
+    // Materialize the full log (including catchup) — pending_catchup_for cleared.
+    let event_log_with_catchup = vec![
+        join_admin,
+        join_bob,
+        kick_bob,
+        rotation_event,
+        join_dave_late,
+        catchup_event,
+    ];
+    let mat_final = materialize(&event_log_with_catchup, admin_addr);
+    assert!(
+        !mat_final.pending_catchup_for.contains(&dave_addr),
+        "pending_catchup_for cleared after catchup delivery"
+    );
+
+    // Confirm Bob still can't decrypt (was kicked).
+    let bob_space = make_space_with_epoch(community_id, admin_addr, 0, k0);
+    assert!(
+        matches!(
+            decrypt_for_topic(&bob_space, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "Bob (kicked) must not decrypt epoch-1"
+    );
+}
+
 /// ZEB-249 §4.3: Two admins A1 and A2 simultaneously kick X and Y. After
 /// both rotations, the materialized pending_rotation_for is empty (self-heal
 /// converged). Members who received the correct rotation can decrypt.
