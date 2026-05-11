@@ -991,7 +991,6 @@ mod subscriber_tests {
 
         let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
-        // Give the subscriber branch a moment to process.
         let accepted = wait_until(
             || async {
                 let t = tracker.lock().await;
@@ -1271,9 +1270,13 @@ mod subscriber_tests {
         let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         // Poll on the positive signal (tracker recorded the publish).
-        // The negative-assertion (spaces stays empty) is checked
-        // affirmatively below — if the merge incorrectly happened,
-        // it would have happened before the tracker insert returned.
+        // Engine flow: tracker.insert → blob fetch → (Ok(None) on
+        // missing blob) → ErrPostMutation, NO merge. The
+        // affirmative `spaces.is_empty()` check below is now
+        // load-bearing: it catches a buggy world where merge
+        // happened anyway. Microsecond-scale operations on the empty
+        // stub make in-progress racing implausible by the time we
+        // re-acquire the local_state lock.
         let recorded = wait_until(
             || async {
                 let t = tracker.lock().await;
@@ -1658,7 +1661,6 @@ mod integration_tests {
         }
         dev.a_engine.notify_dirty();
         dev.b_engine.notify_dirty();
-        // Multiple debounce cycles to converge.
         let converged = wait_until(
             || async {
                 let a = dev.a_state.lock().await;
