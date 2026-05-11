@@ -37,6 +37,14 @@ pub enum DmSignError {
     MalformedSealedEnvelope,
     #[error("invalid Ed25519 pubkey (cannot decompress)")]
     InvalidEd25519Pubkey,
+    /// C1/C2: low-order or small-order public key rejected. Either the
+    /// X25519 ephemeral produced an all-zero shared secret (low-order
+    /// point attack on seal/open), or the Ed25519 point is small-order
+    /// (torsion component attack on the Twisted Edwards → Montgomery
+    /// conversion). In both cases the resulting ECDH output is predictable
+    /// and MUST be rejected before it reaches the AEAD layer.
+    #[error("low-order or small-order public key rejected")]
+    InvalidPublicKey,
 }
 
 /// Seal a payload to a recipient's X25519 public key using
@@ -64,6 +72,14 @@ pub fn seal_to_owner(
     let ephemeral_pub_bytes = *PublicKey::from(&ephemeral).as_bytes();
 
     let shared = ephemeral.diffie_hellman(&recipient_pub);
+    // C1: reject low-order recipient pubkeys. A recipient X25519 pubkey
+    // that is a small-order (torsion) point yields an all-zero ECDH
+    // output regardless of our ephemeral scalar, so any two senders
+    // using the same nonce would produce the same ciphertext. Reject
+    // immediately rather than encrypting under a predictable key.
+    if shared.as_bytes() == &[0u8; 32] {
+        return Err(DmSignError::InvalidPublicKey);
+    }
     let key_bytes = derive_seal_key(shared.as_bytes());
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
@@ -103,6 +119,12 @@ pub fn open_from_owner(
     let recipient_secret = StaticSecret::from(*recipient_x25519_priv);
     let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
     let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
+    // C1: reject low-order ephemeral pubkeys. An all-zero shared secret
+    // means the sender used a small-order (torsion) ephemeral point;
+    // any ciphertext produced under such a key is trivially forgeable.
+    if shared.as_bytes() == &[0u8; 32] {
+        return Err(DmSignError::InvalidPublicKey);
+    }
     let key_bytes = derive_seal_key(shared.as_bytes());
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
 
@@ -122,6 +144,14 @@ pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignE
     let edwards = CompressedEdwardsY(*ed25519_pub)
         .decompress()
         .ok_or(DmSignError::InvalidEd25519Pubkey)?;
+    // C2: reject small-order (torsion) Edwards points. If the Ed25519
+    // pubkey is in the low-order subgroup (8 known small-order points
+    // on the Twisted Edwards curve), to_montgomery() maps them to
+    // small-order Montgomery points, which then produce all-zero ECDH
+    // outputs. Reject here before the conversion, not after.
+    if edwards.is_small_order() {
+        return Err(DmSignError::InvalidEd25519Pubkey);
+    }
     Ok(edwards.to_montgomery().to_bytes())
 }
 
@@ -305,6 +335,26 @@ mod ed25519_x25519_conversion_tests {
         let x2 = ed25519_priv_to_x25519(&signing);
         assert_eq!(x1, x2);
     }
+
+    /// C2: ed25519_pub_to_x25519 must reject small-order (torsion) Edwards
+    /// points. The identity point on the Twisted Edwards curve is
+    /// `(0, 1)` which in compressed form is the byte `0x01` followed by
+    /// 31 zero bytes. This is a small-order point (order 1 in the
+    /// cofactor-8 group) and MUST NOT be converted to a Montgomery form
+    /// for use in ECDH.
+    #[test]
+    fn ed25519_pub_to_x25519_rejects_small_order_identity_point() {
+        // Compressed Edwards Y for the identity point: y=1, sign bit clear.
+        // In little-endian: 0x01 || [0x00; 31].
+        let mut identity_point = [0u8; 32];
+        identity_point[0] = 0x01;
+        let err = ed25519_pub_to_x25519(&identity_point)
+            .expect_err("ed25519_pub_to_x25519 must reject the small-order identity point");
+        assert!(
+            matches!(err, DmSignError::InvalidEd25519Pubkey),
+            "expected InvalidEd25519Pubkey for identity point, got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +410,45 @@ mod epoch_seal_tests {
         assert!(
             matches!(err, DmSignError::DecryptionFailed),
             "expected DecryptionFailed, got {err:?}"
+        );
+    }
+
+    /// C1: seal_to_owner must reject a low-order (all-zero) recipient X25519
+    /// pubkey. The all-zero X25519 point is a small-order (torsion) point;
+    /// ECDH with it yields an all-zero shared secret, making the derived AEAD
+    /// key predictable regardless of the ephemeral scalar.
+    #[test]
+    fn seal_to_owner_rejects_low_order_x25519_pubkey() {
+        // The all-zero X25519 pubkey is a well-known small-order point.
+        let low_order_pub = [0u8; 32];
+        let plaintext = b"low-order attack test";
+        let err = seal_to_owner(&low_order_pub, plaintext)
+            .expect_err("seal_to_owner must reject a low-order (all-zero) X25519 pubkey");
+        assert!(
+            matches!(err, DmSignError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err:?}"
+        );
+    }
+
+    /// C1: open_from_owner must reject a sealed blob whose embedded ephemeral
+    /// pubkey is the all-zero (low-order) X25519 point. Craft a blob
+    /// with [0; 32] as the ephemeral pub and fill the rest with zeros;
+    /// the shared secret would be all-zero, which we must reject before
+    /// reaching the AEAD layer.
+    #[test]
+    fn open_from_owner_rejects_low_order_ephemeral_pubkey() {
+        let (priv_bytes, _pub_bytes) = make_x25519_keypair(0x01);
+        // Craft a fake sealed blob: 32-byte all-zero ephemeral pub + 12-byte
+        // nonce + at least 16-byte ciphertext+tag (all zeros).
+        let mut fake_sealed = vec![0u8; 32 + 12 + 16];
+        // ephemeral pub bytes [0..32] are already zero — the low-order point.
+        // nonce [32..44] and ciphertext+tag [44..] are zero too.
+        fake_sealed[0..32].fill(0);
+        let err = open_from_owner(&priv_bytes, &fake_sealed)
+            .expect_err("open_from_owner must reject a low-order ephemeral X25519 pubkey");
+        assert!(
+            matches!(err, DmSignError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err:?}"
         );
     }
 }

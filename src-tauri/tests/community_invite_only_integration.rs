@@ -42,6 +42,7 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
 use harmony_app::event_loop::CommunityAdapterRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry};
@@ -329,11 +330,22 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         sig: token_sig,
     };
 
+    // M3: For invite-only communities, the epoch key must be sealed to the
+    // invitee's (Bob's) X25519 public key — derived from Bob's Ed25519 signing
+    // key via the standard birational map. Alice seals the 32-byte epoch key
+    // so Bob's `mint_redemption` can decrypt it with `open_from_owner`.
+    let bob_x25519_pub = {
+        let verifying_bytes = bob_sk.verifying_key().to_bytes();
+        ed25519_pub_to_x25519(&verifying_bytes).expect("bob ed25519→x25519 conversion")
+    };
+    let sealed_epoch_key = seal_to_owner(&bob_x25519_pub, alice_minted.membership_key.as_bytes())
+        .expect("seal epoch key to bob");
+
     let invite_url = community_invite::encode_invite_url(&CommunityInvitePayload {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key: alice_minted.membership_key.as_bytes().to_vec(),
+            sealed_epoch_key,
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

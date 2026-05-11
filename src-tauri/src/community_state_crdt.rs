@@ -178,7 +178,16 @@ impl CommunityState {
         // return the bootstrap hint if one was seeded by `seed_bootstrap_hint`.
         // Once a real event is inserted (bumping `version` to 1+), the cache
         // miss path re-materializes from events and the hint is superseded.
-        if cache.version == 0 {
+        //
+        // M5: ALSO guard on events.is_empty(). After deserialization from
+        // disk, version stays 0 (insert_event is never called on load; the
+        // CRDT is rebuilt from the persisted event list). Without the
+        // is_empty() check, the bootstrap hint would shadow real CRDT
+        // data for any deserialized state where version was never advanced
+        // (e.g., a replica that only received remote events, never inserted
+        // a local one). The correct behavior: hint is only the authoritative
+        // view when there are truly NO events yet.
+        if cache.version == 0 && self.events.is_empty() {
             if let Ok(hint_g) = self.bootstrap_hint.lock() {
                 if let Some(hint) = hint_g.clone() {
                     return hint;

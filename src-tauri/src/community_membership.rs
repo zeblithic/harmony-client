@@ -483,6 +483,14 @@ pub enum VerifyError {
     ChannelNameInvalid,
 
     EncodeError(String),
+
+    /// C4: EpochRotation or EpochCatchup was rejected by verify_event's
+    /// lightweight authority + shape pre-check. The issuer lacked admin
+    /// power, was not the target of the triggering Leave, or the event
+    /// had an obviously malformed shape that would unconditionally fail
+    /// in materialize. This is a fast-path rejection that prevents
+    /// unauthorized epoch events from entering the CRDT log.
+    EpochEventUnauthorized,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -566,6 +574,11 @@ impl std::fmt::Display for VerifyError {
                 "channel name is empty or exceeds 32 chars (spec §12.3 limit)"
             ),
             VerifyError::EncodeError(s) => write!(f, "canonical encode failed: {s}"),
+            VerifyError::EpochEventUnauthorized => write!(
+                f,
+                "EpochRotation/EpochCatchup rejected at verify_event: issuer lacks admin power, \
+                 is not the cooperative leaver, or the event shape is obviously malformed"
+            ),
         }
     }
 }
@@ -861,7 +874,7 @@ pub fn materialize(
     let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
     sorted.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
 
-    for event in &sorted {
+    for (idx, event) in sorted.iter().enumerate() {
         match &event.kind {
             MembershipEventKind::Join => {
                 // Per-prior-status transition table:
@@ -896,12 +909,24 @@ pub fn materialize(
                     // may be stale — mark for catchup. Self-healing
                     // observer issues a catchup; redundant catchups
                     // are harmless no-ops.
-                    if prior_status.is_none() && m.current_epoch.unwrap_or(0) > 0 {
+                    // M9: also mark for catchup when an Invited member
+                    // joins (prior_status == Some(Invited)). An invited
+                    // member was never Joined before, so their snapshot
+                    // is just as stale as a brand-new joiner's.
+                    if !matches!(prior_status, Some(MemberStatus::Joined))
+                        && m.current_epoch.unwrap_or(0) > 0
+                    {
                         m.pending_catchup_for.insert(event.actor);
                     }
                 }
             }
             MembershipEventKind::Leave => {
+                // M2: track whether this Leave actually transitioned a member.
+                // Only mark pending_rotation_for if the Leave was non-no-op
+                // (i.e., the actor was a known member). A Leave from a
+                // never-member would otherwise pollute pending_rotation_for
+                // with an entry that can never be cleared by a Kick/Leave lookup.
+                let mut leave_transitioned = false;
                 if let Some(s) = m.members.get_mut(&event.actor) {
                     // Banned is sticky: a Leave from a Banned actor
                     // must NOT transition status back to Left. Without
@@ -913,6 +938,7 @@ pub fn materialize(
                     if s.status != MemberStatus::Banned {
                         s.status = MemberStatus::Left;
                         s.left_at = Some(event.at.clone());
+                        leave_transitioned = true;
                     }
                 }
                 // If actor never joined, Leave is silently no-op.
@@ -922,7 +948,10 @@ pub fn materialize(
                 // from a malformed event.
                 // ZEB-249: Leave needs a rotation. Cooperative leaver may bundle
                 // it; otherwise self-healing observer fills.
-                m.pending_rotation_for.insert(event.actor);
+                // M2: only mark if the Leave actually transitioned someone.
+                if leave_transitioned {
+                    m.pending_rotation_for.insert(event.actor);
+                }
             }
             MembershipEventKind::Invite { target } => {
                 // Per-prior-status transition table:
@@ -1048,9 +1077,12 @@ pub fn materialize(
                     continue;
                 }
 
-                // Find the Kick/Leave event this rotation was generated for.
-                // Linear scan ok — event log is bounded.
-                let triggered_event = sorted.iter().find(|e| &e.id == triggered_by);
+                // M1: trigger lookup must be CAUSAL — only look in events
+                // PRIOR to this rotation in the sorted replay. Scanning the
+                // full log would allow a future event to "authorize" a
+                // rotation that was issued before its trigger, enabling
+                // epoch-advance races.
+                let triggered_event = sorted[..idx].iter().find(|e| &e.id == triggered_by);
                 let kick_target = match triggered_event.map(|e| &e.kind) {
                     Some(MembershipEventKind::Kick { target, .. }) => Some(*target),
                     Some(MembershipEventKind::Leave) => triggered_event.map(|e| e.actor),
@@ -1069,15 +1101,69 @@ pub fn materialize(
                     continue;
                 }
 
+                // M8: completeness check — the rotation must include ALL
+                // currently-Joined-or-Invited members (minus the target).
+                // A malicious rotation that omits some remaining members
+                // would advance the epoch while leaving those members
+                // unable to decrypt future messages.
+                let expected_recipients: std::collections::BTreeSet<OwnerAddr> = m
+                    .members
+                    .iter()
+                    .filter(|(addr, state)| {
+                        **addr != target
+                            && matches!(state.status, MemberStatus::Joined | MemberStatus::Invited)
+                    })
+                    .map(|(addr, _)| *addr)
+                    .collect();
+                let actual_recipients: std::collections::BTreeSet<OwnerAddr> =
+                    recipient_ciphertexts
+                        .iter()
+                        .map(|rc| rc.recipient)
+                        .collect();
+                if !expected_recipients.is_subset(&actual_recipients) {
+                    // Incomplete rotation: some Joined/Invited members are
+                    // missing from recipient_ciphertexts. Drop.
+                    continue;
+                }
+
                 // Validity check (spec §4.4): issuer must have admin power
                 // OR be the target of a Leave (cooperative-leaver path).
+                // C3: the admin check ALSO requires the issuer to be currently
+                // Joined — a kicked former admin retains their power_levels
+                // entry (power_levels is not cleaned up on Kick/Leave) but
+                // must not be able to authorize epoch rotations from outside
+                // the community.
+                //
+                // Exception: the bootstrap admin (admin_addr) may never have
+                // issued an explicit Join event (in test fixtures and early
+                // protocol bootstraps). Their power 100 is baked in from
+                // materialize's bootstrap step and they have no member record
+                // (m.members.get(&issuer) is None). None means "was never
+                // kicked/banned" — distinct from Some(Left)/Some(Banned) which
+                // means "was a member and then left/was kicked". Allow the
+                // admin_addr with None membership as a valid issuer.
                 let issuer = event.actor;
                 let issuer_power = m.power_levels.get(&issuer).copied().unwrap_or(0);
-                let is_admin = issuer_power >= POWER_THRESHOLDS.kick;
+                let issuer_member_status = m.members.get(&issuer).map(|s| s.status);
+                let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
+                // The bootstrap admin has None status (never explicitly joined);
+                // any other None is a non-member with no history — allow only
+                // admin_addr in the None case.
+                let issuer_is_effective_member =
+                    issuer_is_joined || (issuer_member_status.is_none() && issuer == admin_addr);
+                let is_admin = issuer_power >= POWER_THRESHOLDS.kick && issuer_is_effective_member;
+                // Cooperative-leaver path: the leaver themselves may issue the
+                // rotation. After the Leave arm above, the leaver's status is
+                // Left (or Banned if banned — but verify_event rejects Leave
+                // from Banned). Guard: triggered_by must point to a Leave by
+                // the issuer AND the issuer must be in the members map (was
+                // ever a member — prevents Leave-from-never-member from
+                // accessing the cooperative-leaver shortcut).
                 let is_self_leaver = matches!(
                     triggered_event.map(|e| &e.kind),
                     Some(MembershipEventKind::Leave)
-                ) && issuer == target;
+                ) && issuer == target
+                    && m.members.contains_key(&issuer);
                 if !is_admin && !is_self_leaver {
                     continue;
                 }
@@ -1099,8 +1185,9 @@ pub fn materialize(
                     continue;
                 }
 
-                // triggered_by must reference a Join event.
-                let triggered_event = sorted.iter().find(|e| e.id == *triggered_by);
+                // M1: triggered_by lookup restricted to causal prefix (events
+                // before this catchup in the sorted replay).
+                let triggered_event = sorted[..idx].iter().find(|e| e.id == *triggered_by);
                 let join_actor = match triggered_event.map(|e| &e.kind) {
                     Some(MembershipEventKind::Join) => triggered_event.map(|e| e.actor),
                     _ => None,
@@ -1118,9 +1205,20 @@ pub fn materialize(
                 }
 
                 // Issuer must have admin power (spec §4.6 — no cooperative-joiner).
+                // C8: also require issuer to be currently Joined — a former admin
+                // with a stale power_levels entry must not be able to issue
+                // catchups after being kicked or leaving.
+                //
+                // Same bootstrap-admin exception as EpochRotation: admin_addr
+                // may have no member record if they never issued an explicit
+                // Join event (None = never a member, not Left/Banned).
                 let issuer = event.actor;
                 let issuer_power = m.power_levels.get(&issuer).copied().unwrap_or(0);
-                let is_admin = issuer_power >= POWER_THRESHOLDS.kick;
+                let issuer_member_status = m.members.get(&issuer).map(|s| s.status);
+                let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
+                let issuer_is_effective_member =
+                    issuer_is_joined || (issuer_member_status.is_none() && issuer == admin_addr);
+                let is_admin = issuer_power >= POWER_THRESHOLDS.kick && issuer_is_effective_member;
                 if !is_admin {
                     continue;
                 }
@@ -1580,20 +1678,58 @@ pub fn verify_event(
             // both delete attempts return Ok.
         }
         MembershipEventKind::EpochRotation { .. } => {
-            // EpochRotation: power verification is deferred to the
-            // materialize() arm which has both old and new state in scope.
-            // verify_event's role here is limited to signature + wire
-            // format checks. Full protocol invariants (staleness, recipient-
-            // exclusion, admin-or-self-leaver) are enforced in materialize
-            // via the drop-on-invalid path (spec §4.2-4.4).
+            // C4: EpochRotation lightweight authority pre-check.
+            // The issuer must either be:
+            //   (a) an admin (power >= kick_threshold AND currently Joined, OR is
+            //       the bootstrap admin who has power but may have no member record), OR
+            //   (b) any member recorded in prior_state.members (potential
+            //       cooperative-leaver; exact Leave-target check is in materialize
+            //       which has the full causal log).
+            // This fast-path check prevents completely unauthorized addresses
+            // (never-members, zero power) from inserting rotation events into
+            // the CRDT log. Full causal-log resolution + staleness/recipient-
+            // exclusion checks stay in materialize (spec §4.2-4.4).
+            //
+            // Bootstrap-admin exception: ctx.admin_addr may have no member
+            // record if they never issued an explicit Join event. Their power
+            // 100 is from materialize's implicit bootstrap step. None membership
+            // means "was never kicked/banned"; allow if power >= threshold.
+            let issuer_power = actor_power; // already computed above
+            let issuer_member_status = prior_state.members.get(&event.actor).map(|s| s.status);
+            let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
+            let issuer_is_bootstrap_admin =
+                issuer_member_status.is_none() && event.actor == ctx.admin_addr;
+            let issuer_is_admin = issuer_power >= POWER_THRESHOLDS.kick
+                && (issuer_is_joined || issuer_is_bootstrap_admin);
+            let issuer_is_member = prior_state.members.contains_key(&event.actor);
+            if !issuer_is_admin && !issuer_is_member {
+                return Err(VerifyError::EpochEventUnauthorized);
+            }
         }
-        MembershipEventKind::EpochCatchup { .. } => {
-            // EpochCatchup: power verification is deferred to the
-            // materialize() arm which has both old and new state in scope.
-            // verify_event's role here is limited to signature + wire
-            // format checks. Full protocol invariants (epoch match,
-            // triggered_by Join check, admin-only) are enforced in
-            // materialize via the drop-on-invalid path (spec §4.6).
+        MembershipEventKind::EpochCatchup { epoch, .. } => {
+            // C4: EpochCatchup lightweight authority pre-check.
+            // The issuer must have admin power AND be currently Joined
+            // in prior_state (or be the bootstrap admin with no member
+            // record). Additionally, the epoch claimed must match
+            // prior_state's current epoch — a stale-epoch catchup would
+            // always be a no-op in materialize, but blocking it at verify
+            // time prevents CRDT log pollution from obviously invalid events.
+            // Full triggered_by resolution + target-in-recipients check
+            // stay in materialize (spec §4.6).
+            let issuer_power = actor_power; // already computed above
+            let issuer_member_status = prior_state.members.get(&event.actor).map(|s| s.status);
+            let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
+            let issuer_is_bootstrap_admin =
+                issuer_member_status.is_none() && event.actor == ctx.admin_addr;
+            let issuer_is_effective_admin = issuer_power >= POWER_THRESHOLDS.kick
+                && (issuer_is_joined || issuer_is_bootstrap_admin);
+            if !issuer_is_effective_admin {
+                return Err(VerifyError::EpochEventUnauthorized);
+            }
+            let current_epoch = prior_state.current_epoch.unwrap_or(0);
+            if *epoch != current_epoch {
+                return Err(VerifyError::EpochEventUnauthorized);
+            }
         }
     }
 
@@ -1974,7 +2110,18 @@ mod tests {
         let bob_join = make_join_event(0x01, bob, 50);
         let carol_join = make_join_event(0x02, carol, 51);
         let kick1 = make_kick_event(0x01, admin, bob, 100);
-        let rot1 = make_rotation_event(0x01, admin, kick1.id, 0, vec![(admin, vec![1; 92])], 101);
+        // M8: rot1 must include ALL remaining Joined/Invited members (carol + admin).
+        // admin has no member record (bootstrap admin) but materialize only checks
+        // m.members for completeness, so admin is NOT in expected_recipients
+        // (admin never inserted a Join). carol IS in m.members (carol_join at t=51).
+        let rot1 = make_rotation_event(
+            0x01,
+            admin,
+            kick1.id,
+            0,
+            vec![(admin, vec![1; 92]), (carol, vec![1; 92])],
+            101,
+        );
         // Second kick for carol; try a STALE rotation with prior_epoch=0
         // (current would be 1 after rot1).
         let kick2 = make_kick_event(0x02, admin, carol, 200);
@@ -2119,5 +2266,392 @@ mod tests {
         assert_eq!(m.current_epoch, Some(1)); // only rot_a advanced
         assert!(m.pending_rotation_for.contains(&bob));
         assert!(!m.pending_rotation_for.contains(&alice));
+    }
+
+    // ── C4: verify_event rejects unauthorized epoch events ────────────────────
+
+    /// Build a test identity from a seed byte. Returns (PrivateIdentity, identity_pub, OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    /// Helper: sign a membership event payload using a PrivateIdentity.
+    fn sign_with_identity(
+        payload: EventPayload,
+        private: &harmony_identity::PrivateIdentity,
+    ) -> SignedMembershipEvent {
+        sign_event_with_identity(&payload, private).expect("sign_event_with_identity must succeed")
+    }
+
+    /// C4: verify_event must reject an EpochRotation issued by a never-member
+    /// (zero power, not in members map) even if the signature is valid.
+    #[test]
+    fn verify_event_rejects_unauthorized_epoch_rotation_from_never_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (attacker_priv, attacker_pub, attacker_addr) = make_identity(0xee);
+
+        // Build a prior state where admin is joined (epoch 0, no members other than admin).
+        // We use materialize with an admin-join event so power_levels has admin at 100.
+        let admin_join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let admin_join = sign_with_identity(admin_join_payload, &admin_priv);
+        let prior = materialize(std::slice::from_ref(&admin_join), admin_addr);
+
+        // Attacker (never a member, zero power) tries to issue an EpochRotation.
+        // We need a plausible triggered_by; use admin_join.id as placeholder.
+        let rotation_payload = EventPayload {
+            id: [0xfe; 16],
+            community_id,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: admin_join.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: attacker_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let rotation_event = sign_with_identity(rotation_payload, &attacker_priv);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &attacker_pub,
+            countersigner_identity_pub: None,
+        };
+        let result = verify_event(&rotation_event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::EpochEventUnauthorized)),
+            "EpochRotation from never-member must be rejected with EpochEventUnauthorized; got {result:?}"
+        );
+    }
+
+    /// C4: verify_event must reject an EpochCatchup from a non-admin (power < 50).
+    #[test]
+    fn verify_event_rejects_unauthorized_epoch_catchup_non_admin() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (bob_priv, bob_pub, bob_addr) = make_identity(0xb1);
+
+        // Admin + bob join.
+        let admin_join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let admin_join = sign_with_identity(admin_join_payload, &admin_priv);
+        let bob_join_payload = EventPayload {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: bob_addr,
+            at: Hlc {
+                wall_ms: 2,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let bob_join = sign_with_identity(bob_join_payload, &bob_priv);
+
+        let prior = materialize(&[admin_join.clone(), bob_join.clone()], admin_addr);
+        // prior: admin has power 100 (bootstrap), bob has power 0 (default).
+        // current_epoch is None (0); epoch=0 in the catchup is OK.
+
+        // bob (power=0) tries to issue a catchup for themselves at epoch 0.
+        let catchup_payload = EventPayload {
+            id: [0xfd; 16],
+            community_id,
+            kind: MembershipEventKind::EpochCatchup {
+                epoch: 0,
+                triggered_by: bob_join.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: bob_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: bob_addr,
+            at: Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let catchup_event = sign_with_identity(catchup_payload, &bob_priv);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &bob_pub,
+            countersigner_identity_pub: None,
+        };
+        let result = verify_event(&catchup_event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::EpochEventUnauthorized)),
+            "EpochCatchup from non-admin must be rejected with EpochEventUnauthorized; got {result:?}"
+        );
+    }
+
+    // ── C3: EpochRotation rejects kicked former admin with stale power_levels ──
+
+    /// C3: A kicked former admin still has power_levels[addr] = 100 (power_levels
+    /// is not cleaned up on Kick/Leave). They must NOT be able to authorize a
+    /// subsequent EpochRotation because they are no longer Joined.
+    #[test]
+    fn epoch_rotation_rejects_non_joined_issuer_with_stale_power() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let carol = OwnerAddr([0xc1; 16]);
+
+        // Give bob admin power so he can kick.
+        let setpwr_bob = SignedMembershipEvent {
+            id: [0x01; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: bob,
+                level: 100,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        // Carol joins (to be kicked).
+        let carol_join = make_join_event(0x02, carol, 20);
+        // Bob joins (so he has status Joined at the time of setpwr).
+        let bob_join = make_join_event(0x03, bob, 5);
+
+        // Admin kicks bob (bob is now Banned; retains power_levels[bob]=100).
+        let kick_bob = make_kick_event(0x04, admin, bob, 100);
+
+        // Now kick carol triggering a rotation.
+        let kick_carol = make_kick_event(0x05, admin, carol, 200);
+
+        // bob (now Banned, not Joined) tries to issue the rotation for carol's kick.
+        // Power check alone would pass (bob has power 100), but Joined check must fail.
+        let rot_by_bob =
+            make_rotation_event(0x06, bob, kick_carol.id, 0, vec![(admin, vec![1; 92])], 201);
+
+        let m = materialize(
+            &[
+                bob_join, setpwr_bob, carol_join, kick_bob, kick_carol, rot_by_bob,
+            ],
+            admin,
+        );
+        // The rotation by bob must be dropped (bob is Banned, not Joined).
+        assert_eq!(
+            m.current_epoch.unwrap_or(0),
+            0,
+            "rotation by non-Joined former admin must be dropped"
+        );
+        assert!(
+            m.pending_rotation_for.contains(&carol),
+            "carol's rotation is still pending"
+        );
+    }
+
+    // ── C8: EpochCatchup rejects former admin with stale power_levels ─────────
+
+    /// C8: A former admin (kicked or Left) still has power_levels entry >= kick_threshold.
+    /// EpochCatchup must check the issuer is currently Joined, not just powered.
+    #[test]
+    fn epoch_catchup_rejects_former_admin_with_stale_power() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]); // will be kicked (former admin)
+        let dave = OwnerAddr([0xd1; 16]); // new member needing catchup
+
+        // Give bob admin power.
+        let setpwr_bob = SignedMembershipEvent {
+            id: [0x01; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: bob,
+                level: 100,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let bob_join = make_join_event(0x02, bob, 10);
+        // Kick carol (not bob) so we have a rotation to establish epoch=1.
+        let carol = OwnerAddr([0xc1; 16]);
+        let carol_join = make_join_event(0x03, carol, 15);
+        let kick_carol = make_kick_event(0x04, admin, carol, 100);
+        // Rotation for carol's kick: both admin and bob in recipients.
+        let rot = make_rotation_event(
+            0x01,
+            admin,
+            kick_carol.id,
+            0,
+            vec![(admin, vec![1; 92]), (bob, vec![1; 92])],
+            101,
+        );
+        // Now kick bob (he's Banned, retains power_levels[bob]=100).
+        let kick_bob = make_kick_event(0x05, admin, bob, 200);
+        // Rotation for bob's kick.
+        let rot2 =
+            make_rotation_event(0x02, admin, kick_bob.id, 1, vec![(admin, vec![2; 92])], 201);
+        // Dave joins at epoch 2.
+        let join_dave = make_stale_join_event(0x01, dave, 300);
+
+        // bob (Banned, not Joined) tries to issue a catchup for dave.
+        let catchup_by_bob =
+            make_catchup_event(0x01, bob, join_dave.id, 2, vec![(dave, vec![3; 92])], 400);
+
+        let m = materialize(
+            &[
+                bob_join,
+                setpwr_bob,
+                carol_join,
+                kick_carol,
+                rot,
+                kick_bob,
+                rot2,
+                join_dave,
+                catchup_by_bob,
+            ],
+            admin,
+        );
+        // catchup by former admin (now Banned) must be dropped.
+        assert!(
+            m.pending_catchup_for.contains(&dave),
+            "catchup by non-Joined former admin must be dropped"
+        );
+    }
+
+    // ── M2: no-op leave must not pollute pending_rotation_for ────────────────
+
+    /// M2: A Leave from an actor who was never a member is a no-op and must NOT
+    /// add them to pending_rotation_for.
+    #[test]
+    fn noop_leave_does_not_add_to_pending_rotation_for() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let never_member = OwnerAddr([0xbb; 16]);
+        let leave = make_leave_event(0x01, never_member, 100);
+        let m = materialize(&[leave], admin);
+        assert!(
+            !m.pending_rotation_for.contains(&never_member),
+            "Leave from never-member must NOT add to pending_rotation_for"
+        );
+        assert!(
+            m.members.is_empty(),
+            "never-member must not appear in members"
+        );
+    }
+
+    // ── M8: rotation must include ALL remaining Joined/Invited members ────────
+
+    /// M8: An EpochRotation that omits a currently-Joined member (other than
+    /// the kick target) must be dropped.
+    #[test]
+    fn epoch_rotation_rejects_incomplete_recipient_list() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]); // kick target
+        let carol = OwnerAddr([0xc1; 16]); // joined member NOT in recipients
+
+        let bob_join = make_join_event(0x01, bob, 10);
+        let carol_join = make_join_event(0x02, carol, 20);
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        // Incomplete rotation: omits carol from recipient_ciphertexts.
+        let incomplete_rot = make_rotation_event(
+            0x01,
+            admin,
+            kick.id,
+            0,
+            vec![(admin, vec![1; 92])], // carol missing!
+            101,
+        );
+        let m = materialize(&[bob_join, carol_join, kick, incomplete_rot], admin);
+        assert_eq!(
+            m.current_epoch.unwrap_or(0),
+            0,
+            "incomplete rotation must be dropped"
+        );
+        assert!(
+            m.pending_rotation_for.contains(&bob),
+            "bob's rotation still pending"
+        );
+    }
+
+    // ── M9: Invite → Join marks pending_catchup_for ───────────────────────────
+
+    /// M9: An invited member who joins after an epoch rotation has occurred
+    /// must be marked for catchup (just like a brand-new joiner). The prior
+    /// check `prior_status.is_none()` missed the Invited→Joined case.
+    #[test]
+    fn invited_then_join_marks_pending_catchup_for() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]); // kick target (to advance epoch)
+        let carol = OwnerAddr([0xc1; 16]); // was invited, then joins after rotation
+
+        // Bob join + kick + rotation to advance epoch to 1.
+        let bob_join = make_join_event(0x01, bob, 10);
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+
+        // Carol is invited AFTER the rotation (wall_ms=150 > 101). This ensures
+        // the rotation at epoch 0→1 doesn't need to include carol (she's not yet
+        // a member at rotation time). Then carol joins at wall_ms=200 with prior
+        // status Invited — this is the M9 scenario: Invited→Joined after epoch bump.
+        let invite_carol = SignedMembershipEvent {
+            id: [0x10; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Invite { target: carol },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 150,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+
+        // Carol joins AFTER the rotation (epoch is now 1, carol was Invited).
+        let join_carol = make_join_event(0x02, carol, 200);
+
+        let m = materialize(&[bob_join, kick, rot, invite_carol, join_carol], admin);
+        assert_eq!(m.current_epoch, Some(1), "epoch should be 1 after rotation");
+        assert!(
+            m.pending_catchup_for.contains(&carol),
+            "Invited→Joined after epoch rotation must mark carol for catchup (M9 regression)"
+        );
     }
 }

@@ -1659,11 +1659,18 @@ async fn start_node(
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
                                 // mutate across invocations (FnMut + async closures
                                 // require shared state, not `move`-only).
+                                //
+                                // M7: rotation dedup key is (SpaceId, OwnerAddr, EventId)
+                                // where EventId is the triggering Kick/Leave event's id.
+                                // A pure (SpaceId, OwnerAddr) key would suppress the
+                                // second rotation after a rejoin + re-kick sequence,
+                                // leaving the re-kicked member in the community's epoch.
                                 let synthesized_rotations: std::sync::Arc<
                                     std::sync::Mutex<
                                         std::collections::BTreeSet<(
                                             crate::owner_state_types::SpaceId,
                                             crate::owner_state_types::OwnerAddr,
+                                            crate::community_membership::EventId,
                                         )>,
                                     >,
                                 > = std::sync::Arc::new(std::sync::Mutex::new(
@@ -8362,23 +8369,41 @@ pub fn mint_redemption(
     use crate::owner_state_types::{EpochKey, Space, SpaceKind};
     use rand::RngCore;
 
-    // ZEB-249: extract the epoch key from the snapshot.
-    // Open-community invites store the raw 32-byte key in sealed_epoch_key.
-    // Invite-only invites (Phase 4+) will store a 92-byte X25519-sealed
-    // envelope; callers needing to decrypt must pass the decrypted bytes
-    // via a different path (redeem_invite_inner handles that case directly).
-    let epoch_key_bytes: [u8; 32] = payload
-        .epoch_snapshot
-        .sealed_epoch_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
+    // ZEB-249 / M3: extract the epoch key from the snapshot.
+    // - Open communities: sealed_epoch_key is the raw 32-byte EpochKey
+    //   (publicly shareable — anyone with the link gets it).
+    // - Invite-only communities: sealed_epoch_key is a 92-byte X25519-sealed
+    //   envelope (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag) encrypted
+    //   to the invitee's X25519 pubkey. Derive the invitee's X25519 private
+    //   scalar from signing_key (RFC 7748 §5 via ed25519_priv_to_x25519)
+    //   and decrypt here.
+    let epoch_key_bytes: [u8; 32] = if payload.is_invite_only {
+        // Invite-only path: decrypt the 92-byte sealed blob.
+        use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner};
+        let x25519_priv = ed25519_priv_to_x25519(signing_key);
+        let plaintext = open_from_owner(&x25519_priv, &payload.epoch_snapshot.sealed_epoch_key)
+            .map_err(|e| format!("invite-only epoch key decryption failed: {e}"))?;
+        plaintext.as_slice().try_into().map_err(|_| {
             format!(
-                "epoch_snapshot.sealed_epoch_key must be 32 bytes for open communities \
-                 (got {}); invite-only decryption is handled in redeem_invite_inner",
-                payload.epoch_snapshot.sealed_epoch_key.len()
+                "decrypted invite-only epoch key must be 32 bytes (got {})",
+                plaintext.len()
             )
-        })?;
+        })?
+    } else {
+        // Open-community path: raw 32-byte key.
+        payload
+            .epoch_snapshot
+            .sealed_epoch_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "epoch_snapshot.sealed_epoch_key must be 32 bytes for open communities \
+                     (got {})",
+                    payload.epoch_snapshot.sealed_epoch_key.len()
+                )
+            })?
+    };
     let membership_key = EpochKey::new(epoch_key_bytes);
     let epoch = payload.epoch_snapshot.epoch;
 
@@ -10729,6 +10754,7 @@ pub async fn self_heal_community_observer(
             std::collections::BTreeSet<(
                 crate::owner_state_types::SpaceId,
                 crate::owner_state_types::OwnerAddr,
+                crate::community_membership::EventId,
             )>,
         >,
     >,
@@ -10775,17 +10801,10 @@ pub async fn self_heal_community_observer(
     let pending_rotations: Vec<crate::owner_state_types::OwnerAddr> =
         materialized.pending_rotation_for.iter().copied().collect();
     for target in pending_rotations {
-        let key = (community_id, target);
-        {
-            let set = synth_rotations
-                .lock()
-                .expect("synth_rotations mutex poisoned");
-            if set.contains(&key) {
-                continue; // already synthesized this session
-            }
-        }
-
-        // Find the originating Kick or Leave event for this target.
+        // Find the originating Kick or Leave event for this target FIRST —
+        // the M7 dedup key includes the trigger EventId so a rejoin + re-kick
+        // sequence produces a fresh key (and fires a new rotation), whereas
+        // a pure (community_id, target) key would suppress the second rotation.
         let events: Vec<crate::community_membership::SignedMembershipEvent> = {
             let state_g = engine_arc.state();
             let state_g = state_g.lock().await;
@@ -10811,6 +10830,18 @@ pub async fn self_heal_community_observer(
             );
             continue;
         };
+
+        // M7: dedup key includes trigger event ID — rejoin + re-kick produces a
+        // distinct key and fires a fresh rotation rather than being suppressed.
+        let key = (community_id, target, triggered_by);
+        {
+            let set = synth_rotations
+                .lock()
+                .expect("synth_rotations mutex poisoned");
+            if set.contains(&key) {
+                continue; // already synthesized this rotation in this session
+            }
+        }
 
         // Collect remaining active members (excluding the target).
         let mut member_pubs: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])> = Vec::new();

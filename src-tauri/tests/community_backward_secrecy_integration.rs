@@ -921,8 +921,15 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     // engine's spawn-time K(0). This is the core assertion of this test.
     let hlc_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
         Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
-    let synth_rotations: Arc<Mutex<BTreeSet<(SpaceId, OwnerAddr)>>> =
-        Arc::new(Mutex::new(BTreeSet::new()));
+    let synth_rotations: Arc<
+        Mutex<
+            BTreeSet<(
+                SpaceId,
+                OwnerAddr,
+                harmony_app::community_membership::EventId,
+            )>,
+        >,
+    > = Arc::new(Mutex::new(BTreeSet::new()));
     let synth_catchups: Arc<
         Mutex<
             BTreeSet<(

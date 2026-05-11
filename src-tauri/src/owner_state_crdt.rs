@@ -178,6 +178,26 @@ impl OwnerState {
                         incoming.id
                     )));
                 }
+                // M13: guard current_epoch and old_epoch_keys for the same
+                // reason as current_epoch_key. A malicious or stale Space row
+                // with a different current_epoch / old_epoch_keys set would
+                // diverge the key history, leaving some replicas unable to
+                // decrypt historical messages. These are creation-pinned in v1;
+                // rotation via EpochRotation event is ZEB-249.
+                if existing.current_epoch != incoming.current_epoch {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes current_epoch for {:?} \
+                         (creation-pinned in v1; epoch advance via EpochRotation event is ZEB-249)",
+                        incoming.id
+                    )));
+                }
+                if existing.old_epoch_keys != incoming.old_epoch_keys {
+                    return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
+                        "same-SpaceId community update changes old_epoch_keys for {:?} \
+                         (creation-pinned in v1; key history is managed via EpochRotation events)",
+                        incoming.id
+                    )));
+                }
                 if existing.admin_addr != incoming.admin_addr {
                     return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
                         "same-SpaceId community update changes admin_addr for {:?} \

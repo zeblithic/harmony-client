@@ -347,6 +347,13 @@ pub enum EpochError {
     InvalidIssuer {
         issuer: crate::owner_state_types::OwnerAddr,
     },
+
+    /// C6: `encrypt_for_topic` was called on a Space that is missing
+    /// `current_epoch` or `current_epoch_key`. This can happen with
+    /// partially-migrated Spaces deserialized before ZEB-249 epoch fields
+    /// were populated. Replaces the previous `expect(...)` panic.
+    #[error("community Space is missing current_epoch or current_epoch_key")]
+    MissingEpochState,
 }
 
 /// Encrypt `plaintext` under the community's current epoch key,
@@ -354,17 +361,17 @@ pub enum EpochError {
 /// epoch for receiver-side key selection.
 ///
 /// `space` MUST be a Community Space with `current_epoch` and
-/// `current_epoch_key` both `Some`. Panics if invariant violated
-/// (caller bug — validate_invariants would have rejected such a
-/// Space before it reached this helper).
+/// `current_epoch_key` both `Some`. Returns
+/// `EpochError::MissingEpochState` if either field is absent — a
+/// partially-migrated Space (e.g., deserialized before ZEB-249 fields
+/// were added) can reach this helper and must not panic.
 pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnvelope, EpochError> {
-    let epoch = space
-        .current_epoch
-        .expect("community must have current_epoch");
+    // C6: return Err instead of panicking on missing epoch state.
+    let epoch = space.current_epoch.ok_or(EpochError::MissingEpochState)?;
     let key = space
         .current_epoch_key
         .as_ref()
-        .expect("community must have current_epoch_key");
+        .ok_or(EpochError::MissingEpochState)?;
     let cipher = ChaCha20Poly1305::new(key.as_chacha_key());
 
     let mut nonce_bytes = [0u8; 12];
@@ -568,6 +575,14 @@ pub enum LocalInsertError {
         "event community_id {got:?} doesn't match engine's configured community_id {expected:?}"
     )]
     WrongCommunity { expected: SpaceId, got: SpaceId },
+    /// C5: `insert_local_event_pair` pre-validation rejected the first event
+    /// before any state mutation. Neither event was inserted.
+    #[error("pair rejected at first event pre-validation: {0}")]
+    FirstPreValidationFailed(String),
+    /// C5: `insert_local_event_pair` pre-validation rejected the second event
+    /// (first passed). Neither event was inserted — atomicity preserved.
+    #[error("pair rejected at second event pre-validation: {0}")]
+    SecondPreValidationFailed(String),
 }
 
 /// Per-publisher-device latest-accepted HLC, namespaced by publisher
@@ -1232,15 +1247,54 @@ impl CommunitySyncEngine {
             countersigner_identity_pub: second_countersigner_pub.as_ref(),
         };
 
-        // Hold the lock across BOTH inserts — this is the atomicity guarantee.
+        // C5: pre-validate BOTH events before any state mutation.
+        // Acquires the lock once to run both verifications, then re-acquires
+        // (under the same held guard) to insert. This collapses into a single
+        // lock hold — the Mutex is held across verify + insert for both.
         let (first_outcome, second_outcome) = {
             let mut state_g = self.state.lock().await;
+
+            // Pre-validate first: compute prior state from current log.
+            let first_log: Vec<crate::community_membership::SignedMembershipEvent> =
+                state_g.events.values().cloned().collect();
+            let first_prior = crate::community_membership::prior_state_at_event(
+                &first_log,
+                &first,
+                self.admin_addr,
+            );
+            if let Err(e) =
+                crate::community_membership::verify_event(&first, &first_prior, &first_ctx)
+            {
+                // Pre-validation failed — no mutation occurred. Return early.
+                // We return Err so the caller knows NEITHER event landed
+                // (atomicity preserved: first was not inserted).
+                return Err(LocalInsertError::FirstPreValidationFailed(e.to_string()));
+            }
+
+            // Pre-validate second: simulate first already landed by building
+            // a temporary log that includes first.
+            let mut second_log = first_log;
+            second_log.push(first.clone());
+            let second_prior = crate::community_membership::prior_state_at_event(
+                &second_log,
+                &second,
+                self.admin_addr,
+            );
+            if let Err(e) =
+                crate::community_membership::verify_event(&second, &second_prior, &second_ctx)
+            {
+                // Second pre-validation failed — first was NOT inserted.
+                // Atomicity: caller gets a clear error; CRDT is unchanged.
+                return Err(LocalInsertError::SecondPreValidationFailed(e.to_string()));
+            }
+
+            // Both pass: now insert both under the same lock hold.
             let o1 = state_g.insert_event(first.clone(), &first_ctx);
-            // Only insert second if first landed.
+            // Only insert second if first landed (AlreadyKnown = idempotent retry OK).
             let o2 = if matches!(o1, InsertOutcome::Inserted | InsertOutcome::AlreadyKnown) {
                 state_g.insert_event(second.clone(), &second_ctx)
             } else {
-                InsertOutcome::AlreadyKnown // sentinel: pair rejected at first
+                InsertOutcome::AlreadyKnown // sentinel: pair rejected at first (should not happen after pre-validation)
             };
             (o1, o2)
         };
@@ -4182,6 +4236,81 @@ mod envelope_tests {
         assert!(
             matches!(err, EpochError::KeyNotAvailable(999)),
             "expected KeyNotAvailable(999), got {err:?}"
+        );
+    }
+
+    /// C6: encrypt_for_topic must return Err(MissingEpochState) when
+    /// current_epoch is None (partially-migrated Space). Previously panicked.
+    #[test]
+    fn encrypt_for_topic_returns_error_on_missing_epoch() {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let space = Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,     // missing!
+            current_epoch_key: None, // missing!
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = encrypt_for_topic(&space, b"test payload")
+            .expect_err("encrypt_for_topic must return Err on missing epoch state, not panic");
+        assert!(
+            matches!(err, EpochError::MissingEpochState),
+            "expected MissingEpochState, got {err:?}"
+        );
+    }
+
+    /// C6 (variant): current_epoch is Some but current_epoch_key is None.
+    #[test]
+    fn encrypt_for_topic_returns_error_on_missing_epoch_key() {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let space = Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),  // set
+            current_epoch_key: None, // missing!
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = encrypt_for_topic(&space, b"test payload")
+            .expect_err("encrypt_for_topic must return Err on missing epoch key, not panic");
+        assert!(
+            matches!(err, EpochError::MissingEpochState),
+            "expected MissingEpochState, got {err:?}"
         );
     }
 }
