@@ -577,6 +577,32 @@ Mitigations not adopted: rotating on every Join (would double rotation frequency
 
 Each rotation adds one entry to `old_epoch_keys` (~32 bytes). At 1 kick/month, growth is ~400 bytes/year per community. Communities with very high churn (100 kicks/month) would see ~40 KB/year. After 10 years, still ~400 KB worst case. Bounded and acceptable. No pruning policy needed for v2.
 
+### 10.6 Remote-rotation key extraction not wired
+
+The current implementation updates `Space.current_epoch_key` only when
+the LOCAL node's kick/leave handler issues a rotation. When a REMOTE
+admin's rotation arrives via CRDT sync, the local node's
+`Space.current_epoch_key` is NOT advanced — it remains at the
+pre-rotation key.
+
+Practical impact:
+- Local users CAN'T decrypt new messages encrypted under the new
+  epoch key — they're stuck at the old key.
+- Self-healing observer's catchup synthesis uses an out-of-date key.
+
+This is a v2 follow-up: implement an "epoch-key extraction on remote
+rotation" path in the engine's CRDT-apply layer that:
+1. Identifies the local user's `recipient_ciphertexts[my_addr]` entry.
+2. Decrypts it via `dm_signing::open_from_owner` + the local
+   identity privkey.
+3. Updates `crdt_state.spaces[community_id].current_epoch_key`
+   (and pushes the old key to `old_epoch_keys`).
+
+The integration tests cover the LOCAL-issued-rotation happy paths
+exhaustively, but cross-node rotation receipt is not yet wired
+end-to-end. This was discovered during ZEB-249 Task 6 code review
+and is filed as a follow-up.
+
 ## 11. Acceptance criteria
 
 1. New communities created post-merge use `EpochKey` rotation. v1's `MembershipKey` field is fully removed from `Space`; no parallel codepath.

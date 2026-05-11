@@ -1152,12 +1152,17 @@ impl CommunitySyncEngine {
     /// calls run under the same mutex guard, then the lock is released
     /// before the async delta-emit + oneshot-notify calls).
     ///
-    /// Returns `(first_outcome, second_outcome)`. If `first` is `Rejected`
-    /// or `AlreadyKnown`, `second` is NOT inserted and its outcome is
-    /// `AlreadyKnown` (the pair is treated as a unit: the primary event
-    /// must land for the rotation to make sense). The caller should treat
-    /// a rejected first event as the definitive error; the second outcome
-    /// can be ignored.
+    /// Returns `(first_outcome, second_outcome)`.
+    ///
+    /// - If `first` returns `Rejected`, `second` is NOT inserted (the pair is
+    ///   rejected together — caller should treat this as an atomic failure).
+    /// - If `first` returns `Inserted` OR `AlreadyKnown`, `second` IS inserted
+    ///   (idempotent retry: a re-issued kick or rotation finds the original
+    ///   event in CRDT and proceeds with the paired event regardless).
+    ///
+    /// When `first` is `AlreadyKnown`, the sentinel `AlreadyKnown` is
+    /// NOT returned for `second` — the second insert still runs so that
+    /// partially-applied pairs from a previous crash are completed.
     pub async fn insert_local_event_pair(
         &self,
         first: crate::community_membership::SignedMembershipEvent,

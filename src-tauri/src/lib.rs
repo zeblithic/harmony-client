@@ -9702,6 +9702,9 @@ async fn leave_community(
     match leave_rotation_bundle {
         Ok(rotation) => {
             // §4.1 happy path: submit leave + rotation atomically.
+            // _rot_outcome is intentionally ignored: if the rotation is
+            // rejected the self-healing observer will synthesize it (admin
+            // self-heal path). Leave alone is the definitive membership event.
             let (leave_outcome, _rot_outcome) = engine_arc
                 .insert_local_event_pair(leave.clone(), rotation)
                 .await
@@ -9958,10 +9961,10 @@ pub fn mint_epoch_catchup_event(
 /// (bytes 32..64 of the 64-byte combined pub) to X25519 and seals the
 /// fresh `EpochKey` bytes to that X25519 pubkey via `seal_to_owner`.
 ///
-/// Returns `Err` if any member's identity_pub cannot be converted to X25519.
-/// Members for whom lookup returned `None` (unknown identity) are silently
-/// skipped — they will appear in `pending_catchup_for` and the self-healing
-/// observer will retry once their identity propagates.
+/// Returns `Err` if any member's identity_pub cannot be converted to X25519
+/// or if `seal_to_owner` fails. Callers are responsible for filtering the
+/// member list before calling (e.g., dropping members whose identity pubs are
+/// not yet available).
 fn build_sealed_epoch_recipients(
     k_next: &crate::owner_state_types::EpochKey,
     members: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])>,
@@ -10182,8 +10185,14 @@ async fn kick_from_community(
                     "kick_from_community: rotation rejected by CRDT; \
                      self-healing observer will retry"
                 );
-            } else {
-                // Both landed — advance our local Space epoch state.
+            } else if matches!(
+                rot_outcome,
+                crate::community_state_crdt::InsertOutcome::Inserted
+            ) {
+                // Rotation freshly inserted — advance our local Space epoch state.
+                // Guard is `Inserted` (not `!Rejected`) to prevent double-advance
+                // on the astronomically unlikely AlreadyKnown case (same EventId
+                // collision from a re-issued kick replay).
                 if let Some(crdt_state) = {
                     let g = state_lock
                         .lock()
@@ -10945,6 +10954,12 @@ pub async fn self_heal_community_observer(
         };
 
         let current_epoch = materialized.current_epoch.unwrap_or(0);
+
+        // TODO(zeb-249-followup): cross-node observer correctness. When a
+        // REMOTE admin's rotation lands on this node, current_epoch_key in
+        // crdt_state is NOT updated (only LOCAL kick/leave handlers update it).
+        // Catchups synthesized by remote admins' observers would use stale
+        // keys. See spec §10.6.
 
         // Read the CURRENT epoch key from the local owner-state CRDT.
         // `Space.current_epoch_key` is updated by `kick_from_community` /

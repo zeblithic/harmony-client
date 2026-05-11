@@ -527,6 +527,11 @@ fn three_node_selective_access() {
 /// ZEB-249 §4.6: Member B is offline during three consecutive rotations
 /// (epochs 0→1→2→3). When B comes back online, an EpochCatchup delivers
 /// K(3) and B can decrypt current epoch-3 messages.
+///
+/// Note: this is a protocol-level test that exercises the event-building and
+/// key-derivation logic directly with pre-baked events. It does NOT drive the
+/// self-healing observer — it verifies that a correctly-formed EpochCatchup
+/// delivers the right key, decoupled from the async observer machinery.
 #[test]
 fn offline_catchup_through_multiple_rotations() {
     use harmony_identity::PrivateIdentity;
@@ -1032,8 +1037,9 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
 /// converged). Members who received the correct rotation can decrypt.
 ///
 /// Note: this test verifies the CRDT materialize() tracking logic for
-/// pending_rotation_for, not a live multi-admin race (which requires a full
-/// runtime). The convergence guarantee is tested at the materialize level.
+/// pending_rotation_for by directly calling materialize() with pre-assembled
+/// event sets. It does NOT exercise the live self-healing observer or a full
+/// multi-admin runtime race — convergence is validated at the CRDT layer.
 #[test]
 fn concurrent_kicks_self_heal_end_to_end() {
     use harmony_identity::PrivateIdentity;
