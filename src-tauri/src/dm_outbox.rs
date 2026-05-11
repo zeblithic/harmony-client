@@ -331,6 +331,28 @@ pub struct DrainOutcome {
     pub newly_received: Vec<crate::owner_state_types::ReceivedMessage>,
 }
 
+/// ZEB-233: A single `(entry, recipient)` work unit produced by drain's
+/// Phase A. Carries everything Phase B needs to perform an unlocked
+/// `transport.send().await` — the OutboxEntry clone (so Phase B doesn't
+/// need to re-read `state.outbox`) plus pre-resolved destinations.
+#[derive(Debug, Clone)]
+pub struct DrainWorkUnit {
+    pub entry_id: OutboxEntryId,
+    pub entry_clone: OutboxEntry,
+    pub recipient: OwnerAddr,
+    pub destinations: Vec<[u8; 16]>,
+}
+
+/// ZEB-233: The outcome of one `transport.send().await` call, paired
+/// with the (entry, recipient) it targeted. Phase C consumes these to
+/// update backoff + clear in_flight markers under the re-acquired locks.
+#[derive(Debug)]
+pub struct DrainSendResult {
+    pub entry_id: OutboxEntryId,
+    pub recipient: OwnerAddr,
+    pub result: Result<(), TransportError>,
+}
+
 /// Phase 4 — outcome of `DmOutbox::delete_dm_outbox_entry`.
 ///
 /// The IPC layer reads this to decide which `dm-deleted` IPC event to
@@ -679,19 +701,54 @@ impl DmOutbox {
     /// Epilogue: drop backoff/in_flight entries for any OutboxEntry that's
     /// no longer Pending/Partial — covers Complete via local handle_ack,
     /// Complete via CRDT-merge replication of a peer's ack, and Expired.
+    ///
+    /// This is the legacy lock-held entrypoint: callers acquire `&mut self`
+    /// (i.e. hold the `tokio::sync::Mutex<DmOutbox>` guard) for the full
+    /// duration including the transport sends. Tests use this directly.
+    /// Production code calls `drain_lifted` instead (ZEB-233) which
+    /// releases the outbox + state locks around the transport sends so
+    /// concurrent `send_dm` IPCs don't block on the slowest in-flight send.
     pub async fn drain(
         &mut self,
         state: &mut OwnerState,
         transport: &dyn DmTransport,
         wall_now_ms: u64,
     ) -> DrainOutcome {
-        let mut outcome = DrainOutcome::default();
+        let work = self.drain_phase_a(state, wall_now_ms);
+        let mut results = Vec::with_capacity(work.len());
+        for unit in work {
+            let result = transport
+                .send(&unit.entry_clone, unit.recipient, unit.destinations)
+                .await;
+            results.push(DrainSendResult {
+                entry_id: unit.entry_id,
+                recipient: unit.recipient,
+                result,
+            });
+        }
+        // Test wrapper holds locks throughout, so no TOCTOU-skip
+        // semantics — pass an empty `skipped` Vec to drain_phase_c.
+        // Same `wall_now_ms` for both backoff and expiration clocks
+        // since tests don't simulate Phase B/C latency.
+        self.drain_phase_c(state, results, Vec::new(), wall_now_ms, wall_now_ms)
+    }
 
-        // 1. Collect work units up-front to avoid holding a borrow on `state`
-        //    across the await boundary. Entries already past EXPIRATION_MS are
-        //    skipped here — they get marked Expired in the sweep below without
-        //    a final wasted transport.send attempt.
-        let work: Vec<(OutboxEntryId, OutboxEntry, Vec<OwnerAddr>)> = state
+    /// Phase A of drain: under the outbox + state locks, collect every
+    /// (entry, recipient) pair that needs a transport.send this tick.
+    /// Marks each in `self.in_flight` so a concurrent drain tick can't
+    /// double-send the same pair. Synchronous (no await).
+    ///
+    /// Entries already past `EXPIRATION_MS` are skipped here — they get
+    /// marked `Expired` in Phase C's sweep without a final wasted
+    /// transport.send attempt.
+    ///
+    /// Returns the work units ready for Phase B (unlocked sends). Each
+    /// unit carries a clone of the OutboxEntry so Phase B doesn't need
+    /// to re-read `state.outbox`.
+    fn drain_phase_a(&mut self, state: &OwnerState, wall_now_ms: u64) -> Vec<DrainWorkUnit> {
+        // 1. Collect outstanding (entry, recipient) pairs from Pending/
+        //    Partial entries within EXPIRATION_MS.
+        let outstanding: Vec<(OutboxEntryId, OutboxEntry, Vec<OwnerAddr>)> = state
             .outbox
             .iter()
             .filter(|(_, e)| {
@@ -712,8 +769,10 @@ impl DmOutbox {
             })
             .collect();
 
-        // 2. Per-(entry, recipient) attempt.
-        for (entry_id, entry_clone, outstanding) in work {
+        // 2. Per-(entry, recipient): apply in_flight + is_due filters,
+        //    resolve destinations, mark in_flight, build a work unit.
+        let mut work = Vec::new();
+        for (entry_id, entry_clone, outstanding) in outstanding {
             for recipient in outstanding {
                 if self.in_flight.contains(&(entry_id, recipient)) {
                     continue;
@@ -721,53 +780,135 @@ impl DmOutbox {
                 if !self.is_due(entry_id, recipient, wall_now_ms) {
                     continue;
                 }
-                // Resolve destinations from the in-scope `&OwnerState`
-                // (no mutex acquisition: drain holds the state via the
-                // caller's mutex guard, no recursive lock needed).
-                // Production transport returns `TransportError::Transient`
-                // on empty (Flow A may surface the missing
-                // OwnerDeviceCache entry on the next sync round); test
-                // stubs (StubTransport) ignore `destinations` entirely.
+                // Resolve destinations from `&OwnerState` (no mutex
+                // acquisition — caller holds the state guard). Empty
+                // destinations: production transport returns Transient;
+                // test stubs ignore the field.
                 let destinations = resolve_destinations(&state.owner_device_cache, recipient);
                 self.in_flight.insert((entry_id, recipient));
-                let result = transport.send(&entry_clone, recipient, destinations).await;
-                self.in_flight.remove(&(entry_id, recipient));
-                match result {
-                    Ok(()) => {
-                        // Throttle post-Ok retries until the ack arrives.
-                        // Without this, `is_due` returns true on the very next
-                        // 250ms tick (no backoff entry → first attempt),
-                        // producing tick-rate retry until handle_ack fires —
-                        // ~4 sends/sec/recipient against the production
-                        // StubTransport (which always returns Ok and has an
-                        // unbounded sends Vec). Treat "sent but ack pending"
-                        // as failure_count=1 so the existing exponential
-                        // backoff applies (5s base × 2^(n-1), 5min cap).
-                        // First post-Ok retry waits 5s; if still no ack the
-                        // next waits 10s, etc. The 30-day expiration sweep
-                        // is the eventual terminator.
-                        self.backoff.insert(
-                            (entry_id, recipient),
-                            AttemptState {
-                                last_attempt_wall_ms: wall_now_ms,
-                                failure_count: 1,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(?entry_id, ?recipient, error = %e, "transport.send failed; bumping backoff");
-                        let st =
-                            self.backoff
-                                .entry((entry_id, recipient))
-                                .or_insert(AttemptState {
-                                    last_attempt_wall_ms: 0,
-                                    failure_count: 0,
-                                });
-                        st.last_attempt_wall_ms = wall_now_ms;
-                        st.failure_count = st.failure_count.saturating_add(1);
-                    }
+                work.push(DrainWorkUnit {
+                    entry_id,
+                    entry_clone: entry_clone.clone(),
+                    recipient,
+                    destinations,
+                });
+            }
+        }
+        work
+    }
+
+    /// Phase C of drain: under the outbox + state locks, apply each
+    /// transport.send result (update backoff, clear in_flight), clear
+    /// in_flight for pairs Phase B skipped (liveness check failed or
+    /// lock contended), run the 30-day expiration sweep, and clean up
+    /// backoff/in_flight entries for OutboxEntries that are no longer
+    /// Pending/Partial. Synchronous.
+    ///
+    /// `skipped` carries the (entry_id, recipient) pairs that Phase B
+    /// chose NOT to send via the liveness re-check (ZEB-233 round 2).
+    /// Their in_flight markers MUST be cleared here so a future drain
+    /// tick can re-attempt; backoff is NOT updated (skipping isn't an
+    /// attempt).
+    ///
+    /// Two distinct timestamps (ZEB-233 round 3, CodeRabbit Major):
+    ///
+    /// * `backoff_now_ms`: fresh wall-clock captured AFTER Phase C
+    ///   acquired its locks. Reflects when the send outcome was
+    ///   actually recorded — accurate for `last_attempt_wall_ms`
+    ///   bookkeeping so the next is_due check uses a real "we tried
+    ///   at time T" anchor.
+    ///
+    /// * `expiration_now_ms`: original tick-time wall-clock (Phase A's
+    ///   `wall_now_ms`). Reflects when Phase A admitted this drain
+    ///   tick as in-flight. Used for the 30-day expiration sweep so
+    ///   that an entry Phase A admitted as live can NEVER be expired
+    ///   in the same tick due to Phase B/C latency. A slow
+    ///   `transport.send()` (or contended Phase C lock acquisition)
+    ///   that takes the wall-clock past `EXPIRATION_MS` must NOT mark
+    ///   the just-sent entry Expired before its ack arrives.
+    fn drain_phase_c(
+        &mut self,
+        state: &mut OwnerState,
+        results: Vec<DrainSendResult>,
+        skipped: Vec<(OutboxEntryId, OwnerAddr)>,
+        backoff_now_ms: u64,
+        expiration_now_ms: u64,
+    ) -> DrainOutcome {
+        let mut outcome = DrainOutcome::default();
+
+        // 1. Apply each send result.
+        for r in results {
+            self.in_flight.remove(&(r.entry_id, r.recipient));
+            // ZEB-233 round 4 (CodeRabbit Minor): skip the backoff
+            // write if a concurrent `handle_ack` already marked this
+            // recipient delivered between Phase B's send and Phase C's
+            // (delayed, spawned) lock acquisition. Without this check,
+            // we'd resurrect stale per-recipient retry state for an
+            // already-acked recipient, which then sticks until the
+            // whole message completes or expires (Step 4's
+            // backoff.retain only sees the entry-level Pending/Partial
+            // status, not per-recipient delivered_to).
+            let recipient_still_pending = state.outbox.get(&r.entry_id).is_some_and(|entry| {
+                matches!(
+                    entry.delivery_status,
+                    DeliveryStatus::Pending | DeliveryStatus::Partial
+                ) && !entry.delivered_to.contains(&r.recipient)
+            });
+            if !recipient_still_pending {
+                continue;
+            }
+            match r.result {
+                Ok(()) => {
+                    // Throttle post-Ok retries until the ack arrives.
+                    // Without this, `is_due` returns true on the very next
+                    // 250ms tick (no backoff entry → first attempt),
+                    // producing tick-rate retry until handle_ack fires —
+                    // ~4 sends/sec/recipient against the production
+                    // StubTransport (which always returns Ok and has an
+                    // unbounded sends Vec). Treat "sent but ack pending"
+                    // as failure_count=1 so the existing exponential
+                    // backoff applies (5s base × 2^(n-1), 5min cap).
+                    // First post-Ok retry waits 5s; if still no ack the
+                    // next waits 10s, etc. The 30-day expiration sweep
+                    // is the eventual terminator.
+                    self.backoff.insert(
+                        (r.entry_id, r.recipient),
+                        AttemptState {
+                            last_attempt_wall_ms: backoff_now_ms,
+                            failure_count: 1,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entry_id = ?r.entry_id,
+                        recipient = ?r.recipient,
+                        error = %e,
+                        "transport.send failed; bumping backoff"
+                    );
+                    let st =
+                        self.backoff
+                            .entry((r.entry_id, r.recipient))
+                            .or_insert(AttemptState {
+                                last_attempt_wall_ms: 0,
+                                failure_count: 0,
+                            });
+                    st.last_attempt_wall_ms = backoff_now_ms;
+                    st.failure_count = st.failure_count.saturating_add(1);
                 }
             }
+        }
+
+        // 2. Clear in_flight markers for skipped pairs (ZEB-233 round 2).
+        // Phase B chose not to send these — either the liveness check
+        // saw the entry deleted/acked, or outbox/state was contended
+        // and we conservatively skipped rather than send a possibly-
+        // stale entry. DO NOT update backoff: skipping isn't a send
+        // attempt, and bumping `failure_count` would unfairly throttle
+        // a healthy entry on the next tick. The next drain tick's
+        // Phase A will re-evaluate is_due + include if still due.
+        for (entry_id, recipient) in skipped {
+            self.in_flight.remove(&(entry_id, recipient));
         }
 
         // 3. Expiration sweep.
@@ -779,7 +920,7 @@ impl DmOutbox {
             ) {
                 continue;
             }
-            let age = wall_now_ms.saturating_sub(entry.created_at.wall_ms);
+            let age = expiration_now_ms.saturating_sub(entry.created_at.wall_ms);
             if age >= EXPIRATION_MS {
                 let recipient_set: BTreeSet<&OwnerAddr> = entry.recipient_owners.iter().collect();
                 let all_acked = recipient_set
@@ -791,6 +932,7 @@ impl DmOutbox {
                 }
             }
         }
+
         // 4. Cleanup backoff/in_flight for entries no longer Pending/Partial.
         // Covers expired (just marked above), Complete via local handle_ack
         // (already cleaned in handle_ack but defensive double-cleanup is
@@ -798,7 +940,7 @@ impl DmOutbox {
         // replicated through owner-state sync — handle_ack never fires for
         // that path so the previous narrow expired-only sweep leaked
         // forever). Entries whose underlying OutboxEntry is gone
-        // (shouldn't happen in Phase 2; defensive) are also cleaned.
+        // (shouldn't happen; defensive) are also cleaned.
         self.backoff.retain(|(entry_id, _), _| {
             state
                 .outbox
@@ -1590,6 +1732,198 @@ impl DmOutbox {
     }
 }
 
+/// ZEB-233: lock-lifted drain entrypoint for production.
+///
+/// Three-phase structure mirroring `handle_cidnotify_lifted` (ZEB-241):
+///
+/// * **Phase A (locked, try_lock):** acquire `outbox` + `state` via
+///   `try_lock`. On contention, skip this tick. Calls
+///   `DmOutbox::drain_phase_a` to collect work units + mark in_flight.
+///   Locks drop at the end of this block.
+///
+/// * **Phase B (unlocked):** iterate work units, awaiting each
+///   `transport.send().await`. No locks held — concurrent `send_dm`
+///   IPC calls progress against the released outbox lock.
+///
+/// * **Phase C (spawned, locked):** spawn a `tokio::spawn` task that
+///   re-acquires `outbox` + `state` via `.lock().await` (not
+///   `try_lock` — the spawn detaches from the event_loop's `select!`,
+///   so `.lock().await` here doesn't risk the cas_op_rx deadlock that
+///   forced try_lock at Phase A). Calls `DmOutbox::drain_phase_c` to
+///   apply results + run the expiration sweep + cleanup. Emits
+///   `dm-delivered` / `dm-expired` IPC events from the spawned task.
+///
+/// ## Why spawn Phase C instead of awaiting inline
+///
+/// The event_loop runs in a single `select!` and pumps multiple arms
+/// (UDP recv, timer tick, cas_op_rx, etc.). Drain runs on the timer
+/// tick arm. If Phase C used `.lock().await` inline, the event_loop
+/// would stall at the timer arm waiting for the outbox lock — and a
+/// concurrent `send_dm` IPC (which holds outbox while awaiting
+/// `cas.put()` → `cas_op_tx`) could deadlock because cas_op_rx never
+/// gets pumped while the event_loop is parked at the timer arm.
+///
+/// Spawning Phase C makes the timer arm return immediately after
+/// Phase B completes. The event_loop resumes its `select!` and can
+/// pump cas_op_rx, unblocking the holder of outbox, which lets
+/// Phase C's `.lock().await` eventually succeed.
+///
+/// ## Why try_lock at Phase A
+///
+/// Phase A is on the timer arm hot path. Same deadlock risk as the
+/// original (pre-ZEB-233) drain caller — preserved by keeping
+/// try_lock + skip-this-tick at this boundary.
+///
+/// ## Effect on concurrent send_dm IPCs
+///
+/// Before ZEB-233: `send_dm` blocks at `outbox.lock().await` while
+/// drain awaits `transport.send()` (~500ms-5s on real Reticulum).
+/// After ZEB-233: `send_dm` acquires outbox immediately during
+/// Phase B because the lock is released. Latency improvement is
+/// proportional to the slowest in-flight transport.send.
+pub async fn drain_lifted<R: tauri::Runtime>(
+    outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+    state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+    transport: &dyn DmTransport,
+    wall_now_ms: u64,
+    app: tauri::AppHandle<R>,
+) {
+    // Phase A: try_lock + collect work. If either lock is contended,
+    // skip this tick. (Same deadlock-avoidance rationale as the
+    // original event_loop drain caller — see event_loop.rs timer arm
+    // comment.)
+    let work = match (outbox.try_lock(), state.try_lock()) {
+        (Ok(mut o_g), Ok(s_g)) => o_g.drain_phase_a(&s_g, wall_now_ms),
+        _ => {
+            tracing::debug!("drain_lifted Phase A: outbox/state lock contended; skipping tick");
+            return;
+        }
+    };
+
+    // Phase B: unlocked transport sends. Concurrent send_dm IPCs hold
+    // outbox/state during this stretch, so they don't block on us.
+    //
+    // ## TOCTOU liveness re-check (ZEB-233 round 2, closes ZEB-277)
+    //
+    // Between Phase A's lock-drop and a given `transport.send` in this
+    // loop, the (entry, recipient) pair could have its OutboxEntry
+    // deleted by `delete_dm_outbox_entry`, marked Complete for that
+    // recipient by `handle_ack`, or had its in_flight marker cleared
+    // by a previous Phase C cleanup pass. Before each send we re-check
+    // liveness using `try_lock` (NOT `.lock().await` — that would
+    // reintroduce the deadlock Phase A's try_lock was designed to
+    // avoid). On contention OR liveness-check-fail, we push to
+    // `skipped` and let Phase C clear the in_flight marker; the next
+    // drain tick re-evaluates.
+    //
+    // Cost: one try_lock pair (outbox + state) per work unit. The
+    // guards drop at the end of the `match` arm — BEFORE
+    // `transport.send.await`. No locks held across the await.
+    //
+    // Failure modes after this fix:
+    //   * Locks contended at the moment of try_lock: skip + clear
+    //     in_flight in Phase C → next tick re-attempts.
+    //   * Entry deleted between Phase A and Phase B: skip + clear
+    //     in_flight in Phase C → no stale send.
+    //   * Recipient acked between Phase A and Phase B: skip + clear
+    //     in_flight in Phase C → no duplicate send.
+    let mut results = Vec::with_capacity(work.len());
+    let mut skipped: Vec<(OutboxEntryId, OwnerAddr)> = Vec::new();
+    for unit in work {
+        let entry_id = unit.entry_id;
+        let recipient = unit.recipient;
+        // ZEB-233 round 4 (CodeRabbit Major): the liveness re-check
+        // ALSO re-resolves destinations from the CURRENT
+        // `owner_device_cache`. Phase A's snapshot can be stale if a
+        // device was rotated/revoked between Phase A and Phase B —
+        // without the re-resolve, the send would target stale device
+        // hashes (misdelivery to a revoked device). Returns
+        // `Some(destinations)` only when both still-live AND
+        // lock-acquisition succeed.
+        let destinations = match (outbox.try_lock(), state.try_lock()) {
+            (Ok(o_g), Ok(s_g)) => {
+                let live = s_g.outbox.get(&entry_id).is_some_and(|entry| {
+                    matches!(
+                        entry.delivery_status,
+                        DeliveryStatus::Pending | DeliveryStatus::Partial
+                    ) && !entry.delivered_to.contains(&recipient)
+                        && o_g.in_flight.contains(&(entry_id, recipient))
+                });
+                // Compute the re-resolved destinations under the same
+                // try_lock guard, so the cache read is consistent with
+                // the liveness check above. o_g + s_g drop at end of
+                // match arm — BEFORE the `.await` below. No locks
+                // held across the await.
+                if live {
+                    Some(resolve_destinations(&s_g.owner_device_cache, recipient))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                tracing::debug!(
+                    ?entry_id,
+                    ?recipient,
+                    "drain_lifted Phase B: lock contended on liveness re-check; skipping send (next tick retries)"
+                );
+                None
+            }
+        };
+        let Some(destinations) = destinations else {
+            skipped.push((entry_id, recipient));
+            continue;
+        };
+        let result = transport
+            .send(&unit.entry_clone, recipient, destinations)
+            .await;
+        results.push(DrainSendResult {
+            entry_id,
+            recipient,
+            result,
+        });
+    }
+
+    // Phase C: spawn so the event_loop's timer arm returns to select!
+    // immediately. The spawned task runs detached and uses .lock().await
+    // (not try_lock) — by the time it awakens after .lock().await
+    // returns, the event_loop is free to pump cas_op_rx, so any holder
+    // of outbox/state can release.
+    tokio::spawn(async move {
+        let mut o_g = outbox.lock().await;
+        let mut s_g = state.lock().await;
+        // ZEB-233 round 1 (Qodo Correctness #1) + round 3 (CodeRabbit
+        // Major): Phase C needs two distinct timestamps. `backoff_now_ms`
+        // is recomputed AFTER lock acquisition — it reflects when the
+        // send outcome was actually recorded, so `last_attempt_wall_ms`
+        // bookkeeping is accurate. `expiration_now_ms` REUSES the
+        // outer `wall_now_ms` from the captured `let` move — it
+        // reflects when Phase A admitted this drain tick as in-flight,
+        // so the 30-day expiration sweep can't expire an entry in the
+        // same tick it was just sent due to Phase B/C latency.
+        let backoff_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let outcome = o_g.drain_phase_c(&mut s_g, results, skipped, backoff_now_ms, wall_now_ms);
+        // Drop locks before emitting IPC events.
+        drop(s_g);
+        drop(o_g);
+        for (entry_id, recipient) in outcome.newly_delivered {
+            let payload = serde_json::json!({
+                "messageId": hex::encode(entry_id.0),
+                "recipient": hex::encode(recipient.0),
+            });
+            let _ = app.emit("dm-delivered", payload);
+        }
+        for entry_id in outcome.newly_expired {
+            let payload = serde_json::json!({
+                "messageId": hex::encode(entry_id.0),
+            });
+            let _ = app.emit("dm-expired", payload);
+        }
+    });
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SendDmError {
     #[error("space {0:?} not found")]
@@ -2347,6 +2681,476 @@ mod tests {
         assert!(inserted);
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[test]
+    fn drain_phase_c_clears_in_flight_for_skipped_pairs() {
+        // ZEB-233 round 2 (closes ZEB-277): Phase C must clear
+        // in_flight markers for (entry_id, recipient) pairs that
+        // Phase B skipped, in addition to pairs that produced send
+        // results. Otherwise the marker would leak and the next
+        // drain tick's Phase A would skip this pair forever.
+        //
+        // Contract verified here:
+        //   * Skipped pair's in_flight marker is cleared.
+        //   * Skipped pair's backoff is NOT updated (skipping isn't
+        //     a send attempt — bumping failure_count would unfairly
+        //     throttle a healthy entry on the next tick).
+        //   * Sent pair's in_flight is cleared AND backoff is
+        //     updated (the existing post-Ok backoff entry).
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let entry_sent = entry_with_age(7, vec![bob], 1_000);
+        let entry_sent_id = entry_sent.id;
+        let entry_skipped = entry_with_age(8, vec![carol], 1_000);
+        let entry_skipped_id = entry_skipped.id;
+        install_outbox_entry(&mut state, entry_sent);
+        install_outbox_entry(&mut state, entry_skipped);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        // Phase A would mark BOTH (entry, recipient) pairs in_flight;
+        // simulate that here.
+        o.in_flight.insert((entry_sent_id, bob));
+        o.in_flight.insert((entry_skipped_id, carol));
+
+        // Phase B's outcome: entry_sent was sent successfully,
+        // entry_skipped was skipped (liveness check failed / lock
+        // contention).
+        let results = vec![DrainSendResult {
+            entry_id: entry_sent_id,
+            recipient: bob,
+            result: Ok(()),
+        }];
+        let skipped = vec![(entry_skipped_id, carol)];
+
+        let _outcome = o.drain_phase_c(&mut state, results, skipped, 2_000, 2_000);
+
+        // Both in_flight markers should be cleared.
+        assert!(
+            !o.in_flight.contains(&(entry_sent_id, bob)),
+            "in_flight for sent pair must be cleared"
+        );
+        assert!(
+            !o.in_flight.contains(&(entry_skipped_id, carol)),
+            "in_flight for skipped pair must be cleared (otherwise next \
+             drain tick would skip this pair forever)"
+        );
+
+        // Sent pair's backoff updated (failure_count=1 for "sent but
+        // ack pending" — the existing post-Ok throttle).
+        assert!(
+            o.backoff.contains_key(&(entry_sent_id, bob)),
+            "backoff updated for sent pair (post-Ok throttle)"
+        );
+
+        // Skipped pair's backoff NOT updated.
+        assert!(
+            !o.backoff.contains_key(&(entry_skipped_id, carol)),
+            "backoff MUST NOT be updated for skipped pair — skipping \
+             is not a send attempt; bumping failure_count would unfairly \
+             throttle a healthy entry next tick"
+        );
+    }
+
+    #[test]
+    fn drain_phase_c_skips_backoff_for_recipient_already_acked() {
+        // ZEB-233 round 4 (CodeRabbit Minor): Phase C runs in a
+        // spawned task that can be delayed by Phase C lock acquisition
+        // (e.g., contended by a concurrent handle_ack). If handle_ack
+        // marks a recipient `delivered` between Phase B's send and
+        // Phase C's lock acquisition, Phase C MUST NOT resurrect
+        // stale per-recipient backoff for that recipient.
+        //
+        // Test: install entry with bob as a recipient already in
+        // delivered_to (simulating handle_ack having completed bob
+        // between Phase B and Phase C). Run Phase C with a result for
+        // bob. Assert: backoff entry NOT created for (entry, bob).
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let mut entry = entry_with_age(7, vec![bob, carol], 1_000);
+        // Simulate handle_ack: bob already delivered before Phase C runs.
+        // Mark Partial status (some delivered, others pending).
+        entry.delivered_to.insert(bob);
+        entry.delivery_status = DeliveryStatus::Partial;
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        o.in_flight.insert((entry_id, bob));
+        o.in_flight.insert((entry_id, carol));
+
+        // Phase B finished sending to both; results for both arrive.
+        // But by the time Phase C runs, bob has already been acked
+        // (via handle_ack between Phase B and Phase C).
+        let results = vec![
+            DrainSendResult {
+                entry_id,
+                recipient: bob,
+                result: Ok(()),
+            },
+            DrainSendResult {
+                entry_id,
+                recipient: carol,
+                result: Ok(()),
+            },
+        ];
+        let _outcome = o.drain_phase_c(&mut state, results, Vec::new(), 2_000, 2_000);
+
+        // bob's backoff MUST NOT be set — handle_ack already cleared
+        // his per-recipient retry state; Phase C must not resurrect.
+        assert!(
+            !o.backoff.contains_key(&(entry_id, bob)),
+            "backoff for already-acked recipient must NOT be set by Phase C \
+             (would resurrect stale retry state)"
+        );
+
+        // carol's backoff MUST be set (she's still Pending in delivered_to).
+        assert!(
+            o.backoff.contains_key(&(entry_id, carol)),
+            "backoff for still-pending recipient MUST be set normally"
+        );
+
+        // Both in_flight markers cleared.
+        assert!(!o.in_flight.contains(&(entry_id, bob)));
+        assert!(!o.in_flight.contains(&(entry_id, carol)));
+    }
+
+    #[test]
+    fn drain_phase_c_uses_expiration_clock_not_backoff_clock_for_sweep() {
+        // ZEB-233 round 3 (CodeRabbit Major): drain_phase_c uses two
+        // distinct timestamps:
+        //
+        //   backoff_now_ms       — fresh wall clock, post-Phase-B
+        //                          (when the send outcome was recorded)
+        //   expiration_now_ms    — original tick clock, Phase A admission
+        //                          time (when the tick started)
+        //
+        // Without this split, a slow transport.send or contended
+        // Phase C lock could push an entry past EXPIRATION_MS in the
+        // same tick it was just sent, marking it Expired before its
+        // ack can arrive. This test pins the contract: entries
+        // admitted by Phase A as live must NOT be expired by Phase C
+        // in the same tick, regardless of Phase B/C latency.
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+
+        // Entry created at wall=0. EXPIRATION_MS = 30 days.
+        let entry = entry_with_age(7, vec![bob], 0);
+        let entry_id = entry.id;
+        install_outbox_entry(&mut state, entry);
+
+        let mut o = make_outbox_synthetic("dev", alice);
+        o.in_flight.insert((entry_id, bob));
+
+        // Simulate Phase A admitting the entry at wall = EXPIRATION_MS - 10s.
+        // Phase B + Phase C lock contention then push wall past
+        // EXPIRATION_MS before Phase C runs. backoff_now_ms reflects
+        // the slow post-Phase-B time; expiration_now_ms reflects the
+        // Phase A admission time.
+        let expiration_now_ms = EXPIRATION_MS - 10_000; // Phase A's tick time
+        let backoff_now_ms = EXPIRATION_MS + 20_000; // 20s past EXPIRATION
+
+        let results = vec![DrainSendResult {
+            entry_id,
+            recipient: bob,
+            result: Ok(()),
+        }];
+        let outcome = o.drain_phase_c(
+            &mut state,
+            results,
+            Vec::new(),
+            backoff_now_ms,
+            expiration_now_ms,
+        );
+
+        // Contract: entry admitted by Phase A as live (age <
+        // EXPIRATION_MS at expiration_now_ms) MUST NOT be expired in
+        // this same tick, even though backoff_now_ms is well past
+        // EXPIRATION_MS.
+        assert!(
+            outcome.newly_expired.is_empty(),
+            "entry admitted by Phase A must NOT be expired in same tick \
+             due to Phase B/C latency; got newly_expired: {:?}",
+            outcome.newly_expired
+        );
+        let stored = state.outbox.get(&entry_id).unwrap();
+        assert!(
+            matches!(stored.delivery_status, DeliveryStatus::Pending),
+            "entry must stay Pending; expiration uses tick time, not Phase C time"
+        );
+
+        // Backoff bookkeeping uses backoff_now_ms (the fresh clock),
+        // so the next is_due check anchors to the actual send time.
+        let backoff_entry = o.backoff.get(&(entry_id, bob)).unwrap();
+        assert_eq!(
+            backoff_entry.last_attempt_wall_ms, backoff_now_ms,
+            "backoff uses backoff_now_ms (Phase C clock) — accurate \
+             post-send anchor for the next is_due check"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_lifted_releases_outbox_lock_during_transport_send() {
+        // ZEB-233 regression test: drain_lifted MUST release the outbox
+        // + state locks for the duration of Phase B's
+        // transport.send().await. Without this, concurrent send_dm IPCs
+        // block on the slowest in-flight send.
+        //
+        // Verified by a custom transport (LockProbeTransport) that
+        // attempts to `try_lock` the outbox from INSIDE its async send()
+        // body. With the lock-lift working, Phase A's guard has been
+        // dropped before Phase B awaits — try_lock succeeds. Without the
+        // lock-lift, Phase A's guard is still held — try_lock returns
+        // WouldBlock.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        struct LockProbeTransport {
+            outbox: Arc<Mutex<DmOutbox>>,
+            state: Arc<Mutex<OwnerState>>,
+            outbox_try_lock_succeeded: Arc<AtomicBool>,
+            state_try_lock_succeeded: Arc<AtomicBool>,
+            send_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl DmTransport for LockProbeTransport {
+            async fn send(
+                &self,
+                _entry: &OutboxEntry,
+                _recipient: OwnerAddr,
+                _destinations: Vec<[u8; 16]>,
+            ) -> Result<(), TransportError> {
+                self.send_count.fetch_add(1, Ordering::SeqCst);
+                // ZEB-233 round 1 (CodeRabbit Nitpick): probe BOTH the
+                // outbox AND state locks. drain_lifted's lock-lift
+                // releases both for the duration of Phase B; a
+                // regression that releases only one would still pass
+                // an outbox-only probe.
+                if self.outbox.try_lock().is_ok() {
+                    self.outbox_try_lock_succeeded.store(true, Ordering::SeqCst);
+                }
+                if self.state.try_lock().is_ok() {
+                    self.state_try_lock_succeeded.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox = make_outbox_synthetic("dev", alice);
+        let outbox_arc = Arc::new(Mutex::new(outbox));
+        let state_arc = Arc::new(Mutex::new(state));
+
+        let outbox_try_lock_succeeded = Arc::new(AtomicBool::new(false));
+        let state_try_lock_succeeded = Arc::new(AtomicBool::new(false));
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let transport = LockProbeTransport {
+            outbox: Arc::clone(&outbox_arc),
+            state: Arc::clone(&state_arc),
+            outbox_try_lock_succeeded: Arc::clone(&outbox_try_lock_succeeded),
+            state_try_lock_succeeded: Arc::clone(&state_try_lock_succeeded),
+            send_count: Arc::clone(&send_count),
+        };
+
+        let app = tauri::test::mock_app().handle().clone();
+
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+        )
+        .await;
+
+        // ZEB-233 round 1 (Qodo Reliability #2): the assertions below
+        // only depend on Phase B (transport.send) having completed,
+        // which happens before `drain_lifted(...).await` returns. No
+        // post-await synchronization is needed. The spawned Phase C
+        // is left to run (or be dropped on test exit) — tokio handles
+        // its cleanup.
+        assert!(
+            send_count.load(Ordering::SeqCst) > 0,
+            "transport.send must have been called at least once (1 outstanding recipient)"
+        );
+        assert!(
+            outbox_try_lock_succeeded.load(Ordering::SeqCst),
+            "ZEB-233 regression: outbox lock must be RELEASED during Phase B's transport.send. \
+             The try_lock from inside send() failed, meaning Phase A's guard is still held."
+        );
+        assert!(
+            state_try_lock_succeeded.load(Ordering::SeqCst),
+            "ZEB-233 regression: state lock must be RELEASED during Phase B's transport.send. \
+             The try_lock from inside send() failed, meaning Phase A's guard is still held."
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_lifted_phase_b_reresolves_destinations_after_cache_mutation() {
+        // ZEB-233 round 4 (CodeRabbit Trivial): regression test for the
+        // Phase B destination-refresh fix. Phase A captures
+        // `destinations` into the work unit; Phase B IGNORES that and
+        // re-resolves from the CURRENT `owner_device_cache`. A device
+        // rotation/revocation between Phase A and Phase B must reach
+        // the transport — without this fix, drain would misdeliver to
+        // a revoked device hash.
+        //
+        // Multi-recipient scenario so we can observe a mid-Phase-B
+        // mutation: the entry targets [bob, carol]. The custom
+        // transport mutates carol's cache entry during bob's send().
+        // When the Phase B loop advances to carol, its try_lock +
+        // resolve_destinations reads the NEW value. A regression that
+        // uses `unit.destinations` (Phase A's snapshot) would observe
+        // the OLD value instead.
+        use crate::dm_signing::compute_dm_destination_hash;
+        use crate::owner_state_types::OwnerDeviceEntry;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        type Captures = Arc<std::sync::Mutex<Vec<(OwnerAddr, Vec<[u8; 16]>)>>>;
+
+        struct DestinationRefreshProbe {
+            state: Arc<Mutex<OwnerState>>,
+            captures: Captures,
+            rotate_target: OwnerAddr,
+            rotate_to: OwnerDeviceEntry,
+            triggered: AtomicBool,
+        }
+
+        #[async_trait]
+        impl DmTransport for DestinationRefreshProbe {
+            async fn send(
+                &self,
+                _entry: &OutboxEntry,
+                recipient: OwnerAddr,
+                destinations: Vec<[u8; 16]>,
+            ) -> Result<(), TransportError> {
+                self.captures
+                    .lock()
+                    .expect("captures poisoned")
+                    .push((recipient, destinations));
+                if !self.triggered.swap(true, Ordering::SeqCst) {
+                    // First send call (bob's). Phase B dropped both
+                    // locks before awaiting send(), so state.lock()
+                    // acquires cleanly. Mutate carol's cache BEFORE
+                    // Phase B's next iteration runs its try_lock +
+                    // re-resolve.
+                    let mut s = self.state.lock().await;
+                    s.owner_device_cache
+                        .devices
+                        .insert(self.rotate_target, self.rotate_to.clone());
+                }
+                Ok(())
+            }
+        }
+
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let carol = OwnerAddr([0xcc; 16]);
+
+        let bob_dev = DeviceIdentityHash([0xb1; 16]);
+        let carol_dev_old = DeviceIdentityHash([0xc1; 16]);
+        let carol_dev_new = DeviceIdentityHash([0xc2; 16]);
+
+        let learned_at = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "dev".into(),
+        };
+        let bob_entry = OwnerDeviceEntry {
+            devices: vec![bob_dev],
+            device_identity_pubs: vec![Some([0xbb; 64])],
+            learned_at: learned_at.clone(),
+        };
+        let carol_old_entry = OwnerDeviceEntry {
+            devices: vec![carol_dev_old],
+            device_identity_pubs: vec![Some([0xc1; 64])],
+            learned_at: learned_at.clone(),
+        };
+        let carol_new_entry = OwnerDeviceEntry {
+            devices: vec![carol_dev_new],
+            device_identity_pubs: vec![Some([0xc2; 64])],
+            learned_at,
+        };
+
+        let mut state = OwnerState::default();
+        state.owner_device_cache.devices.insert(bob, bob_entry);
+        state
+            .owner_device_cache
+            .devices
+            .insert(carol, carol_old_entry);
+        // Single outbox entry targeting [bob, carol] in that order so
+        // Phase A produces work units in that order (recipient_owners
+        // is a Vec; drain_phase_a preserves Vec order — see line ~776).
+        let entry = entry_with_age(7, vec![bob, carol], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox = make_outbox_synthetic("dev", alice);
+        let outbox_arc = Arc::new(Mutex::new(outbox));
+        let state_arc = Arc::new(Mutex::new(state));
+
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = DestinationRefreshProbe {
+            state: Arc::clone(&state_arc),
+            captures: Arc::clone(&captures),
+            rotate_target: carol,
+            rotate_to: carol_new_entry,
+            triggered: AtomicBool::new(false),
+        };
+
+        let app = tauri::test::mock_app().handle().clone();
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+        )
+        .await;
+
+        let captured = captures.lock().expect("captures poisoned");
+        assert_eq!(
+            captured.len(),
+            2,
+            "expected send() called for both bob and carol; got {} calls",
+            captured.len()
+        );
+        assert_eq!(
+            captured[0],
+            (bob, vec![compute_dm_destination_hash(bob_dev.0)]),
+            "first send must be bob with bob's cached destination"
+        );
+        // Load-bearing assertion: carol's send must observe the
+        // POST-rotation device hash. A regression that uses
+        // `unit.destinations` (Phase A's snapshot) would observe
+        // carol_dev_old here.
+        assert_eq!(
+            captured[1],
+            (carol, vec![compute_dm_destination_hash(carol_dev_new.0)]),
+            "ZEB-233 round 4 regression: carol's send must reflect the \
+             POST-rotation device hash. If this assertion fails with \
+             the pre-rotation hash, Phase B is using `unit.destinations` \
+             (Phase A snapshot) instead of re-resolving from the \
+             current `owner_device_cache`."
+        );
     }
 
     #[tokio::test]
