@@ -900,6 +900,27 @@ mod subscriber_tests {
     use crate::owner_state_types::RootPublishPayload;
     use std::time::Duration;
 
+    /// Per ZEB-259: bounded polling helper for convergence-wait tests.
+    /// Mirrors the helper in `mod integration_tests` below — kept private
+    /// per module to follow the codebase's "every test file has its own"
+    /// convention (see spec §5).
+    async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn make_kt() -> Arc<KeyTree> {
         Arc::new(KeyTree::derive(&[7u8; 32]).expect("kt"))
     }
@@ -971,7 +992,19 @@ mod subscriber_tests {
         let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
         // Give the subscriber branch a moment to process.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let accepted = wait_until(
+            || async {
+                let t = tracker.lock().await;
+                t.get("peer-bob")
+                    .is_some_and(|s| s.wall_ms == 1000 && s.logical == 0)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            accepted,
+            "tracker did not record peer-bob wall_ms=1000 within 2s"
+        );
 
         let t = tracker.lock().await;
         let stored = t.get("peer-bob").expect("peer accepted");
@@ -1008,14 +1041,37 @@ mod subscriber_tests {
             .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let recorded = wait_until(
+            || async {
+                let t = tracker.lock().await;
+                t.get("peer-bob").is_some_and(|s| s.wall_ms == 2000)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            recorded,
+            "first publish (wall_ms=2000) not recorded within 2s"
+        );
 
         // Replay: at=1000 (older). Tracker must NOT regress.
         sub_tx
             .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Poll for "still 2000" — true on entry and remains true if the
+        // older replay is correctly rejected; bounds the wait without
+        // masking a regression (a regression would flip the predicate
+        // to false, which never recovers).
+        let unchanged = wait_until(
+            || async {
+                let t = tracker.lock().await;
+                t.get("peer-bob").is_some_and(|s| s.wall_ms == 2000)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(unchanged, "tracker regressed below wall_ms=2000 within 2s");
 
         let t = tracker.lock().await;
         let stored = t.get("peer-bob").expect("still present");
@@ -1086,7 +1142,15 @@ mod subscriber_tests {
 
         let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let converged = wait_until(
+            || async {
+                let local = local_state.lock().await;
+                local.spaces.contains_key(&SpaceId([42; 16]))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(converged, "local did not merge SpaceId([42; 16]) within 2s");
 
         let local = local_state.lock().await;
         assert!(
@@ -1150,7 +1214,20 @@ mod subscriber_tests {
 
         let wire = make_wire(&kt, &store, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let converged = wait_until(
+            || async {
+                let local = local_state.lock().await;
+                local.spaces.contains_key(&SpaceId([1; 16]))
+                    && local.outbox.contains_key(&OutboxEntryId([7; 16]))
+                    && local.markers.contains_key(&SpaceId([1; 16]))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "subscriber did not merge spaces/outbox/markers within 2s"
+        );
 
         let local = local_state.lock().await;
         assert!(local.spaces.contains_key(&SpaceId([1; 16])));
@@ -1193,7 +1270,19 @@ mod subscriber_tests {
         // stub never receives it.
         let wire = make_wire(&kt, &store_publisher, &remote, "peer-bob", 1000, 0).await;
         sub_tx.send(wire).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll on the positive signal (tracker recorded the publish).
+        // The negative-assertion (spaces stays empty) is checked
+        // affirmatively below — if the merge incorrectly happened,
+        // it would have happened before the tracker insert returned.
+        let recorded = wait_until(
+            || async {
+                let t = tracker.lock().await;
+                t.contains_key("peer-bob")
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(recorded, "tracker did not record peer-bob within 2s");
 
         // Subscriber must NOT have merged — local stays empty.
         let local = local_state.lock().await;
@@ -1245,7 +1334,18 @@ mod subscriber_tests {
                 .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 5000, 0).await)
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let converged = wait_until(
+                || async {
+                    let t = tracker.lock().await;
+                    t.get("peer-bob").is_some_and(|s| s.wall_ms == 5000)
+                },
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                converged,
+                "tracker did not record peer-bob wall_ms=5000 within 2s"
+            );
             let _ = engine.shutdown().await;
         }
 
@@ -1275,7 +1375,21 @@ mod subscriber_tests {
             .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll for "tracker NOT regressed" — true on entry and remains true
+        // throughout (rejection is the expected path), so wait_until exits
+        // immediately on healthy runs but still bounds the total wait.
+        let converged = wait_until(
+            || async {
+                let t = tracker2.lock().await;
+                t.get("peer-bob").is_some_and(|s| s.wall_ms == 5000)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "replay tracker did not retain wall_ms=5000 within 2s"
+        );
 
         let t = tracker2.lock().await;
         assert_eq!(
@@ -1511,7 +1625,15 @@ mod integration_tests {
             a.apply_space_with_canonicalization(f.clone());
         }
         dev.a_engine.notify_dirty();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let converged = wait_until(
+            || async {
+                let b = dev.b_state.lock().await;
+                b.spaces.contains_key(&SpaceId([1; 16]))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(converged, "B did not see SpaceId([1; 16]) within 2s");
 
         let b = dev.b_state.lock().await;
         assert!(b.spaces.contains_key(&SpaceId([1; 16])));
@@ -1537,7 +1659,22 @@ mod integration_tests {
         dev.a_engine.notify_dirty();
         dev.b_engine.notify_dirty();
         // Multiple debounce cycles to converge.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let converged = wait_until(
+            || async {
+                let a = dev.a_state.lock().await;
+                let b = dev.b_state.lock().await;
+                a.spaces.contains_key(&SpaceId([1; 16]))
+                    && a.spaces.contains_key(&SpaceId([2; 16]))
+                    && b.spaces.contains_key(&SpaceId([1; 16]))
+                    && b.spaces.contains_key(&SpaceId([2; 16]))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "A and B did not bidirectionally converge on both DMs within 2s"
+        );
 
         let a = dev.a_state.lock().await;
         let b = dev.b_state.lock().await;
@@ -1570,7 +1707,22 @@ mod integration_tests {
         }
         dev.a_engine.notify_dirty();
         dev.b_engine.notify_dirty();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let converged = wait_until(
+            || async {
+                let a = dev.a_state.lock().await;
+                let b = dev.b_state.lock().await;
+                a.spaces.contains_key(&SpaceId([1; 16]))
+                    && !a.spaces.contains_key(&SpaceId([5; 16]))
+                    && b.spaces.contains_key(&SpaceId([1; 16]))
+                    && !b.spaces.contains_key(&SpaceId([5; 16]))
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            converged,
+            "A and B did not converge on winner SpaceId(1) within 3s"
+        );
 
         let a = dev.a_state.lock().await;
         let b = dev.b_state.lock().await;
@@ -1750,7 +1902,18 @@ mod integration_tests {
             a.apply_owner_device_update(owner, devices.clone(), pubs.clone(), learned.clone());
         }
         dev.a_engine.notify_dirty();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        let converged = wait_until(
+            || async {
+                let b = dev.b_state.lock().await;
+                b.owner_device_cache.devices.contains_key(&owner)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            converged,
+            "B did not replicate OwnerDeviceCache entry from A within 2s"
+        );
 
         // B must see the same entry replicated through state-root sync.
         let b = dev.b_state.lock().await;
