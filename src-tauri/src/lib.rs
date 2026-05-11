@@ -1378,6 +1378,10 @@ async fn start_node(
                             // DmOutbox plumbing.
                             self_owner,
                             signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
+                            // so every spawned engine reads the current epoch key
+                            // dynamically rather than using its spawn-time capture.
+                            crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),
@@ -1654,6 +1658,11 @@ async fn start_node(
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
                                 let crdt_state_for_heal = std::sync::Arc::clone(&crdt_state);
+                                // ZEB-249 §10.6 Phase B: extra captures for
+                                // apply_remote_epoch_event (signing key + self addr).
+                                let signing_key_for_epoch = std::sync::Arc::clone(&signing_key_arc);
+                                let self_owner_for_epoch = self_owner;
+                                let crdt_state_for_epoch = std::sync::Arc::clone(&crdt_state);
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -1702,7 +1711,24 @@ async fn start_node(
                                     let crdt_state = std::sync::Arc::clone(&crdt_state_for_heal);
                                     let synth_rotations = std::sync::Arc::clone(&synthesized_rotations);
                                     let synth_catchups = std::sync::Arc::clone(&synthesized_catchups);
+                                    // ZEB-249 §10.6 Phase B: apply remote epoch
+                                    // key extraction BEFORE self-heal so the
+                                    // observer's catchup synthesis uses the
+                                    // freshly-updated current_epoch_key.
+                                    let sk_epoch = std::sync::Arc::clone(&signing_key_for_epoch);
+                                    let cs_epoch = std::sync::Arc::clone(&crdt_state_for_epoch);
+                                    let community_id = delta.community_id;
+                                    let event = delta.event.clone();
+                                    let local_addr_epoch = self_owner_for_epoch;
                                     async move {
+                                        apply_remote_epoch_event(
+                                            cs_epoch,
+                                            sk_epoch,
+                                            community_id,
+                                            &event,
+                                            local_addr_epoch,
+                                        )
+                                        .await;
                                         self_heal_community_observer(
                                             delta.community_id,
                                             registry,
@@ -7867,6 +7893,7 @@ mod create_community_inner_tests {
                 delta_tx: Some(delta_tx),
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
             }));
 
         // Community adapter channel — receiver kept alive so try_send
@@ -8378,7 +8405,19 @@ pub fn mint_redemption(
     //   scalar from signing_key (RFC 7748 §5 via ed25519_priv_to_x25519)
     //   and decrypt here.
     let epoch_key_bytes: [u8; 32] = if payload.is_invite_only {
-        // Invite-only path: decrypt the 92-byte sealed blob.
+        // Invite-only path: decrypt the 92-byte sealed blob
+        // (32 ephemeral_pub + 12 nonce + 32 ciphertext + 16 AEAD tag).
+        // E2: validate minimum envelope size before attempting decryption so
+        // a truncated payload produces a clear error rather than the generic
+        // MalformedSealedEnvelope from open_from_owner.
+        const SEALED_MIN: usize = 32 + 12 + 16; // ephemeral_pub + nonce + AEAD tag
+        if payload.epoch_snapshot.sealed_epoch_key.len() < SEALED_MIN {
+            return Err(format!(
+                "invite-only epoch key envelope too short: need ≥ {} bytes, got {}",
+                SEALED_MIN,
+                payload.epoch_snapshot.sealed_epoch_key.len()
+            ));
+        }
         use crate::dm_signing::{ed25519_priv_to_x25519, open_from_owner};
         let x25519_priv = ed25519_priv_to_x25519(signing_key);
         let plaintext = open_from_owner(&x25519_priv, &payload.epoch_snapshot.sealed_epoch_key)
@@ -9279,6 +9318,7 @@ mod redeem_invite_inner_tests {
                 delta_tx: None,
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
             }));
 
         let (community_adapter_tx, _community_adapter_rx) =
@@ -9465,6 +9505,14 @@ mod redeem_invite_inner_tests {
             .expect("self-join signature must verify against joiner identity_pub");
     }
 }
+
+/// Sentinel returned from the rotation-bundle closure inside
+/// `leave_community` when the leaver is the sole remaining member
+/// (solo leave). Using a named constant rather than a bare string
+/// literal prevents the fragile `e.contains("no remaining members")`
+/// check at the call-site from silently diverging if the message
+/// text ever changes. E4 (ZEB-249 §10.6 R3 review).
+const LEAVE_SOLO_SENTINEL: &str = "no remaining members — solo leave, no rotation needed";
 
 // ── ZEB-217 Sub-C Phase 3 Task 11: leave_community ───────────────────
 //
@@ -9686,7 +9734,7 @@ async fn leave_community(
 
             // If nobody else in the community (solo creator leaving), no rotation needed.
             if member_pubs.is_empty() {
-                return Err("no remaining members — solo leave, no rotation needed".to_string());
+                return Err(LEAVE_SOLO_SENTINEL.to_string());
             }
 
             // 3. Generate K_next and seal to remaining members.
@@ -9740,9 +9788,9 @@ async fn leave_community(
         }
         Err(e) => {
             // Rotation bundle failed (no members, or identity pubs unknown) —
-            // insert Leave alone. If it's the "no remaining members" sentinel,
+            // insert Leave alone. If it's the solo-leave sentinel,
             // that's expected and not worth warning about.
-            let is_solo = e.contains("no remaining members");
+            let is_solo = e == LEAVE_SOLO_SENTINEL;
             if !is_solo {
                 tracing::warn!(
                     community_id = %hex::encode(space_id.0),
@@ -10705,6 +10753,172 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR, FE, FutE
         // The observer is re-entrant-safe (per-session BTreeSet dedupe)
         // so firing it on channel-config or rotation deltas is cheap.
         on_epoch_event(delta).await;
+    }
+}
+
+/// ZEB-249 §10.6: apply a remote EpochRotation or EpochCatchup event that
+/// arrived via CRDT sync on a NON-ORIGINATING node.
+///
+/// When the originating admin issues the event, it seals the new epoch key to
+/// every current member (including itself). Every other node observes the CRDT
+/// delta carrying the `SignedMembershipEvent`, finds its own entry in
+/// `recipient_ciphertexts`, decrypts the sealed key, and updates its local
+/// `Space` row in `OwnerState` — all without any additional round-trips.
+///
+/// **EpochRotation**: advances `current_epoch` by 1, archives the outgoing
+/// key into `old_epoch_keys`, and replaces `current_epoch_key` with the
+/// freshly-decrypted key.
+///
+/// **EpochCatchup**: sets `current_epoch` and `current_epoch_key` to the
+/// values carried in the event (no archiving — a catchup delivers the already-
+/// current key to a latecomer, so the epoch counter does not advance here).
+///
+/// Idempotent: if this node's `current_epoch` already equals or exceeds the
+/// target epoch, the function is a no-op (avoids double-archival on duplicate
+/// CRDT deliveries).
+///
+/// Called from the delta-consumer task — runs on the consumer's tokio task.
+/// Lock-order contract: acquires the owner-state mutex ONLY; must not be
+/// called while the community-state mutex is already held (community-state
+/// mutations happen in `self_heal_community_observer`, which is always called
+/// AFTER this function returns).
+pub async fn apply_remote_epoch_event(
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_id: crate::owner_state_types::SpaceId,
+    event: &crate::community_membership::SignedMembershipEvent,
+    local_addr: crate::owner_state_types::OwnerAddr,
+) {
+    use crate::community_membership::MembershipEventKind;
+    use crate::owner_state_types::EpochKey;
+
+    match &event.kind {
+        MembershipEventKind::EpochRotation {
+            prior_epoch,
+            recipient_ciphertexts,
+            ..
+        } => {
+            // The new epoch = prior_epoch + 1.
+            let target_epoch = prior_epoch + 1;
+
+            let my_entry = recipient_ciphertexts
+                .iter()
+                .find(|rc| rc.recipient == local_addr);
+            let sealed = match my_entry {
+                Some(rc) => rc.sealed.clone(),
+                None => return, // this node was kicked / left; not in recipient list
+            };
+
+            let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&local_signing_key);
+            let k_bytes_vec = match crate::dm_signing::open_from_owner(&x25519_priv, &sealed) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        "apply_remote_epoch_event: EpochRotation sealed-key open failed: {:?}",
+                        e
+                    );
+                    return;
+                }
+            };
+            let k_bytes: [u8; 32] = match k_bytes_vec.try_into() {
+                Ok(b) => b,
+                Err(v) => {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        "apply_remote_epoch_event: EpochRotation sealed-key wrong length ({})",
+                        v.len()
+                    );
+                    return;
+                }
+            };
+            let k_next = EpochKey::new(k_bytes);
+
+            let mut state = crdt_state.lock().await;
+            let space = match state.spaces.get_mut(&community_id) {
+                Some(s) => s,
+                None => return, // community not yet in local state
+            };
+            let current = space.current_epoch.unwrap_or(0);
+            if current >= target_epoch {
+                // Already at or past this epoch — idempotent no-op.
+                return;
+            }
+            // Archive the current key before replacing it.
+            if let Some(prev_key) = space.current_epoch_key.take() {
+                space.old_epoch_keys.insert(current, prev_key);
+            }
+            space.current_epoch = Some(target_epoch);
+            space.current_epoch_key = Some(k_next);
+            tracing::debug!(
+                community_id = ?community_id,
+                target_epoch,
+                "apply_remote_epoch_event: EpochRotation applied — epoch advanced"
+            );
+        }
+
+        MembershipEventKind::EpochCatchup {
+            epoch,
+            recipient_ciphertexts,
+            ..
+        } => {
+            let target_epoch = *epoch;
+
+            let my_entry = recipient_ciphertexts
+                .iter()
+                .find(|rc| rc.recipient == local_addr);
+            let sealed = match my_entry {
+                Some(rc) => rc.sealed.clone(),
+                None => return, // not the intended catchup recipient
+            };
+
+            let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&local_signing_key);
+            let k_bytes_vec = match crate::dm_signing::open_from_owner(&x25519_priv, &sealed) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        "apply_remote_epoch_event: EpochCatchup sealed-key open failed: {:?}",
+                        e
+                    );
+                    return;
+                }
+            };
+            let k_bytes: [u8; 32] = match k_bytes_vec.try_into() {
+                Ok(b) => b,
+                Err(v) => {
+                    tracing::warn!(
+                        community_id = ?community_id,
+                        "apply_remote_epoch_event: EpochCatchup sealed-key wrong length ({})",
+                        v.len()
+                    );
+                    return;
+                }
+            };
+            let k = EpochKey::new(k_bytes);
+
+            let mut state = crdt_state.lock().await;
+            let space = match state.spaces.get_mut(&community_id) {
+                Some(s) => s,
+                None => return,
+            };
+            let current = space.current_epoch.unwrap_or(0);
+            if current >= target_epoch {
+                // Catchup is for an epoch we already hold or have surpassed.
+                return;
+            }
+            // Catchup delivers the CURRENT epoch key — no archiving.
+            space.current_epoch = Some(target_epoch);
+            space.current_epoch_key = Some(k);
+            tracing::debug!(
+                community_id = ?community_id,
+                target_epoch,
+                "apply_remote_epoch_event: EpochCatchup applied — epoch key installed"
+            );
+        }
+
+        // Non-epoch events: no-op.
+        _ => {}
     }
 }
 

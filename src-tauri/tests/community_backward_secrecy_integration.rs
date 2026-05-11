@@ -220,19 +220,30 @@ fn make_signed_event(
 
 /// Apply an EpochRotation from an event's sealed ciphertexts to a recipient's Space.
 /// The recipient decrypts their sealed K_next using their Ed25519 private key → X25519.
+///
+/// E5 (ZEB-249 §10.6 R3): validates that `space.current_epoch` matches the
+/// event's `prior_epoch` before applying. Returns `false` for stale or
+/// out-of-order rotations — mirrors the idempotency guard in
+/// `apply_remote_epoch_event`.
 fn apply_rotation_to_space(
     space: &mut Space,
     rotation_event: &SignedMembershipEvent,
     my_addr: OwnerAddr,
     my_signing_key: &ed25519_dalek::SigningKey,
 ) -> bool {
-    let recipient_ciphertexts = match &rotation_event.kind {
+    let (prior_epoch, recipient_ciphertexts) = match &rotation_event.kind {
         MembershipEventKind::EpochRotation {
+            prior_epoch,
             recipient_ciphertexts,
             ..
-        } => recipient_ciphertexts,
+        } => (*prior_epoch, recipient_ciphertexts),
         _ => return false,
     };
+    // E5: guard — only apply if space epoch matches prior_epoch.
+    let current = space.current_epoch.unwrap_or(0);
+    if current != prior_epoch {
+        return false;
+    }
     let my_entry = recipient_ciphertexts
         .iter()
         .find(|rc| rc.recipient == my_addr);
@@ -246,12 +257,11 @@ fn apply_rotation_to_space(
         .try_into()
         .expect("sealed key must be 32 bytes");
     let k_next = EpochKey::new(k_next_bytes);
-    let prev_epoch = space.current_epoch.unwrap_or(0);
     let prev_key = space.current_epoch_key.clone();
-    space.current_epoch = Some(prev_epoch + 1);
+    space.current_epoch = Some(prior_epoch + 1);
     space.current_epoch_key = Some(k_next);
     if let Some(pk) = prev_key {
-        space.old_epoch_keys.insert(prev_epoch, pk);
+        space.old_epoch_keys.insert(prior_epoch, pk);
     }
     true
 }
@@ -782,6 +792,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         delta_tx: None,
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_signing_key),
+        crdt_state: None,
     }));
 
     let (pub_tx, _pub_rx) = mpsc::channel(8);
@@ -999,6 +1010,14 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             .map(|k| k.as_bytes() == k1.as_bytes())
             .unwrap_or(false),
         "Dave's current_epoch_key must be K(1) after catchup — observer used crdt_state key, not spawn-time key"
+    );
+    // E6 (ZEB-249 §10.6 R3): EpochCatchup must NOT archive keys — it
+    // delivers the current epoch key to a latecomer, so old_epoch_keys
+    // stays empty on Dave's side (Dave never held an earlier key as
+    // "current").
+    assert!(
+        dave_space.old_epoch_keys.is_empty(),
+        "EpochCatchup must NOT populate old_epoch_keys (Dave had no prior current key)"
     );
 
     // ── Step 8: Dave decrypts epoch-1 messages ───────────────────────────────
@@ -1556,5 +1575,380 @@ fn leaver_malicious_self_include_rejected_admin_self_heals() {
             Err(EpochError::KeyNotAvailable(1))
         ),
         "B must not decrypt epoch-1 after malicious rotation rejected + admin self-heal"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ZEB-249 §10.6 Phase D: cross-node apply_remote_epoch_event integration tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Phase D test 1: remote EpochRotation propagated via `apply_remote_epoch_event`
+/// advances the receiving node's epoch and installs the new key.
+///
+/// Node A (admin) rotates epoch 0→1. Node B (member) receives the rotation
+/// as a `SignedMembershipEvent` via CRDT sync. After calling
+/// `apply_remote_epoch_event`, B's Space must reflect epoch 1, the new key
+/// K(1), and K(0) archived in `old_epoch_keys`.
+#[tokio::test]
+async fn two_node_remote_rotation_propagates_new_key() {
+    use harmony_app::apply_remote_epoch_event;
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+
+    let community_id = SpaceId([0x50; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&b_ed_seed));
+
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let k1 = EpochKey::new([0x20u8; 32]);
+
+    // B starts at epoch 0 with K(0).
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(b_space);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    // Admin encrypts a message under K(1) (post-rotation).
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 1, k1.clone());
+    admin_space.old_epoch_keys.insert(0, k0.clone());
+    let msg = b"epoch-1 content only B can decrypt after rotation";
+    let env1 = encrypt_for_topic(&admin_space, msg).expect("admin encrypt@1");
+
+    // Build EpochRotation sealing K(1) to admin + B.
+    let sealed_pairs = seal_epoch_to_members(
+        &k1,
+        &[(&admin_addr, &admin_signing_key), (&b_addr, &b_signing_key)],
+    );
+    let rotation_event = make_signed_event(
+        0xA0,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: admin_addr.0,
+            recipient_ciphertexts: sealed_pairs
+                .into_iter()
+                .map(|(recipient, sealed)| RecipientCiphertext { recipient, sealed })
+                .collect(),
+        },
+        1000,
+        &admin_signing_key,
+    );
+
+    // B receives the rotation — apply_remote_epoch_event must update B's Space.
+    apply_remote_epoch_event(
+        Arc::clone(&crdt_state),
+        Arc::clone(&b_signing_key),
+        community_id,
+        &rotation_event,
+        b_addr,
+    )
+    .await;
+
+    // Verify B's Space now reflects epoch 1.
+    {
+        let state = crdt_state.lock().await;
+        let space = state.spaces.get(&community_id).expect("space must exist");
+        assert_eq!(
+            space.current_epoch,
+            Some(1),
+            "B's epoch must have advanced to 1"
+        );
+        assert_eq!(
+            space.current_epoch_key.as_ref().map(|k| k.as_bytes()),
+            Some(k1.as_bytes()),
+            "B's current_epoch_key must be K(1)"
+        );
+        assert_eq!(
+            space.old_epoch_keys.get(&0).map(|k| k.as_bytes()),
+            Some(k0.as_bytes()),
+            "K(0) must be archived in old_epoch_keys at index 0"
+        );
+    }
+
+    // B must now be able to decrypt epoch-1 content.
+    let b_space_updated = {
+        let state = crdt_state.lock().await;
+        state.spaces.get(&community_id).cloned().expect("space")
+    };
+    let decrypted = decrypt_for_topic(&b_space_updated, &env1).expect("B decrypts epoch-1");
+    assert_eq!(decrypted, msg, "decrypted content must match");
+}
+
+/// Phase D test 2: a node that was offline during rotation receives both the
+/// rotation event and an EpochCatchup. `apply_remote_epoch_event` on the
+/// catchup correctly installs the current epoch key without archiving.
+///
+/// Scenario: admin rotates 0→1 (B was offline). B comes online, receives
+/// first the catchup (epoch=1, sealed K(1)) via delta consumer. After applying
+/// the catchup, B can decrypt epoch-1 content.
+#[tokio::test]
+async fn offline_catchup_via_remote_rotation_observation() {
+    use harmony_app::apply_remote_epoch_event;
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+
+    let community_id = SpaceId([0x51; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&b_ed_seed));
+
+    let k0 = EpochKey::new([0x30u8; 32]);
+    let k1 = EpochKey::new([0x40u8; 32]);
+
+    // B was offline; its local Space is still at epoch 0 with K(0).
+    let b_space_initial = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(b_space_initial);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    // Admin's Space is at epoch 1 — they encrypt content B must eventually read.
+    let admin_space_k1 = make_space_with_epoch(community_id, admin_addr, 1, k1.clone());
+    let msg = b"epoch-1 message for offline B";
+    let env1 = encrypt_for_topic(&admin_space_k1, msg).expect("admin encrypt@1");
+
+    // Admin synthesizes a catchup for B (sealed K(1) directly to B).
+    let sealed_pairs = seal_epoch_to_members(&k1, &[(&b_addr, &b_signing_key)]);
+    let catchup_event = make_signed_event(
+        0xB0,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochCatchup {
+            epoch: 1,
+            triggered_by: b_addr.0,
+            recipient_ciphertexts: sealed_pairs
+                .into_iter()
+                .map(|(recipient, sealed)| RecipientCiphertext { recipient, sealed })
+                .collect(),
+        },
+        2000,
+        &admin_signing_key,
+    );
+
+    // B receives the catchup delta.
+    apply_remote_epoch_event(
+        Arc::clone(&crdt_state),
+        Arc::clone(&b_signing_key),
+        community_id,
+        &catchup_event,
+        b_addr,
+    )
+    .await;
+
+    // Verify: B now has epoch=1 + K(1). old_epoch_keys must be EMPTY
+    // (catchup doesn't archive — B never held K(0) as "current" at epoch 1).
+    {
+        let state = crdt_state.lock().await;
+        let space = state.spaces.get(&community_id).expect("space must exist");
+        assert_eq!(space.current_epoch, Some(1), "catchup must set epoch to 1");
+        assert_eq!(
+            space.current_epoch_key.as_ref().map(|k| k.as_bytes()),
+            Some(k1.as_bytes()),
+            "catchup must install K(1)"
+        );
+        assert!(
+            space.old_epoch_keys.is_empty(),
+            "catchup must NOT archive keys (no prior epoch held)"
+        );
+    }
+
+    // B can now decrypt the epoch-1 envelope.
+    let b_space_updated = {
+        let state = crdt_state.lock().await;
+        state.spaces.get(&community_id).cloned().expect("space")
+    };
+    let decrypted = decrypt_for_topic(&b_space_updated, &env1).expect("B decrypts@1");
+    assert_eq!(decrypted, msg);
+}
+
+/// Phase D test 3: `apply_remote_epoch_event` is idempotent — applying the
+/// same rotation twice leaves the Space unchanged on the second call.
+///
+/// This covers the duplicate CRDT delivery scenario: Zenoh may re-deliver
+/// deltas; the function must not double-archive or advance the epoch counter
+/// a second time.
+#[tokio::test]
+async fn remote_rotation_apply_is_idempotent() {
+    use harmony_app::apply_remote_epoch_event;
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+
+    let community_id = SpaceId([0x52; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed));
+
+    let k0 = EpochKey::new([0x50u8; 32]);
+    let k1 = EpochKey::new([0x60u8; 32]);
+
+    // Admin starts at epoch 0.
+    let admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(admin_space);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    // Build a rotation event sealing K(1) to admin only.
+    let sealed_pairs = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+    let rotation_event = make_signed_event(
+        0xC0,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: admin_addr.0,
+            recipient_ciphertexts: sealed_pairs
+                .into_iter()
+                .map(|(recipient, sealed)| RecipientCiphertext { recipient, sealed })
+                .collect(),
+        },
+        1000,
+        &admin_signing_key,
+    );
+
+    // Apply once.
+    apply_remote_epoch_event(
+        Arc::clone(&crdt_state),
+        Arc::clone(&admin_signing_key),
+        community_id,
+        &rotation_event,
+        admin_addr,
+    )
+    .await;
+
+    // Apply again (simulated duplicate delivery).
+    apply_remote_epoch_event(
+        Arc::clone(&crdt_state),
+        Arc::clone(&admin_signing_key),
+        community_id,
+        &rotation_event,
+        admin_addr,
+    )
+    .await;
+
+    // Epoch must still be 1 (not 2), and old_epoch_keys must have exactly one entry.
+    let state = crdt_state.lock().await;
+    let space = state.spaces.get(&community_id).expect("space");
+    assert_eq!(space.current_epoch, Some(1), "idempotent: epoch stays at 1");
+    assert_eq!(
+        space.old_epoch_keys.len(),
+        1,
+        "idempotent: only one archived key"
+    );
+    assert_eq!(
+        space.old_epoch_keys.get(&0).map(|k| k.as_bytes()),
+        Some(k0.as_bytes()),
+        "K(0) archived at index 0"
+    );
+    assert_eq!(
+        space.current_epoch_key.as_ref().map(|k| k.as_bytes()),
+        Some(k1.as_bytes()),
+        "current key remains K(1)"
+    );
+}
+
+/// Phase D test 4: `apply_remote_epoch_event` is a no-op for events where
+/// the local node is not in the recipient list (e.g., the node was kicked).
+///
+/// The local node's Space must remain unchanged.
+#[tokio::test]
+async fn remote_rotation_noop_when_not_in_recipient_list() {
+    use harmony_app::apply_remote_epoch_event;
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+
+    let community_id = SpaceId([0x53; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed));
+
+    // B is the node that was kicked — NOT in the rotation's recipient list.
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&b_ed_seed));
+
+    let k0 = EpochKey::new([0x70u8; 32]);
+    let k1 = EpochKey::new([0x80u8; 32]);
+
+    // B starts at epoch 0 with K(0).
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut owner_state = OwnerState::default();
+    owner_state.apply_space_with_canonicalization(b_space);
+    let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
+
+    // Rotation seals K(1) to admin only — B is NOT included (kicked).
+    let sealed_pairs = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+    let rotation_event = make_signed_event(
+        0xD0,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: b_addr.0, // B was the triggered_by (kicked member)
+            recipient_ciphertexts: sealed_pairs
+                .into_iter()
+                .map(|(recipient, sealed)| RecipientCiphertext { recipient, sealed })
+                .collect(),
+        },
+        1000,
+        &admin_signing_key,
+    );
+
+    // B receives the rotation event — but B is not in the recipient list.
+    apply_remote_epoch_event(
+        Arc::clone(&crdt_state),
+        Arc::clone(&b_signing_key),
+        community_id,
+        &rotation_event,
+        b_addr,
+    )
+    .await;
+
+    // B's Space must be unchanged — still at epoch 0 with K(0).
+    let state = crdt_state.lock().await;
+    let space = state.spaces.get(&community_id).expect("space");
+    assert_eq!(
+        space.current_epoch,
+        Some(0),
+        "B's epoch must remain 0 (not in recipient list)"
+    );
+    assert_eq!(
+        space.current_epoch_key.as_ref().map(|k| k.as_bytes()),
+        Some(k0.as_bytes()),
+        "B's key must remain K(0)"
+    );
+    assert!(
+        space.old_epoch_keys.is_empty(),
+        "no archiving when not in recipient list"
     );
 }

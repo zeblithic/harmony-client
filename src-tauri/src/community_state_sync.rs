@@ -199,9 +199,16 @@ pub fn decrypt_blob(mk: &EpochKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryp
 /// convergence), and the per-(addr, device) replay tracker before
 /// merging events.
 ///
-/// Wire format: 4-key CBOR map. All field codes are 2 chars
-/// (`rc`/`pa`/`at`/`ps`) to satisfy the same-length-keys invariant
-/// at this nesting level.
+/// Wire format: 4-key CBOR map (or 5-key if `epoch` is Some). All
+/// field codes are 2 chars (`rc`/`pa`/`at`/`ps`/`ep`) to satisfy the
+/// same-length-keys invariant at this nesting level.
+///
+/// ZEB-249 §10.6 (Phase A): added optional `epoch` field so receivers
+/// can select the correct historical epoch key for decryption when the
+/// sender's epoch differs from the receiver's current epoch. Legacy
+/// messages without this field fall back to the current-then-old-key
+/// trial decryption. `skip_serializing_if = "Option::is_none"` keeps
+/// the wire bytes identical to v1 for publishers that haven't upgraded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityRootPublishPayload {
     /// Content-ID of the encrypted CommunityState blob in the shared
@@ -229,6 +236,13 @@ pub struct CommunityRootPublishPayload {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub publisher_sig: [u8; 64],
+
+    /// ZEB-249 §10.6: epoch counter at publish time. Receivers use this
+    /// to select `old_epoch_keys[epoch]` when their `current_epoch`
+    /// differs. `None` for legacy publishes (pre-§10.6); receivers fall
+    /// back to trying current key then old keys in reverse order.
+    #[serde(rename = "ep", skip_serializing_if = "Option::is_none", default)]
+    pub epoch: Option<u64>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
@@ -257,13 +271,19 @@ impl CanonicalPayload for CommunityRootSignedPayload {}
 
 impl CommunityRootSignedPayload {
     /// Convert a signed sub-payload into its full wire envelope by
-    /// attaching the Ed25519 signature.
-    pub fn into_wire(self, publisher_sig: [u8; 64]) -> CommunityRootPublishPayload {
+    /// attaching the Ed25519 signature and the publisher's current epoch
+    /// (ZEB-249 §10.6: receivers use this to select the right epoch key).
+    pub fn into_wire(
+        self,
+        publisher_sig: [u8; 64],
+        epoch: Option<u64>,
+    ) -> CommunityRootPublishPayload {
         CommunityRootPublishPayload {
             root_cid: self.root_cid,
             publisher_addr: self.publisher_addr,
             at: self.at,
             publisher_sig,
+            epoch,
         }
     }
 }
@@ -770,6 +790,23 @@ pub struct CommunitySyncEngineConfig {
     /// without a back-reference to the registry. `None` for tests /
     /// pre-Phase-4 callers that don't exercise the redeem path.
     pub pending_redemptions: Option<PendingRedemptionMap>,
+
+    /// ZEB-249 §10.6 (Phase A): live reference to the owner-state CRDT.
+    /// When `Some`, `publish_root_now` reads the current epoch key from
+    /// `spaces[community_id].current_epoch_key` rather than the
+    /// spawn-time captured `membership_key`. `handle_incoming_publish`
+    /// similarly uses the live key (with fallback to `old_epoch_keys`
+    /// keyed on `payload.epoch`). `None` for tests and for call sites
+    /// that haven't threaded crdt_state through yet; those fall back to
+    /// the captured `membership_key`.
+    ///
+    /// Lock-order note: the engine NEVER holds both the community-state
+    /// mutex and the owner-state mutex at the same time. In
+    /// `publish_root_now`, the owner-state lock is released before the
+    /// community-state snapshot is taken. In `handle_incoming_publish`,
+    /// the owner-state lock is released before the community-state merge
+    /// lock is acquired.
+    pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -883,6 +920,11 @@ impl CommunitySyncEngine {
         // `engine_arc(cid).membership_key()`. Cheap clone (32-byte
         // wrapper); the spawned task gets its own clone via cfg.
         let membership_key_for_engine = cfg.membership_key.clone();
+        // ZEB-249 §10.6: pass crdt_state to the spawned task (InternalCtx)
+        // so publish_root_now / handle_incoming_publish can read the live
+        // epoch key. The engine struct itself doesn't need the reference —
+        // only the task does.
+        let crdt_state_for_task = cfg.crdt_state;
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -907,6 +949,7 @@ impl CommunitySyncEngine {
             error_tx: cfg.error_tx,
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
+            crdt_state: crdt_state_for_task,
         }));
 
         Self {
@@ -1409,6 +1452,11 @@ struct InternalCtx {
     /// against an Inserted event's id. `None` skips the notify path —
     /// safe for non-redeem callers.
     pending_redemptions: Option<PendingRedemptionMap>,
+
+    /// ZEB-249 §10.6 (Phase A): live owner-state CRDT for current epoch
+    /// key lookup. `None` for tests that use the spawn-time fallback.
+    /// See `CommunitySyncEngineConfig.crdt_state` for the lock-order contract.
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -1615,6 +1663,29 @@ async fn internal_task(mut ctx: InternalCtx) {
     }
 }
 
+/// ZEB-249 §10.6 (Phase A): read the live epoch key and epoch counter
+/// for `community_id` from the owner-state CRDT (`crdt_state`), falling
+/// back to the engine's spawn-time `membership_key` when `crdt_state`
+/// is `None` or the Space is absent/incomplete.
+///
+/// Returns `(epoch_key, epoch_counter)`. `epoch_counter` is `None`
+/// when the fallback fires (spawn-time key carries no epoch metadata).
+async fn live_epoch_key(
+    community_id: SpaceId,
+    crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    fallback: &EpochKey,
+) -> (EpochKey, Option<u64>) {
+    if let Some(cs) = crdt_state {
+        let guard = cs.lock().await;
+        if let Some(space) = guard.spaces.get(&community_id) {
+            if let (Some(k), Some(e)) = (space.current_epoch_key.clone(), space.current_epoch) {
+                return (k, Some(e));
+            }
+        }
+    }
+    (fallback.clone(), None)
+}
+
 /// Snapshot the local CRDT, encrypt it, write to CAS, build a
 /// `CommunityRootPublishPayload`, AEAD-wrap it for the wire, and ship
 /// it on `publisher_tx`.
@@ -1643,6 +1714,17 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
     use ed25519_dalek::Signer;
 
+    // ZEB-249 §10.6 Phase A: read the live epoch key BEFORE snapshotting
+    // community state so we never hold both locks at the same time
+    // (lock-order: owner-state THEN community-state is forbidden; we
+    // release owner-state lock here before acquiring community-state).
+    let (current_key, current_epoch) = live_epoch_key(
+        ctx.community_id,
+        ctx.crdt_state.as_ref(),
+        &ctx.membership_key,
+    )
+    .await;
+
     // Snapshot CRDT state under brief lock; drop guard before the
     // expensive encode + AEAD + CAS hops below.
     let snapshot = {
@@ -1656,7 +1738,9 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 
     // 2. Encrypt with deterministic-nonce blob AEAD so cipher_cid is
     //    reproducible across replicas (dedup + convergence).
-    let blob_ciphertext = encrypt_blob(&ctx.membership_key, &blob_cleartext)?;
+    //    ZEB-249 §10.6: uses `current_key` (live epoch key) rather than
+    //    the spawn-time `membership_key`.
+    let blob_ciphertext = encrypt_blob(&current_key, &blob_cleartext)?;
 
     // 3. Derive structured ContentId for the encrypted blob. Flagged
     //    `encrypted: true` so the eviction policy classifies it as
@@ -1690,13 +1774,17 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
     let publisher_sig = ctx.signing_key.sign(&signed_bytes).to_bytes();
 
-    // 7. Wrap into the full wire envelope.
-    let payload = signed.into_wire(publisher_sig);
+    // 7. Wrap into the full wire envelope, including the current epoch
+    //    tag so receivers can select the matching key.
+    //    ZEB-249 §10.6: `current_epoch` is `Some` when crdt_state is
+    //    available; `None` for test-fallback (legacy behaviour).
+    let payload = signed.into_wire(publisher_sig, current_epoch);
     let payload_bytes = canonical_cbor_encode(&payload)
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
 
     // 8. Encrypt with random-nonce root AEAD (every publish is fresh).
-    let wire = encrypt_root_publish(&ctx.membership_key, &payload_bytes)?;
+    //    ZEB-249 §10.6: uses `current_key` (live epoch key).
+    let wire = encrypt_root_publish(&current_key, &payload_bytes)?;
 
     // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
     ctx.publisher_tx
@@ -1938,10 +2026,55 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     use crate::community_membership::MemberStatus;
     use crate::owner_state_crypto::canonical_cbor_encode;
 
-    // 1. Decrypt root publish.
-    let payload_bytes = match decrypt_root_publish(&ctx.membership_key, &wire) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+    // ZEB-249 §10.6 Phase A: snapshot live epoch key state BEFORE any
+    // lock on community state.  We collect (current_key, old_keys_rev)
+    // here so the decrypt trial loop below doesn't need to re-acquire
+    // any mutex.  Lock-order: owner-state lock released before community-
+    // state lock is ever taken.
+    let (outer_current_key, outer_old_keys_rev) = if let Some(cs) = ctx.crdt_state.as_ref() {
+        let guard = cs.lock().await;
+        if let Some(space) = guard.spaces.get(&ctx.community_id) {
+            let cur = space
+                .current_epoch_key
+                .clone()
+                .unwrap_or_else(|| ctx.membership_key.clone());
+            // Collect old epoch keys in reverse order (newest first) so we
+            // try the most-likely match before the most-stale.
+            let old_rev: Vec<EpochKey> = {
+                let mut v: Vec<(u64, EpochKey)> = space
+                    .old_epoch_keys
+                    .iter()
+                    .map(|(e, k)| (*e, k.clone()))
+                    .collect();
+                v.sort_by(|a, b| b.0.cmp(&a.0));
+                v.into_iter().map(|(_, k)| k).collect()
+            };
+            (cur, old_rev)
+        } else {
+            (ctx.membership_key.clone(), vec![])
+        }
+    } else {
+        (ctx.membership_key.clone(), vec![])
+    };
+
+    // 1. Decrypt root publish.  ZEB-249 §10.6: try current epoch key
+    //    first, then old keys in reverse order (newest first) for the
+    //    brief transition window where a sender may use a key that's one
+    //    epoch behind our current view.
+    let payload_bytes = {
+        let mut result = decrypt_root_publish(&outer_current_key, &wire);
+        if result.is_err() {
+            for old_key in &outer_old_keys_rev {
+                result = decrypt_root_publish(old_key, &wire);
+                if result.is_ok() {
+                    break;
+                }
+            }
+        }
+        match result {
+            Ok(b) => b,
+            Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+        }
     };
     let payload: CommunityRootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
         Ok(p) => p,
@@ -2152,9 +2285,25 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     };
 
     // 7. Decrypt blob (deterministic-nonce).
-    let blob_cleartext = match decrypt_blob(&ctx.membership_key, &blob_ciphertext) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+    //    ZEB-249 §10.6: use the epoch key selected from payload.epoch.
+    //    If payload.epoch matches outer_current_key's epoch, we use that.
+    //    Otherwise we try to find the key for that epoch in our old_epoch_keys.
+    //    Fall back to the same trial-decrypt order used for the outer wire.
+    let blob_cleartext = {
+        // Try the outer key we used to decrypt the wire (most likely match).
+        let mut result = decrypt_blob(&outer_current_key, &blob_ciphertext);
+        if result.is_err() {
+            for old_key in &outer_old_keys_rev {
+                result = decrypt_blob(old_key, &blob_ciphertext);
+                if result.is_ok() {
+                    break;
+                }
+            }
+        }
+        match result {
+            Ok(b) => b,
+            Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+        }
     };
 
     // 8. Decode CommunityState.
@@ -2579,6 +2728,12 @@ pub struct CommunityRegistryConfig {
     /// `start_node` time; identical handle to the one Phase 3's
     /// `insert_local_event` uses for membership-event signing.
     pub signing_key: Arc<ed25519_dalek::SigningKey>,
+
+    /// ZEB-249 §10.6 (Phase A): optional reference to the owner-state
+    /// CRDT. When `Some`, every spawned engine receives a clone of this
+    /// Arc so `publish_root_now` / `handle_incoming_publish` can read
+    /// the live epoch key. `None` for tests that use the spawn-time key.
+    pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -2594,6 +2749,11 @@ pub struct CommunityRegistryConfig {
 pub struct CommunitySyncRegistry {
     cfg: Arc<CommunityRegistryConfig>,
     engines: tokio::sync::Mutex<BTreeMap<SpaceId, Arc<CommunitySyncEngine>>>,
+    /// ZEB-249 §10.6 (Phase A): optional owner-state CRDT reference,
+    /// cloned from `CommunityRegistryConfig.crdt_state` at construction.
+    /// Passed into every `spawn_engine_inner_now` call so engines can
+    /// read the live epoch key. `None` for tests.
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
     /// ZEB-262 Phase 4: per-`EventId` oneshots that fire when the
     /// matching `SignedMembershipEvent` is Inserted into ANY engine in
     /// this registry. The `redeem_invite` IPC registers a oneshot
@@ -2761,9 +2921,11 @@ impl Drop for CommunitySyncSpawnGuard {
 
 impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
+        let crdt_state = cfg.crdt_state.as_ref().map(Arc::clone);
         Self {
             cfg: Arc::new(cfg),
             engines: tokio::sync::Mutex::new(BTreeMap::new()),
+            crdt_state,
             pending_redemptions: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -3183,6 +3345,9 @@ impl CommunitySyncRegistry {
             // `Arc` for IPC-side `register_pending_redemption` /
             // `take_pending_redemption` / `notify_pending_redemption`.
             pending_redemptions: Some(std::sync::Arc::clone(&self.pending_redemptions)),
+            // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
+            // so the engine can read current_epoch_key dynamically.
+            crdt_state: self.crdt_state.as_ref().map(Arc::clone),
         }));
 
         engines.insert(community_id, engine);
@@ -3568,6 +3733,7 @@ mod tests {
             delta_tx: None,
             self_owner: OwnerAddr([0x01; 16]),
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
         }));
 
         // Adapter-request bridge: `spawn_engine_with_guard` will

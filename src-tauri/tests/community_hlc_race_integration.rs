@@ -176,6 +176,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         error_tx: None,
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // Insert the bootstrap Join (Alice's self-Join, which gives her

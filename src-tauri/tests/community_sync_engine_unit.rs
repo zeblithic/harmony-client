@@ -94,6 +94,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // Shutdown without ever sending dirty — clean path.
@@ -157,6 +158,7 @@ async fn flush_now_publishes_one_root_publish() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -337,6 +339,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // B needs an OwnerDeviceCache-style lookup that returns
@@ -373,6 +376,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // Trigger A's publish. B's subscriber arm should fire and merge.
@@ -610,6 +614,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     struct SingleIdentityResolver {
@@ -657,6 +662,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         error_tx: None,
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine_a.flush_now().await.expect("flush_now");
@@ -756,6 +762,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         error_tx: None,
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     let payload = EventPayload {
@@ -908,6 +915,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
     engine.shutdown().await.expect("shutdown");
 }
@@ -981,6 +989,7 @@ async fn publish_carries_valid_publisher_sig() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -1141,7 +1150,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let bad_sig = bob_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(bad_sig);
+    let envelope = signed.into_wire(bad_sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode envelope");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1188,6 +1197,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1368,7 +1378,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let valid_sig = alice_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(valid_sig);
+    let envelope = signed.into_wire(valid_sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode env");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1408,6 +1418,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1543,7 +1554,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = alice_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(sig);
+    let envelope = signed.into_wire(sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode env");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1586,6 +1597,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // 1. Cold cache: resolver empty → first delivery rejected.

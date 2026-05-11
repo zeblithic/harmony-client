@@ -187,6 +187,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         delta_tx: None,
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_sk),
+        crdt_state: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "bob-dev".into(),
@@ -198,6 +199,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         delta_tx: None,
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_sk),
+        crdt_state: None,
     }));
 
     // Bob's owner-state CRDT and HLC tracker. Bob's redeem_invite_inner

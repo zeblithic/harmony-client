@@ -426,12 +426,13 @@ pub enum InviteUrlError {
     Cbor(String),
     /// Defends the CBOR decoder against unbounded input: a hostile
     /// paste of a multi-MB body would otherwise burn allocator + decode
-    /// time before failing. A real invite is ~120-180 bytes; the cap is
-    /// generous enough to absorb future field growth without becoming
-    /// a DoS vector. Measured in base64 characters of the body
-    /// (post-`harmony://invite/` strip), NOT decoded bytes — 4096
-    /// base64 chars decode to ~3072 raw bytes.
-    #[error("invite payload exceeds 4096 base64-char limit (got {0} chars)")]
+    /// time before failing. A real invite is ~120-240 bytes base64; the
+    /// cap is generous enough to absorb future field growth (§10.3
+    /// materialized-state snapshot) without becoming a DoS vector.
+    /// Measured in base64 characters of the body
+    /// (post-`harmony://invite/` strip), NOT decoded bytes — 85 333
+    /// base64 chars decode to exactly 64 KiB raw.
+    #[error("invite payload exceeds 85 333 base64-char limit (got {0} chars)")]
     TooLarge(usize),
     /// Caller passed an invite-only payload missing the admin bootstrap
     /// fields (`admin_bootstrap` and/or `admin_identity_pub`). The reader

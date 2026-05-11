@@ -188,6 +188,7 @@ async fn two_members_dag_sync_full_event_log() {
         // ZEB-256 Task 6: A's registry signs publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -201,6 +202,7 @@ async fn two_members_dag_sync_full_event_log() {
         // values just need to satisfy the type bound.
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way
@@ -398,6 +400,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
         // engine matches what production would have.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     // We need direct access to B's subscriber channel sender to
@@ -500,7 +503,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = admin_signing.sign(&signed_bytes).to_bytes();
-    let publish = signed.into_wire(sig);
+    let publish = signed.into_wire(sig, None);
     let publish_bytes = canonical_cbor_encode(&publish).expect("encode publish");
     let wire = encrypt_root_publish(&mk, &publish_bytes).expect("encrypt root");
 
@@ -618,6 +621,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         // ZEB-256 Task 6: A publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -631,6 +635,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         // works here for the type-bound.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -817,6 +822,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         // ZEB-256 Task 6: A publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -830,6 +836,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         // the type bound.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -1116,6 +1123,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         // publisher under attack.
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1133,6 +1141,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         // B's own publishes (if it ever ran one) would also validate.
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing),
+        crdt_state: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way sync
@@ -1312,7 +1321,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // line that distinguishes the forged packet from a legitimate
     // Alice publish; everything else is byte-perfect imitation.
     let forged_sig = bob_signing.sign(&forged_signed_bytes).to_bytes();
-    let forged_publish = forged_signed.into_wire(forged_sig);
+    let forged_publish = forged_signed.into_wire(forged_sig, None);
     let forged_publish_bytes =
         canonical_cbor_encode(&forged_publish).expect("encode forged publish");
     let forged_wire =
@@ -1576,6 +1585,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         delta_tx: None,
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1587,6 +1597,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         delta_tx: None,
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
     });
 
     // B never publishes, A never receives — but spawn_engine requires
@@ -1930,6 +1941,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         delta_tx: None,
         self_owner,
         signing_key: Arc::clone(&signing_key),
+        crdt_state: None,
     }));
 
     // ZEB-271: ChannelLogRegistry required by the new create_community_inner
@@ -2221,6 +2233,7 @@ mod task3_kick_setpower_round_trip {
             error_tx: None,
             delta_tx: Some(delta_a_tx),
             pending_redemptions: None,
+            crdt_state: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2244,6 +2257,7 @@ mod task3_kick_setpower_round_trip {
             error_tx: None,
             delta_tx: Some(delta_b_tx),
             pending_redemptions: None,
+            crdt_state: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
@@ -2648,6 +2662,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         delta_tx: None,
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing_key),
+        crdt_state: None,
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));

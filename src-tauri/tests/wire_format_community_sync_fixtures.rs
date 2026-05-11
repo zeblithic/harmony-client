@@ -63,6 +63,9 @@ fn community_root_publish_payload_wire_bytes_pinned() {
             device_id: "d1".into(),
         },
         publisher_sig: [0xCC; 64],
+        // epoch: None — this field was added in ZEB-249 §10.6 with
+        // skip_serializing_if = "Option::is_none" so legacy wire bytes are unchanged.
+        epoch: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");

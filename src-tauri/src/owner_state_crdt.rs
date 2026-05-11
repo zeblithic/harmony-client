@@ -757,6 +757,15 @@ impl OwnerState {
     /// Used by the self-healing observer to obtain the CURRENT epoch key (the
     /// key that was installed when `kick_from_community` / `leave_community`
     /// landed the rotation locally) rather than the engine's spawn-time key.
+    ///
+    /// ZEB-249 §10.6 Phase C — hydration watermark note: a separate
+    /// "have-we-replayed-all-events-since-boot" flag is NOT needed here.
+    /// Phase A wires `CommunitySyncEngine` to read the live key from this
+    /// function on every publish/decrypt, and Phase B's
+    /// `apply_remote_epoch_event` updates this entry immediately when a
+    /// remote EpochRotation / EpochCatchup delta lands. Together they ensure
+    /// the key is always current by the time any encrypt or decrypt is
+    /// attempted — no separate replay-complete gate is required.
     pub fn current_epoch_key_for(
         &self,
         community_id: crate::owner_state_types::SpaceId,

@@ -577,31 +577,60 @@ Mitigations not adopted: rotating on every Join (would double rotation frequency
 
 Each rotation adds one entry to `old_epoch_keys` (~32 bytes). At 1 kick/month, growth is ~400 bytes/year per community. Communities with very high churn (100 kicks/month) would see ~40 KB/year. After 10 years, still ~400 KB worst case. Bounded and acceptable. No pruning policy needed for v2.
 
-### 10.6 Remote-rotation key extraction not wired
+### 10.6 Remote-rotation key extraction (implemented in PR #106 R4)
 
-The current implementation updates `Space.current_epoch_key` only when
-the LOCAL node's kick/leave handler issues a rotation. When a REMOTE
-admin's rotation arrives via CRDT sync, the local node's
-`Space.current_epoch_key` is NOT advanced — it remains at the
-pre-rotation key.
+Previously, `Space.current_epoch_key` was updated only when the LOCAL
+node's kick/leave handler issued a rotation. When a REMOTE admin's
+rotation arrived via CRDT sync, the local node was stuck at the old key.
 
-Practical impact:
-- Local users CAN'T decrypt new messages encrypted under the new
-  epoch key — they're stuck at the old key.
-- Self-healing observer's catchup synthesis uses an out-of-date key.
+**Phase A — live-key wiring for CommunitySyncEngine:**
+`CommunitySyncEngine`'s `publish_root_now` and `handle_incoming_publish`
+now read the epoch key from `crdt_state` (the live `OwnerState`) via a
+new `live_epoch_key()` helper rather than using the spawn-time
+`membership_key`. Old keys are tried in reverse for decryption
+(multi-key retry loop) to handle cross-epoch receive ordering.
 
-This is a v2 follow-up: implement an "epoch-key extraction on remote
-rotation" path in the engine's CRDT-apply layer that:
-1. Identifies the local user's `recipient_ciphertexts[my_addr]` entry.
-2. Decrypts it via `dm_signing::open_from_owner` + the local
-   identity privkey.
-3. Updates `crdt_state.spaces[community_id].current_epoch_key`
-   (and pushes the old key to `old_epoch_keys`).
+**Phase B — `apply_remote_epoch_event`:**
+A new `pub async fn apply_remote_epoch_event(...)` in `lib.rs` is
+called from the CRDT delta consumer immediately before
+`self_heal_community_observer`. It:
+1. Identifies the local user's `recipient_ciphertexts[local_addr]`
+   entry in the incoming `EpochRotation` or `EpochCatchup`.
+2. Decrypts it via `dm_signing::open_from_owner` +
+   `ed25519_priv_to_x25519(local_signing_key)`.
+3. Updates `crdt_state.spaces[community_id]` directly (bypassing
+   `apply_space`, which rejects epoch-key mutations as CRDT-replicated
+   ops — remote key extraction is a local-only side effect).
+4. For `EpochRotation`: archives the old key into `old_epoch_keys`,
+   advances `current_epoch` by 1.
+5. For `EpochCatchup`: sets `current_epoch` + `current_epoch_key`
+   directly (no archiving — catchup delivers the current key to a
+   latecomer).
+6. Idempotent: no-op if `current_epoch` already ≥ target epoch.
 
-The integration tests cover the LOCAL-issued-rotation happy paths
-exhaustively, but cross-node rotation receipt is not yet wired
-end-to-end. This was discovered during ZEB-249 Task 6 code review
-and is filed as a follow-up.
+**Phase C — hydration watermark (moot):**
+A separate "replay-complete" flag is not needed. Phase A reads live
+state on every encrypt/decrypt; Phase B updates live state immediately
+on delta arrival. The key is always current by the time any operation
+needs it. See doc-comment on `current_epoch_key_for` in
+`owner_state_crdt.rs`.
+
+**Phase D — 4 cross-node integration tests** added to
+`community_backward_secrecy_integration.rs`:
+- `two_node_remote_rotation_propagates_new_key`
+- `offline_catchup_via_remote_rotation_observation`
+- `remote_rotation_apply_is_idempotent`
+- `remote_rotation_noop_when_not_in_recipient_list`
+
+**Phase E — R3 bot review fixes:**
+- E1: catchup dedupe uses `(SpaceId, OwnerAddr, EventId)` key.
+- E2: invite-only `sealed_epoch_key` minimum-size check before decryption.
+- E3: `InviteUrlError::TooLarge` message + doc updated to 85 333 chars.
+- E4: `leave_community` solo-leave sentinel is a named constant
+  (`LEAVE_SOLO_SENTINEL`); comparison uses `==` not `contains`.
+- E5: `apply_rotation_to_space` test helper validates `prior_epoch`.
+- E6: `stale_invite_catchup_unlocks_decryption_end_to_end` asserts
+  that `EpochCatchup` does NOT populate `old_epoch_keys`.
 
 ## 11. Acceptance criteria
 
