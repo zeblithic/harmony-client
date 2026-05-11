@@ -391,6 +391,27 @@ If `Drop` runs in a thread without an active tokio runtime (e.g., panic-during-d
 
 This is a strictly better failure mode than today (today: panic-during-drop = leak with no log; ZEB-274: panic-during-drop = leak with a clear warn pointing at the next-boot recovery).
 
+### §10.3 Detached cleanup race with concurrent retries (Qodo round 1 finding)
+
+`CommunitySyncSpawnGuard::Drop` spawns the async `shutdown_engine_and_cleanup_persistence` via `Handle::try_current().handle.spawn(...)` rather than `.await`-ing it inline (per `feedback_engineer_for_real_scale` — `Drop` must not block on the hot path). The IPC handler returns Err to the caller IMMEDIATELY; the cleanup task runs in the background.
+
+**Race:** If the user immediately retries (only relevant for `redeem_invite_inner` since `create_community_inner` mints a fresh `community_id` per call):
+
+1. Caller A: `spawn_engine_with_guard` (fresh) → `freshly_created = true` → fails before `commit()` → `Drop` spawns async cleanup task
+2. Caller A returns Err immediately
+3. Caller B (retry, same `community_id` from invite): `spawn_engine_with_guard` → finds existing engine in registry (cleanup task hasn't fired yet) → idempotent path → `freshly_created = false` → `Drop` is no-op → does work → `apply_space` succeeds → `commit()` → owner-state is durable for B
+4. Caller A's cleanup task fires → `engine.shutdown().await` → engine torn down
+5. Subsequent operations (e.g., publishing channel-config events) fail with `EngineNotRunning` until `reconcile_from_state` at next `start_node` respawns the engine
+
+**Bounded impact:**
+- Race window = `engine.shutdown().await` duration (typically a few ms; can grow under heavy backlog of pending writes — bounded by the per-community state CRDT debounce interval).
+- No data loss — owner-state is durable; `reconcile_from_state` at next `start_node` respawns the engine from on-disk state.
+- User-observable degradation: brief `EngineNotRunning` errors in the data plane until next process restart.
+
+**Why we accept this:** the same race shape exists in [ZEB-271](https://linear.app/zeblith/issue/ZEB-271) §10.2 (channel-log commit failures: data plane dead until reconcile) and was accepted as a known limitation there. ZEB-274 inherits the same trade-off. A synchronous-condemnation fix (mark engine as condemned in the engines map under the engines lock, drain on next access) is non-trivial (~50-100 lines + new condemnation flag on the engines map entry + concurrent-access semantics around condemned engines) and out of scope.
+
+**Future enhancement candidate:** add a "condemned" sentinel value to the engines map that `spawn_engine_inner_now`'s idempotent path checks; condemned-then-fresh-spawn semantics would preempt the race. Tracked separately if this UX degradation becomes user-visible.
+
 ## §11 Acceptance criteria
 
 1. ✅ Decision (RAII rollback guard) selected per §2; deferred-spawn rejected for IPC-pre-commit-engine-interaction reason.
@@ -401,7 +422,7 @@ This is a strictly better failure mode than today (today: panic-during-drop = le
    - All 4 `_inner` integration tests per §7.2 + §7.3 passing
 3. ZEB-271 spec §9 updated in this PR (per §7.4) to mark cross-ref RESOLVED.
 4. The freshness-flag (`engine_freshly_created` bool) removed from `spawn_engine` public surface; internalized into guard. ZEB-260 PR #90 round-5 race semantics preserved (verified by `redeem_invite_concurrent_race_loser_no_op_on_drop` test).
-5. All 5 CI gates green: cargo fmt, cargo clippy --features test-fixtures, cargo nextest run, cargo check (msrv proxy), npx tsc + vitest (frontend unaffected but gates still run).
+5. All 5 CI gates green: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`, `cargo check --locked --all-targets --features test-fixtures` (msrv proxy), `npx tsc --noEmit` + `npx vitest run` (frontend unaffected but gates still run).
 
 ## §12 References
 

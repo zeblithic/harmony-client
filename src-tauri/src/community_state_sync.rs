@@ -2547,11 +2547,15 @@ impl CommunitySyncRegistry {
 
         // Recover the engine handle for the caller. The inner helper
         // doesn't return it directly to preserve the existing return-type
-        // shape on the inner; we look it up from the registry. The lookup
-        // is guaranteed to succeed (the engine was just inserted under
-        // the engines lock and we haven't yielded since — for the
-        // freshly_created path. For the idempotent path, the existing
-        // engine is what we return.)
+        // shape on the inner; we look it up from the registry.
+        //
+        // The lookup re-acquires the engines lock asynchronously. In the
+        // freshly_created path, the engine was just inserted under the
+        // same lock — the only way the lookup would miss is if a
+        // concurrent caller invoked `shutdown_engine_and_cleanup_persistence`
+        // (only called by rollback paths) between insert and lookup. The
+        // `ok_or_else` below handles this rare case with a clear error.
+        // In the idempotent path, the existing engine is what we return.
         let engine = self.engine_arc(&community_id).await.ok_or_else(|| {
             CommunitySyncError::Persist(format!(
                 "engine vanished immediately after spawn_engine_inner_now \

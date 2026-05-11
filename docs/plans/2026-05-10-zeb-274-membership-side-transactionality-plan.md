@@ -316,7 +316,7 @@ pub(crate) async fn spawn_engine_inner_now(
 Run: `grep -rn "\.spawn_engine\(" src-tauri/ | grep -v "spawn_engine_with_guard\|spawn_engine_inner_now"`
 Expected output (these are the production call sites that need fixing):
 
-```
+```text
 src-tauri/src/lib.rs:1747:                            .spawn_engine(space_id, mk, admin, is_invite_only, pub_tx, sub_rx)
 src-tauri/src/lib.rs:7275:        .spawn_engine(
 src-tauri/src/lib.rs:8531:        .spawn_engine(
