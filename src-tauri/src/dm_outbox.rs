@@ -4590,6 +4590,14 @@ mod tests {
     // I/O) ample headroom to acquire+release locks before the test
     // mutates state. Bumping if any flake observed.
 
+    /// Time the test sleeps after spawning `handle_cidnotify_lifted`
+    /// to let Phase A run and drop its locks before the test mutates
+    /// state. Phase A is purely in-memory (signature verify + BTreeMap
+    /// lookup + clone) — microsecond-scale even on contended runners.
+    /// 50ms is ~5 orders of magnitude headroom; if this ever flakes
+    /// on CI bump to 200ms.
+    const PHASE_A_GRACE_MS: u64 = 50;
+
     /// CAS stub that blocks `get()` on a `tokio::sync::Notify` until
     /// `release()` fires. Used by the ZEB-241 TOCTOU regression tests
     /// to inject state mutations between Phase A (Space snapshot) and
@@ -4717,7 +4725,7 @@ mod tests {
 
         // Let Phase A run + drop its locks. Phase A is microsecond-
         // scale (no I/O), 50ms is generous headroom.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
 
         // Mutate state under the lock: rotate content_key K1 → K2,
         // record K1 as prior. Direct insertion bypasses
@@ -4820,7 +4828,7 @@ mod tests {
             500,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
 
         // Mutate state: remove the Space entirely. Direct removal
         // bypasses any tombstone semantics (Phase 2 is in-memory,
@@ -4987,17 +4995,17 @@ mod tests {
             500,
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(PHASE_A_GRACE_MS)).await;
 
         // Mutate state: kick alice. The remaining members [bob,
         // charlie] is len=2 which would fail GroupDm's 3+ invariant
         // — so we can't push the mutated Space through
         // apply_space_with_canonicalization. Direct insert
-        // (mirroring the existing handle_cidnotify_drops_when_
-        // resolved_owner_not_in_space_members test pattern at
-        // line 4222) bypasses the invariant check, simulating a
-        // post-revocation state where the local cache has the kick
-        // applied.
+        // (mirroring the existing
+        // handle_cidnotify_drops_when_resolved_owner_not_in_space_members
+        // test pattern above) bypasses the invariant check,
+        // simulating a post-revocation state where the local cache
+        // has the kick applied.
         {
             let mut state_g = state_arc.lock().await;
             let mut sp = state_g.spaces.get(&space_id).cloned().unwrap();
