@@ -7002,13 +7002,18 @@ async fn generate_invite(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let crdt_state = {
+    let (crdt_state, community_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state
-            .clone()
-            .ok_or("crdt_state missing — node not running?")?
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+        )
     };
 
     let space = {
@@ -7052,10 +7057,34 @@ async fn generate_invite(
     let epoch = space
         .current_epoch
         .ok_or("community Space missing current_epoch (corrupt row?)")?;
+
+    // ZEB-249: snapshot current materialized state for invitee's UI bootstrap.
+    // Spec §5.2: state_snapshot is populated from the inviter's current
+    // materialized state at issuance time. CRDT replay post-redemption
+    // corrects any inviter-tampered snapshot.
+    let state_snapshot = {
+        let materialized = if let Some(state_arc) = community_registry.state_for(&space_id).await {
+            let state = state_arc.lock().await;
+            let events: Vec<crate::community_membership::SignedMembershipEvent> =
+                state.events.values().cloned().collect();
+            drop(state);
+            crate::community_membership::materialize(&events, admin)
+        } else {
+            // No engine yet (e.g., just-created community with no events):
+            // fall back to empty maps — still a valid bootstrap hint.
+            crate::community_membership::MaterializedMembership::default()
+        };
+        crate::community_invite::MaterializedCommunityState {
+            members: materialized.members,
+            channels: materialized.channels,
+            power_levels: materialized.power_levels,
+        }
+    };
+
     let epoch_snapshot = crate::community_invite::InviteEpochSnapshot {
         epoch,
         sealed_epoch_key: mk.as_bytes().to_vec(),
-        state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+        state_snapshot,
     };
 
     let payload = crate::community_invite::CommunityInvitePayload {
@@ -8789,6 +8818,26 @@ where
     // succeeded — the redemption is durable. Sync (no .await needed). Per
     // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
     community_sync_guard.commit();
+
+    // TODO(zeb-249-task-6): wire state_snapshot bootstrap.
+    // Spec §5.2 requires seeding the invitee's local CommunitySyncRegistry
+    // materialized-state cache from `payload.epoch_snapshot.state_snapshot`
+    // (members/channels/power_levels) so the UI can render community state
+    // immediately after join, before CRDT events arrive via Zenoh sync.
+    //
+    // The registry currently has no separate materialized-state cache —
+    // it recomputes from CRDT events on every `state_for` + `materialize_now`
+    // call. Injecting snapshot hints requires either:
+    //   a) A new per-community "bootstrap hint" field in the engine
+    //      (returned by `materialize_now` until the first real CRDT event
+    //      arrives and supersedes it), or
+    //   b) Pre-inserting the snapshot members as synthetic CRDT events
+    //      (rejected: would pollute the event log with unsigned data).
+    //
+    // Task 6's event_loop self-healing observer will reconcile from CRDT
+    // events, which corrects any inviter-tampered snapshot. Until Task 6
+    // wires option (a), the UI may briefly show empty state on first load
+    // post-redemption — acceptable since CRDT sync follows within seconds.
 
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the redemption Space is committed. If commit()

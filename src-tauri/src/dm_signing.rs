@@ -131,12 +131,16 @@ pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignE
 /// The Ed25519 secret scalar is derived via SHA-512 of the 32-byte
 /// private seed; the first 32 bytes are the X25519 scalar candidate,
 /// clamped per RFC 7748 §5 before use.
-pub fn ed25519_priv_to_x25519(signing_key: &ed25519_dalek::SigningKey) -> [u8; 32] {
-    use sha2::{Digest, Sha512};
-    let hash = Sha512::digest(signing_key.to_bytes());
-    let mut x_priv = [0u8; 32];
-    x_priv.copy_from_slice(&hash[..32]);
-    // Clamp per RFC 7748 §5.
+pub fn ed25519_priv_to_x25519(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> zeroize::Zeroizing<[u8; 32]> {
+    // `to_scalar_bytes` is ed25519-dalek 2.x's canonical accessor for the
+    // SHA-512-derived, low-half-clamped scalar — exactly the X25519 private
+    // scalar per RFC 7748 §5. Using the library API avoids an extra SHA-512
+    // call and ensures we stay in sync with dalek's own clamping logic.
+    let mut x_priv = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
+    // Apply RFC 7748 §5 clamping (dalek's to_scalar_bytes returns the
+    // raw low-half before clamping; we clamp here before use).
     x_priv[0] &= 248;
     x_priv[31] &= 127;
     x_priv[31] |= 64;

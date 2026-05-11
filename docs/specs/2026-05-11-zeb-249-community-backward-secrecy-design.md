@@ -301,7 +301,7 @@ pub struct InviteEpochSnapshot {
 
 pub struct MaterializedCommunityState {
     pub members: BTreeMap<OwnerAddr, MemberState>,
-    pub channels: BTreeMap<ChannelId, ChannelState>,
+    pub channels: BTreeMap<ChannelId, ChannelInfo>,
     pub power_levels: BTreeMap<OwnerAddr, u8>,
 }
 ```
