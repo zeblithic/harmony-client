@@ -1104,10 +1104,25 @@ impl DmOutbox {
         signed_bytes: Vec<u8>,
         wall_now_ms: u64,
     ) {
-        // Phase A — locked, fast: verify + resolve + snapshot.
-        let (_space_a, identity_pub, resolved_owner) = {
-            let _outbox_g = outbox_arc.lock().await;
-            let state_g = state_arc.lock().await;
+        // Phase A — locked, fast: verify + resolve + snapshot + cache refresh.
+        // Outbox lock is acquired for `device_id` (used in
+        // apply_owner_device_update's HLC) and to keep the existing
+        // outbox-before-state lock-ordering convention. State lock is
+        // acquired as `mut` because apply_owner_device_update mutates the
+        // OwnerDeviceCache.
+        //
+        // apply_owner_device_update lives in Phase A (not Phase C) to
+        // match the original handle_cidnotify's behavior: the device cache
+        // gets refreshed on every successfully-verified inbound CidNotify,
+        // even if the subsequent CAS fetch times out or the Space gets
+        // deleted in the TOCTOU window. Doing it in Phase C would silently
+        // skip cache updates whenever the slow path fails — a behavior
+        // regression Cursor Bugbot flagged on round 0.
+        // identity_pub is no longer in the returned tuple — Phase A
+        // now consumes it directly via apply_owner_device_update.
+        let (_space_a, resolved_owner) = {
+            let outbox_g = outbox_arc.lock().await;
+            let mut state_g = state_arc.lock().await;
             let identity_pub = match lookup_pubkey_for_device(
                 &state_g.owner_device_cache,
                 signed.signing_device_hash,
@@ -1164,7 +1179,29 @@ impl DmOutbox {
                 );
                 return;
             }
-            (space, identity_pub, resolved_owner)
+            // Refresh OwnerDeviceCache (Step 8 from original
+            // handle_cidnotify). MUST happen before lock-drop so the
+            // refresh persists even if Phase B's CAS fetch times out
+            // or Phase C finds the Space deleted in the TOCTOU window.
+            let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
+            if let Some(idx) = signed
+                .sender_devices
+                .iter()
+                .position(|d| *d == signed.signing_device_hash)
+            {
+                updated_pubs[idx] = Some(identity_pub);
+            }
+            let _ = state_g.apply_owner_device_update(
+                resolved_owner,
+                signed.sender_devices.clone(),
+                updated_pubs,
+                Hlc {
+                    wall_ms: wall_now_ms,
+                    logical: 0,
+                    device_id: outbox_g.device_id.clone(),
+                },
+            );
+            (space, resolved_owner)
         }; // locks dropped here
 
         // Phase B — unlocked, slow: CAS fetch.
@@ -1290,25 +1327,9 @@ impl DmOutbox {
                 return;
             }
 
-            // Refresh OwnerDeviceCache (Step 8 in original handle_cidnotify).
-            let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
-            if let Some(idx) = signed
-                .sender_devices
-                .iter()
-                .position(|d| *d == signed.signing_device_hash)
-            {
-                updated_pubs[idx] = Some(identity_pub);
-            }
-            let _ = state_g.apply_owner_device_update(
-                resolved_owner,
-                signed.sender_devices.clone(),
-                updated_pubs,
-                Hlc {
-                    wall_ms: wall_now_ms,
-                    logical: 0,
-                    device_id: outbox_g.device_id.clone(),
-                },
-            );
+            // NOTE: OwnerDeviceCache refresh (Step 8 in original
+            // handle_cidnotify) was moved up to Phase A, so it runs
+            // even when the slow path (CAS fetch, decrypt) fails.
 
             // apply_inbox — atomic-emit semantics.
             let inbox_entry = crate::owner_state_types::InboxEntry {
