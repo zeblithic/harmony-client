@@ -138,6 +138,32 @@ fn epoch_rotation_event_wire_bytes_pinned() {
 }
 
 #[test]
+fn epoch_catchup_event_wire_bytes_pinned() {
+    let triggered_by: [u8; 16] = [0xfa; 16];
+    let kind = MembershipEventKind::EpochCatchup {
+        epoch: 7,
+        triggered_by,
+        recipient_ciphertexts: vec![RecipientCiphertext {
+            recipient: OwnerAddr([0xd1; 16]),
+            sealed: vec![0xab; 92],
+        }],
+    };
+    let bytes = canonical_cbor_encode(&kind).expect("encode");
+    let expected_hex = "a2627467616662766ca36265700762747350fafafafafafafafafafafafafafafafa62726381a262726350d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1626374585cabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for pinning: {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER with the bytes above");
+    });
+    assert_eq!(
+        bytes,
+        expected,
+        "EpochCatchup wire bytes drifted: {} vs {}",
+        hex::encode(&bytes),
+        hex::encode(&expected)
+    );
+}
+
+#[test]
 fn encrypted_envelope_wire_bytes_pinned_v3_with_ratchet() {
     let env = EncryptedEnvelope {
         epoch: 5,

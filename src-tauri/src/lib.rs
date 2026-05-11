@@ -9985,12 +9985,13 @@ pub fn delta_to_change(
         // ChannelConfigChangedPayload via delta_to_channel_config_change
         // instead — the consumer fan-out fires the channel-config-updated
         // Tauri event.
-        // ZEB-249: EpochRotation is epoch-state, not membership-state;
-        // no Tauri event emitted from this projector.
+        // ZEB-249: EpochRotation and EpochCatchup are epoch-state, not
+        // membership-state; no Tauri event emitted from this projector.
         crate::community_membership::MembershipEventKind::ChannelCreate { .. }
         | crate::community_membership::MembershipEventKind::ChannelModify { .. }
         | crate::community_membership::MembershipEventKind::ChannelDelete { .. }
-        | crate::community_membership::MembershipEventKind::EpochRotation { .. } => return None,
+        | crate::community_membership::MembershipEventKind::EpochRotation { .. }
+        | crate::community_membership::MembershipEventKind::EpochCatchup { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -10213,6 +10214,7 @@ mod community_member_dto_tests {
             channels: BTreeMap::new(),
             current_epoch: None,
             pending_rotation_for: std::collections::BTreeSet::new(),
+            pending_catchup_for: std::collections::BTreeSet::new(),
         };
         let dto = member_info_for(&materialized);
 
@@ -10254,6 +10256,7 @@ mod community_member_dto_tests {
             channels: BTreeMap::new(),
             current_epoch: None,
             pending_rotation_for: std::collections::BTreeSet::new(),
+            pending_catchup_for: std::collections::BTreeSet::new(),
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);

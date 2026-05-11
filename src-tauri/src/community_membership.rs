@@ -129,6 +129,27 @@ pub enum MembershipEventKind {
         #[serde(rename = "rc")]
         recipient_ciphertexts: Vec<RecipientCiphertext>,
     },
+
+    /// ZEB-249: Delivers `current_epoch_key` to specified members WITHOUT
+    /// advancing the epoch. Triggered by a Join whose snapshot was stale
+    /// at redemption time. Spec §4.6.
+    ///
+    /// Variant code "f" (for "fill"). Inner field keys are 2-char.
+    #[serde(rename = "f")]
+    EpochCatchup {
+        #[serde(rename = "ep")]
+        epoch: u64,
+
+        #[serde(
+            rename = "ts",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        triggered_by: EventId,
+
+        #[serde(rename = "rc")]
+        recipient_ciphertexts: Vec<RecipientCiphertext>,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -710,6 +731,13 @@ pub struct MaterializedMembership {
     /// these up and synthesizes fresh rotations. See spec §4.3.
     #[serde(default)]
     pub pending_rotation_for: BTreeSet<OwnerAddr>,
+
+    /// ZEB-249: Tracks new members whose Bootstrap-Join landed with a
+    /// stale snapshot_epoch < current_epoch (kick between invite issuance
+    /// and redemption). Self-healing observer synthesizes EpochCatchup
+    /// events. Spec §4.6.
+    #[serde(default)]
+    pub pending_catchup_for: BTreeSet<OwnerAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -863,6 +891,14 @@ pub fn materialize(
                             left_at: None,
                         },
                     );
+                    // ZEB-249: if any rotation has already happened
+                    // (current_epoch > 0), this new member's snapshot
+                    // may be stale — mark for catchup. Self-healing
+                    // observer issues a catchup; redundant catchups
+                    // are harmless no-ops.
+                    if prior_status.is_none() && m.current_epoch.unwrap_or(0) > 0 {
+                        m.pending_catchup_for.insert(event.actor);
+                    }
                 }
             }
             MembershipEventKind::Leave => {
@@ -1051,6 +1087,48 @@ pub fn materialize(
                 // Tasks 5/6). materialize is pure replay.
                 m.current_epoch = Some(current + 1);
                 m.pending_rotation_for.remove(&target);
+            }
+            MembershipEventKind::EpochCatchup {
+                epoch,
+                triggered_by,
+                recipient_ciphertexts,
+            } => {
+                // Epoch must match current (spec §4.6).
+                let current = m.current_epoch.unwrap_or(0);
+                if *epoch != current {
+                    continue;
+                }
+
+                // triggered_by must reference a Join event.
+                let triggered_event = sorted.iter().find(|e| e.id == *triggered_by);
+                let join_actor = match triggered_event.map(|e| &e.kind) {
+                    Some(MembershipEventKind::Join) => triggered_event.map(|e| e.actor),
+                    _ => None,
+                };
+                let Some(target) = join_actor else {
+                    continue;
+                };
+
+                // target must be in recipient_ciphertexts.
+                if !recipient_ciphertexts
+                    .iter()
+                    .any(|rc| rc.recipient == target)
+                {
+                    continue;
+                }
+
+                // Issuer must have admin power (spec §4.6 — no cooperative-joiner).
+                let issuer = event.actor;
+                let issuer_power = m.power_levels.get(&issuer).copied().unwrap_or(0);
+                let is_admin = issuer_power >= POWER_THRESHOLDS.kick;
+                if !is_admin {
+                    continue;
+                }
+
+                // Apply: clear target from pending_catchup_for.
+                // (Actual key delivery to receiver's local Space happens
+                // in community_state_sync apply layer — Tasks 5/6.)
+                m.pending_catchup_for.remove(&target);
             }
         }
     }
@@ -1350,6 +1428,14 @@ pub fn verify_event(
             // path allows a non-member (the leaver) to issue the rotation,
             // so we can't apply a blanket ActorNotJoined gate here.
         }
+        MembershipEventKind::EpochCatchup { .. } => {
+            // EpochCatchup power verification is deferred to the
+            // materialize() arm which has both old and new state in scope.
+            // verify_event's role here is limited to signature + wire
+            // format checks. Full protocol invariants (epoch match,
+            // triggered_by Join check, admin-only) are enforced in
+            // materialize via the drop-on-invalid path (spec §4.6).
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1495,6 +1581,14 @@ pub fn verify_event(
             // exclusion, admin-or-self-leaver) are enforced in materialize
             // via the drop-on-invalid path (spec §4.2-4.4).
         }
+        MembershipEventKind::EpochCatchup { .. } => {
+            // EpochCatchup: power verification is deferred to the
+            // materialize() arm which has both old and new state in scope.
+            // verify_event's role here is limited to signature + wire
+            // format checks. Full protocol invariants (epoch match,
+            // triggered_by Join check, admin-only) are enforced in
+            // materialize via the drop-on-invalid path (spec §4.6).
+        }
     }
 
     Ok(())
@@ -1631,6 +1725,225 @@ mod tests {
             sig: [0; 64],
             countersig: None,
         }
+    }
+
+    fn make_catchup_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        triggered_by: [u8; 16],
+        epoch: u64,
+        recipients: Vec<(OwnerAddr, Vec<u8>)>,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfe; 16];
+        id[15] = id_byte;
+        let recipient_ciphertexts: Vec<RecipientCiphertext> = recipients
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::EpochCatchup {
+                epoch,
+                triggered_by,
+                recipient_ciphertexts,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    fn make_stale_join_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xff; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    #[test]
+    fn epoch_catchup_delivers_current_key_without_advancing_epoch() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let join_d = make_stale_join_event(0x01, dave, 200);
+
+        // Sanity: post-Join, dave is in pending_catchup_for.
+        let m_pre = materialize(&[kick.clone(), rot.clone(), join_d.clone()], admin);
+        assert_eq!(m_pre.current_epoch, Some(1));
+        assert!(
+            m_pre.pending_catchup_for.contains(&dave),
+            "post-Join with stale snapshot: dave is pending catchup"
+        );
+
+        let catchup = make_catchup_event(0x01, admin, join_d.id, 1, vec![(dave, vec![5; 92])], 300);
+        let m_post = materialize(&[kick, rot, join_d, catchup], admin);
+        assert_eq!(
+            m_post.current_epoch,
+            Some(1),
+            "catchup must NOT advance epoch"
+        );
+        assert!(!m_post.pending_catchup_for.contains(&dave), "dave cleared");
+    }
+
+    #[test]
+    fn stale_invite_join_marks_pending_catchup_for() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let join_d = make_stale_join_event(0x01, dave, 200);
+
+        let m = materialize(&[kick, rot, join_d], admin);
+        assert_eq!(m.current_epoch, Some(1));
+        assert!(m.pending_catchup_for.contains(&dave));
+    }
+
+    #[test]
+    fn epoch_catchup_with_stale_epoch_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let join_d = make_stale_join_event(0x01, dave, 200);
+        // catchup says epoch=0 but current is now 1 → must be dropped.
+        let stale_catchup =
+            make_catchup_event(0x01, admin, join_d.id, 0, vec![(dave, vec![1; 92])], 300);
+
+        let m = materialize(&[kick, rot, join_d, stale_catchup], admin);
+        assert!(
+            m.pending_catchup_for.contains(&dave),
+            "stale-epoch catchup must NOT clear pending_catchup_for"
+        );
+    }
+
+    #[test]
+    fn epoch_catchup_referencing_non_join_event_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let join_d = make_stale_join_event(0x01, dave, 200);
+        // Malformed catchup: triggered_by points to kick (not a Join).
+        let bad_catchup =
+            make_catchup_event(0x01, admin, kick.id, 1, vec![(dave, vec![1; 92])], 300);
+
+        let m = materialize(&[kick, rot, join_d, bad_catchup], admin);
+        assert!(
+            m.pending_catchup_for.contains(&dave),
+            "catchup with non-Join triggered_by must NOT clear pending_catchup_for"
+        );
+    }
+
+    #[test]
+    fn non_admin_issued_catchup_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let carol = OwnerAddr([0xc1; 16]); // not admin
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(
+            0x01,
+            admin,
+            kick.id,
+            0,
+            vec![(admin, vec![1; 92]), (carol, vec![1; 92])],
+            101,
+        );
+        let join_d = make_stale_join_event(0x01, dave, 200);
+        // Carol tries to catchup-fill dave's gap, but she's not admin.
+        let bad_catchup =
+            make_catchup_event(0x01, carol, join_d.id, 1, vec![(dave, vec![1; 92])], 300);
+
+        let m = materialize(&[kick, rot, join_d, bad_catchup], admin);
+        assert!(
+            m.pending_catchup_for.contains(&dave),
+            "non-admin catchup must NOT clear pending_catchup_for"
+        );
+    }
+
+    #[test]
+    fn epoch_catchup_for_already_caught_up_member_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let admin2 = OwnerAddr([0xa2; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let dave = OwnerAddr([0xd1; 16]);
+
+        let setpwr_admin2 = SignedMembershipEvent {
+            id: [0x05; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: admin2,
+                level: 100,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(
+            0x01,
+            admin,
+            kick.id,
+            0,
+            vec![(admin, vec![1; 92]), (admin2, vec![1; 92])],
+            101,
+        );
+        let join_d = make_stale_join_event(0x01, dave, 200);
+        // Two admin-issued catchups for the same Join. Use distinct id_bytes.
+        let catchup1 =
+            make_catchup_event(0x01, admin, join_d.id, 1, vec![(dave, vec![1; 92])], 300);
+        let catchup2 =
+            make_catchup_event(0x02, admin2, join_d.id, 1, vec![(dave, vec![2; 92])], 301);
+
+        let m = materialize(
+            &[setpwr_admin2, kick, rot, join_d, catchup1, catchup2],
+            admin,
+        );
+        assert!(
+            !m.pending_catchup_for.contains(&dave),
+            "dave was caught up by first catchup"
+        );
+        assert_eq!(m.current_epoch, Some(1), "epoch unchanged by catchups");
     }
 
     #[test]
