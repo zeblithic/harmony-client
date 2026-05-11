@@ -1360,6 +1360,23 @@ mod integration_tests {
     use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind, TransportBinding};
     use std::time::Duration;
 
+    async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn make_kt(seed: u8) -> Arc<KeyTree> {
         Arc::new(KeyTree::derive(&[seed; 32]).expect("kt"))
     }
@@ -1609,7 +1626,20 @@ mod integration_tests {
 
         dev.a_engine.notify_dirty();
         dev.b_engine.notify_dirty();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let converged = wait_until(
+            || async {
+                let a = dev.a_state.lock().await;
+                a.outbox
+                    .get(&OutboxEntryId([42; 16]))
+                    .is_some_and(|e| e.space_id == SpaceId([1; 16]))
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            converged,
+            "A's outbox did not canonicalize space_id within 3s"
+        );
 
         // After sync: A's outbox should have been canonicalized to id=1.
         {
@@ -1642,7 +1672,22 @@ mod integration_tests {
             });
         }
         dev.a_engine.notify_dirty();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let converged = wait_until(
+            || async {
+                let a = dev.a_state.lock().await;
+                a.outbox.get(&OutboxEntryId([42; 16])).is_some_and(|e| {
+                    e.space_id == SpaceId([1; 16])
+                        && e.delivered_to.len() == 2
+                        && e.delivery_status == DeliveryStatus::Complete
+                })
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            converged,
+            "A's outbox did not reach Complete with 2 acks within 3s"
+        );
 
         // After sync: A's entry still on canonicalized space_id=1,
         // and BOTH acks ({1, 2}) are present → Complete.
