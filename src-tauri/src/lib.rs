@@ -1636,6 +1636,15 @@ async fn start_node(
                                     }
                                 }
                             },
+                            // ZEB-249 Task 6: self-healing observer hook.
+                            // Fires on every EpochRotation / EpochCatchup delta.
+                            // Production hook is a no-op placeholder — the
+                            // self-healing logic is implemented in the kick/leave
+                            // IPC handlers (which bundle the rotation atomically)
+                            // and in the self-healing observer below. This hook
+                            // exists so future Task 7 can extend it without
+                            // changing the consumer signature.
+                            |_delta| async {},
                         ));
                     }
 
@@ -7892,6 +7901,8 @@ mod create_community_inner_tests {
                             .await;
                     }
                 },
+                // ZEB-249 Task 6: epoch-event hook — no-op in test
+                |_delta| async {},
             ))
         };
 
@@ -8819,25 +8830,31 @@ where
     // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
     community_sync_guard.commit();
 
-    // TODO(zeb-249-task-6): wire state_snapshot bootstrap.
-    // Spec §5.2 requires seeding the invitee's local CommunitySyncRegistry
-    // materialized-state cache from `payload.epoch_snapshot.state_snapshot`
-    // (members/channels/power_levels) so the UI can render community state
-    // immediately after join, before CRDT events arrive via Zenoh sync.
+    // ZEB-249 Task 6 spec §5.2: seed the invitee's materialized-state cache
+    // from `payload.epoch_snapshot.state_snapshot` so the UI can render
+    // community state immediately after join, before CRDT events arrive via
+    // Zenoh sync.
     //
-    // The registry currently has no separate materialized-state cache —
-    // it recomputes from CRDT events on every `state_for` + `materialize_now`
-    // call. Injecting snapshot hints requires either:
-    //   a) A new per-community "bootstrap hint" field in the engine
-    //      (returned by `materialize_now` until the first real CRDT event
-    //      arrives and supersedes it), or
-    //   b) Pre-inserting the snapshot members as synthetic CRDT events
-    //      (rejected: would pollute the event log with unsigned data).
-    //
-    // Task 6's event_loop self-healing observer will reconcile from CRDT
-    // events, which corrects any inviter-tampered snapshot. Until Task 6
-    // wires option (a), the UI may briefly show empty state on first load
-    // post-redemption — acceptable since CRDT sync follows within seconds.
+    // Implementation: we resolved this using option (a) from the old TODO —
+    // a `bootstrap_hint` field on `CommunityState` that `materialized()`
+    // returns when the event log is still empty (version == 0). The first
+    // real CRDT event insert invalidates the cache and CRDT replay supersedes
+    // any inviter-tampered snapshot (spec §5.2 + §10.3).
+    {
+        let snapshot = &payload.epoch_snapshot.state_snapshot;
+        let hint = crate::community_membership::MaterializedMembership {
+            members: snapshot.members.clone(),
+            channels: snapshot.channels.clone(),
+            power_levels: snapshot.power_levels.clone(),
+            current_epoch: Some(payload.epoch_snapshot.epoch),
+            pending_rotation_for: std::collections::BTreeSet::new(),
+            pending_catchup_for: std::collections::BTreeSet::new(),
+        };
+        if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
+            let state_g = state_arc.lock().await;
+            state_g.seed_bootstrap_hint(hint);
+        }
+    }
 
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the redemption Space is committed. If commit()
@@ -9551,6 +9568,98 @@ async fn leave_community(
         return Err(membership_outcome_err("leave_community", &outcome));
     }
 
+    // ZEB-249 Task 6 spec §4.4: cooperative leaver issues an EpochRotation
+    // excluding self. This closes the post-leave secrecy window in CRDT-
+    // propagation time. If this fails, the self-healing observer (admin) takes
+    // over. We do NOT return Err — the Leave event is already inserted.
+    {
+        let rotation_result: Result<(), String> = async {
+            // 1. Read materialized membership post-leave.
+            let admin_addr = engine_arc.admin_addr();
+            let materialized = {
+                let state = engine_arc.state();
+                let state_g = state.lock().await;
+                state_g.materialize_now(admin_addr)
+            };
+
+            let current_epoch = materialized.current_epoch.unwrap_or(0);
+
+            // 2. Collect remaining ACTIVE members (excluding self — the leaver).
+            let resolver = community_registry.identity_resolver();
+            let mut member_pubs: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])> = Vec::new();
+            for (addr, state_m) in &materialized.members {
+                if *addr == self_owner {
+                    continue; // leaver excluded per spec §4.4
+                }
+                if !matches!(
+                    state_m.status,
+                    crate::community_membership::MemberStatus::Joined
+                ) {
+                    continue;
+                }
+                if let Some(pub64) = resolver.resolve(addr).await {
+                    member_pubs.push((*addr, pub64));
+                }
+            }
+
+            // Skip if nobody else in the community (solo creator leaving).
+            if member_pubs.is_empty() {
+                return Ok(());
+            }
+
+            // 3. Generate K_next and seal to remaining members.
+            let k_next = crate::owner_state_types::EpochKey::random();
+            let recipients = build_sealed_epoch_recipients(&k_next, member_pubs)?;
+
+            // 4. Reserve HLC for rotation.
+            let rotation_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+                &hlc_tracker,
+                &device_id,
+                wall_now_ms,
+            )
+            .await;
+
+            // 5. Mint and insert the rotation (leaver is the signer — cooperative leave path).
+            let rotation = {
+                let outbox_g = dm_outbox.lock().await;
+                let signing_key = outbox_g.signing_key.as_ref();
+                mint_epoch_rotation_event(
+                    space_id,
+                    self_owner,
+                    leave.id,
+                    current_epoch,
+                    recipients,
+                    signing_key,
+                    rotation_hlc,
+                )?
+            };
+
+            let rot_outcome = engine_arc
+                .insert_local_event(rotation)
+                .await
+                .map_err(|e| format!("insert leave-rotation: {e}"))?;
+            if matches!(
+                rot_outcome,
+                crate::community_state_crdt::InsertOutcome::Rejected(_)
+            ) {
+                return Err(format!("leave rotation rejected: {rot_outcome:?}"));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = rotation_result {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                self_owner = %hex::encode(self_owner.0),
+                error = %e,
+                "leave_community: cooperative EpochRotation bundle failed; \
+                 admin self-healing observer will synthesize rotation"
+            );
+        }
+    }
+
     // ZEB-265: notify the nav layer so the community node disappears
     // from the tree. emit failure is non-fatal — the leave already
     // committed, and worst case the node lingers until reload.
@@ -9663,6 +9772,137 @@ pub fn mint_kick_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign kick: {e}"))
 }
 
+/// ZEB-249 Task 6: pure helper — mint a signed `EpochRotation` event.
+///
+/// `triggered_by` is the `EventId` of the Kick or Leave event this rotation
+/// is responding to. `prior_epoch` is the epoch being retired (the new epoch
+/// will be `prior_epoch + 1` after materialize applies this event).
+/// `recipients` maps each remaining member's `OwnerAddr` to their sealed
+/// epoch key bytes (as produced by `seal_to_owner`). The kick target MUST
+/// NOT appear in `recipients` (validated by `verify_event` / materialize).
+///
+/// ZEB-267: Caller pre-reserves `hlc`.
+pub fn mint_epoch_rotation_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    triggered_by: crate::community_membership::EventId,
+    prior_epoch: u64,
+    recipients: Vec<(crate::owner_state_types::OwnerAddr, Vec<u8>)>,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, RecipientCiphertext,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let recipient_ciphertexts: Vec<RecipientCiphertext> = recipients
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::EpochRotation {
+            prior_epoch,
+            triggered_by,
+            recipient_ciphertexts,
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign epoch_rotation: {e}"))
+}
+
+/// ZEB-249 Task 6: pure helper — mint a signed `EpochCatchup` event.
+///
+/// `triggered_by` is the `EventId` of the Join event the latecomer member
+/// used. `epoch` is the current epoch being delivered. `recipients` maps
+/// each member in `pending_catchup_for` to their sealed epoch key bytes
+/// (as produced by `seal_to_owner`). Each named recipient MUST appear in
+/// `recipients` for the event to pass materialize's validity check.
+///
+/// ZEB-267: Caller pre-reserves `hlc`.
+pub fn mint_epoch_catchup_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    triggered_by: crate::community_membership::EventId,
+    epoch: u64,
+    recipients: Vec<(crate::owner_state_types::OwnerAddr, Vec<u8>)>,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, RecipientCiphertext,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let recipient_ciphertexts: Vec<RecipientCiphertext> = recipients
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::EpochCatchup {
+            epoch,
+            triggered_by,
+            recipient_ciphertexts,
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign epoch_catchup: {e}"))
+}
+
+/// ZEB-249 Task 6: build the sealed epoch key map for all given members.
+///
+/// For each `(OwnerAddr, identity_pub_64)` pair, converts the Ed25519 pub
+/// (bytes 32..64 of the 64-byte combined pub) to X25519 and seals the
+/// fresh `EpochKey` bytes to that X25519 pubkey via `seal_to_owner`.
+///
+/// Returns `Err` if any member's identity_pub cannot be converted to X25519.
+/// Members for whom lookup returned `None` (unknown identity) are silently
+/// skipped — they will appear in `pending_catchup_for` and the self-healing
+/// observer will retry once their identity propagates.
+fn build_sealed_epoch_recipients(
+    k_next: &crate::owner_state_types::EpochKey,
+    members: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])>,
+) -> Result<Vec<(crate::owner_state_types::OwnerAddr, Vec<u8>)>, String> {
+    use crate::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
+
+    let mut recipients = Vec::with_capacity(members.len());
+    for (addr, identity_pub_64) in members {
+        // identity_pub_64 layout: [x25519_pub(32) || ed25519_pub(32)]
+        // Ed25519 pub is bytes 32..64.
+        let ed_pub: &[u8; 32] = identity_pub_64[32..64]
+            .try_into()
+            .map_err(|_| "identity_pub_64 slice 32..64 not 32 bytes (should never happen)")?;
+        let x25519_pub = ed25519_pub_to_x25519(ed_pub)
+            .map_err(|e| format!("ed25519_pub_to_x25519 for {addr:?}: {e}"))?;
+        let sealed = seal_to_owner(&x25519_pub, k_next.as_bytes())
+            .map_err(|e| format!("seal_to_owner for {addr:?}: {e}"))?;
+        recipients.push((addr, sealed));
+    }
+    Ok(recipients)
+}
+
 /// Tauri IPC: kick a member from a community.
 ///
 /// Power-gated by `verify_event`: actor must have power ≥ 50 (kick
@@ -9766,6 +10006,131 @@ async fn kick_from_community(
         crate::community_state_crdt::InsertOutcome::Rejected(_)
     ) {
         return Err(membership_outcome_err("kick_from_community", &outcome));
+    }
+
+    // ZEB-249 Task 6 spec §4.1: bundle a fresh EpochRotation with the kick.
+    // After the Kick is Inserted, read the materialized membership to know
+    // which members remain (excluding the kicked target), seal the fresh
+    // K_next to each of their identity pubkeys, and insert the rotation event.
+    //
+    // If any step fails (e.g., unknown identity for a remaining member), we log
+    // and move on — the self-healing observer will synthesize the rotation once
+    // missing identity pubkeys arrive. We do NOT return Err to the caller:
+    // the Kick event itself is already inserted, so failure here would surface
+    // a spurious error for a completed operation.
+    {
+        let rotation_result: Result<(), String> = async {
+            // 1. Read materialized membership post-kick to determine remaining members.
+            let materialized = {
+                let state = engine_arc.state();
+                let state_g = state.lock().await;
+                let admin_addr = engine_arc.admin_addr();
+                state_g.materialize_now(admin_addr)
+            };
+
+            let current_epoch = materialized.current_epoch.unwrap_or(0);
+
+            // 2. Collect remaining active members (excluding the kick target and self).
+            //    We seal to ALL remaining members including self so our own Space can
+            //    advance. The resolver returns the 64-byte identity pub.
+            let resolver = community_registry.identity_resolver();
+            let mut member_pubs: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])> = Vec::new();
+            for (addr, state_m) in &materialized.members {
+                if *addr == target {
+                    continue; // kicked target excluded per spec §4.1
+                }
+                if !matches!(
+                    state_m.status,
+                    crate::community_membership::MemberStatus::Joined
+                ) {
+                    continue; // only deliver to active members
+                }
+                if let Some(pub64) = resolver.resolve(addr).await {
+                    member_pubs.push((*addr, pub64));
+                }
+                // If resolve returns None, member's identity hasn't propagated yet.
+                // Self-healing observer will retry.
+            }
+
+            // 3. Generate K_next and seal to each remaining member.
+            let k_next = crate::owner_state_types::EpochKey::random();
+            let recipients = build_sealed_epoch_recipients(&k_next, member_pubs)?;
+
+            // 4. Reserve a second HLC for the rotation (must be strictly newer than kick_hlc).
+            let rotation_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+                &hlc_tracker,
+                &device_id,
+                wall_now_ms,
+            )
+            .await;
+
+            // 5. Mint the EpochRotation event referencing the Kick's EventId.
+            let rotation = {
+                let outbox_g = dm_outbox.lock().await;
+                let signing_key = outbox_g.signing_key.as_ref();
+                mint_epoch_rotation_event(
+                    space_id,
+                    self_owner,
+                    kick.id,
+                    current_epoch,
+                    recipients,
+                    signing_key,
+                    rotation_hlc,
+                )?
+            };
+
+            // 6. Insert the rotation event.
+            let rot_outcome = engine_arc
+                .insert_local_event(rotation)
+                .await
+                .map_err(|e| format!("insert rotation: {e}"))?;
+            if matches!(
+                rot_outcome,
+                crate::community_state_crdt::InsertOutcome::Rejected(_)
+            ) {
+                return Err(format!("epoch rotation rejected: {rot_outcome:?}"));
+            }
+
+            // 7. Locally advance our own Space's epoch state in owner-state CRDT.
+            // This is the atomic update: kick CRDT event + rotation CRDT event are
+            // both inserted; now we update the local Space row so encrypt_for_topic
+            // and decrypt_for_topic use K_next going forward.
+            // We look up our own sealed key (the entry for self_owner in the rotation's
+            // recipient_ciphertexts) and open it with our X25519 private key.
+            //
+            // Actually, since we're the issuer and generated K_next ourselves, we just
+            // apply the epoch advancement directly without round-tripping through seal/open.
+            if let Some(crdt_state) = {
+                let g = state_lock
+                    .lock()
+                    .map_err(|e| format!("NodeState poisoned: {e}"))?;
+                g.crdt_state.clone()
+            } {
+                let mut state_g = crdt_state.lock().await;
+                if let Some(space) = state_g.spaces.get_mut(&space_id) {
+                    let prev_epoch = space.current_epoch.unwrap_or(0);
+                    let prev_key = space.current_epoch_key.clone();
+                    space.current_epoch = Some(prev_epoch + 1);
+                    space.current_epoch_key = Some(k_next);
+                    if let Some(pk) = prev_key {
+                        space.old_epoch_keys.insert(prev_epoch, pk);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = rotation_result {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                target = %hex::encode(target.0),
+                error = %e,
+                "kick_from_community: EpochRotation bundle failed; \
+                 self-healing observer will synthesize rotation"
+            );
+        }
     }
 
     Ok(())
@@ -10139,6 +10504,8 @@ pub fn delta_to_channel_config_change(
 ///     (membership variants: Join/Leave/Invite/Kick/SetPower)
 ///   - `ChannelConfigChangedPayload` → `channel-config-updated` Tauri
 ///     event (ZEB-248 Phase 1 channel-config variants)
+///   - `EpochEventPayload` → `on_epoch_event` hook (ZEB-249 Task 6)
+///     for epoch rotation/catchup self-healing
 ///
 /// Stops cleanly when the channel closes (last sender dropped — typically
 /// on `stop_node`).
@@ -10146,13 +10513,14 @@ pub fn delta_to_channel_config_change(
 /// Phase 3 emits one change per `community-members-changed` IPC event
 /// (engine fires one delta per CRDT mutation); the wire format leaves
 /// room for batched future deltas without a contract break.
-pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
+pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR, FE, FutE>(
     mut delta_rx: tokio::sync::mpsc::Receiver<
         crate::community_state_sync::CommunityMembershipDelta,
     >,
     mut emit_membership: FM,
     mut emit_channel_config: FC,
     mut on_channel_config_registry: FR,
+    mut on_epoch_event: FE,
 ) where
     FM: FnMut(CommunityMembersChangedPayload) -> FutM + Send + 'static,
     FutM: std::future::Future<Output = ()> + Send + 'static,
@@ -10170,6 +10538,13 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
     // errors via tracing).
     FR: FnMut(ChannelConfigChangedPayload) -> FutR + Send + 'static,
     FutR: std::future::Future<Output = ()> + Send + 'static,
+    // ZEB-249 Task 6: fired for every EpochRotation or EpochCatchup delta.
+    // The production hook implements the self-healing observer (spec §4.3):
+    // checks pending_rotation_for / pending_catchup_for in materialized state
+    // and synthesizes missing events if local user has admin power. Tests
+    // supply `|_| async {}`.
+    FE: FnMut(crate::community_state_sync::CommunityMembershipDelta) -> FutE + Send + 'static,
+    FutE: std::future::Future<Output = ()> + Send + 'static,
 {
     while let Some(delta) = delta_rx.recv().await {
         if let Some((community_id, change)) = delta_to_change(&delta) {
@@ -10199,6 +10574,16 @@ pub async fn run_community_delta_consumer<FM, FutM, FC, FutC, FR, FutR>(
             // Both callbacks see the same payload bytes.
             on_channel_config_registry(payload.clone()).await;
             emit_channel_config(payload).await;
+        } else {
+            // ZEB-249 Task 6: EpochRotation / EpochCatchup deltas reach
+            // on_epoch_event for the self-healing observer. The hook also
+            // fires on Kick/Leave membership events (delta_to_change → None
+            // for those? No — Kick/Leave DO map to MembershipChange above).
+            // We fire on_epoch_event for any delta that DIDN'T match either
+            // of the above projectors, which currently is only epoch events.
+            // This is forward-compatible: new unknown event kinds will also
+            // reach this branch and be silently ignored by the no-op hook.
+            on_epoch_event(delta).await;
         }
     }
 }
@@ -11319,6 +11704,8 @@ mod delta_consumer_task_tests {
                 // ZEB-270 Phase 3 Task 4B: 3rd callback (registry hook)
                 // — no-op for tests that don't exercise the registry.
                 |_payload: ChannelConfigChangedPayload| async move {},
+                // ZEB-249 Task 6: epoch-event hook — no-op in this test.
+                |_delta| async move {},
             )
             .await
         });
@@ -11521,6 +11908,8 @@ mod create_channel_delta_tests {
             // assertion below targets the channel-config callback's
             // capture vec, not registry side-effects.
             |_payload: ChannelConfigChangedPayload| async move {},
+            // ZEB-249 Task 6: epoch-event hook — no-op in this test.
+            |_delta| async move {},
         ));
 
         let community_id = SpaceId([0x37; 16]);

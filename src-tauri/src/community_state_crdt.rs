@@ -45,6 +45,17 @@ pub struct CommunityState {
     /// cache on miss) don't take a mutable borrow on `&self`.
     #[serde(skip)]
     cache: std::sync::Mutex<MaterializedCache>,
+
+    /// ZEB-249 Task 6 spec §5.2: UI bootstrap hint injected from
+    /// `CommunityInvitePayload.epoch_snapshot.state_snapshot` after
+    /// `mint_redemption`. Returned by `materialized()` ONLY when the
+    /// event log is empty (i.e., CRDT events haven't arrived yet from
+    /// Zenoh sync). On first real event insert, `version` increments
+    /// past the cache, causing re-materialization from events which
+    /// supersedes this hint. Skipped from CBOR (not source of truth —
+    /// CRDT events are). Never written to disk.
+    #[serde(skip)]
+    bootstrap_hint: std::sync::Mutex<Option<MaterializedMembership>>,
 }
 
 #[derive(Default, Debug)]
@@ -78,6 +89,9 @@ impl Clone for CommunityState {
             community_id: self.community_id,
             events: self.events.clone(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
+            bootstrap_hint: std::sync::Mutex::new(
+                self.bootstrap_hint.lock().ok().and_then(|g| g.clone()),
+            ),
         }
     }
 }
@@ -114,6 +128,25 @@ impl CommunityState {
             community_id,
             events: BTreeMap::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
+            bootstrap_hint: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// ZEB-249 Task 6 spec §5.2: seed the materialized-view cache with
+    /// the snapshot from `CommunityInvitePayload.epoch_snapshot.state_snapshot`.
+    ///
+    /// This hint is returned by `materialized()` ONLY when the event log
+    /// is still empty (i.e., before Zenoh-synced CRDT events arrive). The
+    /// first real event insert invalidates the cache and causes re-
+    /// materialization from the authoritative event log, which supersedes
+    /// any inviter-supplied snapshot per spec §5.2 + §10.3.
+    ///
+    /// Concurrency: takes the `bootstrap_hint` mutex briefly. Safe to call
+    /// from an async context (held only across the clone + assign — no
+    /// `.await` inside).
+    pub fn seed_bootstrap_hint(&self, hint: MaterializedMembership) {
+        if let Ok(mut g) = self.bootstrap_hint.lock() {
+            *g = Some(hint);
         }
     }
 
@@ -140,6 +173,18 @@ impl CommunityState {
     /// the lock is released before the cloned value is returned.
     pub fn materialized(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        // ZEB-249 Task 6 spec §5.2: when the event log is still empty
+        // (just after redemption, before Zenoh-sync delivers CRDT events),
+        // return the bootstrap hint if one was seeded by `seed_bootstrap_hint`.
+        // Once a real event is inserted (bumping `version` to 1+), the cache
+        // miss path re-materializes from events and the hint is superseded.
+        if cache.version == 0 {
+            if let Ok(hint_g) = self.bootstrap_hint.lock() {
+                if let Some(hint) = hint_g.clone() {
+                    return hint;
+                }
+            }
+        }
         let cache_hit = cache.cached_version == Some(cache.version)
             && cache.cached_admin_addr == Some(admin_addr);
         if !cache_hit {

@@ -9,7 +9,14 @@
 #![cfg(feature = "test-fixtures")]
 
 use harmony_app::community_invite::{InviteEpochSnapshot, MaterializedCommunityState};
+use harmony_app::community_membership::{
+    materialize, sign_event, EventPayload, MembershipEventKind, RecipientCiphertext,
+    SignedMembershipEvent,
+};
 use harmony_app::community_state_sync::{decrypt_for_topic, encrypt_for_topic, EpochError};
+use harmony_app::dm_signing::{
+    ed25519_priv_to_x25519, ed25519_pub_to_x25519, open_from_owner, seal_to_owner,
+};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
 
 fn make_space_with_epoch(
@@ -176,4 +183,998 @@ fn stale_invite_unable_to_decrypt_new_events_without_catchup() {
 
     // 7. (Catchup synthesis is Task 6 — this test only verifies the gap exists.)
     // The admin's K(1) would need to be delivered to Dave via an EpochCatchup event.
+}
+
+// ── ZEB-249 Task 6 integration tests ─────────────────────────────────────────
+//
+// These tests exercise the full epoch-rotation protocol:
+// seal/open of epoch keys, Space state advancement, and the
+// materialize() pending_rotation_for / pending_catchup_for logic.
+// Each test uses in-process "nodes" (Space + signing identity).
+
+/// Helper: make a `SignedMembershipEvent` with a pre-filled sig for materialize.
+/// Uses sign_event with a real key to get a valid signature.
+fn make_signed_event(
+    id_byte: u8,
+    community_id: SpaceId,
+    actor: OwnerAddr,
+    kind: MembershipEventKind,
+    wall_ms: u64,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SignedMembershipEvent {
+    let mut id = [0u8; 16];
+    id[15] = id_byte;
+    let payload = EventPayload {
+        id,
+        community_id,
+        kind,
+        actor,
+        at: Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test".into(),
+        },
+    };
+    sign_event(&payload, signing_key).expect("sign event")
+}
+
+/// Apply an EpochRotation from an event's sealed ciphertexts to a recipient's Space.
+/// The recipient decrypts their sealed K_next using their Ed25519 private key → X25519.
+fn apply_rotation_to_space(
+    space: &mut Space,
+    rotation_event: &SignedMembershipEvent,
+    my_addr: OwnerAddr,
+    my_signing_key: &ed25519_dalek::SigningKey,
+) -> bool {
+    let recipient_ciphertexts = match &rotation_event.kind {
+        MembershipEventKind::EpochRotation {
+            recipient_ciphertexts,
+            ..
+        } => recipient_ciphertexts,
+        _ => return false,
+    };
+    let my_entry = recipient_ciphertexts
+        .iter()
+        .find(|rc| rc.recipient == my_addr);
+    let sealed = match my_entry {
+        Some(rc) => &rc.sealed,
+        None => return false, // not in recipient list (kicked / leaver)
+    };
+    let x25519_priv = ed25519_priv_to_x25519(my_signing_key);
+    let k_next_bytes_vec = open_from_owner(&x25519_priv, sealed).expect("open sealed key");
+    let k_next_bytes: [u8; 32] = k_next_bytes_vec
+        .try_into()
+        .expect("sealed key must be 32 bytes");
+    let k_next = EpochKey::new(k_next_bytes);
+    let prev_epoch = space.current_epoch.unwrap_or(0);
+    let prev_key = space.current_epoch_key.clone();
+    space.current_epoch = Some(prev_epoch + 1);
+    space.current_epoch_key = Some(k_next);
+    if let Some(pk) = prev_key {
+        space.old_epoch_keys.insert(prev_epoch, pk);
+    }
+    true
+}
+
+/// Apply an EpochCatchup (same shape as rotation, but targeted at joiners).
+fn apply_catchup_to_space(
+    space: &mut Space,
+    catchup_event: &SignedMembershipEvent,
+    my_addr: OwnerAddr,
+    my_signing_key: &ed25519_dalek::SigningKey,
+) -> bool {
+    let (epoch, recipient_ciphertexts) = match &catchup_event.kind {
+        MembershipEventKind::EpochCatchup {
+            epoch,
+            recipient_ciphertexts,
+            ..
+        } => (*epoch, recipient_ciphertexts),
+        _ => return false,
+    };
+    let my_entry = recipient_ciphertexts
+        .iter()
+        .find(|rc| rc.recipient == my_addr);
+    let sealed = match my_entry {
+        Some(rc) => &rc.sealed,
+        None => return false,
+    };
+    let x25519_priv = ed25519_priv_to_x25519(my_signing_key);
+    let k_bytes_vec = open_from_owner(&x25519_priv, sealed).expect("open sealed key");
+    let k_bytes: [u8; 32] = k_bytes_vec.try_into().expect("sealed key must be 32 bytes");
+    let k = EpochKey::new(k_bytes);
+    // Catchup delivers the CURRENT epoch key (no increment).
+    space.current_epoch = Some(epoch);
+    space.current_epoch_key = Some(k);
+    true
+}
+
+/// Seal K_next to a set of recipients given their Ed25519 signing keys.
+/// Returns a Vec<(OwnerAddr, sealed_bytes)> ready for RecipientCiphertext.
+fn seal_epoch_to_members(
+    k_next: &EpochKey,
+    recipients: &[(&OwnerAddr, &ed25519_dalek::SigningKey)],
+) -> Vec<(OwnerAddr, Vec<u8>)> {
+    recipients
+        .iter()
+        .map(|(addr, sk)| {
+            let pub64 = sk.verifying_key().to_bytes();
+            let x25519_pub = ed25519_pub_to_x25519(&pub64).expect("ed25519_pub_to_x25519");
+            let sealed = seal_to_owner(&x25519_pub, k_next.as_bytes()).expect("seal_to_owner");
+            (**addr, sealed)
+        })
+        .collect()
+}
+
+/// ZEB-249 §4.1: Admin A kicks member B; B cannot decrypt events encrypted
+/// under K(1) (the new epoch key). A and remaining member C can decrypt.
+#[test]
+fn two_node_kick_then_cannot_decrypt() {
+    use harmony_identity::PrivateIdentity;
+
+    let community_id = SpaceId([0x30; 16]);
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = ed25519_dalek::SigningKey::from_bytes(&b_ed_seed);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+
+    // Epoch 0: both admin and B share K(0).
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+
+    // Admin encrypts a message under K(0) — both can decrypt.
+    let msg_epoch0 = b"hello at epoch 0";
+    let env0 = encrypt_for_topic(&admin_space, msg_epoch0).expect("encrypt@0");
+    decrypt_for_topic(&b_space, &env0).expect("B decrypts epoch-0 msg");
+
+    // Admin kicks B — build Kick + EpochRotation.
+    let kick_event = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: b_addr,
+            reason: None,
+        },
+        1000,
+        &admin_signing_key,
+    );
+
+    // Generate K(1); seal only to admin (B excluded per spec §4.1).
+    let k_next = EpochKey::new([0x20u8; 32]);
+    let rotation_recipients = seal_epoch_to_members(&k_next, &[(&admin_addr, &admin_signing_key)]);
+    let rotation_rcs: Vec<RecipientCiphertext> = rotation_recipients
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+
+    let rotation_event = make_signed_event(
+        0x02,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: kick_event.id,
+            recipient_ciphertexts: rotation_rcs,
+        },
+        1001,
+        &admin_signing_key,
+    );
+
+    // Admin applies the rotation to their own Space.
+    apply_rotation_to_space(
+        &mut admin_space,
+        &rotation_event,
+        admin_addr,
+        &admin_signing_key,
+    );
+    assert_eq!(
+        admin_space.current_epoch,
+        Some(1),
+        "admin must advance to epoch 1"
+    );
+
+    // Admin encrypts a new message under K(1).
+    let msg_epoch1 = b"secret at epoch 1 (B excluded)";
+    let env1 = encrypt_for_topic(&admin_space, msg_epoch1).expect("encrypt@1");
+    assert_eq!(env1.epoch, 1);
+
+    // B still has only K(0); epoch=1 message fails.
+    let err = decrypt_for_topic(&b_space, &env1)
+        .expect_err("B must not decrypt epoch-1 message after kick");
+    assert!(
+        matches!(err, EpochError::KeyNotAvailable(1)),
+        "expected KeyNotAvailable(1), got {err:?}"
+    );
+
+    // B CAN still decrypt epoch=0 messages (backward: old messages preserved).
+    decrypt_for_topic(&b_space, &env0).expect("B can still read old epoch-0 msg");
+
+    // Sanity: applying the rotation for B (simulating getting the wrong sealed key
+    // from a different member's sealed bytes) fails open_from_owner.
+    let admin_pub64 = admin_signing_key.verifying_key().to_bytes();
+    let x25519_admin_pub = ed25519_pub_to_x25519(&admin_pub64).expect("convert pub");
+    let sealed_for_admin =
+        seal_to_owner(&x25519_admin_pub, k_next.as_bytes()).expect("seal to admin");
+    let b_x25519_priv = ed25519_priv_to_x25519(&b_signing_key);
+    let result = open_from_owner(&b_x25519_priv, &sealed_for_admin);
+    // Should either fail or produce wrong bytes (wrong recipient key).
+    // The AEAD tag will fail since the sealed envelope is for admin's X25519 key.
+    assert!(
+        result.is_err(),
+        "B must not be able to open a sealed key intended for admin"
+    );
+}
+
+/// ZEB-249 §4.1: Admin A invites B and C at epoch 0. A kicks B at epoch 1.
+/// C (remaining member) gets the rotation and can decrypt epoch-1 messages.
+/// B cannot.
+#[test]
+fn three_node_selective_access() {
+    use harmony_identity::PrivateIdentity;
+
+    let community_id = SpaceId([0x31; 16]);
+
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let _b_signing_key = ed25519_dalek::SigningKey::from_bytes(&b_ed_seed);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+
+    let c_identity = PrivateIdentity::from_seed(&[0xCC; 32]);
+    let c_sk_bytes = c_identity.to_private_bytes();
+    let c_ed_seed: [u8; 32] = c_sk_bytes[32..64].try_into().unwrap();
+    let c_signing_key = ed25519_dalek::SigningKey::from_bytes(&c_ed_seed);
+    let c_addr = OwnerAddr(c_identity.identity.address_hash);
+
+    // All three start with K(0).
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut c_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+
+    // Admin kicks B → generate K(1) sealed to admin and C only.
+    let kick_event = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: b_addr,
+            reason: None,
+        },
+        1000,
+        &admin_signing_key,
+    );
+    let k1 = EpochKey::new([0x20u8; 32]);
+    let rotation_recipients = seal_epoch_to_members(
+        &k1,
+        &[(&admin_addr, &admin_signing_key), (&c_addr, &c_signing_key)],
+    );
+    let rotation_rcs: Vec<RecipientCiphertext> = rotation_recipients
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+    let rotation_event = make_signed_event(
+        0x02,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: kick_event.id,
+            recipient_ciphertexts: rotation_rcs,
+        },
+        1001,
+        &admin_signing_key,
+    );
+
+    // Apply to admin and C.
+    apply_rotation_to_space(
+        &mut admin_space,
+        &rotation_event,
+        admin_addr,
+        &admin_signing_key,
+    );
+    apply_rotation_to_space(&mut c_space, &rotation_event, c_addr, &c_signing_key);
+    assert_eq!(admin_space.current_epoch, Some(1));
+    assert_eq!(c_space.current_epoch, Some(1));
+
+    // Admin encrypts at epoch 1.
+    let msg = b"members-only at epoch 1";
+    let env1 = encrypt_for_topic(&admin_space, msg).expect("encrypt@1");
+
+    // C decrypts successfully.
+    let decrypted = decrypt_for_topic(&c_space, &env1).expect("C decrypts epoch-1");
+    assert_eq!(decrypted.as_slice(), msg);
+
+    // B cannot decrypt (no K(1)).
+    assert!(
+        matches!(
+            decrypt_for_topic(&b_space, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "B must not decrypt epoch-1"
+    );
+
+    // B and C can still read epoch-0 messages.
+    let env0 = encrypt_for_topic(
+        &make_space_with_epoch(community_id, admin_addr, 0, k0.clone()),
+        b"old msg",
+    )
+    .expect("encrypt@0");
+    decrypt_for_topic(&b_space, &env0).expect("B reads old epoch-0 msg");
+    decrypt_for_topic(&c_space, &env0).expect("C reads old epoch-0 msg");
+}
+
+/// ZEB-249 §4.6: Member B is offline during three consecutive rotations
+/// (epochs 0→1→2→3). When B comes back online, an EpochCatchup delivers
+/// K(3) and B can decrypt current epoch-3 messages.
+#[test]
+fn offline_catchup_through_multiple_rotations() {
+    use harmony_identity::PrivateIdentity;
+
+    let community_id = SpaceId([0x32; 16]);
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = ed25519_dalek::SigningKey::from_bytes(&b_ed_seed);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+
+    // B joins at epoch=0 and goes offline.
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let mut b_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+
+    // Simulate 3 rotations driven by kicking some other member (X) each time.
+    // B is not kicked — just offline. We simulate the admin issuing 3 rotations
+    // but NOT including B in the recipient list (simulating B being unreachable).
+    // In reality, admin would include B. For this test we deliberately exclude B
+    // to prove the catchup mechanism works.
+    let _x_addr = OwnerAddr([0xFF; 16]);
+    let mut kick_id = [0u8; 16];
+    kick_id[0] = 0x01;
+    let mut current_key = k0;
+
+    for i in 0..3u64 {
+        let k_next = EpochKey::random();
+        // Admin applies rotation (B excluded to simulate offline).
+        let sealed_for_admin = seal_epoch_to_members(&k_next, &[(&admin_addr, &admin_signing_key)]);
+        let rotation_rcs: Vec<RecipientCiphertext> = sealed_for_admin
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+        let rotation_event = SignedMembershipEvent {
+            id: {
+                let mut id = [0u8; 16];
+                id[0] = 0x10 + i as u8;
+                id
+            },
+            community_id,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: i,
+                triggered_by: kick_id,
+                recipient_ciphertexts: rotation_rcs,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1000 + i,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        };
+        // Just advance admin's space directly (we're not calling insert_local_event).
+        let prev_epoch = admin_space.current_epoch.unwrap_or(0);
+        let prev_key = admin_space.current_epoch_key.clone();
+        admin_space.current_epoch = Some(prev_epoch + 1);
+        admin_space.current_epoch_key = Some(k_next.clone());
+        if let Some(pk) = prev_key {
+            admin_space.old_epoch_keys.insert(prev_epoch, pk);
+        }
+        let _ = rotation_event; // suppress unused warning
+        current_key = k_next;
+    }
+
+    // Admin is now at epoch=3. B is still at epoch=0.
+    assert_eq!(admin_space.current_epoch, Some(3));
+    assert_eq!(b_space.current_epoch, Some(0));
+
+    // Admin encrypts at epoch 3 — B can't decrypt.
+    let msg3 = b"epoch 3 secret";
+    let env3 = encrypt_for_topic(&admin_space, msg3).expect("encrypt@3");
+    assert!(
+        matches!(
+            decrypt_for_topic(&b_space, &env3),
+            Err(EpochError::KeyNotAvailable(3))
+        ),
+        "B must fail without catchup"
+    );
+
+    // B comes back online. Admin issues an EpochCatchup delivering K(3) to B.
+    // The "triggered_by" would reference B's Join event id in production.
+    let b_join_id = [0xFE; 16];
+    let sealed_for_b = seal_epoch_to_members(&current_key, &[(&b_addr, &b_signing_key)]);
+    let catchup_rcs: Vec<RecipientCiphertext> = sealed_for_b
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+    let catchup_event = SignedMembershipEvent {
+        id: [0xCA; 16],
+        community_id,
+        kind: MembershipEventKind::EpochCatchup {
+            epoch: 3,
+            triggered_by: b_join_id,
+            recipient_ciphertexts: catchup_rcs,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 5000,
+            logical: 0,
+            device_id: "test".into(),
+        },
+        sig: [0u8; 64],
+        countersig: None,
+    };
+
+    // B applies the catchup.
+    apply_catchup_to_space(&mut b_space, &catchup_event, b_addr, &b_signing_key);
+    assert_eq!(
+        b_space.current_epoch,
+        Some(3),
+        "B must be at epoch 3 after catchup"
+    );
+
+    // B can now decrypt epoch-3 messages.
+    let decrypted = decrypt_for_topic(&b_space, &env3).expect("B decrypts after catchup");
+    assert_eq!(decrypted.as_slice(), msg3);
+}
+
+/// ZEB-249 §4.3: Two admins A1 and A2 simultaneously kick X and Y. After
+/// both rotations, the materialized pending_rotation_for is empty (self-heal
+/// converged). Members who received the correct rotation can decrypt.
+///
+/// Note: this test verifies the CRDT materialize() tracking logic for
+/// pending_rotation_for, not a live multi-admin race (which requires a full
+/// runtime). The convergence guarantee is tested at the materialize level.
+#[test]
+fn concurrent_kicks_self_heal_end_to_end() {
+    use harmony_identity::PrivateIdentity;
+    let community_id = SpaceId([0x33; 16]);
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let x_addr = OwnerAddr([0x10; 16]);
+    let y_addr = OwnerAddr([0x20; 16]);
+    let z_addr = OwnerAddr([0x30; 16]); // survivor
+
+    // Build the event log manually: admin + x + y + z join, then x and y kicked.
+    // Admin starts at power=100, x/y/z at power=0.
+    let hlc = |w: u64| Hlc {
+        wall_ms: w,
+        logical: 0,
+        device_id: "test".into(),
+    };
+
+    let join_admin = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Join,
+        100,
+        &admin_signing_key,
+    );
+    let join_x = SignedMembershipEvent {
+        id: [0x11; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: x_addr,
+        at: hlc(200),
+        sig: [0; 64],
+        countersig: None,
+    };
+    let join_y = SignedMembershipEvent {
+        id: [0x12; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: y_addr,
+        at: hlc(300),
+        sig: [0; 64],
+        countersig: None,
+    };
+    let join_z = SignedMembershipEvent {
+        id: [0x13; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: z_addr,
+        at: hlc(400),
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    // Admin kicks X and Y simultaneously.
+    let kick_x = make_signed_event(
+        0x20,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: x_addr,
+            reason: None,
+        },
+        1000,
+        &admin_signing_key,
+    );
+    let kick_y = make_signed_event(
+        0x21,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Kick {
+            target: y_addr,
+            reason: None,
+        },
+        1001,
+        &admin_signing_key,
+    );
+
+    // After both kicks, materialize: both x and y should be in pending_rotation_for.
+    let log_post_kicks = vec![
+        join_admin.clone(),
+        join_x.clone(),
+        join_y.clone(),
+        join_z.clone(),
+        kick_x.clone(),
+        kick_y.clone(),
+    ];
+    let mat_post_kicks = materialize(&log_post_kicks, admin_addr);
+    assert!(
+        mat_post_kicks.pending_rotation_for.contains(&x_addr),
+        "x must be in pending_rotation_for"
+    );
+    assert!(
+        mat_post_kicks.pending_rotation_for.contains(&y_addr),
+        "y must be in pending_rotation_for"
+    );
+    assert_eq!(mat_post_kicks.pending_rotation_for.len(), 2);
+
+    // Admin issues EpochRotation for X's kick (covering Y's kick too by referencing kick_x).
+    // In the multi-kick case, spec §4.3 says any rotation for a pending kick clears it;
+    // the admin issues one rotation per kick in practice, or one covers both via HLC order.
+    // Here we test that a rotation for kick_x clears x from pending_rotation_for.
+    let _k1 = EpochKey::new([0x20u8; 32]);
+    let rot_x = make_signed_event(
+        0x30,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: kick_x.id,
+            recipient_ciphertexts: vec![
+                RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 60],
+                },
+                RecipientCiphertext {
+                    recipient: z_addr,
+                    sealed: vec![0u8; 60],
+                },
+            ],
+        },
+        1002,
+        &admin_signing_key,
+    );
+
+    let log_with_rot_x = vec![
+        join_admin.clone(),
+        join_x.clone(),
+        join_y.clone(),
+        join_z.clone(),
+        kick_x.clone(),
+        kick_y.clone(),
+        rot_x.clone(),
+    ];
+    let mat_with_rot_x = materialize(&log_with_rot_x, admin_addr);
+    // x is cleared; y still pending.
+    assert!(
+        !mat_with_rot_x.pending_rotation_for.contains(&x_addr),
+        "x must be cleared after rotation for kick_x"
+    );
+    assert!(
+        mat_with_rot_x.pending_rotation_for.contains(&y_addr),
+        "y still pending (only kick_x rotation issued so far)"
+    );
+    assert_eq!(mat_with_rot_x.current_epoch, Some(1), "epoch must advance");
+
+    // Issue rotation for Y's kick.
+    let rot_y = make_signed_event(
+        0x31,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 1,
+            triggered_by: kick_y.id,
+            recipient_ciphertexts: vec![
+                RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 60],
+                },
+                RecipientCiphertext {
+                    recipient: z_addr,
+                    sealed: vec![0u8; 60],
+                },
+            ],
+        },
+        1003,
+        &admin_signing_key,
+    );
+
+    let log_full = vec![
+        join_admin, join_x, join_y, join_z, kick_x, kick_y, rot_x, rot_y,
+    ];
+    let mat_final = materialize(&log_full, admin_addr);
+    assert!(
+        mat_final.pending_rotation_for.is_empty(),
+        "all kicks rotated: pending_rotation_for must be empty (self-heal converged)"
+    );
+    assert_eq!(mat_final.current_epoch, Some(2), "final epoch must be 2");
+}
+
+/// ZEB-249 §4.4: Member B cooperatively issues an EpochRotation on Leave.
+/// After B's Leave + bundled rotation, admin does NOT need to act — the
+/// rotation is already in the CRDT and pending_rotation_for is cleared.
+#[test]
+fn leaver_cooperative_rotation() {
+    use harmony_identity::PrivateIdentity;
+
+    let community_id = SpaceId([0x34; 16]);
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = ed25519_dalek::SigningKey::from_bytes(&b_ed_seed);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+
+    let hlc = |w: u64| Hlc {
+        wall_ms: w,
+        logical: 0,
+        device_id: "test".into(),
+    };
+
+    let join_admin = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Join,
+        100,
+        &admin_signing_key,
+    );
+    let join_b = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: b_addr,
+        at: hlc(200),
+        sig: [0; 64],
+        countersig: None,
+    };
+
+    // B leaves cooperatively.
+    let leave_b = make_signed_event(
+        0x10,
+        community_id,
+        b_addr,
+        MembershipEventKind::Leave,
+        1000,
+        &b_signing_key,
+    );
+
+    // B issues rotation excluding self (spec §4.4).
+    let k1 = EpochKey::new([0x20u8; 32]);
+    let sealed_for_admin = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+    let rot_rcs: Vec<RecipientCiphertext> = sealed_for_admin
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+    // Verify B is NOT in the rotation recipients.
+    assert!(
+        rot_rcs.iter().all(|rc| rc.recipient != b_addr),
+        "leaver must not be in rotation recipients"
+    );
+
+    let rotation = make_signed_event(
+        0x11,
+        community_id,
+        b_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: leave_b.id,
+            recipient_ciphertexts: rot_rcs,
+        },
+        1001,
+        &b_signing_key,
+    );
+
+    // Materialize: pending_rotation_for should be cleared by B's rotation.
+    let log = vec![join_admin, join_b, leave_b, rotation];
+    let mat = materialize(&log, admin_addr);
+    assert!(
+        !mat.pending_rotation_for.contains(&b_addr),
+        "cooperative rotation clears pending_rotation_for for leaver"
+    );
+    assert!(
+        mat.pending_rotation_for.is_empty(),
+        "no pending rotations after cooperative leave"
+    );
+    assert_eq!(
+        mat.current_epoch,
+        Some(1),
+        "epoch advances on cooperative leave"
+    );
+
+    // Admin receives K(1) from B's sealed rotation.
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0);
+    // Build the rotation event as a SignedMembershipEvent (needed for apply_rotation_to_space).
+    let rotation2 = {
+        let sealed_for_admin2 = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+        let rot_rcs2: Vec<RecipientCiphertext> = sealed_for_admin2
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+        SignedMembershipEvent {
+            id: [0x12; 16],
+            community_id,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: [0x10; 16],
+                recipient_ciphertexts: rot_rcs2,
+            },
+            actor: b_addr,
+            at: Hlc {
+                wall_ms: 1001,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    };
+    apply_rotation_to_space(&mut admin_space, &rotation2, admin_addr, &admin_signing_key);
+    assert_eq!(admin_space.current_epoch, Some(1));
+
+    // B's space is dropped (leaver doesn't keep the space).
+    // Admin can encrypt at epoch 1; B has no access.
+    let msg = b"epoch 1 post-leave";
+    let env1 = encrypt_for_topic(&admin_space, msg).expect("encrypt@1");
+
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, EpochKey::new([0x10u8; 32]));
+    assert!(
+        matches!(
+            decrypt_for_topic(&b_space, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "B cannot decrypt epoch-1 after leaving"
+    );
+}
+
+/// ZEB-249 §4.4: B issues a Leave with a malicious rotation that includes
+/// self as a recipient. The materialize() layer must reject this rotation
+/// (target must NOT appear in recipient_ciphertexts). The admin self-healing
+/// observer then synthesizes a valid rotation.
+#[test]
+fn leaver_malicious_self_include_rejected_admin_self_heals() {
+    use harmony_identity::PrivateIdentity;
+
+    let community_id = SpaceId([0x35; 16]);
+    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+    let admin_sk_bytes = admin_identity.to_private_bytes();
+    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
+    let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed);
+    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+    let b_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
+    let b_sk_bytes = b_identity.to_private_bytes();
+    let b_ed_seed: [u8; 32] = b_sk_bytes[32..64].try_into().unwrap();
+    let b_signing_key = ed25519_dalek::SigningKey::from_bytes(&b_ed_seed);
+    let b_addr = OwnerAddr(b_identity.identity.address_hash);
+
+    let hlc = |w: u64| Hlc {
+        wall_ms: w,
+        logical: 0,
+        device_id: "test".into(),
+    };
+
+    let join_admin = make_signed_event(
+        0x01,
+        community_id,
+        admin_addr,
+        MembershipEventKind::Join,
+        100,
+        &admin_signing_key,
+    );
+    let join_b = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: b_addr,
+        at: hlc(200),
+        sig: [0; 64],
+        countersig: None,
+    };
+    let leave_b = make_signed_event(
+        0x10,
+        community_id,
+        b_addr,
+        MembershipEventKind::Leave,
+        1000,
+        &b_signing_key,
+    );
+
+    // B maliciously includes SELF in the rotation recipients.
+    let k1 = EpochKey::new([0x20u8; 32]);
+    let malicious_rcs = vec![
+        RecipientCiphertext {
+            recipient: admin_addr,
+            sealed: vec![0u8; 60],
+        },
+        // B includes itself — this violates the spec §4.4 invariant.
+        RecipientCiphertext {
+            recipient: b_addr,
+            sealed: vec![0u8; 60],
+        },
+    ];
+    let malicious_rotation = make_signed_event(
+        0x11,
+        community_id,
+        b_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: leave_b.id,
+            recipient_ciphertexts: malicious_rcs,
+        },
+        1001,
+        &b_signing_key,
+    );
+
+    // Materialize: malicious rotation MUST be silently dropped.
+    // B still appears in pending_rotation_for (rotation didn't count).
+    let log_with_malicious = vec![
+        join_admin.clone(),
+        join_b.clone(),
+        leave_b.clone(),
+        malicious_rotation,
+    ];
+    let mat_malicious = materialize(&log_with_malicious, admin_addr);
+    assert!(
+        mat_malicious.pending_rotation_for.contains(&b_addr),
+        "malicious rotation must be dropped; B stays in pending_rotation_for"
+    );
+    assert_eq!(
+        mat_malicious.current_epoch, None,
+        "epoch must NOT advance from a malicious rotation"
+    );
+
+    // Admin self-heals: issues a valid rotation excluding B.
+    let sealed_for_admin = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+    let valid_rcs: Vec<RecipientCiphertext> = sealed_for_admin
+        .into_iter()
+        .map(|(addr, sealed)| RecipientCiphertext {
+            recipient: addr,
+            sealed,
+        })
+        .collect();
+    let valid_rotation = make_signed_event(
+        0x12,
+        community_id,
+        admin_addr,
+        MembershipEventKind::EpochRotation {
+            prior_epoch: 0,
+            triggered_by: leave_b.id,
+            recipient_ciphertexts: valid_rcs,
+        },
+        1002,
+        &admin_signing_key,
+    );
+
+    // Materialize with admin's valid rotation: pending_rotation_for cleared.
+    let log_healed = vec![join_admin, join_b, leave_b, valid_rotation];
+    let mat_healed = materialize(&log_healed, admin_addr);
+    assert!(
+        !mat_healed.pending_rotation_for.contains(&b_addr),
+        "admin's valid rotation clears pending_rotation_for"
+    );
+    assert!(
+        mat_healed.pending_rotation_for.is_empty(),
+        "no pending rotations after admin self-heal"
+    );
+    assert_eq!(
+        mat_healed.current_epoch,
+        Some(1),
+        "epoch advances after valid admin rotation"
+    );
+
+    // B cannot decrypt epoch-1 messages (admin's rotation excluded B).
+    let k0 = EpochKey::new([0x10u8; 32]);
+    let mut admin_space = make_space_with_epoch(community_id, admin_addr, 0, k0.clone());
+    let rot_event = {
+        let sealed_for_admin2 = seal_epoch_to_members(&k1, &[(&admin_addr, &admin_signing_key)]);
+        let rot_rcs2: Vec<RecipientCiphertext> = sealed_for_admin2
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+        SignedMembershipEvent {
+            id: [0x13; 16],
+            community_id,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: [0x10; 16],
+                recipient_ciphertexts: rot_rcs2,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1002,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    };
+    apply_rotation_to_space(&mut admin_space, &rot_event, admin_addr, &admin_signing_key);
+    let msg = b"epoch 1 admin only";
+    let env1 = encrypt_for_topic(&admin_space, msg).expect("encrypt@1");
+    let b_space = make_space_with_epoch(community_id, admin_addr, 0, k0);
+    assert!(
+        matches!(
+            decrypt_for_topic(&b_space, &env1),
+            Err(EpochError::KeyNotAvailable(1))
+        ),
+        "B must not decrypt epoch-1 after malicious rotation rejected + admin self-heal"
+    );
 }

@@ -3098,6 +3098,15 @@ impl CommunitySyncRegistry {
         self.engines.lock().await.get(community_id).cloned()
     }
 
+    /// ZEB-249 Task 6: returns a clone of the registry's shared
+    /// `IdentityResolver`. IPC handlers that need to look up members'
+    /// 64-byte identity pubs (e.g., to derive X25519 pubkeys for
+    /// EpochRotation/EpochCatchup `seal_to_owner` calls) can call this
+    /// without reaching into the engine internals.
+    pub fn identity_resolver(&self) -> Arc<dyn IdentityResolver> {
+        Arc::clone(&self.cfg.identity_resolver)
+    }
+
     /// Force the engine for `community_id` to publish its current CRDT
     /// state immediately, bypassing the debounce window. Returns
     /// `Err(CommunitySyncError::TransportClosed)` if no engine is
