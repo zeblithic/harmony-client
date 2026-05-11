@@ -8,10 +8,31 @@
 //! See `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::OwnerAddr;
+
+/// ZEB-249: one per-recipient sealed ciphertext in an EpochRotation /
+/// EpochCatchup. Wire format: 2-key CBOR map. Keys (rc, ct) are 2-char
+/// to satisfy the same-length-keys invariant at this nesting level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipientCiphertext {
+    #[serde(rename = "rc")]
+    pub recipient: OwnerAddr,
+
+    /// X25519-sealed bytes (92 = 32 ephemeral pub + 12 nonce + 32 ct + 16 tag).
+    /// See `dm_signing::seal_to_owner`.
+    #[serde(
+        rename = "ct",
+        serialize_with = "crate::owner_state_types::serialize_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_from_bstr"
+    )]
+    pub sealed: Vec<u8>,
+}
+
+impl CanonicalPayloadSealed for RecipientCiphertext {}
+impl CanonicalPayload for RecipientCiphertext {}
 
 /// The five membership event kinds. Adjacently tagged so the wire
 /// format is `{ "tg": "<variant>", "vl": <body> }` — both keys are
@@ -86,6 +107,27 @@ pub enum MembershipEventKind {
     ChannelDelete {
         #[serde(rename = "ch")]
         channel_id: ChannelId,
+    },
+
+    /// ZEB-249: Advances current_epoch. Triggered by Kick/Leave
+    /// (subtractive — excludes the kicked/leaving member from
+    /// recipient_ciphertexts). Spec §4.1.
+    ///
+    /// Variant code "r". Inner field keys are 2-char (pe, ts, rc).
+    #[serde(rename = "r")]
+    EpochRotation {
+        #[serde(rename = "pe")]
+        prior_epoch: u64,
+
+        #[serde(
+            rename = "ts",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        triggered_by: EventId,
+
+        #[serde(rename = "rc")]
+        recipient_ciphertexts: Vec<RecipientCiphertext>,
     },
 }
 
@@ -657,6 +699,17 @@ pub struct MaterializedMembership {
     /// is functionally a derived view; the default is harmless.
     #[serde(default)]
     pub channels: BTreeMap<ChannelId, ChannelInfo>,
+
+    /// ZEB-249: Current epoch counter; advances on each `EpochRotation`.
+    /// `Some(_)` after the first Kick/Leave+rotation; `None` until then.
+    #[serde(default)]
+    pub current_epoch: Option<u64>,
+
+    /// ZEB-249: Tracks members whose Kick/Leave hasn't been followed
+    /// by a successful matching EpochRotation. Self-healing path picks
+    /// these up and synthesizes fresh rotations. See spec §4.3.
+    #[serde(default)]
+    pub pending_rotation_for: BTreeSet<OwnerAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,7 +833,7 @@ pub fn materialize(
     let mut sorted: Vec<&SignedMembershipEvent> = events.iter().collect();
     sorted.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
 
-    for event in sorted {
+    for event in &sorted {
         match &event.kind {
             MembershipEventKind::Join => {
                 // Per-prior-status transition table:
@@ -831,6 +884,9 @@ pub fn materialize(
                 // the materialization path stays simple — the
                 // alternative (insert-with-Left) would corrupt state
                 // from a malformed event.
+                // ZEB-249: Leave needs a rotation. Cooperative leaver may bundle
+                // it; otherwise self-healing observer fills.
+                m.pending_rotation_for.insert(event.actor);
             }
             MembershipEventKind::Invite { target } => {
                 // Per-prior-status transition table:
@@ -879,6 +935,10 @@ pub fn materialize(
                     s.status = MemberStatus::Banned;
                     s.left_at = Some(event.at.clone());
                 }
+                // ZEB-249: track that this kick needs a matching EpochRotation.
+                // The self-healing observer synthesizes one if the bundled
+                // rotation didn't land (e.g., concurrent-kick contention).
+                m.pending_rotation_for.insert(*target);
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
@@ -940,6 +1000,57 @@ pub fn materialize(
                         info.deleted_at = Some(event.at.clone());
                     }
                 }
+            }
+            MembershipEventKind::EpochRotation {
+                prior_epoch,
+                triggered_by,
+                recipient_ciphertexts,
+            } => {
+                // Staleness gate (spec §4.2): silently drop if not for current epoch.
+                let current = m.current_epoch.unwrap_or(0);
+                if *prior_epoch != current {
+                    continue;
+                }
+
+                // Find the Kick/Leave event this rotation was generated for.
+                // Linear scan ok — event log is bounded.
+                let triggered_event = sorted.iter().find(|e| &e.id == triggered_by);
+                let kick_target = match triggered_event.map(|e| &e.kind) {
+                    Some(MembershipEventKind::Kick { target, .. }) => Some(*target),
+                    Some(MembershipEventKind::Leave) => triggered_event.map(|e| e.actor),
+                    _ => None,
+                };
+                let Some(target) = kick_target else {
+                    continue;
+                };
+
+                // Malformed rotation check (spec §4.4): target must NOT be
+                // in recipient_ciphertexts.
+                if recipient_ciphertexts
+                    .iter()
+                    .any(|rc| rc.recipient == target)
+                {
+                    continue;
+                }
+
+                // Validity check (spec §4.4): issuer must have admin power
+                // OR be the target of a Leave (cooperative-leaver path).
+                let issuer = event.actor;
+                let issuer_power = m.power_levels.get(&issuer).copied().unwrap_or(0);
+                let is_admin = issuer_power >= POWER_THRESHOLDS.kick;
+                let is_self_leaver = matches!(
+                    triggered_event.map(|e| &e.kind),
+                    Some(MembershipEventKind::Leave)
+                ) && issuer == target;
+                if !is_admin && !is_self_leaver {
+                    continue;
+                }
+
+                // Apply: advance epoch. Per-receiver key insertion happens
+                // outside materialize (community_state_sync apply layer —
+                // Tasks 5/6). materialize is pure replay.
+                m.current_epoch = Some(current + 1);
+                m.pending_rotation_for.remove(&target);
             }
         }
     }
@@ -1233,6 +1344,12 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
+        MembershipEventKind::EpochRotation { .. } => {
+            // EpochRotation membership + power checks happen in the
+            // per-kind power-rules block below — the cooperative-leaver
+            // path allows a non-member (the leaver) to issue the rotation,
+            // so we can't apply a blanket ActorNotJoined gate here.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1370,6 +1487,14 @@ pub fn verify_event(
             // at most a redundant tombstone event in the log; UX-wise
             // both delete attempts return Ok.
         }
+        MembershipEventKind::EpochRotation { .. } => {
+            // EpochRotation: power verification is deferred to the
+            // materialize() arm which has both old and new state in scope.
+            // verify_event's role here is limited to signature + wire
+            // format checks. Full protocol invariants (staleness, recipient-
+            // exclusion, admin-or-self-leaver) are enforced in materialize
+            // via the drop-on-invalid path (spec §4.2-4.4).
+        }
     }
 
     Ok(())
@@ -1403,3 +1528,277 @@ pub const POWER_THRESHOLDS: PowerThresholds = PowerThresholds {
     set_power: 100,
     max: 100,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_kick_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfa; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    fn make_rotation_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        triggered_by: [u8; 16],
+        prior_epoch: u64,
+        recipients: Vec<(OwnerAddr, Vec<u8>)>,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfb; 16];
+        id[15] = id_byte;
+        let recipient_ciphertexts: Vec<RecipientCiphertext> = recipients
+            .into_iter()
+            .map(|(addr, sealed)| RecipientCiphertext {
+                recipient: addr,
+                sealed,
+            })
+            .collect();
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch,
+                triggered_by,
+                recipient_ciphertexts,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    fn make_leave_event(id_byte: u8, actor: OwnerAddr, at_wall_ms: u64) -> SignedMembershipEvent {
+        let mut id = [0xfc; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Leave,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    /// Helper: construct a Join event for a member so materialize can
+    /// find them in the members map (needed for Kick to update status).
+    fn make_join_event(id_byte: u8, actor: OwnerAddr, at_wall_ms: u64) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    #[test]
+    fn epoch_rotation_advances_current_epoch() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        // admin has power 100 from bootstrap; bob needs to be in members for kick to fire
+        let bob_join = make_join_event(0x01, bob, 50);
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let m = materialize(&[bob_join, kick, rot], admin);
+        assert_eq!(m.current_epoch, Some(1));
+        assert!(!m.pending_rotation_for.contains(&bob));
+        assert_eq!(m.members[&bob].status, MemberStatus::Banned);
+    }
+
+    #[test]
+    fn stale_rotation_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let carol = OwnerAddr([0xc1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        let carol_join = make_join_event(0x02, carol, 51);
+        let kick1 = make_kick_event(0x01, admin, bob, 100);
+        let rot1 = make_rotation_event(0x01, admin, kick1.id, 0, vec![(admin, vec![1; 92])], 101);
+        // Second kick for carol; try a STALE rotation with prior_epoch=0
+        // (current would be 1 after rot1).
+        let kick2 = make_kick_event(0x02, admin, carol, 200);
+        let stale_rot =
+            make_rotation_event(0x02, admin, kick2.id, 0, vec![(admin, vec![3; 92])], 201);
+        let m = materialize(
+            &[bob_join, carol_join, kick1, rot1, kick2, stale_rot],
+            admin,
+        );
+        assert_eq!(m.current_epoch, Some(1)); // stale rotation didn't advance
+        assert!(m.pending_rotation_for.contains(&carol));
+    }
+
+    #[test]
+    fn malformed_rotation_dropped() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        // Malformed: recipient_ciphertexts includes bob (the kicked target).
+        let malformed = make_rotation_event(
+            0x01,
+            admin,
+            kick.id,
+            0,
+            vec![(admin, vec![1; 92]), (bob, vec![1; 92])],
+            101,
+        );
+        let m = materialize(&[bob_join, kick, malformed], admin);
+        assert!(m.current_epoch.unwrap_or(0) == 0); // didn't advance
+        assert!(m.pending_rotation_for.contains(&bob));
+    }
+
+    #[test]
+    fn leaver_issued_rotation_accepted_when_well_formed() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        let leave = make_leave_event(0x01, bob, 100);
+        // bob signs the rotation; recipients exclude bob.
+        let rot = make_rotation_event(0x01, bob, leave.id, 0, vec![(admin, vec![1; 92])], 101);
+        let m = materialize(&[bob_join, leave, rot], admin);
+        assert_eq!(m.current_epoch, Some(1));
+        assert!(!m.pending_rotation_for.contains(&bob));
+    }
+
+    #[test]
+    fn leaver_issued_rotation_rejected_when_self_included() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        let leave = make_leave_event(0x01, bob, 100);
+        // bob signs the rotation BUT includes himself (malformed).
+        let rot = make_rotation_event(
+            0x01,
+            bob,
+            leave.id,
+            0,
+            vec![(admin, vec![1; 92]), (bob, vec![1; 92])],
+            101,
+        );
+        let m = materialize(&[bob_join, leave, rot], admin);
+        assert!(m.current_epoch.unwrap_or(0) == 0);
+        assert!(m.pending_rotation_for.contains(&bob));
+    }
+
+    #[test]
+    fn pending_rotation_tracking_clears_after_matching_rotation_lands() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let m_partial = materialize(&[bob_join.clone(), kick.clone()], admin);
+        assert!(m_partial.pending_rotation_for.contains(&bob));
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 101);
+        let m_full = materialize(&[bob_join, kick, rot], admin);
+        assert_eq!(m_full.pending_rotation_for.len(), 0);
+    }
+
+    #[test]
+    fn kick_then_rotation_same_hlc_tick_materializes_atomically() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        let bob_join = make_join_event(0x01, bob, 50);
+        // Same wall_ms for kick + rotation; event-id tiebreaks (kick id ends 0x01, rotation ends 0x01)
+        // but different id arrays (0xfa...01 vs 0xfb...01) ensure distinct ordering.
+        let kick = make_kick_event(0x01, admin, bob, 100);
+        let rot = make_rotation_event(0x01, admin, kick.id, 0, vec![(admin, vec![1; 92])], 100);
+        let m = materialize(&[bob_join, kick, rot], admin);
+        assert_eq!(m.current_epoch, Some(1));
+        assert_eq!(m.pending_rotation_for.len(), 0);
+    }
+
+    #[test]
+    fn concurrent_kicks_self_heal() {
+        let admin1 = OwnerAddr([0xa1; 16]);
+        let admin2 = OwnerAddr([0xa2; 16]);
+        let alice = OwnerAddr([0xb1; 16]);
+        let bob = OwnerAddr([0xb2; 16]);
+        // Promote admin2 to admin power via SetPower from admin1.
+        let setpwr = SignedMembershipEvent {
+            id: [0x05; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: admin2,
+                level: 100,
+            },
+            actor: admin1,
+            at: Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let alice_join = make_join_event(0x01, alice, 51);
+        let bob_join = make_join_event(0x02, bob, 52);
+        let kick_a = make_kick_event(0x01, admin1, alice, 100);
+        let rot_a = make_rotation_event(
+            0x01,
+            admin1,
+            kick_a.id,
+            0,
+            vec![(admin2, vec![1; 92]), (bob, vec![1; 92])],
+            101,
+        );
+        let kick_b = make_kick_event(0x02, admin2, bob, 200);
+        // STALE: prior_epoch=0 but current is now 1 after rot_a.
+        let rot_b = make_rotation_event(
+            0x02,
+            admin2,
+            kick_b.id,
+            0,
+            vec![(admin1, vec![2; 92]), (alice, vec![2; 92])],
+            201,
+        );
+        let m = materialize(
+            &[setpwr, alice_join, bob_join, kick_a, rot_a, kick_b, rot_b],
+            admin1,
+        );
+        assert_eq!(m.current_epoch, Some(1)); // only rot_a advanced
+        assert!(m.pending_rotation_for.contains(&bob));
+        assert!(!m.pending_rotation_for.contains(&alice));
+    }
+}

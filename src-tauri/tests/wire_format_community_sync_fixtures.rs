@@ -5,6 +5,7 @@
 //! fixtures — locking the encoded bytes prevents silent wire-form drift
 //! across phases.
 
+use harmony_app::community_membership::{MembershipEventKind, RecipientCiphertext};
 use harmony_app::community_state_sync::{
     CommunityRootPublishPayload, CommunityRootSignedPayload, EncryptedEnvelope,
 };
@@ -95,6 +96,42 @@ fn encrypted_envelope_wire_bytes_pinned_v2_null_ratchet() {
         bytes,
         expected,
         "drifted: {} vs {}",
+        hex::encode(&bytes),
+        hex::encode(&expected)
+    );
+}
+
+#[test]
+fn epoch_rotation_event_wire_bytes_pinned() {
+    let triggered_by: [u8; 16] = [0xfa; 16];
+    let kind = MembershipEventKind::EpochRotation {
+        prior_epoch: 5,
+        triggered_by,
+        recipient_ciphertexts: vec![
+            RecipientCiphertext {
+                recipient: OwnerAddr([0xa1; 16]),
+                sealed: vec![0xab; 92],
+            },
+            RecipientCiphertext {
+                recipient: OwnerAddr([0xb1; 16]),
+                sealed: vec![0xcd; 92],
+            },
+            RecipientCiphertext {
+                recipient: OwnerAddr([0xc1; 16]),
+                sealed: vec![0xef; 92],
+            },
+        ],
+    };
+    let bytes = canonical_cbor_encode(&kind).expect("encode");
+    let expected_hex = "a2627467617262766ca36270650562747350fafafafafafafafafafafafafafafafa62726383a262726350a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1626374585cababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababa262726350b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1626374585ccdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcda262726350c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1626374585cefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for pinning: {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER with the bytes above");
+    });
+    assert_eq!(
+        bytes,
+        expected,
+        "EpochRotation wire bytes drifted: {} vs {}",
         hex::encode(&bytes),
         hex::encode(&expected)
     );
