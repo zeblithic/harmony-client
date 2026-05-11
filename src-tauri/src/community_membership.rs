@@ -1125,10 +1125,15 @@ pub fn materialize(
                     continue;
                 }
 
-                // Apply: clear target from pending_catchup_for.
+                // Apply: clear pending_catchup_for for every member named in
+                // recipient_ciphertexts. Spec §4.6 allows multi-recipient
+                // catchups (e.g., one admin synthesizing a single catchup
+                // event that covers several recent joiners at once).
                 // (Actual key delivery to receiver's local Space happens
                 // in community_state_sync apply layer — Tasks 5/6.)
-                m.pending_catchup_for.remove(&target);
+                for rc in recipient_ciphertexts {
+                    m.pending_catchup_for.remove(&rc.recipient);
+                }
             }
         }
     }
@@ -1429,12 +1434,13 @@ pub fn verify_event(
             // so we can't apply a blanket ActorNotJoined gate here.
         }
         MembershipEventKind::EpochCatchup { .. } => {
-            // EpochCatchup power verification is deferred to the
-            // materialize() arm which has both old and new state in scope.
-            // verify_event's role here is limited to signature + wire
-            // format checks. Full protocol invariants (epoch match,
-            // triggered_by Join check, admin-only) are enforced in
-            // materialize via the drop-on-invalid path (spec §4.6).
+            // EpochCatchup: skip the ActorNotJoined gate because the
+            // admin issuing the catchup might subsequently be kicked
+            // by the time an observer replays; we deliberately don't
+            // enforce membership-at-replay-time. All authority and
+            // shape checks (epoch must match current, triggered_by
+            // must be a Join, target must be in recipients, issuer
+            // must have admin power) are enforced in materialize. Spec §4.6.
         }
     }
 
@@ -1897,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_catchup_for_already_caught_up_member_dropped() {
+    fn duplicate_catchup_for_same_join_is_harmless_nop() {
         let admin = OwnerAddr([0xa1; 16]);
         let admin2 = OwnerAddr([0xa2; 16]);
         let bob = OwnerAddr([0xb1; 16]);
