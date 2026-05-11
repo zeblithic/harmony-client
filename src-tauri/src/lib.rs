@@ -3104,8 +3104,8 @@ async fn decrypt_inbox_entries(
 ///
 /// `message_id` is the 32-character hex of a 16-byte OutboxEntryId.
 #[tauri::command]
-async fn delete_outbox_entry(
-    app: tauri::AppHandle,
+async fn delete_outbox_entry<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     message_id: String,
 ) -> Result<(), String> {
@@ -10330,6 +10330,28 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
+}
+
+/// Test-only helper: adds the 4 DM IPC handlers (`send_dm`,
+/// `read_dm_thread`, `delete_outbox_entry`, `add_space`) to a Tauri
+/// builder. Used by `tests/dm_ipc_roundtrip.rs` to set up a
+/// `tauri::test::mock_app` with the commands registered — integration
+/// tests can't see private `#[tauri::command]` fns directly, so this
+/// helper provides the registration surface without re-publishing the
+/// commands themselves.
+///
+/// Production code uses the explicit `invoke_handler` block in
+/// `run()` above (which lists all ~50 commands); this helper exists
+/// solely to support the JS↔Rust binding roundtrip tests added in
+/// ZEB-247.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.invoke_handler(tauri::generate_handler![
+        send_dm,
+        read_dm_thread,
+        delete_outbox_entry,
+        add_space,
+    ])
 }
 
 #[cfg(test)]
