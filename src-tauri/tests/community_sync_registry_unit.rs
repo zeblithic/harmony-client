@@ -52,7 +52,7 @@ async fn registry_spawns_and_tears_down_per_community() {
     let (a_pub_tx, _a_pub_rx) = mpsc::channel(8);
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid_a, mk_a, admin_a, /* is_invite_only */ false, a_pub_tx, a_sub_rx,
         )
         .await
@@ -100,7 +100,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     let (_b_sub_tx, b_sub_rx) = mpsc::channel(8);
 
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid_b,
             MembershipKey::new([0xb1; 32]),
             OwnerAddr([0xb1; 16]),
@@ -111,7 +111,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         .await
         .expect("spawn b");
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid_a,
             MembershipKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
@@ -126,7 +126,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     let (a2_pub_tx, _a2_pub_rx) = mpsc::channel(8);
     let (_a2_sub_tx, a2_sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid_a,
             MembershipKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
@@ -225,7 +225,7 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
     let (pub_tx, mut pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine(cid, mk, admin, false, pub_tx, sub_rx)
+        .spawn_engine_inner_now(cid, mk, admin, false, pub_tx, sub_rx)
         .await
         .expect("spawn");
 
@@ -320,7 +320,7 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx,
         )
         .await
@@ -416,7 +416,7 @@ async fn pending_redemption_unregistered_when_no_match() {
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine(
+        .spawn_engine_inner_now(
             cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx,
         )
         .await
