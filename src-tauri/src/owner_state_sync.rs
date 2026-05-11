@@ -1058,19 +1058,15 @@ mod subscriber_tests {
             .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await)
             .await
             .unwrap();
-        // Poll for "still 2000" — true on entry and remains true if the
-        // older replay is correctly rejected; bounds the wait without
-        // masking a regression (a regression would flip the predicate
-        // to false, which never recovers).
-        let unchanged = wait_until(
-            || async {
-                let t = tracker.lock().await;
-                t.get("peer-bob").is_some_and(|s| s.wall_ms == 2000)
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(unchanged, "tracker regressed below wall_ms=2000 within 2s");
+        // Tier B settle window (per spec §3 negative-assertion rule):
+        // we're verifying the tracker stays at wall_ms=2000 AFTER the
+        // subscriber processes the older replay. wait_until is the
+        // wrong tool here — its predicate is true on entry, so it
+        // would exit immediately, before the engine has dequeued the
+        // older wire. Bare-sleep gives the subscriber loop time to
+        // process; the affirmative assert below then catches a
+        // regression. 500ms is 10× the original 50ms for CI headroom.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let t = tracker.lock().await;
         let stored = t.get("peer-bob").expect("still present");
@@ -1378,21 +1374,15 @@ mod subscriber_tests {
             .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 2000, 0).await)
             .await
             .unwrap();
-        // Poll for "tracker NOT regressed" — true on entry and remains true
-        // throughout (rejection is the expected path), so wait_until exits
-        // immediately on healthy runs but still bounds the total wait.
-        let converged = wait_until(
-            || async {
-                let t = tracker2.lock().await;
-                t.get("peer-bob").is_some_and(|s| s.wall_ms == 5000)
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(
-            converged,
-            "replay tracker did not retain wall_ms=5000 within 2s"
-        );
+        // Tier B settle window (per spec §3 negative-assertion rule):
+        // verifying the post-restart tracker stays at wall_ms=5000
+        // AFTER the engine processes the older replay. wait_until's
+        // predicate is true on entry, so it would exit before the
+        // engine dequeues the wire — a regression after that exit
+        // would slip past. Bare-sleep gives the subscriber loop time
+        // to process; the affirmative assert_eq! below catches any
+        // regression. 500ms is 5× the original 100ms for CI headroom.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let t = tracker2.lock().await;
         assert_eq!(
