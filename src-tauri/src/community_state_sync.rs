@@ -3669,4 +3669,119 @@ mod tests {
             "engine from the first call must remain after the second use-once-rejected call"
         );
     }
+
+    /// CR round 5: regression test for the Arc::ptr_eq cross-registry
+    /// rejection branch added in CR round 3. Two separate
+    /// CommunitySyncRegistry instances; guard from registry A is passed
+    /// to registry B's spawn_engine_with_guard. Must Err immediately,
+    /// before any spawn side effects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_wrong_registry_rejected() {
+        let fix_a = build_test_fixture().await;
+        let fix_b = build_test_fixture().await;
+        let community_id = SpaceId([0xc8; 16]);
+
+        // Open guard on registry A; pass it to registry B.
+        let mut guard = std::sync::Arc::clone(&fix_a.registry).begin_spawn_guard(community_id);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let result = std::sync::Arc::clone(&fix_b.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix_b.membership_key.clone(),
+                fix_b.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix_b.community_adapter_tx.clone(),
+            )
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("cross-registry call must Err, got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guard/registry mismatch")
+                || msg.contains("different CommunitySyncRegistry"),
+            "Err must mention registry mismatch; got: {msg}"
+        );
+
+        // Engine must NOT be in EITHER registry (rejection happened
+        // before any spawn side effects).
+        assert!(
+            !fix_a.registry.has_engine(&community_id).await,
+            "registry A must have no engine (no spawn happened)"
+        );
+        assert!(
+            !fix_b.registry.has_engine(&community_id).await,
+            "registry B must have no engine (rejected before spawn)"
+        );
+
+        // Commit guard A to release its rollback obligation cleanly
+        // (otherwise Drop runs on a registry-A guard that nothing was
+        // spawned on — harmless but spammy log).
+        guard.commit();
+    }
+
+    /// CR round 5: regression test for the community_id mismatch
+    /// rejection branch added in CR round 2. Same registry; guard
+    /// opened for community X but spawn called with community Y.
+    /// Must Err immediately, before any spawn side effects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_wrong_community_id_rejected() {
+        let fix = build_test_fixture().await;
+        let community_x = SpaceId([0xc9; 16]);
+        let community_y = SpaceId([0xca; 16]);
+
+        // Guard for X; call with Y.
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_x);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let result = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_y, // mismatch — guard is for X
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+            )
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("community_id mismatch call must Err, got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("guard/community_id mismatch"),
+            "Err must mention community_id mismatch; got: {msg}"
+        );
+
+        // No engine in registry for EITHER community.
+        assert!(
+            !fix.registry.has_engine(&community_x).await,
+            "no engine for community X (guard was for X but never spawned)"
+        );
+        assert!(
+            !fix.registry.has_engine(&community_y).await,
+            "no engine for community Y (rejected before spawn)"
+        );
+
+        // Commit guard for X to release rollback obligation cleanly.
+        guard.commit();
+    }
 }

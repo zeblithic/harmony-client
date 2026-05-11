@@ -296,14 +296,19 @@ This preserves the ZEB-260 PR #90 round-5 invariant: only the FRESH creator owns
 
 ### §5.3 Adapter-dispatch failure (atomic with engine spawn)
 
-`spawn_engine_with_guard` is now responsible for both engine construction AND adapter `try_send`. Internal sequence:
+`spawn_engine_with_guard` is now responsible for both engine construction AND adapter `try_send`. Internal sequence (per CR round 4 finding #3 — set-early-arm pattern):
 
-1. `spawn_engine` (existing): build engine, insert into engines map. Records bool internally.
-2. If freshly created: `community_adapter_tx.try_send(CommunityAdapterRequest { ... })`.
-3. If try_send fails AND freshly created: `.await shutdown_engine_and_cleanup_persistence` inline (we're already inside the async spawn_engine_with_guard) to undo the spawn, then return Err. Guard's `freshly_created` flag is NEVER set to true (so Drop is a no-op).
-4. If both succeed: set guard's `freshly_created` to the engine-spawn result. Return Ok(engine).
+1. **Validation** (CR round 2 + 3): reject if `guard.registry` ptr-mismatches `self`, if `guard.community_id` mismatches the call arg, or if `guard.used` was already set (use-once enforcement via `compare_exchange`).
+2. **Spawn**: `spawn_engine_inner_now` builds engine + inserts into engines map; returns `freshly_created: bool` set under the engines-map lock.
+3. **Arm the guard** (set-early): `guard.freshly_created = freshly_created`. From this point on, the guard's Drop is the safety net for any later failure in this function — including the rare engine_arc-vanished race at step 6.
+4. **Dispatch adapter** (only if freshly created): `community_adapter_tx.try_send(CommunityAdapterRequest { ... })`.
+5. **On try_send failure**: inline `.await shutdown_engine_and_cleanup_persistence`. Two sub-cases:
+   - **Inline cleanup succeeds** → `guard.freshly_created = false` (disarm; Drop is no-op).
+   - **Inline cleanup ALSO fails** → leave `guard.freshly_created = true` (armed; Drop's spawned cleanup task retries). Log a warn pointing at reconcile_from_state recovery if Drop also fails.
+   Return Err either way.
+6. **Recover engine handle**: `engine_arc(&community_id).await.ok_or_else(...)?`. The rare miss case is now safe — the guard is already armed (step 3), so its Drop runs the cleanup.
 
-The IPC handler sees a single Err on adapter-dispatch failure; the guard at scope exit is a no-op. This is strictly better than today's behavior (where a separate explicit rollback runs after spawn returns true and try_send fails).
+The IPC handler sees a single Err on adapter-dispatch failure; the guard at scope exit is correctly armed-or-disarmed depending on whether inline cleanup succeeded. This is strictly better than the original design (where a separate explicit rollback ran after spawn returned true + try_send failed, and the engine_arc-vanished race left the engine orphaned).
 
 ### §5.4 commit-then-Drop semantics
 
@@ -397,7 +402,7 @@ This is a strictly better failure mode than today (today: panic-during-drop = le
 
 ### §10.3 Detached cleanup race with concurrent retries (Qodo round 1 finding)
 
-`CommunitySyncSpawnGuard::Drop` spawns the async `shutdown_engine_and_cleanup_persistence` via `Handle::try_current().handle.spawn(...)` rather than `.await`-ing it inline (per `feedback_engineer_for_real_scale` — `Drop` must not block on the hot path). The IPC handler returns Err to the caller IMMEDIATELY; the cleanup task runs in the background.
+`CommunitySyncSpawnGuard::Drop` spawns the async `shutdown_engine_and_cleanup_persistence` via `match Handle::try_current() { Ok(handle) => handle.spawn(...), Err(_) => log warn (no runtime → leak per §10.2) }` rather than `.await`-ing it inline (per `feedback_engineer_for_real_scale` — `Drop` must not block on the hot path). The IPC handler returns Err to the caller IMMEDIATELY; the cleanup task runs in the background.
 
 **Race:** If the user immediately retries (only relevant for `redeem_invite_inner` since `create_community_inner` mints a fresh `community_id` per call):
 
