@@ -10,7 +10,7 @@ use harmony_app::community_membership::{
     ChannelId, CounterSignature, MembershipEventKind, SignedMembershipEvent,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 fn fixture_hlc() -> Hlc {
     Hlc {
@@ -34,13 +34,13 @@ fn fixture_signed_event(kind: MembershipEventKind) -> SignedMembershipEvent {
 
 #[test]
 fn membership_key_wire_bytes_pinned() {
-    let k = MembershipKey::new([0xAA; 32]);
+    let k = EpochKey::new([0xAA; 32]);
     let bytes = canonical_cbor_encode(&k).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("membership_key hex: {hex}");
     assert_eq!(
         hex, "5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "MembershipKey wire format changed"
+        "EpochKey wire format changed"
     );
 }
 
@@ -141,7 +141,7 @@ fn countersignature_wire_bytes_pinned() {
 fn community_invite_payload_open_wire_bytes_pinned() {
     let p = CommunityInvitePayload {
         community_id: SpaceId([0x37; 16]),
-        membership_key: MembershipKey::new([0xAA; 32]),
+        membership_key: EpochKey::new([0xAA; 32]),
         admin_addr: OwnerAddr([0x11; 16]),
         community_name: "fix".into(),
         is_invite_only: false,
@@ -185,7 +185,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
 
     let p = CommunityInvitePayload {
         community_id: SpaceId([0x37; 16]),
-        membership_key: MembershipKey::new([0xAA; 32]),
+        membership_key: EpochKey::new([0xAA; 32]),
         admin_addr: OwnerAddr([0x11; 16]),
         community_name: "fix".into(),
         is_invite_only: true,

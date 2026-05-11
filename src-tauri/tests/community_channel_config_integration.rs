@@ -22,7 +22,7 @@ use harmony_app::community_state_sync::{
     DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -174,7 +174,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     let dir_b = tempfile::tempdir().expect("dir b");
 
     let community_id = SpaceId([0x37; 16]);
-    let membership_key = MembershipKey::new([0x55; 32]);
+    let membership_key = EpochKey::new([0x55; 32]);
 
     // Per-identity registry so each side has its own `delta_tx`.
     let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
@@ -400,7 +400,7 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
     let dir_b = tempfile::tempdir().expect("dir b");
 
     let community_id = SpaceId([0x38; 16]);
-    let membership_key = MembershipKey::new([0x66; 32]);
+    let membership_key = EpochKey::new([0x66; 32]);
 
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "bob-dev".into(),
@@ -551,7 +551,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
     let dir_b = tempfile::tempdir().expect("dir b");
 
     let community_id = SpaceId([0x39; 16]);
-    let membership_key = MembershipKey::new([0x77; 32]);
+    let membership_key = EpochKey::new([0x77; 32]);
 
     let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);

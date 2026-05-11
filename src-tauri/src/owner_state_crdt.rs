@@ -171,10 +171,10 @@ impl OwnerState {
             // sync is where it becomes load-bearing. Adding the gate now
             // means Phase 2 can't accidentally regress it.
             if existing.kind == SpaceKind::Community {
-                if existing.membership_key != incoming.membership_key {
+                if existing.current_epoch_key != incoming.current_epoch_key {
                     return ApplyOutcome::Rejected(RejectionReason::InvariantFail(format!(
-                        "same-SpaceId community update changes membership_key for {:?} \
-                         (creation-pinned in v1; rotation is ZEB-253)",
+                        "same-SpaceId community update changes current_epoch_key for {:?} \
+                         (creation-pinned in v1; rotation via EpochRotation event is ZEB-249)",
                         incoming.id
                     )));
                 }
@@ -846,7 +846,7 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         (None, Some(ck)) => (Some(ck.clone()), vec![]),
     };
 
-    // admin_addr, membership_key, and is_invite_only are creation-pinned
+    // admin_addr, current_epoch_key, and is_invite_only are creation-pinned
     // for Community spaces (per ZEB-217 spec: no admin transfer, no
     // membership-key rotation, no flip-to-private in v1). LWW on
     // updated_at would let a malicious or buggy peer publish a same-
@@ -881,7 +881,9 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         updated_at: newer.updated_at.clone(),
         content_key,
         prior_content_keys,
-        membership_key: creator_side.membership_key.clone(),
+        current_epoch: creator_side.current_epoch,
+        current_epoch_key: creator_side.current_epoch_key.clone(),
+        old_epoch_keys: creator_side.old_epoch_keys.clone(),
         admin_addr: creator_side.admin_addr,
         is_invite_only: creator_side.is_invite_only,
     }
@@ -916,7 +918,9 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -925,7 +929,7 @@ mod apply_space_tests {
     fn community_space(
         id: u8,
         admin_addr: OwnerAddr,
-        membership_key: crate::owner_state_types::MembershipKey,
+        epoch_key: crate::owner_state_types::EpochKey,
         invite_only: bool,
     ) -> Space {
         Space {
@@ -943,7 +947,9 @@ mod apply_space_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(membership_key),
+            current_epoch: Some(0),
+            current_epoch_key: Some(epoch_key),
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
         }
@@ -968,7 +974,9 @@ mod apply_space_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -1030,21 +1038,16 @@ mod apply_space_tests {
     /// both sides' priors, dedup, sort, and cap. Winner content_key is
     /// preserved unchanged.
     /// apply_space rejects same-SpaceId Community updates that change
-    /// the creation-pinned fields (membership_key, admin_addr,
+    /// the creation-pinned fields (current_epoch_key, admin_addr,
     /// is_invite_only, created_at). Without this check, a backdated
     /// incoming Space could win the lww_merge_space creator-pin and
     /// hijack admin authority / rotate the symmetric key.
     #[test]
     fn apply_space_rejects_same_space_id_community_admin_addr_change() {
-        use crate::owner_state_types::MembershipKey;
+        use crate::owner_state_types::EpochKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(
-            7,
-            OwnerAddr([1u8; 16]),
-            MembershipKey::new([0xaa; 32]),
-            false,
-        );
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1069,28 +1072,23 @@ mod apply_space_tests {
     }
 
     #[test]
-    fn apply_space_rejects_same_space_id_community_membership_key_change() {
-        use crate::owner_state_types::MembershipKey;
+    fn apply_space_rejects_same_space_id_community_current_epoch_key_change() {
+        use crate::owner_state_types::EpochKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(
-            7,
-            OwnerAddr([1u8; 16]),
-            MembershipKey::new([0xaa; 32]),
-            false,
-        );
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
         let mut rotation = original.clone();
-        rotation.membership_key = Some(MembershipKey::new([0xbb; 32]));
+        rotation.current_epoch_key = Some(EpochKey::new([0xbb; 32]));
         rotation.updated_at = hlc(999);
         let outcome = s.apply_space(rotation);
         match outcome {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(msg)) => {
                 assert!(
-                    msg.contains("membership_key"),
-                    "expected membership_key rejection; got: {msg}"
+                    msg.contains("current_epoch_key"),
+                    "expected current_epoch_key rejection; got: {msg}"
                 );
             }
             other => panic!("expected InvariantFail rejection, got {other:?}"),
@@ -1099,15 +1097,10 @@ mod apply_space_tests {
 
     #[test]
     fn apply_space_rejects_same_space_id_community_is_invite_only_flip() {
-        use crate::owner_state_types::MembershipKey;
+        use crate::owner_state_types::EpochKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(
-            7,
-            OwnerAddr([1u8; 16]),
-            MembershipKey::new([0xaa; 32]),
-            false,
-        );
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1132,15 +1125,10 @@ mod apply_space_tests {
         // lww_merge_space pins to the older created_at side, an attacker
         // can set their incoming created_at older than the legitimate
         // creator's to "win" the pin. Reject the change at apply time.
-        use crate::owner_state_types::MembershipKey;
+        use crate::owner_state_types::EpochKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(
-            7,
-            OwnerAddr([1u8; 16]),
-            MembershipKey::new([0xaa; 32]),
-            false,
-        );
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1161,15 +1149,10 @@ mod apply_space_tests {
 
     #[test]
     fn apply_space_accepts_same_space_id_community_mutable_field_update() {
-        use crate::owner_state_types::MembershipKey;
+        use crate::owner_state_types::EpochKey;
 
         let mut s = OwnerState::default();
-        let original = community_space(
-            7,
-            OwnerAddr([1u8; 16]),
-            MembershipKey::new([0xaa; 32]),
-            false,
-        );
+        let original = community_space(7, OwnerAddr([1u8; 16]), EpochKey::new([0xaa; 32]), false);
         let outcome = s.apply_space(original.clone());
         assert_eq!(outcome, ApplyOutcome::Inserted);
 
@@ -1181,20 +1164,20 @@ mod apply_space_tests {
         assert_eq!(s.spaces.get(&SpaceId([7; 16])).unwrap().name, "renamed");
     }
 
-    /// Defense-in-depth for ZEB-217: admin_addr, membership_key, and
+    /// Defense-in-depth for ZEB-217: admin_addr, current_epoch_key, and
     /// is_invite_only are creation-pinned for Community spaces. A
     /// fresher updated_at on a same-SpaceId Space must NOT shift the
-    /// bootstrap admin, rotate the membership key, or flip privacy
+    /// bootstrap admin, rotate the epoch key, or flip privacy
     /// mode — those are explicit higher-level operations that don't
     /// exist in v1. Pinning to the older created_at side defends
     /// against a malicious or buggy peer publishing a Space with the
     /// same SpaceId but a hostile admin/key/policy.
     #[test]
     fn lww_merge_community_pins_creation_fields_to_older_creator() {
-        use crate::owner_state_types::MembershipKey;
+        use crate::owner_state_types::EpochKey;
 
         let original_admin = OwnerAddr([1u8; 16]);
-        let original_key = MembershipKey::new([0xaa; 32]);
+        let original_key = EpochKey::new([0xaa; 32]);
         let earlier = Space {
             id: SpaceId([7; 16]),
             kind: SpaceKind::Community,
@@ -1210,7 +1193,9 @@ mod apply_space_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(original_key.clone()),
+            current_epoch: Some(0),
+            current_epoch_key: Some(original_key.clone()),
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
         };
@@ -1229,9 +1214,11 @@ mod apply_space_tests {
             updated_at: hlc(300), // even fresher
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0xbb; 32])), // hostile rotation
-            admin_addr: Some(OwnerAddr([99u8; 16])),              // hostile admin takeover
-            is_invite_only: Some(true),                           // hostile flip to private
+            current_epoch: Some(1),
+            current_epoch_key: Some(EpochKey::new([0xbb; 32])), // hostile rotation
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
+            is_invite_only: Some(true),              // hostile flip to private
         };
 
         let merged = lww_merge_space(&earlier, &attacker_replay);
@@ -1242,9 +1229,9 @@ mod apply_space_tests {
             "admin_addr must pin to the older creator — power-100 authority can't shift via LWW"
         );
         assert_eq!(
-            merged.membership_key,
-            Some(original_key),
-            "membership_key must pin to creation — rotation would lock prior encrypted state"
+            merged.current_epoch_key.as_ref().map(|k| *k.as_bytes()),
+            Some(*original_key.as_bytes()),
+            "current_epoch_key must pin to creation — rotation would lock prior encrypted state"
         );
         assert_eq!(
             merged.is_invite_only,
@@ -1281,7 +1268,9 @@ mod apply_space_tests {
             updated_at: hlc(1),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x10; 32])],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -1302,7 +1291,9 @@ mod apply_space_tests {
             updated_at: hlc(2),
             content_key: Some(shared_key.clone()),
             prior_content_keys: vec![DmContentKey::new([0x20; 32])],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -1443,7 +1434,9 @@ mod apply_space_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -1468,7 +1461,9 @@ mod apply_space_tests {
             updated_at: hlc(200),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2117,7 +2112,9 @@ mod canonicalization_tests {
             updated_at: hlc(ts),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -2412,7 +2409,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -2504,7 +2503,9 @@ mod crypto_integration_tests {
             updated_at: hlc(100),
             content_key: Some(DmContentKey::new([0xcc; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -3189,7 +3190,9 @@ mod merge_prior_content_keys_tests {
             updated_at: hlc,
             content_key: Some(content_key),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -3348,7 +3351,9 @@ mod dm_crypto_integration_tests {
             updated_at: hlc,
             content_key: Some(ck),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }

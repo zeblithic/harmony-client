@@ -34,7 +34,7 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,7 +146,7 @@ async fn two_members_dag_sync_full_event_log() {
     ));
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -369,7 +369,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     use harmony_app::community_state_sync::CommunityRootSignedPayload;
 
     let community_id = SpaceId([2u8; 16]);
-    let mk = MembershipKey::new([0x55; 32]);
+    let mk = EpochKey::new([0x55; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xb1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -590,7 +590,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     ));
 
     let community_id = SpaceId([3u8; 16]);
-    let mk = MembershipKey::new([0x77; 32]);
+    let mk = EpochKey::new([0x77; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xc1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -789,7 +789,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
     ));
 
     let community_id = SpaceId([4u8; 16]);
-    let mk = MembershipKey::new([0x88; 32]);
+    let mk = EpochKey::new([0x88; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xd1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -998,7 +998,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
 
 /// ZEB-256 § 11 acceptance: "Spoofing test demonstrates the censorship
 /// attack is no longer possible." Prior to publisher authentication,
-/// any member with the shared `MembershipKey` could publish a state-
+/// any member with the shared `EpochKey` could publish a state-
 /// root payload claiming `publisher_addr = alice_addr` at HLC `huge`,
 /// advancing every receiver's `(alice_addr, alice_dev)` tracker slot
 /// past `huge`. Alice's subsequent legitimate publishes — at
@@ -1015,7 +1015,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
 ///   2. We craft a forged publish: `publisher_addr = alice_addr`,
 ///      `at = Hlc { wall_ms: huge, device_id: "a-dev" }`,
 ///      `publisher_sig = bob_sk.sign(...)`. This decrypts cleanly
-///      (Bob has the `MembershipKey`) AND passes the membership-at-
+///      (Bob has the `EpochKey`) AND passes the membership-at-
 ///      HLC gate (Alice IS Joined), but FAILS the publisher-sig
 ///      verify because `bob_sk` does not match `alice_pub`. B emits a
 ///      `publisher_sig_invalid` degraded report and DOES NOT advance
@@ -1046,7 +1046,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     ));
 
     let community_id = SpaceId([5u8; 16]);
-    let mk = MembershipKey::new([0xAA; 32]);
+    let mk = EpochKey::new([0xAA; 32]);
 
     // Alice — the real, legitimate publisher. Engine A signs publishes
     // with `alice_signing`; both registries' resolvers map
@@ -1058,7 +1058,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     let alice_signing = signing_key_from(&id_alice);
 
     // Bob — the attacker. Bob is also a community member (so Bob has
-    // the `MembershipKey`), but Bob's signing key is NOT Alice's. The
+    // the `EpochKey`), but Bob's signing key is NOT Alice's. The
     // forged publish below is signed with `bob_signing` while claiming
     // `publisher_addr = alice_addr`; verify-on-receive rejects it
     // because `bob_signing` does not match Alice's resolver-resolved
@@ -1262,7 +1262,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // Step 2 — Build the forged publish OUTSIDE any registry.
     //
     // The attacker's threat model: Bob is a paid-up community member
-    // with the `MembershipKey`. Bob crafts a wire packet claiming
+    // with the `EpochKey`. Bob crafts a wire packet claiming
     // `publisher_addr = alice_addr`, signs it with `bob_signing`, and
     // ships it to B's Zenoh subscriber. The packet AEAD-decrypts
     // cleanly (Bob has the MK), the publisher-membership gate passes
@@ -1527,7 +1527,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     ));
 
     let community_id = SpaceId([0x77; 16]);
-    let mk = MembershipKey::new([0x55; 32]);
+    let mk = EpochKey::new([0x55; 32]);
 
     // Alice is the admin AND the publisher under test. She'll Join then
     // Leave — exercising the tracker's behavior across a Leave so we
@@ -2485,7 +2485,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
-    use harmony_app::owner_state_types::{DeviceIdentityHash, MembershipKey};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey};
     use std::collections::BTreeMap;
 
     // Short timeout so the test runs fast. RAII guard restores any
@@ -2539,7 +2539,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     // `canonical_invite_token_bytes` (which only reads the payload
     // fields, ignoring `sig`), then re-construct with the real sig.
     let community_id = SpaceId([0x33; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let minted_at = Hlc {
         wall_ms: 1000,
         logical: 0,

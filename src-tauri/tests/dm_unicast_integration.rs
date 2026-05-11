@@ -152,7 +152,9 @@ fn make_dm_space(
         },
         content_key: Some(content_key),
         prior_content_keys: vec![],
-        membership_key: None,
+        current_epoch: None,
+        current_epoch_key: None,
+        old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
     }

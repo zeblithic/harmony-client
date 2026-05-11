@@ -1694,7 +1694,7 @@ async fn start_node(
                     // pair for the event_loop to wire to a dead engine.
                     type CommunitySpawnSnapshot = (
                         crate::owner_state_types::SpaceId,
-                        crate::owner_state_types::MembershipKey,
+                        crate::owner_state_types::EpochKey,
                         crate::owner_state_types::OwnerAddr,
                         bool,
                     );
@@ -1712,12 +1712,12 @@ async fn start_node(
                                 if space.left_at.is_some() {
                                     return None;
                                 }
-                                let mk = match space.membership_key.as_ref() {
+                                let mk = match space.current_epoch_key.as_ref() {
                                     Some(k) => k.clone(),
                                     None => {
                                         tracing::warn!(
                                             ?space_id,
-                                            "community Space missing membership_key — skipping engine spawn"
+                                            "community Space missing current_epoch_key — skipping engine spawn"
                                         );
                                         return None;
                                     }
@@ -3362,7 +3362,9 @@ pub fn add_space_dm_inner(
         updated_at: creation_hlc.clone(),
         content_key: Some(content_key.clone()),
         prior_content_keys: vec![],
-        membership_key: None,
+        current_epoch: None,
+        current_epoch_key: None,
+        old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
     };
@@ -6966,7 +6968,7 @@ pub fn build_open_invite_url(
 }
 
 /// Generate a `harmony://invite/...` URL for an OPEN community. The
-/// returned URL carries the community id + symmetric `MembershipKey` +
+/// returned URL carries the community id + symmetric `EpochKey` +
 /// admin addr + community name, so any holder can decrypt the
 /// state-root topic and publish their own Join event.
 ///
@@ -7028,9 +7030,9 @@ async fn generate_invite(
         ));
     }
     let mk = space
-        .membership_key
+        .current_epoch_key
         .clone()
-        .ok_or("community Space missing membership_key (corrupt row?)")?;
+        .ok_or("community Space missing current_epoch_key (corrupt row?)")?;
     let admin = space
         .admin_addr
         .ok_or("community Space missing admin_addr (corrupt row?)")?;
@@ -7059,7 +7061,7 @@ async fn generate_invite(
 
 // ── ZEB-217 Sub-C Phase 3 Task 9: create_community ───────────────────
 //
-// Mints a new community: fresh community_id, fresh MembershipKey,
+// Mints a new community: fresh community_id, fresh EpochKey,
 // bootstrap admin self-Join SignedMembershipEvent, then applies the
 // Community Space row to owner-state CRDT, advances the local HLC
 // tracker, spawns a CommunitySyncEngine via the registry, hands the
@@ -7076,14 +7078,14 @@ async fn generate_invite(
 /// destructure cleanly.
 pub struct MintedCommunity {
     pub community_id: crate::owner_state_types::SpaceId,
-    pub membership_key: crate::owner_state_types::MembershipKey,
+    pub membership_key: crate::owner_state_types::EpochKey,
     pub space: crate::owner_state_types::Space,
     pub bootstrap_join: crate::community_membership::SignedMembershipEvent,
 }
 
 /// Pure function: mint a fresh community + signed bootstrap Join.
 ///
-/// Generates random `community_id` (16 bytes) and `MembershipKey`
+/// Generates random `community_id` (16 bytes) and `EpochKey`
 /// (32 bytes), builds the Community Space row, signs a self-Join
 /// `SignedMembershipEvent` with the caller's ed25519 key. Returns
 /// all four artefacts so the IPC layer can apply the Space, send
@@ -7091,7 +7093,7 @@ pub struct MintedCommunity {
 ///
 /// Sync / no I/O / no async — caller supplies `creation_hlc`
 /// (pre-reserved via `dm_outbox::reserve_next_hlc_for_device` per
-/// ZEB-267); `community_id`, `MembershipKey`, and the bootstrap-Join
+/// ZEB-267); `community_id`, `EpochKey`, and the bootstrap-Join
 /// `event_id` are drawn from `rand::thread_rng()`. Not deterministic,
 /// but "pure" w.r.t. HLC ordering — concurrent callers with distinct
 /// reserved HLCs always produce monotone outputs. Free of channels,
@@ -7105,7 +7107,7 @@ pub fn mint_community_creation(
     creation_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use crate::owner_state_types::{MembershipKey, Space, SpaceId, SpaceKind};
+    use crate::owner_state_types::{EpochKey, Space, SpaceId, SpaceKind};
     use rand::RngCore;
 
     let mut rng = rand::thread_rng();
@@ -7115,7 +7117,7 @@ pub fn mint_community_creation(
 
     let mut mk_bytes = [0u8; 32];
     rng.fill_bytes(&mut mk_bytes);
-    let membership_key = MembershipKey::new(mk_bytes);
+    let membership_key = EpochKey::new(mk_bytes);
 
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
@@ -7144,7 +7146,9 @@ pub fn mint_community_creation(
         updated_at: creation_hlc,
         content_key: None,
         prior_content_keys: Vec::new(),
-        membership_key: Some(membership_key.clone()),
+        current_epoch: Some(0),
+        current_epoch_key: Some(membership_key.clone()),
+        old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
     };
@@ -8118,7 +8122,7 @@ mod create_community_inner_tests {
         assert_eq!(minted.space.id, minted.community_id);
         assert_eq!(minted.space.admin_addr, Some(self_owner));
         assert_eq!(minted.space.is_invite_only, Some(false));
-        assert!(minted.space.membership_key.is_some());
+        assert!(minted.space.current_epoch_key.is_some());
         assert_eq!(minted.space.name, "Hackers United");
         assert_eq!(minted.space.created_at.wall_ms, wall_now_ms);
         assert_eq!(&minted.space.created_at.device_id, device_id);
@@ -8152,8 +8156,8 @@ mod create_community_inner_tests {
         assert_ne!(minted.community_id, minted2.community_id);
         assert_ne!(minted.bootstrap_join.id, minted2.bootstrap_join.id);
         assert_ne!(
-            minted.space.membership_key.as_ref().unwrap().as_bytes(),
-            minted2.space.membership_key.as_ref().unwrap().as_bytes(),
+            minted.space.current_epoch_key.as_ref().unwrap().as_bytes(),
+            minted2.space.current_epoch_key.as_ref().unwrap().as_bytes(),
         );
 
         // Bootstrap signature MUST verify against self_owner's
@@ -8268,7 +8272,9 @@ pub fn mint_redemption(
         updated_at: join_hlc,
         content_key: None,
         prior_content_keys: Vec::new(),
-        membership_key: Some(payload.membership_key.clone()),
+        current_epoch: Some(0),
+        current_epoch_key: Some(payload.membership_key.clone()),
+        old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(payload.admin_addr),
         // Use the invite's declared is_invite_only so the redeemer's
         // Space row matches the creator's row (Phase 1's CRDT same-
@@ -8979,7 +8985,7 @@ mod redeem_invite_inner_tests {
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::dm_outbox::{DmOutbox, UnicastSendRequest};
     use crate::owner_state_crdt::OwnerState;
-    use crate::owner_state_types::{DeviceIdentityHash, Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use crate::owner_state_types::{DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, SpaceId};
     use harmony_identity::PrivateIdentity;
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
@@ -9160,7 +9166,7 @@ mod redeem_invite_inner_tests {
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
 
         let community_id = crate::owner_state_types::SpaceId([0xf1; 16]);
-        let membership_key = MembershipKey::new([0x42; 32]);
+        let membership_key = EpochKey::new([0x42; 32]);
 
         let invite_payload = CommunityInvitePayload {
             community_id,
@@ -9227,7 +9233,7 @@ mod redeem_invite_inner_tests {
 
         let payload = CommunityInvitePayload {
             community_id: SpaceId([0xee; 16]),
-            membership_key: MembershipKey::new([0x77; 32]),
+            membership_key: EpochKey::new([0x77; 32]),
             admin_addr: OwnerAddr([0x33; 16]),
             community_name: "TestCom".into(),
             is_invite_only: false,
@@ -11057,13 +11063,13 @@ mod list_community_members_ipc_tests {
 mod generate_invite_helper_tests {
     use super::*;
     use crate::community_invite::{decode_invite_url, CommunityInvitePayload};
-    use crate::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
     #[test]
     fn build_open_invite_payload_round_trips_via_url() {
         let payload = CommunityInvitePayload {
             community_id: SpaceId([7; 16]),
-            membership_key: MembershipKey::new([0x99; 32]),
+            membership_key: EpochKey::new([0x99; 32]),
             admin_addr: OwnerAddr([0x11; 16]),
             community_name: "DoorClub".into(),
             is_invite_only: false,

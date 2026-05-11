@@ -525,7 +525,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         InviteToken, RedeemBootstrapVerifyError,
     };
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
     let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
     let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
@@ -556,7 +556,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
 
     let invite_url = encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: MembershipKey::new([0xDD; 32]),
+        membership_key: EpochKey::new([0xDD; 32]),
         admin_addr: alice_addr,
         community_name: "TamperedTest".into(),
         is_invite_only: true,

@@ -263,18 +263,22 @@ impl std::fmt::Debug for DmContentKey {
 }
 
 /// 32-byte symmetric key for community membership-topic encryption
-/// (ChaCha20-Poly1305). Wire format: bstr(32). In-memory: zeroized
-/// on drop. Debug redacts bytes to avoid log leakage.
+/// (ChaCha20-Poly1305) at a specific epoch. Wire format: bstr(32).
+/// In-memory: zeroized on drop. Debug redacts bytes to avoid log
+/// leakage.
+///
+/// Per-epoch — rotates on every Kick/Leave via the `EpochRotation`
+/// CRDT event. The current key for new outbound events lives in
+/// `Space.current_epoch_key`; historical keys (for decrypting old
+/// events) live in `Space.old_epoch_keys`.
 ///
 /// Mirrors DmContentKey precisely — same shape, different purpose.
-/// Distributed via CommunityInvitePayload at invite-link generation;
-/// stored in the community Space's `membership_key` field on every
-/// member's owner-state CRDT (where it inherits encryption-at-rest
-/// from ZEB-211).
+/// Distributed via per-recipient X25519-sealed ciphertexts on every
+/// rotation; the initial key ships in `CommunityInvitePayload.epoch_snapshot`.
 ///
-/// See ZEB-217 spec §"Data model — Space struct additions".
+/// See ZEB-249 spec §"Data model — EpochKey".
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
-pub struct MembershipKey(
+pub struct EpochKey(
     #[serde(
         serialize_with = "serialize_bytes_as_bstr",
         deserialize_with = "deserialize_bytes_from_bstr"
@@ -282,7 +286,7 @@ pub struct MembershipKey(
     [u8; 32],
 );
 
-impl MembershipKey {
+impl EpochKey {
     pub fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
@@ -311,9 +315,9 @@ impl MembershipKey {
     }
 }
 
-impl std::fmt::Debug for MembershipKey {
+impl std::fmt::Debug for EpochKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MembershipKey(<32 bytes redacted>)")
+        write!(f, "EpochKey(<32 bytes redacted>)")
     }
 }
 
@@ -1050,7 +1054,7 @@ impl_canonical!(
     ContentId,
     OutboxEntryId,
     DmContentKey,
-    MembershipKey, // ← NEW (Phase 1: ZEB-217)
+    EpochKey, // ← NEW (Phase 1: ZEB-217)
     DeviceIdentityHash,
     OwnerDeviceCache,
     OwnerDeviceEntry,
@@ -1411,13 +1415,26 @@ pub struct Space {
     )]
     pub prior_content_keys: Vec<DmContentKey>,
 
-    /// Per-community symmetric key for membership topic encryption.
+    /// Current epoch counter for this community. 0 at community creation;
+    /// increments on every successful EpochRotation. MUST be Some for
+    /// kind == Community; MUST be None otherwise. Wire: u64 under "ce".
+    /// See ZEB-249 spec §3.2.
+    #[serde(rename = "ce", skip_serializing_if = "Option::is_none", default)]
+    pub current_epoch: Option<u64>,
+
+    /// Active EpochKey for new outbound events at `current_epoch`.
     /// MUST be Some for kind == Community; MUST be None otherwise.
-    /// Wire: bstr(32) under "mk".  Zeroized on drop (via the
-    /// MembershipKey newtype's ZeroizeOnDrop impl).
-    /// See ZEB-217 spec §"Data model — Space struct additions".
-    #[serde(rename = "mk", skip_serializing_if = "Option::is_none", default)]
-    pub membership_key: Option<MembershipKey>,
+    /// Wire: bstr(32) under "ek". Zeroized on drop.
+    /// See ZEB-249 spec §3.2.
+    #[serde(rename = "ek", skip_serializing_if = "Option::is_none", default)]
+    pub current_epoch_key: Option<EpochKey>,
+
+    /// Historical EpochKeys for decrypting old events. Keyed by the
+    /// epoch counter at which the key was current. MUST be empty for
+    /// kind != Community. Wire: map<u64, bstr(32)> under "ok".
+    /// See ZEB-249 spec §3.2 + §10.5 (storage growth bounds).
+    #[serde(rename = "ok", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub old_epoch_keys: BTreeMap<u64, EpochKey>,
 
     /// Initial admin (creator) — receives power 100 implicitly via the
     /// bootstrap rule (see ZEB-217 spec §"Materialization rules /
@@ -1472,9 +1489,21 @@ impl Space {
         // Checked before the per-kind match so every non-community kind gets
         // the same enforcement without per-arm duplication.
         if self.kind != SpaceKind::Community {
-            if self.membership_key.is_some() {
+            if self.current_epoch.is_some() {
                 return Err(InvariantError(format!(
-                    "{:?} must have membership_key=None (only Community carries it)",
+                    "{:?} must have current_epoch=None (only Community carries epoch state)",
+                    self.kind
+                )));
+            }
+            if self.current_epoch_key.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have current_epoch_key=None (only Community carries epoch state)",
+                    self.kind
+                )));
+            }
+            if !self.old_epoch_keys.is_empty() {
+                return Err(InvariantError(format!(
+                    "{:?} must have old_epoch_keys=empty (only Community carries epoch state)",
                     self.kind
                 )));
             }
@@ -1578,12 +1607,18 @@ impl Space {
                 }
             }
             SpaceKind::Community => {
-                if self.membership_key.is_none() {
+                if self.current_epoch.is_none() {
                     return Err(InvariantError(
-                        "community must have membership_key (symmetric key for the membership topic)"
+                        "community must have current_epoch (epoch counter, 0 at creation)".into(),
+                    ));
+                }
+                if self.current_epoch_key.is_none() {
+                    return Err(InvariantError(
+                        "community must have current_epoch_key (active symmetric key for the membership topic at current_epoch)"
                             .into(),
                     ));
                 }
+                // old_epoch_keys may be empty (epoch 0 has no history); no None check.
                 if self.admin_addr.is_none() {
                     return Err(InvariantError(
                         "community must have admin_addr (creator who holds power 100 via the bootstrap rule)"
@@ -1616,7 +1651,7 @@ impl Space {
                 if self.content_key.is_some() {
                     return Err(InvariantError(
                         "community must have content_key=None \
-                         (membership_key is the community's symmetric key)"
+                         (current_epoch_key is the community's symmetric key)"
                             .into(),
                     ));
                 }
@@ -1636,23 +1671,21 @@ impl Space {
             SpaceKind::Community => {
                 // content_key invariant for Community is enforced in the Community
                 // arm of the kind-invariants match above (with its own rationale
-                // message — "membership_key is the community's symmetric key").
+                // message — "current_epoch_key is the community's symmetric key").
                 // Excluding the content_key check here prevents a duplicated
                 // error firing with a less-informative message if the
                 // kind-invariants match is ever refactored to fall through.
                 //
                 // prior_content_keys must still be empty (Community has no
-                // historical content-key chain — the membership_key is fixed
-                // for the lifetime of the community in v1; key rotation is
-                // ZEB-253 follow-up). Enforce it here because the catch-all
-                // _ arm below would also reject content_key=Some, which
-                // Community legitimately disallows via its own message above
+                // historical content-key chain — historical epoch keys live in
+                // old_epoch_keys, not prior_content_keys). Enforce it here because
+                // the catch-all _ arm below would also reject content_key=Some,
+                // which Community legitimately disallows via its own message above
                 // — so falling through would surface a worse error.
                 if !self.prior_content_keys.is_empty() {
                     return Err(InvariantError(
                         "community must have prior_content_keys=[] \
-                         (no historical content-key chain — membership_key \
-                         is fixed in v1; rotation is ZEB-253)"
+                         (historical epoch keys live in old_epoch_keys, not prior_content_keys)"
                             .into(),
                     ));
                 }
@@ -2081,7 +2114,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -2125,7 +2160,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2154,7 +2191,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2186,7 +2225,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2220,7 +2261,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2253,7 +2296,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2292,7 +2337,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2317,7 +2364,9 @@ mod space_tests {
                 updated_at: hlc(1),
                 content_key: None,
                 prior_content_keys: vec![],
-                membership_key: None,
+                current_epoch: None,
+                current_epoch_key: None,
+                old_epoch_keys: ::std::collections::BTreeMap::new(),
                 admin_addr: None,
                 is_invite_only: None,
             };
@@ -2369,7 +2418,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2401,7 +2452,9 @@ mod space_tests {
             updated_at: hlc(1),
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2450,7 +2503,9 @@ mod space_tests {
             },
             content_key: None, // ← invariant violation
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2486,7 +2541,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2520,7 +2577,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])), // ← invariant violation
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2552,7 +2611,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![DmContentKey::new([0xbb; 32])], // ← invariant violation
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2587,7 +2648,9 @@ mod space_tests {
             },
             content_key: Some(dup.clone()),
             prior_content_keys: vec![dup], // ← same as content_key — violation
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2623,7 +2686,9 @@ mod space_tests {
             prior_content_keys: (0u8..(MAX_PRIOR_CONTENT_KEYS as u8 + 1))
                 .map(|i| DmContentKey::new([i; 32]))
                 .collect(),
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2662,7 +2727,9 @@ mod space_tests {
             // never fires by accident.
             content_key: Some(DmContentKey::new([0xff; 32])),
             prior_content_keys: priors,
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -2836,7 +2903,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![DmContentKey::new([0xbb; 32])],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2872,7 +2941,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2899,7 +2970,7 @@ mod space_tests {
 
         let admin = OwnerAddr([1u8; 16]);
         let community_id = SpaceId([2u8; 16]);
-        let key = MembershipKey::new([3u8; 32]);
+        let key = EpochKey::new([3u8; 32]);
 
         let space = Space {
             id: community_id,
@@ -2924,7 +2995,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(key.clone()),
+            current_epoch: Some(0),
+            current_epoch_key: Some(key.clone()),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(admin),
             is_invite_only: Some(true),
         };
@@ -2933,12 +3006,12 @@ mod space_tests {
         let decoded: Space = canonical_cbor_decode(&encoded).expect("decode");
 
         assert_eq!(decoded.kind, SpaceKind::Community);
-        // Compare raw bytes (not MembershipKey directly) so the failure
-        // message shows actual hex on mismatch — MembershipKey's Debug
+        // Compare raw bytes (not EpochKey directly) so the failure
+        // message shows actual hex on mismatch — EpochKey's Debug
         // impl redacts the bytes, which would render assert_eq! useless
         // on failure.
         assert_eq!(
-            decoded.membership_key.as_ref().map(|k| *k.as_bytes()),
+            decoded.current_epoch_key.as_ref().map(|k| *k.as_bytes()),
             Some(*key.as_bytes())
         );
         assert_eq!(decoded.admin_addr, Some(admin));
@@ -2979,7 +3052,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -2987,7 +3062,7 @@ mod space_tests {
     }
 
     #[test]
-    fn community_space_rejects_missing_membership_key() {
+    fn community_space_rejects_missing_current_epoch_key() {
         let s = Space {
             id: SpaceId([1u8; 16]),
             kind: SpaceKind::Community,
@@ -3011,12 +3086,14 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None, // ← invariant violation
+            current_epoch: Some(0),
+            current_epoch_key: None, // ← invariant violation
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
         let err = s.validate_invariants().expect_err("must reject");
-        assert!(err.0.contains("membership_key"));
+        assert!(err.0.contains("current_epoch_key"));
     }
 
     #[test]
@@ -3044,7 +3121,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None, // ← invariant violation
             is_invite_only: Some(false),
         };
@@ -3077,7 +3156,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: None, // ← invariant violation
         };
@@ -3110,7 +3191,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -3143,7 +3226,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([7u8; 32])), // ← invariant violation
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -3176,7 +3261,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -3220,7 +3307,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![DmContentKey::new([5u8; 32])], // ← invariant violation
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -3259,7 +3348,9 @@ mod space_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([0u8; 32])),
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
         };
@@ -3268,7 +3359,7 @@ mod space_tests {
     }
 
     #[test]
-    fn dm_space_rejects_membership_key_present() {
+    fn dm_space_rejects_epoch_key_present() {
         let s = Space {
             id: SpaceId([1u8; 16]),
             kind: SpaceKind::Dm,
@@ -3294,14 +3385,16 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([5u8; 32])),
             prior_content_keys: vec![],
-            membership_key: Some(MembershipKey::new([7u8; 32])), // ← wrong kind
+            current_epoch: None,
+            current_epoch_key: Some(EpochKey::new([7u8; 32])), // ← wrong kind
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
-            err.0.contains("membership_key"),
-            "expected error about non-community membership_key; got: {}",
+            err.0.contains("current_epoch_key"),
+            "expected error about non-community current_epoch_key; got: {}",
             err.0
         );
     }
@@ -3335,7 +3428,9 @@ mod space_tests {
             },
             content_key: Some(DmContentKey::new([5u8; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -3349,7 +3444,9 @@ mod space_tests {
         // data values that incidentally contain the same 2-char byte pair
         // (e.g. device_id "d" = 0x61 0x64 would spuriously match "ad").
         let needles: &[[u8; 3]] = &[
-            [0x62, b'm', b'k'], // CBOR text(2) "mk"
+            [0x62, b'c', b'e'], // CBOR text(2) "ce"
+            [0x62, b'e', b'k'], // CBOR text(2) "ek"
+            [0x62, b'o', b'k'], // CBOR text(2) "ok"
             [0x62, b'a', b'd'], // CBOR text(2) "ad"
             [0x62, b'i', b'o'], // CBOR text(2) "io"
         ];
@@ -3783,29 +3880,29 @@ mod owner_device_entry_deserialize_tests {
 }
 
 #[cfg(test)]
-mod membership_key_tests {
+mod epoch_key_tests {
     use super::*;
 
     #[test]
-    fn membership_key_round_trips_through_canonical_cbor() {
+    fn epoch_key_round_trips_through_canonical_cbor() {
         use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = i as u8;
         }
-        let key = MembershipKey::new(bytes);
+        let key = EpochKey::new(bytes);
 
         let encoded = canonical_cbor_encode(&key).expect("encode");
-        let decoded: MembershipKey = canonical_cbor_decode(&encoded).expect("decode");
+        let decoded: EpochKey = canonical_cbor_decode(&encoded).expect("decode");
 
         assert_eq!(key.as_bytes(), decoded.as_bytes());
     }
 
     #[test]
-    fn membership_key_serializes_as_bstr_32() {
+    fn epoch_key_serializes_as_bstr_32() {
         use ciborium::into_writer;
-        let k = MembershipKey::new([0u8; 32]);
+        let k = EpochKey::new([0u8; 32]);
         let mut bytes = Vec::new();
         into_writer(&k, &mut bytes).unwrap();
         // bstr(32): 0x58 0x20 || <32 bytes> = 34 bytes total.
@@ -3815,8 +3912,8 @@ mod membership_key_tests {
     }
 
     #[test]
-    fn membership_key_debug_is_redacted() {
-        let k = MembershipKey::new([0xab; 32]);
+    fn epoch_key_debug_is_redacted() {
+        let k = EpochKey::new([0xab; 32]);
         let s = format!("{:?}", k);
         // No raw byte values, no hex, no decimal — must be a fixed redacted form.
         assert!(!s.contains("0xab"));
@@ -3825,19 +3922,19 @@ mod membership_key_tests {
     }
 
     #[test]
-    fn membership_key_zeroized_on_drop() {
+    fn epoch_key_zeroized_on_drop() {
         // Use ZeroizeOnDrop's invariant: dropping the wrapper zeros the
         // underlying [u8; 32]. We can't easily observe the freed memory,
         // but we can verify the trait is implemented by constraining a
         // generic function.
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-        assert_zeroize_on_drop::<MembershipKey>();
+        assert_zeroize_on_drop::<EpochKey>();
     }
 
     #[test]
-    fn membership_key_random_produces_distinct_values() {
-        let a = MembershipKey::random();
-        let b = MembershipKey::random();
+    fn epoch_key_random_produces_distinct_values() {
+        let a = EpochKey::random();
+        let b = EpochKey::random();
         assert_ne!(a.as_bytes(), b.as_bytes(), "OsRng entropy was identical?!");
     }
 }

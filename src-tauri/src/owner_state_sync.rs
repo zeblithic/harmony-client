@@ -1105,7 +1105,9 @@ mod subscriber_tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -1524,7 +1526,9 @@ mod integration_tests {
             },
             content_key: Some(DmContentKey::new([0xaa; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }

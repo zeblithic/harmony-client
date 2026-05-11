@@ -2,7 +2,7 @@
 //!
 //! Ships:
 //! - `SignedChannelEvent` (Post variant; v3-reserved variants commented).
-//! - `ChannelKey` + `derive_channel_key` (HKDF-SHA256 over MembershipKey).
+//! - `ChannelKey` + `derive_channel_key` (HKDF-SHA256 over EpochKey).
 //! - `encrypt_channel_packet` / `decrypt_channel_packet` (ChaCha20-Poly1305 with
 //!   12-byte random nonce + static AAD).
 //! - `ChannelLogReplayTracker` (per-(channel, author, device) HLC monotonicity).
@@ -18,8 +18,8 @@
 
 use crate::community_membership::ChannelId;
 use crate::community_membership::ChannelInfo;
+use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::Hlc;
-use crate::owner_state_types::MembershipKey;
 use crate::owner_state_types::OwnerAddr;
 use crate::owner_state_types::SpaceId;
 use chacha20poly1305::aead::{Aead, OsRng, Payload};
@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Symmetric key for one channel's wire encryption. Derived
-/// deterministically from `(MembershipKey, community_id, channel_id)`
+/// deterministically from `(EpochKey, community_id, channel_id)`
 /// via HKDF-SHA256, so any Joined member can derive every channel's
 /// key without out-of-band coordination. v3 will use this seam to
 /// add private channels (distribute the ChannelKey to a subset of
@@ -55,7 +55,7 @@ impl std::fmt::Debug for ChannelKey {
 
 /// HKDF-SHA256 derivation of a per-channel symmetric key.
 ///
-/// - IKM: `MembershipKey` raw bytes (32 B).
+/// - IKM: `EpochKey` raw bytes (32 B).
 /// - Salt: `community_id` raw bytes (16 B). Community-scoped so the same
 ///   channel-id collision across two communities yields different keys.
 /// - Info: `b"channel:" || channel_id` (8 + 16 = 24 B). Channel-scoped so
@@ -64,7 +64,7 @@ impl std::fmt::Debug for ChannelKey {
 ///
 /// Per spec §6.
 pub fn derive_channel_key(
-    mk: &MembershipKey,
+    mk: &EpochKey,
     community_id: &SpaceId,
     channel_id: &ChannelId,
 ) -> ChannelKey {
@@ -1264,8 +1264,8 @@ impl ChannelLog {
 mod tests {
     use super::*;
 
-    fn fixture_mk() -> MembershipKey {
-        MembershipKey::new([0xaa; 32])
+    fn fixture_mk() -> EpochKey {
+        EpochKey::new([0xaa; 32])
     }
 
     fn fixture_community(id: u8) -> SpaceId {
@@ -1316,8 +1316,8 @@ mod tests {
     fn derive_channel_key_distinct_by_membership_key() {
         let cid = fixture_community(0xc0);
         let chid = fixture_channel(0x01);
-        let k_a = derive_channel_key(&MembershipKey::new([0xaa; 32]), &cid, &chid);
-        let k_b = derive_channel_key(&MembershipKey::new([0xbb; 32]), &cid, &chid);
+        let k_a = derive_channel_key(&EpochKey::new([0xaa; 32]), &cid, &chid);
+        let k_b = derive_channel_key(&EpochKey::new([0xbb; 32]), &cid, &chid);
         assert_ne!(
             k_a.as_bytes(),
             k_b.as_bytes(),

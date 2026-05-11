@@ -17,7 +17,7 @@ use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig, SpawnOutcome,
 };
 use harmony_app::community_membership::{ChannelId, ChannelInfo};
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, Mutex};
@@ -201,7 +201,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     // ── Set up shared community + channel ────────────────────────────
     let community_id = SpaceId([0xc0; 16]);
     let channel_id = ChannelId([0xc1; 16]);
-    let membership_key = MembershipKey::new([0x77; 32]);
+    let membership_key = EpochKey::new([0x77; 32]);
     let channel_key = derive_channel_key(&membership_key, &community_id, &channel_id);
 
     // ── Set up Tauri mock apps for each side ────────────────────────

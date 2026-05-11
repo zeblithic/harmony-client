@@ -7,7 +7,7 @@ use harmony_app::community_state_sync::{
     CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -46,7 +46,7 @@ async fn registry_spawns_and_tears_down_per_community() {
     });
 
     let cid_a = SpaceId([1u8; 16]);
-    let mk_a = MembershipKey::new([0xa1; 32]);
+    let mk_a = EpochKey::new([0xa1; 32]);
     let admin_a = OwnerAddr([0xb1; 16]);
 
     let (a_pub_tx, _a_pub_rx) = mpsc::channel(8);
@@ -102,7 +102,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_b,
-            MembershipKey::new([0xb1; 32]),
+            EpochKey::new([0xb1; 32]),
             OwnerAddr([0xb1; 16]),
             false,
             b_pub_tx,
@@ -113,7 +113,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_a,
-            MembershipKey::new([0xa1; 32]),
+            EpochKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
             false,
             a_pub_tx,
@@ -128,7 +128,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_a,
-            MembershipKey::new([0xa1; 32]),
+            EpochKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
             false,
             a2_pub_tx,
@@ -219,7 +219,7 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
     });
 
     let cid = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let admin = OwnerAddr([0xbb; 16]);
 
     let (pub_tx, mut pub_rx) = mpsc::channel(8);
@@ -316,7 +316,7 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
     }));
 
     let cid = SpaceId([0x10; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
@@ -412,7 +412,7 @@ async fn pending_redemption_unregistered_when_no_match() {
     }));
 
     let cid = SpaceId([0x10; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry

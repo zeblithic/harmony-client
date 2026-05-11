@@ -3,11 +3,11 @@
 use harmony_app::community_state_sync::{
     decrypt_blob, decrypt_root_publish, encrypt_blob, encrypt_root_publish, CommunityCryptoError,
 };
-use harmony_app::owner_state_types::MembershipKey;
+use harmony_app::owner_state_types::EpochKey;
 
 #[test]
 fn encrypt_root_publish_round_trips() {
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
     let plaintext = b"hello-community-root-publish".to_vec();
 
     let wire = encrypt_root_publish(&mk, &plaintext).expect("encrypt");
@@ -19,8 +19,8 @@ fn encrypt_root_publish_round_trips() {
 
 #[test]
 fn encrypt_root_publish_rejects_wrong_key() {
-    let mk_a = MembershipKey::new([0x01; 32]);
-    let mk_b = MembershipKey::new([0x02; 32]);
+    let mk_a = EpochKey::new([0x01; 32]);
+    let mk_b = EpochKey::new([0x02; 32]);
     let plaintext = b"secret".to_vec();
     let wire = encrypt_root_publish(&mk_a, &plaintext).expect("encrypt");
     let err = decrypt_root_publish(&mk_b, &wire).unwrap_err();
@@ -34,7 +34,7 @@ fn encrypt_blob_is_deterministic_for_same_key_and_plaintext() {
     // letting the ContentStore content-address it identically across
     // replicas. encrypt_root_publish uses a random nonce by contrast
     // (each publish is a distinct wire packet and we want freshness).
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let plaintext = b"deterministic-blob".to_vec();
     let a = encrypt_blob(&mk, &plaintext).expect("encrypt a");
     let b = encrypt_blob(&mk, &plaintext).expect("encrypt b");
@@ -46,7 +46,7 @@ fn encrypt_blob_is_deterministic_for_same_key_and_plaintext() {
 
 #[test]
 fn encrypt_blob_round_trips() {
-    let mk = MembershipKey::new([0xbb; 32]);
+    let mk = EpochKey::new([0xbb; 32]);
     let plaintext = b"event-log-cbor-bytes-go-here".to_vec();
     let ct = encrypt_blob(&mk, &plaintext).expect("encrypt");
     let recovered = decrypt_blob(&mk, &ct).expect("decrypt");
@@ -57,8 +57,8 @@ fn encrypt_blob_round_trips() {
 fn decrypt_blob_rejects_wrong_key() {
     // encrypt_blob has no AAD, so the only thing rejecting a wrong-key
     // decrypt is the Poly1305 tag — pinning that here.
-    let mk_a = MembershipKey::new([0x11; 32]);
-    let mk_b = MembershipKey::new([0x22; 32]);
+    let mk_a = EpochKey::new([0x11; 32]);
+    let mk_b = EpochKey::new([0x22; 32]);
     let plaintext = b"blob-secret".to_vec();
     let wire = encrypt_blob(&mk_a, &plaintext).expect("encrypt");
     let err = decrypt_blob(&mk_b, &wire).unwrap_err();
@@ -69,7 +69,7 @@ fn decrypt_blob_rejects_wrong_key() {
 fn decrypt_root_publish_rejects_truncated_wire() {
     // Wire shorter than NONCE_LEN + TAG_LEN must be rejected before
     // any slicing — guards the Truncated error variant.
-    let mk = MembershipKey::new([0x33; 32]);
+    let mk = EpochKey::new([0x33; 32]);
     let too_short = vec![0u8; 27]; // 1 byte short of 12 + 16
     let err = decrypt_root_publish(&mk, &too_short).unwrap_err();
     assert!(matches!(err, CommunityCryptoError::Truncated));
@@ -77,7 +77,7 @@ fn decrypt_root_publish_rejects_truncated_wire() {
 
 #[test]
 fn decrypt_blob_rejects_truncated_wire() {
-    let mk = MembershipKey::new([0x44; 32]);
+    let mk = EpochKey::new([0x44; 32]);
     let too_short = vec![0u8; 27];
     let err = decrypt_blob(&mk, &too_short).unwrap_err();
     assert!(matches!(err, CommunityCryptoError::Truncated));

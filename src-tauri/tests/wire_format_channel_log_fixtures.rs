@@ -42,7 +42,7 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 #[cfg(feature = "test-fixtures")]
 use harmony_app::community_channel_log::{derive_channel_key, encrypt_channel_packet_with_nonce};
 #[cfg(feature = "test-fixtures")]
-use harmony_app::owner_state_types::MembershipKey;
+use harmony_app::owner_state_types::EpochKey;
 
 fn fixture() -> SignedChannelEvent {
     let key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
@@ -100,7 +100,7 @@ fn backfill_reply_packet_wire_bytes_pinned() {
     let community_id = SpaceId([0xc0; 16]);
     let channel_id = ChannelId([0x01; 16]);
     let owner = OwnerAddr([0xa1; 16]);
-    let mk = MembershipKey::new([0x77; 32]);
+    let mk = EpochKey::new([0x77; 32]);
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xa1; 32]);
     let key = derive_channel_key(&mk, &community_id, &channel_id);
 

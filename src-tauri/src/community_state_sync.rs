@@ -54,7 +54,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
 use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, MembershipKey, OwnerAddr, SpaceId,
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 
 /// Errors specific to community-state encryption + decryption.
@@ -89,14 +89,14 @@ const COMMUNITY_BLOB_NONCE_PREFIX: &[u8] = b"harmony-community-blob-v1";
 const COMMUNITY_ROOT_PUBLISH_AAD: &[u8] = b"harmony-community-root-publish-v1";
 
 /// Encrypt a state-root publish payload with the community's
-/// `MembershipKey`. Random 12-byte nonce prepended to the ciphertext;
+/// `EpochKey`. Random 12-byte nonce prepended to the ciphertext;
 /// receiver splits and verifies via ChaCha20-Poly1305 AAD binding.
 ///
 /// Random nonce is correct here (every publish is a distinct wire
 /// packet — we WANT freshness; replay protection is the receiver's
 /// `RootHlcTracker`, not nonce reuse).
 pub fn encrypt_root_publish(
-    mk: &MembershipKey,
+    mk: &EpochKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CommunityCryptoError> {
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
@@ -124,10 +124,7 @@ pub fn encrypt_root_publish(
 /// `encrypt_root_publish`. Verifies the AAD binding; rejects packets
 /// shorter than `NONCE_LEN + TAG_LEN` bytes before slicing to avoid
 /// panics on truncated input.
-pub fn decrypt_root_publish(
-    mk: &MembershipKey,
-    wire: &[u8],
-) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn decrypt_root_publish(mk: &EpochKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
@@ -156,7 +153,7 @@ pub fn decrypt_root_publish(
 /// is a nonce-reuse-resistance hedge (an attacker without `mk` cannot
 /// derive the nonce, so a chosen-plaintext nonce-collision attack
 /// requires already having the key).
-pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn encrypt_blob(mk: &EpochKey, plaintext: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     let mut h = Sha256::new();
     h.update(COMMUNITY_BLOB_NONCE_PREFIX);
     h.update(mk.as_bytes());
@@ -182,7 +179,7 @@ pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, Com
 /// the head is treated as opaque; correctness rests on the Poly1305
 /// tag, not on re-deriving the nonce. Rejects wires shorter than
 /// `NONCE_LEN + TAG_LEN` bytes before slicing.
-pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn decrypt_blob(mk: &EpochKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
@@ -411,7 +408,7 @@ pub enum CommunitySyncError {
     /// Ed25519 signature over `canonical_cbor(CommunityRootSignedPayload)`
     /// did not validate against the resolved identity_pub. This is
     /// the load-bearing defense against the spoofing attack: a
-    /// malicious member with the `MembershipKey` cannot forge a
+    /// malicious member with the `EpochKey` cannot forge a
     /// publish claiming another member's `publisher_addr` because
     /// they don't have that member's signing key. Tracker NOT
     /// advanced.
@@ -446,7 +443,7 @@ pub enum LocalInsertError {
 /// Per-publisher-device latest-accepted HLC, namespaced by publisher
 /// `OwnerAddr`. ZEB-256: re-keyed from `BTreeMap<String, Hlc>` so a
 /// member cannot squat another member's HLC slot via shared
-/// `MembershipKey`. Each publisher's address gets its own per-device
+/// `EpochKey`. Each publisher's address gets its own per-device
 /// namespace, so a malicious Alice cannot squat Bob's HLC slot even if
 /// she emits a publish carrying `at.device_id == bob_dev`.
 ///
@@ -579,7 +576,7 @@ pub struct CommunityMembershipDelta {
 /// owner-state engine has 9 positional args and is already at the limit.
 pub struct CommunitySyncEngineConfig {
     pub community_id: SpaceId,
-    pub membership_key: MembershipKey,
+    pub membership_key: EpochKey,
     pub admin_addr: OwnerAddr,
     /// Whether this community requires invite-only counter-sigs on
     /// non-admin Joins. Plumbed into `VerifyContext` at receive time
@@ -667,9 +664,9 @@ pub struct CommunitySyncEngine {
     /// keys via `derive_channel_key(membership_key, cid, chid)`) can
     /// reach it through `engine_arc(cid).membership_key()` without
     /// re-plumbing the value through `NodeState` or the registry.
-    /// `MembershipKey` derives `Clone` (just a 32-byte wrapper) so the
+    /// `EpochKey` derives `Clone` (just a 32-byte wrapper) so the
     /// accessor returns by value.
-    membership_key: MembershipKey,
+    membership_key: EpochKey,
     /// Community identity this engine was configured with. Bound at
     /// construction so `insert_local_event` can:
     ///   1. Reject mis-routed events (caller passed an event whose
@@ -817,14 +814,14 @@ impl CommunitySyncEngine {
         self.admin_addr
     }
 
-    /// Returns this engine's per-community symmetric `MembershipKey`.
+    /// Returns this engine's per-community symmetric `EpochKey`.
     /// ZEB-270 Phase 3 Task 4.5: the channel-log registry's `spawn`
     /// derives a per-channel symmetric key via
     /// `derive_channel_key(membership_key, community_id, channel_id)`.
     /// The membership key is bound at `spawn_engine` time and never
     /// changes for the engine's lifetime, so handing out a clone is
     /// safe.
-    pub(crate) fn membership_key(&self) -> MembershipKey {
+    pub(crate) fn membership_key(&self) -> EpochKey {
         self.membership_key.clone()
     }
 
@@ -1060,7 +1057,7 @@ impl CommunitySyncEngine {
 /// `internal_task` `select!` loop or its helpers.
 struct InternalCtx {
     community_id: SpaceId,
-    membership_key: MembershipKey,
+    membership_key: EpochKey,
     admin_addr: OwnerAddr,
     is_invite_only: bool,
     device_id: String,
@@ -1594,7 +1591,7 @@ impl IncomingOutcome {
 /// runs; per-publisher namespacing on the tracker key
 /// `(publisher_addr, device_id)` further isolates the per-addr
 /// HLC space so an attacker can't claim Alice's slot via shared
-/// `MembershipKey`.
+/// `EpochKey`.
 ///
 /// **Divergence from `owner_state_sync::handle_incoming_publish`:**
 /// owner-state advances the tracker IMMEDIATELY after the replay-check
@@ -2489,7 +2486,7 @@ impl CommunitySyncRegistry {
         self: &std::sync::Arc<Self>,
         guard: &mut CommunitySyncSpawnGuard,
         community_id: SpaceId,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
@@ -2778,7 +2775,7 @@ impl CommunitySyncRegistry {
     pub async fn spawn_engine_inner_now(
         &self,
         community_id: SpaceId,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
@@ -3201,7 +3198,7 @@ mod tests {
     struct GuardTestFixture {
         registry: std::sync::Arc<CommunitySyncRegistry>,
         identity_dir: std::path::PathBuf,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
         // Held to keep the adapter-request channel alive (and the
@@ -3246,7 +3243,7 @@ mod tests {
         GuardTestFixture {
             registry,
             identity_dir,
-            membership_key: MembershipKey::new([0xa1; 32]),
+            membership_key: EpochKey::new([0xa1; 32]),
             admin_addr: OwnerAddr([0xb1; 16]),
             community_adapter_tx,
             community_adapter_rx,

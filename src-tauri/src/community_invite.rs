@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, MembershipKey, OwnerAddr, SpaceId,
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 
 /// The full payload an invite link carries. Encoded as canonical CBOR
@@ -30,7 +30,7 @@ pub struct CommunityInvitePayload {
     pub community_id: SpaceId,
 
     #[serde(rename = "mk")]
-    pub membership_key: MembershipKey,
+    pub membership_key: EpochKey,
 
     #[serde(rename = "ad")]
     pub admin_addr: OwnerAddr,
