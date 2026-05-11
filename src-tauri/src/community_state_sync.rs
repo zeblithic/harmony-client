@@ -2491,11 +2491,18 @@ impl CommunitySyncRegistry {
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     ) -> Result<std::sync::Arc<CommunitySyncEngine>, CommunitySyncError> {
         // Defensive: guard must be for the same community_id. Programming
-        // error if not — the IPC handler should always pair them.
-        debug_assert_eq!(
-            guard.community_id, community_id,
-            "spawn_engine_with_guard guard/community_id mismatch — programming error"
-        );
+        // error if not — the IPC handler should always pair them. CR
+        // round 2: must be a RUNTIME check (not debug_assert) so release
+        // builds also reject mismatched pairs; otherwise a wrong-guard
+        // call would silently succeed and the guard's later Drop would
+        // tear down the wrong community.
+        if guard.community_id != community_id {
+            return Err(CommunitySyncError::Persist(format!(
+                "spawn_engine_with_guard guard/community_id mismatch — programming error \
+                 (guard for {:?}, called with {:?})",
+                guard.community_id, community_id
+            )));
+        }
 
         // Step 1: spawn the engine via the inner helper.
         let freshly_created = self
@@ -3264,22 +3271,28 @@ mod tests {
             // guard drops here without commit → Drop spawns cleanup task
         }
 
-        // Poll up to 500ms for the cleanup task to clear the engine
-        // (mirrors ZEB-271's tx_dropped_guard_safety_net_aborts pattern).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
+        // Poll up to 2s for the cleanup task to BOTH remove the engine
+        // from the registry map AND remove the per-community persistence
+        // dir from disk. shutdown_engine_and_cleanup_persistence runs
+        // these in sequence: stop_engine first (engine.shutdown().await
+        // + map remove) THEN tokio::fs::remove_dir_all. CI's slower disk
+        // I/O exposed a race where has_engine() became false (after
+        // stop_engine) but the dir was still present (remove_dir_all
+        // not yet completed). The fix: wait for BOTH conditions.
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while (fix.registry.has_engine(&community_id).await || dir.exists())
+            && std::time::Instant::now() < deadline
+        {
             tokio::task::yield_now().await;
         }
         assert!(
             !fix.registry.has_engine(&community_id).await,
             "engine must be torn down after guard drops without commit"
         );
-
-        // Persistence dir must also be cleaned up.
-        let dir = fix
-            .identity_dir
-            .join("communities")
-            .join(hex::encode(community_id.0));
         assert!(
             !dir.exists(),
             "persistence dir must be removed after guard drops"
@@ -3375,8 +3388,11 @@ mod tests {
 
         guard.abort();
 
-        // Poll up to 500ms for abort's spawned cleanup task.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        // Poll up to 2s for abort's spawned cleanup task. Deadline
+        // bumped from 500ms to 2s for CI's slower disk I/O (the
+        // shutdown path includes engine.shutdown().await which can
+        // flush pending writes — multi-ms on CI runners).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
         while fix.registry.has_engine(&community_id).await && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
@@ -3440,5 +3456,85 @@ mod tests {
             .shutdown_engine_and_cleanup_persistence(&community_id)
             .await
             .expect("explicit cleanup for test isolation");
+    }
+
+    /// CodeRabbit round 2: regression test for the adapter-dispatch-failure
+    /// rollback path inside spawn_engine_with_guard (spec §5.3 step 3).
+    /// Force community_adapter_tx.try_send to fail by closing the receiver
+    /// BEFORE calling spawn_engine_with_guard. The function should:
+    ///   1. Spawn the engine via spawn_engine_inner_now (succeeds)
+    ///   2. Try to dispatch the adapter request → fails (channel closed)
+    ///   3. Tear down the freshly spawned engine inline before returning Err
+    ///   4. Leave guard.freshly_created = false so Drop is a no-op
+    ///
+    /// Asserts: spawn returns Err; engine is NOT in the registry (rolled
+    /// back inline); persistence dir is NOT created (rolled back inline).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_try_send_failure_rolls_back_without_arming_guard() {
+        let mut fix = build_test_fixture().await;
+        let community_id = SpaceId([0xc6; 16]);
+
+        // Drop the receiver to close the adapter channel. Subsequent
+        // try_send calls on the surviving Sender will return Closed.
+        // Take ownership of the rx field by replacing with a dummy,
+        // then explicitly drop the original (binding to `_`-prefixed
+        // local would extend the lifetime to the end of the enclosing
+        // scope, defeating the close).
+        let (_dummy_tx, dummy_rx) = mpsc::channel(1);
+        drop(std::mem::replace(&mut fix.community_adapter_rx, dummy_rx));
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let result = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "spawn_engine_with_guard must return Err when adapter try_send fails"
+        );
+
+        // Engine MUST NOT be in the registry (rolled back inline by
+        // spawn_engine_with_guard's step 3 — NOT by the guard's Drop,
+        // which would only run if freshly_created=true; we're verifying
+        // the inline rollback path).
+        assert!(
+            !fix.registry.has_engine(&community_id).await,
+            "engine must NOT be in the registry after adapter try_send failure \
+             (spawn_engine_with_guard rolled back inline)"
+        );
+
+        // Persistence dir MUST NOT exist either.
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        assert!(
+            !dir.exists(),
+            "persistence dir must NOT exist after adapter try_send failure \
+             (rolled back inline before guard arming)"
+        );
+
+        // The guard drops at scope exit. Its Drop should be a no-op
+        // because freshly_created stayed false (never set, since
+        // spawn_engine_with_guard returned Err before binding it).
+        // We don't assert anything else — Drop running cleanup again
+        // would be the bug; if it ran, the (already-cleaned-up) state
+        // wouldn't change anyway, but the spawned cleanup task would
+        // log a warn about a missing engine. Inspect logs if this test
+        // ever flakes.
     }
 }

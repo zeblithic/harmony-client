@@ -136,13 +136,17 @@ impl Drop for CommunitySyncSpawnGuard {
                 "CommunitySyncSpawnGuard dropped without commit/abort — \
                  running safety net"
             );
-            // Same Handle::try_current() + sync fallback as ZEB-271's
-            // Drop. shutdown_engine_and_cleanup_persistence is async,
-            // so we spawn it via Handle if available; otherwise fall
-            // back to a synchronous teardown that does best-effort
-            // cleanup without the async parts (logged at warn — the
-            // engine + persist dir may leak; reconcile_from_state at
-            // next start_node will reconcile).
+            // shutdown_engine_and_cleanup_persistence is async (it
+            // includes engine.shutdown().await which flushes pending
+            // writes), so we spawn it via Handle::try_current() if a
+            // tokio runtime is available. Unlike ZEB-271's
+            // CommunityTransactionGuard (whose abort_transaction_internal
+            // is sync map cleanup with a sync fallback), there is NO
+            // sync alternative for engine.shutdown(). When no runtime
+            // is present, we log a warn and accept the leak — the
+            // engine + persist dir remain on disk; reconcile_from_state
+            // at next start_node will detect the inconsistency and
+            // recover. See §10.2 for full discussion.
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     let registry = Arc::clone(&self.registry);
