@@ -26,6 +26,7 @@ use crate::owner_state_types::{
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 
 pub type MessageId = OutboxEntryId;
 
@@ -1300,6 +1301,309 @@ impl DmOutbox {
         }
 
         Ok(drain_outcome)
+    }
+
+    /// ZEB-241: lock-lifted variant of `handle_cidnotify`. Manages its
+    /// own lock cycles internally so the slow CAS fetch in Phase B
+    /// happens with NO locks held. Designed to be called from a
+    /// `tokio::spawn`'d task (event_loop fires-and-forgets).
+    ///
+    /// Three phases:
+    ///   - Phase A (locked): verify signature + resolve owner + check
+    ///     sender match + snapshot Space (cloned). Drops locks.
+    ///   - Phase B (unlocked): cas.get(message_cid) under 500ms timeout.
+    ///   - Phase C (re-locked): re-fetch Space (TOCTOU window — content_key
+    ///     could have rotated, member could have been kicked, Space could
+    ///     have been deleted), decrypt with prior_content_keys fallback,
+    ///     apply_owner_device_update, apply_inbox, build + try_send acks.
+    ///     IPC emits happen AFTER lock drop.
+    ///
+    /// On any error inside the task, logs via tracing::warn! and returns.
+    /// Never panics on caller. Spawned-task panic recovery is the caller's
+    /// responsibility (event_loop wraps with a top-level error log).
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub async fn handle_cidnotify_lifted<R: tauri::Runtime>(
+        outbox_arc: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+        state_arc: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        cas: std::sync::Arc<dyn ContentStore>,
+        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        app: tauri::AppHandle<R>,
+        signed: crate::dm_envelope::DmCidNotifySigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
+        wall_now_ms: u64,
+    ) {
+        // Phase A — locked, fast: verify + resolve + snapshot.
+        let (_space_a, identity_pub, resolved_owner) = {
+            let _outbox_g = outbox_arc.lock().await;
+            let state_g = state_arc.lock().await;
+            let identity_pub = match lookup_pubkey_for_device(
+                &state_g.owner_device_cache,
+                signed.signing_device_hash,
+            ) {
+                Some(pub_) => pub_,
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::UnknownSigningKey,
+                        "handle_cidnotify_lifted Phase A: dropping packet"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = crate::dm_signing::verify_dm_packet_signature(
+                &signed_bytes,
+                &signature,
+                &identity_pub,
+                signed.signing_device_hash,
+            ) {
+                tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
+                return;
+            }
+            let resolved_owner = match resolve_signed_origin_owner(
+                &state_g.owner_device_cache,
+                signed.signing_device_hash,
+            ) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "handle_cidnotify_lifted Phase A: dropping packet");
+                    return;
+                }
+            };
+            if signed.sender_owner_addr != resolved_owner {
+                tracing::warn!(
+                    error = ?DmReceiveError::OwnerFieldMismatch,
+                    "handle_cidnotify_lifted Phase A: dropping packet"
+                );
+                return;
+            }
+            let space = match state_g.spaces.get(&signed.space_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::SpaceNotFound,
+                        "handle_cidnotify_lifted Phase A: dropping packet"
+                    );
+                    return;
+                }
+            };
+            if !space.members.contains(&resolved_owner) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderNotInSpaceMembers,
+                    "handle_cidnotify_lifted Phase A: dropping packet"
+                );
+                return;
+            }
+            (space, identity_pub, resolved_owner)
+        }; // locks dropped here
+
+        // Phase B — unlocked, slow: CAS fetch.
+        let blob = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cas.get(&signed.message_cid),
+        )
+        .await
+        {
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => {
+                tracing::warn!(
+                    error = ?DmReceiveError::CasFetchFailed("blob not found".into()),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
+                );
+                return;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = ?DmReceiveError::CasFetchFailed(format!("{e:?}")),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    error = ?DmReceiveError::CasFetchFailed("500ms fetch timeout".into()),
+                    "handle_cidnotify_lifted Phase B: dropping packet"
+                );
+                return;
+            }
+        };
+
+        // Phase C — re-locked, fast: re-fetch Space + decrypt + apply + ack.
+        let drain_outcome = {
+            let outbox_g = outbox_arc.lock().await;
+            let mut state_g = state_arc.lock().await;
+
+            // TOCTOU re-check: Space may have been deleted, members may have
+            // shrunk (GroupDm), or content_key may have rotated.
+            let space_c = match state_g.spaces.get(&signed.space_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::SpaceNotFound,
+                        "handle_cidnotify_lifted Phase C: dropping packet (Space deleted in TOCTOU window)"
+                    );
+                    return;
+                }
+            };
+            if !space_c.members.contains(&resolved_owner) {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderNotInSpaceMembers,
+                    "handle_cidnotify_lifted Phase C: dropping packet (sender lost membership in TOCTOU window)"
+                );
+                return;
+            }
+
+            // Decrypt with current Space + prior_content_keys fallback —
+            // handles content_key rotation between Phase A and Phase C.
+            let aad = match crate::dm_crypto::compute_aad(&space_c) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::AadCompute(e.to_string()),
+                        "handle_cidnotify_lifted Phase C: dropping packet"
+                    );
+                    return;
+                }
+            };
+            let payload = match crate::dm_crypto::decrypt_dm_message(
+                space_c
+                    .content_key
+                    .as_ref()
+                    .expect("DM Space MUST have content_key per validate_invariants"),
+                &space_c.prior_content_keys,
+                &aad,
+                &blob,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::DecryptFailed,
+                        "handle_cidnotify_lifted Phase C: dropping packet"
+                    );
+                    return;
+                }
+            };
+
+            // Sender-binding check.
+            if crate::dm_crypto::verify_sender_binding(&payload, resolved_owner).is_err() {
+                tracing::warn!(
+                    error = ?DmReceiveError::SenderImpersonation,
+                    "handle_cidnotify_lifted Phase C: dropping packet"
+                );
+                return;
+            }
+
+            // Refresh OwnerDeviceCache (Step 8 in original handle_cidnotify).
+            let mut updated_pubs: Vec<Option<[u8; 64]>> = vec![None; signed.sender_devices.len()];
+            if let Some(idx) = signed
+                .sender_devices
+                .iter()
+                .position(|d| *d == signed.signing_device_hash)
+            {
+                updated_pubs[idx] = Some(identity_pub);
+            }
+            let _ = state_g.apply_owner_device_update(
+                resolved_owner,
+                signed.sender_devices.clone(),
+                updated_pubs,
+                Hlc {
+                    wall_ms: wall_now_ms,
+                    logical: 0,
+                    device_id: outbox_g.device_id.clone(),
+                },
+            );
+
+            // apply_inbox — atomic-emit semantics.
+            let inbox_entry = crate::owner_state_types::InboxEntry {
+                space_id: signed.space_id,
+                message_cid: signed.message_cid,
+                from: resolved_owner,
+                received_at: Hlc {
+                    wall_ms: wall_now_ms,
+                    logical: 0,
+                    device_id: outbox_g.device_id.clone(),
+                },
+            };
+            let outcome = state_g.apply_inbox(inbox_entry.clone());
+            let mut drain_outcome = DrainOutcome::default();
+            if matches!(outcome, ApplyOutcome::Inserted) {
+                drain_outcome
+                    .newly_received
+                    .push(crate::owner_state_types::ReceivedMessage {
+                        inbox_entry,
+                        body: payload.body.clone(),
+                        mime_type: payload.mime_type.clone(),
+                        sent_at: payload.sent_at.clone(),
+                    });
+            }
+
+            // Build + try_send acks (cheap — non-blocking).
+            let our_ack_devices = state_g
+                .owner_device_cache
+                .devices
+                .get(&outbox_g.self_owner)
+                .map(|e| e.devices.clone())
+                .filter(|devs| devs.contains(&outbox_g.our_signing_device_hash))
+                .unwrap_or_else(|| vec![outbox_g.our_signing_device_hash]);
+            let ack_signed = crate::dm_envelope::DmAckSigned {
+                space_id: signed.space_id,
+                message_cid: signed.message_cid,
+                ack_from_owner_addr: outbox_g.self_owner,
+                ack_from_devices: our_ack_devices,
+                signing_device_hash: outbox_g.our_signing_device_hash,
+            };
+            let ack_packet =
+                match crate::dm_envelope::build_signed_ack(ack_signed, &outbox_g.signing_key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?DmReceiveError::Decode(format!("build_signed_ack: {e}")),
+                            "handle_cidnotify_lifted Phase C: ack build failed"
+                        );
+                        return;
+                    }
+                };
+            let ack_wire = match crate::dm_envelope::encode_packet(&ack_packet) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?DmReceiveError::Decode(format!("encode_packet ack: {e}")),
+                        "handle_cidnotify_lifted Phase C: ack encode failed"
+                    );
+                    return;
+                }
+            };
+            for device in &signed.sender_devices {
+                let dest_hash = crate::dm_signing::compute_dm_destination_hash(device.0);
+                if let Err(e) = unicast_send_tx.try_send(UnicastSendRequest {
+                    destination_hash: dest_hash,
+                    packet: ack_wire.clone(),
+                }) {
+                    tracing::warn!(
+                        error = ?e,
+                        "handle_cidnotify_lifted Phase C: ack fan-out dropped due to channel pressure"
+                    );
+                }
+            }
+
+            drain_outcome
+        }; // locks dropped here
+
+        // IPC emit — locks released, safe to fire dm-received events.
+        for rm in drain_outcome.newly_received {
+            let _ = app.emit(
+                "dm-received",
+                serde_json::json!({
+                    "spaceId": hex::encode(rm.inbox_entry.space_id.0),
+                    "messageCid": hex::encode(rm.inbox_entry.message_cid.to_bytes()),
+                    "from": hex::encode(rm.inbox_entry.from.0),
+                    "receivedAt": rm.inbox_entry.received_at.wall_ms,
+                    "sentAt": rm.sent_at.wall_ms,
+                    "body": hex::encode(&rm.body),
+                    "mimeType": rm.mime_type,
+                }),
+            );
+        }
     }
 
     /// Inbound `DmAck` handler — Phase 3b receive path for the sender side.
