@@ -2490,12 +2490,23 @@ impl CommunitySyncRegistry {
         subscriber_tx: mpsc::Sender<Vec<u8>>,
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     ) -> Result<std::sync::Arc<CommunitySyncEngine>, CommunitySyncError> {
-        // Defensive: guard must be for the same community_id. Programming
-        // error if not — the IPC handler should always pair them. CR
-        // round 2: must be a RUNTIME check (not debug_assert) so release
-        // builds also reject mismatched pairs; otherwise a wrong-guard
-        // call would silently succeed and the guard's later Drop would
-        // tear down the wrong community.
+        // Defensive: guard must be for the same registry instance AND the
+        // same community_id. Programming errors otherwise — the IPC handler
+        // should always pair them. Both checks are RUNTIME (not
+        // debug_assert) so release builds also reject mismatched pairs;
+        // otherwise a wrong-guard call would silently succeed and the
+        // guard's later Drop would tear down the wrong registry/community.
+        // CR round 2: community_id check. CR round 3: registry-Arc check
+        // — without it, a guard from registry A could be used with
+        // registry B's spawn_engine_with_guard, and the guard's Drop
+        // would later tear down community_id from registry A.
+        if !std::sync::Arc::ptr_eq(&guard.registry, self) {
+            return Err(CommunitySyncError::Persist(format!(
+                "spawn_engine_with_guard guard/registry mismatch — programming error \
+                 (guard from a different CommunitySyncRegistry instance; \
+                 community_id = {community_id:?})"
+            )));
+        }
         if guard.community_id != community_id {
             return Err(CommunitySyncError::Persist(format!(
                 "spawn_engine_with_guard guard/community_id mismatch — programming error \
