@@ -331,6 +331,28 @@ pub struct DrainOutcome {
     pub newly_received: Vec<crate::owner_state_types::ReceivedMessage>,
 }
 
+/// ZEB-233: A single `(entry, recipient)` work unit produced by drain's
+/// Phase A. Carries everything Phase B needs to perform an unlocked
+/// `transport.send().await` — the OutboxEntry clone (so Phase B doesn't
+/// need to re-read `state.outbox`) plus pre-resolved destinations.
+#[derive(Debug, Clone)]
+pub struct DrainWorkUnit {
+    pub entry_id: OutboxEntryId,
+    pub entry_clone: OutboxEntry,
+    pub recipient: OwnerAddr,
+    pub destinations: Vec<[u8; 16]>,
+}
+
+/// ZEB-233: The outcome of one `transport.send().await` call, paired
+/// with the (entry, recipient) it targeted. Phase C consumes these to
+/// update backoff + clear in_flight markers under the re-acquired locks.
+#[derive(Debug)]
+pub struct DrainSendResult {
+    pub entry_id: OutboxEntryId,
+    pub recipient: OwnerAddr,
+    pub result: Result<(), TransportError>,
+}
+
 /// Phase 4 — outcome of `DmOutbox::delete_dm_outbox_entry`.
 ///
 /// The IPC layer reads this to decide which `dm-deleted` IPC event to
@@ -679,19 +701,50 @@ impl DmOutbox {
     /// Epilogue: drop backoff/in_flight entries for any OutboxEntry that's
     /// no longer Pending/Partial — covers Complete via local handle_ack,
     /// Complete via CRDT-merge replication of a peer's ack, and Expired.
+    ///
+    /// This is the legacy lock-held entrypoint: callers acquire `&mut self`
+    /// (i.e. hold the `tokio::sync::Mutex<DmOutbox>` guard) for the full
+    /// duration including the transport sends. Tests use this directly.
+    /// Production code calls `drain_lifted` instead (ZEB-233) which
+    /// releases the outbox + state locks around the transport sends so
+    /// concurrent `send_dm` IPCs don't block on the slowest in-flight send.
     pub async fn drain(
         &mut self,
         state: &mut OwnerState,
         transport: &dyn DmTransport,
         wall_now_ms: u64,
     ) -> DrainOutcome {
-        let mut outcome = DrainOutcome::default();
+        let work = self.drain_phase_a(state, wall_now_ms);
+        let mut results = Vec::with_capacity(work.len());
+        for unit in work {
+            let result = transport
+                .send(&unit.entry_clone, unit.recipient, unit.destinations)
+                .await;
+            results.push(DrainSendResult {
+                entry_id: unit.entry_id,
+                recipient: unit.recipient,
+                result,
+            });
+        }
+        self.drain_phase_c(state, results, wall_now_ms)
+    }
 
-        // 1. Collect work units up-front to avoid holding a borrow on `state`
-        //    across the await boundary. Entries already past EXPIRATION_MS are
-        //    skipped here — they get marked Expired in the sweep below without
-        //    a final wasted transport.send attempt.
-        let work: Vec<(OutboxEntryId, OutboxEntry, Vec<OwnerAddr>)> = state
+    /// Phase A of drain: under the outbox + state locks, collect every
+    /// (entry, recipient) pair that needs a transport.send this tick.
+    /// Marks each in `self.in_flight` so a concurrent drain tick can't
+    /// double-send the same pair. Synchronous (no await).
+    ///
+    /// Entries already past `EXPIRATION_MS` are skipped here — they get
+    /// marked `Expired` in Phase C's sweep without a final wasted
+    /// transport.send attempt.
+    ///
+    /// Returns the work units ready for Phase B (unlocked sends). Each
+    /// unit carries a clone of the OutboxEntry so Phase B doesn't need
+    /// to re-read `state.outbox`.
+    fn drain_phase_a(&mut self, state: &OwnerState, wall_now_ms: u64) -> Vec<DrainWorkUnit> {
+        // 1. Collect outstanding (entry, recipient) pairs from Pending/
+        //    Partial entries within EXPIRATION_MS.
+        let outstanding: Vec<(OutboxEntryId, OutboxEntry, Vec<OwnerAddr>)> = state
             .outbox
             .iter()
             .filter(|(_, e)| {
@@ -712,8 +765,10 @@ impl DmOutbox {
             })
             .collect();
 
-        // 2. Per-(entry, recipient) attempt.
-        for (entry_id, entry_clone, outstanding) in work {
+        // 2. Per-(entry, recipient): apply in_flight + is_due filters,
+        //    resolve destinations, mark in_flight, build a work unit.
+        let mut work = Vec::new();
+        for (entry_id, entry_clone, outstanding) in outstanding {
             for recipient in outstanding {
                 if self.in_flight.contains(&(entry_id, recipient)) {
                     continue;
@@ -721,56 +776,82 @@ impl DmOutbox {
                 if !self.is_due(entry_id, recipient, wall_now_ms) {
                     continue;
                 }
-                // Resolve destinations from the in-scope `&OwnerState`
-                // (no mutex acquisition: drain holds the state via the
-                // caller's mutex guard, no recursive lock needed).
-                // Production transport returns `TransportError::Transient`
-                // on empty (Flow A may surface the missing
-                // OwnerDeviceCache entry on the next sync round); test
-                // stubs (StubTransport) ignore `destinations` entirely.
+                // Resolve destinations from `&OwnerState` (no mutex
+                // acquisition — caller holds the state guard). Empty
+                // destinations: production transport returns Transient;
+                // test stubs ignore the field.
                 let destinations = resolve_destinations(&state.owner_device_cache, recipient);
                 self.in_flight.insert((entry_id, recipient));
-                let result = transport.send(&entry_clone, recipient, destinations).await;
-                self.in_flight.remove(&(entry_id, recipient));
-                match result {
-                    Ok(()) => {
-                        // Throttle post-Ok retries until the ack arrives.
-                        // Without this, `is_due` returns true on the very next
-                        // 250ms tick (no backoff entry → first attempt),
-                        // producing tick-rate retry until handle_ack fires —
-                        // ~4 sends/sec/recipient against the production
-                        // StubTransport (which always returns Ok and has an
-                        // unbounded sends Vec). Treat "sent but ack pending"
-                        // as failure_count=1 so the existing exponential
-                        // backoff applies (5s base × 2^(n-1), 5min cap).
-                        // First post-Ok retry waits 5s; if still no ack the
-                        // next waits 10s, etc. The 30-day expiration sweep
-                        // is the eventual terminator.
-                        self.backoff.insert(
-                            (entry_id, recipient),
-                            AttemptState {
-                                last_attempt_wall_ms: wall_now_ms,
-                                failure_count: 1,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(?entry_id, ?recipient, error = %e, "transport.send failed; bumping backoff");
-                        let st =
-                            self.backoff
-                                .entry((entry_id, recipient))
-                                .or_insert(AttemptState {
-                                    last_attempt_wall_ms: 0,
-                                    failure_count: 0,
-                                });
-                        st.last_attempt_wall_ms = wall_now_ms;
-                        st.failure_count = st.failure_count.saturating_add(1);
-                    }
+                work.push(DrainWorkUnit {
+                    entry_id,
+                    entry_clone: entry_clone.clone(),
+                    recipient,
+                    destinations,
+                });
+            }
+        }
+        work
+    }
+
+    /// Phase C of drain: under the outbox + state locks, apply each
+    /// transport.send result (update backoff, clear in_flight), run the
+    /// 30-day expiration sweep, and clean up backoff/in_flight entries
+    /// for OutboxEntries that are no longer Pending/Partial.
+    /// Synchronous.
+    fn drain_phase_c(
+        &mut self,
+        state: &mut OwnerState,
+        results: Vec<DrainSendResult>,
+        wall_now_ms: u64,
+    ) -> DrainOutcome {
+        let mut outcome = DrainOutcome::default();
+
+        // 1. Apply each send result.
+        for r in results {
+            self.in_flight.remove(&(r.entry_id, r.recipient));
+            match r.result {
+                Ok(()) => {
+                    // Throttle post-Ok retries until the ack arrives.
+                    // Without this, `is_due` returns true on the very next
+                    // 250ms tick (no backoff entry → first attempt),
+                    // producing tick-rate retry until handle_ack fires —
+                    // ~4 sends/sec/recipient against the production
+                    // StubTransport (which always returns Ok and has an
+                    // unbounded sends Vec). Treat "sent but ack pending"
+                    // as failure_count=1 so the existing exponential
+                    // backoff applies (5s base × 2^(n-1), 5min cap).
+                    // First post-Ok retry waits 5s; if still no ack the
+                    // next waits 10s, etc. The 30-day expiration sweep
+                    // is the eventual terminator.
+                    self.backoff.insert(
+                        (r.entry_id, r.recipient),
+                        AttemptState {
+                            last_attempt_wall_ms: wall_now_ms,
+                            failure_count: 1,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entry_id = ?r.entry_id,
+                        recipient = ?r.recipient,
+                        error = %e,
+                        "transport.send failed; bumping backoff"
+                    );
+                    let st =
+                        self.backoff
+                            .entry((r.entry_id, r.recipient))
+                            .or_insert(AttemptState {
+                                last_attempt_wall_ms: 0,
+                                failure_count: 0,
+                            });
+                    st.last_attempt_wall_ms = wall_now_ms;
+                    st.failure_count = st.failure_count.saturating_add(1);
                 }
             }
         }
 
-        // 3. Expiration sweep.
+        // 2. Expiration sweep.
         let mut expired: Vec<OutboxEntryId> = Vec::new();
         for (id, entry) in state.outbox.iter_mut() {
             if !matches!(
@@ -791,14 +872,15 @@ impl DmOutbox {
                 }
             }
         }
-        // 4. Cleanup backoff/in_flight for entries no longer Pending/Partial.
+
+        // 3. Cleanup backoff/in_flight for entries no longer Pending/Partial.
         // Covers expired (just marked above), Complete via local handle_ack
         // (already cleaned in handle_ack but defensive double-cleanup is
         // cheap), AND Complete via CRDT merge (a peer device's ack
         // replicated through owner-state sync — handle_ack never fires for
         // that path so the previous narrow expired-only sweep leaked
         // forever). Entries whose underlying OutboxEntry is gone
-        // (shouldn't happen in Phase 2; defensive) are also cleaned.
+        // (shouldn't happen; defensive) are also cleaned.
         self.backoff.retain(|(entry_id, _), _| {
             state
                 .outbox
@@ -1590,6 +1672,116 @@ impl DmOutbox {
     }
 }
 
+/// ZEB-233: lock-lifted drain entrypoint for production.
+///
+/// Three-phase structure mirroring `handle_cidnotify_lifted` (ZEB-241):
+///
+/// * **Phase A (locked, try_lock):** acquire `outbox` + `state` via
+///   `try_lock`. On contention, skip this tick. Calls
+///   `DmOutbox::drain_phase_a` to collect work units + mark in_flight.
+///   Locks drop at the end of this block.
+///
+/// * **Phase B (unlocked):** iterate work units, awaiting each
+///   `transport.send().await`. No locks held — concurrent `send_dm`
+///   IPC calls progress against the released outbox lock.
+///
+/// * **Phase C (spawned, locked):** spawn a `tokio::spawn` task that
+///   re-acquires `outbox` + `state` via `.lock().await` (not
+///   `try_lock` — the spawn detaches from the event_loop's `select!`,
+///   so `.lock().await` here doesn't risk the cas_op_rx deadlock that
+///   forced try_lock at Phase A). Calls `DmOutbox::drain_phase_c` to
+///   apply results + run the expiration sweep + cleanup. Emits
+///   `dm-delivered` / `dm-expired` IPC events from the spawned task.
+///
+/// ## Why spawn Phase C instead of awaiting inline
+///
+/// The event_loop runs in a single `select!` and pumps multiple arms
+/// (UDP recv, timer tick, cas_op_rx, etc.). Drain runs on the timer
+/// tick arm. If Phase C used `.lock().await` inline, the event_loop
+/// would stall at the timer arm waiting for the outbox lock — and a
+/// concurrent `send_dm` IPC (which holds outbox while awaiting
+/// `cas.put()` → `cas_op_tx`) could deadlock because cas_op_rx never
+/// gets pumped while the event_loop is parked at the timer arm.
+///
+/// Spawning Phase C makes the timer arm return immediately after
+/// Phase B completes. The event_loop resumes its `select!` and can
+/// pump cas_op_rx, unblocking the holder of outbox, which lets
+/// Phase C's `.lock().await` eventually succeed.
+///
+/// ## Why try_lock at Phase A
+///
+/// Phase A is on the timer arm hot path. Same deadlock risk as the
+/// original (pre-ZEB-233) drain caller — preserved by keeping
+/// try_lock + skip-this-tick at this boundary.
+///
+/// ## Effect on concurrent send_dm IPCs
+///
+/// Before ZEB-233: `send_dm` blocks at `outbox.lock().await` while
+/// drain awaits `transport.send()` (~500ms-5s on real Reticulum).
+/// After ZEB-233: `send_dm` acquires outbox immediately during
+/// Phase B because the lock is released. Latency improvement is
+/// proportional to the slowest in-flight transport.send.
+pub async fn drain_lifted<R: tauri::Runtime>(
+    outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+    state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+    transport: &dyn DmTransport,
+    wall_now_ms: u64,
+    app: tauri::AppHandle<R>,
+) {
+    // Phase A: try_lock + collect work. If either lock is contended,
+    // skip this tick. (Same deadlock-avoidance rationale as the
+    // original event_loop drain caller — see event_loop.rs timer arm
+    // comment.)
+    let work = match (outbox.try_lock(), state.try_lock()) {
+        (Ok(mut o_g), Ok(s_g)) => o_g.drain_phase_a(&s_g, wall_now_ms),
+        _ => {
+            tracing::debug!("drain_lifted Phase A: outbox/state lock contended; skipping tick");
+            return;
+        }
+    };
+
+    // Phase B: unlocked transport sends. Concurrent send_dm IPCs hold
+    // outbox/state during this stretch, so they don't block on us.
+    let mut results = Vec::with_capacity(work.len());
+    for unit in work {
+        let result = transport
+            .send(&unit.entry_clone, unit.recipient, unit.destinations)
+            .await;
+        results.push(DrainSendResult {
+            entry_id: unit.entry_id,
+            recipient: unit.recipient,
+            result,
+        });
+    }
+
+    // Phase C: spawn so the event_loop's timer arm returns to select!
+    // immediately. The spawned task runs detached and uses .lock().await
+    // (not try_lock) — by the time it awakens after .lock().await
+    // returns, the event_loop is free to pump cas_op_rx, so any holder
+    // of outbox/state can release.
+    tokio::spawn(async move {
+        let mut o_g = outbox.lock().await;
+        let mut s_g = state.lock().await;
+        let outcome = o_g.drain_phase_c(&mut s_g, results, wall_now_ms);
+        // Drop locks before emitting IPC events.
+        drop(s_g);
+        drop(o_g);
+        for (entry_id, recipient) in outcome.newly_delivered {
+            let payload = serde_json::json!({
+                "messageId": hex::encode(entry_id.0),
+                "recipient": hex::encode(recipient.0),
+            });
+            let _ = app.emit("dm-delivered", payload);
+        }
+        for entry_id in outcome.newly_expired {
+            let payload = serde_json::json!({
+                "messageId": hex::encode(entry_id.0),
+            });
+            let _ = app.emit("dm-expired", payload);
+        }
+    });
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SendDmError {
     #[error("space {0:?} not found")]
@@ -2347,6 +2539,89 @@ mod tests {
         assert!(inserted);
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(matches!(stored.delivery_status, DeliveryStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn drain_lifted_releases_outbox_lock_during_transport_send() {
+        // ZEB-233 regression test: drain_lifted MUST release the outbox
+        // + state locks for the duration of Phase B's
+        // transport.send().await. Without this, concurrent send_dm IPCs
+        // block on the slowest in-flight send.
+        //
+        // Verified by a custom transport (LockProbeTransport) that
+        // attempts to `try_lock` the outbox from INSIDE its async send()
+        // body. With the lock-lift working, Phase A's guard has been
+        // dropped before Phase B awaits — try_lock succeeds. Without the
+        // lock-lift, Phase A's guard is still held — try_lock returns
+        // WouldBlock.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        struct LockProbeTransport {
+            outbox: Arc<Mutex<DmOutbox>>,
+            try_lock_succeeded: Arc<AtomicBool>,
+            send_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl DmTransport for LockProbeTransport {
+            async fn send(
+                &self,
+                _entry: &OutboxEntry,
+                _recipient: OwnerAddr,
+                _destinations: Vec<[u8; 16]>,
+            ) -> Result<(), TransportError> {
+                self.send_count.fetch_add(1, Ordering::SeqCst);
+                if self.outbox.try_lock().is_ok() {
+                    self.try_lock_succeeded.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let mut state = OwnerState::default();
+        let alice = OwnerAddr([0xaa; 16]);
+        let bob = OwnerAddr([0xbb; 16]);
+        let entry = entry_with_age(7, vec![bob], 1_000);
+        install_outbox_entry(&mut state, entry);
+
+        let outbox = make_outbox_synthetic("dev", alice);
+        let outbox_arc = Arc::new(Mutex::new(outbox));
+        let state_arc = Arc::new(Mutex::new(state));
+
+        let try_lock_succeeded = Arc::new(AtomicBool::new(false));
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let transport = LockProbeTransport {
+            outbox: Arc::clone(&outbox_arc),
+            try_lock_succeeded: Arc::clone(&try_lock_succeeded),
+            send_count: Arc::clone(&send_count),
+        };
+
+        let app = tauri::test::mock_app().handle().clone();
+
+        super::drain_lifted(
+            Arc::clone(&outbox_arc),
+            Arc::clone(&state_arc),
+            &transport,
+            2_000,
+            app,
+        )
+        .await;
+
+        // drain_lifted spawns Phase C; give it a moment to settle so
+        // the spawned task isn't dangling when the test exits.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            send_count.load(Ordering::SeqCst) > 0,
+            "transport.send must have been called at least once (1 outstanding recipient)"
+        );
+        assert!(
+            try_lock_succeeded.load(Ordering::SeqCst),
+            "ZEB-233 regression: outbox lock must be RELEASED during Phase B's transport.send. \
+             The try_lock from inside send() failed, meaning Phase A's guard is still held."
+        );
     }
 
     #[tokio::test]
