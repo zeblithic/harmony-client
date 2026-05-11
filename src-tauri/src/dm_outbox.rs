@@ -1742,6 +1742,31 @@ pub async fn drain_lifted<R: tauri::Runtime>(
 
     // Phase B: unlocked transport sends. Concurrent send_dm IPCs hold
     // outbox/state during this stretch, so they don't block on us.
+    //
+    // ## Known TOCTOU window (ZEB-233 round 1)
+    //
+    // Between Phase A's lock-drop and a given `transport.send` in this
+    // loop, the (entry, recipient) pair could have its OutboxEntry
+    // deleted by `delete_dm_outbox_entry` or marked Complete for that
+    // recipient by `handle_ack`. We do NOT re-check liveness here
+    // because the obvious fix (`outbox.lock().await` + `state.lock().await`)
+    // would reintroduce the same deadlock Phase A's try_lock was
+    // designed to avoid: drain_lifted runs on the event_loop's timer
+    // arm, so `.lock().await` on a contended lock parks the timer arm
+    // → cas_op_rx is not pumped → send_dm (which holds the lock while
+    // awaiting `cas.put → cas_op_tx`) cannot release → deadlock.
+    //
+    // The worst-case TOCTOU impact: one extra network packet per
+    // (entry, recipient) pair before the delete/ack reaches drain on
+    // the next tick. The receiver dedups by `(space_id, message_cid)`
+    // in `handle_cidnotify_lifted` (the InboxKey invariant), so the
+    // duplicate packet does NOT produce a duplicate UI message.
+    //
+    // If production telemetry surfaces actual duplicate-send issues,
+    // ZEB-277 explores mitigation strategies (try_lock + skip with
+    // in_flight cleanup, dedicated liveness channel, or Phase A
+    // richer snapshot). Not implemented here because the obvious
+    // `.lock().await` fix reintroduces the deadlock ZEB-233 fixed.
     let mut results = Vec::with_capacity(work.len());
     for unit in work {
         let result = transport
@@ -1762,7 +1787,20 @@ pub async fn drain_lifted<R: tauri::Runtime>(
     tokio::spawn(async move {
         let mut o_g = outbox.lock().await;
         let mut s_g = state.lock().await;
-        let outcome = o_g.drain_phase_c(&mut s_g, results, wall_now_ms);
+        // ZEB-233 round 1 (Qodo Correctness #1): recompute wall_now_ms
+        // AFTER locks are acquired. Phase A's `wall_now_ms` is stale by
+        // the time Phase C runs — Phase B's sequential sends can take
+        // seconds (500ms-5s/recipient on real Reticulum), and Phase C
+        // can wait further on the lock if a concurrent send_dm holds
+        // it during cas.put. Using the stale value would write backoff
+        // last_attempt_wall_ms in the past, shortening effective retry
+        // windows. The fresh value reflects when the outcome was
+        // actually recorded.
+        let phase_c_wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let outcome = o_g.drain_phase_c(&mut s_g, results, phase_c_wall_now_ms);
         // Drop locks before emitting IPC events.
         drop(s_g);
         drop(o_g);
@@ -2560,7 +2598,9 @@ mod tests {
 
         struct LockProbeTransport {
             outbox: Arc<Mutex<DmOutbox>>,
-            try_lock_succeeded: Arc<AtomicBool>,
+            state: Arc<Mutex<OwnerState>>,
+            outbox_try_lock_succeeded: Arc<AtomicBool>,
+            state_try_lock_succeeded: Arc<AtomicBool>,
             send_count: Arc<AtomicUsize>,
         }
 
@@ -2573,8 +2613,16 @@ mod tests {
                 _destinations: Vec<[u8; 16]>,
             ) -> Result<(), TransportError> {
                 self.send_count.fetch_add(1, Ordering::SeqCst);
+                // ZEB-233 round 1 (CodeRabbit Nitpick): probe BOTH the
+                // outbox AND state locks. drain_lifted's lock-lift
+                // releases both for the duration of Phase B; a
+                // regression that releases only one would still pass
+                // an outbox-only probe.
                 if self.outbox.try_lock().is_ok() {
-                    self.try_lock_succeeded.store(true, Ordering::SeqCst);
+                    self.outbox_try_lock_succeeded.store(true, Ordering::SeqCst);
+                }
+                if self.state.try_lock().is_ok() {
+                    self.state_try_lock_succeeded.store(true, Ordering::SeqCst);
                 }
                 Ok(())
             }
@@ -2590,11 +2638,14 @@ mod tests {
         let outbox_arc = Arc::new(Mutex::new(outbox));
         let state_arc = Arc::new(Mutex::new(state));
 
-        let try_lock_succeeded = Arc::new(AtomicBool::new(false));
+        let outbox_try_lock_succeeded = Arc::new(AtomicBool::new(false));
+        let state_try_lock_succeeded = Arc::new(AtomicBool::new(false));
         let send_count = Arc::new(AtomicUsize::new(0));
         let transport = LockProbeTransport {
             outbox: Arc::clone(&outbox_arc),
-            try_lock_succeeded: Arc::clone(&try_lock_succeeded),
+            state: Arc::clone(&state_arc),
+            outbox_try_lock_succeeded: Arc::clone(&outbox_try_lock_succeeded),
+            state_try_lock_succeeded: Arc::clone(&state_try_lock_succeeded),
             send_count: Arc::clone(&send_count),
         };
 
@@ -2609,17 +2660,24 @@ mod tests {
         )
         .await;
 
-        // drain_lifted spawns Phase C; give it a moment to settle so
-        // the spawned task isn't dangling when the test exits.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
+        // ZEB-233 round 1 (Qodo Reliability #2): the assertions below
+        // only depend on Phase B (transport.send) having completed,
+        // which happens before `drain_lifted(...).await` returns. No
+        // post-await synchronization is needed. The spawned Phase C
+        // is left to run (or be dropped on test exit) — tokio handles
+        // its cleanup.
         assert!(
             send_count.load(Ordering::SeqCst) > 0,
             "transport.send must have been called at least once (1 outstanding recipient)"
         );
         assert!(
-            try_lock_succeeded.load(Ordering::SeqCst),
+            outbox_try_lock_succeeded.load(Ordering::SeqCst),
             "ZEB-233 regression: outbox lock must be RELEASED during Phase B's transport.send. \
+             The try_lock from inside send() failed, meaning Phase A's guard is still held."
+        );
+        assert!(
+            state_try_lock_succeeded.load(Ordering::SeqCst),
+            "ZEB-233 regression: state lock must be RELEASED during Phase B's transport.send. \
              The try_lock from inside send() failed, meaning Phase A's guard is still held."
         );
     }
