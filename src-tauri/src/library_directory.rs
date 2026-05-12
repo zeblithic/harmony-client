@@ -170,6 +170,11 @@ pub const MAX_TOPICS_PER_ENTRY: usize = 16;
 pub const MAX_TOPIC_LEN: usize = 64;
 pub const MAX_ENTRIES_PER_LIBRARY: usize = 10_000;
 
+/// Cap on the in-memory `Announces` map. Smaller than
+/// `MAX_ENTRIES_PER_LIBRARY` because this is a global count of known
+/// libraries, not per-library entries. Spec §4.2 / §10.
+pub const MAX_DISCOVERED_LIBRARIES: usize = 1_000;
+
 /// Verification error categories for `LibraryAnnounce`. Mirrors
 /// `EntryVerifyError` but simpler — no invite URL, no
 /// community/admin payload binding. Each variant surfaces as a
@@ -592,6 +597,130 @@ impl Aggregation {
     }
 }
 
+/// In-memory discovered-libraries map populated by
+/// `process_announce`. NOT persisted — rebuilt on startup from the
+/// announce-topic subscription. Spec §4.2.
+#[derive(Debug, Default)]
+pub struct Announces {
+    by_addr: BTreeMap<OwnerAddr, LibraryAnnounce>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnounceOutcome {
+    /// New library address — first time seen.
+    Inserted(OwnerAddr),
+    /// Existing library, replaced by newer-HLC announce.
+    Updated(OwnerAddr),
+    /// Existing library, incoming has older/equal HLC.
+    Idempotent,
+}
+
+/// Result of `process_announce`. The outer outcome and any
+/// orthogonal cap-eviction are independent — both fields can be
+/// populated when an at-cap insert evicts an unrelated library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceProcessResult {
+    pub outcome: AnnounceOutcome,
+    /// `Some(addr)` if the cap was hit and `addr` was evicted to make
+    /// room for the incoming announce.
+    pub evicted: Option<OwnerAddr>,
+}
+
+impl Announces {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_addr.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_addr.is_empty()
+    }
+
+    /// Snapshot for IPC return. Sorted by `listed_at` descending (newest
+    /// first) so the UI surfaces fresh announces at the top. Ties on
+    /// `listed_at` fall back to `OwnerAddr` byte order ascending for
+    /// deterministic test output.
+    pub fn snapshot(&self) -> Vec<LibraryAnnounce> {
+        // Collect (addr, announce) pairs so we can stable-tie-break on
+        // OwnerAddr when listed_at compares equal across entries.
+        let mut pairs: Vec<(OwnerAddr, LibraryAnnounce)> =
+            self.by_addr.iter().map(|(a, e)| (*a, e.clone())).collect();
+        pairs.sort_by(|(addr_a, a), (addr_b, b)| {
+            // Newer first: `b` strictly newer than `a` => b comes first.
+            if b.listed_at.is_strictly_newer_than(&a.listed_at) {
+                std::cmp::Ordering::Greater
+            } else if a.listed_at.is_strictly_newer_than(&b.listed_at) {
+                std::cmp::Ordering::Less
+            } else {
+                // Equal listed_at => stable tie-break by addr ascending.
+                addr_a.cmp(addr_b)
+            }
+        });
+        pairs.into_iter().map(|(_, e)| e).collect()
+    }
+
+    /// Process a verified announce. Caller MUST have run
+    /// `verify_announce` first (which returns the derived `library_addr`).
+    /// This method does NOT re-verify.
+    pub fn on_announce(
+        &mut self,
+        library_addr: OwnerAddr,
+        announce: LibraryAnnounce,
+    ) -> AnnounceProcessResult {
+        // Dedupe: latest-listed_at-wins (strict; equal HLC is idempotent).
+        if let Some(existing) = self.by_addr.get(&library_addr) {
+            if !announce
+                .listed_at
+                .is_strictly_newer_than(&existing.listed_at)
+            {
+                return AnnounceProcessResult {
+                    outcome: AnnounceOutcome::Idempotent,
+                    evicted: None,
+                };
+            }
+            // Strictly newer — replace.
+            self.by_addr.insert(library_addr, announce);
+            return AnnounceProcessResult {
+                outcome: AnnounceOutcome::Updated(library_addr),
+                evicted: None,
+            };
+        }
+
+        // Brand-new library — apply cap.
+        let mut evicted: Option<OwnerAddr> = None;
+        if self.by_addr.len() >= MAX_DISCOVERED_LIBRARIES {
+            // Evict oldest-by-listed_at. Stable tie-break by addr byte
+            // order ascending so eviction is deterministic across runs.
+            if let Some(oldest_addr) = self
+                .by_addr
+                .iter()
+                .min_by(|(addr_a, a), (addr_b, b)| {
+                    if a.listed_at.is_strictly_newer_than(&b.listed_at) {
+                        std::cmp::Ordering::Greater
+                    } else if b.listed_at.is_strictly_newer_than(&a.listed_at) {
+                        std::cmp::Ordering::Less
+                    } else {
+                        // Equal listed_at — evict by addr ascending.
+                        addr_a.cmp(addr_b)
+                    }
+                })
+                .map(|(addr, _)| *addr)
+            {
+                self.by_addr.remove(&oldest_addr);
+                evicted = Some(oldest_addr);
+            }
+        }
+        self.by_addr.insert(library_addr, announce);
+        AnnounceProcessResult {
+            outcome: AnnounceOutcome::Inserted(library_addr),
+            evicted,
+        }
+    }
+}
+
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -613,6 +742,9 @@ pub enum LibraryDirectoryRequest {
 /// event-loop consumer task is spawned.
 pub struct LibraryDirectory {
     pub aggregation: Mutex<Aggregation>,
+    /// Sub-D Phase 2: discovered-libraries map populated by the
+    /// announce-topic subscriber. Spec §4.2.
+    pub announces: Mutex<Announces>,
     pub request_tx: mpsc::UnboundedSender<LibraryDirectoryRequest>,
 }
 
@@ -623,6 +755,7 @@ impl LibraryDirectory {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let dir = Arc::new(Self {
             aggregation: Mutex::new(Aggregation::new()),
+            announces: Mutex::new(Announces::new()),
             request_tx,
         });
         (dir, request_rx)
@@ -657,6 +790,24 @@ impl LibraryDirectory {
         verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
         let mut agg = self.aggregation.lock().await;
         Ok(agg.on_entry(entry))
+    }
+
+    /// Sub-D Phase 2: ingest one announce-topic sample. Decodes, verifies,
+    /// then inserts/updates the announces map. Returns the outcome so the
+    /// caller can emit `library-directory-updated` on non-`Idempotent`
+    /// changes (or on orthogonal cap-eviction).
+    pub async fn process_announce(
+        self: &Arc<Self>,
+        bytes: Vec<u8>,
+    ) -> Result<AnnounceProcessResult, AnnounceVerifyError> {
+        let announce: LibraryAnnounce = ciborium::from_reader(&bytes[..]).map_err(|e| {
+            AnnounceVerifyError::Encode(crate::owner_state_crypto::CryptoError::CborDecode(
+                format!("{e}"),
+            ))
+        })?;
+        let library_addr = verify_announce(&announce)?;
+        let mut announces = self.announces.lock().await;
+        Ok(announces.on_announce(library_addr, announce))
     }
 
     pub async fn drop_library(&self, library: &OwnerAddr) -> Vec<SpaceId> {
@@ -1581,5 +1732,104 @@ mod announce_verify_tests {
         announce.name = "x".repeat(MAX_NAME_LEN + 1);
         let err = verify_announce(&announce).unwrap_err();
         assert!(matches!(err, AnnounceVerifyError::NameTooLong));
+    }
+}
+
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+
+    fn test_announce(name: &str, wall_ms: u64) -> LibraryAnnounce {
+        LibraryAnnounce {
+            // Not verified at this layer — `on_announce` is purely the
+            // map-mutation surface and assumes its caller has already run
+            // `verify_announce`.
+            library_identity_pub: [0u8; 64],
+            name: name.to_string(),
+            description: String::new(),
+            listed_at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "d".to_string(),
+            },
+            library_signature: [0u8; 64],
+        }
+    }
+
+    fn addr(b: u8) -> OwnerAddr {
+        OwnerAddr([b; 16])
+    }
+
+    #[test]
+    fn on_announce_inserts_new_library() {
+        let mut announces = Announces::new();
+        let result = announces.on_announce(addr(1), test_announce("LibA", 100));
+        assert_eq!(result.outcome, AnnounceOutcome::Inserted(addr(1)));
+        assert_eq!(result.evicted, None);
+        assert_eq!(announces.len(), 1);
+    }
+
+    #[test]
+    fn on_announce_dedupes_latest_listed_at_wins() {
+        let mut announces = Announces::new();
+        announces.on_announce(addr(1), test_announce("Old", 100));
+        let result = announces.on_announce(addr(1), test_announce("New", 200));
+        assert_eq!(result.outcome, AnnounceOutcome::Updated(addr(1)));
+        assert_eq!(result.evicted, None);
+        let snap = announces.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].name, "New");
+    }
+
+    #[test]
+    fn on_announce_older_is_idempotent() {
+        let mut announces = Announces::new();
+        announces.on_announce(addr(1), test_announce("New", 200));
+        let result = announces.on_announce(addr(1), test_announce("Older", 100));
+        assert_eq!(result.outcome, AnnounceOutcome::Idempotent);
+        assert_eq!(result.evicted, None);
+        let snap = announces.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].name, "New");
+    }
+
+    #[test]
+    fn on_announce_cap_eviction_drops_oldest_listed_at() {
+        let mut announces = Announces::new();
+        // Fill to cap with distinct addrs (distinct first byte +
+        // last-two bytes encoding the index to disambiguate >255 entries)
+        // and ascending listed_at values.
+        for i in 0..MAX_DISCOVERED_LIBRARIES {
+            let mut a = [0u8; 16];
+            a[0] = (i & 0xFF) as u8;
+            a[1] = ((i >> 8) & 0xFF) as u8;
+            announces.on_announce(
+                OwnerAddr(a),
+                test_announce(&format!("Lib{i}"), 100 + i as u64),
+            );
+        }
+        assert_eq!(announces.len(), MAX_DISCOVERED_LIBRARIES);
+
+        // Insert one more — should evict the oldest (i=0, listed_at=100,
+        // addr = all-zero bytes).
+        let new_addr = OwnerAddr([0xFF; 16]);
+        let result = announces.on_announce(new_addr, test_announce("New", 9_999));
+        assert_eq!(result.outcome, AnnounceOutcome::Inserted(new_addr));
+        let evicted_addr = result.evicted.expect("must have evicted oldest");
+        assert_eq!(evicted_addr, OwnerAddr([0u8; 16]));
+        assert_eq!(announces.len(), MAX_DISCOVERED_LIBRARIES);
+    }
+
+    #[test]
+    fn snapshot_sorted_newest_first() {
+        let mut announces = Announces::new();
+        announces.on_announce(addr(1), test_announce("Old", 100));
+        announces.on_announce(addr(2), test_announce("Mid", 200));
+        announces.on_announce(addr(3), test_announce("New", 300));
+        let snap = announces.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].name, "New");
+        assert_eq!(snap[1].name, "Mid");
+        assert_eq!(snap[2].name, "Old");
     }
 }
