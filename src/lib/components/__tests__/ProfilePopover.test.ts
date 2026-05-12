@@ -159,18 +159,24 @@ describe('ProfilePopover', () => {
 
   it('popover_shows_no_memberships_after_timeout', async () => {
     vi.useFakeTimers();
-    const { service } = makeService(); // returns null
-    const peerProfile: Profile = { address: PEER_ADDR, displayName: 'Peer' };
-    const { getByText } = render(ProfilePopover, {
-      props: baseProps({
-        profile: peerProfile,
-        profileBroadcastService: service,
-      }),
-    });
-    expect(getByText('Looking up public memberships…')).toBeTruthy();
-    // Advance 3s; loading flips off and empty state renders.
-    await vi.advanceTimersByTimeAsync(3100);
-    expect(getByText('No public memberships shared.')).toBeTruthy();
-    vi.useRealTimers();
+    try {
+      const { service } = makeService(); // returns null
+      const peerProfile: Profile = { address: PEER_ADDR, displayName: 'Peer' };
+      const { getByText } = render(ProfilePopover, {
+        props: baseProps({
+          profile: peerProfile,
+          profileBroadcastService: service,
+        }),
+      });
+      expect(getByText('Looking up public memberships…')).toBeTruthy();
+      // Advance 3s; loading flips off and empty state renders.
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(getByText('No public memberships shared.')).toBeTruthy();
+    } finally {
+      // Always restore real timers — if any assertion above throws, the
+      // bare `vi.useRealTimers()` call wouldn't run and subsequent tests
+      // would inherit fake-timer state.
+      vi.useRealTimers();
+    }
   });
 });

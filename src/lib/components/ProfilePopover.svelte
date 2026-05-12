@@ -71,6 +71,13 @@
       // Don't subscribe to ourselves; the section isn't rendered.
       return;
     }
+    // Reset to a clean loading state on every profile.address change.
+    // Without this, a popover instance reused across peer switches
+    // (e.g. closed for A, immediately re-opened for B before the prior
+    // subscription cleanup runs) would briefly render peer A's
+    // memberships under peer B's profile header.
+    memberships = null;
+    isLoading = true;
     let cancelled = false;
     let unlistenFn: (() => void) | null = null;
     let localSubId: number | null = null;

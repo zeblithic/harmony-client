@@ -328,11 +328,16 @@ impl ProfileBroadcastPublisher {
                     return;
                 }
             }
-        } else if !has_ever_published {
-            // Refresh tick fires before any opt-in: still must respect
-            // the privacy invariant.
-            return;
         }
+        // Refresh-arm: NO `!has_ever_published` early-return here. After
+        // process restart, the in-memory `last_published` is `None` (it's
+        // intentionally not persisted), but `Space.shared_in_profile` is
+        // — so a user with persisted opt-ins must re-broadcast on the
+        // first refresh tick without needing an explicit `notify_dirty()`.
+        // The privacy invariant (no broadcast before first opt-in) is
+        // already guarded above by the `!has_ever_published &&
+        // current.is_empty()` early-return: when there's no persisted
+        // opt-in set, `current` is empty and the publisher stays silent.
 
         // Rotation: when refresh tick fires AFTER N→0, the prior snapshot
         // is empty. Don't republish empty over empty.
@@ -396,8 +401,15 @@ impl ProfileBroadcastSource for OwnerStateBroadcastSource {
             .spaces
             .values()
             .filter(|s| {
+                // `left_at.is_none()` guards the privacy invariant from
+                // `leave_community`: the Community Space is intentionally
+                // retained (history, re-join, etc.) but MUST NOT continue
+                // to be advertised in the profile broadcast. Without this
+                // filter, a stale `shared_in_profile=true` on a left
+                // community would leak past departure.
                 matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
                     && s.shared_in_profile
+                    && s.left_at.is_none()
             })
             .map(|s| s.id)
             .collect();
@@ -553,10 +565,13 @@ impl ProfileBroadcastCache {
         }
         if let Some(prev) = &entry.latest {
             // Strict greater-than: equal HLC is also rejected (idempotent
-            // duplicate). HLC comparison is on (wall_ms, logical) tuple.
-            let newer = (broadcast.shared_at.wall_ms, broadcast.shared_at.logical)
-                > (prev.shared_at.wall_ms, prev.shared_at.logical);
-            if !newer {
+            // duplicate). Use the canonical `Hlc::is_strictly_newer_than`
+            // which compares on the full (wall_ms, logical, device_id)
+            // tuple. Comparing only (wall_ms, logical) — as an earlier
+            // revision did — would incorrectly reject broadcasts from a
+            // different bound device of the same owner whose wall+logical
+            // happen to tie a previously-cached sample.
+            if !broadcast.shared_at.is_strictly_newer_than(&prev.shared_at) {
                 return Err(CacheOnSampleError::Replay);
             }
         }
@@ -889,6 +904,102 @@ mod tests {
         );
     }
 
+    /// Regression: a Community Space with `shared_in_profile=true` AND
+    /// `left_at=Some(_)` MUST be excluded from the broadcast set. The
+    /// `leave_community` IPC intentionally retains the Space (so history,
+    /// re-join, etc. stay coherent) but the privacy promise of "no
+    /// advertising memberships you no longer hold" requires filtering
+    /// here. Without the `left_at.is_none()` guard, a stale opt-in
+    /// would keep leaking past departure.
+    #[tokio::test]
+    async fn owner_state_source_excludes_left_communities() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::{EpochKey, OwnerAddr, Space, SpaceKind};
+
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let left_hlc = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "t".into(),
+        };
+
+        // Community A — opted-in AND still joined. MUST appear.
+        let still_joined = Space {
+            id: SpaceId([0xa1; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Still joined".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xab; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+        // Community B — was opted-in but the user has since left. The
+        // shared_in_profile flag is still true (not auto-cleared by
+        // leave_community), but the broadcast source MUST suppress it
+        // because `left_at` is Some.
+        let left_but_still_flagged = Space {
+            id: SpaceId([0xa2; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Left community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: Some(left_hlc),
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xcd; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+
+        let mut state = OwnerState::default();
+        state.spaces.insert(still_joined.id, still_joined.clone());
+        state
+            .spaces
+            .insert(left_but_still_flagged.id, left_but_still_flagged.clone());
+
+        let crdt_state = StdArc::new(TokioMutex::new(state));
+        let hlc_tracker = StdArc::new(TokioMutex::new(std::collections::BTreeMap::new()));
+        let src = OwnerStateBroadcastSource {
+            crdt_state,
+            hlc_tracker,
+            device_id: "test".into(),
+        };
+
+        let got = src.current_shared_set().await;
+        assert_eq!(
+            got,
+            vec![still_joined.id],
+            "current_shared_set must exclude communities with left_at=Some(_) \
+             even when shared_in_profile is still true; got {got:?}"
+        );
+    }
+
     // Type aliases keep clippy::type_complexity happy and make the
     // MockSink / mock_publisher_setup signatures readable.
     type SharedPublished = StdArc<TokioMutex<Vec<(String, Vec<u8>)>>>;
@@ -1043,6 +1154,42 @@ mod tests {
         );
         drop(pubs);
         publisher.shutdown().await;
+    }
+
+    /// Regression: simulates a process restart where the user has
+    /// `Space.shared_in_profile=true` persisted in the CRDT but no
+    /// in-memory `last_published` yet (it's not persisted across
+    /// restarts). Without an explicit `notify_dirty()` call, the
+    /// first refresh-interval tick MUST publish the persisted opt-in
+    /// set. A prior revision returned early on refresh-tick whenever
+    /// `!has_ever_published`, so users with persisted opt-ins went
+    /// silent until they re-toggled — the privacy invariant is still
+    /// preserved by the upstream `current.is_empty()` early-return.
+    #[tokio::test]
+    async fn publisher_persisted_optin_rebroadcasts_after_restart_without_notify() {
+        let (set, published, publisher) = mock_publisher_setup();
+        // Persisted opt-in set BEFORE any notify_dirty() — represents
+        // state recovered from on-disk CRDT after process restart.
+        *set.lock().await = vec![fixture_space_id(1)];
+        // Do NOT call publisher.notify_dirty(). Wait past one refresh
+        // interval (test setup uses 100ms refresh) and confirm an
+        // initial publish happened anyway.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        publisher.shutdown().await;
+        let pubs = published.lock().await;
+        assert!(
+            !pubs.is_empty(),
+            "persisted opt-in must produce an initial broadcast on the \
+             first refresh tick (no notify_dirty required); got {pubs:?}"
+        );
+        let first_payload = &pubs[0].1;
+        let decoded: ProfileMembershipBroadcast =
+            ciborium::from_reader(&first_payload[..]).expect("decode first payload");
+        assert_eq!(
+            decoded.community_ids,
+            vec![fixture_space_id(1)],
+            "first broadcast on restart must carry the persisted opt-in set"
+        );
     }
 
     #[tokio::test]

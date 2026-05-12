@@ -1550,8 +1550,11 @@ pub struct Space {
     pub is_invite_only: Option<bool>,
 
     /// Sub-D Phase 4 (ZEB-281): opt-in flag for including this Space's
-    /// `community_id` in the owner's ProfileMembershipBroadcast.
-    /// Default `false` (no communities shared until user explicitly
+    /// `Space.id` (the community's identifier) in the owner's
+    /// ProfileMembershipBroadcast. Community Spaces have
+    /// `community_id = None` (the field is a back-pointer that lives on
+    /// child Channel Spaces); the shared identifier IS this Space's own
+    /// `id`. Default `false` (no communities shared until user explicitly
     /// opts in). Replicated across the owner's bound devices via the
     /// existing owner-state CRDT sync — opting in on one device shows
     /// on all of them.
@@ -3591,6 +3594,92 @@ mod space_tests {
         assert!(
             err.0.contains("current_epoch_key"),
             "expected error about non-community current_epoch_key; got: {}",
+            err.0
+        );
+    }
+
+    /// Sub-D Phase 4 (ZEB-281): a Community Space with the opt-in flag
+    /// set MUST validate. Counterpart to
+    /// `non_community_with_shared_in_profile_true_rejected` below.
+    #[test]
+    fn community_space_with_shared_in_profile_true_accepted() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "opted-in community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+        assert_eq!(s.validate_invariants(), Ok(()));
+    }
+
+    /// Sub-D Phase 4 (ZEB-281): a non-Community Space with the opt-in
+    /// flag set MUST be rejected. Defends against a malformed peer or
+    /// future-self bug that tries to advertise a DM / channel / folder
+    /// in the public profile broadcast.
+    #[test]
+    fn non_community_with_shared_in_profile_true_rejected() {
+        let s = Space {
+            id: SpaceId([2u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: true, // ← invariant violation
+        };
+        let err = s
+            .validate_invariants()
+            .expect_err("non-community must reject shared_in_profile=true");
+        assert!(
+            err.0.contains("shared_in_profile=false"),
+            "expected error mentioning shared_in_profile invariant; got: {}",
             err.0
         );
     }

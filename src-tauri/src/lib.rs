@@ -10256,7 +10256,14 @@ async fn set_space_shared_in_profile(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let community_space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (crdt_state, publisher, hlc_tracker, device_id) = {
+    // Capture `generation` paired-atomically with the Arcs. If stop_inner
+    // detaches the Arcs (sets to None) and start_node bumps the generation
+    // while we're awaiting on the HLC reservation / CRDT lock, the Arcs we
+    // hold are orphaned: we'd mutate a `crdt_state` the new node never
+    // reads from. The post-check after the mutation surfaces that as Err
+    // rather than returning Ok(()) for an effectively dropped write. Same
+    // idiom as `send_dm` (~lib.rs:2935).
+    let (crdt_state, publisher, hlc_tracker, device_id, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -10273,6 +10280,7 @@ async fn set_space_shared_in_profile(
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
         )
     };
 
@@ -10335,6 +10343,32 @@ async fn set_space_shared_in_profile(
         space.updated_at = new_hlc;
     }
 
+    // Post-check: a concurrent stop_node / restart between the initial
+    // state_lock grab and now would have orphaned `crdt_state`. The
+    // mutation we just performed went into a detached state that the
+    // live NodeState's node never reads from. Surface as Err so the
+    // caller can retry against the live node. stop_inner clears handles
+    // to None WITHOUT bumping `generation`, so additionally verify the
+    // handles are still present. Same idiom as `send_dm`.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during set_space_shared_in_profile \
+                 (was {}, now {}); flag was written to a detached crdt_state \
+                 — retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.crdt_state.is_none() || g.profile_broadcast_publisher.is_none() {
+            return Err("node was stopped during set_space_shared_in_profile; \
+                 flag was written to a detached crdt_state"
+                .to_string());
+        }
+    }
+
     // Notify the publisher to recompute + debounce-publish.
     publisher.notify_dirty();
     Ok(())
@@ -10370,7 +10404,16 @@ async fn list_shared_in_profile_communities(
         .spaces
         .values()
         .filter(|s| {
-            matches!(s.kind, crate::owner_state_types::SpaceKind::Community) && s.shared_in_profile
+            // Mirror `OwnerStateBroadcastSource::current_shared_set`: the
+            // frontend opt-in toggle MUST reflect what the publisher
+            // actually broadcasts. A Community Space the user has left
+            // (`left_at = Some(_)`) is intentionally retained but is
+            // suppressed from the broadcast — surfacing it here would
+            // falsely claim "sharing on" for a community no longer in
+            // the broadcast set.
+            matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
+                && s.shared_in_profile
+                && s.left_at.is_none()
         })
         .map(|s| hex::encode(s.id.0))
         .collect();
@@ -10407,13 +10450,20 @@ async fn subscribe_peer_profile(
         .map_err(|e| format!("invalid peer_addr hex: {e}"))?;
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     cache.register(id, peer_owner_addr).await;
-    request_tx
+    // If the request channel is closing (event-loop shutdown raced this
+    // IPC), the slot we just registered would persist forever — a phantom
+    // subscription nothing will ever deliver a sample to. Roll the cache
+    // entry back before surfacing the error.
+    if let Err(e) = request_tx
         .send(crate::event_loop::ProfileBroadcastRequest::Subscribe {
             subscription_id: id,
             peer_addr: peer_owner_addr,
         })
         .await
-        .map_err(|e| format!("profile_broadcast_request_tx send: {e}"))?;
+    {
+        cache.drop_subscription(id).await;
+        return Err(format!("profile_broadcast_request_tx send: {e}"));
+    }
     Ok(id)
 }
 
