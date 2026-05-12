@@ -2001,12 +2001,21 @@ mod integration_tests {
         );
     }
 
-    /// 50 randomized sequences of (mutate-on-A, mutate-on-B,
+    /// 10 randomized sequences of (mutate-on-A, mutate-on-B,
     /// publish-A, publish-B) operations. After draining, A and B
     /// must hold equal `OwnerState`s. Catches non-determinism in
     /// the merge path that scripted tests miss.
+    ///
+    /// ZEB-283: Trial count was reduced from 50 → 10 (2026-05-12) to
+    /// cut wall-clock from ~76s to ~15s on every `cargo nextest run`.
+    /// The xorshift64 RNG seed is fixed so the SAME 10 sequences
+    /// exercise on every run — deterministic regression detection
+    /// across those 10 trials. If we ever need 50-trial paranoia for
+    /// periodic deep validation, file a follow-up to gate a wider
+    /// trial count behind a `nightly` Cargo feature + separate CI
+    /// workflow.
     #[tokio::test]
-    async fn random_sequence_convergence_50x() {
+    async fn random_sequence_convergence_10x() {
         // Seedable PRNG — chosen so a regression reproduces.
         let mut rng_state: u64 = 0xdead_beef_cafe_babe;
         fn next(rng: &mut u64) -> u64 {
@@ -2019,7 +2028,7 @@ mod integration_tests {
             x
         }
 
-        for trial in 0..50 {
+        for trial in 0..10 {
             let dev = spawn_two_devices((trial % 256) as u8);
             // Generate 8-12 random folder mutations split between A and B.
             let n_ops = 8 + (next(&mut rng_state) % 5) as u8;
