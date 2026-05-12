@@ -62,6 +62,96 @@ pub fn mock_directory_entry(
     entry
 }
 
+/// ZEB-280 Phase 3: build a `LibraryDirectoryEntry` with both layers
+/// of signatures. Pass `library_signer = None` to produce a Phase 1-
+/// shaped (unwrapped) entry equivalent to `mock_directory_entry`.
+/// Pass `Some((signing_key, identity_bundle))` to produce a fully
+/// wrapped Phase 3 entry.
+///
+/// Admin sig signs over canonical CBOR with cs=0, li=None, ls=None
+/// (skip_serializing_if omits the Optional fields). Library sig
+/// signs over canonical CBOR with ls=None, li populated, cs populated.
+///
+/// Spec §5.
+#[allow(clippy::too_many_arguments)]
+pub fn mock_library_entry_wrapped(
+    community_id: SpaceId,
+    admin_seed: [u8; 32],
+    listed_by: OwnerAddr,
+    listed_at: Hlc,
+    invite_url: String,
+    name: &str,
+    description: &str,
+    topics: Vec<String>,
+    library_signer: Option<(&SigningKey, [u8; 64])>,
+) -> LibraryDirectoryEntry {
+    let (admin_signing_key, admin_identity_pub) = build_test_admin_identity(admin_seed);
+
+    // Phase 1 admin sig (Optional fields None — skip_serializing_if
+    // omits them, so admin sig is identical to Phase 1).
+    let mut entry = LibraryDirectoryEntry {
+        community_id,
+        community_admin_identity_pub: admin_identity_pub,
+        name: name.to_string(),
+        description: description.to_string(),
+        topics,
+        invite_url,
+        listed_by,
+        listed_at,
+        community_signature: [0u8; 64],
+        library_identity_pub: None,
+        library_signature: None,
+    };
+    let mut for_sig = entry.clone();
+    for_sig.community_signature = [0u8; 64];
+    let admin_signed = canonical_cbor_encode(&for_sig).expect("encode admin sign");
+    entry.community_signature = admin_signing_key.sign(&admin_signed).to_bytes();
+
+    // Phase 3 wrapping sig (if library_signer provided).
+    if let Some((library_signing_key, library_identity_bundle)) = library_signer {
+        entry.library_identity_pub = Some(library_identity_bundle);
+        entry.library_signature = None;
+        let lib_signed = canonical_cbor_encode(&entry).expect("encode library sign");
+        entry.library_signature = Some(library_signing_key.sign(&lib_signed).to_bytes());
+    }
+
+    entry
+}
+
+/// ZEB-280 Phase 3: take an already-admin-signed entry (presumed
+/// produced by `mock_directory_entry` or `mock_library_entry_wrapped`)
+/// and replace its wrapping sig with a new library's signature.
+/// This is the verbatim re-syndication primitive: library A
+/// republishes library B's entry by re-signing over the same
+/// admin-signed bytes with A's own key, advertising A as the
+/// broadcaster.
+///
+/// Spec §3 / §5.
+pub fn mock_library_entry_republished_by(
+    original: &LibraryDirectoryEntry,
+    new_library_signing_key: &SigningKey,
+    new_library_identity_bundle: [u8; 64],
+) -> LibraryDirectoryEntry {
+    let mut wrapped = original.clone();
+    wrapped.library_identity_pub = Some(new_library_identity_bundle);
+    wrapped.library_signature = None;
+    let lib_signed = canonical_cbor_encode(&wrapped).expect("encode library sign");
+    wrapped.library_signature = Some(new_library_signing_key.sign(&lib_signed).to_bytes());
+    wrapped
+}
+
+/// ZEB-280 Phase 3: build a deterministic library identity bundle +
+/// signing key. Mirrors `build_test_admin_identity` but with a stable
+/// X25519 prefix of `0x22 × 32` (distinct from admin's `0x11 × 32`).
+pub fn build_test_library_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
+    let signing = SigningKey::from_bytes(&seed);
+    let verifying = signing.verifying_key().to_bytes();
+    let mut bundle = [0u8; 64];
+    bundle[..32].copy_from_slice(&[0x22; 32]);
+    bundle[32..].copy_from_slice(&verifying);
+    (signing, bundle)
+}
+
 /// Build a signed `LibraryAnnounce` ready to publish on
 /// `harmony/discovery/library/announce`. Returns the encoded bytes
 /// plus the derived library `OwnerAddr` (so callers can assert

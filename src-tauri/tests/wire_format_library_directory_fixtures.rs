@@ -155,3 +155,122 @@ fn library_directory_entry_field_keys_are_2char() {
             .collect();
     assert_eq!(keys, expected, "field keys must match exactly");
 }
+
+/// ZEB-280 Phase 3: a wrapped entry (both Optional fields populated)
+/// round-trips through canonical CBOR and the bstr serde helpers.
+/// Sentinel byte patterns chosen to make wire-format diffs obvious.
+#[test]
+fn phase3_wrapped_entry_roundtrips() {
+    let entry = LibraryDirectoryEntry {
+        community_id: SpaceId([0x11; 16]),
+        community_admin_identity_pub: fixture_admin_identity_pub(),
+        name: "Wrapped Fixture".to_string(),
+        description: "Phase 3 federation test.".to_string(),
+        topics: vec!["federation".to_string()],
+        invite_url: "harmony://invite/?p=AAAA".to_string(),
+        listed_by: OwnerAddr([0x22; 16]),
+        listed_at: fixture_hlc(),
+        community_signature: [0x33; 64],
+        library_identity_pub: Some([0x44; 64]),
+        library_signature: Some([0x55; 64]),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    let roundtrip: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    assert_eq!(entry, roundtrip, "wrapped entry round-trips");
+    assert_eq!(roundtrip.library_identity_pub, Some([0x44; 64]));
+    assert_eq!(roundtrip.library_signature, Some([0x55; 64]));
+}
+
+/// ZEB-280 Phase 3: pin the canonical CBOR PREFIX bytes for a
+/// wrapped entry. We pin the prefix (not the full hex string) because
+/// the wrapped entry's bytes are 256+ bytes long — pinning the prefix
+/// catches the map(11) marker + key ordering changes without requiring
+/// us to maintain a 500-char hex string by hand.
+///
+/// Expected prefix:
+/// - `ab` (CBOR map header, 11 keys: cd, ai, nm, ds, tp, iu, lb, la,
+///   cs, li, ls)
+/// - first key `cd` is text(2) = `62 63 64`
+///
+/// Wrapped entries MUST have exactly 11 keys (Phase 1's 9 + li + ls);
+/// unwrapped entries have 9.
+#[test]
+fn phase3_wrapped_entry_pinned_bytes_prefix() {
+    let entry = LibraryDirectoryEntry {
+        community_id: SpaceId([0x11; 16]),
+        community_admin_identity_pub: fixture_admin_identity_pub(),
+        name: "Wrapped Fixture".to_string(),
+        description: "Phase 3 federation test.".to_string(),
+        topics: vec!["federation".to_string()],
+        invite_url: "harmony://invite/?p=AAAA".to_string(),
+        listed_by: OwnerAddr([0x22; 16]),
+        listed_at: fixture_hlc(),
+        community_signature: [0x33; 64],
+        library_identity_pub: Some([0x44; 64]),
+        library_signature: Some([0x55; 64]),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    assert_eq!(
+        bytes[0], 0xab,
+        "wrapped entry must encode as map(11); got map({:#x}) prefix byte",
+        bytes[0]
+    );
+    // First key after map header: text(2) "cd" = [0x62, 0x63, 0x64]
+    assert_eq!(
+        &bytes[1..4],
+        b"\x62cd",
+        "first map key must be text(2) \"cd\""
+    );
+}
+
+/// ZEB-280 Phase 3: 2-char field-key invariant must hold for the
+/// wrapped entry — all 11 keys (including new li + ls) are 2-char.
+#[test]
+fn phase3_wrapped_entry_two_char_keys_audit() {
+    let entry = LibraryDirectoryEntry {
+        community_id: SpaceId([0; 16]),
+        community_admin_identity_pub: [0; 64],
+        name: String::new(),
+        description: String::new(),
+        topics: vec![],
+        invite_url: String::new(),
+        listed_by: OwnerAddr([0; 16]),
+        listed_at: Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: String::new(),
+        },
+        community_signature: [0; 64],
+        library_identity_pub: Some([0; 64]),
+        library_signature: Some([0; 64]),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+
+    let mut keys = std::collections::BTreeSet::new();
+    for (k, _) in map {
+        match k {
+            ciborium::value::Value::Text(s) => {
+                assert_eq!(s.len(), 2, "field key must be 2 chars: {s:?}");
+                keys.insert(s);
+            }
+            other => panic!("non-text map key in LibraryDirectoryEntry encoding: {other:?}"),
+        }
+    }
+
+    let expected: std::collections::BTreeSet<String> = [
+        "cd", "ai", "nm", "ds", "tp", "iu", "lb", "la", "cs", "li", "ls",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        keys, expected,
+        "Phase 3 wrapped entry must have exactly these 11 keys"
+    );
+}
