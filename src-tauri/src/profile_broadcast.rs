@@ -110,10 +110,6 @@ pub enum BroadcastVerifyError {
 /// `signer.verifying_key().as_bytes()` MUST be the Ed25519 half (bytes
 /// 32-63) of `owner_identity_pub`, otherwise the caller has a key/identity
 /// mismatch (sig will verify but identity parse may not).
-// Called from `ProfileBroadcastPublisher::maybe_publish` in Task 2; until
-// then only `#[cfg(test)]` callers exist, so the non-test build sees this
-// as unused.
-#[allow(dead_code)]
 pub(crate) fn sign_broadcast(
     signer: &ed25519_dalek::SigningKey,
     owner_identity_pub: [u8; 64],
@@ -159,6 +155,295 @@ pub fn verify_broadcast(
         .verify_strict(&signed_bytes, &sig)
         .map_err(|_| BroadcastVerifyError::SignatureInvalid)?;
     Ok(OwnerAddr(identity.address_hash))
+}
+
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
+
+/// Async sink for outbound broadcasts. Production wraps the event-loop
+/// `publish_tx`; tests can use `MockSink` to assert the published payload
+/// without spinning up Zenoh.
+#[async_trait::async_trait]
+pub trait ProfileBroadcastPublishSink: Send + Sync + 'static {
+    async fn publish(&self, topic: String, payload: Vec<u8>) -> Result<(), String>;
+}
+
+/// Read-side handle to the owner-state opted-in set + HLC source.
+/// Production wraps `Arc<Mutex<OwnerState>>` + the existing HLC tracker;
+/// tests can use `MockSource` to inject fixed sets.
+#[async_trait::async_trait]
+pub trait ProfileBroadcastSource: Send + Sync + 'static {
+    /// Return the SORTED, deduped current opted-in community SpaceIds.
+    /// (Walks `OwnerState.spaces` for `kind == Community &&
+    /// shared_in_profile == true`.)
+    async fn current_shared_set(&self) -> Vec<SpaceId>;
+    /// Return the next HLC to stamp on the next publish.
+    async fn next_hlc(&self) -> Hlc;
+}
+
+/// Publisher debounce window. Spec §5.
+pub const PUBLISHER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Publisher periodic refresh interval. Spec §5.
+pub const PUBLISHER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Tracks publish state across debounce/refresh ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedSnapshot {
+    set: Vec<SpaceId>, // sorted, deduped
+    hlc: Hlc,
+}
+
+/// Sub-D Phase 4 publisher. Spec §5.
+pub struct ProfileBroadcastPublisher {
+    notify: Arc<Notify>,
+    /// Most recent published snapshot. `None` until first publish.
+    last_published: Arc<Mutex<Option<PublishedSnapshot>>>,
+    /// Background task driving debounce + refresh. Aborted on `shutdown()`.
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ProfileBroadcastPublisher {
+    /// Spawn the publisher background task. `signer` Ed25519-signs each
+    /// outbound payload; `identity_pub` is the 64-byte bundle stamped on
+    /// every broadcast (and from which subscribers derive the broadcaster
+    /// OwnerAddr for the attribution check). `source` reads the current
+    /// opted-in set + HLC; `sink` publishes the bytes.
+    pub fn spawn(
+        signer: ed25519_dalek::SigningKey,
+        identity_pub: [u8; 64],
+        source: Arc<dyn ProfileBroadcastSource>,
+        sink: Arc<dyn ProfileBroadcastPublishSink>,
+        // Test seam: lets unit tests provide a faster debounce/refresh.
+        // Production always uses the constants above.
+        debounce: std::time::Duration,
+        refresh: std::time::Duration,
+    ) -> Arc<Self> {
+        let notify = Arc::new(Notify::new());
+        let last_published: Arc<Mutex<Option<PublishedSnapshot>>> = Arc::new(Mutex::new(None));
+
+        let task = {
+            let notify_for_task = Arc::clone(&notify);
+            let last_published_for_task = Arc::clone(&last_published);
+            let identity_pub_for_task = identity_pub;
+            tokio::spawn(async move {
+                let mut refresh_interval = tokio::time::interval(refresh);
+                refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // First tick fires immediately; consume it.
+                refresh_interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = notify_for_task.notified() => {
+                            // Debounce — drain further notifies that
+                            // arrive within `debounce`.
+                            let deadline = tokio::time::Instant::now() + debounce;
+                            loop {
+                                tokio::select! {
+                                    _ = notify_for_task.notified() => continue,
+                                    _ = tokio::time::sleep_until(deadline) => break,
+                                }
+                            }
+                            Self::maybe_publish(
+                                &signer,
+                                identity_pub_for_task,
+                                source.as_ref(),
+                                sink.as_ref(),
+                                last_published_for_task.as_ref(),
+                                false, // is_refresh
+                            ).await;
+                        }
+                        _ = refresh_interval.tick() => {
+                            Self::maybe_publish(
+                                &signer,
+                                identity_pub_for_task,
+                                source.as_ref(),
+                                sink.as_ref(),
+                                last_published_for_task.as_ref(),
+                                true, // is_refresh
+                            ).await;
+                        }
+                    }
+                }
+            })
+        };
+
+        Arc::new(Self {
+            notify,
+            last_published,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    /// IPC handler calls this after mutating `Space.shared_in_profile`.
+    pub fn notify_dirty(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Abort the background task. Idempotent.
+    pub async fn shutdown(&self) {
+        if let Some(h) = self.task.lock().await.take() {
+            h.abort();
+        }
+    }
+
+    /// Test seam: read the most recently published snapshot.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn last_published_for_test(&self) -> Option<(Vec<SpaceId>, Hlc)> {
+        self.last_published
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| (s.set.clone(), s.hlc.clone()))
+    }
+
+    async fn maybe_publish(
+        signer: &ed25519_dalek::SigningKey,
+        identity_pub: [u8; 64],
+        source: &dyn ProfileBroadcastSource,
+        sink: &dyn ProfileBroadcastPublishSink,
+        last_published: &Mutex<Option<PublishedSnapshot>>,
+        is_refresh: bool,
+    ) {
+        let current = source.current_shared_set().await;
+        let mut guard = last_published.lock().await;
+        let last_snapshot = guard.as_ref().cloned();
+
+        // Privacy invariant: NO broadcast before first opt-in.
+        let has_ever_published = last_snapshot.is_some();
+        if !has_ever_published && current.is_empty() {
+            return;
+        }
+
+        // Skip-when-unchanged for debounce path; refresh always re-publishes
+        // the current set as long as we've ever published before.
+        if !is_refresh {
+            if let Some(snap) = &last_snapshot {
+                if snap.set == current {
+                    return;
+                }
+            }
+        } else if !has_ever_published {
+            // Refresh tick fires before any opt-in: still must respect
+            // the privacy invariant.
+            return;
+        }
+
+        // Rotation: when refresh tick fires AFTER N→0, the prior snapshot
+        // is empty. Don't republish empty over empty.
+        if is_refresh {
+            if let Some(snap) = &last_snapshot {
+                if snap.set.is_empty() && current.is_empty() {
+                    return;
+                }
+            }
+        }
+
+        let hlc = source.next_hlc().await;
+        let broadcast = match sign_broadcast(signer, identity_pub, current.clone(), hlc.clone()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = ?e, "profile broadcast sign failed");
+                return;
+            }
+        };
+        let bytes = match canonical_cbor_encode(&broadcast) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = ?e, "profile broadcast encode failed");
+                return;
+            }
+        };
+        let addr = match harmony_identity::Identity::from_public_bytes(&identity_pub) {
+            Ok(id) => OwnerAddr(id.address_hash),
+            Err(e) => {
+                tracing::warn!(error = ?e, "profile broadcast identity derive failed");
+                return;
+            }
+        };
+        let topic = broadcast_topic_for(&addr);
+        if let Err(e) = sink.publish(topic, bytes).await {
+            tracing::warn!(error = %e, "profile broadcast publish failed");
+            return;
+        }
+        *guard = Some(PublishedSnapshot { set: current, hlc });
+    }
+}
+
+/// Production-side `ProfileBroadcastSource` that reads the owner-state
+/// CRDT + uses the existing HLC tracker. Wired in start_node (Task 5).
+pub struct OwnerStateBroadcastSource {
+    pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    pub hlc_tracker: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    pub device_id: String,
+}
+
+#[async_trait::async_trait]
+impl ProfileBroadcastSource for OwnerStateBroadcastSource {
+    async fn current_shared_set(&self) -> Vec<SpaceId> {
+        let g = self.crdt_state.lock().await;
+        let mut ids: Vec<SpaceId> = g
+            .spaces
+            .values()
+            .filter(|s| {
+                matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
+                    && s.shared_in_profile
+            })
+            .filter_map(|s| s.community_id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    async fn next_hlc(&self) -> Hlc {
+        // Mirror the bump-pattern used by `owner_state_sync::next_hlc`
+        // and other community-related publishes (SystemTime-based wall
+        // clock + saturating logical counter).
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut tracker = self.hlc_tracker.lock().await;
+        let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: self.device_id.clone(),
+        });
+        if now_ms > entry.wall_ms {
+            entry.wall_ms = now_ms;
+            entry.logical = 0;
+        } else {
+            entry.logical = entry.logical.saturating_add(1);
+        }
+        entry.clone()
+    }
+}
+
+/// Production-side `ProfileBroadcastPublishSink` that forwards to the
+/// event-loop's `publish_tx` channel.
+pub struct EventLoopPublishSink {
+    pub publish_tx: tokio::sync::mpsc::Sender<crate::event_loop::PublishRequest>,
+}
+
+#[async_trait::async_trait]
+impl ProfileBroadcastPublishSink for EventLoopPublishSink {
+    async fn publish(&self, topic: String, payload: Vec<u8>) -> Result<(), String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.publish_tx
+            .send(crate::event_loop::PublishRequest {
+                key_expr: topic,
+                payload,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|e| format!("publish_tx send: {e}"))?;
+        reply_rx
+            .await
+            .map_err(|e| format!("publish_tx reply dropped: {e}"))?
+    }
 }
 
 #[cfg(test)]
@@ -315,5 +600,161 @@ mod tests {
             .unwrap()
             .address_hash;
         assert_eq!(addr.0, expected);
+    }
+
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    // Type aliases keep clippy::type_complexity happy and make the
+    // MockSink / mock_publisher_setup signatures readable.
+    type SharedPublished = StdArc<TokioMutex<Vec<(String, Vec<u8>)>>>;
+    type SharedSpaceIds = StdArc<TokioMutex<Vec<SpaceId>>>;
+
+    struct MockSink {
+        published: SharedPublished,
+    }
+
+    #[async_trait::async_trait]
+    impl ProfileBroadcastPublishSink for MockSink {
+        async fn publish(&self, topic: String, payload: Vec<u8>) -> Result<(), String> {
+            self.published.lock().await.push((topic, payload));
+            Ok(())
+        }
+    }
+
+    struct MockSource {
+        set: StdArc<TokioMutex<Vec<SpaceId>>>,
+        hlc: StdArc<TokioMutex<Hlc>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProfileBroadcastSource for MockSource {
+        async fn current_shared_set(&self) -> Vec<SpaceId> {
+            self.set.lock().await.clone()
+        }
+        async fn next_hlc(&self) -> Hlc {
+            let mut g = self.hlc.lock().await;
+            g.logical = g.logical.saturating_add(1);
+            g.clone()
+        }
+    }
+
+    fn mock_publisher_setup() -> (
+        SharedSpaceIds,
+        SharedPublished,
+        Arc<ProfileBroadcastPublisher>,
+    ) {
+        let (signer, identity_pub) = build_identity([42u8; 32]);
+        let set = StdArc::new(TokioMutex::new(Vec::new()));
+        let hlc = StdArc::new(TokioMutex::new(Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "test".into(),
+        }));
+        let published = StdArc::new(TokioMutex::new(Vec::new()));
+        let source = Arc::new(MockSource {
+            set: StdArc::clone(&set),
+            hlc: StdArc::clone(&hlc),
+        });
+        let sink = Arc::new(MockSink {
+            published: StdArc::clone(&published),
+        });
+        let publisher = ProfileBroadcastPublisher::spawn(
+            signer,
+            identity_pub,
+            source,
+            sink,
+            // Fast debounce + fast refresh for tests.
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(100),
+        );
+        (set, published, publisher)
+    }
+
+    #[tokio::test]
+    async fn publisher_no_broadcast_before_first_optin() {
+        let (_set, published, publisher) = mock_publisher_setup();
+        // Empty set — notify the publisher anyway.
+        publisher.notify_dirty();
+        // Wait past the debounce + a refresh tick.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pubs = published.lock().await;
+        assert!(
+            pubs.is_empty(),
+            "publisher must NOT publish before first opt-in (privacy invariant); \
+             published: {pubs:?}"
+        );
+        drop(pubs);
+        publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publisher_debounce_coalesces_rapid_toggles() {
+        let (set, published, publisher) = mock_publisher_setup();
+        // Seed an opted-in set so privacy gate is open.
+        *set.lock().await = vec![fixture_space_id(1)];
+        publisher.notify_dirty();
+        // Rapid-fire 5 toggles within the 20ms debounce.
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            publisher.notify_dirty();
+        }
+        // Wait past debounce.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pubs = published.lock().await;
+        assert_eq!(
+            pubs.len(),
+            1,
+            "5 rapid toggles must coalesce to 1 broadcast; got {}",
+            pubs.len()
+        );
+        drop(pubs);
+        publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn publisher_rotation_publishes_empty_then_stops_refresh() {
+        let (set, published, publisher) = mock_publisher_setup();
+        // First opt-in → publish.
+        *set.lock().await = vec![fixture_space_id(1)];
+        publisher.notify_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // N→0 rotation → publish empty.
+        *set.lock().await = vec![];
+        publisher.notify_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait several refresh intervals — should NOT republish empty.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let pubs = published.lock().await;
+        assert_eq!(
+            pubs.len(),
+            2,
+            "expected 2 publishes (first opt-in + N→0 rotation); got {} entries: {pubs:?}",
+            pubs.len()
+        );
+        // Decode the second payload and assert community_ids == [].
+        let second_payload = &pubs[1].1;
+        let decoded: ProfileMembershipBroadcast =
+            ciborium::from_reader(&second_payload[..]).expect("decode rotation payload");
+        assert!(
+            decoded.community_ids.is_empty(),
+            "rotation publish must carry empty community_ids; got {:?}",
+            decoded.community_ids
+        );
+        // And its HLC must be strictly newer than the first.
+        let first_payload = &pubs[0].1;
+        let first_decoded: ProfileMembershipBroadcast =
+            ciborium::from_reader(&first_payload[..]).expect("decode first payload");
+        assert!(
+            decoded.shared_at.wall_ms > first_decoded.shared_at.wall_ms
+                || (decoded.shared_at.wall_ms == first_decoded.shared_at.wall_ms
+                    && decoded.shared_at.logical > first_decoded.shared_at.logical),
+            "rotation HLC must be strictly newer; first={:?} second={:?}",
+            first_decoded.shared_at,
+            decoded.shared_at
+        );
+        drop(pubs);
+        publisher.shutdown().await;
     }
 }
