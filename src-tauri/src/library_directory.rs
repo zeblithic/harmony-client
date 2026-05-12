@@ -1273,11 +1273,28 @@ pub fn find_open_community_invite_url_in_snapshot(
         .find(|a| a.entry.community_id == want)
         .ok_or_else(|| "This community is no longer listed by any of your libraries".to_string())?;
 
-    // 3. Defensive `is_invite_only` re-check (spec §4.4).
+    // 3. Defensive re-checks (spec §4.4 + CodeRabbit PR #113):
+    //    decode the invite URL and verify both
+    //    (a) `is_invite_only == false` and
+    //    (b) the payload's `community_id` matches the entry's `community_id`.
+    //    Phase 1's `verify_entry` (lines 359-395) already enforces BOTH
+    //    bindings at receive time, so a malformed entry should be unreachable
+    //    here — but the re-checks defend against future regressions in
+    //    `verify_entry`. The community_id bind is the load-bearing
+    //    anti-phishing check: without it, a malicious entry advertising
+    //    community A's metadata but carrying community B's invite_url could
+    //    silently redirect the join (the UI shows A, the user clicks Join,
+    //    we'd redeem into B).
     let payload = crate::community_invite::decode_invite_url(&agg.entry.invite_url)
         .map_err(|e| format!("directory entry's invite URL failed to decode: {e:?}"))?;
     if payload.is_invite_only {
         return Err("Invite-only community cannot be joined directly from the directory".into());
+    }
+    if payload.community_id != agg.entry.community_id {
+        return Err(
+            "Directory entry is malformed: invite URL's community_id does not match the entry's"
+                .into(),
+        );
     }
 
     Ok(agg.entry.invite_url.clone())
@@ -2744,6 +2761,79 @@ mod tests {
         assert_eq!(
             returned, invite_url,
             "helper must return the entry's invite_url verbatim"
+        );
+    }
+
+    /// Anti-phishing defense: an entry that advertises community A's id
+    /// but whose `invite_url` decodes to community B's payload must be
+    /// rejected. Phase 1's `verify_entry` (lines 376-381) already enforces
+    /// this binding at receive time; the helper re-checks defensively so
+    /// a future regression in `verify_entry` cannot silently redirect the
+    /// join intent through this code path.
+    #[test]
+    fn find_open_community_invite_url_returns_err_when_community_id_mismatch() {
+        use crate::library_directory::find_open_community_invite_url_in_snapshot;
+        use harmony_identity::PrivateIdentity;
+        use std::collections::BTreeSet;
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let entry_community_id = SpaceId([0xf1; 16]);
+        let payload_community_id = SpaceId([0xf2; 16]);
+
+        // Build the invite URL pointing at community B (0xf2).
+        let payload = CommunityInvitePayload {
+            community_id: payload_community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0x42u8; 32],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "MaliciousB".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+        };
+        let invite_url = encode_invite_url(&payload).expect("encode mismatched url");
+
+        // But the entry claims community A (0xf1) — phishing-class entry.
+        let entry = LibraryDirectoryEntry {
+            community_id: entry_community_id,
+            community_admin_identity_pub: admin_identity.identity.to_public_bytes(),
+            name: "DisplayedAsA".into(),
+            description: String::new(),
+            topics: Vec::new(),
+            invite_url,
+            listed_by: OwnerAddr([0xcc; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-dev".into(),
+            },
+            library_identity_pub: None,
+            library_signature: None,
+            community_signature: [0u8; 64],
+        };
+        let agg = AggregatedEntry {
+            entry,
+            attested_by: BTreeSet::new(),
+            unattested_by: BTreeSet::new(),
+        };
+        let snapshot = vec![agg];
+
+        // Caller asks to join community A; helper must reject because the
+        // entry's URL would actually redeem into community B.
+        let result = find_open_community_invite_url_in_snapshot(
+            &snapshot,
+            &hex::encode(entry_community_id.0),
+        );
+        let err = result.expect_err("mismatched community_id must be rejected");
+        assert!(
+            err.to_lowercase().contains("community_id") || err.to_lowercase().contains("malformed"),
+            "expected community_id mismatch / malformed message, got: {err}"
         );
     }
 }

@@ -31,7 +31,7 @@
 
 1. The IPC parameter name on the Rust side is `community_id: String` (snake_case); on the JS side it's `communityId: string` (camelCase). Tauri's IPC layer auto-converts.
 2. Error extraction in any frontend `catch` block uses `e instanceof Error ? e.message : String(e)`.
-3. All 5 CI gates must remain green between tasks: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`, `cargo check --locked --all-targets --features test-fixtures` (msrv), `npx tsc --noEmit`, `npx vitest run`. The first four run from `src-tauri/`; the last two run from the repo root.
+3. All 6 CI gates must remain green between tasks: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`, `cargo check --locked --all-targets --features test-fixtures` (msrv), `npx tsc --noEmit`, `npx vitest run`. The first four run from `src-tauri/`; the last two run from the repo root.
 
 ---
 

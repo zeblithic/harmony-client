@@ -165,7 +165,7 @@ In `src-tauri/tests/community_join_integration.rs` (or wherever Phase 1's `redee
 3. Directory Browser Join button calls `join_open_community(community_id)`, not `redeem_invite(invite_url)`.
 4. `redeem_invite(url)` remains callable and behaves unchanged (verified by existing tests).
 5. Calling `join_open_community(unknown_community_id)` returns the §4.3 error.
-6. All 5 CI gates green: `cargo fmt --all -- --check`, `cargo clippy --features test-fixtures -- -D warnings`, `cargo nextest run --features test-fixtures`, `cargo check (msrv) --features test-fixtures`, `npx tsc --noEmit`, `npx vitest run`.
+6. All 6 CI gates green: `cargo fmt --all -- --check`, `cargo clippy --features test-fixtures -- -D warnings`, `cargo nextest run --features test-fixtures`, `cargo check (msrv) --features test-fixtures`, `npx tsc --noEmit`, `npx vitest run`.
 
 ## 8. Out of scope (explicit non-goals)
 

@@ -1681,10 +1681,16 @@
           // ZEB-252 Sub-D Phase 6: typed direct-join. Backend re-resolves
           // the matching directory entry server-side and delegates to
           // the same redeem_invite_inner codepath RedeemInviteDialog uses.
-          // Side-effects (nav-updated synthesis, kind tracking, selected-
-          // community switch, member refresh) mirror the dialog handler
-          // at line ~1620+ so the directory click path produces the same
-          // post-join UX.
+          // Side-effects (nav-updated synthesis, selected-community switch,
+          // member refresh) mirror the dialog handler at line ~1620+.
+          //
+          // Error handling is delegated to the browser component's
+          // handleJoin (LibraryDirectoryBrowser.svelte:175-180), which
+          // catches with `e instanceof Error ? e.message : String(e)`
+          // and surfaces via its own `joinError` state. The dialog has
+          // its own redeemPending/redeemError accumulators; the browser
+          // owns the equivalent state itself — that's why this handler
+          // has no try/catch/finally of its own.
           const dto = await communityService.joinOpenCommunity(communityId);
           navService.addOrUpdateNavSpace({
             action: 'added',
