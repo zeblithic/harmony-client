@@ -329,6 +329,75 @@ impl Aggregation {
     }
 }
 
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+
+/// Request from IPC handlers (or startup walk) to the event loop:
+/// declare or drop a Zenoh subscriber for one library's directory topic.
+#[derive(Debug, Clone)]
+pub enum LibraryDirectoryRequest {
+    Subscribe(OwnerAddr),
+    Unsubscribe(OwnerAddr),
+}
+
+/// Shared state: aggregation map + the request sender. Held inside
+/// `NodeState` (Arc<Mutex<...>>).
+pub struct LibraryDirectory {
+    pub aggregation: Mutex<Aggregation>,
+    pub request_tx: mpsc::Sender<LibraryDirectoryRequest>,
+}
+
+impl LibraryDirectory {
+    /// Construct alongside the matching `request_rx` consumed by the
+    /// event loop.
+    pub fn new() -> (Arc<Self>, mpsc::Receiver<LibraryDirectoryRequest>) {
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let dir = Arc::new(Self {
+            aggregation: Mutex::new(Aggregation::new()),
+            request_tx,
+        });
+        (dir, request_rx)
+    }
+
+    /// Decode + verify + aggregate one received sample. Returns the
+    /// outcome for the caller (event-loop task) to emit
+    /// `library-directory-updated` from.
+    pub async fn process_sample(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<OnEntryOutcome, ProcessSampleError> {
+        let entry: LibraryDirectoryEntry =
+            ciborium::de::from_reader(&bytes[..]).map_err(ProcessSampleError::Decode)?;
+        verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
+        let mut agg = self.aggregation.lock().await;
+        Ok(agg.on_entry(entry))
+    }
+
+    pub async fn drop_library(&self, library: &OwnerAddr) -> Vec<SpaceId> {
+        let mut agg = self.aggregation.lock().await;
+        agg.drop_library(library)
+    }
+
+    pub async fn snapshot_all(&self) -> Vec<AggregatedEntry> {
+        self.aggregation.lock().await.snapshot_all()
+    }
+
+    pub async fn snapshot_filtered_by_library(&self, library: &OwnerAddr) -> Vec<AggregatedEntry> {
+        self.aggregation
+            .lock()
+            .await
+            .snapshot_filtered_by_library(library)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessSampleError {
+    #[error("CBOR decode failed: {0}")]
+    Decode(ciborium::de::Error<std::io::Error>),
+    #[error("verify failed: {0}")]
+    Verify(#[from] EntryVerifyError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

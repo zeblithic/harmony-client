@@ -307,6 +307,12 @@ pub struct NodeState {
     /// — a larger refactor).
     channel_log_registry:
         Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
+    /// ZEB-218 Sub-D Phase 1: aggregated library-directory state. `Some`
+    /// while the node is running; the matching `request_rx` is consumed
+    /// by an event-loop task that declares per-library Zenoh
+    /// subscribers on demand. Cleared in `stop_inner` so the channel
+    /// closes and the consumer task winds down on next recv.
+    pub library_directory: Option<std::sync::Arc<crate::library_directory::LibraryDirectory>>,
 }
 
 impl NodeState {
@@ -357,6 +363,9 @@ impl Default for NodeState {
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
+            // ZEB-218 Sub-D Phase 1: directory stays None until
+            // start_node wires it.
+            library_directory: None,
         }
     }
 }
@@ -595,6 +604,10 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // scope via a separate binding rather than trying to thread
         // it through the already-saturated `tup`.
         channel_log_registry_for_shutdown = guard.channel_log_registry.take();
+        // ZEB-218 Sub-D Phase 1: drop the library_directory Arc. The
+        // event-loop's consumer task observes the matching request_tx
+        // close on next recv and exits cleanly.
+        let _ = guard.library_directory.take();
         tup
     };
 
@@ -948,6 +961,10 @@ async fn start_node(
         // community engine pool shuts down (verify-chain dependency,
         // same ordering as stop_inner).
         old_channel_log_registry = guard.channel_log_registry.take();
+        // ZEB-218 Sub-D Phase 1: drop the previous identity's library
+        // directory handle. The matching event_loop consumer task
+        // observes the request_tx close on next recv and exits.
+        let _ = guard.library_directory.take();
         tup
     };
 
@@ -1993,6 +2010,40 @@ async fn start_node(
             s3_enabled: false,
         };
 
+        // ZEB-218 Sub-D Phase 1: construct the `LibraryDirectory` (Arc<…>)
+        // and split off the matching `request_rx` for the event-loop
+        // consumer task. The Arc is stashed onto NodeState below so
+        // future IPC handlers (Task 4) can reach `request_tx` to add /
+        // remove libraries; the rx is moved into `event_loop::run`.
+        // Built BEFORE the std MutexGuard lock acquisition since the
+        // startup walk awaits on the tokio Mutex `crdt_state` lock and
+        // would otherwise hold the !Send std guard across an await.
+        let (library_directory_arc, library_request_rx) =
+            crate::library_directory::LibraryDirectory::new();
+        // ZEB-218 Sub-D Phase 1: walk owner-state at startup and send a
+        // Subscribe request for each effective (non-tombstoned) library.
+        // Done BEFORE the event_loop spawn — the channel has capacity
+        // 64 so this never blocks unless the user has >64 libraries
+        // (in which case we'd want a different strategy anyway).
+        if let Some(ref crdt_arc) = crdt_state_for_state {
+            let crdt_g = crdt_arc.lock().await;
+            for (addr, lib_entry) in &crdt_g.libraries {
+                if lib_entry.is_effective() {
+                    if let Err(e) = library_directory_arc
+                        .request_tx
+                        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(*addr))
+                        .await
+                    {
+                        tracing::warn!(
+                            ?addr,
+                            error = %e,
+                            "failed to enqueue library Subscribe at startup"
+                        );
+                    }
+                }
+            }
+        }
+
         // Re-acquire lock and atomically register the new node.
         // Handles are stored BEFORE awaiting ready_rx so stop_node can
         // cancel an in-flight startup via shutdown_tx.
@@ -2065,6 +2116,11 @@ async fn start_node(
         // `community_registry_arc` (the post-spawn `guard.community_registry`
         // assignment still needs the original handle).
         let community_registry_for_loop = community_registry_arc.clone();
+        // ZEB-218 Sub-D Phase 1: thread the pre-built `LibraryDirectory`
+        // handle + request rx (constructed + populated above the
+        // std::sync::MutexGuard scope) into event_loop::run.
+        let library_directory_for_loop = Some(std::sync::Arc::clone(&library_directory_arc));
+        let library_request_rx_for_loop = Some(library_request_rx);
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -2161,6 +2217,8 @@ async fn start_node(
                         community_adapter_request_rx,
                         community_registry_for_loop,
                         channel_log_adapter_request_rx_for_loop,
+                        library_directory_for_loop,
+                        library_request_rx_for_loop,
                     )
                     .await;
                 });
@@ -2237,6 +2295,11 @@ async fn start_node(
                 // no owner identity is loaded — the registry is gated
                 // on owner-load above.
                 guard.channel_log_registry = channel_log_registry_arc.clone();
+                // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
+                // so future IPC handlers (Task 4) can reach `request_tx`
+                // to add / remove libraries. The matching rx was moved
+                // into event_loop above.
+                guard.library_directory = Some(library_directory_arc.clone());
                 thread_install_failure = None;
             }
             Err(e) => {

@@ -337,6 +337,16 @@ pub async fn run<R: Runtime>(
     // sensible bound — see `adapter_request_tx` doc on
     // `ChannelLogRegistryConfig` for the full rationale.
     mut channel_log_adapter_request_rx: mpsc::UnboundedReceiver<ChannelLogAdapterRequest>,
+    // ZEB-218 Sub-D Phase 1: shared `LibraryDirectory` (aggregation + request
+    // channel). `None` is allowed but currently always `Some` when the
+    // event loop is started by production `start_node`. The consumer
+    // task spawned below pulls `LibraryDirectoryRequest`s and declares
+    // per-library subscribers.
+    library_directory: Option<Arc<crate::library_directory::LibraryDirectory>>,
+    // ZEB-218 Sub-D Phase 1: receiver paired with `LibraryDirectory.request_tx`.
+    // Moved into the long-lived consumer task below. `None` when
+    // `library_directory` is `None`.
+    library_request_rx: Option<mpsc::Receiver<crate::library_directory::LibraryDirectoryRequest>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -573,6 +583,114 @@ pub async fn run<R: Runtime>(
             req.subscriber_tx,
             Arc::clone(&closing),
         );
+    }
+
+    // ── ZEB-218 Sub-D Phase 1: library-directory subscription consumer ──
+    // Mirrors the state-root subscriber pattern above — declare on
+    // `LibraryDirectoryRequest::Subscribe`, drop the handle on
+    // `Unsubscribe`. Each declared subscriber feeds samples into
+    // `library_directory::process_sample` which decodes + verifies +
+    // aggregates, then emits `library-directory-updated` on
+    // non-Idempotent outcomes.
+    if let (Some(library_directory), Some(library_request_rx)) =
+        (library_directory, library_request_rx)
+    {
+        let library_directory_handle = library_directory.clone();
+        let mut request_rx = library_request_rx;
+        let session_for_libdir = Arc::clone(&session_arc);
+        let app_for_libdir = app.clone();
+        let closing_libdir = Arc::clone(&closing);
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            let mut handles: HashMap<
+                crate::owner_state_types::OwnerAddr,
+                tokio::task::JoinHandle<()>,
+            > = HashMap::new();
+            while let Some(req) = request_rx.recv().await {
+                match req {
+                    crate::library_directory::LibraryDirectoryRequest::Subscribe(addr) => {
+                        if handles.contains_key(&addr) {
+                            continue; // idempotent
+                        }
+                        let key_expr = format!(
+                            "harmony/discovery/library/{}/communities",
+                            hex::encode(addr.0)
+                        );
+                        let sub = match session_for_libdir.declare_subscriber(&key_expr).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?addr,
+                                    error = %e,
+                                    "declare_subscriber failed for library"
+                                );
+                                continue;
+                            }
+                        };
+                        let dir = Arc::clone(&library_directory_handle);
+                        let app_for_task = app_for_libdir.clone();
+                        let closing_task = Arc::clone(&closing_libdir);
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                match sub.recv_async().await {
+                                    Ok(sample) => {
+                                        let bytes = sample.payload().to_bytes().to_vec();
+                                        match dir.process_sample(bytes).await {
+                                            Ok(outcome) => match outcome {
+                                                crate::library_directory::OnEntryOutcome::Idempotent => {}
+                                                _ => {
+                                                    let community_id = match &outcome {
+                                                        crate::library_directory::OnEntryOutcome::Inserted(c)
+                                                        | crate::library_directory::OnEntryOutcome::Replaced(c)
+                                                        | crate::library_directory::OnEntryOutcome::AccretedListedBy(c) => Some(c),
+                                                        crate::library_directory::OnEntryOutcome::EvictedThenInserted { inserted, .. } => Some(inserted),
+                                                        _ => None,
+                                                    };
+                                                    let _ = app_for_task.emit(
+                                                        "library-directory-updated",
+                                                        serde_json::json!({
+                                                            "communityId": community_id.map(|c| hex::encode(c.0)),
+                                                        }),
+                                                    );
+                                                }
+                                            },
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = ?e,
+                                                    "library-directory entry rejected"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if !closing_task.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                ?addr,
+                                                "library subscriber closed unexpectedly"
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        handles.insert(addr, handle);
+                    }
+                    crate::library_directory::LibraryDirectoryRequest::Unsubscribe(addr) => {
+                        if let Some(h) = handles.remove(&addr) {
+                            h.abort();
+                        }
+                        let evicted = library_directory_handle.drop_library(&addr).await;
+                        if !evicted.is_empty() {
+                            let _ = app_for_libdir.emit(
+                                "library-directory-updated",
+                                serde_json::json!({ "communityId": null }),
+                            );
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────
