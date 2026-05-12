@@ -25,6 +25,7 @@
   import CommunityView from './lib/components/CommunityView.svelte';
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
   import { LibraryDirectoryService } from './lib/library-directory-service';
+  import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService } from './lib/community-service';
   import { ChannelMessageService } from './lib/channel-message-service';
@@ -178,6 +179,18 @@
   let tauriAdapter = $state<TauriAdapter | null>(null);
   let libraryDirectoryService = $state<LibraryDirectoryService | null>(null);
   let libraryDirectoryOpen = $state(false);
+  // ── ZEB-281 Sub-D Phase 4: profile-membership broadcast service ────
+  // Shared singleton wrapping the four set/subscribe/unsubscribe/cached
+  // IPCs. Lazy-created alongside libraryDirectoryService once the Tauri
+  // adapter wires up. The CommunitySettingsPanel toggle and the
+  // ProfilePopover memberships section both route through this instance.
+  let profileBroadcastService = $state<ProfileBroadcastService | null>(null);
+  // Local optimistic mirror of per-community shared_in_profile state.
+  // The backend is the source of truth (no read IPC yet — see Sub-D
+  // Phase 4 follow-up); we default to `false` on first toggle render and
+  // flip the cell on successful toggle. The settings panel rolls back
+  // on failure.
+  let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   let myAddress = $state('');
@@ -525,6 +538,7 @@
       // can mount the browser modal once Tauri-init has wired up.
       tauriAdapter = adapter;
       libraryDirectoryService = new LibraryDirectoryService(adapter);
+      profileBroadcastService = new ProfileBroadcastService(adapter);
 
       // Per-service connect wrapper: logs failures with the adapter name but
       // doesn't cascade — a broken MessageService shouldn't kill VineService.
@@ -1176,6 +1190,7 @@
         ownAddress={myAddress}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
+        sharedInProfile={sharedInProfileByCommunity.get(selectedCommunityNode.id) ?? false}
         {communityService}
         {channelMessageService}
         {trustService}
@@ -1222,6 +1237,22 @@
         onGenerateInvite={async () => {
           if (!selectedCommunityId) throw new Error('no community selected');
           return communityService.generateInvite(selectedCommunityId);
+        }}
+        onToggleSharedInProfile={async (shared) => {
+          if (!selectedCommunityId) return;
+          const cid = selectedCommunityId;
+          if (!profileBroadcastService) {
+            // Tauri adapter not wired yet — surface failure so the
+            // settings panel rolls back the checkbox UI.
+            throw new Error('profile broadcast service not connected');
+          }
+          await profileBroadcastService.setShared(cid, shared);
+          // Optimistic local mirror (no read IPC yet — see ZEB-281
+          // Sub-D Phase 4 follow-up). Reassign the map so the
+          // reactive read in the parent picks up the change.
+          const next = new Map(sharedInProfileByCommunity);
+          next.set(cid, shared);
+          sharedInProfileByCommunity = next;
         }}
       />
     {:else}
@@ -1439,12 +1470,23 @@
   {/snippet}
 </Layout>
 
-{#if popoverProfile}
+{#if popoverProfile && profileBroadcastService}
   <ProfilePopover
     profile={popoverProfile}
     x={popoverX}
     y={popoverY}
     onClose={closePopover}
+    ownAddress={myAddress}
+    profileBroadcastService={profileBroadcastService}
+    resolveCommunityName={(communityIdHex) => {
+      // Look up the viewer's own NavNodes (subset of OwnerState.spaces);
+      // returns null for communities the viewer isn't a member of, so
+      // the popover falls back to the truncated hex id.
+      const node = navNodes.find(
+        (n) => n.type === 'community' && n.id === communityIdHex,
+      );
+      return node?.name ?? null;
+    }}
   />
 {/if}
 

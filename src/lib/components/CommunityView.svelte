@@ -20,6 +20,7 @@
     ownAddress,
     members,
     isDegraded,
+    sharedInProfile,
     communityService,
     channelMessageService,
     trustService,
@@ -27,6 +28,7 @@
     onKickMember,
     onSetPowerLevel,
     onGenerateInvite,
+    onToggleSharedInProfile,
   }: {
     communityId: string;
     communityName: string;
@@ -35,6 +37,7 @@
     ownAddress: string;
     members: CommunityMember[];
     isDegraded: boolean;
+    sharedInProfile: boolean;
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
@@ -42,6 +45,7 @@
     onKickMember: (addr: string) => Promise<void>;
     onSetPowerLevel: (addr: string, power: number) => Promise<void>;
     onGenerateInvite: () => Promise<string>;
+    onToggleSharedInProfile: (shared: boolean) => Promise<void>;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -236,6 +240,8 @@
     myAddress={ownAddress}
     {myPower}
     {isDegraded}
+    {sharedInProfile}
+    {onToggleSharedInProfile}
     onClose={() => { settingsModalOpen = false; }}
     onKick={onKickMember}
     onSetPower={onSetPowerLevel}

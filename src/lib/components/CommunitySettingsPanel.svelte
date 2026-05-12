@@ -14,6 +14,8 @@
     myAddress,
     myPower,
     isDegraded,
+    sharedInProfile,
+    onToggleSharedInProfile,
     onClose,
     onKick,
     onSetPower,
@@ -27,6 +29,8 @@
     myAddress: string;
     myPower: number;
     isDegraded: boolean;
+    sharedInProfile: boolean;
+    onToggleSharedInProfile: (shared: boolean) => Promise<void>;
     onClose: () => void;
     onKick: (targetAddr: string) => void;
     onSetPower: (targetAddr: string, newPower: number) => void;
@@ -156,6 +160,34 @@
           {isDegraded ? '⚠ Degraded — pending events not yet visible' : '● Healthy'}
         </div>
       </div>
+    </div>
+
+    <div class="section">
+      <div class="section-label">Public profile</div>
+      <label class="toggle-row">
+        <input
+          type="checkbox"
+          checked={sharedInProfile}
+          onchange={async (e) => {
+            const checked = (e.currentTarget as HTMLInputElement).checked;
+            try {
+              await onToggleSharedInProfile(checked);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // Roll back the UI to match server state on failure.
+              (e.currentTarget as HTMLInputElement).checked = !checked;
+              console.warn('toggle shared_in_profile failed:', msg);
+            }
+          }}
+        />
+        <span class="toggle-label">
+          Share this community in my public profile
+        </span>
+      </label>
+      <p class="toggle-help">
+        When enabled, peers viewing your profile will see that you've
+        joined <strong>{communityName}</strong>. Off by default.
+      </p>
     </div>
 
     <div class="section">
@@ -413,5 +445,21 @@
   .kick:focus-visible {
     outline: 2px solid var(--accent, #5865f2);
     outline-offset: 1px;
+  }
+  .toggle-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    cursor: pointer;
+    padding: 6px 0;
+  }
+  .toggle-label {
+    font-size: 0.8rem;
+    color: var(--text-primary);
+  }
+  .toggle-help {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    margin: 4px 0 0;
   }
 </style>

@@ -15,11 +15,13 @@ const baseProps = {
   myAddress: adminMember.address,
   myPower: 100,
   isDegraded: false,
+  sharedInProfile: false,
   onClose: vi.fn(),
   onKick: vi.fn(),
   onSetPower: vi.fn(),
   onLeave: vi.fn(),
   onGenerateInvite: vi.fn().mockResolvedValue('harmony://invite/...'),
+  onToggleSharedInProfile: vi.fn().mockResolvedValue(undefined),
 };
 
 describe('CommunitySettingsPanel', () => {
@@ -234,5 +236,18 @@ describe('CommunitySettingsPanel', () => {
     const visibleNames = Array.from(container.querySelectorAll('.member-row .name')).map((el) => el.textContent);
     expect(visibleNames.some((n) => n?.includes('Charlie'))).toBe(true);
     expect(visibleNames.some((n) => n?.includes('Alice'))).toBe(false);
+  });
+
+  it('settings_panel_toggle_invokes_set_shared', async () => {
+    const onToggle = vi.fn().mockResolvedValue(undefined);
+    const { getByLabelText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onToggleSharedInProfile: onToggle },
+    });
+    // The <input type="checkbox"> sits inside a <label> wrapping the
+    // "Share this community in my public profile" text — Testing
+    // Library's getByLabelText matches via the implicit label.
+    const checkbox = getByLabelText(/share this community in my public profile/i);
+    await fireEvent.click(checkbox);
+    expect(onToggle).toHaveBeenCalledWith(true);
   });
 });
