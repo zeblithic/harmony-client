@@ -17,6 +17,25 @@ export interface LibraryInfo {
   entry_count: number;
 }
 
+/**
+ * Mirrors `library_directory::DiscoveredLibraryInfo` IPC return shape
+ * (ZEB-279 Sub-D Phase 2). Surfaces libraries the user has *discovered*
+ * via the `harmony/discovery/library/announce` topic but has NOT yet
+ * added to their trust set. The Rust DTO uses
+ * `#[serde(rename_all = "camelCase")]`, so wire keys are camelCase
+ * (unlike `LibraryInfo`, which is snake_case on the wire). `listedAt`
+ * is a base-10 string of `listed_at.wall_ms` for display only — callers
+ * MUST NOT use this for HLC ordering decisions.
+ */
+export interface DiscoveredLibraryInfo {
+  /** Hex-encoded 16-byte library OwnerAddr (32 hex chars). */
+  libraryAddr: string;
+  name: string;
+  description: string;
+  /** `listed_at.wall_ms` as base-10 string for display only. */
+  listedAt: string;
+}
+
 /** Mirrors `library_directory::DirectoryEntryDTO` IPC return shape. */
 export interface DirectoryEntry {
   /** Hex-encoded SpaceId (32 chars). */
@@ -43,6 +62,20 @@ export class LibraryDirectoryService {
   /** Snapshot of effective LibraryEntry rows (sorted by address). */
   async list(): Promise<LibraryInfo[]> {
     return (await this.adapter.invoke('list_libraries', {})) as LibraryInfo[];
+  }
+
+  /**
+   * Sub-D Phase 2 (ZEB-279): snapshot of libraries the user has
+   * discovered via the announce topic but has NOT yet added. The Rust
+   * handler filters out already-added (non-tombstoned) libraries, so
+   * a row migrates from this list to `list()` after a successful
+   * `add()` + refetch.
+   */
+  async listDiscovered(): Promise<DiscoveredLibraryInfo[]> {
+    return (await this.adapter.invoke(
+      'list_discovered_libraries',
+      {},
+    )) as DiscoveredLibraryInfo[];
   }
 
   /** LWW-add a library to owner_state.libraries + subscribe. */

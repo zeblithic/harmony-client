@@ -11,7 +11,12 @@
    * debounce so a burst of incoming entries collapses into one fetch.
    */
   import AddLibraryDialog from './AddLibraryDialog.svelte';
-  import type { LibraryDirectoryService, LibraryInfo, DirectoryEntry } from '../library-directory-service';
+  import type {
+    LibraryDirectoryService,
+    LibraryInfo,
+    DirectoryEntry,
+    DiscoveredLibraryInfo,
+  } from '../library-directory-service';
   import type { TauriAdapter } from '../zenoh-service';
 
   let {
@@ -37,6 +42,14 @@
   let joinPending = $state<string | null>(null); // community_id mid-join
   let joinError: string | null = $state(null);
 
+  // ZEB-279 Sub-D Phase 2: discovered libraries (auto-announce ingest).
+  // Filtered IPC excludes already-added libraries, so a row migrates
+  // from `discovered` to `libraries` on the next refetch after `add`.
+  let discovered: DiscoveredLibraryInfo[] = $state([]);
+  let discoveredOpen: boolean = $state(false);
+  let addingDiscovered: Record<string, boolean> = $state({});
+  let discoveredError: Record<string, string> = $state({});
+
   // `adapter.listen` returns `Promise<() => void>` (see TauriAdapter in
   // zenoh-service.ts). We stash the resolved unsubscribe so the $effect
   // cleanup can fire it without racing the in-flight Promise.
@@ -51,6 +64,23 @@
       // best-effort; UI just won't refresh
       const msg = e instanceof Error ? e.message : String(e);
       console.warn('refresh failed:', msg);
+    }
+    // ZEB-279 Sub-D Phase 2: fetch discovered list independently so a
+    // Phase 1 refresh failure doesn't blank the discovered panel and
+    // vice-versa.
+    try {
+      discovered = await service.listDiscovered();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('listDiscovered failed:', msg);
+      discovered = [];
+    }
+    // Auto-expand the section the first time we observe entries.
+    // Doing this in `refresh()` (not a $effect) avoids re-expanding
+    // every time the array reference changes after the user has
+    // explicitly collapsed it.
+    if (discovered.length > 0 && !discoveredOpen) {
+      discoveredOpen = true;
     }
   }
 
@@ -94,6 +124,23 @@
       // successful remove (so subsequent unrelated re-renders don't
       // briefly hide the error message).
       if (succeeded) removeError = null;
+    }
+  }
+
+  async function handleAddDiscovered(libraryAddr: string) {
+    addingDiscovered[libraryAddr] = true;
+    discoveredError[libraryAddr] = '';
+    try {
+      await service.add(libraryAddr);
+      // Refetch is also triggered by the `library-directory-updated`
+      // event listener, but call explicitly here as belt-and-suspenders
+      // for cases where the event hasn't propagated yet (or to flush
+      // the row from the discovered list immediately on success).
+      await refresh();
+    } catch (e) {
+      discoveredError[libraryAddr] = e instanceof Error ? e.message : String(e);
+    } finally {
+      addingDiscovered[libraryAddr] = false;
     }
   }
 
@@ -156,6 +203,42 @@
         + Add a library
       </button>
     </div>
+    <!-- ZEB-279: discovered panel may surface entries even before the
+         user has added any library — show it in the empty state too. -->
+    <section class="discovered-section">
+      <button
+        type="button"
+        class="discovered-toggle"
+        onclick={() => (discoveredOpen = !discoveredOpen)}
+        aria-expanded={discoveredOpen}
+      >
+        {discoveredOpen ? '▼' : '▶'} Discovered libraries ({discovered.length})
+      </button>
+      {#if discoveredOpen}
+        <ul class="discovered-list">
+          {#each discovered as d (d.libraryAddr)}
+            <li class="discovered-row">
+              <div class="discovered-meta">
+                <strong>{d.name}</strong>
+                <span class="discovered-desc">{d.description}</span>
+                <span class="discovered-addr">({shortAddr(d.libraryAddr)})</span>
+              </div>
+              <button
+                type="button"
+                class="discovered-add"
+                onclick={() => handleAddDiscovered(d.libraryAddr)}
+                disabled={addingDiscovered[d.libraryAddr]}
+              >
+                {addingDiscovered[d.libraryAddr] ? 'Adding…' : 'Add'}
+              </button>
+              {#if discoveredError[d.libraryAddr]}
+                <span class="discovered-error" role="alert">{discoveredError[d.libraryAddr]}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {:else}
     <div class="libraries-bar">
       {#each libraries as lib (lib.address)}
@@ -176,6 +259,43 @@
     {#if removeError}
       <p class="remove-error" role="alert">Could not remove library: {removeError}</p>
     {/if}
+
+    <!-- ZEB-279 Sub-D Phase 2: discovered libraries section.
+         Click-to-toggle; auto-expanded by refresh() when N>0. -->
+    <section class="discovered-section">
+      <button
+        type="button"
+        class="discovered-toggle"
+        onclick={() => (discoveredOpen = !discoveredOpen)}
+        aria-expanded={discoveredOpen}
+      >
+        {discoveredOpen ? '▼' : '▶'} Discovered libraries ({discovered.length})
+      </button>
+      {#if discoveredOpen}
+        <ul class="discovered-list">
+          {#each discovered as d (d.libraryAddr)}
+            <li class="discovered-row">
+              <div class="discovered-meta">
+                <strong>{d.name}</strong>
+                <span class="discovered-desc">{d.description}</span>
+                <span class="discovered-addr">({shortAddr(d.libraryAddr)})</span>
+              </div>
+              <button
+                type="button"
+                class="discovered-add"
+                onclick={() => handleAddDiscovered(d.libraryAddr)}
+                disabled={addingDiscovered[d.libraryAddr]}
+              >
+                {addingDiscovered[d.libraryAddr] ? 'Adding…' : 'Add'}
+              </button>
+              {#if discoveredError[d.libraryAddr]}
+                <span class="discovered-error" role="alert">{discoveredError[d.libraryAddr]}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
 
     {#if entries.length === 0}
       <p class="empty-catalog">No communities listed yet.</p>
@@ -265,4 +385,59 @@
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }
   .primary { background: rgba(120,140,200,0.4); padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+
+  /* ZEB-279 Sub-D Phase 2: discovered libraries panel. */
+  .discovered-section { margin: 0.5rem 0 0.75rem; }
+  .discovered-toggle {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.25rem 0;
+    width: 100%;
+    text-align: left;
+    font-size: 0.9rem;
+    color: inherit;
+  }
+  .discovered-list { list-style: none; padding: 0; margin: 0.25rem 0 0; }
+  .discovered-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .discovered-meta {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .discovered-desc {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60ch;
+  }
+  .discovered-addr {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: monospace;
+  }
+  .discovered-add {
+    padding: 4px 10px;
+    background: rgba(120,140,200,0.4);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .discovered-add:disabled { opacity: 0.4; cursor: not-allowed; }
+  .discovered-error {
+    color: #d83c3e;
+    font-size: 0.8rem;
+    width: 100%;
+  }
 </style>

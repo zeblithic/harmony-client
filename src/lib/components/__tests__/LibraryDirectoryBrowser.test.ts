@@ -1,16 +1,23 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import LibraryDirectoryBrowser from '../LibraryDirectoryBrowser.svelte';
-import type { LibraryDirectoryService, LibraryInfo, DirectoryEntry } from '../../library-directory-service';
+import type {
+  LibraryDirectoryService,
+  LibraryInfo,
+  DirectoryEntry,
+  DiscoveredLibraryInfo,
+} from '../../library-directory-service';
 import type { TauriAdapter } from '../../zenoh-service';
 
 function mockService(
   list: LibraryInfo[],
   browse: DirectoryEntry[] = [],
+  discovered: DiscoveredLibraryInfo[] = [],
 ): LibraryDirectoryService {
   return {
     list: vi.fn().mockResolvedValue(list),
     browse: vi.fn().mockResolvedValue(browse),
+    listDiscovered: vi.fn().mockResolvedValue(discovered),
     add: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
   } as unknown as LibraryDirectoryService;
@@ -141,6 +148,7 @@ describe('LibraryDirectoryBrowser', () => {
         { address: 'aabbccddeeff00112233445566778899', added_at: { w: 0, l: 0, d: 'd' }, entry_count: 0 },
       ]),
       browse: vi.fn().mockResolvedValue([]),
+      listDiscovered: vi.fn().mockResolvedValue([]),
       add: vi.fn(),
       remove: vi.fn().mockRejectedValue(new Error('test error')),
     } as unknown as LibraryDirectoryService;
@@ -155,6 +163,7 @@ describe('LibraryDirectoryBrowser', () => {
     const svc = {
       list: vi.fn().mockResolvedValue([]),
       browse: vi.fn().mockResolvedValue([]),
+      listDiscovered: vi.fn().mockResolvedValue([]),
       add: vi.fn().mockRejectedValue(new Error('expected 16 bytes, got 8')),
       remove: vi.fn(),
     } as unknown as LibraryDirectoryService;
@@ -166,5 +175,86 @@ describe('LibraryDirectoryBrowser', () => {
     await fireEvent.input(input, { target: { value: 'aabbccddeeff00112233445566778899' } });
     await fireEvent.click(await findByText(/Add library/));
     expect(await findByText(/expected 16 bytes/i)).toBeInTheDocument();
+  });
+
+  // ZEB-279 Sub-D Phase 2: discovered libraries panel.
+  describe('Discovered libraries panel', () => {
+    it('discovered_panel_renders_with_n_entries', async () => {
+      const svc = mockService([], [], [
+        { libraryAddr: '11'.padEnd(32, '0'), name: 'LibA', description: 'desc A', listedAt: '0' },
+        { libraryAddr: '22'.padEnd(32, '0'), name: 'LibB', description: 'desc B', listedAt: '0' },
+        { libraryAddr: '33'.padEnd(32, '0'), name: 'LibC', description: 'desc C', listedAt: '0' },
+      ]);
+      const { findByText } = render(LibraryDirectoryBrowser, {
+        props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+      });
+      // Header renders with the correct count and auto-expanded (N>0)
+      // so the row names are visible.
+      expect(await findByText(/Discovered libraries \(3\)/)).toBeInTheDocument();
+      expect(await findByText('LibA')).toBeInTheDocument();
+      expect(await findByText('LibB')).toBeInTheDocument();
+      expect(await findByText('LibC')).toBeInTheDocument();
+    });
+
+    it('discovered_section_collapsed_when_empty', async () => {
+      const svc = mockService([], [], []);
+      const { findByText, queryByText } = render(LibraryDirectoryBrowser, {
+        props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+      });
+      // Header renders "(0)" but rows are not visible (section collapsed).
+      expect(await findByText(/Discovered libraries \(0\)/)).toBeInTheDocument();
+      // Sanity: no discovered row content rendered. We can't query for
+      // a specific row name here (there are none) — instead assert that
+      // the toggle indicator shows the collapsed glyph (▶) rather than
+      // the expanded glyph (▼).
+      expect(queryByText(/▼ Discovered libraries/)).toBeNull();
+      expect(await findByText(/▶ Discovered libraries/)).toBeInTheDocument();
+    });
+
+    it('click_add_invokes_addLibrary_with_correct_addr', async () => {
+      const libAddr = 'abcd'.padEnd(32, '0');
+      const svc = mockService([], [], [
+        { libraryAddr: libAddr, name: 'LibX', description: 'd', listedAt: '0' },
+      ]);
+      const { findAllByText } = render(LibraryDirectoryBrowser, {
+        props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+      });
+      // The discovered Add button has text exactly "Add". The CTA in
+      // the empty state is "+ Add a library", which doesn't match.
+      const addButtons = await findAllByText(/^Add$/);
+      // Find the Add button inside the discovered row (not any other).
+      const discoveredAddBtn = addButtons.find(
+        (b) => b.closest('.discovered-row') !== null,
+      );
+      expect(discoveredAddBtn).toBeDefined();
+      await fireEvent.click(discoveredAddBtn!);
+      await waitFor(() => {
+        expect(svc.add).toHaveBeenCalledWith(libAddr);
+      });
+    });
+
+    it('add_failure_surfaces_inline', async () => {
+      const libAddr = 'fail'.padEnd(32, '0');
+      const svc = {
+        list: vi.fn().mockResolvedValue([]),
+        browse: vi.fn().mockResolvedValue([]),
+        listDiscovered: vi.fn().mockResolvedValue([
+          { libraryAddr: libAddr, name: 'BadLib', description: '', listedAt: '0' },
+        ]),
+        add: vi.fn().mockRejectedValue(new Error('library add failed')),
+        remove: vi.fn(),
+      } as unknown as LibraryDirectoryService;
+      const { findAllByText, findByText } = render(LibraryDirectoryBrowser, {
+        props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+      });
+      const addButtons = await findAllByText(/^Add$/);
+      const discoveredAddBtn = addButtons.find(
+        (b) => b.closest('.discovered-row') !== null,
+      );
+      expect(discoveredAddBtn).toBeDefined();
+      await fireEvent.click(discoveredAddBtn!);
+      // Inline error shows next to the row.
+      expect(await findByText(/library add failed/)).toBeInTheDocument();
+    });
   });
 });
