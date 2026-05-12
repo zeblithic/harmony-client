@@ -9717,6 +9717,89 @@ async fn list_libraries(
     Ok(out)
 }
 
+/// IPC: list libraries the user has discovered via the
+/// `harmony/discovery/library/announce` topic but has NOT yet added.
+/// Filtered against `OwnerState.libraries` non-tombstoned entries —
+/// once the user adds a discovered library, it disappears from this
+/// list on the next refetch and appears in `list_libraries` instead.
+///
+/// Sub-D Phase 2 (ZEB-279). Spec §6.1.
+///
+/// Ordering: announces are returned newest-`listed_at`-first (the
+/// `Announces::snapshot` ordering), so fresh discoveries surface at
+/// the top of the UI. `listed_at` ties break on `OwnerAddr` byte order
+/// for determinism.
+///
+/// Cost: re-derives each announce's library_addr via
+/// `Identity::from_public_bytes` (one Blake3 hash per entry). At
+/// `MAX_DISCOVERED_LIBRARIES = 1000` this is negligible at IPC call
+/// time. `process_announce` already validated every announce in the
+/// map, so the parse can't realistically fail — but a parse error is
+/// handled defensively by skipping that announce.
+#[tauri::command]
+async fn list_discovered_libraries(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<crate::library_directory::DiscoveredLibraryInfo>, String> {
+    let (crdt_state, library_directory) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+        )
+    };
+
+    // Snapshot the already-added set first, drop the lock, then take
+    // the announces lock. This keeps the two tokio mutexes lock-disjoint
+    // (no nested holding) so an unrelated long-running announce-side
+    // operation can't stall library_directory IPCs.
+    let already_added: std::collections::BTreeSet<crate::owner_state_types::OwnerAddr> = {
+        let crdt_g = crdt_state.lock().await;
+        crdt_g
+            .libraries
+            .iter()
+            .filter(|(_, entry)| entry.is_effective())
+            .map(|(addr, _)| *addr)
+            .collect()
+    };
+
+    let snapshot = {
+        let announces_g = library_directory.announces.lock().await;
+        announces_g.snapshot()
+    };
+
+    let mut out: Vec<crate::library_directory::DiscoveredLibraryInfo> =
+        Vec::with_capacity(snapshot.len());
+    for ann in snapshot {
+        // Re-derive library_addr from the signed identity bundle. The
+        // announce went through `verify_announce` already (which calls
+        // `Identity::from_public_bytes` and ed25519 verify_strict), so
+        // a parse failure here is unreachable on the happy path —
+        // defensively skip rather than surface an IPC error.
+        let identity =
+            match harmony_identity::Identity::from_public_bytes(&ann.library_identity_pub) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+        let addr = crate::owner_state_types::OwnerAddr(identity.address_hash);
+        if already_added.contains(&addr) {
+            continue;
+        }
+        out.push(crate::library_directory::DiscoveredLibraryInfo {
+            library_addr: hex::encode(addr.0),
+            name: ann.name,
+            description: ann.description,
+            listed_at: ann.listed_at.wall_ms.to_string(),
+        });
+    }
+    Ok(out)
+}
+
 /// Pure LWW merge for `add_library`. Splits the merge math out of the
 /// IPC handler so it can be unit-tested without spinning up a
 /// `tauri::State<NodeState>` harness.
@@ -12097,6 +12180,7 @@ pub fn run() {
             post_channel_message,
             request_channel_backfill,
             list_libraries,
+            list_discovered_libraries,
             add_library,
             remove_library,
             browse_library,
