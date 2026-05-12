@@ -69,6 +69,56 @@ pub struct LibraryDirectoryEntry {
 impl CanonicalPayloadSealed for LibraryDirectoryEntry {}
 impl CanonicalPayload for LibraryDirectoryEntry {}
 
+/// Sub-D Phase 2 auto-discovery announce record. Spec §4.1.
+///
+/// Published by libraries to `harmony/discovery/library/announce` to
+/// advertise their existence. Each device subscribes the topic once at
+/// startup; valid announces populate the in-memory `Announces` map and
+/// surface in the `LibraryDirectoryBrowser` "Discovered libraries"
+/// section.
+///
+/// Signing model: the library signs its own announce with the Ed25519
+/// half of its 64-byte identity bundle. The OwnerAddr derives from the
+/// identity bundle (via `Identity::from_public_bytes`), so no separate
+/// `library_addr` field is on the wire — it cannot disagree with the
+/// signed identity.
+///
+/// 2-char field keys (`ai`, `nm`, `ds`, `la`, `ls`) satisfy
+/// `canonical_cbor_encode`'s same-length-keys precondition (mirrors
+/// `LibraryDirectoryEntry` and all other Sub-A/B/C wire types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryAnnounce {
+    /// 64-byte identity bundle (X25519_pub(32) || Ed25519_pub(32)).
+    /// The OwnerAddr derives from this; the Ed25519 half verifies
+    /// `library_signature`.
+    #[serde(
+        rename = "ai",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub library_identity_pub: [u8; 64],
+
+    #[serde(rename = "nm")]
+    pub name: String,
+
+    #[serde(rename = "ds")]
+    pub description: String,
+
+    #[serde(rename = "la")]
+    pub listed_at: Hlc,
+
+    /// Ed25519 sig over canonical CBOR with `ls` zeroed.
+    #[serde(
+        rename = "ls",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub library_signature: [u8; 64],
+}
+
+impl CanonicalPayloadSealed for LibraryAnnounce {}
+impl CanonicalPayload for LibraryAnnounce {}
+
 use crate::owner_state_crypto::canonical_cbor_encode;
 use ed25519_dalek::Signature;
 
@@ -119,6 +169,25 @@ pub const MAX_DESCRIPTION_LEN: usize = 2000;
 pub const MAX_TOPICS_PER_ENTRY: usize = 16;
 pub const MAX_TOPIC_LEN: usize = 64;
 pub const MAX_ENTRIES_PER_LIBRARY: usize = 10_000;
+
+/// Verification error categories for `LibraryAnnounce`. Mirrors
+/// `EntryVerifyError` but simpler — no invite URL, no
+/// community/admin payload binding. Each variant surfaces as a
+/// warn-level log; the announce is silently dropped from the
+/// caller's perspective.
+#[derive(Debug, thiserror::Error)]
+pub enum AnnounceVerifyError {
+    #[error("malformed library identity_pub: {0}")]
+    InvalidIdentityPub(String),
+    #[error("canonical CBOR encode failed: {0}")]
+    Encode(#[from] crate::owner_state_crypto::CryptoError),
+    #[error("Ed25519 signature verification failed")]
+    SignatureInvalid,
+    #[error("name exceeds {MAX_NAME_LEN} bytes")]
+    NameTooLong,
+    #[error("description exceeds {MAX_DESCRIPTION_LEN} bytes")]
+    DescriptionTooLong,
+}
 
 /// Verify a `LibraryDirectoryEntry` end-to-end:
 /// 1. Anti-spam bounds (name/description/topic lengths)
@@ -197,6 +266,42 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
     }
 
     Ok(())
+}
+
+/// Verify a `LibraryAnnounce` end-to-end:
+/// 1. Anti-spam bounds (name/description lengths)
+/// 2. Parse `library_identity_pub` via
+///    `harmony_identity::Identity::from_public_bytes` (validates both
+///    halves of the X25519||Ed25519 bundle)
+/// 3. Verify the Ed25519 signature over canonical-CBOR-encoded fields
+///    with `library_signature` zeroed (so verify == sign exactly)
+///
+/// Returns the derived `OwnerAddr` (library_addr) on success — callers
+/// need this to insert into the Announces map.
+pub fn verify_announce(announce: &LibraryAnnounce) -> Result<OwnerAddr, AnnounceVerifyError> {
+    // (1) Bounds
+    if announce.name.len() > MAX_NAME_LEN {
+        return Err(AnnounceVerifyError::NameTooLong);
+    }
+    if announce.description.len() > MAX_DESCRIPTION_LEN {
+        return Err(AnnounceVerifyError::DescriptionTooLong);
+    }
+
+    // (2) Parse identity_pub — also rejects malformed point bytes.
+    let identity = harmony_identity::Identity::from_public_bytes(&announce.library_identity_pub)
+        .map_err(|e| AnnounceVerifyError::InvalidIdentityPub(format!("{e:?}")))?;
+
+    // (3) Verify sig over canonical CBOR with signature field zeroed.
+    let mut for_sig = announce.clone();
+    for_sig.library_signature = [0u8; 64];
+    let signed_bytes = canonical_cbor_encode(&for_sig)?;
+    let sig = Signature::from_bytes(&announce.library_signature);
+    identity
+        .verifying_key
+        .verify_strict(&signed_bytes, &sig)
+        .map_err(|_| AnnounceVerifyError::SignatureInvalid)?;
+
+    Ok(OwnerAddr(identity.address_hash))
 }
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1434,5 +1539,47 @@ mod tests {
             verify_entry(&bad),
             Err(EntryVerifyError::TooManyTopics)
         ));
+    }
+}
+
+#[cfg(test)]
+mod announce_verify_tests {
+    use super::*;
+
+    fn unsigned_announce_with_identity(identity_pub: [u8; 64]) -> LibraryAnnounce {
+        LibraryAnnounce {
+            library_identity_pub: identity_pub,
+            name: "Test".to_string(),
+            description: "Test desc".to_string(),
+            listed_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".to_string(),
+            },
+            library_signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_identity_pub() {
+        // Ed25519 half `[0x7F; 32]` doesn't decompress under ed25519-dalek
+        // 2.x / curve25519-dalek 4.x — same fixture used by
+        // `malformed_identity_pub_rejected` in the entry tests.
+        let mut bad_identity_pub = [0u8; 64];
+        bad_identity_pub[32..].copy_from_slice(&[0x7F; 32]);
+        let announce = unsigned_announce_with_identity(bad_identity_pub);
+        let err = verify_announce(&announce).unwrap_err();
+        assert!(matches!(err, AnnounceVerifyError::InvalidIdentityPub(_)));
+    }
+
+    #[test]
+    fn rejects_name_too_long() {
+        // Bounds checks come BEFORE identity parse in `verify_announce`,
+        // so we can use any identity_pub bytes here — name-too-long
+        // fires before the (otherwise-invalid) identity is ever parsed.
+        let mut announce = unsigned_announce_with_identity([0x7F; 64]);
+        announce.name = "x".repeat(MAX_NAME_LEN + 1);
+        let err = verify_announce(&announce).unwrap_err();
+        assert!(matches!(err, AnnounceVerifyError::NameTooLong));
     }
 }
