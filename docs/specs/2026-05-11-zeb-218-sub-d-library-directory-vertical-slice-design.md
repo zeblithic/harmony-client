@@ -625,8 +625,8 @@ close it when each lands.
 - Existing patterns referenced:
   - `src-tauri/src/community_invite.rs::InviteEpochSnapshot` — open vs
     invite-only invite payload shape
-  - `src-tauri/src/community_invite.rs:7069 build_open_invite_url` — IPC
-    libraries call (off-client) to mint URLs for their entries
+  - `src-tauri/src/lib.rs::build_open_invite_url` — IPC libraries call
+    (off-client) to mint URLs for their entries
   - `src-tauri/src/community_state_sync.rs::CommunitySyncRegistry` — the
     subscription-lifecycle pattern `library_directory.rs` mirrors
   - `src-tauri/src/community_membership.rs::MembershipEventKind` — the
