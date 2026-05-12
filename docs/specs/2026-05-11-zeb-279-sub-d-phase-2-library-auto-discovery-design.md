@@ -117,7 +117,7 @@ const MAX_DISCOVERED_LIBRARIES: usize = 1_000;
 
 **Cap = 1,000.** Much smaller than Phase 1's per-library 10,000 cap. This is the **global** count of known libraries (not per-library entries); 1,000 is generous and bounds memory at a few hundred KB.
 
-**Overflow eviction**: on insert when at-cap, drop the oldest-by-`listed_at` entry. Stable tie-break by `OwnerAddr` byte order if two have identical HLCs.
+**Overflow eviction**: on insert when at-cap, drop the oldest-by-`listed_at` entry. Defensive stable tie-break by `OwnerAddr` byte order in the unlikely event two announces share an identical HLC (e.g., two libraries with the same `device_id` publishing at the same `wall_ms`/`logical`) — the `(wall_ms, logical, device_id)` HLC tuple should make identical HLCs across devices vanishingly improbable in normal operation; the tie-break exists only to keep eviction deterministic in pathological/buggy cases.
 
 ---
 
@@ -145,7 +145,14 @@ Sample router (extends the existing `harmony/discovery/library/*/communities` ro
 if key_expr == "harmony/discovery/library/announce" {
     if let Some(dir) = library_directory.as_ref() {
         let result = dir.process_announce(payload);
-        if matches!(result.outcome, AnnounceOutcome::Inserted | AnnounceOutcome::Updated) {
+        let changed = matches!(
+            result.outcome,
+            AnnounceOutcome::Inserted(_) | AnnounceOutcome::Updated(_)
+        );
+        // Eviction also mutates observable state — emit so the UI
+        // re-fetches and the dropped row disappears. Mirrors the
+        // architecture diagram in §3.
+        if changed || result.evicted.is_some() {
             emit_library_directory_updated(&app);
         }
     }
@@ -378,9 +385,9 @@ If the user wants any of these surfaced as proper Linear tickets, that's a one-l
 - **Library hosting itself.** Libraries are a separate role; the publishing-side `harmony-library` codebase (if it exists) is not in this client repo.
 - **Curated default libraries pre-populated at install.** Already rejected in Phase 1 brainstorm as anti-polycentric.
 - **Reputation / ranking of discovered libraries.** No global moderation, no platform admin.
-- **Phase 3 federated republication** (library wrapping signature) — separate ticket [ZEB-280](https://linear.app/zeblith/issue/ZEB-280/).
-- **Phase 4 ProfileMembershipBroadcast** — separate ticket [ZEB-281](https://linear.app/zeblith/issue/ZEB-281/).
-- **Phase 6 direct-join IPC** — separate ticket [ZEB-252](https://linear.app/zeblith/issue/ZEB-252/).
+- **Federated republication (Phase 3)** — libraries wrapping each other's signatures, deferred to [ZEB-280](https://linear.app/zeblith/issue/ZEB-280/).
+- **ProfileMembershipBroadcast (Phase 4)** — per-profile membership broadcast surface, deferred to [ZEB-281](https://linear.app/zeblith/issue/ZEB-281/).
+- **Direct-join IPC (Phase 6)** — programmatic join from discovered entries, deferred to [ZEB-252](https://linear.app/zeblith/issue/ZEB-252/).
 
 ---
 

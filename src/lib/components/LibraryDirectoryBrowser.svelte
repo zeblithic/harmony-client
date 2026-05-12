@@ -243,6 +243,9 @@
               <button
                 type="button"
                 class="discovered-add"
+                aria-label={d.name
+                  ? `Add ${d.name}`
+                  : `Add library ${shortAddr(d.libraryAddr)}`}
                 onclick={() => handleAddDiscovered(d.libraryAddr)}
                 disabled={addingDiscovered[d.libraryAddr]}
               >

@@ -218,24 +218,44 @@ describe('LibraryDirectoryBrowser', () => {
 
     it('click_add_invokes_addLibrary_with_correct_addr', async () => {
       const libAddr = 'abcd'.padEnd(32, '0');
-      const svc = mockService([], [], [
-        { libraryAddr: libAddr, name: 'LibX', description: 'd', listedAt: '0' },
-      ]);
-      const { findAllByText } = render(LibraryDirectoryBrowser, {
+      // R3 F4 (CodeRabbit Trivial): also assert the user-visible effect
+      // — the row is removed from "Discovered libraries" via the IPC
+      // filter (backend excludes already-added addrs from
+      // list_discovered_libraries). Mock listDiscovered with successive
+      // values so the post-add refresh observes the filtered result.
+      const listDiscovered = vi
+        .fn()
+        .mockResolvedValueOnce([
+          { libraryAddr: libAddr, name: 'LibX', description: 'd', listedAt: '0' },
+        ])
+        .mockResolvedValue([]); // post-add refresh: filtered out
+      const svc = {
+        list: vi.fn().mockResolvedValue([]),
+        browse: vi.fn().mockResolvedValue([]),
+        listDiscovered,
+        add: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn(),
+      } as unknown as LibraryDirectoryService;
+      const { findByRole, queryByText, findByText } = render(LibraryDirectoryBrowser, {
         props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
       });
-      // The discovered Add button has text exactly "Add". The CTA in
-      // the empty state is "+ Add a library", which doesn't match.
-      const addButtons = await findAllByText(/^Add$/);
-      // Find the Add button inside the discovered row (not any other).
-      const discoveredAddBtn = addButtons.find(
-        (b) => b.closest('.discovered-row') !== null,
-      );
-      expect(discoveredAddBtn).toBeDefined();
-      await fireEvent.click(discoveredAddBtn!);
+      // F5: each discovered Add button now carries a unique aria-label
+      // including the library name, so screen readers (and tests) can
+      // distinguish rows.
+      const discoveredAddBtn = await findByRole('button', { name: /Add LibX/i });
+      await fireEvent.click(discoveredAddBtn);
       await waitFor(() => {
         expect(svc.add).toHaveBeenCalledWith(libAddr);
       });
+      // After add succeeds, refresh() refetches listDiscovered which
+      // now returns []. The LibX row should be gone from the DOM.
+      await waitFor(() => {
+        expect(listDiscovered).toHaveBeenCalledTimes(2);
+      });
+      // Section header now shows (0) and the row name is no longer
+      // rendered anywhere.
+      expect(await findByText(/Discovered libraries \(0\)/)).toBeInTheDocument();
+      expect(queryByText('LibX')).toBeNull();
     });
 
     // F5 (CodeAnt + CodeRabbit Major Logic): the discovered panel
