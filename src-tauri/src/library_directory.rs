@@ -853,6 +853,28 @@ pub struct LibraryInfo {
     pub entry_count: usize,
 }
 
+/// Frontend-facing DTO returned by `list_discovered_libraries` (Sub-D
+/// Phase 2, ZEB-279). Surfaces libraries the user has *discovered* via
+/// the `harmony/discovery/library/announce` topic but has NOT yet
+/// added to their trust set. Filtered at the IPC layer against
+/// non-tombstoned entries in `OwnerState.libraries`, so a library
+/// migrates from the "Discovered" panel to "Your libraries" on the
+/// next refetch after `add_library`.
+///
+/// `listed_at` is the raw `wall_ms` rendered as a base-10 string. The
+/// frontend formats for display; callers MUST NOT use this for HLC
+/// ordering decisions (HLC ordering happens inside `Announces`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredLibraryInfo {
+    /// Hex-encoded 16-byte library OwnerAddr (32 hex chars).
+    pub library_addr: String,
+    pub name: String,
+    pub description: String,
+    /// `listed_at.wall_ms` as base-10 string for display only.
+    pub listed_at: String,
+}
+
 /// Frontend-facing DTO: one community in the browse list. Strips
 /// `community_admin_identity_pub` and `community_signature` (verified
 /// at receive); exposes the derived `community_addr` for display.

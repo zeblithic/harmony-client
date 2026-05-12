@@ -162,3 +162,62 @@ async fn announce_cap_eviction_drops_oldest() {
     // Newest is at index 0 (snapshot sorts by listed_at desc).
     assert_eq!(snap[0].name, "newest");
 }
+
+/// Sub-D Phase 2 (ZEB-279): replicate the `list_discovered_libraries`
+/// IPC filter logic and prove that an announce whose derived
+/// library_addr is already present in `OwnerState.libraries` (as a
+/// non-tombstoned `LibraryEntry`) is omitted from the discovered list.
+///
+/// This test does NOT spin up the Tauri State harness — it builds an
+/// `OwnerState` directly and replicates the filter math from the IPC
+/// handler. The handler's lock-ordering and DTO construction are
+/// type-checked at compile time; the filter correctness is what's
+/// load-bearing here, and it's pure logic over data already in scope.
+#[tokio::test]
+async fn announce_filter_omits_already_added_libraries() {
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_types::{Hlc, LibraryEntry, OwnerAddr};
+
+    let (dir, _rx) = LibraryDirectory::new();
+    let (bytes, addr) =
+        common::library_fixtures::mock_library_announce([10u8; 32], "Already added", "", 100);
+    dir.process_announce(bytes).await.expect("ingest ok");
+
+    // Simulate the owner having already added this library via Phase 1.
+    let mut crdt = OwnerState::default();
+    crdt.libraries.insert(
+        addr,
+        LibraryEntry {
+            address: addr,
+            added_at: Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            removed_at: None,
+        },
+    );
+
+    // Replicate the filter logic from the `list_discovered_libraries`
+    // IPC handler: snapshot the already-added (non-tombstoned) addrs,
+    // then exclude announces whose derived library_addr matches.
+    let already_added: std::collections::BTreeSet<OwnerAddr> = crdt
+        .libraries
+        .iter()
+        .filter(|(_, e)| e.is_effective())
+        .map(|(a, _)| *a)
+        .collect();
+    let snap = dir.announces.lock().await.snapshot();
+    let filtered: Vec<_> = snap
+        .iter()
+        .filter(|ann| {
+            let id = harmony_identity::Identity::from_public_bytes(&ann.library_identity_pub)
+                .expect("ident");
+            !already_added.contains(&OwnerAddr(id.address_hash))
+        })
+        .collect();
+    assert!(
+        filtered.is_empty(),
+        "already-added library must be filtered out of the discovered list",
+    );
+}
