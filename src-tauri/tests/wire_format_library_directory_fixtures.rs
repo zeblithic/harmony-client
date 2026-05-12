@@ -194,6 +194,13 @@ fn phase3_wrapped_entry_roundtrips() {
 ///
 /// Wrapped entries MUST have exactly 11 keys (Phase 1's 9 + li + ls);
 /// unwrapped entries have 9.
+///
+/// ZEB-280 R1 (CodeRabbit): in addition to pinning the map(11) header
+/// and the first key, decode into `ciborium::Value::Map` and assert
+/// the FULL canonical key ordering. This catches field-reordering
+/// regressions that would silently break wrapping-sig portability
+/// (the admin sig and library sig both rely on canonical CBOR's
+/// declared field order).
 #[test]
 fn phase3_wrapped_entry_pinned_bytes_prefix() {
     let entry = LibraryDirectoryEntry {
@@ -220,6 +227,29 @@ fn phase3_wrapped_entry_pinned_bytes_prefix() {
         &bytes[1..4],
         b"\x62cd",
         "first map key must be text(2) \"cd\""
+    );
+
+    // Full canonical key ordering check (ZEB-280 R1, CodeRabbit). Decode
+    // and walk the map preserving declaration order.
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+    let observed_keys: Vec<String> = map
+        .into_iter()
+        .map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => s,
+            other => panic!("non-text map key: {other:?}"),
+        })
+        .collect();
+    let expected_keys: Vec<&str> = vec![
+        "cd", "ai", "nm", "ds", "tp", "iu", "lb", "la", "cs", "li", "ls",
+    ];
+    assert_eq!(
+        observed_keys, expected_keys,
+        "Phase 3 wrapped entry must encode keys in this exact canonical order \
+         (admin sig + library sig portability depends on declaration-order CBOR encoding)"
     );
 }
 

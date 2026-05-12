@@ -108,7 +108,12 @@ impl CanonicalPayload for LibraryDirectoryEntry {}
 /// admin-sig-verified entry's wrapping-signature state, which feeds the
 /// aggregation's broadcasting-library tracking and the frontend
 /// "unattested" badge. Spec §4.2.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Copy` is derived defensively (R1, CodeRabbit): `process_sample` matches
+/// on `status` once and then passes it to `on_entry`, which compiles today
+/// via match-ergonomics but would break on future refactors that move the
+/// match. The variant only holds `OwnerAddr` (already `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationStatus {
     /// Phase 1-style entry: no wrapping sig present (both
     /// `library_signature` and `library_identity_pub` are `None`).
@@ -561,6 +566,38 @@ impl Aggregation {
     ///     when library A republishes library B's entry verbatim)
     ///   - eviction by `drop_library` (must sweep both attested_by
     ///     and unattested_by)
+    ///
+    /// ## ZEB-280 R1 unified policy (CodeRabbit + Qodo)
+    ///
+    /// **Invariant:** `attested_by` and `unattested_by` are DISJOINT per
+    /// community — a library is in at most one set per community.
+    ///
+    /// **`per_library_count[X]`** = count of communities where X is in
+    /// `attested_by`. **Unattested-only contributions do NOT count toward
+    /// the cap.** This shuts down the Qodo DoS finding: a network
+    /// adversary publishing bad-sig entries on library X's open Zenoh
+    /// topic with `library_identity_pub = X` could otherwise pump X's
+    /// count via the unattested path until cap eviction targeted X's
+    /// LEGITIMATE attested contributions.
+    ///
+    /// **Insertion rules:**
+    /// - `Attested(X)` / `Unwrapped` (X = entry.listed_by):
+    ///   - X in `attested_by`: no-op (idempotent)
+    ///   - X in `unattested_by`: recovery — move X to `attested_by`,
+    ///     bump `per_library_count[X]`
+    ///   - X in neither: insert X into `attested_by`, bump count
+    /// - `Unattested(X)`:
+    ///   - X in `attested_by`: no-op (do NOT downgrade trusted attestation)
+    ///   - X in `unattested_by`: no-op (idempotent)
+    ///   - X in neither + community exists: insert into `unattested_by`,
+    ///     do NOT bump `per_library_count`
+    ///   - community does NOT exist: DROP entirely (return Idempotent).
+    ///     Prevents fake-community memory DoS from a network adversary
+    ///     on the library's open topic.
+    ///
+    /// **Cap check** fires only for Attested/Unwrapped status and only
+    /// when X is NOT already attesting this community. Unattested status
+    /// never triggers cap eviction.
     pub fn on_entry(
         &mut self,
         entry: LibraryDirectoryEntry,
@@ -576,75 +613,89 @@ impl Aggregation {
             AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
             AttestationStatus::Unwrapped => entry.listed_by,
         };
+        let is_attesting_status = matches!(
+            status,
+            AttestationStatus::Attested(_) | AttestationStatus::Unwrapped
+        );
 
-        // Cap check BEFORE insert. If this library is already at cap
-        // and we're about to add a NEW contribution (not an update),
-        // evict the oldest entry from this library first.
+        // ZEB-280 R1 (Qodo): drop Unattested entries for communities
+        // that have no prior aggregation. Prevents a network adversary
+        // on library X's open Zenoh topic from publishing bad-sig
+        // entries with `library_identity_pub = X` to fabricate fake
+        // communities in our aggregation map.
+        if !is_attesting_status && !self.by_community.contains_key(&community_id) {
+            return ProcessResult {
+                outcome: OnEntryOutcome::Idempotent,
+                evicted: None,
+            };
+        }
+
+        // Cap check BEFORE insert. ZEB-280 R1: only triggers for
+        // attesting status (Attested/Unwrapped). Unattested entries do
+        // NOT count toward `per_library_count` and therefore cannot
+        // cause cap eviction (defeats Qodo's DoS via spoofed
+        // library_identity_pub on an open topic).
         //
-        // Phase 3: "is_new_contribution" checks BOTH attested_by AND
-        // unattested_by sets — a library that previously broadcast
-        // this community with a bad wrapping sig (unattested_by) is
-        // still considered a contributor for cap purposes (counts
-        // toward MAX_ENTRIES_PER_LIBRARY).
-        let library_at_cap =
-            self.entry_count_for_library(&broadcasting_lib) >= MAX_ENTRIES_PER_LIBRARY;
-        let is_new_contribution_for_library = !self
-            .by_community
-            .get(&community_id)
-            .map(|agg| {
-                agg.attested_by.contains(&broadcasting_lib)
-                    || agg.unattested_by.contains(&broadcasting_lib)
-            })
-            .unwrap_or(false);
-
+        // "is_new_contribution_for_library" under the new disjoint-sets
+        // invariant: X is a new attesting contributor iff X is NOT
+        // already in `attested_by` (membership in `unattested_by` is a
+        // recovery candidate, not "already attesting").
         let mut evicted: Option<SpaceId> = None;
-        if library_at_cap && is_new_contribution_for_library {
-            if let Some(oldest_id) = self.find_oldest_for_library(&broadcasting_lib) {
-                self.evict_library_contribution(&broadcasting_lib, oldest_id);
-                evicted = Some(oldest_id);
-            } else {
-                tracing::warn!(
-                    target: "library_directory",
-                    library = ?broadcasting_lib,
-                    per_library_count = self.entry_count_for_library(&broadcasting_lib),
-                    max = MAX_ENTRIES_PER_LIBRARY,
-                    "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
-                );
-                debug_assert!(
-                    false,
-                    "per_library_count invariant violated: library {:?} count={} but no community lists it",
-                    broadcasting_lib,
-                    self.entry_count_for_library(&broadcasting_lib)
-                );
+        if is_attesting_status {
+            let library_at_cap =
+                self.entry_count_for_library(&broadcasting_lib) >= MAX_ENTRIES_PER_LIBRARY;
+            let already_attesting = self
+                .by_community
+                .get(&community_id)
+                .map(|agg| agg.attested_by.contains(&broadcasting_lib))
+                .unwrap_or(false);
+            if library_at_cap && !already_attesting {
+                if let Some(oldest_id) = self.find_oldest_for_library(&broadcasting_lib) {
+                    self.evict_library_contribution(&broadcasting_lib, oldest_id);
+                    evicted = Some(oldest_id);
+                } else {
+                    tracing::warn!(
+                        target: "library_directory",
+                        library = ?broadcasting_lib,
+                        per_library_count = self.entry_count_for_library(&broadcasting_lib),
+                        max = MAX_ENTRIES_PER_LIBRARY,
+                        "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
+                    );
+                    debug_assert!(
+                        false,
+                        "per_library_count invariant violated: library {:?} count={} but no community lists it",
+                        broadcasting_lib,
+                        self.entry_count_for_library(&broadcasting_lib)
+                    );
+                }
             }
         }
 
         let outcome = match self.by_community.get_mut(&community_id) {
             None => {
-                // Brand-new community in the aggregation.
-                let (attested_by, unattested_by) = match status {
-                    AttestationStatus::Attested(lib_addr) => {
-                        let mut set = BTreeSet::new();
-                        set.insert(lib_addr);
-                        (set, BTreeSet::new())
-                    }
-                    AttestationStatus::Unwrapped => {
-                        let mut set = BTreeSet::new();
-                        set.insert(entry.listed_by);
-                        (set, BTreeSet::new())
-                    }
-                    AttestationStatus::Unattested(lib_addr) => {
-                        let mut set = BTreeSet::new();
-                        set.insert(lib_addr);
-                        (BTreeSet::new(), set)
-                    }
+                // Brand-new community. Unattested-status branches were
+                // already filtered above (the `!is_attesting_status &&
+                // !contains_key` early-return), so we only land here for
+                // Attested or Unwrapped status — the disjoint-sets
+                // invariant gives `unattested_by = ∅`.
+                debug_assert!(
+                    is_attesting_status,
+                    "ZEB-280 R1: Unattested for new community should have early-returned"
+                );
+                let inserted_lib = match status {
+                    AttestationStatus::Attested(lib_addr) => lib_addr,
+                    AttestationStatus::Unwrapped => entry.listed_by,
+                    // Unreachable: filtered by early-return above.
+                    AttestationStatus::Unattested(addr) => addr,
                 };
+                let mut attested_by = BTreeSet::new();
+                attested_by.insert(inserted_lib);
                 self.by_community.insert(
                     community_id,
                     AggregatedEntry {
                         entry,
                         attested_by,
-                        unattested_by,
+                        unattested_by: BTreeSet::new(),
                     },
                 );
                 *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
@@ -654,21 +705,51 @@ impl Aggregation {
                 let incoming_newer = entry
                     .listed_at
                     .is_strictly_newer_than(&existing.entry.listed_at);
-                // Phase 3: insert into the correct set per AttestationStatus.
-                let was_new_contribution = match status {
-                    AttestationStatus::Attested(lib_addr) => existing.attested_by.insert(lib_addr),
-                    AttestationStatus::Unwrapped => existing.attested_by.insert(entry.listed_by),
+                // ZEB-280 R1: disjoint-sets policy. Track whether this
+                // insert grew the *attested* set (which is what drives
+                // both AccretedListedBy and per_library_count).
+                //
+                // Recovery semantics: when an Attested/Unwrapped entry
+                // arrives for a library already in `unattested_by`,
+                // move the library from unattested_by → attested_by
+                // (preserves disjoint invariant; bumps the cap counter
+                // exactly once, treating the move as a new attestation).
+                let was_new_attestation = match status {
+                    AttestationStatus::Attested(lib_addr) => {
+                        let was_new = existing.attested_by.insert(lib_addr);
+                        if was_new {
+                            // Recovery: previously-tampered wrap is now
+                            // valid. Remove the stale unattested entry.
+                            existing.unattested_by.remove(&lib_addr);
+                        }
+                        was_new
+                    }
+                    AttestationStatus::Unwrapped => {
+                        let was_new = existing.attested_by.insert(entry.listed_by);
+                        if was_new {
+                            existing.unattested_by.remove(&entry.listed_by);
+                        }
+                        was_new
+                    }
                     AttestationStatus::Unattested(lib_addr) => {
-                        existing.unattested_by.insert(lib_addr)
+                        // Don't downgrade a trusted attestation: if X
+                        // is already in attested_by, ignore the bad-sig
+                        // broadcast entirely. Otherwise, insert into
+                        // unattested_by (idempotent if already present).
+                        // Unattested NEVER bumps per_library_count.
+                        if !existing.attested_by.contains(&lib_addr) {
+                            let _ = existing.unattested_by.insert(lib_addr);
+                        }
+                        false
                     }
                 };
-                if was_new_contribution {
+                if was_new_attestation {
                     *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
                 }
                 if incoming_newer {
                     existing.entry = entry;
                     OnEntryOutcome::Replaced(community_id)
-                } else if was_new_contribution {
+                } else if was_new_attestation {
                     OnEntryOutcome::AccretedListedBy(community_id)
                 } else {
                     OnEntryOutcome::Idempotent
@@ -702,24 +783,30 @@ impl Aggregation {
     pub fn drop_library(&mut self, library: &OwnerAddr) -> Vec<SpaceId> {
         // Two-pass to satisfy the borrow checker (R2 F2 patterns
         // unchanged from Phase 1 — just generalized to both sets).
-        let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>, BTreeSet<OwnerAddr>)> = Vec::new();
+        //
+        // ZEB-280 R1: counter rollback uses only `attested_by`
+        // membership (deduped). Under the disjoint-sets invariant a
+        // library appears in at most one of attested_by/unattested_by
+        // per community, but per_library_count tracks ONLY attested
+        // contributions (unattested entries don't count toward the
+        // cap). Decrementing for unattested-set membership would
+        // double-decrement the count for libraries that recovered
+        // from unattested → attested.
+        let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>)> = Vec::new();
         for (community_id, agg) in self.by_community.iter_mut() {
             let source_was_this_library = &agg.entry.listed_by == library;
             let _ = agg.attested_by.remove(library);
             let _ = agg.unattested_by.remove(library);
             let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
             if source_was_this_library || both_sets_empty {
-                to_evict.push((
-                    *community_id,
-                    agg.attested_by.clone(),
-                    agg.unattested_by.clone(),
-                ));
+                // Capture remaining attested_by ONLY for counter rollback.
+                to_evict.push((*community_id, agg.attested_by.clone()));
             }
         }
         let mut evicted_ids = Vec::with_capacity(to_evict.len());
-        for (id, remaining_attested, remaining_unattested) in to_evict {
+        for (id, remaining_attested) in to_evict {
             self.by_community.remove(&id);
-            for other in remaining_attested.into_iter().chain(remaining_unattested) {
+            for other in remaining_attested {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -734,12 +821,15 @@ impl Aggregation {
         evicted_ids
     }
 
+    /// ZEB-280 R1: filter only by `attested_by` membership. Cap eviction
+    /// operates exclusively on attested contributions — unattested
+    /// entries never counted toward `per_library_count` in the first
+    /// place, so they cannot be "the oldest contribution" by cap
+    /// semantics.
     fn find_oldest_for_library(&self, library: &OwnerAddr) -> Option<SpaceId> {
         self.by_community
             .iter()
-            .filter(|(_, agg)| {
-                agg.attested_by.contains(library) || agg.unattested_by.contains(library)
-            })
+            .filter(|(_, agg)| agg.attested_by.contains(library))
             .min_by(|a, b| {
                 // Lexicographic ordering on the HLC tuple. Note we want
                 // the OLDEST, so we min on (wall_ms, logical, device_id).
@@ -769,44 +859,42 @@ impl Aggregation {
     /// alongside the eviction to keep the counters consistent.
     fn evict_library_contribution(&mut self, library: &OwnerAddr, community_id: SpaceId) {
         // Capture state in a scoped borrow, then apply mutations after.
+        //
+        // ZEB-280 R1: per_library_count tracks ONLY attested
+        // contributions. Decrement when removing the library from
+        // `attested_by`; removal from `unattested_by` is counter-neutral.
+        // Same dedupe rule for OTHER libraries on surviving eviction:
+        // roll back counts only via attested_by membership.
         let mut surviving_attested: Option<BTreeSet<OwnerAddr>> = None;
-        let mut surviving_unattested: Option<BTreeSet<OwnerAddr>> = None;
         if let Some(agg) = self.by_community.get_mut(&community_id) {
             let removed_from_attested = agg.attested_by.remove(library);
-            let removed_from_unattested = agg.unattested_by.remove(library);
-            if removed_from_attested || removed_from_unattested {
+            let _ = agg.unattested_by.remove(library);
+            if removed_from_attested {
                 if let Some(c) = self.per_library_count.get_mut(library) {
                     if *c > 0 {
                         *c -= 1;
                     }
                 }
-                // Phase 3 generalization of the Phase 1 "source matches"
-                // rule: if the stored entry was sourced from this
-                // library AND the broadcasting library identity for
-                // that stored entry's last-write was this library,
-                // evict the community entirely. We can't perfectly know
-                // who broadcast the LATEST entry update without tracking
-                // a separate `last_broadcast_by` field — but the entry's
-                // signed `listed_by` is the closest proxy from the wire
-                // (admin attested who's hosting). For the same Phase 1
-                // R1 F3 rationale, we evict if either set is empty OR
-                // if the stored entry's listed_by equals this library.
-                let source_was_this_library = &agg.entry.listed_by == library;
-                let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
-                if source_was_this_library || both_sets_empty {
-                    surviving_attested = Some(agg.attested_by.clone());
-                    surviving_unattested = Some(agg.unattested_by.clone());
-                }
+            }
+            // Phase 3 generalization of the Phase 1 "source matches"
+            // rule: if the stored entry was sourced from this
+            // library, evict the community entirely. The entry's
+            // signed `listed_by` is the closest proxy for "who
+            // sourced the stored metadata". Also evict if both sets
+            // empty after the removal.
+            let source_was_this_library = &agg.entry.listed_by == library;
+            let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
+            if source_was_this_library || both_sets_empty {
+                surviving_attested = Some(agg.attested_by.clone());
             }
         }
-        if let (Some(remaining_attested), Some(remaining_unattested)) =
-            (surviving_attested, surviving_unattested)
-        {
+        if let Some(remaining_attested) = surviving_attested {
             self.by_community.remove(&community_id);
             // R2 F2: roll back per_library_count for OTHER libraries
-            // whose contributions are also being dropped by this
-            // eviction (both attested and unattested branches).
-            for other in remaining_attested.into_iter().chain(remaining_unattested) {
+            // whose attested contributions are also being dropped by
+            // this eviction. Unattested contributions don't carry a
+            // counter, so they need no rollback.
+            for other in remaining_attested {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -2300,35 +2388,103 @@ mod tests {
         );
     }
 
-    /// ZEB-280 Phase 3: an `AttestationStatus::Unattested(lib_addr)`
-    /// entry inserts `lib_addr` into `unattested_by`. The entry is
-    /// NOT dropped from the aggregation — admin sig is still valid.
+    /// ZEB-280 Phase 3 (R1, CodeRabbit + Qodo): an
+    /// `AttestationStatus::Unattested(lib_addr)` entry inserts
+    /// `lib_addr` into `unattested_by` ONLY when the community has a
+    /// prior attestation. The DTO surfaces `unattested = true`. The
+    /// disjoint-sets invariant (attested_by ∩ unattested_by = ∅ per
+    /// community) means an unattested broadcast from library X for a
+    /// community where X is the only attester is a no-op.
     #[test]
-    fn aggregation_on_entry_unattested_inserts_into_unattested_by() {
+    fn aggregation_on_entry_unattested_inserts_into_unattested_by_when_community_already_attested()
+    {
         let mut agg = Aggregation::new();
         let community_id = SpaceId([0x33; 16]);
-        let listed_by = OwnerAddr([0xAA; 16]);
-        let lib_addr = OwnerAddr([0xCC; 16]);
-        let entry = build_signed_open_entry_for_library(community_id, [9u8; 32], listed_by);
-        let _ = agg.on_entry(entry, AttestationStatus::Unattested(lib_addr));
+        let attested_lib = OwnerAddr([0xAA; 16]);
+        let unattested_lib = OwnerAddr([0xCC; 16]);
+
+        // Step 1: legitimate attested broadcast creates the community.
+        let entry = build_signed_open_entry_for_library(community_id, [9u8; 32], attested_lib);
+        let _ = agg.on_entry(entry.clone(), AttestationStatus::Attested(attested_lib));
+
+        // Step 2: unattested broadcast from a DIFFERENT library on
+        // existing community.
+        let _ = agg.on_entry(entry, AttestationStatus::Unattested(unattested_lib));
 
         let snap = agg.snapshot_all();
-        assert_eq!(
-            snap.len(),
-            1,
-            "Unattested entries are NOT dropped from aggregation"
-        );
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].attested_by.contains(&attested_lib));
+        assert!(snap[0].unattested_by.contains(&unattested_lib));
         assert!(
-            snap[0].unattested_by.contains(&lib_addr),
-            "Unattested(lib_addr) inserts the lib into unattested_by"
+            !snap[0].attested_by.contains(&unattested_lib),
+            "library never appears in BOTH sets — disjoint invariant"
         );
-        assert!(snap[0].attested_by.is_empty(), "no attested contributions");
 
-        // DTO surfaces unattested = true.
         let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+        assert!(dto.unattested);
+    }
+
+    /// ZEB-280 Phase 3 R1 (Qodo finding — DoS prevention): Unattested
+    /// entries for communities that have no prior attestation are
+    /// DROPPED entirely. Prevents a network adversary on a library's
+    /// open Zenoh topic from creating fake-community memory pressure
+    /// via bad-sig broadcasts with `library_identity_pub` spoofed.
+    #[test]
+    fn aggregation_on_entry_unattested_dropped_when_no_prior_attestation() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x33; 16]);
+        let lib_addr = OwnerAddr([0xCC; 16]);
+        let entry =
+            build_signed_open_entry_for_library(community_id, [9u8; 32], OwnerAddr([0xAA; 16]));
+
+        let result = agg.on_entry(entry, AttestationStatus::Unattested(lib_addr));
+
+        assert!(matches!(result.outcome, OnEntryOutcome::Idempotent));
         assert!(
-            dto.unattested,
-            "DTO unattested = true when unattested_by non-empty"
+            agg.snapshot_all().is_empty(),
+            "Unattested entry for new community dropped — no aggregation created"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&lib_addr),
+            0,
+            "no per-library count bump for dropped Unattested"
+        );
+    }
+
+    /// ZEB-280 Phase 3 R1 (Qodo finding — cap-bypass prevention):
+    /// `per_library_count` tracks attested+unwrapped contributions
+    /// only. Unattested broadcasts (potentially from a network
+    /// adversary on the library's topic) cannot pump the count and
+    /// cause cap eviction of the library's legitimate attestations.
+    #[test]
+    fn aggregation_unattested_does_not_count_toward_per_library_cap() {
+        let mut agg = Aggregation::new();
+        let attested_lib = OwnerAddr([0xAA; 16]);
+        let unattested_lib = OwnerAddr([0xCC; 16]);
+
+        // Create an attested community.
+        let entry = build_signed_open_entry_for_library(SpaceId([1; 16]), [9u8; 32], attested_lib);
+        let _ = agg.on_entry(entry, AttestationStatus::Attested(attested_lib));
+
+        // Have unattested_lib unattested-broadcast many times for this
+        // community. Under R1 policy: each is a no-op for cap (community
+        // exists, after first insertion unattested_lib is in
+        // unattested_by; per_library_count NEVER counts unattested).
+        for _ in 0..100 {
+            let entry =
+                build_signed_open_entry_for_library(SpaceId([1; 16]), [9u8; 32], attested_lib);
+            let _ = agg.on_entry(entry, AttestationStatus::Unattested(unattested_lib));
+        }
+
+        assert_eq!(
+            agg.entry_count_for_library(&unattested_lib),
+            0,
+            "Unattested broadcasts don't count toward cap"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&attested_lib),
+            1,
+            "Attested broadcast counts once"
         );
     }
 

@@ -25,7 +25,7 @@ The Phase 3 design is intentionally wire-compatible with Phase 1: both new wrapp
 
 ## 3. Architecture overview
 
-```
+```text
 ┌────────────────────────────────────────────────────────────────┐
 │ Library X (publisher)                                          │
 │                                                                │

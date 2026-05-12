@@ -141,13 +141,17 @@ pub fn mock_library_entry_republished_by(
 }
 
 /// ZEB-280 Phase 3: build a deterministic library identity bundle +
-/// signing key. Mirrors `build_test_admin_identity` but with a stable
-/// X25519 prefix of `0x22 × 32` (distinct from admin's `0x11 × 32`).
+/// signing key. Mirrors `build_test_admin_identity` and uses the same
+/// X25519 prefix (`0x11 × 32`) — ZEB-280 R1 (CodeAnt) flagged the
+/// previous `0x22 × 32` prefix as a footgun: for the same Ed25519 seed,
+/// `build_test_library_identity` and `mock_library_announce` would
+/// derive *different* `OwnerAddr`s, silently breaking any test that
+/// crosses the two helpers.
 pub fn build_test_library_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
     let signing = SigningKey::from_bytes(&seed);
     let verifying = signing.verifying_key().to_bytes();
     let mut bundle = [0u8; 64];
-    bundle[..32].copy_from_slice(&[0x22; 32]);
+    bundle[..32].copy_from_slice(&[0x11; 32]);
     bundle[32..].copy_from_slice(&verifying);
     (signing, bundle)
 }
