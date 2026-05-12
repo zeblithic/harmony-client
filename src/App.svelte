@@ -1654,11 +1654,13 @@
 {/if}
 
 {#if libraryDirectoryOpen && libraryDirectoryService && tauriAdapter}
-  <!-- ZEB-218 Sub-D Phase 1: library directory browser modal. Click-to-
-       join feeds `invite_url` straight into `redeem_invite` — no new
-       join protocol surface (reuses ZEB-249's open-community invite
-       redemption path). Stale URLs handled by ZEB-249 §4.6 EpochCatchup
-       self-healing; no app-level retry needed here. -->
+  <!-- ZEB-218 Sub-D Phase 1 + Phase 6 (ZEB-252): library directory
+       browser modal. Click-to-join calls `join_open_community(community_id)`
+       which re-resolves the entry server-side and delegates to the
+       same `redeem_invite_inner` codepath RedeemInviteDialog uses
+       (full side-effects: nav-updated synth, kind tracking, selected-
+       community switch, member refresh). Stale URLs handled by ZEB-249
+       §4.6 EpochCatchup self-healing; no app-level retry needed here. -->
   <div
     class="modal-overlay"
     role="presentation"
@@ -1675,10 +1677,26 @@
       <LibraryDirectoryBrowser
         service={libraryDirectoryService}
         adapter={tauriAdapter}
-        onJoin={async (inviteUrl) => {
-          // Reuse the redeem path so nav-updated emit + side effects
-          // match exactly what RedeemInviteDialog does.
-          await tauriAdapter!.invoke('redeem_invite', { url: inviteUrl });
+        onJoin={async (communityId) => {
+          // ZEB-252 Sub-D Phase 6: typed direct-join. Backend re-resolves
+          // the matching directory entry server-side and delegates to
+          // the same redeem_invite_inner codepath RedeemInviteDialog uses.
+          // Side-effects (nav-updated synthesis, kind tracking, selected-
+          // community switch, member refresh) mirror the dialog handler
+          // at line ~1620+ so the directory click path produces the same
+          // post-join UX.
+          const dto = await communityService.joinOpenCommunity(communityId);
+          navService.addOrUpdateNavSpace({
+            action: 'added',
+            spaceId: dto.communityId,
+            kind: 'community',
+            name: dto.communityName,
+            members: [],
+            parentId: null,
+          });
+          libraryDirectoryOpen = false;
+          changeSelectedCommunity(dto.communityId);
+          await refreshCommunityMembers(dto.communityId);
         }}
         onClose={() => (libraryDirectoryOpen = false)}
       />
