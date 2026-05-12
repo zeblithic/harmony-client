@@ -475,3 +475,310 @@ async fn per_library_cap_evicts_oldest_on_overflow() {
     let snap = dir.snapshot_all().await;
     assert_eq!(snap.len(), MAX_ENTRIES_PER_LIBRARY);
 }
+
+// ── Test 8: click-to-join end-to-end smoke (spec §8) ─────────────────
+
+/// End-to-end smoke test for the ZEB-218 Sub-D Phase 1 spec §8
+/// click-to-join flow:
+///
+/// 1. A founder mints a real open-community invite URL (via
+///    `build_open_invite_url`, the same path the production
+///    `generate_invite` IPC uses).
+/// 2. A mock library publishes a `LibraryDirectoryEntry` carrying that
+///    URL — the joiner's `LibraryDirectory::process_sample` accepts
+///    and aggregates it.
+/// 3. The joiner reads the aggregated entry's `invite_url` (mirroring
+///    how the UI would pull it from `browse_library` and feed it to
+///    `redeem_invite`).
+/// 4. The joiner calls `redeem_invite_inner` (the inner of the
+///    `redeem_invite` IPC — same call path the click-to-join button
+///    in spec §8 invokes).
+/// 5. Assert: the joiner's `OwnerState.spaces` now contains a
+///    Community Space whose id matches the founder's community.
+///
+/// Validates that the entire reuse-existing-redeem_invite architecture
+/// holds end-to-end at the module-API level. No new join protocol
+/// surface needed; ZEB-249's open-community invite shape (unsealed
+/// 32-byte EpochKey) handles the actual join correctly.
+///
+/// Harness scope: follows the Task-4 `dm_send_integration.rs`-style
+/// direct-module-API pattern rather than the heavier two-engine
+/// in-memory Zenoh bridge of `community_open_flow_integration.rs`.
+/// The library-publishes step is driven via `process_sample` (the
+/// same in-process pipeline Tests 1-7 above use); the redeem step is
+/// driven via `redeem_invite_inner` (the same inner helper the
+/// `redeem_invite_inner_tests::happy_path_no_pending_transaction_after_success`
+/// unit test in `lib.rs` uses).
+#[tokio::test]
+async fn click_to_join_redeem_invite_smoke() {
+    use harmony_app::community_channel_log_engine::{
+        ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
+    };
+    use harmony_app::community_state_sync::{
+        CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
+    };
+    use harmony_app::content_store::{ContentStore, RuntimeContentStore};
+    use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey, SpaceKind};
+    use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex};
+
+    // ── Founder side: mint a real OPEN-community invite URL. ─────────
+    //
+    // The founder is just an identity + a fixed community_id +
+    // EpochKey. We don't need to spin up the founder's community-sync
+    // engine; the invite payload is self-describing per spec §5.2 —
+    // joiner's `redeem_invite_inner` cold-bootstraps from it.
+    //
+    // Importantly: the founder's `admin_identity_pub` must match the
+    // `community_admin_identity_pub` in the directory entry, because
+    // the joiner's `verify_entry` checks both the entry's signature
+    // (Ed25519 over canonical CBOR) AND that the URL's `admin_addr`
+    // resolves consistently with the entry's identity_pub. The
+    // `mock_directory_entry` fixture's `admin_seed` parameter drives
+    // both — we use the same seed for the URL's admin_addr derivation.
+    let founder_seed = [0x55u8; 32];
+    let founder_signing = ed25519_dalek::SigningKey::from_bytes(&founder_seed);
+    let founder_ed_pub = founder_signing.verifying_key().to_bytes();
+    let mut founder_identity_pub = [0u8; 64];
+    founder_identity_pub[..32].copy_from_slice(&[0x11; 32]);
+    founder_identity_pub[32..].copy_from_slice(&founder_ed_pub);
+    // The directory entry's `community_admin_identity_pub` field is
+    // the 64-byte (X25519||Ed25519) compound; the URL's `admin_addr`
+    // is the 16-byte OwnerAddr derived from the same identity. For
+    // this smoke test we use a fixed OwnerAddr — the joiner's
+    // `redeem_invite_inner` doesn't verify the URL's admin_addr
+    // against the directory entry (the directory layer is what
+    // cross-checks those; for click-to-join we only need the URL to
+    // decode + redeem cleanly).
+    let founder_owner_addr = OwnerAddr([0xAA; 16]);
+
+    let community_id = SpaceId([0xC0; 16]);
+    let membership_key = EpochKey::new([0xEC; 32]);
+
+    let invite_payload = CommunityInvitePayload {
+        community_id,
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: membership_key.as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
+        admin_addr: founder_owner_addr,
+        community_name: "Founder Community".into(),
+        is_invite_only: false,
+        expires_at: None,
+        invite_token: None,
+        admin_bootstrap: None,
+        admin_identity_pub: None,
+    };
+    let founder_invite_url =
+        harmony_app::build_open_invite_url(&invite_payload).expect("build open invite url");
+
+    // ── Library side: publish a directory entry carrying the URL. ────
+    //
+    // Reuses the same `process_sample` pipeline as Tests 1-7 — exact
+    // same code path the production Zenoh subscriber drives in
+    // `event_loop.rs`. The `mock_directory_entry` fixture signs the
+    // entry with the founder's identity seed so `verify_entry`
+    // accepts it.
+    let dir = build_directory();
+    let library_addr = OwnerAddr([0xBB; 16]);
+    let entry = mock_directory_entry(
+        community_id,
+        founder_seed,
+        library_addr,
+        hlc(1_000),
+        founder_invite_url.clone(),
+        "Founder Community",
+        "smoke-test target",
+        vec!["smoke".into()],
+    );
+    let outcome = dir
+        .process_sample(encode_entry(&entry))
+        .await
+        .expect("process_sample");
+    assert!(
+        matches!(
+            outcome,
+            harmony_app::library_directory::OnEntryOutcome::Inserted(_)
+        ),
+        "directory entry must aggregate, got {outcome:?}"
+    );
+
+    // The joiner's UI would call browse_library() and read entry
+    // DTOs. Here we go through `snapshot_all` (the underlying state
+    // browse_library projects from) and extract the URL exactly as
+    // the click-to-join button would.
+    let snap = dir.snapshot_all().await;
+    assert_eq!(snap.len(), 1, "exactly the founder's entry aggregated");
+    let click_to_join_url = snap[0].entry.invite_url.clone();
+    assert_eq!(
+        click_to_join_url, founder_invite_url,
+        "directory URL must round-trip unchanged"
+    );
+
+    // ── Joiner side: build a minimal redeem_invite_inner fixture. ────
+    //
+    // Mirrors `redeem_invite_inner_tests::build_redeem_invite_test_fixture`
+    // (in `lib.rs`) but inlined here since fixtures are private to
+    // the crate. Same shape: a CommunitySyncRegistry + ChannelLogRegistry
+    // + DmOutbox + crdt_state + hlc_tracker, plus adapter/unicast
+    // channels whose receivers are kept alive so try_send doesn't
+    // observe Closed.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+    let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
+    let joiner_pub_64 = joiner_identity.identity.to_public_bytes();
+    let joiner_signing_key = {
+        let private_bytes = joiner_identity.to_private_bytes();
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&private_bytes[32..64]);
+        Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
+    };
+
+    // Identity resolver — admits the joiner's own signature on the
+    // bootstrap Join. Founder isn't reached on the OPEN path (no
+    // counter-sign dance), so we only need the joiner here.
+    struct JoinerResolver {
+        joiner: OwnerAddr,
+        joiner_pub: [u8; 64],
+    }
+    #[async_trait::async_trait]
+    impl IdentityResolver for JoinerResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            if *addr == self.joiner {
+                Some(self.joiner_pub)
+            } else {
+                None
+            }
+        }
+    }
+
+    // CAS servicer stub (drains the channel so `put_local` doesn't
+    // block forever on a oneshot reply). Mirrors the pattern from
+    // `community_sync_integration::redeem_invite_only_rolls_back_when_inviter_unreachable`.
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
+    tokio::spawn(async move {
+        while let Some(op) = cas_op_rx.recv().await {
+            match op {
+                harmony_app::content_store::CasOp::PutLocal { reply, .. } => {
+                    if let Some(r) = reply {
+                        let _ = r.send(Ok(()));
+                    }
+                }
+                harmony_app::content_store::CasOp::GetOrFetch { reply, .. } => {
+                    let _ = reply.send(Ok(None));
+                }
+            }
+        }
+    });
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        Duration::from_millis(1000),
+    ));
+
+    let community_registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "joiner-dev".into(),
+        content_store: cs,
+        identity_resolver: Arc::new(JoinerResolver {
+            joiner: joiner_owner,
+            joiner_pub: joiner_pub_64,
+        }),
+        identity_dir: tmp.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: joiner_owner,
+        signing_key: Arc::clone(&joiner_signing_key),
+        crdt_state: None,
+    }));
+
+    let (community_adapter_tx, _community_adapter_rx) =
+        mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(16);
+    let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+    let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
+        "joiner-dev".into(),
+        joiner_owner,
+        DeviceIdentityHash(joiner_identity.identity.address_hash),
+        Arc::clone(&joiner_signing_key),
+        Arc::new(joiner_identity),
+    )));
+
+    let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+        mpsc::unbounded_channel::<harmony_app::event_loop::ChannelLogAdapterRequest>();
+    let app = tauri::test::mock_app();
+    let channel_log_registry = Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+        adapter_request_tx: channel_log_adapter_tx,
+        app: app.handle().clone(),
+        identity_dir: tmp.path().to_path_buf(),
+        self_owner: joiner_owner,
+        self_device_id: "joiner-dev".into(),
+        signing_key: Arc::clone(&joiner_signing_key),
+        engine_config: ChannelLogEngineConfig::default(),
+    }));
+
+    let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
+    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+
+    // Pre-call snapshot: joiner has no Spaces.
+    {
+        let g = crdt_state.lock().await;
+        assert!(
+            g.spaces.is_empty(),
+            "joiner owner-state must start empty (no Spaces)"
+        );
+    }
+
+    // ── Click: drive redeem_invite_inner with the URL from the entry. ─
+    let result = harmony_app::redeem_invite_inner(
+        click_to_join_url,
+        Arc::clone(&crdt_state),
+        Arc::clone(&hlc_tracker),
+        "joiner-dev".into(),
+        joiner_owner,
+        Arc::clone(&joiner_signing_key),
+        Arc::clone(&community_registry),
+        community_adapter_tx,
+        unicast_send_tx,
+        Arc::clone(&dm_outbox),
+        Arc::clone(&channel_log_registry),
+        || Ok(()),
+    )
+    .await;
+
+    let dto = result.expect("click-to-join redeem must succeed for OPEN invite");
+    assert_eq!(
+        dto.community_id,
+        hex::encode(community_id.0),
+        "DTO must echo the founder's community_id"
+    );
+    assert!(!dto.is_invite_only, "URL was OPEN");
+    assert_eq!(dto.community_name, "Founder Community");
+
+    // ── Assert: founder's community Space landed in joiner's owner-state. ─
+    let g = crdt_state.lock().await;
+    let space = g
+        .spaces
+        .get(&community_id)
+        .expect("joiner OwnerState.spaces must contain the founder's community after redeem");
+    assert_eq!(space.kind, SpaceKind::Community);
+    assert_eq!(space.id, community_id);
+    assert_eq!(space.name, "Founder Community");
+    assert_eq!(
+        space.admin_addr,
+        Some(founder_owner_addr),
+        "Space.admin_addr must carry the URL's admin_addr"
+    );
+    assert_eq!(space.is_invite_only, Some(false));
+
+    drop(g);
+    community_registry
+        .shutdown_all()
+        .await
+        .expect("registry shutdown");
+}
