@@ -233,6 +233,68 @@ describe('LibraryDirectoryBrowser', () => {
       });
     });
 
+    // F5 (CodeAnt + CodeRabbit Major Logic): the discovered panel
+    // auto-expands once on first non-empty observation, then never
+    // re-opens after the user manually toggles it. Previously, every
+    // refresh re-applied `if (n>0 && !open) open = true`, so manual
+    // collapse was non-sticky.
+    it('discovered_panel_stays_collapsed_after_user_collapses', async () => {
+      const listenerBox: { fn: (() => void) | null } = { fn: null };
+      const adapter = {
+        invoke: vi.fn(),
+        listen: vi.fn(async (event: string, cb: () => void) => {
+          if (event === 'library-directory-updated') listenerBox.fn = cb;
+          return () => {};
+        }),
+      } as unknown as TauriAdapter;
+
+      // Drive the discovered list via successive resolves: start empty,
+      // then non-empty (auto-opens), then non-empty again after user
+      // collapsed (must stay collapsed).
+      const discoveredA = [
+        { libraryAddr: 'aa'.padEnd(32, '0'), name: 'LibA', description: '', listedAt: '0' },
+      ];
+      const listDiscovered = vi
+        .fn()
+        .mockResolvedValueOnce([]) // initial refresh: empty → stays collapsed
+        .mockResolvedValueOnce(discoveredA) // 2nd refresh: non-empty → auto-opens
+        .mockResolvedValueOnce(discoveredA); // 3rd refresh: still non-empty → must stay closed after manual collapse
+      const svc = {
+        list: vi.fn().mockResolvedValue([]),
+        browse: vi.fn().mockResolvedValue([]),
+        listDiscovered,
+        add: vi.fn(),
+        remove: vi.fn(),
+      } as unknown as LibraryDirectoryService;
+
+      const { findByText, queryByText } = render(LibraryDirectoryBrowser, {
+        props: { service: svc, adapter, onJoin: vi.fn(), onClose: vi.fn() },
+      });
+
+      // First render: initial refresh returns []. Section is collapsed.
+      expect(await findByText(/▶ Discovered libraries \(0\)/)).toBeInTheDocument();
+      await waitFor(() => expect(listenerBox.fn).not.toBeNull());
+
+      // Trigger the second refresh via the listener — list now has 1
+      // entry, auto-expand fires (▼ glyph).
+      listenerBox.fn?.();
+      // Debounce window is 200ms; wait it out plus a margin.
+      await new Promise((r) => setTimeout(r, 250));
+      expect(await findByText(/▼ Discovered libraries \(1\)/)).toBeInTheDocument();
+
+      // User manually collapses the panel by clicking the toggle.
+      await fireEvent.click(await findByText(/▼ Discovered libraries \(1\)/));
+      expect(await findByText(/▶ Discovered libraries \(1\)/)).toBeInTheDocument();
+
+      // Trigger another refresh — discovered is STILL non-empty, but
+      // because the user manually toggled, auto-expand must NOT fire.
+      listenerBox.fn?.();
+      await new Promise((r) => setTimeout(r, 250));
+      // Still collapsed: ▶ glyph, not ▼.
+      expect(await findByText(/▶ Discovered libraries \(1\)/)).toBeInTheDocument();
+      expect(queryByText(/▼ Discovered libraries/)).toBeNull();
+    });
+
     it('add_failure_surfaces_inline', async () => {
       const libAddr = 'fail'.padEnd(32, '0');
       const svc = {

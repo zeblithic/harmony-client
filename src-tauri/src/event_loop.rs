@@ -729,49 +729,94 @@ pub async fn run<R: Runtime>(
             let closing_announce = Arc::clone(&closing);
             tokio::spawn(async move {
                 let key_expr = "harmony/discovery/library/announce";
-                let sub = match session_for_announce.declare_subscriber(key_expr).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "declare_subscriber failed for library announce — auto-discovery disabled this session"
-                        );
-                        return;
-                    }
-                };
+                // F4 (CodeAnt Major): outer retry loop. Previously
+                // declare_subscriber failures and mid-session recv_async
+                // errors permanently disabled auto-discovery; now we
+                // exponentially back off and re-declare so a transient
+                // transport hiccup doesn't kill discovery for the session.
+                let mut backoff = std::time::Duration::from_secs(5);
+                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
                 loop {
-                    match sub.recv_async().await {
-                        Ok(sample) => {
-                            let bytes = sample.payload().to_bytes().to_vec();
-                            match dir.process_announce(bytes).await {
-                                Ok(result) => {
-                                    let changed = matches!(
-                                        result.outcome,
-                                        crate::library_directory::AnnounceOutcome::Inserted(_)
-                                            | crate::library_directory::AnnounceOutcome::Updated(_)
+                    if closing_announce.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let sub = match session_for_announce.declare_subscriber(key_expr).await {
+                        Ok(s) => {
+                            // Reset backoff on each successful declare so a
+                            // long-lived subscriber that briefly hiccups
+                            // doesn't start from a 60s wait next time.
+                            backoff = std::time::Duration::from_secs(5);
+                            s
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "library announce declare_subscriber failed; retrying after backoff",
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                    loop {
+                        match sub.recv_async().await {
+                            Ok(sample) => {
+                                let bytes_view = sample.payload().to_bytes();
+                                // F3 (CodeAnt Critical Security): drop oversized
+                                // payloads BEFORE materializing into an owned
+                                // Vec<u8>. The announce topic is global — any
+                                // peer can publish, so an attacker could
+                                // flood-DoS via attacker-sized frames otherwise.
+                                if bytes_view.len()
+                                    > crate::library_directory::MAX_ANNOUNCE_WIRE_BYTES
+                                {
+                                    tracing::warn!(
+                                        size = bytes_view.len(),
+                                        max = crate::library_directory::MAX_ANNOUNCE_WIRE_BYTES,
+                                        "oversized library announce dropped"
                                     );
-                                    if changed || result.evicted.is_some() {
-                                        let _ = app_for_announce.emit(
-                                            "library-directory-updated",
-                                            serde_json::json!({ "communityId": null }),
+                                    continue;
+                                }
+                                let bytes = bytes_view.to_vec();
+                                match dir.process_announce(bytes).await {
+                                    Ok(result) => {
+                                        let changed = matches!(
+                                            result.outcome,
+                                            crate::library_directory::AnnounceOutcome::Inserted(_)
+                                                | crate::library_directory::AnnounceOutcome::Updated(_)
+                                        );
+                                        if changed || result.evicted.is_some() {
+                                            let _ = app_for_announce.emit(
+                                                "library-directory-updated",
+                                                serde_json::json!({ "communityId": null }),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "library announce rejected"
                                         );
                                     }
                                 }
-                                Err(e) => {
+                            }
+                            Err(_) => {
+                                if !closing_announce.load(Ordering::SeqCst) {
                                     tracing::warn!(
-                                        error = ?e,
-                                        "library announce rejected"
+                                        "library announce subscriber closed unexpectedly; reconnecting"
                                     );
                                 }
+                                break; // break inner loop → outer redeclares
                             }
-                        }
-                        Err(_) => {
-                            if !closing_announce.load(Ordering::SeqCst) {
-                                tracing::warn!("library announce subscriber closed unexpectedly");
-                            }
-                            break;
                         }
                     }
+                    if closing_announce.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Brief pause before re-declaring on mid-session
+                    // recv_async failure (transport hiccup case).
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             });
         }

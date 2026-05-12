@@ -175,6 +175,18 @@ pub const MAX_ENTRIES_PER_LIBRARY: usize = 10_000;
 /// libraries, not per-library entries. Spec §4.2 / §10.
 pub const MAX_DISCOVERED_LIBRARIES: usize = 1_000;
 
+/// Hard cap on the wire size of a single `LibraryAnnounce` payload
+/// before CBOR decode. The caller (the Zenoh announce subscriber)
+/// MUST drop payloads larger than this without allocating them into
+/// owned `Vec<u8>` buffers downstream of `to_bytes()`. Bound rationale:
+/// `name` (≤ 200) + `description` (≤ 2000) + `library_identity_pub`
+/// (64) + `library_signature` (64) + `Hlc` (≈ 20) + CBOR framing
+/// overhead ≈ 2.4 KB worst-case canonical payload. 4 KB is ~1.6×
+/// headroom — generous enough to survive minor schema additions while
+/// still bounding adversarial allocations on the global
+/// `harmony/discovery/library/announce` topic.
+pub const MAX_ANNOUNCE_WIRE_BYTES: usize = 4_096;
+
 /// Verification error categories for `LibraryAnnounce`. Mirrors
 /// `EntryVerifyError` but simpler — no invite URL, no
 /// community/admin payload binding. Each variant surfaces as a
@@ -182,6 +194,8 @@ pub const MAX_DISCOVERED_LIBRARIES: usize = 1_000;
 /// caller's perspective.
 #[derive(Debug, thiserror::Error)]
 pub enum AnnounceVerifyError {
+    #[error("CBOR decode failed: {0}")]
+    DecodeFailed(String),
     #[error("malformed library identity_pub: {0}")]
     InvalidIdentityPub(String),
     #[error("canonical CBOR encode failed: {0}")]
@@ -800,11 +814,8 @@ impl LibraryDirectory {
         &self,
         bytes: Vec<u8>,
     ) -> Result<AnnounceProcessResult, AnnounceVerifyError> {
-        let announce: LibraryAnnounce = ciborium::from_reader(&bytes[..]).map_err(|e| {
-            AnnounceVerifyError::Encode(crate::owner_state_crypto::CryptoError::CborDecode(
-                format!("{e}"),
-            ))
-        })?;
+        let announce: LibraryAnnounce = ciborium::from_reader(&bytes[..])
+            .map_err(|e| AnnounceVerifyError::DecodeFailed(format!("{e}")))?;
         let library_addr = verify_announce(&announce)?;
         let mut announces = self.announces.lock().await;
         Ok(announces.on_announce(library_addr, announce))

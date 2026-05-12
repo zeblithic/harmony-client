@@ -23,7 +23,8 @@
 mod common;
 
 use harmony_app::library_directory::{
-    AnnounceOutcome, AnnounceVerifyError, LibraryDirectory, MAX_DISCOVERED_LIBRARIES,
+    AnnounceOutcome, AnnounceVerifyError, LibraryDirectory, MAX_ANNOUNCE_WIRE_BYTES,
+    MAX_DISCOVERED_LIBRARIES,
 };
 
 #[tokio::test]
@@ -101,9 +102,9 @@ async fn announce_invalid_sig_rejected() {
     assert!(
         matches!(
             err,
-            AnnounceVerifyError::SignatureInvalid | AnnounceVerifyError::Encode(_)
+            AnnounceVerifyError::SignatureInvalid | AnnounceVerifyError::DecodeFailed(_)
         ),
-        "expected SignatureInvalid (or Encode if the bit flip broke CBOR structure), got {:?}",
+        "expected SignatureInvalid (or DecodeFailed if the bit flip broke CBOR structure), got {:?}",
         err,
     );
 
@@ -220,4 +221,36 @@ async fn announce_filter_omits_already_added_libraries() {
         filtered.is_empty(),
         "already-added library must be filtered out of the discovered list",
     );
+}
+
+/// F3 (CodeAnt Critical Security): the announce subscriber in
+/// `event_loop.rs` checks payload size BEFORE handing bytes to
+/// `process_announce`, so the wire-size cap is enforced upstream of
+/// this entrypoint. This test exercises the secondary defense: if any
+/// oversized buffer ever reaches `process_announce` (e.g., a future
+/// caller that forgets the upstream check), CBOR decode rejects the
+/// shape with `DecodeFailed`. It also documents the `MAX_ANNOUNCE_WIRE_BYTES`
+/// constant's intent: payloads above this bound are adversarial and
+/// MUST never be allocated by the subscriber.
+#[tokio::test]
+async fn announce_oversized_payload_dropped() {
+    let (dir, _rx) = LibraryDirectory::new();
+    // Construct a payload one byte larger than the bound. Pure-zero
+    // bytes won't parse as a CBOR map for `LibraryAnnounce`, so we
+    // expect a `DecodeFailed` error. The point isn't to test CBOR — it's
+    // to document that oversized payloads are unconditionally rejected.
+    let oversized = vec![0u8; MAX_ANNOUNCE_WIRE_BYTES + 1];
+    let err = dir.process_announce(oversized).await.unwrap_err();
+    // `DecodeFailed` is expected since pure 0x00 bytes don't decode as a
+    // canonical CBOR `LibraryAnnounce`. Allow other verify errors too in
+    // case a future codec change makes some zero-filled prefix parse —
+    // the wire-size check in `event_loop.rs` is the load-bearing
+    // defense; this test just verifies `process_announce` is itself
+    // robust to oversized inputs (no panic, returns error).
+    assert!(
+        matches!(err, AnnounceVerifyError::DecodeFailed(_)),
+        "expected DecodeFailed for oversized garbage payload, got {:?}",
+        err,
+    );
+    assert_eq!(dir.announces.lock().await.snapshot().len(), 0);
 }

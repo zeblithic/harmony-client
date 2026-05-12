@@ -178,7 +178,10 @@ pub struct DiscoveredLibraryInfo {
     pub library_addr: String,
     pub name: String,
     pub description: String,
-    /// ISO-8601 string from `listed_at.wall_ms` for UI display only.
+    /// Base-10 string of `listed_at.wall_ms` for UI display only.
+    /// HLC ordering decisions MUST NOT use this value — the wall_ms
+    /// projection drops the logical+device_id tie-break fields. The
+    /// frontend formats this for human-readable timestamps.
     pub listed_at: String,
 }
 

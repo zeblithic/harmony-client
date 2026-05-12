@@ -47,6 +47,13 @@
   // from `discovered` to `libraries` on the next refetch after `add`.
   let discovered: DiscoveredLibraryInfo[] = $state([]);
   let discoveredOpen: boolean = $state(false);
+  // F5 (CodeAnt + CodeRabbit): once the user touches the toggle, auto-
+  // expand on refresh stops firing — otherwise every refresh with N>0
+  // would re-open a panel the user just collapsed. The flag also flips
+  // on the FIRST auto-expand so subsequent N=0 → N>0 transitions don't
+  // re-trigger either (the auto-expand fires exactly once over the
+  // component's lifetime).
+  let discoveredManuallyToggled: boolean = $state(false);
   let addingDiscovered: Record<string, boolean> = $state({});
   let discoveredError: Record<string, string> = $state({});
 
@@ -76,12 +83,18 @@
       discovered = [];
     }
     // Auto-expand the section the first time we observe entries.
-    // Doing this in `refresh()` (not a $effect) avoids re-expanding
-    // every time the array reference changes after the user has
-    // explicitly collapsed it.
-    if (discovered.length > 0 && !discoveredOpen) {
+    // F5: only fire if the user has NEVER touched the toggle. Manual
+    // collapse is sticky — re-opening a panel the user just dismissed
+    // is hostile.
+    if (discovered.length > 0 && !discoveredOpen && !discoveredManuallyToggled) {
       discoveredOpen = true;
+      discoveredManuallyToggled = true;
     }
+  }
+
+  function toggleDiscovered() {
+    discoveredOpen = !discoveredOpen;
+    discoveredManuallyToggled = true;
   }
 
   function scheduleRefresh() {
@@ -130,8 +143,10 @@
   async function handleAddDiscovered(libraryAddr: string) {
     addingDiscovered[libraryAddr] = true;
     discoveredError[libraryAddr] = '';
+    let succeeded = false;
     try {
       await service.add(libraryAddr);
+      succeeded = true;
       // Refetch is also triggered by the `library-directory-updated`
       // event listener, but call explicitly here as belt-and-suspenders
       // for cases where the event hasn't propagated yet (or to flush
@@ -140,7 +155,14 @@
     } catch (e) {
       discoveredError[libraryAddr] = e instanceof Error ? e.message : String(e);
     } finally {
-      addingDiscovered[libraryAddr] = false;
+      // F6 (CodeAnt Minor): prune per-item state maps rather than
+      // setting `false` / empty string. Across long sessions where
+      // many discovered rows are added, unbounded growth here is a
+      // small but real leak.
+      delete addingDiscovered[libraryAddr];
+      if (succeeded) {
+        delete discoveredError[libraryAddr];
+      }
     }
   }
 
@@ -209,7 +231,7 @@
       <button
         type="button"
         class="discovered-toggle"
-        onclick={() => (discoveredOpen = !discoveredOpen)}
+        onclick={toggleDiscovered}
         aria-expanded={discoveredOpen}
       >
         {discoveredOpen ? '▼' : '▶'} Discovered libraries ({discovered.length})
@@ -266,7 +288,7 @@
       <button
         type="button"
         class="discovered-toggle"
-        onclick={() => (discoveredOpen = !discoveredOpen)}
+        onclick={toggleDiscovered}
         aria-expanded={discoveredOpen}
       >
         {discoveredOpen ? '▼' : '▶'} Discovered libraries ({discovered.length})
