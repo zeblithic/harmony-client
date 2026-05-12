@@ -30,7 +30,7 @@ Deferred to Phase 2.1 follow-ups (see §12): persistent dismiss-list, TTL, per-s
 
 ## 3. Architecture overview
 
-```
+```text
   Zenoh topic                              consumer (each device)
   ───────────                              ────────────────────────
   harmony/discovery/library/announce ───► single subscriber (event_loop)
@@ -206,7 +206,7 @@ Sort: newest `listed_at` first (helps users see fresh announces at the top of th
 
 A new section between "Your libraries" and the bottom add-manual affordance:
 
-```
+```text
 +---- Library Directory ---------------+
 | Your libraries (2)                   |
 |  [chip] LibX (abcd…)  [Remove]       |

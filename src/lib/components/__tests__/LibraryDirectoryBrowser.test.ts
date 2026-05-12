@@ -134,9 +134,14 @@ describe('LibraryDirectoryBrowser', () => {
     await waitFor(() => expect(listenerBox.fn).not.toBeNull());
     listenerBox.fn?.();
     listenerBox.fn?.(); // multiple events within debounce window — still one refetch
-    await new Promise((r) => setTimeout(r, 250));
-    // Initial + ONE debounced refetch = 2 calls.
-    expect(svc.list).toHaveBeenCalledTimes(2);
+    // R2 F3 (CodeRabbit): use `waitFor` for a condition-based wait rather
+    // than a fixed 250ms sleep so the test doesn't break if the debounce
+    // window changes. `waitFor` polls until the assertion passes or times
+    // out, so it tolerates any debounce ≤ the default timeout (1000ms).
+    await waitFor(() => {
+      // Initial + ONE debounced refetch = 2 calls.
+      expect(svc.list).toHaveBeenCalledTimes(2);
+    });
   });
 
   // R2 F4: previously the remove-library handler only console.warn'd on
@@ -278,8 +283,15 @@ describe('LibraryDirectoryBrowser', () => {
       // Trigger the second refresh via the listener — list now has 1
       // entry, auto-expand fires (▼ glyph).
       listenerBox.fn?.();
-      // Debounce window is 200ms; wait it out plus a margin.
-      await new Promise((r) => setTimeout(r, 250));
+      // R2 F3 (CodeRabbit): replace the fixed 250ms sleep with
+      // `waitFor` so the test doesn't break if the debounce window
+      // changes. `findByText` already polls, so the subsequent assert
+      // is naturally condition-based — but we explicitly wait for the
+      // second listDiscovered call to land first to make the intent
+      // (debounce flushed → second refresh observed) explicit.
+      await waitFor(() => {
+        expect(listDiscovered).toHaveBeenCalledTimes(2);
+      });
       expect(await findByText(/▼ Discovered libraries \(1\)/)).toBeInTheDocument();
 
       // User manually collapses the panel by clicking the toggle.
@@ -289,7 +301,9 @@ describe('LibraryDirectoryBrowser', () => {
       // Trigger another refresh — discovered is STILL non-empty, but
       // because the user manually toggled, auto-expand must NOT fire.
       listenerBox.fn?.();
-      await new Promise((r) => setTimeout(r, 250));
+      await waitFor(() => {
+        expect(listDiscovered).toHaveBeenCalledTimes(3);
+      });
       // Still collapsed: ▶ glyph, not ▼.
       expect(await findByText(/▶ Discovered libraries \(1\)/)).toBeInTheDocument();
       expect(queryByText(/▼ Discovered libraries/)).toBeNull();

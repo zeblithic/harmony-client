@@ -218,15 +218,10 @@
     <button type="button" class="close-btn" aria-label="Close" onclick={onClose}>✕</button>
   </header>
 
-  {#if libraries.length === 0}
-    <div class="empty">
-      <p>Add a library to start browsing communities.</p>
-      <button type="button" class="primary" onclick={() => (addDialogOpen = true)}>
-        + Add a library
-      </button>
-    </div>
-    <!-- ZEB-279: discovered panel may surface entries even before the
-         user has added any library — show it in the empty state too. -->
+  <!-- ZEB-279 R2 F1: discovered-section template extracted to a single
+       {#snippet} so both the empty-libraries-CTA branch and the populated
+       branch render the same markup. Future updates touch one place. -->
+  {#snippet discoveredPanel()}
     <section class="discovered-section">
       <button
         type="button"
@@ -261,6 +256,18 @@
         </ul>
       {/if}
     </section>
+  {/snippet}
+
+  {#if libraries.length === 0}
+    <div class="empty">
+      <p>Add a library to start browsing communities.</p>
+      <button type="button" class="primary" onclick={() => (addDialogOpen = true)}>
+        + Add a library
+      </button>
+    </div>
+    <!-- ZEB-279: discovered panel may surface entries even before the
+         user has added any library — show it in the empty state too. -->
+    {@render discoveredPanel()}
   {:else}
     <div class="libraries-bar">
       {#each libraries as lib (lib.address)}
@@ -284,40 +291,7 @@
 
     <!-- ZEB-279 Sub-D Phase 2: discovered libraries section.
          Click-to-toggle; auto-expanded by refresh() when N>0. -->
-    <section class="discovered-section">
-      <button
-        type="button"
-        class="discovered-toggle"
-        onclick={toggleDiscovered}
-        aria-expanded={discoveredOpen}
-      >
-        {discoveredOpen ? '▼' : '▶'} Discovered libraries ({discovered.length})
-      </button>
-      {#if discoveredOpen}
-        <ul class="discovered-list">
-          {#each discovered as d (d.libraryAddr)}
-            <li class="discovered-row">
-              <div class="discovered-meta">
-                <strong>{d.name}</strong>
-                <span class="discovered-desc">{d.description}</span>
-                <span class="discovered-addr">({shortAddr(d.libraryAddr)})</span>
-              </div>
-              <button
-                type="button"
-                class="discovered-add"
-                onclick={() => handleAddDiscovered(d.libraryAddr)}
-                disabled={addingDiscovered[d.libraryAddr]}
-              >
-                {addingDiscovered[d.libraryAddr] ? 'Adding…' : 'Add'}
-              </button>
-              {#if discoveredError[d.libraryAddr]}
-                <span class="discovered-error" role="alert">{discoveredError[d.libraryAddr]}</span>
-              {/if}
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </section>
+    {@render discoveredPanel()}
 
     {#if entries.length === 0}
       <p class="empty-catalog">No communities listed yet.</p>
