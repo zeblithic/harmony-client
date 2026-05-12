@@ -600,6 +600,10 @@ pub async fn run<R: Runtime>(
         (library_directory, library_request_rx)
     {
         let library_directory_handle = library_directory.clone();
+        // ZEB-279 Sub-D Phase 2: hold a second clone for the permanent
+        // announce-topic subscriber spawned after this per-library
+        // spawn (which consumes `library_directory_handle`).
+        let library_directory_for_announce = library_directory.clone();
         let mut request_rx = library_request_rx;
         let session_for_libdir = Arc::clone(&session_arc);
         let app_for_libdir = app.clone();
@@ -712,6 +716,65 @@ pub async fn run<R: Runtime>(
                 }
             }
         });
+
+        // ZEB-279 Sub-D Phase 2: permanent announce-topic subscriber.
+        // Single fixed-key subscription, lifetime = app lifetime — no
+        // add/remove plumbing. Mirrors the per-library subscriber shape
+        // above but without the request-channel (the announce key is
+        // a fixed exact-match string; everyone listens to it always).
+        {
+            let dir = library_directory_for_announce;
+            let session_for_announce = Arc::clone(&session_arc);
+            let app_for_announce = app.clone();
+            let closing_announce = Arc::clone(&closing);
+            tokio::spawn(async move {
+                let key_expr = "harmony/discovery/library/announce";
+                let sub = match session_for_announce.declare_subscriber(key_expr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "declare_subscriber failed for library announce — auto-discovery disabled this session"
+                        );
+                        return;
+                    }
+                };
+                loop {
+                    match sub.recv_async().await {
+                        Ok(sample) => {
+                            let bytes = sample.payload().to_bytes().to_vec();
+                            match dir.process_announce(bytes).await {
+                                Ok(result) => {
+                                    let changed = matches!(
+                                        result.outcome,
+                                        crate::library_directory::AnnounceOutcome::Inserted(_)
+                                            | crate::library_directory::AnnounceOutcome::Updated(_)
+                                    );
+                                    if changed || result.evicted.is_some() {
+                                        let _ = app_for_announce.emit(
+                                            "library-directory-updated",
+                                            serde_json::json!({ "communityId": null }),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "library announce rejected"
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if !closing_announce.load(Ordering::SeqCst) {
+                                tracing::warn!("library announce subscriber closed unexpectedly");
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────

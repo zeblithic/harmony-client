@@ -797,7 +797,7 @@ impl LibraryDirectory {
     /// caller can emit `library-directory-updated` on non-`Idempotent`
     /// changes (or on orthogonal cap-eviction).
     pub async fn process_announce(
-        self: &Arc<Self>,
+        &self,
         bytes: Vec<u8>,
     ) -> Result<AnnounceProcessResult, AnnounceVerifyError> {
         let announce: LibraryAnnounce = ciborium::from_reader(&bytes[..]).map_err(|e| {
