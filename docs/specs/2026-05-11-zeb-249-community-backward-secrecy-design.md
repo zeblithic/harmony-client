@@ -164,7 +164,7 @@ The materializer tracks `pending_rotation_for: BTreeSet<OwnerAddr>` (members who
 
 Materialization rules:
 
-```
+```rust
 match event {
     Kick { target } | Leave { } => {
         state.members.remove(target);
@@ -223,7 +223,7 @@ Remediation via `EpochCatchup`:
 
 **Materializer state**: `pending_catchup_for: BTreeSet<OwnerAddr>` tracks new members at stale epochs.
 
-```
+```rust
 match event {
     BootstrapJoin { new_member, snapshot_epoch } => {
         state.members.insert(new_member, ...);
@@ -447,7 +447,7 @@ The two load-bearing correctness tests are `concurrent_kicks_self_heal` (integra
 
 ### 7.1 EpochRotation event (CBOR)
 
-```
+```text
 {
   "tg": "r",
   "vl": {
@@ -467,7 +467,7 @@ At N=10k members: 92 × 9999 ≈ 920 KB per rotation event. At N=20k: 92 × 1999
 
 ### 7.2 EncryptedEnvelope (CBOR)
 
-```
+```text
 {
   "ep": 5,                                // epoch
   "nc": h'010203040506070809abcdef',      // 12-byte nonce
@@ -480,7 +480,7 @@ At N=10k members: 92 × 9999 ≈ 920 KB per rotation event. At N=20k: 92 × 1999
 
 ### 7.3 InviteEpochSnapshot in CommunityInvitePayload (CBOR)
 
-```
+```text
 {
   // existing CommunityInvitePayload fields...
   "es": {                                 // epoch_snapshot
@@ -497,7 +497,7 @@ At N=10k members: 92 × 9999 ≈ 920 KB per rotation event. At N=20k: 92 × 1999
 
 ### 7.4 EpochCatchup event (CBOR)
 
-```
+```text
 {
   "tg": "f",
   "vl": {

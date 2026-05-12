@@ -543,7 +543,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         decode_invite_url, encode_invite_url, verify_admin_bootstrap, RedeemBootstrapVerifyError,
     };
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
     let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
     let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
@@ -572,11 +572,16 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     // Tamper: flip a single bit in the signature.
     alice_bootstrap.sig[0] ^= 0x01;
 
+    // sealed_epoch_key must be 92 bytes for invite-only (32 ephemeral_pub +
+    // 12 nonce + 32 ct + 16 tag). The exact value is irrelevant for this
+    // test — we're asserting on the tampered admin_bootstrap.sig rejection,
+    // not the key content. Use a valid-length vector of 0xDD bytes.
+    // ZEB-249 PR #106 R5: encode_invite_url now enforces this length.
     let invite_url = encode_invite_url(&CommunityInvitePayload {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key: EpochKey::new([0xDD; 32]).as_bytes().to_vec(),
+            sealed_epoch_key: vec![0xDD; 92], // valid invite-only length: 92 bytes
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

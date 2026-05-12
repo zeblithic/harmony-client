@@ -2603,11 +2603,16 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         };
         sign_event_with_identity(&payload, &alice).expect("sign admin bootstrap")
     };
+    // sealed_epoch_key must be 92 bytes for invite-only (32 ephemeral_pub +
+    // 12 nonce + 32 ct + 16 tag). The actual key value doesn't matter for
+    // this rollback test — we construct a dummy 92-byte vector.
+    // ZEB-249 PR #106 R5: encode_invite_url now enforces this length.
+    let _ = mk; // original EpochKey retained for documentation but not used directly
     let url = encode_invite_url(&CommunityInvitePayload {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key: mk.as_bytes().to_vec(),
+            sealed_epoch_key: vec![0xaa; 92], // invite-only: 92 bytes
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

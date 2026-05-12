@@ -1685,23 +1685,21 @@ async fn start_node(
                                 > = std::sync::Arc::new(std::sync::Mutex::new(
                                     std::collections::BTreeSet::new(),
                                 ));
-                                // Catchup dedupe: (SpaceId, OwnerAddr, EventId).
+                                // Catchup dedupe: (SpaceId, OwnerAddr, EventId, u64).
                                 // Including the originating Join EventId means a
                                 // second rotation producing a new pending_catchup_for
                                 // for the same member fires fresh; a pure (SpaceId,
                                 // OwnerAddr) key would suppress it across epoch
-                                // boundaries.
-                                let synthesized_catchups: std::sync::Arc<
-                                    std::sync::Mutex<
-                                        std::collections::BTreeSet<(
-                                            crate::owner_state_types::SpaceId,
-                                            crate::owner_state_types::OwnerAddr,
-                                            crate::community_membership::EventId,
-                                        )>,
-                                    >,
-                                > = std::sync::Arc::new(std::sync::Mutex::new(
-                                    std::collections::BTreeSet::new(),
-                                ));
+                                // boundaries. The u64 discriminator is current_epoch
+                                // at synthesis time: the same Join EventId can produce
+                                // a fresh catchup after each successive epoch rotation
+                                // (e.g., a member who joins during a rapid kick flurry
+                                // needs a catchup after each rotation that advances the
+                                // epoch while they are still pending). ZEB-249 PR #106
+                                // R5 (CodeRabbit Major). Type alias: SynthCatchupsSet.
+                                let synthesized_catchups: SynthCatchupsSet = std::sync::Arc::new(
+                                    std::sync::Mutex::new(std::collections::BTreeSet::new()),
+                                );
                                 move |delta: crate::community_state_sync::CommunityMembershipDelta| {
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
                                     let signing_key = std::sync::Arc::clone(&signing_key_for_heal);
@@ -9715,7 +9713,14 @@ async fn leave_community(
             let current_epoch = materialized.current_epoch.unwrap_or(0);
 
             // 2. Collect remaining ACTIVE members (excluding self — the leaver).
+            // ZEB-249 PR #106 R5 (CodeRabbit Major): distinguish true solo-leave
+            // (no remaining Joined/Invited members) from the unresolvable-identities
+            // case (members exist but their pubs aren't in the resolver cache yet).
+            // The old code treated both as "no rotation needed" and returned the
+            // solo-leave sentinel, which silently swallowed the unresolvable case and
+            // left a backward-secrecy gap: removed member retains the epoch key.
             let resolver = community_registry.identity_resolver();
+            let mut remaining_joined_count: usize = 0;
             let mut member_pubs: Vec<(crate::owner_state_types::OwnerAddr, [u8; 64])> = Vec::new();
             for (addr, state_m) in &materialized.members {
                 if *addr == self_owner {
@@ -9724,17 +9729,31 @@ async fn leave_community(
                 if !matches!(
                     state_m.status,
                     crate::community_membership::MemberStatus::Joined
+                        | crate::community_membership::MemberStatus::Invited
                 ) {
                     continue;
                 }
+                remaining_joined_count += 1;
                 if let Some(pub64) = resolver.resolve(addr).await {
                     member_pubs.push((*addr, pub64));
                 }
             }
 
-            // If nobody else in the community (solo creator leaving), no rotation needed.
-            if member_pubs.is_empty() {
+            // True solo leave — no other active members, no rotation needed.
+            if remaining_joined_count == 0 {
                 return Err(LEAVE_SOLO_SENTINEL.to_string());
+            }
+
+            // Members exist but none have resolvable identity pubs yet — error so
+            // the leaver is NOT falsely reported as "leave succeeded with no rotation".
+            // The admin self-healing observer will synthesize the rotation once pubs
+            // propagate. Surfaces as a non-solo error string; the Err(_) branch in
+            // the caller logs a warn and inserts Leave-alone (self-heal path).
+            if member_pubs.is_empty() {
+                return Err(format!(
+                    "leave_community: {remaining_joined_count} remaining member(s) but \
+                     no identity pubs resolvable — rotation deferred to self-heal observer"
+                ));
             }
 
             // 3. Generate K_next and seal to remaining members.
@@ -9771,10 +9790,12 @@ async fn leave_community(
     match leave_rotation_bundle {
         Ok(rotation) => {
             // §4.1 happy path: submit leave + rotation atomically.
-            // _rot_outcome is intentionally ignored: if the rotation is
-            // rejected the self-healing observer will synthesize it (admin
-            // self-heal path). Leave alone is the definitive membership event.
-            let (leave_outcome, _rot_outcome) = engine_arc
+            // ZEB-249 PR #106 R5 (CodeRabbit Major): rotation rejection is now
+            // surfaced as an Err so the caller can signal the rotation gap rather
+            // than silently swallowing it. Leave itself is still the definitive
+            // membership event; if the rotation is rejected here, the admin
+            // self-healing observer will synthesize it on the next delta.
+            let (leave_outcome, rot_outcome) = engine_arc
                 .insert_local_event_pair(leave.clone(), rotation)
                 .await
                 .map_err(|e| format!("engine.insert_local_event_pair: {e}"))?;
@@ -9784,6 +9805,18 @@ async fn leave_community(
                 crate::community_state_crdt::InsertOutcome::Rejected(_)
             ) {
                 return Err(membership_outcome_err("leave_community", &leave_outcome));
+            }
+
+            // Surface rotation rejection as a warning — leave committed, but
+            // backward secrecy gap exists until the self-heal observer fires.
+            if let crate::community_state_crdt::InsertOutcome::Rejected(ref rot_err) = rot_outcome {
+                tracing::warn!(
+                    community_id = %hex::encode(space_id.0),
+                    self_owner = %hex::encode(self_owner.0),
+                    error = ?rot_err,
+                    "leave_community: Leave committed but paired EpochRotation was \
+                     rejected — admin self-healing observer will synthesize rotation"
+                );
             }
         }
         Err(e) => {
@@ -10922,6 +10955,23 @@ pub async fn apply_remote_epoch_event(
     }
 }
 
+/// Dedupe set for synthesized EpochCatchup events. The 4-tuple
+/// `(SpaceId, OwnerAddr, EventId, u64)` identifies a catchup by
+/// community, target member, originating Join EventId, and the epoch
+/// at synthesis time. The epoch discriminator lets a second rotation
+/// produce a fresh catchup for the same still-pending member (ZEB-249
+/// PR #106 R5 — CodeRabbit Major).
+pub type SynthCatchupsSet = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::BTreeSet<(
+            crate::owner_state_types::SpaceId,
+            crate::owner_state_types::OwnerAddr,
+            crate::community_membership::EventId,
+            u64,
+        )>,
+    >,
+>;
+
 /// ZEB-249 Task 6 §4.3 + §4.6: self-healing community observer.
 ///
 /// Called after every CRDT delta lands in the community engine. Re-materializes
@@ -10935,12 +10985,13 @@ pub async fn apply_remote_epoch_event(
 /// First-admin-wins via HLC linearization handles multi-admin races
 /// (materialize's staleness gate silently drops duplicate EpochRotations).
 ///
-/// The catchup dedupe key is `(SpaceId, OwnerAddr, EventId)` where EventId is
-/// the originating Join event's id. This allows the observer to re-fire a
-/// catchup for the same member if the underlying state changes (e.g., a second
-/// rotation lands, producing a new Join-triggered catchup with a fresh EventId).
-/// A pure `(SpaceId, OwnerAddr)` key would silently suppress follow-up catchups
-/// for the same member across epoch boundaries.
+/// The catchup dedupe key is `(SpaceId, OwnerAddr, EventId, u64)` where EventId
+/// is the originating Join event's id and u64 is current_epoch at synthesis time.
+/// The epoch discriminator ensures that after a successive epoch rotation the
+/// same still-pending joiner fires a fresh catchup (the old key at the prior
+/// epoch is no longer useful). A pure `(SpaceId, OwnerAddr, EventId)` key would
+/// suppress the post-rotation catchup because the Join EventId doesn't change
+/// across rotations. ZEB-249 PR #106 R5 (CodeRabbit Major).
 ///
 /// The `crdt_state` parameter provides the local owner's CRDT, from which the
 /// observer reads `spaces[community_id].current_epoch_key` — the CURRENT epoch
@@ -10968,15 +11019,7 @@ pub async fn self_heal_community_observer(
             )>,
         >,
     >,
-    synth_catchups: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeSet<(
-                crate::owner_state_types::SpaceId,
-                crate::owner_state_types::OwnerAddr,
-                crate::community_membership::EventId,
-            )>,
-        >,
-    >,
+    synth_catchups: SynthCatchupsSet,
 ) {
     let engine_arc = match registry.engine_arc(&community_id).await {
         Some(e) => e,
@@ -11173,12 +11216,14 @@ pub async fn self_heal_community_observer(
             continue;
         };
 
-        // Dedupe key: (community_id, target, triggered_by).
-        // Including the originating EventId means a second rotation producing
-        // a new pending_catchup_for for the same member (with the same Join)
-        // is suppressed — but if the member re-joins (new Join EventId) the
-        // observer fires fresh. This is the correct semantics.
-        let key = (community_id, target, triggered_by);
+        // Dedupe key: (community_id, target, triggered_by, current_epoch).
+        // The epoch discriminator ensures a second epoch rotation landing
+        // while the same member is still pending-catchup fires a fresh
+        // catchup (the prior epoch's key is no longer useful to them).
+        // If the member re-joins (new Join EventId) the observer also
+        // fires fresh. ZEB-249 PR #106 R5 (CodeRabbit Major).
+        let current_epoch_for_key = materialized.current_epoch.unwrap_or(0);
+        let key = (community_id, target, triggered_by, current_epoch_for_key);
         {
             let set = synth_catchups
                 .lock()

@@ -571,6 +571,19 @@ pub enum CommunitySyncError {
     /// advanced.
     #[error("publisher signature invalid for addr {addr:?}")]
     PublisherSigInvalid { addr: OwnerAddr },
+
+    /// `publish_root_now` detected an epoch change between the pre-snapshot
+    /// key read and the post-snapshot key read on every retry attempt.
+    /// This should be unreachable in a correct cluster (rotations are rare
+    /// and bounded by the number of members); if it fires it indicates
+    /// continuous rapid epoch rotation, which is a bug or an adversarial
+    /// condition. ZEB-249 PR #106 R5 (CodeRabbit Critical).
+    #[error(
+        "publish_root_now: epoch changed on every retry attempt (5); \
+         publish aborted to prevent encrypting post-rotation snapshot \
+         under pre-rotation key"
+    )]
+    PublishRetryExhausted,
 }
 
 /// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
@@ -1714,22 +1727,66 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
     use ed25519_dalek::Signer;
 
-    // ZEB-249 §10.6 Phase A: read the live epoch key BEFORE snapshotting
-    // community state so we never hold both locks at the same time
-    // (lock-order: owner-state THEN community-state is forbidden; we
-    // release owner-state lock here before acquiring community-state).
-    let (current_key, current_epoch) = live_epoch_key(
-        ctx.community_id,
-        ctx.crdt_state.as_ref(),
-        &ctx.membership_key,
-    )
-    .await;
+    // ZEB-249 §10.6 Phase A + PR #106 R5 (CodeRabbit Critical):
+    // Recheck-and-retry pattern to close the TOCTOU race where an
+    // EpochRotation lands between the live_epoch_key read and the
+    // community-state snapshot. If that happens, the post-rotation
+    // snapshot would be encrypted under the pre-rotation key — a
+    // backward-secrecy gap. We detect the race by re-reading the
+    // live epoch key after snapshotting and retrying if the epoch changed.
+    //
+    // Lock-order invariant preserved: owner-state lock is acquired
+    // then released (inside live_epoch_key) BEFORE community-state
+    // lock is acquired (inside snapshot clone). We never hold both.
+    //
+    // Rotation events are rare (one per Kick/Leave), so the tight loop
+    // is benign in practice. Bounded at 5 iterations to prevent an
+    // infinite loop in the pathological case where another actor is
+    // continuously rotating (should be impossible in a correct cluster,
+    // but we defend against it anyway).
+    let (current_key, current_epoch, snapshot) = {
+        let mut retries: u8 = 5;
+        loop {
+            let (_key_before, epoch_before) = live_epoch_key(
+                ctx.community_id,
+                ctx.crdt_state.as_ref(),
+                &ctx.membership_key,
+            )
+            .await;
 
-    // Snapshot CRDT state under brief lock; drop guard before the
-    // expensive encode + AEAD + CAS hops below.
-    let snapshot = {
-        let state = ctx.state.lock().await;
-        state.clone()
+            // Snapshot CRDT state under brief lock; drop guard before
+            // the epoch recheck and the expensive encode + AEAD + CAS
+            // hops below.
+            let snap = {
+                let state = ctx.state.lock().await;
+                state.clone()
+            };
+
+            let (key_after, epoch_after) = live_epoch_key(
+                ctx.community_id,
+                ctx.crdt_state.as_ref(),
+                &ctx.membership_key,
+            )
+            .await;
+
+            if epoch_before == epoch_after {
+                // Epoch stable across snapshot window — safe to proceed.
+                break (key_after, epoch_after, snap);
+            }
+
+            retries -= 1;
+            if retries == 0 {
+                return Err(CommunitySyncError::PublishRetryExhausted);
+            }
+            // Epoch changed between key reads — retry with fresh key.
+            tracing::debug!(
+                community_id = ?ctx.community_id,
+                epoch_before = ?epoch_before,
+                epoch_after = ?epoch_after,
+                retries_left = retries,
+                "publish_root_now: epoch changed mid-publish, retrying"
+            );
+        }
     };
 
     // 1. Canonical-CBOR encode the CommunityState as the cleartext blob.
@@ -2046,7 +2103,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     .iter()
                     .map(|(e, k)| (*e, k.clone()))
                     .collect();
-                v.sort_by(|a, b| b.0.cmp(&a.0));
+                v.sort_by_key(|x| std::cmp::Reverse(x.0));
                 v.into_iter().map(|(_, k)| k).collect()
             };
             (cur, old_rev)
@@ -2663,6 +2720,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
         CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
+        CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",
     }
 }
 

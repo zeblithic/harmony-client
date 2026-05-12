@@ -18,6 +18,7 @@ use harmony_app::dm_signing::{
     ed25519_priv_to_x25519, ed25519_pub_to_x25519, open_from_owner, seal_to_owner,
 };
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+use harmony_app::SynthCatchupsSet;
 
 fn make_space_with_epoch(
     community_id: SpaceId,
@@ -941,15 +942,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             )>,
         >,
     > = Arc::new(Mutex::new(BTreeSet::new()));
-    let synth_catchups: Arc<
-        Mutex<
-            BTreeSet<(
-                SpaceId,
-                OwnerAddr,
-                harmony_app::community_membership::EventId,
-            )>,
-        >,
-    > = Arc::new(Mutex::new(BTreeSet::new()));
+    let synth_catchups: SynthCatchupsSet = Arc::new(Mutex::new(BTreeSet::new()));
 
     self_heal_community_observer(
         community_id,
@@ -1045,12 +1038,12 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         "Dave can decrypt epoch-1 after observer catchup delivery"
     );
 
-    // Dedupe set check: synth_catchups must contain the (community_id, dave_addr, join_id) key.
+    // Dedupe set check: synth_catchups must contain the (community_id, dave_addr, join_id, epoch) key.
     {
         let set = synth_catchups.lock().unwrap();
         assert!(
             set.iter()
-                .any(|(sid, addr, _)| *sid == community_id && *addr == dave_addr),
+                .any(|(sid, addr, _, _)| *sid == community_id && *addr == dave_addr),
             "synth_catchups must record the synthesized catchup for Dave"
         );
     }
