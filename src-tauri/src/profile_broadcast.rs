@@ -12,6 +12,7 @@ use crate::owner_state_crypto::{
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use ed25519_dalek::{Signature, Signer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Hard cap on number of community IDs per broadcast. 200 SpaceIds × 32
 /// bytes + framing + sig ≈ 6.5 KB worst-case canonical payload. Spec §4.1.
@@ -451,6 +452,134 @@ impl ProfileBroadcastPublishSink for EventLoopPublishSink {
         reply_rx
             .await
             .map_err(|e| format!("publish_tx reply dropped: {e}"))?
+    }
+}
+
+/// Subscription identifier handed to the frontend by `subscribe_peer_profile`.
+/// Plain u64 (monotonic, allocated by an AtomicU64 in NodeState). One
+/// subscription_id maps to one Zenoh subscriber task; multiple subscriptions
+/// to the same peer are allowed (one per open ProfilePopover).
+pub type SubscriptionId = u64;
+
+/// Snapshot of the latest verified broadcast for a subscription.
+/// Wire keys are camelCase to match `DiscoveredLibraryInfo` (Phase 2).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredProfileInfo {
+    /// Hex-encoded 16-byte OwnerAddr (32 hex chars).
+    pub owner_addr: String,
+    /// Hex-encoded SpaceIds the peer opted to share (32 hex chars each).
+    pub community_ids: Vec<String>,
+    /// `shared_at.wall_ms` as base-10 string. Display only — callers MUST
+    /// NOT use this for HLC ordering decisions.
+    pub shared_at: String,
+}
+
+/// Per-subscription cache entry. Holds the highest-HLC verified broadcast
+/// observed so far + the peer addr the subscription targets (for attribution).
+#[derive(Debug, Clone)]
+struct CachedSubscription {
+    peer_addr: OwnerAddr,
+    /// Most recent verified broadcast. `None` until first valid sample
+    /// arrives (covers the "loading" UI state).
+    latest: Option<ProfileMembershipBroadcast>,
+}
+
+/// In-process cache of verified peer profile broadcasts. Spec §6.
+#[derive(Debug, Default)]
+pub struct ProfileBroadcastCache {
+    by_sub: tokio::sync::Mutex<HashMap<SubscriptionId, CachedSubscription>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CacheOnSampleError {
+    #[error("subscription not found: {0}")]
+    SubscriptionNotFound(SubscriptionId),
+    #[error("verify failed: {0}")]
+    VerifyFailed(#[from] BroadcastVerifyError),
+    #[error("attribution mismatch: topic owner={topic_owner:?}, derived={derived:?}")]
+    AttributionMismatch {
+        topic_owner: OwnerAddr,
+        derived: OwnerAddr,
+    },
+    #[error("replay: incoming HLC not strictly newer than cached")]
+    Replay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheOnSampleOutcome {
+    /// First broadcast for this subscription — emit event.
+    InsertedFirst,
+    /// Newer broadcast replaced an older one — emit event.
+    Replaced,
+}
+
+impl ProfileBroadcastCache {
+    /// Register a subscription with the cache. Idempotent — re-inserting
+    /// the same subscription_id replaces the prior entry.
+    pub async fn register(&self, sub: SubscriptionId, peer_addr: OwnerAddr) {
+        self.by_sub.lock().await.insert(
+            sub,
+            CachedSubscription {
+                peer_addr,
+                latest: None,
+            },
+        );
+    }
+
+    /// Drop a subscription from the cache. Idempotent — missing sub is OK.
+    pub async fn drop_subscription(&self, sub: SubscriptionId) {
+        self.by_sub.lock().await.remove(&sub);
+    }
+
+    /// Process an incoming raw payload for a subscription. Spec §6.
+    pub async fn on_sample(
+        &self,
+        sub: SubscriptionId,
+        broadcast: ProfileMembershipBroadcast,
+    ) -> Result<CacheOnSampleOutcome, CacheOnSampleError> {
+        // (1) Verify
+        let derived = verify_broadcast(&broadcast)?;
+        // (2) Attribution check + replay defense — atomic against the map.
+        let mut g = self.by_sub.lock().await;
+        let entry = g
+            .get_mut(&sub)
+            .ok_or(CacheOnSampleError::SubscriptionNotFound(sub))?;
+        if derived != entry.peer_addr {
+            return Err(CacheOnSampleError::AttributionMismatch {
+                topic_owner: entry.peer_addr,
+                derived,
+            });
+        }
+        if let Some(prev) = &entry.latest {
+            // Strict greater-than: equal HLC is also rejected (idempotent
+            // duplicate). HLC comparison is on (wall_ms, logical) tuple.
+            let newer = (broadcast.shared_at.wall_ms, broadcast.shared_at.logical)
+                > (prev.shared_at.wall_ms, prev.shared_at.logical);
+            if !newer {
+                return Err(CacheOnSampleError::Replay);
+            }
+        }
+        let was_none = entry.latest.is_none();
+        entry.latest = Some(broadcast);
+        Ok(if was_none {
+            CacheOnSampleOutcome::InsertedFirst
+        } else {
+            CacheOnSampleOutcome::Replaced
+        })
+    }
+
+    /// Snapshot the latest verified broadcast for a subscription as the
+    /// frontend DTO.
+    pub async fn get_cached(&self, sub: SubscriptionId) -> Option<DiscoveredProfileInfo> {
+        let g = self.by_sub.lock().await;
+        let entry = g.get(&sub)?;
+        let b = entry.latest.as_ref()?;
+        Some(DiscoveredProfileInfo {
+            owner_addr: hex::encode(entry.peer_addr.0),
+            community_ids: b.community_ids.iter().map(|s| hex::encode(s.0)).collect(),
+            shared_at: b.shared_at.wall_ms.to_string(),
+        })
     }
 }
 
@@ -914,5 +1043,86 @@ mod tests {
         );
         drop(pubs);
         publisher.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn state_replay_old_hlc_rejected() {
+        let (signer, identity_pub) = build_identity([100u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(1, peer_addr).await;
+
+        let newer = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(200),
+        )
+        .unwrap();
+        let older = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(2)],
+            fixture_hlc(100),
+        )
+        .unwrap();
+
+        // Land the newer first.
+        assert_eq!(
+            cache.on_sample(1, newer.clone()).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst
+        );
+        // Older arrives second → Replay.
+        assert!(matches!(
+            cache.on_sample(1, older).await,
+            Err(CacheOnSampleError::Replay)
+        ));
+        // Cached state unchanged: still the newer.
+        let snap = cache.get_cached(1).await.unwrap();
+        assert_eq!(snap.shared_at, "200");
+    }
+
+    #[tokio::test]
+    async fn state_replay_newer_hlc_accepted() {
+        let (signer, identity_pub) = build_identity([101u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(2, peer_addr).await;
+
+        let older = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(100),
+        )
+        .unwrap();
+        let newer = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(2)],
+            fixture_hlc(200),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.on_sample(2, older).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst
+        );
+        assert_eq!(
+            cache.on_sample(2, newer).await.unwrap(),
+            CacheOnSampleOutcome::Replaced
+        );
+        // Cached state updated to the newer.
+        let snap = cache.get_cached(2).await.unwrap();
+        assert_eq!(snap.shared_at, "200");
+        assert_eq!(snap.community_ids, vec![hex::encode([2u8; 16])]);
     }
 }
