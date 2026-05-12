@@ -28,6 +28,7 @@
     onNewGroupDm,
     onNewCommunity,
     onRedeemInvite,
+    onBrowseLibraries,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -50,6 +51,8 @@
     onNewGroupDm?: () => void;
     onNewCommunity?: () => void;
     onRedeemInvite?: () => void;
+    /** ZEB-218 Sub-D Phase 1: opens the library directory browser. */
+    onBrowseLibraries?: () => void;
   } = $props();
 
   // ── ZEB-263 FAB + fan-out menu ──────────────────────────────────────
@@ -212,6 +215,7 @@
           <hr />
           <button type="button" role="menuitem" onclick={() => handleMenuItem(onNewCommunity)}>🏛️ New community</button>
           <button type="button" role="menuitem" onclick={() => handleMenuItem(onRedeemInvite)}>🔗 Redeem invite link</button>
+          <button type="button" role="menuitem" onclick={() => handleMenuItem(onBrowseLibraries)}>📚 Browse libraries</button>
         </div>
       {/if}
       <button class="settings-btn" onclick={() => onSettingsClick?.()} aria-label="Notification settings">⚙</button>

@@ -23,6 +23,9 @@
   import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
   import CommunityView from './lib/components/CommunityView.svelte';
+  import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
+  import { LibraryDirectoryService } from './lib/library-directory-service';
+  import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService } from './lib/community-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -165,6 +168,16 @@
   let redeemPending = $state(false);
   let redeemError = $state<string | null>(null);
   let redeemUrl = $state('');
+
+  // ── ZEB-218 Sub-D Phase 1: library directory browser modal ─────────
+  // The adapter is constructed inside the Tauri-init IIFE below; we
+  // hoist a reference here so the LibraryDirectoryService can be
+  // lazy-created when the user opens the browser. The service itself
+  // is `null` until the adapter wires up — opening the browser before
+  // Tauri-init has completed will leave the button effectively inert.
+  let tauriAdapter = $state<TauriAdapter | null>(null);
+  let libraryDirectoryService = $state<LibraryDirectoryService | null>(null);
+  let libraryDirectoryOpen = $state(false);
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
   let myAddress = $state('');
@@ -507,6 +520,11 @@
         invoke: (cmd: string, args?: Record<string, unknown>) => invoke(cmd, args),
         listen: (event: string, handler: (e: { payload: unknown }) => void) => listen(event, handler),
       };
+      // ZEB-218 Sub-D Phase 1: expose adapter + lazy-init library
+      // directory service so the NavPanel "Browse libraries" button
+      // can mount the browser modal once Tauri-init has wired up.
+      tauriAdapter = adapter;
+      libraryDirectoryService = new LibraryDirectoryService(adapter);
 
       // Per-service connect wrapper: logs failures with the adapter name but
       // doesn't cascade — a broken MessageService shouldn't kill VineService.
@@ -1134,6 +1152,7 @@
         onNewGroupDm={() => { dmCreateInitialKind = 'group-dm'; dmCreateDialogOpen = true; }}
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
+        onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
       />
       {#if !collapsed && appMode === 'messages'}
         <button
@@ -1565,6 +1584,39 @@
       redeemError = null;
     }}
   />
+{/if}
+
+{#if libraryDirectoryOpen && libraryDirectoryService && tauriAdapter}
+  <!-- ZEB-218 Sub-D Phase 1: library directory browser modal. Click-to-
+       join feeds `invite_url` straight into `redeem_invite` — no new
+       join protocol surface (reuses ZEB-249's open-community invite
+       redemption path). Stale URLs handled by ZEB-249 §4.6 EpochCatchup
+       self-healing; no app-level retry needed here. -->
+  <div
+    class="modal-overlay"
+    role="presentation"
+    onclick={() => (libraryDirectoryOpen = false)}
+    onkeydown={(e) => { if (e.key === 'Escape') libraryDirectoryOpen = false; }}
+  >
+    <div
+      class="modal-content"
+      role="dialog"
+      aria-modal="true"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      <LibraryDirectoryBrowser
+        service={libraryDirectoryService}
+        adapter={tauriAdapter}
+        onJoin={async (inviteUrl) => {
+          // Reuse the redeem path so nav-updated emit + side effects
+          // match exactly what RedeemInviteDialog does.
+          await tauriAdapter!.invoke('redeem_invite', { url: inviteUrl });
+        }}
+        onClose={() => (libraryDirectoryOpen = false)}
+      />
+    </div>
+  </div>
 {/if}
 
 

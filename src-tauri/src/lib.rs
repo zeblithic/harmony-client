@@ -27,6 +27,7 @@ mod follows;
 pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
+pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
 pub mod owner_commands;
@@ -306,6 +307,12 @@ pub struct NodeState {
     /// — a larger refactor).
     channel_log_registry:
         Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
+    /// ZEB-218 Sub-D Phase 1: aggregated library-directory state. `Some`
+    /// while the node is running; the matching `request_rx` is consumed
+    /// by an event-loop task that declares per-library Zenoh
+    /// subscribers on demand. Cleared in `stop_inner` so the channel
+    /// closes and the consumer task winds down on next recv.
+    pub library_directory: Option<std::sync::Arc<crate::library_directory::LibraryDirectory>>,
 }
 
 impl NodeState {
@@ -356,6 +363,9 @@ impl Default for NodeState {
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
+            // ZEB-218 Sub-D Phase 1: directory stays None until
+            // start_node wires it.
+            library_directory: None,
         }
     }
 }
@@ -594,6 +604,10 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // scope via a separate binding rather than trying to thread
         // it through the already-saturated `tup`.
         channel_log_registry_for_shutdown = guard.channel_log_registry.take();
+        // ZEB-218 Sub-D Phase 1: drop the library_directory Arc. The
+        // event-loop's consumer task observes the matching request_tx
+        // close on next recv and exits cleanly.
+        let _ = guard.library_directory.take();
         tup
     };
 
@@ -947,6 +961,10 @@ async fn start_node(
         // community engine pool shuts down (verify-chain dependency,
         // same ordering as stop_inner).
         old_channel_log_registry = guard.channel_log_registry.take();
+        // ZEB-218 Sub-D Phase 1: drop the previous identity's library
+        // directory handle. The matching event_loop consumer task
+        // observes the request_tx close on next recv and exits.
+        let _ = guard.library_directory.take();
         tup
     };
 
@@ -1992,6 +2010,43 @@ async fn start_node(
             s3_enabled: false,
         };
 
+        // ZEB-218 Sub-D Phase 1: construct the `LibraryDirectory` (Arc<…>)
+        // and split off the matching `request_rx` for the event-loop
+        // consumer task. The Arc is stashed onto NodeState below so
+        // future IPC handlers (Task 4) can reach `request_tx` to add /
+        // remove libraries; the rx is moved into `event_loop::run`.
+        // Built BEFORE the std MutexGuard lock acquisition since the
+        // startup walk awaits on the tokio Mutex `crdt_state` lock and
+        // would otherwise hold the !Send std guard across an await.
+        let (library_directory_arc, library_request_rx) =
+            crate::library_directory::LibraryDirectory::new();
+        // ZEB-218 Sub-D Phase 1: walk owner-state at startup and send a
+        // Subscribe request for each effective (non-tombstoned) library.
+        // Done BEFORE the event_loop spawn. The channel is unbounded
+        // (UnboundedSender::send is synchronous and never blocks) —
+        // see the F1 fix discussion in `LibraryDirectory::new` doc:
+        // Subscribe/Unsubscribe traffic is small + infrequent + only
+        // grows with user library count, so the bounded(64) variant
+        // could deadlock on >64 libraries here BEFORE the consumer task
+        // even spawned.
+        if let Some(ref crdt_arc) = crdt_state_for_state {
+            let crdt_g = crdt_arc.lock().await;
+            for (addr, lib_entry) in &crdt_g.libraries {
+                if lib_entry.is_effective() {
+                    if let Err(e) = library_directory_arc
+                        .request_tx
+                        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(*addr))
+                    {
+                        tracing::warn!(
+                            ?addr,
+                            error = %e,
+                            "failed to enqueue library Subscribe at startup"
+                        );
+                    }
+                }
+            }
+        }
+
         // Re-acquire lock and atomically register the new node.
         // Handles are stored BEFORE awaiting ready_rx so stop_node can
         // cancel an in-flight startup via shutdown_tx.
@@ -2064,6 +2119,11 @@ async fn start_node(
         // `community_registry_arc` (the post-spawn `guard.community_registry`
         // assignment still needs the original handle).
         let community_registry_for_loop = community_registry_arc.clone();
+        // ZEB-218 Sub-D Phase 1: thread the pre-built `LibraryDirectory`
+        // handle + request rx (constructed + populated above the
+        // std::sync::MutexGuard scope) into event_loop::run.
+        let library_directory_for_loop = Some(std::sync::Arc::clone(&library_directory_arc));
+        let library_request_rx_for_loop = Some(library_request_rx);
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -2160,6 +2220,8 @@ async fn start_node(
                         community_adapter_request_rx,
                         community_registry_for_loop,
                         channel_log_adapter_request_rx_for_loop,
+                        library_directory_for_loop,
+                        library_request_rx_for_loop,
                     )
                     .await;
                 });
@@ -2236,6 +2298,11 @@ async fn start_node(
                 // no owner identity is loaded — the registry is gated
                 // on owner-load above.
                 guard.channel_log_registry = channel_log_registry_arc.clone();
+                // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
+                // so future IPC handlers (Task 4) can reach `request_tx`
+                // to add / remove libraries. The matching rx was moved
+                // into event_loop above.
+                guard.library_directory = Some(library_directory_arc.clone());
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -9590,6 +9657,435 @@ fn membership_outcome_err(
     }
 }
 
+// ── ZEB-218 Sub-D Phase 1: library-directory IPC surface ─────────────
+//
+// Four `#[tauri::command]` handlers that drive the
+// `LibraryDirectory` consumer:
+//
+// - `list_libraries` — snapshot of effective LibraryEntry rows from
+//   owner-state, enriched with per-library aggregation counts.
+// - `add_library` — LWW-merge into `owner_state.libraries` + Subscribe
+//   request to the event-loop consumer.
+// - `remove_library` — set tombstone + Unsubscribe (which evicts the
+//   library's contributions from the aggregation map).
+// - `browse_library` — snapshot the aggregation map; `None` returns
+//   all, `Some(addr_hex)` filters to one library's listings.
+//
+// Persistence: owner-state mutations flow through the existing
+// owner-state SyncEngine's debounced persist cycle — same pattern as
+// `add_space`. No explicit write-back IPC-side; the SyncEngine picks
+// up the BTreeMap mutation on its next checkpoint.
+//
+// HLC discipline: mints via `reserve_next_hlc_for_device` (the
+// `dm_outbox` helper) so the local tracker advances atomically with
+// the reservation — same shape as other owner-state mutations.
+
+/// IPC: list the user's effective libraries with per-library
+/// aggregation counts. Returns `Vec<LibraryInfo>` ordered by the
+/// `OwnerAddr` key (BTreeMap iteration order).
+#[tauri::command]
+async fn list_libraries(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<crate::library_directory::LibraryInfo>, String> {
+    let (crdt_state, library_directory) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+        )
+    };
+    let crdt_g = crdt_state.lock().await;
+    let agg_g = library_directory.aggregation.lock().await;
+    let mut out = Vec::new();
+    for (addr, lib) in &crdt_g.libraries {
+        if !lib.is_effective() {
+            continue;
+        }
+        let count = agg_g.entry_count_for_library(addr);
+        out.push(crate::library_directory::LibraryInfo {
+            address: hex::encode(addr.0),
+            added_at: lib.added_at.clone(),
+            entry_count: count,
+        });
+    }
+    Ok(out)
+}
+
+/// Pure LWW merge for `add_library`. Splits the merge math out of the
+/// IPC handler so it can be unit-tested without spinning up a
+/// `tauri::State<NodeState>` harness.
+///
+/// Returns:
+/// - `Ok(new_entry)` — the LibraryEntry to insert into
+///   `owner_state.libraries[addr]`. Caller persists.
+/// - `Err(msg)` — caller surfaces to the user; mutation MUST be skipped.
+///
+/// Rules:
+/// - If a higher-HLC tombstone exists, refuse (`HLC went backward; refusing to add`).
+/// - Never regress `added_at`: keep `existing.added_at` if it's strictly
+///   newer than `now_hlc` (R3 F1). Otherwise stamp `now_hlc`.
+/// - Carry forward any existing tombstone so re-adds preserve the
+///   removed_at HLC for LWW.
+pub(crate) fn merge_add_library(
+    existing: Option<&crate::owner_state_types::LibraryEntry>,
+    addr: crate::owner_state_types::OwnerAddr,
+    now_hlc: &crate::owner_state_types::Hlc,
+) -> Result<crate::owner_state_types::LibraryEntry, String> {
+    if let Some(prev) = existing {
+        if let Some(prev_remove) = &prev.removed_at {
+            if prev_remove.is_strictly_newer_than(now_hlc) {
+                return Err("HLC went backward; refusing to add".into());
+            }
+        }
+    }
+    let chosen_added = match existing {
+        Some(prev) if prev.added_at.is_strictly_newer_than(now_hlc) => prev.added_at.clone(),
+        _ => now_hlc.clone(),
+    };
+    Ok(crate::owner_state_types::LibraryEntry {
+        address: addr,
+        added_at: chosen_added,
+        removed_at: existing.and_then(|e| e.removed_at.clone()),
+    })
+}
+
+/// Pure LWW guard for `remove_library`. Returns Ok if the caller may
+/// stamp `now_hlc` into the row's `removed_at`; Err otherwise.
+///
+/// Rules:
+/// - Row absent: nothing to remove. Caller treats as a no-op.
+/// - Row present and `now_hlc <= existing.added_at`: refuse (R3 F2). A
+///   write here would leave `is_effective()` true after the tombstone,
+///   so the local unsubscribe + Ok return would create cross-device
+///   divergence.
+pub(crate) fn merge_remove_library(
+    existing: Option<&crate::owner_state_types::LibraryEntry>,
+    now_hlc: &crate::owner_state_types::Hlc,
+) -> Result<(), String> {
+    if let Some(lib) = existing {
+        if !now_hlc.is_strictly_newer_than(&lib.added_at) {
+            return Err("HLC went backward; refusing to remove".into());
+        }
+    }
+    Ok(())
+}
+
+/// IPC: add a library to the user's trust set. LWW-merges into
+/// `owner_state.libraries` and sends a Subscribe request to the
+/// event-loop consumer (which declares the per-library Zenoh
+/// subscriber).
+#[tauri::command]
+async fn add_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: String,
+) -> Result<(), String> {
+    let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
+    // R3 F3: snapshot `generation` paired-atomically with the Arcs so
+    // the post-await fence below can detect a stop_node / start_node
+    // racing through this command (mirrors add_space, send_dm).
+    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
+        )
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let now_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    {
+        let mut crdt_g = crdt_state.lock().await;
+        // R3 F3: post-await restart fence. If a stop_node/start_node
+        // raced this command, our cloned Arcs are now detached — the
+        // mutation would land in an orphan crdt_state that won't be
+        // persisted, and the request_tx Subscribe would target the
+        // old library_directory consumer task. Re-check generation
+        // under the std lock before mutating.
+        {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during add_library (was {}, now {}); \
+                     mutation would land in detached crdt_state — aborted",
+                    snapshot_generation, g.generation
+                ));
+            }
+        }
+        // R3 F1: never regress the LWW state. If a remote bound device
+        // already synced an add with a HIGHER HLC than our local now_hlc
+        // (e.g., wall-clock skew or a synced concurrent add), keep the
+        // existing `added_at`. Otherwise our overwrite would clobber a
+        // strictly-newer LWW state. Logic is in `merge_add_library` so
+        // it's unit-testable without a tauri::State harness.
+        let new_entry = merge_add_library(crdt_g.libraries.get(&addr), addr, &now_hlc)?;
+        crdt_g.libraries.insert(addr, new_entry);
+        // Persistence writeback: owner-state SyncEngine debounces its
+        // own checkpoint on the same crdt_state Arc (see add_space).
+    }
+    let _ = library_directory
+        .request_tx
+        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(addr));
+    Ok(())
+}
+
+/// IPC: remove a library. Sets the LWW tombstone in owner-state and
+/// sends an Unsubscribe request which (a) aborts the live Zenoh
+/// subscriber task and (b) calls `drop_library` to evict the library's
+/// contributions from the aggregation map.
+#[tauri::command]
+async fn remove_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: String,
+) -> Result<(), String> {
+    let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
+    // R3 F3: snapshot `generation` paired-atomically with the Arcs so
+    // the post-await fence below can detect a stop_node / start_node
+    // racing through this command (mirrors add_library, add_space).
+    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
+        )
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let now_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    {
+        let mut crdt_g = crdt_state.lock().await;
+        // R3 F3: post-await restart fence (same rationale as add_library).
+        {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during remove_library (was {}, now {}); \
+                     mutation would land in detached crdt_state — aborted",
+                    snapshot_generation, g.generation
+                ));
+            }
+        }
+        // R3 F2: symmetric LWW guard. If our tombstone HLC doesn't beat
+        // the row's `added_at` (e.g., a remote add with a later HLC just
+        // synced), `is_effective()` will still return true after this
+        // write — yet we'd unsubscribe locally and return Ok, leaving
+        // cross-device state inconsistent. Refuse and surface the error.
+        // Logic is in `merge_remove_library` so it's unit-testable
+        // without a tauri::State harness.
+        merge_remove_library(crdt_g.libraries.get(&addr), &now_hlc)?;
+        if let Some(lib) = crdt_g.libraries.get_mut(&addr) {
+            lib.removed_at = Some(now_hlc);
+        }
+    }
+    let _ = library_directory
+        .request_tx
+        .send(crate::library_directory::LibraryDirectoryRequest::Unsubscribe(addr));
+    Ok(())
+}
+
+/// IPC: browse the directory. `None` aggregates across all libraries;
+/// `Some(addr_hex)` filters to one library's contributions. Maps to
+/// `DirectoryEntryDTO` (strips cryptographic material; derives
+/// `community_addr` from the admin identity bundle for display).
+#[tauri::command]
+async fn browse_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: Option<String>,
+) -> Result<Vec<crate::library_directory::DirectoryEntryDTO>, String> {
+    let library_directory = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.library_directory
+            .clone()
+            .ok_or("library_directory missing — node not running?")?
+    };
+    let aggregated = match library_addr {
+        None => library_directory.snapshot_all().await,
+        Some(addr_hex) => {
+            let addr = crate::library_directory::parse_owner_addr_hex(&addr_hex)?;
+            library_directory.snapshot_filtered_by_library(&addr).await
+        }
+    };
+    Ok(aggregated
+        .iter()
+        .map(crate::library_directory::DirectoryEntryDTO::from_aggregated)
+        .collect())
+}
+
+#[cfg(test)]
+mod library_directory_lww_tests {
+    //! Unit tests for the pure LWW helpers behind `add_library` /
+    //! `remove_library`. R3 F1 + F2 regression coverage.
+    use super::*;
+    use crate::owner_state_types::{Hlc, LibraryEntry, OwnerAddr};
+
+    fn hlc(wall_ms: u64, logical: u32) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical,
+            device_id: "d".to_string(),
+        }
+    }
+
+    /// R3 F1: a newer synced add (higher HLC than local now_hlc) must
+    /// not be regressed by a local add_library call. The chosen
+    /// `added_at` stays at the existing higher value.
+    #[test]
+    fn add_library_does_not_regress_newer_synced_add() {
+        let addr = OwnerAddr([0xAA; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(500, 0);
+        let merged = merge_add_library(Some(&existing), addr, &local_now)
+            .expect("merge should accept non-tombstoned regress attempt");
+        assert_eq!(
+            merged.added_at,
+            hlc(1000, 0),
+            "added_at must NOT regress below the synced higher value",
+        );
+        assert_eq!(merged.removed_at, None);
+        assert_eq!(merged.address, addr);
+    }
+
+    /// Forward direction: a strictly-newer local add advances added_at
+    /// to now_hlc. Sanity check the LWW math both ways.
+    #[test]
+    fn add_library_advances_added_at_when_now_hlc_is_newer() {
+        let addr = OwnerAddr([0xBB; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(500, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        let merged = merge_add_library(Some(&existing), addr, &local_now).expect("merge");
+        assert_eq!(merged.added_at, hlc(1000, 0));
+    }
+
+    /// R1 F1 regression: a higher-HLC tombstone refuses the add.
+    #[test]
+    fn add_library_refuses_when_tombstone_beats_now_hlc() {
+        let addr = OwnerAddr([0xCC; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(100, 0),
+            removed_at: Some(hlc(2000, 0)),
+        };
+        let local_now = hlc(500, 0);
+        let err = merge_add_library(Some(&existing), addr, &local_now)
+            .expect_err("should refuse: tombstone is strictly newer than now_hlc");
+        assert!(err.contains("HLC went backward"));
+    }
+
+    /// First-add path: no existing row, stamp now_hlc directly.
+    #[test]
+    fn add_library_stamps_now_hlc_on_first_add() {
+        let addr = OwnerAddr([0xDD; 16]);
+        let local_now = hlc(1234, 5);
+        let merged = merge_add_library(None, addr, &local_now).expect("merge");
+        assert_eq!(merged.added_at, hlc(1234, 5));
+        assert_eq!(merged.removed_at, None);
+    }
+
+    /// R3 F2: remove must refuse when now_hlc doesn't strictly exceed
+    /// the row's added_at — otherwise the tombstone wouldn't win LWW
+    /// (is_effective() would still return true) and we'd diverge from
+    /// the synced state.
+    #[test]
+    fn remove_library_refuses_if_hlc_does_not_beat_added_at() {
+        let addr = OwnerAddr([0xEE; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(500, 0);
+        let err = merge_remove_library(Some(&existing), &local_now)
+            .expect_err("should refuse: now_hlc < added_at");
+        assert!(err.contains("HLC went backward"));
+    }
+
+    /// Equal-HLC remove also refuses (need STRICT > to win LWW).
+    #[test]
+    fn remove_library_refuses_on_equal_hlc() {
+        let addr = OwnerAddr([0xEE; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        assert!(merge_remove_library(Some(&existing), &local_now).is_err());
+    }
+
+    /// Remove with strictly-newer HLC: caller may proceed.
+    #[test]
+    fn remove_library_allows_strictly_newer_hlc() {
+        let addr = OwnerAddr([0xFF; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(500, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        merge_remove_library(Some(&existing), &local_now)
+            .expect("strict-greater now_hlc must beat added_at");
+    }
+
+    /// Remove with no existing row is a no-op (caller does the absent-
+    /// row check separately — helper just doesn't error).
+    #[test]
+    fn remove_library_noop_when_row_absent() {
+        let local_now = hlc(1000, 0);
+        merge_remove_library(None, &local_now).expect("absent row is no-op");
+    }
+}
+
 /// Tauri IPC: leave a community we currently belong to.
 ///
 /// Mints a self-Leave event, looks up the per-community engine via
@@ -11600,6 +12096,10 @@ pub fn run() {
             list_channel_messages,
             post_channel_message,
             request_channel_backfill,
+            list_libraries,
+            add_library,
+            remove_library,
+            browse_library,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
