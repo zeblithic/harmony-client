@@ -1801,32 +1801,14 @@ mod tests {
     }
 
     /// ZEB-280 Phase 3: an entry with `library_identity_pub` and
-    /// `library_signature` both populated (some `[0u8; 64]` sentinel
-    /// here — Task 2 adds real-signer verifier tests) round-trips
+    /// `library_signature` both populated (static `[0u8; 64]` sentinel
+    /// bytes here — Task 2 adds real-signer verifier tests) round-trips
     /// through canonical CBOR and the bstr serde helpers correctly.
     #[test]
     fn phase3_wrapped_entry_roundtrips_via_canonical_cbor() {
-        let community_id = SpaceId([0x11; 16]);
-        let admin_addr = OwnerAddr([0; 16]);
-        let (admin_signing_key, admin_identity_pub) = {
-            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
-            let mut bundle = [0u8; 64];
-            bundle[..32].copy_from_slice(&[0x11; 32]);
-            bundle[32..].copy_from_slice(&key.verifying_key().to_bytes());
-            // Sanity-check the bundle parses back to an `Identity`.
-            // (Bundle is X25519_pub(32) || Ed25519_pub(32); the X25519
-            // half here is a constant, but `from_public_bytes` only
-            // validates structural length, not key validity per-half.)
-            let _id =
-                harmony_identity::Identity::from_public_bytes(&bundle).expect("valid identity");
-            (key, bundle)
-        };
-        let _ = admin_signing_key; // referenced for completeness; not signing here
-        let _ = admin_addr;
-
         let entry = LibraryDirectoryEntry {
-            community_id,
-            community_admin_identity_pub: admin_identity_pub,
+            community_id: SpaceId([0x11; 16]),
+            community_admin_identity_pub: [0x11; 64],
             name: "Phase 3 test".to_string(),
             description: "Round-trip test for wrapped entry".to_string(),
             topics: vec!["test".to_string()],
@@ -1844,8 +1826,6 @@ mod tests {
         let bytes = canonical_cbor_encode(&entry).expect("encode");
         let decoded: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(entry, decoded, "wrapped entry round-trips");
-        assert_eq!(decoded.library_identity_pub, Some([0xBB; 64]));
-        assert_eq!(decoded.library_signature, Some([0xCC; 64]));
     }
 
     /// ZEB-280 Phase 3: a Phase 1-style entry (both Optional fields
