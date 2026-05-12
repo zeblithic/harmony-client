@@ -38,6 +38,7 @@ const fixtureEntry: DirectoryEntry = {
   topics: ['test'],
   invite_url: 'harmony://invite/?p=AAAA',
   listed_by_count: 1,
+  unattested: false,
   listed_at: { w: 0, l: 0, d: 'd' },
 };
 
@@ -352,5 +353,68 @@ describe('LibraryDirectoryBrowser', () => {
       // Inline error shows next to the row.
       expect(await findByText(/library add failed/)).toBeInTheDocument();
     });
+  });
+
+  // ZEB-280 Sub-D Phase 3: inline ⚠ Unattested badge. The badge renders
+  // when entry.unattested === true (Rust: !unattested_by.is_empty()).
+  // Amber (NOT red) styling — admin sig is still the content trust
+  // anchor; only the wrapping (transport-integrity) sig is compromised.
+  it('unattested_badge_renders_when_dto_unattested_true', async () => {
+    const mockEntry: DirectoryEntry = {
+      community_id: 'cc'.repeat(16),
+      community_addr: 'dd'.repeat(16),
+      name: 'Test Community',
+      description: 'A community for testing.',
+      topics: ['test'],
+      invite_url: 'harmony://invite/?p=AAAA',
+      listed_by_count: 1,
+      unattested: true, // ← drives badge
+      listed_at: { w: 0, l: 0, d: 'd' },
+    };
+    const svc = mockService(
+      [{ address: 'aa'.repeat(16), added_at: { w: 0, l: 0, d: 'd' }, entry_count: 1 }],
+      [mockEntry],
+    );
+    const { container } = render(LibraryDirectoryBrowser, {
+      props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+    });
+
+    // Wait for the entries to load (refresh runs in $effect).
+    await waitFor(() => {
+      expect(container.querySelector('.unattested-badge')).toBeTruthy();
+    });
+
+    const badge = container.querySelector('.unattested-badge')!;
+    expect(badge.textContent).toContain('Unattested');
+    expect(badge.getAttribute('aria-label')).toContain('wrapping signature');
+    expect(badge.getAttribute('title')).toContain('admin');
+  });
+
+  it('unattested_badge_absent_when_dto_unattested_false', async () => {
+    const mockEntry: DirectoryEntry = {
+      community_id: 'cc'.repeat(16),
+      community_addr: 'dd'.repeat(16),
+      name: 'Test Community',
+      description: 'A community for testing.',
+      topics: ['test'],
+      invite_url: 'harmony://invite/?p=AAAA',
+      listed_by_count: 1,
+      unattested: false,
+      listed_at: { w: 0, l: 0, d: 'd' },
+    };
+    const svc = mockService(
+      [{ address: 'aa'.repeat(16), added_at: { w: 0, l: 0, d: 'd' }, entry_count: 1 }],
+      [mockEntry],
+    );
+    const { container } = render(LibraryDirectoryBrowser, {
+      props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+    });
+
+    // Wait for entries to load THEN assert badge is NOT present.
+    await waitFor(() => {
+      expect(container.textContent).toContain('Test Community');
+    });
+
+    expect(container.querySelector('.unattested-badge')).toBeNull();
   });
 });

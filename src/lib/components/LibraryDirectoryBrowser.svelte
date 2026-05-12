@@ -303,7 +303,19 @@
         {#each entries as entry (entry.community_id)}
           <li class="catalog-row">
             <div class="row-main">
-              <div class="row-title">{entry.name || '(unnamed)'}</div>
+              <div class="row-title">
+                <span class="community-name">{entry.name || '(unnamed)'}</span>
+                {#if entry.unattested}
+                  <span
+                    class="unattested-badge"
+                    role="img"
+                    aria-label="One or more libraries' wrapping signatures failed to verify for this entry"
+                    title="Unattested: at least one broadcasting library's signature failed to verify. The community admin's signature is still valid; the listing's content is trustworthy."
+                  >
+                    ⚠ Unattested
+                  </span>
+                {/if}
+              </div>
               <div class="row-desc">{entry.description}</div>
               {#if entry.topics.length > 0}
                 <div class="topics">
@@ -438,5 +450,22 @@
     color: #d83c3e;
     font-size: 0.8rem;
     width: 100%;
+  }
+
+  /* ZEB-280 Sub-D Phase 3: inline unattested badge. Amber (NOT red)
+     because the admin sig is still the trust anchor for content; only
+     the wrapping (transport-integrity) attestation is compromised. */
+  .unattested-badge {
+    display: inline-block;
+    margin-left: 0.5rem;
+    padding: 0.125rem 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    background-color: #fef3c7; /* amber-100 */
+    color: #92400e; /* amber-800 */
+    border: 1px solid #fcd34d; /* amber-300 */
+    border-radius: 0.25rem;
+    vertical-align: middle;
+    cursor: help; /* hover tooltip cue */
   }
 </style>
