@@ -30,6 +30,7 @@ pub fn build_test_admin_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
 /// Construct a `LibraryDirectoryEntry`, signing over canonical CBOR
 /// with `community_signature` zeroed at sign time (matching the
 /// production verifier). Returns the signed entry ready to publish.
+#[allow(clippy::too_many_arguments)]
 pub fn mock_directory_entry(
     community_id: SpaceId,
     admin_seed: [u8; 32],

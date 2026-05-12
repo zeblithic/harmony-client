@@ -9654,6 +9654,208 @@ fn membership_outcome_err(
     }
 }
 
+// ── ZEB-218 Sub-D Phase 1: library-directory IPC surface ─────────────
+//
+// Four `#[tauri::command]` handlers that drive the
+// `LibraryDirectory` consumer:
+//
+// - `list_libraries` — snapshot of effective LibraryEntry rows from
+//   owner-state, enriched with per-library aggregation counts.
+// - `add_library` — LWW-merge into `owner_state.libraries` + Subscribe
+//   request to the event-loop consumer.
+// - `remove_library` — set tombstone + Unsubscribe (which evicts the
+//   library's contributions from the aggregation map).
+// - `browse_library` — snapshot the aggregation map; `None` returns
+//   all, `Some(addr_hex)` filters to one library's listings.
+//
+// Persistence: owner-state mutations flow through the existing
+// owner-state SyncEngine's debounced persist cycle — same pattern as
+// `add_space`. No explicit write-back IPC-side; the SyncEngine picks
+// up the BTreeMap mutation on its next checkpoint.
+//
+// HLC discipline: mints via `reserve_next_hlc_for_device` (the
+// `dm_outbox` helper) so the local tracker advances atomically with
+// the reservation — same shape as other owner-state mutations.
+
+/// IPC: list the user's effective libraries with per-library
+/// aggregation counts. Returns `Vec<LibraryInfo>` ordered by the
+/// `OwnerAddr` key (BTreeMap iteration order).
+#[tauri::command]
+async fn list_libraries(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<crate::library_directory::LibraryInfo>, String> {
+    let (crdt_state, library_directory) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+        )
+    };
+    let crdt_g = crdt_state.lock().await;
+    let agg_g = library_directory.aggregation.lock().await;
+    let mut out = Vec::new();
+    for (addr, lib) in &crdt_g.libraries {
+        if !lib.is_effective() {
+            continue;
+        }
+        let count = agg_g.entry_count_for_library(addr);
+        out.push(crate::library_directory::LibraryInfo {
+            address: hex::encode(addr.0),
+            added_at: lib.added_at.clone(),
+            entry_count: count,
+        });
+    }
+    Ok(out)
+}
+
+/// IPC: add a library to the user's trust set. LWW-merges into
+/// `owner_state.libraries` and sends a Subscribe request to the
+/// event-loop consumer (which declares the per-library Zenoh
+/// subscriber).
+#[tauri::command]
+async fn add_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: String,
+) -> Result<(), String> {
+    let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
+    let (crdt_state, library_directory, hlc_tracker, device_id) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing — node not running?")?,
+        )
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let now_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    {
+        let mut crdt_g = crdt_state.lock().await;
+        let existing = crdt_g.libraries.get(&addr).cloned();
+        // If a higher-HLC tombstone exists, our add must beat it.
+        // Otherwise the LWW state stays "removed" and this Subscribe
+        // would be a no-op from the user's perspective.
+        if let Some(prev) = existing.as_ref() {
+            if let Some(prev_remove) = &prev.removed_at {
+                if prev_remove.is_strictly_newer_than(&now_hlc) {
+                    return Err("HLC went backward; refusing to add".into());
+                }
+            }
+        }
+        let new_entry = crate::owner_state_types::LibraryEntry {
+            address: addr,
+            added_at: now_hlc.clone(),
+            removed_at: existing.as_ref().and_then(|e| e.removed_at.clone()),
+        };
+        crdt_g.libraries.insert(addr, new_entry);
+        // Persistence writeback: owner-state SyncEngine debounces its
+        // own checkpoint on the same crdt_state Arc (see add_space).
+    }
+    let _ = library_directory
+        .request_tx
+        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(addr))
+        .await;
+    Ok(())
+}
+
+/// IPC: remove a library. Sets the LWW tombstone in owner-state and
+/// sends an Unsubscribe request which (a) aborts the live Zenoh
+/// subscriber task and (b) calls `drop_library` to evict the library's
+/// contributions from the aggregation map.
+#[tauri::command]
+async fn remove_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: String,
+) -> Result<(), String> {
+    let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
+    let (crdt_state, library_directory, hlc_tracker, device_id) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing — node not running?")?,
+        )
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let now_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    {
+        let mut crdt_g = crdt_state.lock().await;
+        if let Some(lib) = crdt_g.libraries.get_mut(&addr) {
+            lib.removed_at = Some(now_hlc);
+        }
+    }
+    let _ = library_directory
+        .request_tx
+        .send(crate::library_directory::LibraryDirectoryRequest::Unsubscribe(addr))
+        .await;
+    Ok(())
+}
+
+/// IPC: browse the directory. `None` aggregates across all libraries;
+/// `Some(addr_hex)` filters to one library's contributions. Maps to
+/// `DirectoryEntryDTO` (strips cryptographic material; derives
+/// `community_addr` from the admin identity bundle for display).
+#[tauri::command]
+async fn browse_library(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    library_addr: Option<String>,
+) -> Result<Vec<crate::library_directory::DirectoryEntryDTO>, String> {
+    let library_directory = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.library_directory
+            .clone()
+            .ok_or("library_directory missing — node not running?")?
+    };
+    let aggregated = match library_addr {
+        None => library_directory.snapshot_all().await,
+        Some(addr_hex) => {
+            let addr = crate::library_directory::parse_owner_addr_hex(&addr_hex)?;
+            library_directory.snapshot_filtered_by_library(&addr).await
+        }
+    };
+    Ok(aggregated
+        .iter()
+        .map(crate::library_directory::DirectoryEntryDTO::from_aggregated)
+        .collect())
+}
+
 /// Tauri IPC: leave a community we currently belong to.
 ///
 /// Mints a self-Leave event, looks up the per-community engine via
@@ -11664,6 +11866,10 @@ pub fn run() {
             list_channel_messages,
             post_channel_message,
             request_channel_backfill,
+            list_libraries,
+            add_library,
+            remove_library,
+            browse_library,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

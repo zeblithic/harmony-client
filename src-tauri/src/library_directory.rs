@@ -398,6 +398,68 @@ pub enum ProcessSampleError {
     Verify(#[from] EntryVerifyError),
 }
 
+/// Frontend-facing DTO: minimal library info for chip rendering.
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryInfo {
+    /// Hex-encoded OwnerAddr (32 chars).
+    pub address: String,
+    pub added_at: Hlc,
+    /// Count of entries currently aggregated from this library.
+    pub entry_count: usize,
+}
+
+/// Frontend-facing DTO: one community in the browse list. Strips
+/// `community_admin_identity_pub` and `community_signature` (verified
+/// at receive); exposes the derived `community_addr` for display.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryEntryDTO {
+    /// Hex-encoded SpaceId (32 chars).
+    pub community_id: String,
+    /// Hex-encoded OwnerAddr (32 chars) derived from
+    /// `community_admin_identity_pub` via `address_hash`.
+    pub community_addr: String,
+    pub name: String,
+    pub description: String,
+    pub topics: Vec<String>,
+    pub invite_url: String,
+    pub listed_by_count: usize,
+    pub listed_at: Hlc,
+}
+
+impl DirectoryEntryDTO {
+    pub fn from_aggregated(agg: &AggregatedEntry) -> Self {
+        let addr_bytes =
+            harmony_identity::Identity::from_public_bytes(&agg.entry.community_admin_identity_pub)
+                .map(|id| id.address_hash)
+                .unwrap_or_default();
+        Self {
+            community_id: hex::encode(agg.entry.community_id.0),
+            community_addr: hex::encode(addr_bytes),
+            name: agg.entry.name.clone(),
+            description: agg.entry.description.clone(),
+            topics: agg.entry.topics.clone(),
+            invite_url: agg.entry.invite_url.clone(),
+            listed_by_count: agg.listed_by.len(),
+            listed_at: agg.entry.listed_at.clone(),
+        }
+    }
+}
+
+/// Parse a 32-hex-char address into `OwnerAddr`. Validation entry point
+/// used by `add_library` / `remove_library` IPCs.
+pub fn parse_owner_addr_hex(s: &str) -> Result<OwnerAddr, String> {
+    let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() != 16 {
+        return Err(format!(
+            "expected 16-byte OwnerAddr (32 hex chars), got {} bytes",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes);
+    Ok(OwnerAddr(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +910,27 @@ mod tests {
             invite_url.clone(),
         ));
         assert_eq!(outcome, OnEntryOutcome::Idempotent);
+    }
+
+    #[test]
+    fn parse_owner_addr_hex_round_trips() {
+        let good = "aa".repeat(16);
+        let addr = parse_owner_addr_hex(&good).expect("valid 32-hex-char");
+        assert_eq!(addr, OwnerAddr([0xAA; 16]));
+    }
+
+    #[test]
+    fn parse_owner_addr_hex_rejects_short_input() {
+        let too_short = "aa".repeat(15);
+        let err = parse_owner_addr_hex(&too_short).unwrap_err();
+        assert!(err.contains("expected 16-byte"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_owner_addr_hex_rejects_non_hex() {
+        let non_hex = "zz".repeat(16);
+        let err = parse_owner_addr_hex(&non_hex).unwrap_err();
+        assert!(err.contains("invalid hex"), "got: {err}");
     }
 
     #[test]
