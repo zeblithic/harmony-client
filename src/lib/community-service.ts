@@ -157,6 +157,26 @@ export class CommunityService {
     return dto;
   }
 
+  /**
+   * ZEB-252 Sub-D Phase 6: typed direct-join entry point for
+   * library-directory click flows. The backend re-resolves the matching
+   * `LibraryDirectoryEntry` by community_id and delegates to the same
+   * `redeem_invite_inner` codepath `redeemInvite` uses, so the resulting
+   * DTO and side-effects (engine spawn, owner-state Space row, self-Join
+   * event log) are identical. `redeemInvite(url)` stays for hand-pasted
+   * URLs.
+   */
+  async joinOpenCommunity(communityId: string): Promise<RedeemInviteResultDto> {
+    const dto = await this.invoke<RedeemInviteResultDto>('join_open_community', { communityId });
+    // Backend hands back the kind; populate getKind() the same way redeemInvite does.
+    // Phase 6 only joins OPEN communities (invite-only entries are rejected
+    // by the backend's defensive re-check), so isInviteOnly will always be false
+    // for successful returns — but we mirror redeemInvite's logic for symmetry
+    // rather than assuming.
+    this.knownKinds.set(dto.communityId, dto.isInviteOnly ? 'invite-only' : 'open');
+    return dto;
+  }
+
   async leaveCommunity(communityId: string): Promise<void> {
     await this.invoke<void>('leave_community', { communityId });
   }

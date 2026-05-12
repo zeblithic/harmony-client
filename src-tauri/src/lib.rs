@@ -9452,6 +9452,194 @@ async fn redeem_invite(
     Ok(dto)
 }
 
+// ── ZEB-252 Sub-D Phase 6: join_open_community ─────────────────────────────
+//
+// Thin wrapper over redeem_invite_inner. Re-resolves the directory entry
+// server-side at click time so the renderer can't pass a URL the user
+// never saw. The actual join machinery (URL decode, HLC reserve, mint,
+// engine spawn, owner-state commit) is unchanged — Phase 6 is strictly
+// a caller of redeem_invite_inner.
+//
+// See `docs/specs/2026-05-12-zeb-252-sub-d-phase-6-direct-join-design.md`.
+
+/// Inner helper for `join_open_community`. Separated from the Tauri command
+/// so unit tests can supply a fabricated snapshot + the standard
+/// redeem-invite test fixture without spinning up a `LibraryDirectory` actor.
+#[allow(clippy::too_many_arguments)]
+async fn join_open_community_inner<R, F>(
+    community_id_hex: String,
+    snapshot: &[crate::library_directory::AggregatedEntry],
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
+    fence_check: F,
+) -> Result<RedeemInviteResultDto, String>
+where
+    R: tauri::Runtime,
+    F: Fn() -> Result<(), String>,
+{
+    let invite_url = crate::library_directory::find_open_community_invite_url_in_snapshot(
+        snapshot,
+        &community_id_hex,
+    )?;
+
+    redeem_invite_inner(
+        invite_url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        fence_check,
+    )
+    .await
+}
+
+/// Tauri IPC: join an open community directly from the library-directory
+/// aggregation. Re-resolves the entry by `community_id` server-side, then
+/// delegates to `redeem_invite_inner` (which Phase 6 strictly wraps).
+///
+/// `redeem_invite(url)` remains the IPC for hand-pasted URLs.
+///
+/// Errors:
+/// - `"This community is no longer listed by any of your libraries"` — entry
+///   not in current aggregation (spec §4.3).
+/// - `"Invite-only community cannot be joined directly from the directory"` —
+///   defensive re-check; spec §4.4.
+/// - Any error from `redeem_invite_inner` propagated verbatim.
+#[tauri::command]
+async fn join_open_community(
+    app: tauri::AppHandle,
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<RedeemInviteResultDto, String> {
+    let (
+        library_directory,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        channel_log_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.library_directory
+                .clone()
+                .ok_or("library_directory missing — node not running?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.community_adapter_request_tx
+                .clone()
+                .ok_or("community_adapter_request_tx missing")?,
+            g.unicast_send_tx
+                .clone()
+                .ok_or("unicast_send_tx missing — no owner identity?")?,
+            g.channel_log_registry
+                .clone()
+                .ok_or("channel_log_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    }; // std lock dropped here.
+
+    let snapshot = library_directory.snapshot_all().await;
+
+    let signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+
+    let fence_check = {
+        let state_lock = state_lock.clone();
+        move || -> Result<(), String> {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during join_open_community (was {}, now {}); \
+                     join minted on a detached crdt_state and won't be persisted — \
+                     engine spawn suppressed",
+                    snapshot_generation, g.generation
+                ));
+            }
+            if g.community_registry.is_none() {
+                return Err(
+                    "community_registry was torn down during join_open_community — engine \
+                     spawn suppressed"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    };
+
+    let dto = join_open_community_inner(
+        community_id,
+        &snapshot,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        fence_check,
+    )
+    .await?;
+
+    if let Err(e) = app.emit(
+        "nav-updated",
+        &NavUpdatedPayload {
+            action: "added",
+            space_id: dto.community_id.clone(),
+            kind: "community",
+            name: dto.community_name.clone(),
+            members: None,
+            parent_id: None,
+        },
+    ) {
+        tracing::warn!(error = %e, "join_open_community: nav-updated emit failed");
+    }
+
+    Ok(dto)
+}
+
 #[cfg(test)]
 mod redeem_invite_inner_tests {
     use super::*;
@@ -9470,7 +9658,7 @@ mod redeem_invite_inner_tests {
 
     // ── Fixture helper ────────────────────────────────────────────────────────
 
-    fn signing_key_from_identity(
+    pub(super) fn signing_key_from_identity(
         identity: &PrivateIdentity,
     ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
         let sk_bytes_full = identity.to_private_bytes();
@@ -9480,17 +9668,19 @@ mod redeem_invite_inner_tests {
         std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
     }
 
-    struct RedeemInviteTestFixture {
-        crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
-        hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
-        device_id: String,
-        self_owner: OwnerAddr,
-        signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
-        community_registry: std::sync::Arc<CommunitySyncRegistry>,
-        community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
-        unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
-        dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
-        channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
+    pub(super) struct RedeemInviteTestFixture {
+        pub(super) crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
+        pub(super) hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        pub(super) device_id: String,
+        pub(super) self_owner: OwnerAddr,
+        pub(super) signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        pub(super) community_registry: std::sync::Arc<CommunitySyncRegistry>,
+        pub(super) community_adapter_tx:
+            tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+        pub(super) unicast_send_tx: tokio::sync::mpsc::Sender<UnicastSendRequest>,
+        pub(super) dm_outbox: std::sync::Arc<tokio::sync::Mutex<DmOutbox>>,
+        pub(super) channel_log_registry:
+            std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
         // Held alive so channels don't report Closed.
         _community_adapter_rx:
             tokio::sync::mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
@@ -9515,7 +9705,7 @@ mod redeem_invite_inner_tests {
     ///   (remote Zenoh events don't arrive in unit tests).
     /// - `unicast_send_tx` receiver is kept alive so try_send doesn't see
     ///   Closed (needed by the INVITE-ONLY branch; unused on the OPEN path).
-    async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
+    pub(super) async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
         // Joiner identity (self).
@@ -9756,6 +9946,104 @@ mod redeem_invite_inner_tests {
         // the engine's verify_event runs the same check on insert.
         crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
             .expect("self-join signature must verify against joiner identity_pub");
+    }
+}
+
+#[cfg(test)]
+mod join_open_community_tests {
+    use super::*;
+    use crate::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
+    };
+    use crate::library_directory::{AggregatedEntry, LibraryDirectoryEntry};
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeSet;
+
+    fn build_open_directory_aggregated(
+        admin_identity: &PrivateIdentity,
+        community_id: SpaceId,
+        membership_key_bytes: [u8; 32],
+        community_name: &str,
+    ) -> AggregatedEntry {
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key_bytes.to_vec(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: community_name.into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+        };
+        let invite_url = encode_invite_url(&payload).expect("encode open url");
+        let entry = LibraryDirectoryEntry {
+            community_id,
+            community_admin_identity_pub: admin_identity.identity.to_public_bytes(),
+            name: community_name.into(),
+            description: String::new(),
+            topics: Vec::new(),
+            invite_url,
+            listed_by: OwnerAddr([0xcc; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-dev".into(),
+            },
+            library_identity_pub: None,
+            library_signature: None,
+            community_signature: [0u8; 64],
+        };
+        AggregatedEntry {
+            entry,
+            attested_by: BTreeSet::new(),
+            unattested_by: BTreeSet::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_open_community_happy_path_delegates_to_redeem_and_returns_dto() {
+        let fixture = redeem_invite_inner_tests::build_redeem_invite_test_fixture().await;
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let community_id = SpaceId([0xf3; 16]);
+        let membership_key = EpochKey::new([0x42; 32]);
+
+        let agg = build_open_directory_aggregated(
+            &admin_identity,
+            community_id,
+            *membership_key.as_bytes(),
+            "JoinCom",
+        );
+        let snapshot = vec![agg];
+
+        let dto = join_open_community_inner(
+            hex::encode(community_id.0),
+            &snapshot,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+        )
+        .await
+        .expect("happy path must succeed");
+
+        assert_eq!(dto.community_id, hex::encode(community_id.0));
+        assert_eq!(dto.community_name, "JoinCom");
+        assert!(!dto.is_invite_only);
     }
 }
 
@@ -12643,6 +12931,7 @@ pub fn run() {
             generate_invite,
             create_community,
             redeem_invite,
+            join_open_community,
             leave_community,
             kick_from_community,
             set_power_level,

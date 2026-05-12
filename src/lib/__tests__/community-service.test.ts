@@ -92,6 +92,26 @@ describe('CommunityService', () => {
     expect(service.getKind('eeff0011')).toBe('invite-only');
   });
 
+  it('joinOpenCommunity returns the DTO and learns the community kind', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'aabbccddeeff00112233445566778899',
+      communityName: 'DirCommunity',
+      isInviteOnly: false,
+    });
+    const returned = await service.joinOpenCommunity('aabbccddeeff00112233445566778899');
+    expect(adapter.invoke).toHaveBeenCalledWith('join_open_community', {
+      communityId: 'aabbccddeeff00112233445566778899',
+    });
+    expect(returned).toEqual({
+      communityId: 'aabbccddeeff00112233445566778899',
+      communityName: 'DirCommunity',
+      isInviteOnly: false,
+    });
+    // Same as redeemInvite: a successful direct-join learns the kind.
+    expect(service.getKind('aabbccddeeff00112233445566778899')).toBe('open');
+  });
+
   it('redeemInvite records open kind when isInviteOnly is false', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue({

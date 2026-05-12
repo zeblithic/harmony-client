@@ -4,8 +4,11 @@
    * - Empty state CTA → opens `AddLibraryDialog`
    * - Library chips with remove ✕
    * - Aggregated catalog (deduped by community_id across libraries)
-   * - Join button → `onJoin(invite_url)` callback (App wires to
-   *   `redeem_invite` IPC, reusing ZEB-249's open-community invite path)
+   * - Join button → `onJoin(community_id)` callback (App wires to
+   *   `join_open_community` IPC — ZEB-252 Sub-D Phase 6. The backend
+   *   re-resolves the matching entry server-side and delegates to the
+   *   existing `redeem_invite_inner` codepath, so end state is identical
+   *   to what `redeem_invite(invite_url)` produces.)
    *
    * Refreshes on the `library-directory-updated` IPC event with a 200ms
    * debounce so a burst of incoming entries collapses into one fetch.
@@ -27,8 +30,10 @@
   }: {
     service: LibraryDirectoryService;
     adapter: TauriAdapter;
-    /** Called when the user clicks Join on an entry. Wired to redeem_invite. */
-    onJoin: (inviteUrl: string) => Promise<void>;
+    /** Called when the user clicks Join on an entry. Wired to join_open_community.
+     *  Receives the entry's `community_id` (32-hex-char SpaceId) so the backend
+     *  can re-resolve the directory entry server-side at click time. */
+    onJoin: (communityId: string) => Promise<void>;
     /** Closes the browser modal. */
     onClose: () => void;
   } = $props();
@@ -170,7 +175,7 @@
     joinPending = entry.community_id;
     joinError = null;
     try {
-      await onJoin(entry.invite_url);
+      await onJoin(entry.community_id);
       onClose();
     } catch (e) {
       joinError = e instanceof Error ? e.message : String(e);

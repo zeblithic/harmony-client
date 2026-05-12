@@ -81,7 +81,7 @@ describe('LibraryDirectoryBrowser', () => {
     expect(await findByText(/Listed by 1 library/)).toBeInTheDocument();
   });
 
-  it('Join calls onJoin with invite_url', async () => {
+  it('Join calls onJoin with community_id (ZEB-252 Phase 6)', async () => {
     const onJoin = vi.fn().mockResolvedValue(undefined);
     const onClose = vi.fn();
     const svc = mockService(
@@ -93,7 +93,10 @@ describe('LibraryDirectoryBrowser', () => {
     });
     await fireEvent.click(await findByText(/Join/));
     await waitFor(() => {
-      expect(onJoin).toHaveBeenCalledWith('harmony://invite/?p=AAAA');
+      // ZEB-252 Sub-D Phase 6: onJoin now receives community_id, not invite_url.
+      // App wires this to communityService.joinOpenCommunity(communityId).
+      expect(onJoin).toHaveBeenCalledWith('11111111111111111111111111111111');
+      expect(onJoin).not.toHaveBeenCalledWith(expect.stringMatching(/^harmony:/));
       expect(onClose).toHaveBeenCalled();
     });
   });
