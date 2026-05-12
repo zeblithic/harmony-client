@@ -89,19 +89,33 @@ fn dup_identity(src: &PrivateIdentity) -> PrivateIdentity {
         .expect("PrivateIdentity round-trip via to/from_private_bytes")
 }
 
+/// Process-global mutex serializing mutations to the
+/// `HARMONY_REDEEM_INVITE_TIMEOUT_MS` env var across parallel tests.
+///
+/// CR Major (PR #106 R7): `std::env::set_var` is process-global.
+/// Multiple tests can race on it under `cargo nextest`'s default
+/// parallel test-thread model.  Holding this mutex for the guard's
+/// entire lifetime serializes the set + test + restore sequence so
+/// that no two tests overlap their env-var window.
+static REDEEM_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// RAII guard for the redeem-invite timeout env var. Captures the
 /// pre-existing value (if any) and restores or removes it on Drop, so a
 /// panicking test cannot leak the override into subsequent tests in
 /// this binary. (Cross-binary leakage is moot — each test binary is a
 /// separate OS process.)
 struct RedeemTimeoutGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
     prior: Option<std::ffi::OsString>,
 }
 impl RedeemTimeoutGuard {
     fn set(value: &str) -> Self {
+        let lock = REDEEM_TIMEOUT_ENV_LOCK
+            .lock()
+            .expect("timeout env lock poisoned");
         let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
         std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", value);
-        Self { prior }
+        Self { _lock: lock, prior }
     }
 }
 impl Drop for RedeemTimeoutGuard {
@@ -110,6 +124,7 @@ impl Drop for RedeemTimeoutGuard {
             Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
             None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
         }
+        // _lock drops here, releasing REDEEM_TIMEOUT_ENV_LOCK.
     }
 }
 

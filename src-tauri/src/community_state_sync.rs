@@ -584,6 +584,20 @@ pub enum CommunitySyncError {
          under pre-rotation key"
     )]
     PublishRetryExhausted,
+
+    /// CR Critical (PR #106 R7): `live_epoch_key` was called with
+    /// `crdt_state = Some(...)` (owner-state IS wired) but the Space entry
+    /// or its epoch fields are absent / incomplete.  Silently falling back to
+    /// the spawn-time key would reopen the §10.6 backward-secrecy gap, so
+    /// this is surfaced as an error instead.
+    ///
+    /// `crdt_state = None` (test/legacy mode) still takes the explicit
+    /// fallback path and never produces this error.
+    #[error(
+        "live_epoch_key: crdt_state is wired but Space/epoch is incomplete for community {0:?}; \
+         refusing to fall back to spawn-time key (would reopen §10.6 backward-secrecy gap)"
+    )]
+    LiveEpochKeyMissing(SpaceId),
 }
 
 /// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
@@ -1683,20 +1697,42 @@ async fn internal_task(mut ctx: InternalCtx) {
 ///
 /// Returns `(epoch_key, epoch_counter)`. `epoch_counter` is `None`
 /// when the fallback fires (spawn-time key carries no epoch metadata).
+/// Return the live epoch key and epoch number for `community_id`.
+///
+/// CR Critical (PR #106 R7): the `crdt_state = None` (test/legacy) and
+/// `crdt_state = Some` paths are now explicitly separated:
+///
+/// - `None` → explicit fallback to the spawn-time `fallback` key.
+/// - `Some` → the owner-state IS wired; if the Space/epoch fields are
+///   missing or incomplete we surface `LiveEpochKeyMissing` rather than
+///   silently using the spawn-time key, which would reopen the §10.6
+///   backward-secrecy gap.
 async fn live_epoch_key(
     community_id: SpaceId,
     crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
     fallback: &EpochKey,
-) -> (EpochKey, Option<u64>) {
-    if let Some(cs) = crdt_state {
-        let guard = cs.lock().await;
-        if let Some(space) = guard.spaces.get(&community_id) {
-            if let (Some(k), Some(e)) = (space.current_epoch_key.clone(), space.current_epoch) {
-                return (k, Some(e));
+) -> Result<(EpochKey, Option<u64>), CommunitySyncError> {
+    match crdt_state {
+        None => {
+            // Test / legacy mode: explicit fallback to spawn-time key.
+            Ok((fallback.clone(), None))
+        }
+        Some(cs) => {
+            let guard = cs.lock().await;
+            match guard.spaces.get(&community_id) {
+                Some(space) => match (&space.current_epoch_key, space.current_epoch) {
+                    (Some(k), Some(e)) => Ok((k.clone(), Some(e))),
+                    _ => {
+                        // crdt_state IS wired but Space/epoch is incomplete.
+                        // Surface as error rather than silently substituting
+                        // the spawn-time key (which would reopen §10.6 gap).
+                        Err(CommunitySyncError::LiveEpochKeyMissing(community_id))
+                    }
+                },
+                None => Err(CommunitySyncError::LiveEpochKeyMissing(community_id)),
             }
         }
     }
-    (fallback.clone(), None)
 }
 
 /// Snapshot the local CRDT, encrypt it, write to CAS, build a
@@ -1747,12 +1783,15 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     let (current_key, current_epoch, snapshot) = {
         let mut retries: u8 = 5;
         loop {
+            // CR Critical (PR #106 R7): live_epoch_key now returns Result.
+            // If crdt_state is Some but Space/epoch is incomplete, abort
+            // immediately rather than looping with a stale key.
             let (_key_before, epoch_before) = live_epoch_key(
                 ctx.community_id,
                 ctx.crdt_state.as_ref(),
                 &ctx.membership_key,
             )
-            .await;
+            .await?;
 
             // Snapshot CRDT state under brief lock; drop guard before
             // the epoch recheck and the expensive encode + AEAD + CAS
@@ -1767,7 +1806,7 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
                 ctx.crdt_state.as_ref(),
                 &ctx.membership_key,
             )
-            .await;
+            .await?;
 
             if epoch_before == epoch_after {
                 // Epoch stable across snapshot window — safe to proceed.
@@ -2725,6 +2764,7 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
         CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",
+        CommunitySyncError::LiveEpochKeyMissing(_) => "live_epoch_key_missing",
     }
 }
 

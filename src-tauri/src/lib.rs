@@ -9850,6 +9850,16 @@ async fn leave_community(
             ) {
                 return Err(membership_outcome_err("leave_community", &outcome));
             }
+            // CR Major (PR #106 R7): "survivors exist but we couldn't mint companion
+            // EpochRotation" is NOT a successful leave — backward secrecy is broken
+            // until the admin self-healing observer synthesizes the rotation. Return
+            // Err so callers can distinguish this from a true solo-leave (Ok(())).
+            if !is_solo {
+                return Err(format!(
+                    "leave_community committed Leave but could not mint paired EpochRotation: {e}"
+                ));
+            }
+            // Solo-leave: no rotation needed; fall through to nav-update and Ok(()).
         }
     }
 
@@ -10206,6 +10216,7 @@ async fn kick_from_community(
         (
             crate::community_membership::SignedMembershipEvent,
             crate::owner_state_types::EpochKey,
+            u64, // prior_epoch: current_epoch at the time the rotation was minted
         ),
         String,
     > = async {
@@ -10265,12 +10276,12 @@ async fn kick_from_community(
             )?
         };
 
-        Ok((rotation, k_next))
+        Ok((rotation, k_next, current_epoch))
     }
     .await;
 
     match rotation_bundle {
-        Ok((rotation, k_next)) => {
+        Ok((rotation, k_next, prior_epoch)) => {
             // §4.1 happy path: submit kick + rotation atomically.
             let (kick_outcome, rot_outcome) = engine_arc
                 .insert_local_event_pair(kick.clone(), rotation)
@@ -10302,6 +10313,14 @@ async fn kick_from_community(
                 // Guard is `Inserted` (not `!Rejected`) to prevent double-advance
                 // on the astronomically unlikely AlreadyKnown case (same EventId
                 // collision from a re-issued kick replay).
+                //
+                // CR Critical (PR #106 R7): apply_remote_epoch_event (the delta
+                // consumer) can process this node's own EpochRotation before we
+                // reach here, since events flow through the consumer regardless of
+                // origin. If it already advanced the epoch we must NOT advance again
+                // — that would double-advance and archive the wrong key. Compare
+                // against `prior_epoch` (the epoch at minting time) and only apply
+                // when the stored epoch is still behind the target.
                 if let Some(crdt_state) = {
                     let g = state_lock
                         .lock()
@@ -10310,13 +10329,17 @@ async fn kick_from_community(
                 } {
                     let mut state_g = crdt_state.lock().await;
                     if let Some(space) = state_g.spaces.get_mut(&space_id) {
-                        let prev_epoch = space.current_epoch.unwrap_or(0);
-                        let prev_key = space.current_epoch_key.clone();
-                        space.current_epoch = Some(prev_epoch + 1);
-                        space.current_epoch_key = Some(k_next);
-                        if let Some(pk) = prev_key {
-                            space.old_epoch_keys.insert(prev_epoch, pk);
+                        let target_epoch = prior_epoch + 1;
+                        if space.current_epoch.unwrap_or(0) < target_epoch {
+                            // Delta-consumer has not yet applied this rotation.
+                            let prev_key = space.current_epoch_key.clone();
+                            space.current_epoch = Some(target_epoch);
+                            space.current_epoch_key = Some(k_next);
+                            if let Some(pk) = prev_key {
+                                space.old_epoch_keys.insert(prior_epoch, pk);
+                            }
                         }
+                        // else: delta-consumer path already at or past target — skip.
                     }
                 }
             }
