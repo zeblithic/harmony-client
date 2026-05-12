@@ -307,6 +307,9 @@ impl ProfileBroadcastPublisher {
         is_refresh: bool,
     ) {
         let current = source.current_shared_set().await;
+        // Lock held across `sink.publish().await` is safe here — single-writer
+        // task (the spawned publisher), only other consumer
+        // (`last_published_for_test`) is read-only.
         let mut guard = last_published.lock().await;
         let last_snapshot = guard.as_ref().cloned();
 
@@ -383,6 +386,11 @@ pub struct OwnerStateBroadcastSource {
 impl ProfileBroadcastSource for OwnerStateBroadcastSource {
     async fn current_shared_set(&self) -> Vec<SpaceId> {
         let g = self.crdt_state.lock().await;
+        // NOTE: For a Community Space, the community's SpaceId IS `s.id`
+        // — `s.community_id` is a back-pointer from a Channel Space to
+        // its parent Community Space and is validated to be `None` on
+        // Community Spaces themselves (owner_state_types.rs:1769-1775).
+        // Using `s.community_id` here would filter every Community out.
         let mut ids: Vec<SpaceId> = g
             .spaces
             .values()
@@ -390,7 +398,7 @@ impl ProfileBroadcastSource for OwnerStateBroadcastSource {
                 matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
                     && s.shared_in_profile
             })
-            .filter_map(|s| s.community_id)
+            .map(|s| s.id)
             .collect();
         ids.sort();
         ids.dedup();
@@ -605,6 +613,153 @@ mod tests {
     use std::sync::Arc as StdArc;
     use tokio::sync::Mutex as TokioMutex;
 
+    /// Regression: ensures `OwnerStateBroadcastSource::current_shared_set`
+    /// extracts the Community Space's own `id` (the community's SpaceId)
+    /// and NOT `s.community_id` (which is a back-pointer from Channels to
+    /// their parent Community, and validates as `None` on Community
+    /// Spaces themselves — see owner_state_types.rs:1769-1775). The
+    /// MockSource above returns hard-coded SpaceIds so it doesn't
+    /// exercise this code path; this test wires the real production
+    /// source against a synthetic `OwnerState`.
+    #[tokio::test]
+    async fn owner_state_source_returns_opted_in_community_space_ids() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::owner_state_types::{
+            DmContentKey, EpochKey, OwnerAddr, Space, SpaceKind, TransportBinding,
+        };
+
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        // Community A — opted in. Its id MUST appear in the result.
+        let community_opted_in = Space {
+            id: SpaceId([0xa1; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None, // back-pointer is None on Community itself
+            name: "Opted-in community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xab; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+        // Community B — opted OUT. Must NOT appear.
+        let community_opted_out = Space {
+            id: SpaceId([0xa2; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Opted-out community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc.clone(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xcd; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: false,
+        };
+        // DM — shared_in_profile=true defensively, kind != Community
+        // so it MUST be filtered out regardless of the flag.
+        let dm = Space {
+            id: SpaceId([0xd0; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "Some DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc.clone(),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: true,
+        };
+        // Channel — kind != Community, with community_id back-pointer
+        // to community_opted_in. Previous bug would have included this
+        // community's id via the back-pointer instead of via the
+        // Community Space's own id. MUST be filtered out (wrong kind).
+        let channel = Space {
+            id: SpaceId([0xc0; 16]),
+            kind: SpaceKind::Channel,
+            parent: Some(community_opted_in.id),
+            community_id: Some(community_opted_in.id),
+            name: "Some channel".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+        };
+
+        let mut state = OwnerState::default();
+        state
+            .spaces
+            .insert(community_opted_in.id, community_opted_in.clone());
+        state
+            .spaces
+            .insert(community_opted_out.id, community_opted_out.clone());
+        state.spaces.insert(dm.id, dm.clone());
+        state.spaces.insert(channel.id, channel.clone());
+
+        let crdt_state = StdArc::new(TokioMutex::new(state));
+        let hlc_tracker = StdArc::new(TokioMutex::new(std::collections::BTreeMap::new()));
+        let src = OwnerStateBroadcastSource {
+            crdt_state,
+            hlc_tracker,
+            device_id: "test".into(),
+        };
+
+        let got = src.current_shared_set().await;
+        assert_eq!(
+            got,
+            vec![community_opted_in.id],
+            "current_shared_set must return ONLY the opted-in Community \
+             Space's own id (not community_id back-pointer, not the \
+             opted-out community, not the DM, not the channel); got {got:?}"
+        );
+    }
+
     // Type aliases keep clippy::type_complexity happy and make the
     // MockSink / mock_publisher_setup signatures readable.
     type SharedPublished = StdArc<TokioMutex<Vec<(String, Vec<u8>)>>>;
@@ -701,6 +856,11 @@ mod tests {
         }
         // Wait past debounce.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Shut down BEFORE asserting to eliminate the race against the
+        // 100ms refresh tick on contended CI runners — once the task is
+        // aborted no further publishes can happen, so the assert runs
+        // against a quiesced publisher.
+        publisher.shutdown().await;
         let pubs = published.lock().await;
         assert_eq!(
             pubs.len(),
@@ -708,8 +868,6 @@ mod tests {
             "5 rapid toggles must coalesce to 1 broadcast; got {}",
             pubs.len()
         );
-        drop(pubs);
-        publisher.shutdown().await;
     }
 
     #[tokio::test]
