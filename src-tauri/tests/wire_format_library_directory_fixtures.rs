@@ -101,12 +101,13 @@ fn library_entry_with_tombstone_canonical_cbor_pinned() {
 }
 
 /// 2-char field-key invariant: every key in the canonical CBOR must be
-/// a 2-byte text(2) string (CBOR major-type 3, length 2). The CBOR
-/// header for text(2) is 0x62. We scan for the windows(3) sequence
-/// `[0x62, key_byte_0, key_byte_1]` matching each declared field.
+/// a 2-byte text(2) string.
 ///
-/// This is the same pattern as ZEB-255's
-/// `non_community_space_skips_membership_fields_in_wire`.
+/// R4 F1: previous implementation scanned for `[0x62, k0, k1]` byte
+/// patterns via `windows(3)`, which could false-pass if a payload byte
+/// sequence coincidentally matched the header+key triple. The strict
+/// approach is to decode the canonical CBOR into a `Value::Map`, walk
+/// its keys, and assert exact set-equality with the expected keys.
 #[test]
 fn library_directory_entry_field_keys_are_2char() {
     let entry = LibraryDirectoryEntry {
@@ -126,11 +127,27 @@ fn library_directory_entry_field_keys_are_2char() {
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
 
-    for key in ["cd", "ai", "nm", "ds", "tp", "iu", "lb", "la", "cs"] {
-        let needle = [0x62, key.as_bytes()[0], key.as_bytes()[1]];
-        assert!(
-            bytes.windows(3).any(|w| w == needle),
-            "field key {key:?} (CBOR text(2)) not found in encoded bytes"
-        );
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+
+    let mut keys = std::collections::BTreeSet::new();
+    for (k, _) in map {
+        match k {
+            ciborium::value::Value::Text(s) => {
+                assert_eq!(s.len(), 2, "field key must be 2 chars: {s:?}");
+                keys.insert(s);
+            }
+            other => panic!("non-text map key in LibraryDirectoryEntry encoding: {other:?}"),
+        }
     }
+
+    let expected: std::collections::BTreeSet<String> =
+        ["cd", "ai", "nm", "ds", "tp", "iu", "lb", "la", "cs"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    assert_eq!(keys, expected, "field keys must match exactly");
 }

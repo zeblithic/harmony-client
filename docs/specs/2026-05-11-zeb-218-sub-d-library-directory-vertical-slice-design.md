@@ -54,7 +54,7 @@ direct-join IPC because:
 
 ## 3. Architecture overview
 
-```
+```text
                 ┌───────────────────────────────────┐
                 │ harmony/discovery/library/        │
                 │   {lib_addr}/communities          │
@@ -161,8 +161,9 @@ without storing redundant wire bytes.
 - `Identity::from_public_bytes(&community_admin_identity_pub)` parses
   successfully (returns `Ok`; checks both halves are valid points)
 - `community_signature` verifies via the derived `Identity.verifying_key`
-  against the canonical-CBOR encoding of all preceding fields
-  (`cs` excluded). Failure → entry rejected at warn-level.
+  against the canonical-CBOR encoding (RFC 8949 §4.2 deterministic
+  encoding) of all preceding fields (`cs` excluded). Failure → entry
+  rejected at warn-level.
 - `invite_url` parses as a valid open-community invite via existing
   `parse_invite_url` (with `is_invite_only == false`). Invite-only URLs
   in directory entries are rejected.
@@ -214,6 +215,12 @@ pub struct LibraryEntry {
 - Cross-device convergence proven by the same LWW tests Sub-C already
   uses for membership events
 
+**HLC ordering**: Two HLCs are compared lexicographically on
+`(wall_ms, logical_counter, device_id)`. Exact equality is theoretically
+impossible because `device_id` is unique per bound device; even if
+`wall_ms` and `logical_counter` match, `device_id` strings always
+differ. The `is_strictly_newer_than` helper implements this ordering.
+
 **Tombstone retention**: tombstones are NEVER GC'd. A user adding and
 removing 1000 libraries over a lifetime accumulates 1000 entries; at
 ~80 bytes per `LibraryEntry`, that's 80 KB. Acceptable.
@@ -248,7 +255,10 @@ manages per-community subscriptions:
 
 1. On `add_library(addr)`:
    - Validate `addr` is well-formed OwnerAddr hex (32 hex chars / 16
-     bytes decoded — matches the 16-byte `address_hash` shape)
+     bytes decoded — matches the 16-byte `address_hash` shape). Hex
+     chars are accepted case-insensitively but normalized to lowercase
+     for storage and comparison; an address pasted as `ABC123...` is
+     treated identically to `abc123...`.
    - Acquire owner-state lock, insert `LibraryEntry { address: addr,
      added_at: now_hlc(), removed_at: None }` (or update if exists with
      newer HLC than any tombstone). Release lock.
@@ -284,7 +294,11 @@ manages per-community subscriptions:
      `listed_by` only
    - **Existing with newer `listed_at`**: drop (older entry, no-op)
 5. Emit `library-directory-updated` IPC event with payload
-   `{ communityId: hex(community_id) }`
+   `{ communityId: hex(community_id) }`. **Idempotent no-op** (existing
+   entry with same `listed_at` from same library) does NOT emit the
+   event — only outcomes that change aggregation state (Inserted,
+   Replaced, AccretedListedBy, EvictedThenInserted) emit. This matches
+   the production code's `OnEntryOutcome::Idempotent` branch.
 
 ### 5.3 Teardown on `remove_library`
 
@@ -432,7 +446,9 @@ ZEB-249's existing self-healing.
 
 **Per-library entry cap**: `MAX_ENTRIES_PER_LIBRARY = 10_000`. Hardcoded
 constant. Libraries publishing more get their oldest contributions
-evicted as new ones arrive (newest-first by `listed_at`).
+evicted as new ones arrive (newest-first by `listed_at`). **"Oldest"
+means lowest `listed_at` HLC** (publication time), not insertion order.
+This is consistent with §10.3 which says 'newest-first by `listed_at`'.
 
 **Aggregation map size**: At 10 libraries × 10k entries = 100k entries
 worst case. Each `AggregatedEntry` is ~500 bytes (long strings dominate).
