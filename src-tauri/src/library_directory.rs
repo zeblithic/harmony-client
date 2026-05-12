@@ -1240,6 +1240,49 @@ impl DirectoryEntryDTO {
     }
 }
 
+/// ZEB-252 Sub-D Phase 6: find the open-community `invite_url` for a
+/// given hex-encoded `community_id` in a directory snapshot.
+///
+/// Returns the entry's `invite_url` on success. Errors:
+/// - No matching entry: `"This community is no longer listed by any of your libraries"`
+///   (the user-facing race-window message from spec §4.3).
+/// - Matching entry but its invite URL decodes to `is_invite_only == true`:
+///   `"Invite-only community cannot be joined directly from the directory"`
+///   (belt-and-suspenders per spec §4.4 — Phase 1's `verify_entry` already
+///   rejects invite-only URLs at receive, so this branch is unreachable in
+///   practice; the re-check defends against future Phase 1 regressions).
+/// - Malformed `community_id_hex`: bubbles a "invalid hex" / "wrong length" message.
+///
+/// Pure function. Caller supplies the snapshot (typically the result of
+/// `LibraryDirectory::snapshot_all().await`).
+pub fn find_open_community_invite_url_in_snapshot(
+    snapshot: &[AggregatedEntry],
+    community_id_hex: &str,
+) -> Result<String, String> {
+    // 1. Parse community_id_hex into a SpaceId for the comparison key.
+    let id_bytes: [u8; 16] = hex::decode(community_id_hex)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let want = crate::owner_state_types::SpaceId(id_bytes);
+
+    // 2. Find the matching aggregated entry.
+    let agg = snapshot
+        .iter()
+        .find(|a| a.entry.community_id == want)
+        .ok_or_else(|| "This community is no longer listed by any of your libraries".to_string())?;
+
+    // 3. Defensive `is_invite_only` re-check (spec §4.4).
+    let payload = crate::community_invite::decode_invite_url(&agg.entry.invite_url)
+        .map_err(|e| format!("directory entry's invite URL failed to decode: {e:?}"))?;
+    if payload.is_invite_only {
+        return Err("Invite-only community cannot be joined directly from the directory".into());
+    }
+
+    Ok(agg.entry.invite_url.clone())
+}
+
 /// Parse a 32-hex-char address into `OwnerAddr`. Validation entry point
 /// used by `add_library` / `remove_library` IPCs.
 pub fn parse_owner_addr_hex(s: &str) -> Result<OwnerAddr, String> {
@@ -2539,6 +2582,168 @@ mod tests {
         assert!(
             snap_after_a.is_empty(),
             "community evicted after both drops"
+        );
+    }
+
+    // ── ZEB-252 Sub-D Phase 6 — find_open_community_invite_url_in_snapshot tests ──
+
+    #[test]
+    fn find_open_community_invite_url_returns_err_when_missing() {
+        use crate::library_directory::find_open_community_invite_url_in_snapshot;
+
+        let snapshot: Vec<AggregatedEntry> = Vec::new();
+        let result =
+            find_open_community_invite_url_in_snapshot(&snapshot, "00".repeat(16).as_str());
+        let err = result.expect_err("empty snapshot should not match");
+        assert!(
+            err.contains("no longer listed"),
+            "expected friendly missing-entry message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_open_community_invite_url_returns_err_when_entry_is_invite_only() {
+        use crate::community_invite::InviteToken;
+        use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+        use crate::library_directory::find_open_community_invite_url_in_snapshot;
+        use harmony_identity::PrivateIdentity;
+        use std::collections::BTreeSet;
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let community_id = SpaceId([0xf1; 16]);
+
+        let admin_bootstrap = SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-dev".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 92],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Inviteonly".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(InviteToken {
+                inviter: admin_addr,
+                invitee_hint: None,
+                minted_at: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: "test-dev".into(),
+                },
+                expires_at: None,
+                sig: [0u8; 64],
+            }),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some(admin_identity.identity.to_public_bytes()),
+        };
+        let invite_url = encode_invite_url(&payload).expect("encode invite-only url");
+
+        let entry = LibraryDirectoryEntry {
+            community_id,
+            community_admin_identity_pub: admin_identity.identity.to_public_bytes(),
+            name: "Inviteonly".into(),
+            description: String::new(),
+            topics: Vec::new(),
+            invite_url,
+            listed_by: OwnerAddr([0xcc; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-dev".into(),
+            },
+            library_identity_pub: None,
+            library_signature: None,
+            community_signature: [0u8; 64],
+        };
+        let agg = AggregatedEntry {
+            entry,
+            attested_by: BTreeSet::new(),
+            unattested_by: BTreeSet::new(),
+        };
+        let snapshot = vec![agg];
+
+        let result =
+            find_open_community_invite_url_in_snapshot(&snapshot, &hex::encode(community_id.0));
+        let err = result.expect_err("invite-only entry must be rejected");
+        assert!(
+            err.to_lowercase().contains("invite-only"),
+            "expected invite-only message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_open_community_invite_url_returns_ok_for_open_entry() {
+        use crate::library_directory::find_open_community_invite_url_in_snapshot;
+        use harmony_identity::PrivateIdentity;
+        use std::collections::BTreeSet;
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let community_id = SpaceId([0xf2; 16]);
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0x42u8; 32],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "OpenCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+        };
+        let invite_url = encode_invite_url(&payload).expect("encode open url");
+
+        let entry = LibraryDirectoryEntry {
+            community_id,
+            community_admin_identity_pub: admin_identity.identity.to_public_bytes(),
+            name: "OpenCom".into(),
+            description: String::new(),
+            topics: Vec::new(),
+            invite_url: invite_url.clone(),
+            listed_by: OwnerAddr([0xcc; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-dev".into(),
+            },
+            library_identity_pub: None,
+            library_signature: None,
+            community_signature: [0u8; 64],
+        };
+        let agg = AggregatedEntry {
+            entry,
+            attested_by: BTreeSet::new(),
+            unattested_by: BTreeSet::new(),
+        };
+        let snapshot = vec![agg];
+
+        let returned =
+            find_open_community_invite_url_in_snapshot(&snapshot, &hex::encode(community_id.0))
+                .expect("open entry must return Ok");
+        assert_eq!(
+            returned, invite_url,
+            "helper must return the entry's invite_url verbatim"
         );
     }
 }
