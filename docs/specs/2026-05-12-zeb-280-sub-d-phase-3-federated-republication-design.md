@@ -172,10 +172,11 @@ pub struct AggregatedEntry {
 }
 ```
 
-**Set-merge invariants:**
-- Both sets use the standard `BTreeSet::insert` — idempotent and commutative across multiple receives.
-- A library can appear in **both** sets concurrently (e.g., library A broadcasts the same community twice — once with a valid wrapping sig, once with a tampered one). Both contributions are tracked.
-- Set unions across receives never need conflict resolution: if A's first broadcast attests and A's second tampers, both are surfaced (attested AND unattested for A) — the UI will show the badge because `unattested_by` is non-empty, which is the conservative correct answer.
+**Set-merge invariants (R1 hardened):**
+- The two sets are **disjoint per community** — a library appears in AT MOST one of `attested_by` / `unattested_by` for a given community at any time. Status transitions move the library between sets atomically rather than letting it accumulate in both.
+- `Attested` / `Unwrapped` status: insert library into `attested_by`, removing it from `unattested_by` if previously present (clean recovery — a library that fixes a bad sig regains its attested status).
+- `Unattested` status when library is already in `attested_by`: **no-op** (don't downgrade a trusted attestation on a single bad-sig broadcast — defends against an adversary on the library's topic transient-tampering trusted listings).
+- `Unattested` status for a community with **no prior aggregation entry**: the entry is **dropped entirely** (no aggregation insert, no counter bump). Reason: a community-creating broadcast must be cryptographically attestable; otherwise a network adversary on a trusted library's Zenoh topic could fabricate communities ex nihilo by publishing admin-signed entries with garbage wrapping sigs.
 
 **`Aggregation::on_entry` signature change:**
 
@@ -193,7 +194,7 @@ pub fn on_entry(
 
 Callers pass the `AttestationStatus` returned by `verify_entry` so the aggregation knows which set to populate.
 
-**Per-library cap (`MAX_ENTRIES_PER_LIBRARY = 10_000`):** counts ALL contributions from a library (attested + unattested + Unwrapped's fallback `listed_by`). A misbehaving library cannot bypass the cap by tampering its own sigs.
+**Per-library cap (`MAX_ENTRIES_PER_LIBRARY = 10_000`) — R1 hardened:** counts ONLY `attested_by` membership (verified wrapping sigs + Unwrapped fallbacks). **Unattested contributions are NOT counted** toward the cap and never trigger cap eviction. Rationale: Zenoh's open-publish model means any network adversary can publish on library X's topic with `library_identity_pub = Some(X_pub)` and a garbage wrapping sig — the attribution check (`broadcasting_lib == topic_owner`) passes because the adversary claims to be X. If the cap counted unattested contributions, the adversary could flood X's topic and trigger eviction of X's legitimate attested entries. Restricting the cap to attested contributions makes this DoS infeasible (`find_oldest_for_library` filters on `attested_by` only, so eviction targets verifiable entries).
 
 **`drop_library(library)` evolution:** sweeps the library from both `attested_by` and `unattested_by` sets. Per-library count decrements normally. Existing R1/R2 fixes to `drop_library` (source-matches eviction + counter rollback) apply unchanged to both sets.
 
@@ -399,8 +400,10 @@ pub fn mock_library_entry_republished_by(
 | `verify_entry_malformed_library_identity_pub_rejected` | Bad library_identity_pub bytes → `Err(InvalidLibraryIdentityPub)` |
 | `aggregation_on_entry_unwrapped_inserts_into_attested_by_via_listed_by_fallback` | `Unwrapped` status → `attested_by.contains(entry.listed_by)` |
 | `aggregation_on_entry_attested_inserts_into_attested_by_via_lib_addr` | `Attested(A)` → `attested_by.contains(A)` |
-| `aggregation_on_entry_unattested_inserts_into_unattested_by` | `Unattested(B)` → `unattested_by.contains(B)`; entry IS inserted (not dropped) |
-| `aggregation_drop_library_sweeps_both_attestation_sets` | `drop_library(X)` removes X from both `attested_by` and `unattested_by` |
+| `aggregation_on_entry_unattested_inserts_into_unattested_by_when_community_already_attested` | `Unattested(B)` for a community already in `attested_by` from another library → `unattested_by.contains(B)`; disjoint-sets invariant holds (`B ∉ attested_by`) |
+| `aggregation_on_entry_unattested_dropped_when_no_prior_attestation` | `Unattested(B)` for a community with no aggregation entry → `Idempotent` outcome; community NOT created; per-library count for B unchanged (DoS prevention) |
+| `aggregation_unattested_does_not_count_toward_per_library_cap` | After 100 `Unattested(B)` broadcasts for the same attested community, `entry_count_for_library(B) == 0` (cap excludes unattested contributions) |
+| `aggregation_drop_library_sweeps_both_attestation_sets` | `drop_library(X)` removes X from both `attested_by` and `unattested_by`; counter rollback uses only `attested_by` membership (dedupe) |
 
 ### 11.3 Integration tests — `tests/library_directory_integration.rs`
 
