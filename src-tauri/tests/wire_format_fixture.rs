@@ -52,3 +52,125 @@ fn wire_format_v1_pinned() {
         "WIRE FORMAT CHANGED — bump format_version and add a v2 fixture before regenerating"
     );
 }
+
+/// Sub-D Phase 4 (ZEB-281) wire-compat invariant: a Space with
+/// `shared_in_profile: false` (the default) encodes byte-identically to
+/// a Space constructed before the field existed. Powered by
+/// `#[serde(rename = "sp", default, skip_serializing_if =
+/// "core::ops::Not::not")]` on `Space.shared_in_profile`.
+///
+/// If this test fails, the `skip_serializing_if` invariant has been
+/// inadvertently changed — Phase 4 broke cross-version owner-state
+/// CRDT compat. Fix the field attrs, don't update the test.
+#[test]
+fn space_shared_in_profile_default_false_byte_identical_to_pre_phase4() {
+    use harmony_app::owner_state_crypto::canonical_cbor_encode;
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    // Construct a minimal community Space with default-false
+    // shared_in_profile. The encoded bytes MUST NOT contain a "sp" key.
+    let space = Space {
+        id: SpaceId([1u8; 16]),
+        kind: SpaceKind::Community,
+        parent: None,
+        community_id: Some(SpaceId([2u8; 16])),
+        name: "test".to_string(),
+        transport: None,
+        members: vec![OwnerAddr([3u8; 16])],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: Hlc {
+            wall_ms: 1700000000000,
+            logical: 0,
+            device_id: "fix".into(),
+        },
+        updated_at: Hlc {
+            wall_ms: 1700000000000,
+            logical: 0,
+            device_id: "fix".into(),
+        },
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(0),
+        current_epoch_key: None,
+        old_epoch_keys: Default::default(),
+        admin_addr: Some(OwnerAddr([3u8; 16])),
+        is_invite_only: Some(false),
+        shared_in_profile: false, // The Phase 4 field, default
+    };
+
+    let bytes = canonical_cbor_encode(&space).expect("encode");
+
+    // Decode and walk the CBOR map; "sp" key MUST NOT appear.
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+    let keys: Vec<String> = map
+        .iter()
+        .filter_map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !keys.iter().any(|k| k == "sp"),
+        "Space with default-false shared_in_profile must NOT emit \"sp\" key on the wire; \
+         observed keys: {keys:?}"
+    );
+}
+
+/// Companion test: a Space with `shared_in_profile: true` DOES emit "sp" → true.
+#[test]
+fn space_shared_in_profile_true_emits_sp_key() {
+    use harmony_app::owner_state_crypto::canonical_cbor_encode;
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    let space = Space {
+        id: SpaceId([1u8; 16]),
+        kind: SpaceKind::Community,
+        parent: None,
+        community_id: Some(SpaceId([2u8; 16])),
+        name: "test".to_string(),
+        transport: None,
+        members: vec![OwnerAddr([3u8; 16])],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: Hlc {
+            wall_ms: 1700000000000,
+            logical: 0,
+            device_id: "fix".into(),
+        },
+        updated_at: Hlc {
+            wall_ms: 1700000000000,
+            logical: 0,
+            device_id: "fix".into(),
+        },
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(0),
+        current_epoch_key: None,
+        old_epoch_keys: Default::default(),
+        admin_addr: Some(OwnerAddr([3u8; 16])),
+        is_invite_only: Some(false),
+        shared_in_profile: true,
+    };
+
+    let bytes = canonical_cbor_encode(&space).expect("encode");
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+    let sp_value = map
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (ciborium::value::Value::Text(s), v) if s == "sp" => Some(v.clone()),
+            _ => None,
+        })
+        .expect("Space with shared_in_profile: true must emit \"sp\" key");
+    assert_eq!(sp_value, ciborium::value::Value::Bool(true));
+}

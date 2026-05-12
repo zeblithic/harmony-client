@@ -265,6 +265,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let mut s2 = s1.clone();
         s2.id = SpaceId([99; 16]); // different SpaceId

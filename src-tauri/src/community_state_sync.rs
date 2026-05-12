@@ -4451,6 +4451,7 @@ mod envelope_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         }
     }
 
@@ -4536,6 +4537,7 @@ mod envelope_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = encrypt_for_topic(&space, b"test payload")
             .expect_err("encrypt_for_topic must return Err on missing epoch state, not panic");
@@ -4573,6 +4575,7 @@ mod envelope_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = encrypt_for_topic(&space, b"test payload")
             .expect_err("encrypt_for_topic must return Err on missing epoch key, not panic");

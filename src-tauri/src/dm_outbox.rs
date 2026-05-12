@@ -1209,6 +1209,7 @@ impl DmOutbox {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let space_outcome = state.apply_space_with_canonicalization(space);
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = space_outcome {
@@ -2288,6 +2289,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -3984,6 +3986,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let outcome = state.apply_space_with_canonicalization(space.clone());
         assert!(
@@ -4309,6 +4312,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         state.apply_space_with_canonicalization(space.clone());
 
@@ -4511,6 +4515,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         state.apply_space_with_canonicalization(space);
 
@@ -4612,6 +4617,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         state.apply_space_with_canonicalization(space.clone());
 
@@ -5856,6 +5862,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let outcome = state.apply_space_with_canonicalization(space.clone());
         assert!(
@@ -6062,6 +6069,7 @@ mod tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         state.spaces.insert(space_id, space);
 

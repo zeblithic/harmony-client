@@ -39,6 +39,7 @@ pub mod owner_state_sync;
 pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
+pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
@@ -313,6 +314,27 @@ pub struct NodeState {
     /// subscribers on demand. Cleared in `stop_inner` so the channel
     /// closes and the consumer task winds down on next recv.
     pub library_directory: Option<std::sync::Arc<crate::library_directory::LibraryDirectory>>,
+    /// ZEB-281 Sub-D Phase 4: profile-broadcast publisher. `Some` while the
+    /// node is running and an owner identity is available. Shutdown is
+    /// called explicitly in `stop_inner` before the event-loop thread is
+    /// joined so the in-flight publish drains.
+    profile_broadcast_publisher:
+        Option<std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>>,
+    /// ZEB-281 Sub-D Phase 4: peer-broadcast cache. Shared with the
+    /// event-loop's subscriber task pool. Always Some while node is
+    /// running.
+    profile_broadcast_cache:
+        Option<std::sync::Arc<crate::profile_broadcast::ProfileBroadcastCache>>,
+    /// ZEB-281 Sub-D Phase 4: control channel into the event-loop's
+    /// profile-broadcast subscriber task pool. IPC handlers send
+    /// `Subscribe`/`Unsubscribe`; the event loop owns the Zenoh
+    /// subscriber map.
+    profile_broadcast_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::ProfileBroadcastRequest>>,
+    /// ZEB-281 Sub-D Phase 4: monotonic subscription-id allocator.
+    /// Persisted only across IPC calls within a single node lifetime;
+    /// reset on stop_node.
+    profile_broadcast_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl NodeState {
@@ -366,6 +388,15 @@ impl Default for NodeState {
             // ZEB-218 Sub-D Phase 1: directory stays None until
             // start_node wires it.
             library_directory: None,
+            // ZEB-281 Sub-D Phase 4: publisher / cache / request_tx stay
+            // None until start_node wires them; the SubscriptionId
+            // allocator starts at 1 (0 reserved as "uninitialized").
+            profile_broadcast_publisher: None,
+            profile_broadcast_cache: None,
+            profile_broadcast_request_tx: None,
+            profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
         }
     }
 }
@@ -518,6 +549,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     let channel_log_registry_for_shutdown: Option<
         std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
     >;
+    // ZEB-281 Sub-D Phase 4: declared in the outer scope so the
+    // post-lock `shutdown().await` can drive the publisher's final-flush
+    // pass on an ephemeral runtime (the std `MutexGuard` is `!Send`).
+    let profile_broadcast_publisher_for_shutdown: Option<
+        std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -608,10 +645,49 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // event-loop's consumer task observes the matching request_tx
         // close on next recv and exits cleanly.
         let _ = guard.library_directory.take();
+        // ZEB-281 Sub-D Phase 4: take the publisher into the outer-scope
+        // binding so `shutdown()` runs on an ephemeral runtime below
+        // (the std `MutexGuard` is `!Send` across an await). Clear the
+        // cache + request_tx + reset the SubscriptionId allocator so a
+        // restart starts at 1 again.
+        profile_broadcast_publisher_for_shutdown = guard.profile_broadcast_publisher.take();
+        guard.profile_broadcast_cache = None;
+        guard.profile_broadcast_request_tx = None;
+        guard.profile_broadcast_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         tup
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
+    // ZEB-281 Sub-D Phase 4: abort the profile-broadcast publisher BEFORE
+    // dropping `publish_tx`. `shutdown()` calls `JoinHandle::abort()` on
+    // the publisher's background task — ordering this before the
+    // publish channel drops avoids a race where the publisher debounce
+    // tick wakes during teardown and the sink call surfaces a closed-
+    // channel Err. `stop_inner` is sync but the publisher's shutdown is
+    // async — use the same `thread::scope` + ephemeral-runtime pattern
+    // as the other registry shutdowns below.
+    if let Some(publisher) = profile_broadcast_publisher_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        rt.block_on(publisher.shutdown());
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for \
+                             ProfileBroadcastPublisher shutdown — task abort skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     // Drop the pairing handle BEFORE the publish_tx so the state machine
     // task observes its mpsc shutdown cleanly: the handle owns the JoinHandle
     // for the SM task; once dropped, the task's transport.recv path exits
@@ -879,6 +955,13 @@ async fn start_node(
     let old_channel_log_registry: Option<
         std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
     >;
+    // ZEB-281 Sub-D Phase 4: outer-scope binding for the previous
+    // identity's profile-broadcast publisher. Awaited outside the std
+    // `MutexGuard` scope (the guard is `!Send`) — mirrors
+    // `old_channel_log_registry`'s pattern.
+    let old_profile_broadcast_publisher: Option<
+        std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
+    >;
     let (
         old_shutdown,
         old_thread,
@@ -965,6 +1048,17 @@ async fn start_node(
         // directory handle. The matching event_loop consumer task
         // observes the request_tx close on next recv and exits.
         let _ = guard.library_directory.take();
+        // ZEB-281 Sub-D Phase 4: take the prior identity's
+        // profile-broadcast publisher into a scope-local binding so
+        // `shutdown()` runs outside the std `MutexGuard` (which is
+        // !Send across an await). Clear the cache + request_tx + reset
+        // the SubscriptionId allocator so the new identity's IPCs
+        // start from id=1 again.
+        old_profile_broadcast_publisher = guard.profile_broadcast_publisher.take();
+        guard.profile_broadcast_cache = None;
+        guard.profile_broadcast_request_tx = None;
+        guard.profile_broadcast_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         tup
     };
 
@@ -972,6 +1066,14 @@ async fn start_node(
     // sees its receiver close after the publish channel is gone — same
     // ordering as stop_inner.
     drop(old_pairing_handle);
+    // ZEB-281 Sub-D Phase 4: explicitly await the previous identity's
+    // profile-broadcast publisher shutdown BEFORE dropping the prior
+    // publish channels. The publisher's background task may otherwise
+    // wake during teardown and surface a closed-sink Err. Mirrors the
+    // ordering in stop_inner.
+    if let Some(publisher) = old_profile_broadcast_publisher {
+        publisher.shutdown().await;
+    }
     drop(old_publish);
     drop(old_fetch);
     drop(old_ingest);
@@ -1200,6 +1302,25 @@ async fn start_node(
         let mut channel_log_registry_arc: Option<
             std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
         > = None;
+
+        // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher + cache + request channel ──
+        //
+        // All three holders live in the outer scope so the post-spawn
+        // `guard.profile_broadcast_*` assignments can reach them. The
+        // publisher is constructed INSIDE the `if let Some(seed)` block
+        // below (needs the `signing_key_arc` + `identity_pub_64` +
+        // `crdt_state` + `tracker` + `device_id` + `publish_tx` from
+        // the owner-identity path). The cache is constructed
+        // unconditionally so the subscriber pool can be wired up even
+        // when no owner identity is loaded; the matching
+        // request_rx is moved into `event_loop::run` below.
+        let mut profile_broadcast_publisher_arc: Option<
+            std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
+        > = None;
+        let profile_broadcast_cache_arc =
+            std::sync::Arc::new(crate::profile_broadcast::ProfileBroadcastCache::default());
+        let (profile_broadcast_request_tx, profile_broadcast_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::ProfileBroadcastRequest>(64);
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -1957,6 +2078,38 @@ async fn start_node(
 
                     community_registry_arc = Some(registry);
 
+                    // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
+                    //
+                    // Owns Arc clones of `crdt_state` + `tracker` for the
+                    // `OwnerStateBroadcastSource` (walks Community Spaces
+                    // for the opted-in set + bumps the HLC for each
+                    // publish), and a clone of `publish_tx` for the
+                    // `EventLoopPublishSink` (forwards canonical-CBOR
+                    // bytes to the event loop's per-topic Zenoh
+                    // publisher). The signing key is derived from the
+                    // same Ed25519 seed `DmOutbox` consumes — bit-
+                    // identical to PrivateIdentity::sign's internal key
+                    // (see dm_signing.rs). identity_pub_64 is the same
+                    // 64-byte bundle stamped on outbound DmInvite
+                    // packets (captured before PrivateIdentity dropped).
+                    profile_broadcast_publisher_arc =
+                        Some(crate::profile_broadcast::ProfileBroadcastPublisher::spawn(
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::new(
+                                crate::profile_broadcast::OwnerStateBroadcastSource {
+                                    crdt_state: std::sync::Arc::clone(&crdt_state),
+                                    hlc_tracker: std::sync::Arc::clone(&tracker),
+                                    device_id: device_id.clone(),
+                                },
+                            ),
+                            std::sync::Arc::new(crate::profile_broadcast::EventLoopPublishSink {
+                                publish_tx: publish_tx.clone(),
+                            }),
+                            crate::profile_broadcast::PUBLISHER_DEBOUNCE,
+                            crate::profile_broadcast::PUBLISHER_REFRESH_INTERVAL,
+                        ));
+
                     // Lift the per-identity handles out for NodeState
                     // assignment below.
                     device_id_for_state = Some(device_id);
@@ -2124,6 +2277,13 @@ async fn start_node(
         // std::sync::MutexGuard scope) into event_loop::run.
         let library_directory_for_loop = Some(std::sync::Arc::clone(&library_directory_arc));
         let library_request_rx_for_loop = Some(library_request_rx);
+        // ZEB-281 Sub-D Phase 4: thread the profile-broadcast cache +
+        // request rx into event_loop::run. The cache is shared with the
+        // NodeState (so IPC handlers can register/drop subscriptions
+        // synchronously); the rx is moved into the consumer task.
+        let profile_broadcast_cache_for_loop =
+            Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
+        let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
         let thread_result = thread::Builder::new()
             .name("harmony-runtime".to_string())
             // Windows debug builds overflow the default ~2 MiB stack inside
@@ -2222,6 +2382,8 @@ async fn start_node(
                         channel_log_adapter_request_rx_for_loop,
                         library_directory_for_loop,
                         library_request_rx_for_loop,
+                        profile_broadcast_cache_for_loop,
+                        profile_broadcast_request_rx_for_loop,
                     )
                     .await;
                 });
@@ -2303,6 +2465,19 @@ async fn start_node(
                 // to add / remove libraries. The matching rx was moved
                 // into event_loop above.
                 guard.library_directory = Some(library_directory_arc.clone());
+                // ZEB-281 Sub-D Phase 4: stash the publisher, cache,
+                // request channel + subscription-id allocator on
+                // NodeState. The publisher Arc is None when no owner
+                // identity was loaded (publisher.spawn is gated inside
+                // the if-let-Some(seed) block above) — without an owner
+                // identity, set_space_shared_in_profile IPC will still
+                // fail with "publisher missing" so the absence is fine.
+                guard.profile_broadcast_publisher = profile_broadcast_publisher_arc.clone();
+                guard.profile_broadcast_cache =
+                    Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
+                guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
+                guard.profile_broadcast_next_subscription_id =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
                 thread_install_failure = None;
             }
             Err(e) => {
@@ -2321,6 +2496,7 @@ async fn start_node(
             sync_engine_arc.clone(),
             community_registry_arc.clone(),
             channel_log_registry_arc.clone(),
+            profile_broadcast_publisher_arc.clone(),
         )
     };
     let (
@@ -2329,9 +2505,18 @@ async fn start_node(
         engine_for_cleanup,
         registry_for_cleanup,
         channel_log_registry_for_cleanup,
+        profile_broadcast_publisher_for_cleanup,
     ) = our_gen;
 
     if let Some(msg) = thread_spawn_failure {
+        // ZEB-281 Sub-D Phase 4: abort the profile-broadcast publisher
+        // FIRST — its background task holds a clone of `publish_tx`
+        // (now orphaned because the runtime thread never spawned), so
+        // aborting it deterministically releases the clone before the
+        // other registries shut down.
+        if let Some(publisher) = profile_broadcast_publisher_for_cleanup {
+            publisher.shutdown().await;
+        }
         // ZEB-270 Phase 3 Task 4.5: shutdown the channel-log registry
         // FIRST so each per-channel engine's final flush completes
         // before the per-community state engines (which back the
@@ -3540,6 +3725,7 @@ pub fn add_space_dm_inner(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
+        shared_in_profile: false,
     };
 
     // Validate invariants up front — catches programmer error before we
@@ -7366,6 +7552,7 @@ pub fn mint_community_creation(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
+        shared_in_profile: false,
     };
 
     Ok(MintedCommunity {
@@ -8549,6 +8736,7 @@ pub fn mint_redemption(
         // SpaceId rejection of community-creation field changes would
         // silently reject the redemption Space if these disagreed).
         is_invite_only: Some(payload.is_invite_only),
+        shared_in_profile: false,
     };
 
     Ok(MintedCommunity {
@@ -10035,6 +10223,292 @@ async fn browse_library(
         .iter()
         .map(crate::library_directory::DirectoryEntryDTO::from_aggregated)
         .collect())
+}
+
+// ── ZEB-281 Sub-D Phase 4: ProfileMembershipBroadcast IPCs ─────────────
+//
+// Four IPCs and one Tauri event (`profile-broadcast-received`) wire the
+// per-community opt-in toggle + per-peer profile subscription path. See
+// `docs/specs/2026-05-12-zeb-281-sub-d-phase-4-profile-membership-broadcast-design.md`
+// §6 + §7 for the protocol; the publisher state machine lives in
+// `profile_broadcast::ProfileBroadcastPublisher::spawn`. The event-loop
+// subscriber pool is in `event_loop.rs`.
+
+/// IPC: Sub-D Phase 4 (ZEB-281). Toggle the opt-in flag for a community
+/// Space. Mutates `Space.shared_in_profile`, bumps `Space.updated_at`
+/// via the atomic HLC reservation helper (same idiom as add_space /
+/// leave_community), then notifies the profile-broadcast publisher so
+/// it re-walks the opted-in set and emits the new broadcast.
+///
+/// No-op when the flag is already in the requested state — does NOT
+/// bump the HLC in that case, so a redundant toggle doesn't burn a
+/// logical-clock tick.
+#[tauri::command]
+async fn set_space_shared_in_profile(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    shared: bool,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let community_space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    // Capture `generation` paired-atomically with the Arcs. If stop_inner
+    // detaches the Arcs (sets to None) and start_node bumps the generation
+    // while we're awaiting on the HLC reservation / CRDT lock, the Arcs we
+    // hold are orphaned: we'd mutate a `crdt_state` the new node never
+    // reads from. The post-check after the mutation surfaces that as Err
+    // rather than returning Ok(()) for an effectively dropped write. Same
+    // idiom as `send_dm` (~lib.rs:2935).
+    let (crdt_state, publisher, hlc_tracker, device_id, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.profile_broadcast_publisher
+                .clone()
+                .ok_or("profile_broadcast_publisher missing — node not running?")?,
+            g.hlc_tracker
+                .clone()
+                .ok_or("hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
+        )
+    };
+
+    // Wall clock for HLC bump. Read once OUTSIDE the lock since the
+    // tracker locking happens inside reserve_next_hlc_for_device.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Determine whether this is a no-op (current == target) BEFORE
+    // taking a tracker tick — read under the CRDT lock, then drop the
+    // guard so the HLC reservation doesn't race with another caller
+    // holding the CRDT lock.
+    {
+        let g = crdt_state.lock().await;
+        let space = g
+            .spaces
+            .values()
+            .find(|s| {
+                s.id == community_space_id
+                    && matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
+            })
+            .ok_or_else(|| format!("community Space not found for community_id={community_id}"))?;
+        if space.shared_in_profile == shared {
+            // No-op — return without bumping HLC.
+            return Ok(());
+        }
+    }
+
+    // Reserve next HLC. Same idiom as add_space / leave_community.
+    let new_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Re-acquire the CRDT lock and apply the mutation. Re-find the
+    // Space in case state moved between the no-op probe and now (e.g.,
+    // a concurrent EpochRotation merged in); refuse to mutate if the
+    // Space disappeared.
+    {
+        let mut g = crdt_state.lock().await;
+        let space = g
+            .spaces
+            .values_mut()
+            .find(|s| {
+                s.id == community_space_id
+                    && matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "community Space not found for community_id={community_id} \
+                     (raced with a concurrent mutation)"
+                )
+            })?;
+        // Second check inside the lock — between the no-op probe and
+        // this lock acquisition another caller may have raced us.
+        if space.shared_in_profile == shared {
+            return Ok(());
+        }
+        space.shared_in_profile = shared;
+        space.updated_at = new_hlc;
+    }
+
+    // Post-check: a concurrent stop_node / restart between the initial
+    // state_lock grab and now would have orphaned `crdt_state`. The
+    // mutation we just performed went into a detached state that the
+    // live NodeState's node never reads from. Surface as Err so the
+    // caller can retry against the live node. stop_inner clears handles
+    // to None WITHOUT bumping `generation`, so additionally verify the
+    // handles are still present. Same idiom as `send_dm`.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during set_space_shared_in_profile \
+                 (was {}, now {}); flag was written to a detached crdt_state \
+                 — retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.crdt_state.is_none() || g.profile_broadcast_publisher.is_none() {
+            return Err("node was stopped during set_space_shared_in_profile; \
+                 flag was written to a detached crdt_state"
+                .to_string());
+        }
+    }
+
+    // Notify the publisher to recompute + debounce-publish.
+    publisher.notify_dirty();
+    Ok(())
+}
+
+/// IPC: Sub-D Phase 4 (ZEB-281). Read the set of community SpaceIds the
+/// user has opted to share in their public profile. Frontend calls this
+/// once at startup to populate the per-community toggle initial state in
+/// CommunitySettingsPanel — without this read, the toggle defaults to
+/// OFF on every restart even when server-side `shared_in_profile == true`
+/// (the publisher continues broadcasting correctly because it reads from
+/// CRDT, but the UI would falsely claim "off / private", inverting the
+/// privacy contract).
+///
+/// Returns hex-encoded SpaceIds (32 chars each), matching the on-the-wire
+/// shape used in `DiscoveredProfileInfo.communityIds`. Sorted + deduped
+/// to mirror `OwnerStateBroadcastSource::current_shared_set` (the
+/// publisher's view of the same predicate).
+#[tauri::command]
+async fn list_shared_in_profile_communities(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<String>, String> {
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state
+            .clone()
+            .ok_or("crdt_state missing — node not running?")?
+    };
+    let g = crdt_state.lock().await;
+    let mut ids: Vec<String> = g
+        .spaces
+        .values()
+        .filter(|s| {
+            // Mirror `OwnerStateBroadcastSource::current_shared_set`: the
+            // frontend opt-in toggle MUST reflect what the publisher
+            // actually broadcasts. A Community Space the user has left
+            // (`left_at = Some(_)`) is intentionally retained but is
+            // suppressed from the broadcast — surfacing it here would
+            // falsely claim "sharing on" for a community no longer in
+            // the broadcast set.
+            matches!(s.kind, crate::owner_state_types::SpaceKind::Community)
+                && s.shared_in_profile
+                && s.left_at.is_none()
+        })
+        .map(|s| hex::encode(s.id.0))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// IPC: Sub-D Phase 4 (ZEB-281). Subscribe to a peer's profile-broadcast
+/// topic. Returns a u64 SubscriptionId the frontend uses to address
+/// subsequent unsubscribe/get_cached calls + to filter incoming
+/// `profile-broadcast-received` events.
+#[tauri::command]
+async fn subscribe_peer_profile(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    peer_addr: String,
+) -> Result<u64, String> {
+    let (cache, request_tx, next_id) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.profile_broadcast_cache
+                .clone()
+                .ok_or("profile_broadcast_cache missing — node not running?")?,
+            g.profile_broadcast_request_tx
+                .clone()
+                .ok_or("profile_broadcast_request_tx missing — node not running?")?,
+            std::sync::Arc::clone(&g.profile_broadcast_next_subscription_id),
+        )
+    };
+
+    let peer_owner_addr = crate::library_directory::parse_owner_addr_hex(&peer_addr)
+        .map_err(|e| format!("invalid peer_addr hex: {e}"))?;
+    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    cache.register(id, peer_owner_addr).await;
+    // If the request channel is closing (event-loop shutdown raced this
+    // IPC), the slot we just registered would persist forever — a phantom
+    // subscription nothing will ever deliver a sample to. Roll the cache
+    // entry back before surfacing the error.
+    if let Err(e) = request_tx
+        .send(crate::event_loop::ProfileBroadcastRequest::Subscribe {
+            subscription_id: id,
+            peer_addr: peer_owner_addr,
+        })
+        .await
+    {
+        cache.drop_subscription(id).await;
+        return Err(format!("profile_broadcast_request_tx send: {e}"));
+    }
+    Ok(id)
+}
+
+/// IPC: Sub-D Phase 4 (ZEB-281). Unsubscribe from a previously-registered
+/// peer profile subscription. The event-loop's subscriber pool aborts
+/// the Zenoh subscriber task AND drops the cache entry (atomic teardown
+/// inside the consumer task).
+#[tauri::command]
+async fn unsubscribe_peer_profile(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<(), String> {
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.profile_broadcast_request_tx
+            .clone()
+            .ok_or("profile_broadcast_request_tx missing — node not running?")?
+    };
+    request_tx
+        .send(crate::event_loop::ProfileBroadcastRequest::Unsubscribe { subscription_id })
+        .await
+        .map_err(|e| format!("profile_broadcast_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: Sub-D Phase 4 (ZEB-281). Snapshot the latest verified broadcast
+/// for a subscription. Returns `Ok(None)` when the subscription is
+/// known but no broadcast has been received yet (loading state) or
+/// when the subscription has been dropped.
+#[tauri::command]
+async fn get_cached_peer_profile(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<Option<crate::profile_broadcast::DiscoveredProfileInfo>, String> {
+    let cache = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.profile_broadcast_cache
+            .clone()
+            .ok_or("profile_broadcast_cache missing — node not running?")?
+    };
+    Ok(cache.get_cached(subscription_id).await)
 }
 
 #[cfg(test)]
@@ -12184,6 +12658,11 @@ pub fn run() {
             add_library,
             remove_library,
             browse_library,
+            set_space_shared_in_profile,
+            list_shared_in_profile_communities,
+            subscribe_peer_profile,
+            unsubscribe_peer_profile,
+            get_cached_peer_profile,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])

@@ -935,6 +935,12 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         old_epoch_keys: creator_side.old_epoch_keys.clone(),
         admin_addr: creator_side.admin_addr,
         is_invite_only: creator_side.is_invite_only,
+        // shared_in_profile is LWW like other mutable per-device prefs
+        // (notification_pref, custom_name). Hardcoding `false` here
+        // would break the cross-device opt-in promise in ZEB-281 spec
+        // §2 — Device A opting in could be silently overwritten by a
+        // stale Device B replay. Newer `updated_at` wins.
+        shared_in_profile: newer.shared_in_profile,
     }
 }
 
@@ -972,6 +978,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -1001,6 +1008,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
+            shared_in_profile: false,
         }
     }
 
@@ -1028,6 +1036,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -1298,6 +1307,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let attacker_replay = Space {
             id: SpaceId([7; 16]),
@@ -1319,6 +1329,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
             is_invite_only: Some(true),              // hostile flip to private
+            shared_in_profile: false,
         };
 
         let merged = lww_merge_space(&earlier, &attacker_replay);
@@ -1356,6 +1367,91 @@ mod apply_space_tests {
         );
     }
 
+    /// Sub-D Phase 4 (ZEB-281): `shared_in_profile` is a mutable
+    /// per-device preference that MUST follow LWW semantics — the newer
+    /// `updated_at` side wins. A prior revision of `lww_merge_space`
+    /// hardcoded `false`, which silently overwrote a Device A opt-in
+    /// whenever a stale Device B replay merged in. This regression
+    /// pins the LWW behaviour so the cross-device opt-in promise in
+    /// spec §2 doesn't break again.
+    #[test]
+    fn lww_merge_preserves_shared_in_profile_from_newer() {
+        use crate::owner_state_types::EpochKey;
+
+        // Older (Device B): opted OUT.
+        let older = Space {
+            id: SpaceId([42; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "C".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(100), // older
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xaa; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([1u8; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: false,
+        };
+        // Newer (Device A): opted IN — user just flipped the toggle.
+        let newer = Space {
+            id: SpaceId([42; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "C".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(100),
+            updated_at: hlc(500), // strictly newer
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0xaa; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([1u8; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+
+        // Merge in both orderings; the LWW winner is `newer` regardless
+        // of argument position so the result must inherit
+        // shared_in_profile=true either way.
+        let merged_a = lww_merge_space(&older, &newer);
+        assert!(
+            merged_a.shared_in_profile,
+            "merge(older, newer): newer side opted in MUST win — \
+             prior hardcoded `false` silently dropped Device A's opt-in"
+        );
+        let merged_b = lww_merge_space(&newer, &older);
+        assert!(
+            merged_b.shared_in_profile,
+            "merge(newer, older): result must be argument-order-independent"
+        );
+
+        // Symmetric case: newer side opted OUT must also win.
+        let mut newer_opt_out = newer.clone();
+        newer_opt_out.shared_in_profile = false;
+        let mut older_opt_in = older.clone();
+        older_opt_in.shared_in_profile = true;
+        let merged_out = lww_merge_space(&older_opt_in, &newer_opt_out);
+        assert!(
+            !merged_out.shared_in_profile,
+            "newer opt-out MUST win over older opt-in (LWW symmetric)"
+        );
+    }
+
     #[test]
     fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
@@ -1384,6 +1480,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let b = Space {
             id: SpaceId([1; 16]),
@@ -1407,6 +1504,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
 
         // Order-independent: both call orderings yield the same merged prior.
@@ -1550,6 +1648,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -1577,6 +1676,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -2228,6 +2328,7 @@ mod canonicalization_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -2525,6 +2626,7 @@ mod crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -2619,6 +2721,7 @@ mod crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -3306,6 +3409,7 @@ mod merge_prior_content_keys_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -3467,6 +3571,7 @@ mod dm_crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 

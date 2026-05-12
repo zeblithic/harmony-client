@@ -56,12 +56,14 @@ async function setup(channelList: any[] = [general, announcements], propOverride
     ownAddress: adminMember.address,
     members: [adminMember],
     isDegraded: false,
+    sharedInProfile: false,
     communityService,
     channelMessageService,
     onLeave: vi.fn(),
     onKickMember: vi.fn(),
     onSetPowerLevel: vi.fn(),
     onGenerateInvite: vi.fn().mockResolvedValue('harmony://invite/...'),
+    onToggleSharedInProfile: vi.fn().mockResolvedValue(undefined),
     ...propOverrides,
   };
   const renderResult = render(CommunityView, { props });

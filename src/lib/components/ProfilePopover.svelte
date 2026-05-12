@@ -1,16 +1,38 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import type { Profile } from '../types';
+  import type {
+    ProfileBroadcastService,
+    ProfileMembershipBroadcastInfo,
+  } from '../profile-broadcast-service';
   import Avatar from './Avatar.svelte';
 
-  let { profile, x, y, onClose }: {
+  let {
+    profile,
+    x,
+    y,
+    onClose,
+    ownAddress,
+    profileBroadcastService,
+    resolveCommunityName,
+  }: {
     profile: Profile;
     x: number;
     y: number;
     onClose: () => void;
+    ownAddress: string;
+    profileBroadcastService: ProfileBroadcastService;
+    resolveCommunityName: (communityIdHex: string) => string | null;
   } = $props();
 
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
+
+  let subscriptionId = $state<number | null>(null);
+  let memberships = $state<ProfileMembershipBroadcastInfo | null>(null);
+  let isLoading = $state(true);
+  // Switch loading→empty after 3s if no broadcast arrives. Spec §8.3.
+  const LOAD_TIMEOUT_MS = 3000;
 
   $effect(() => {
     const close = untrack(() => onClose);
@@ -31,6 +53,116 @@
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('click', onClickOutside);
       clearTimeout(timer);
+    };
+  });
+
+  // Subscription lifecycle for peer profiles. Splits from the keyboard
+  // / click-outside effect so subscribe + listener cleanup are
+  // independent: re-running the listener effect should not tear down
+  // the subscription, and vice versa.
+  $effect(() => {
+    // Snapshot reactive deps so this effect tracks only the address
+    // identity of the profile we're showing.
+    const peerAddr = profile.address;
+    const ownAddr = untrack(() => ownAddress);
+    const svc = untrack(() => profileBroadcastService);
+
+    if (peerAddr === ownAddr) {
+      // Don't subscribe to ourselves; the section isn't rendered.
+      return;
+    }
+    // Reset to a clean loading state on every profile.address change.
+    // Without this, a popover instance reused across peer switches
+    // (e.g. closed for A, immediately re-opened for B before the prior
+    // subscription cleanup runs) would briefly render peer A's
+    // memberships under peer B's profile header.
+    memberships = null;
+    isLoading = true;
+    let cancelled = false;
+    let unlistenFn: (() => void) | null = null;
+    let localSubId: number | null = null;
+
+    (async () => {
+      try {
+        const id = await svc.subscribe(peerAddr);
+        if (cancelled) {
+          await svc.unsubscribe(id).catch(() => {});
+          return;
+        }
+        localSubId = id;
+        subscriptionId = id;
+        // Attach the listener BEFORE reading the cache. Otherwise a
+        // broadcast can land at the server between `getCached` and
+        // `listen` and be silently dropped: the cache snapshot we read
+        // predates the broadcast, and no listener is attached to
+        // receive the corresponding `profile-broadcast-received` event.
+        // Order: subscribe → listen → getCached. Any event that lands
+        // between subscribe and getCached is queued for the listener;
+        // any event that lands between listen and getCached either
+        // overwrites the cache before we read it (and we render the
+        // newer value) or fires through the listener (and we render
+        // via the event path).
+        // Event payload is flat per spec §7:
+        // { subscriptionId, ownerAddr, communityIds, sharedAt }.
+        const unlisten = await listen<{
+          subscriptionId: number;
+          ownerAddr: string;
+          communityIds: string[];
+          sharedAt: string;
+        }>('profile-broadcast-received', (event) => {
+          // subscriptionId filtering: a final event may race past
+          // server-side abort() — silently drop events for other ids.
+          if (event.payload.subscriptionId !== id) return;
+          memberships = {
+            ownerAddr: event.payload.ownerAddr,
+            communityIds: event.payload.communityIds,
+            sharedAt: event.payload.sharedAt,
+          };
+          isLoading = false;
+        });
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenFn = unlisten;
+        // Render immediately if already cached.
+        const cached = await svc.getCached(id);
+        if (!cancelled && cached && isLoading) {
+          // Only paint from cache if a live event hasn't already
+          // painted newer data (isLoading guards against clobbering a
+          // listener-delivered render with a staler cache snapshot).
+          memberships = cached;
+          isLoading = false;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!cancelled) {
+          console.warn('peer profile subscription setup failed:', msg);
+          // Flip out of the loading state so the popover renders the
+          // empty / "no shared communities" view instead of spinning
+          // until the 3s timeout fires.
+          isLoading = false;
+        }
+      }
+    })();
+
+    const timeout = setTimeout(() => {
+      if (!cancelled && isLoading) {
+        isLoading = false;
+        // memberships stays null → renders empty state
+      }
+    }, LOAD_TIMEOUT_MS);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+      // Unlisten first (so we don't process a final event we'd ignore),
+      // then unsubscribe IPC (so the server-side subscription drops).
+      if (unlistenFn) unlistenFn();
+      if (localSubId !== null) {
+        svc.unsubscribe(localSubId).catch(() => {});
+      }
+      subscriptionId = null;
     };
   });
 </script>
@@ -57,6 +189,22 @@
       </div>
     {/each}
   </div>
+  {#if profile.address !== ownAddress}
+    <div class="popover-memberships">
+      <div class="memberships-label">Public memberships</div>
+      {#if isLoading}
+        <div class="memberships-loading">Looking up public memberships…</div>
+      {:else if memberships === null || memberships.communityIds.length === 0}
+        <div class="memberships-empty">No public memberships shared.</div>
+      {:else}
+        <ul class="memberships-list">
+          {#each memberships.communityIds as communityId}
+            <li>{resolveCommunityName(communityId) ?? communityId.slice(0, 8) + '…'}</li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -135,5 +283,35 @@
   .sound-value {
     font-size: 12px;
     color: var(--text-muted);
+  }
+
+  .popover-memberships {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 10px;
+  }
+  .memberships-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .memberships-loading,
+  .memberships-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 3px 0;
+  }
+  .memberships-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .memberships-list li {
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 3px 0;
   }
 </style>

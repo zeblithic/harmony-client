@@ -1548,6 +1548,26 @@ pub struct Space {
     /// Community; MUST be None otherwise. Wire: bool under "io".
     #[serde(rename = "io", skip_serializing_if = "Option::is_none", default)]
     pub is_invite_only: Option<bool>,
+
+    /// Sub-D Phase 4 (ZEB-281): opt-in flag for including this Space's
+    /// `Space.id` (the community's identifier) in the owner's
+    /// ProfileMembershipBroadcast. Community Spaces have
+    /// `community_id = None` (the field is a back-pointer that lives on
+    /// child Channel Spaces); the shared identifier IS this Space's own
+    /// `id`. Default `false` (no communities shared until user explicitly
+    /// opts in). Replicated across the owner's bound devices via the
+    /// existing owner-state CRDT sync — opting in on one device shows
+    /// on all of them.
+    ///
+    /// Only meaningful for `kind == Community`. Setting `true` on
+    /// non-community Spaces is rejected by `validate_invariants`.
+    ///
+    /// `skip_serializing_if = "core::ops::Not::not"` (skip when false)
+    /// keeps the default-false case byte-identical to pre-Phase-4
+    /// owner-state wire bytes. Verified by existing wire-format pinning
+    /// fixtures (Task 4 will add a dedicated regression test).
+    #[serde(rename = "sp", default, skip_serializing_if = "core::ops::Not::not")]
+    pub shared_in_profile: bool,
 }
 
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
@@ -1615,6 +1635,15 @@ impl Space {
             if self.is_invite_only.is_some() {
                 return Err(InvariantError(format!(
                     "{:?} must have is_invite_only=None (only Community carries it)",
+                    self.kind
+                )));
+            }
+            // Sub-D Phase 4 (ZEB-281): shared_in_profile is only
+            // meaningful for communities. Reject malformed peers attempting
+            // to set it on DMs/group-DMs/profiles/folders/etc.
+            if self.shared_in_profile {
+                return Err(InvariantError(format!(
+                    "{:?} must have shared_in_profile=false (only Community carries it)",
                     self.kind
                 )));
             }
@@ -2259,6 +2288,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -2305,6 +2335,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(mk_dm(0).validate_invariants().is_err());
         assert!(mk_dm(1).validate_invariants().is_err());
@@ -2336,6 +2367,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(mk(2).validate_invariants().is_err());
         assert!(mk(3).validate_invariants().is_ok());
@@ -2370,6 +2402,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
         // Distinct members still pass.
@@ -2406,6 +2439,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
         // Sorted ascending passes.
@@ -2441,6 +2475,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(g.validate_invariants().is_err());
         g.members = vec![
@@ -2482,6 +2517,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(g.validate_invariants().is_err());
     }
@@ -2509,6 +2545,7 @@ mod space_tests {
                 old_epoch_keys: ::std::collections::BTreeMap::new(),
                 admin_addr: None,
                 is_invite_only: None,
+                shared_in_profile: false,
             };
         // Missing community_id → reject.
         assert!(
@@ -2563,6 +2600,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let a = OwnerAddr([1u8; 16]);
         let b = OwnerAddr([2u8; 16]);
@@ -2597,6 +2635,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert_eq!(
             pc.dedupe_key(),
@@ -2648,6 +2687,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2686,6 +2726,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2722,6 +2763,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2756,6 +2798,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2793,6 +2836,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2831,6 +2875,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2872,6 +2917,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -3048,6 +3094,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -3086,6 +3133,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -3140,6 +3188,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(admin),
             is_invite_only: Some(true),
+            shared_in_profile: false,
         };
 
         let encoded = canonical_cbor_encode(&space).expect("encode");
@@ -3197,6 +3246,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         assert!(s.validate_invariants().is_ok());
     }
@@ -3231,6 +3281,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("current_epoch_key"));
@@ -3266,6 +3317,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None, // ← invariant violation
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("admin_addr"));
@@ -3301,6 +3353,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: None, // ← invariant violation
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("is_invite_only"));
@@ -3336,6 +3389,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("community_id=None"));
@@ -3371,6 +3425,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("content_key=None"));
@@ -3406,6 +3461,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
@@ -3452,6 +3508,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
@@ -3493,6 +3550,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("transport=None"));
@@ -3530,11 +3588,98 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
             err.0.contains("current_epoch_key"),
             "expected error about non-community current_epoch_key; got: {}",
+            err.0
+        );
+    }
+
+    /// Sub-D Phase 4 (ZEB-281): a Community Space with the opt-in flag
+    /// set MUST validate. Counterpart to
+    /// `non_community_with_shared_in_profile_true_rejected` below.
+    #[test]
+    fn community_space_with_shared_in_profile_true_accepted() {
+        let s = Space {
+            id: SpaceId([1u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "opted-in community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey::new([0u8; 32])),
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([2u8; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile: true,
+        };
+        assert_eq!(s.validate_invariants(), Ok(()));
+    }
+
+    /// Sub-D Phase 4 (ZEB-281): a non-Community Space with the opt-in
+    /// flag set MUST be rejected. Defends against a malformed peer or
+    /// future-self bug that tries to advertise a DM / channel / folder
+    /// in the public profile broadcast.
+    #[test]
+    fn non_community_with_shared_in_profile_true_rejected() {
+        let s = Space {
+            id: SpaceId([2u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "DM".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: ::std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: true, // ← invariant violation
+        };
+        let err = s
+            .validate_invariants()
+            .expect_err("non-community must reject shared_in_profile=true");
+        assert!(
+            err.0.contains("shared_in_profile=false"),
+            "expected error mentioning shared_in_profile invariant; got: {}",
             err.0
         );
     }
@@ -3573,6 +3718,7 @@ mod space_tests {
             old_epoch_keys: ::std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
 
         let bytes = canonical_cbor_encode(&dm).expect("encode");

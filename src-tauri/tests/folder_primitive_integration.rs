@@ -277,6 +277,8 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     },
                     None, // ZEB-218 Sub-D Phase 1: library_directory not exercised in this test
                     None, // ZEB-218 Sub-D Phase 1: library_request_rx not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_cache not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                 )
                 .await;
             });
