@@ -216,7 +216,7 @@ describe('LibraryDirectoryBrowser', () => {
       expect(await findByText(/▶ Discovered libraries/)).toBeInTheDocument();
     });
 
-    it('click_add_invokes_addLibrary_with_correct_addr', async () => {
+    it('click_add_invokes_service_add_with_correct_addr', async () => {
       const libAddr = 'abcd'.padEnd(32, '0');
       // R3 F4 (CodeRabbit Trivial): also assert the user-visible effect
       // — the row is removed from "Discovered libraries" via the IPC

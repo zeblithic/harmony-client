@@ -231,7 +231,7 @@ A new section between "Your libraries" and the bottom add-manual affordance:
 - Section header is a click-to-toggle collapsible (`<details>` element or equivalent Svelte 5 idiom).
 - **Collapsed by default when N=0.** Auto-expanded when N>0.
 - Each row: name (bold), description (subdued single-line truncated to 60 chars), short addr (`abcd…`, 8 chars + ellipsis), `Add` button.
-- Click `Add` → calls existing `addLibrary(libraryAddrHex)` → success closes the row (refetch removes it from discovered set via the filter). Error surfaces inline next to the row (mirrors Phase 1 `removeError` placement).
+- Click `Add` → calls existing `LibraryDirectoryService.add(libraryAddrHex)` → success closes the row (refetch removes it from discovered set via the filter). Error surfaces inline next to the row (mirrors Phase 1 `removeError` placement).
 
 ### 7.2 `library-directory-service.ts`
 
@@ -261,9 +261,9 @@ Existing `library-directory-updated` listener in `LibraryDirectoryBrowser.svelte
 
 ## 8. Add-from-discovered flow
 
-No new IPC. The "Add" button calls existing Phase 1 `addLibrary(libraryAddrHex)`:
+No new IPC. The "Add" button calls existing Phase 1 `LibraryDirectoryService.add(libraryAddrHex)`:
 
-1. Phase 1's `add_library` validates hex, mutates `OwnerState.libraries`, spawns the per-library `harmony/discovery/library/{addr}/communities` subscription (Phase 1 path).
+1. Phase 1's `add_library` IPC validates hex, mutates `OwnerState.libraries`, spawns the per-library `harmony/discovery/library/{addr}/communities` subscription (Phase 1 path).
 2. Emits `library-directory-updated`.
 3. Frontend refetches both lists; the IPC filter at §6.1 now excludes this library from `list_discovered_libraries`, so it visibly moves from "Discovered" to "Your libraries".
 
@@ -363,7 +363,7 @@ New cases added to the existing test file:
 
 - `discovered_panel_renders_with_n_entries` — mock IPC returns 3 entries; section header reads "Discovered libraries (3)"; rows render with name + description + addr.
 - `discovered_section_collapsed_when_empty` — IPC returns []; section header reads "Discovered libraries (0)"; rows not visible.
-- `click_add_invokes_addLibrary_with_correct_addr` — click `Add` on a row → spy on service `addLibrary` confirms it was called with the row's `libraryAddr`.
+- `click_add_invokes_service_add_with_correct_addr` — click `Add` on a row → spy on `LibraryDirectoryService.add` confirms it was called with the row's `libraryAddr`, AND after refetch the row is removed from the discovered list.
 - `add_failure_surfaces_inline` — service throws; row shows inline error text.
 
 ---
@@ -400,7 +400,7 @@ If the user wants any of these surfaced as proper Linear tickets, that's a one-l
 |---|---|
 | Auto-discovery topic subscribed at startup | §5.1 — single fixed-key subscribe in `event_loop.rs` |
 | Announce records surface in UI | §6.1 + §7.1 — `list_discovered_libraries` IPC + inline panel |
-| User must explicitly confirm adding | §7.1 + §8 — `Add` button calls existing `addLibrary`; no auto-add path |
+| User must explicitly confirm adding | §7.1 + §8 — `Add` button calls existing `LibraryDirectoryService.add()`; no auto-add path |
 | Discovered libraries replicate across bound devices | §3 + §4.2 — loose replication: every device subscribes the same global topic. Strong CRDT replication deferred (§12 row 4). |
 
 ---
